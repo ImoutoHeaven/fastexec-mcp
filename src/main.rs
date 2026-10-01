@@ -7,9 +7,12 @@ mod tasks;
 
 use output::{Truncate, Window};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ProgressNotificationParam};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities,
+    ServerInfo,
+};
 use rmcp::service::RequestContext;
-use rmcp::{RoleServer, ServiceExt, tool, tool_router};
+use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -172,7 +175,20 @@ struct Server {
     tasks: Arc<Tasks>,
 }
 
-#[tool_router(server_handler)]
+/// Server instructions say when to use the tool; hosts that show one line take the first.
+const INSTRUCTIONS: &str = "Runs bash commands as tasks: long-running builds and servers, stdin-driven programs, and terminal (PTY) programs such as password prompts, with bounded output and process-tree kill.
+Prefer it over one-shot shell tools when a command may outlive a single call or needs input; tasks end when the session ends.";
+
+#[tool_handler]
+impl ServerHandler for Server {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("fastexec", env!("CARGO_PKG_VERSION")))
+            .with_instructions(INSTRUCTIONS)
+    }
+}
+
+#[tool_router]
 impl Server {
     #[doc = include_str!("description.md")]
     #[tool(

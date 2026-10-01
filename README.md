@@ -26,7 +26,8 @@ pi with its built-in MCP support (`~/.pi/agent/mcp.json`):
   "mcpServers": {
     "fastexec": {
       "command": "/path/to/fastexec",
-      "exposure": "direct"
+      "exposure": "direct",
+      "description": "Run long-running, stdin-driven, and terminal (PTY) bash commands as tasks"
     }
   }
 }
@@ -50,6 +51,28 @@ pi with the `pi-mcp-adapter` extension:
 - The model sees the tool as `fastexec_fastexec`.
 
 For any other MCP host, set its tool timeout to at least 300 s unless it sends progress tokens.
+
+## Agent instructions
+
+The tool description explains how to use fastexec, and the server instructions explain when. To make an agent prefer fastexec for long-running and interactive work, append this section to its global instructions file, such as `~/.pi/agent/AGENTS.md`, `~/.codex/AGENTS.md`, or `~/.claude/CLAUDE.md`. The markers let a later update replace the block in place.
+
+```markdown
+<!-- fastexec:begin -->
+### fastexec
+
+- Use the fastexec tool for commands that may run longer than a minute, servers and
+  watchers, programs that read stdin, and programs that need a terminal (`pty: true`),
+  including password prompts.
+- Start with `start`; continue with `poll`, using long `waitMs` values (up to 240000)
+  for builds and tests and short ones for interactive prompts. Stop with `kill`.
+- fastexec tasks end with the session. Use a persistent job runner for work that must
+  survive a session restart.
+- Each `start` runs a fresh bash: `cd` and exported variables do not carry over; pass
+  `cwd` or chain commands with `&&`.
+<!-- fastexec:end -->
+```
+
+The tool's name depends on the host, for example `mcp__fastexec__fastexec` in pi and `fastexec_fastexec` with `pi-mcp-adapter`, so the section names it "the fastexec tool". If the file already routes work to other shell tools, keep one owner per kind of work: one-shot commands, in-session long-running or interactive tasks, and jobs that outlive the session.
 
 ## Tool
 
