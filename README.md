@@ -52,6 +52,28 @@ pi with the `pi-mcp-adapter` extension:
 
 For any other MCP host, set its tool timeout to at least 300 s unless it sends progress tokens.
 
+### Output placement
+
+Set `FASTEXEC_OUTPUT_MODE` in the MCP server's `env` configuration. The mode applies to every `start` and `poll` result for that server:
+
+| Mode | Text `content` | `structuredContent.output` |
+|---|---|---|
+| `text` (default) | Output body and status line | Omitted |
+| `both` | Output body and status line | Output body |
+| `structured` | Status line | Output body |
+
+Every mode preserves structured task and window metadata, including `taskId`, `state`, `exitCode`, `logPath`, `omittedRange`, and `cutLines`. `list`, `kill`, and error results keep their text and metadata. An invalid mode fails at startup with a diagnostic on stderr.
+
+Use `text` for pi and other text-consuming hosts. Use `structured` for hosts that expose structured results to the model, such as Codex. Use `both` for callers that require the body in both forms. A host that reads only `content` sees the status line in `structured` mode; the task log holds the body.
+
+For example, add this field to the server configuration:
+
+```json
+"env": { "FASTEXEC_OUTPUT_MODE": "structured" }
+```
+
+Programmatic callers read the body from the text block in `text` mode, or from `structuredContent.output` in `both` and `structured` modes. Output cleaning, truncation, shell pipelines, and the poll cursor work identically in every mode.
+
 ## Agent instructions
 
 The tool description explains how to use fastexec, and the server instructions explain when. To make an agent prefer fastexec for long-running and interactive work, append this section to its global instructions file, such as `~/.pi/agent/AGENTS.md`, `~/.codex/AGENTS.md`, or `~/.claude/CLAUDE.md`. The markers let a later update replace the block in place.
@@ -88,7 +110,7 @@ One tool takes an `action` and the parameters that apply to it:
 Output options:
 
 - `truncate`: `head_tail` (default), `head`, `tail`, or `none`. The bounded modes cut lines longer than 2000 characters (64 KiB with `raw`) and count them in `cutLines`; `none` returns whole lines.
-- `maxBytes`: 1024–1048576, default 16384. It bounds the whole result, status line included.
+- `maxBytes`: 1024–1048576, default 16384. It bounds the output window and status line together. `both` includes a second copy of the window in JSON; metadata and JSON serialization add bytes to the MCP response.
 - `raw`: `true` skips cleaning.
 - `encoding`: a WHATWG label such as `big5` or `gbk`.
 
@@ -97,7 +119,7 @@ Behavior:
 - **Waits.** Each wait lasts at most 240 s. An ended wait, a cancelled call, or a timeout leaves the process running.
 - **Environment.** Pipe and PTY tasks inherit the server's environment, then fastexec sets terminal, pager, and locale variables.
 - **Output.** stdout and stderr share one stream. Cleaning strips ANSI sequences, collapses carriage-return progress bars to their final text, and trims trailing spaces.
-- **Results.** Each result ends with a status line such as `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/t3.log`. `structuredContent` carries the same data as JSON: `state`, `exitCode`, `output`, `omittedRange`, `cutLines`, and `logPath`.
+- **Results.** Each `start` or `poll` text result ends with a status line such as `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/t3.log`. `structuredContent` carries task and window metadata as JSON. `FASTEXEC_OUTPUT_MODE` selects where the output body appears.
 - **Logs.** Each task's output is kept in a log file of up to 64 MiB, and omitted lines are named by their log line numbers. The server keeps the 64 most recently finished tasks and deletes its log directory on exit. Log directories are `fastexec-<uid>-<pid>` on Unix and `fastexec-<pid>` on Windows, in the temp directory; at startup the server removes the current user's directories whose server process has ended, such as those left by a forced kill.
 - **Process trees.** A task is its whole process tree. When the root bash exits, the rest of the tree ends too, so long-lived servers run as their own task. Windows uses a kill-on-close Job Object. Linux kills the task's process group and every process in its session; a process that starts its own session (`setsid`, daemons) leaves the tree.
 - **PTY input.** In PTY mode, send a carriage return (`"\r"`) for Enter, `"\u0003"` for Ctrl-C, and `"\u0004"` for Ctrl-D.

@@ -33,6 +33,7 @@ impl Server {
     /// Starts the server after `configure` adjusts its launch, such as its environment.
     fn start_with(configure: impl FnOnce(&mut Command)) -> Server {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        command.env_remove("FASTEXEC_OUTPUT_MODE");
         configure(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
@@ -190,9 +191,8 @@ fn short_command_returns_its_final_result_in_one_call() {
     assert_eq!(out["state"], "exited");
     assert_eq!(out["exitCode"], 3);
     assert!(text.starts_with("hello\noops\n\n[exited 3] t1"), "{text}");
-    let (out, text) = server.ok(json!({"action": "start", "command": "true"}));
+    let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
     assert!(text.starts_with("(no new output)"), "{text}");
-    assert_eq!(out["output"], "", "the placeholder is display text only");
     for pty in [false, true] {
         let (out, text) =
             server.ok(json!({"action": "start", "command": "kill -INT $$", "pty": pty}));
@@ -201,6 +201,81 @@ fn short_command_returns_its_final_result_in_one_call() {
             "a signal exit reports 128 + signal (pty={pty}): {text}"
         );
     }
+}
+
+#[test]
+fn output_modes_place_start_and_poll_body_without_losing_metadata() {
+    for (mode, text_body, structured_body) in [
+        (None, true, false),
+        (Some("text"), true, false),
+        (Some("both"), true, true),
+        (Some("structured"), false, true),
+    ] {
+        let mut server = Server::start_with(|command| {
+            if let Some(mode) = mode {
+                command.env("FASTEXEC_OUTPUT_MODE", mode);
+            }
+        });
+        let (out, text) = server.ok(json!({
+            "action": "start", "command": "printf 'MODE_START\\n'; exit 3"
+        }));
+        assert_eq!(
+            text.contains("MODE_START"),
+            text_body,
+            "mode={mode:?}: {text}"
+        );
+        assert_eq!(
+            out.get("output").and_then(Value::as_str),
+            structured_body.then_some("MODE_START"),
+            "mode={mode:?}: {out}"
+        );
+        assert!(text.contains("[exited 3] t1"), "{text}");
+        assert_eq!(out["taskId"], "t1");
+        assert_eq!(out["state"], "exited");
+        assert_eq!(out["exitCode"], 3);
+        assert!(std::path::Path::new(out["logPath"].as_str().unwrap()).exists());
+
+        server.ok(json!({
+            "action": "start", "command": "read -r line; printf '%s\\n' \"$line\"", "waitMs": 0
+        }));
+        let (out, text) = server.ok(json!({
+            "action": "poll", "taskId": "t2", "input": "MODE_POLL\n", "eof": true, "waitMs": 10000
+        }));
+        assert_eq!(
+            text.contains("MODE_POLL"),
+            text_body,
+            "mode={mode:?}: {text}"
+        );
+        assert_eq!(
+            out.get("output").and_then(Value::as_str),
+            structured_body.then_some("MODE_POLL"),
+            "mode={mode:?}: {out}"
+        );
+        assert_eq!(out["state"], "exited");
+        assert_eq!(out["exitCode"], 0);
+        let (out, text) = server.ok(json!({"action": "poll", "taskId": "t2", "waitMs": 0}));
+        assert_eq!(text.contains("(no new output)"), text_body, "{text}");
+        assert_eq!(
+            out.get("output").and_then(Value::as_str),
+            structured_body.then_some("")
+        );
+        assert!(text.contains("[exited 0] t2"), "{text}");
+        assert_eq!(out["omittedRange"], Value::Null);
+
+        let (out, text, is_error) = server.call(json!({"action": "poll", "taskId": "missing"}));
+        assert!(is_error && text.contains("Unknown taskId"), "{text}");
+        assert_eq!(out["ok"], false);
+    }
+
+    let result = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+        .env("FASTEXEC_OUTPUT_MODE", "bogus")
+        .output()
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "an invalid mode must fail at startup"
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("FASTEXEC_OUTPUT_MODE"));
 }
 
 #[test]
@@ -397,15 +472,16 @@ fn output_window_respects_max_bytes_and_points_at_the_log() {
     let (out, text) = server.ok(json!({"action": "start", "command": line(3000)}));
     assert_eq!(out["cutLines"], 1);
     assert!(text.contains("line cut at 2000 of 3000 chars"), "{text}");
-    let (out, _) = server.ok(json!({"action": "start", "command": line(3000), "truncate": "none"}));
+    let (out, text) =
+        server.ok(json!({"action": "start", "command": line(3000), "truncate": "none"}));
     assert_eq!(
-        (out["output"].as_str().unwrap().len(), &out["cutLines"]),
+        (text.split_once("\n\n").unwrap().0.len(), &out["cutLines"]),
         (3000, &json!(0))
     );
-    let (out, _) = server
+    let (out, text) = server
         .ok(json!({"action": "start", "command": line(70000), "truncate": "none", "raw": true}));
     assert_eq!(
-        (out["output"].as_str().unwrap().len(), &out["cutLines"]),
+        (text.split_once("\n\n").unwrap().0.len(), &out["cutLines"]),
         (70000, &json!(0))
     );
 }

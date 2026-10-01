@@ -170,9 +170,17 @@ fn validate(request: &Request) -> Result<View, String> {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Text,
+    Both,
+    Structured,
+}
+
 #[derive(Clone)]
 struct Server {
     tasks: Arc<Tasks>,
+    output_mode: OutputMode,
 }
 
 /// Server instructions say when to use the tool; hosts that show one line take the first.
@@ -250,7 +258,7 @@ impl Server {
                     .map_err(|error| format!("Internal failure while starting: {error}."))??;
                 let wait = request.wait_ms.unwrap_or(30_000);
                 wait_for(&task, wait, context).await?;
-                window_result(Action::Start, task, view).await
+                window_result(Action::Start, task, view, self.output_mode).await
             }
             Action::Poll => {
                 let task = self.task(request.task_id.as_deref())?;
@@ -261,7 +269,7 @@ impl Server {
                     30_000
                 };
                 wait_for(&task, request.wait_ms.unwrap_or(default_wait), context).await?;
-                window_result(Action::Poll, task, view).await
+                window_result(Action::Poll, task, view, self.output_mode).await
             }
             Action::Kill => {
                 let task = self.task(request.task_id.as_deref())?;
@@ -358,6 +366,7 @@ async fn window_result(
     action: Action,
     task: Arc<Task>,
     view: View,
+    output_mode: OutputMode,
 ) -> Result<CallToolResult, String> {
     let reader = Arc::clone(&task);
     let encoding = view.encoding.unwrap_or(task.encoding);
@@ -396,10 +405,16 @@ async fn window_result(
     } else {
         output.as_str()
     };
-    let text = format!("{body}\n\n{status}");
+    let text = if output_mode == OutputMode::Structured {
+        status
+    } else {
+        format!("{body}\n\n{status}")
+    };
     let mut structured = task_json(action, &task, &snapshot);
     add_window(&mut structured, &window);
-    structured["output"] = json!(output);
+    if output_mode != OutputMode::Text {
+        structured["output"] = json!(output);
+    }
     structured["cutLines"] = json!(cut_lines);
     Ok(success(text, structured))
 }
@@ -479,6 +494,17 @@ fn error_result(action: Action, message: &str) -> CallToolResult {
 
 #[tokio::main]
 async fn main() {
+    let output_mode = match std::env::var("FASTEXEC_OUTPUT_MODE").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("text") => OutputMode::Text,
+        Ok("both") => OutputMode::Both,
+        Ok("structured") => OutputMode::Structured,
+        value => {
+            eprintln!(
+                "fastexec: invalid FASTEXEC_OUTPUT_MODE {value:?}; expected text, both, or structured"
+            );
+            std::process::exit(1);
+        }
+    };
     let tasks = match Tasks::new() {
         Ok(tasks) => tasks,
         Err(error) => {
@@ -488,6 +514,7 @@ async fn main() {
     };
     let server = Server {
         tasks: Arc::clone(&tasks),
+        output_mode,
     };
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
