@@ -42,21 +42,35 @@ The tool takes one flat object with `deny_unknown_fields`. `action` selects the 
 | `loginShell` | start | boolean, `true` | `bash -lc` when true; `bash --noprofile --norc -c` when false |
 | `killAfterMs` | start | nonnegative integer; 0 or omitted: no limit | Kill the whole tree this long after launch, independently of waits, polls, and request cancellation |
 | `taskId` | poll, kill | string | Task returned by `start` or `list` |
-| `input` | poll | string, at most 16 KiB UTF-8 | Written exactly as given before waiting; include `\n` or `\r` for Enter |
+| `input` | poll | string, at most 16 KiB UTF-8 | Written exactly as given, before `keys` and before waiting |
+| `keys` | poll, PTY tasks | array of key names | Pressed after `input`, in array order (§3 Keys). `input` and the encoded keys together hold at most 16 KiB |
 | `eof` | poll | boolean, `false` | Pipe mode: close stdin after `input`. PTY mode: returns an error |
-| `waitMs` | start, poll | integer 0–240000 | Defaults: start 30000; poll with `input` 2000; poll without `input` 30000 |
+| `waitMs` | start, poll | integer 0–240000 | Defaults: start 30000; poll with `input` or `keys` 2000; other polls 30000 |
 | `truncate` | start, poll | `head_tail` (default) / `head` / `tail` / `none` | Output window mode (§5) |
 | `maxBytes` | start, poll | integer 1024–1048576, default 16384 | Output window budget; rejected with `truncate: "none"` |
 | `raw` | start, poll | boolean, `false` | Return output without cleaning (§5) |
 | `encoding` | start, poll | ASCII-compatible WHATWG label, e.g. `gbk`, `big5` | Decode output from this encoding. A value on `start` becomes the task default; a value on `poll` applies to that call. UTF-16 labels are rejected because lines split on the LF byte |
+| `screen` | start, poll; PTY tasks | boolean, `false` | Return the rendered terminal screen instead of the output window (§5). Rejected with `truncate`, `raw`, or `encoding`, on `start` without `pty: true`, and on a task started with a non-UTF-8 `encoding` |
 
 ### Action semantics
 
 - **`start`** spawns the command and waits up to `waitMs`. If the command exits within the window, the result carries the final state and all of its output, as a foreground command would. Otherwise the result carries `state: "running"`, the task ID, and the output so far. `waitMs: 0` returns immediately.
-- **`poll`** writes `input`, then applies `eof`. It then waits until the task ends or `waitMs` elapses, and returns the output the caller has not seen yet. New output during the window leaves the wait running. `waitMs: 0` takes an immediate snapshot. A poll without `input` always reads, including on a finished task, where it returns the final state and any remaining unseen output. `input` after stdin has closed (by `eof`, by the program, or by exit) returns an error and delivers nothing.
+- **`poll`** writes `input`, then the bytes of `keys`, as one write, then applies `eof`. It then waits until the task ends or `waitMs` elapses, and returns the output the caller has not seen yet. New output during the window leaves the wait running. `waitMs: 0` takes an immediate snapshot. A poll without `input` always reads, including on a finished task, where it returns the final state and any remaining unseen output. `input` after stdin has closed (by `eof`, by the program, or by exit) returns an error and delivers nothing. An invalid key name also returns an error and delivers nothing.
 - **`kill`** terminates the whole process tree (§6.3), waits up to 5 s for the exit, and returns the status with `state: "killed"`; a tree still running after 5 s returns `state: "running"` with a note to poll later. Unseen output stays available to `poll`. Killing a finished task returns its existing final state. A failed native termination call returns an error result naming the cause; an already empty tree counts as terminated.
 - **Lifetime limit.** A positive `killAfterMs` arms a timer owned by the task. When it fires while the task runs, the task is killed through the same tree termination and reports `state: "killed"` with `lifetimeExpired: true`. The kill and expiry flags are read when the root exits, so a root that exits before a kill keeps its natural result while its output drains.
 - **`list`** returns every task of this server, newest first.
+
+### Keys
+
+`keys` names keys as tmux `send-keys` does (`key-string.c`), and each key sends the bytes tmux sends to a pane in its standard key mode (`input-keys.c`):
+
+- Names, case-insensitive: `Enter`, `Tab`, `BTab`, `Escape`, `Space`, `BSpace`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`/`PgUp`/`PPage`, `PageDown`/`PgDn`/`NPage`, `Insert`/`IC`, `Delete`/`DC`, `F1`–`F12`, `KP0`–`KP9`, `KP/`, `KP*`, `KP-`, `KP+`, `KP.`, `KPEnter`, and `[NUL]`–`[US]` for C0 controls.
+- One character (printable ASCII or any Unicode character), or `0xHH` for a code point.
+- Modifier prefixes `C-`, `M-`, and `S-` combine in any order; `^c` means `C-c`.
+- Arrow keys send `ESC O x` when the program has enabled application cursor mode (DECCKM), and keypad keys do so in application keypad mode (DECKPAM); the PTY task's terminal emulator (§5) tracks both modes.
+- Modified function, arrow, and editing keys use the xterm form `ESC [ <n> ; <m> <final>`. `M-` before any other key sends `ESC` first; `C-` maps characters to C0 controls as a VT terminal does.
+
+fastexec differs from tmux in two cases, both errors that deliver nothing: a name tmux would send as literal text (literal text belongs in `input`), and a modifier that the key's legacy encoding cannot carry, which tmux drops silently (`C-Enter`, `C-Tab`, `S-a`, `C-é`, `C-BSpace`, any modified `BTab`, Ctrl or Shift on a keypad key). Pipe tasks reject `keys`.
 
 ### Waiting
 
@@ -79,7 +93,8 @@ The tool takes one flat object with `deny_unknown_fields`. `action` selects the 
   - Every mode uses the same output window, byte budget, and poll cursor. `list`, `kill`, and operational error results keep their text in every mode.
 - `structuredContent` carries:
   - for `start`, `poll`, and `kill`: `ok`, `action`, `taskId`, `state` (`running` / `exited` / `killed`), `exitCode`, `pty`, `elapsedMs`, `logPath`, `lifetimeExpired`, and `logError` (the first log write failure, or `null`);
-  - for `start` and `poll`, additionally: `omittedLines`, `omittedRange` (`[first, last]` log lines or `null`), `cutLines` (shown lines that lost part of their text to a per-line limit or the budget), and `encodingErrors` (lines with invalid byte sequences). In `both` and `structured` modes they also carry `output`, the window text, with an empty string for an empty window; `content` displays `(no new output)` for that empty window in `text` and `both` modes;
+  - for `start` and `poll` with `screen`, additionally: `cursor` (`[row, column]`, 1-based) and `omittedRows`; in `both` and `structured` modes also `output`, the screen text;
+  - for other `start` and `poll` results, additionally: `omittedLines`, `omittedRange` (`[first, last]` log lines or `null`), `cutLines` (shown lines that lost part of their text to a per-line limit or the budget), and `encodingErrors` (lines with invalid byte sequences). In `both` and `structured` modes they also carry `output`, the window text, with an empty string for an empty window; `content` displays `(no new output)` for that empty window in `text` and `both` modes;
   - for `list`: `ok`, `action`, and a `tasks` array of `{taskId, state, exitCode, pty, elapsedMs, command (first 120 chars), logPath, lifetimeExpired}`;
   - for operational errors: `ok: false`, `action`, and `error`.
 - **Background footer.** `start`, `poll`, and `kill` results append one line after the status line, such as `(Background: t3 exited 7, t5 running 4m3s.)`. It names the other tasks that need attention: finished tasks whose final state no delivered result has shown, ranked failures (nonzero exit or `killAfterMs` expiry) first, then other completions, then running tasks, newest first within a rank. It names at most three, then appends the remaining count, aggregate counts, and `use list`; when that exceeds the cap it shows counts only. The cap is 512 bytes, and at most a quarter of `maxBytes` for bounded windows; the footer is reserved before the output window is sized, so the whole text still fits `maxBytes`. Showing a finished task's final state in a result, in the footer, or in `list` marks it reported. Results without such tasks carry no footer. The footer is best-effort delivery; `list` remains the complete view.
@@ -90,7 +105,7 @@ The tool takes one flat object with `deny_unknown_fields`. `action` selects the 
 
 ## 4. Tool Description
 
-The tool description (`src/description.md`, at most 2.5 KB) says how to use the tool, and the server instructions returned by `initialize` say when. pi-mcp-adapter shows the instructions in its `mcp` proxy description. pi's built-in MCP lists one line for each server with `codemode` or `deferred` tools, taken from the configured `description` or else the first line of the instructions, so that first line stands alone; `describeNamespace()` returns the full instructions. `serverInfo` reports `fastexec` and the crate version.
+The tool description (`src/description.md`, at most 3 KB) says how to use the tool, and the server instructions returned by `initialize` say when. pi-mcp-adapter shows the instructions in its `mcp` proxy description. pi's built-in MCP lists one line for each server with `codemode` or `deferred` tools, taken from the configured `description` or else the first line of the instructions, so that first line stands alone; `describeNamespace()` returns the full instructions. `serverInfo` reports `fastexec` and the crate version.
 
 `src/description.md` is the authoritative text. It covers:
 
@@ -100,7 +115,7 @@ The tool description (`src/description.md`, at most 2.5 KB) says how to use the 
 - task lifetime: tasks end with the session, and the rest of a tree ends with its root bash, so long-lived servers run as their own task;
 - output: one merged stream, cleaning and `raw`, the `truncate` modes and per-line caps, narrowing with pipelines and `set -o pipefail`, and reading the log file with `sed` or `grep`;
 - stdin: pipe-mode stdin stays open until `eof` or exit; `< /dev/null` for programs that read it;
-- PTY: control characters for Enter, Ctrl-C, and Ctrl-D; password prompts need `pty: true`; full-screen programs render poorly; `input` is recorded in the transcript;
+- PTY: `keys` with tmux names for Enter and control keys, since a newline in `input` is not Enter to a TUI; password prompts need `pty: true`; `screen: true` for full-screen and TUI programs; `input` is recorded in the transcript;
 - Windows: Git Bash path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL`, PowerShell through a script file or `-EncodedCommand`, and `loginShell: false` for faster starts;
 - U+FFFD in output as the cue to pass `encoding`.
 
@@ -118,6 +133,16 @@ The tool description (`src/description.md`, at most 2.5 KB) says how to use the 
   - A failed log write stops writing for that task in the same way and records the first error. The readable range ends at the last fully written chunk. Interrupted reads are retried; any other read error ends capture like EOF.
 - The server keeps the 64 most recently finished tasks. Each time a task finishes, the tasks that finished earliest beyond that count are removed with their logs; the task that just finished always stays.
 - The server deletes its log directory on shutdown. At startup it deletes the current user's log directories whose server process has ended; a forced kill is the only way to leave one behind. A process the user may not query (Windows access denied, Unix `EPERM`) counts as running.
+
+### Screen
+
+Each PTY task feeds all of its output into a 120×30 terminal emulator (`vt100` 0.16) without scrollback. `screen: true` returns the emulator's visible rows instead of the output window, after the usual wait:
+
+- Each row loses its trailing spaces, and blank rows at the bottom are dropped. An empty screen shows `(blank screen)`.
+- The status line ends with `screen, cursor row R col C` (1-based).
+- The rows, status line, and footer fit `maxBytes`. When the rows do not fit, the top rows are dropped first, behind the marker `... [N top rows omitted] ...`.
+- The output stream counts as read up to the screen, so a later stream poll starts after it. The log keeps every byte.
+- The emulator decodes UTF-8.
 
 ### Model-facing window
 
@@ -201,7 +226,7 @@ PTY commands start from the server's process environment: portable-pty's own see
   - `portable-pty` 0.9.0 (ConPTY on Windows, Unix PTY elsewhere), size 120×30.
   - Input goes through the master writer, fed by the same per-task queue.
   - The reader drains `try_clone_reader()` into the same log path as pipe mode.
-  - The reader answers each cursor-position query (`ESC[6n`) with `ESC[1;1R`. ConPTY sends one at startup and holds all output until a terminal answers. Replies share the 1 MiB input limit; replies past it are dropped.
+  - The reader feeds every chunk into the task's terminal emulator (§5), which answers each cursor-position query (`ESC[6n`) with the cursor's position. ConPTY sends one at startup and holds all output until a terminal answers. Replies share the 1 MiB input limit; replies past it are dropped.
 
 ### 6.3 Process-tree ownership
 
@@ -265,11 +290,12 @@ pi with the `pi-mcp-adapter` extension (2.26), which replaces the built-in MCP s
 | `src/process.rs` | launch, environment, locale, Job Object, process session, PTY spawn | FastCtx `src/shell/process.rs` and `src/process_policy.rs`, plus PTY |
 | `src/output.rs` | streaming ANSI/CR cleaning and head/tail windows under a byte budget | FastCtx `src/shell/normalize.rs` and `src/shell/output.rs`, with CR overwrite |
 | `src/tasks.rs` | task registry, log capture, cursors, input queues, retention, shutdown | new |
+| `src/keys.rs` | tmux key names to terminal input bytes (§3 Keys) | tmux `key-string.c` and `input-keys.c` |
 | `tests/mcp.rs` | contract tests that drive the built binary over MCP stdio | new |
 
 `Cargo.toml` lists the dependencies and pins rmcp (`=2.2.0`) and portable-pty (`=0.9.0`) exactly.
 
-Files derived from FastCtx open with a header that names the FastCtx source files and credits FastCtx (Apache-2.0, Copyright 2026 yc-duan). The repository `NOTICE` lists those files.
+Files derived from FastCtx open with a header that names the FastCtx source files and credits FastCtx (Apache-2.0, Copyright 2026 yc-duan). The repository `NOTICE` lists those files and credits tmux (ISC) for the key names and encodings in `src/keys.rs`.
 
 ## 9. Acceptance
 
@@ -282,7 +308,7 @@ Run every case on Windows 11 x64 with Git for Windows and on Ubuntu x64 with bas
 | A3 | 240 s poll | Completes within pi's request timeout; progress appears in the TUI; an early exit returns early |
 | A4 | Cancel during wait | The call ends; the task keeps running; `list` shows a task whose `start` was cancelled |
 | A5 | Pipe input | A line-reading program receives each exact `input`; `eof` delivers EOF |
-| A6 | PTY input | The program sees a TTY; `\r`, Ctrl-C, and Ctrl-D behave as terminal input; an ssh password prompt accepts `input` |
+| A6 | PTY input | The program sees a TTY; `keys` Enter, C-c, and C-d behave as terminal keys after `input`; arrows follow the program's cursor mode; an ssh password prompt accepts `input` |
 | A7 | `kill` | Shell → child → grandchild trees end on both platforms; repeated `kill` returns the same final state |
 | A8 | Session end | `/reload`, `/new`, and quit end every task tree and remove the log directory |
 | A9 | Output windows | All four `truncate` modes respect `maxBytes`; the omitted line range matches the log; `raw` keeps ANSI and CR |
@@ -290,3 +316,4 @@ Run every case on Windows 11 x64 with Git for Windows and on Ubuntu x64 with bas
 | A11 | Log limits | Output beyond 64 MiB keeps the child running and reports the drop; memory stays bounded |
 | A12 | Windows specifics | `MSYS_NO_PATHCONV=1` passes `/F` intact to a native tool; commands over 12000 bytes run; every child runs windowless |
 | A13 | Parameters | Misplaced or out-of-range parameters return errors; `null` optional fields behave as omitted |
+| A14 | TUI | pi's interactive TUI accepts a prompt typed with `input` and submitted with `keys: ["Enter"]`; `screen: true` shows one rendered frame |

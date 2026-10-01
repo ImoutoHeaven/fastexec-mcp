@@ -258,14 +258,18 @@ fn spawn_pipe(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     })
 }
 
+/// PTY size; the terminal emulator behind `screen` uses the same.
+pub const PTY_ROWS: u16 = 30;
+pub const PTY_COLS: u16 = 120;
+
 fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     fn other(error: impl std::fmt::Display) -> std::io::Error {
         std::io::Error::other(error.to_string())
     }
     let pair = native_pty_system()
         .openpty(PtySize {
-            rows: 30,
-            cols: 120,
+            rows: PTY_ROWS,
+            cols: PTY_COLS,
             pixel_width: 0,
             pixel_height: 0,
         })

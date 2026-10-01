@@ -60,6 +60,47 @@ pub struct Task {
     done: watch::Sender<bool>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
     queued: AtomicUsize,
+    /// PTY tasks: a terminal emulator fed with every output byte.
+    terminal: Option<Mutex<vt100::Parser<Replies>>>,
+}
+
+/// Replies to the terminal queries the emulator sees: cursor-position reports (`ESC[6n`).
+/// ConPTY sends one at startup and holds all output until a terminal answers.
+#[derive(Default)]
+struct Replies(Vec<u8>);
+
+impl vt100::Callbacks for Replies {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        if c == 'n' && i1.is_none() && params == [&[6][..]] {
+            let (row, col) = cursor(screen);
+            self.0
+                .extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
+        }
+    }
+}
+
+/// Zero-based cursor row and column. After a write to the last column, vt100 keeps the
+/// pending wrap as column `width`; a terminal reports the last column.
+fn cursor(screen: &vt100::Screen) -> (u16, u16) {
+    let (row, col) = screen.cursor_position();
+    (row, col.min(screen.size().1 - 1))
+}
+
+/// The rendered terminal of a PTY task.
+pub struct Screen {
+    /// Visible rows without trailing spaces; blank rows at the bottom are dropped.
+    pub rows: Vec<String>,
+    /// Zero-based row and column.
+    pub cursor: (u16, u16),
+    /// End of the readable log at the moment the screen was taken.
+    pub log_end: u64,
 }
 
 #[derive(Default)]
@@ -210,6 +251,14 @@ impl Tasks {
             done: watch::Sender::new(false),
             input: Mutex::new(Some(input_tx.clone())),
             queued: AtomicUsize::new(0),
+            terminal: args.pty.then(|| {
+                Mutex::new(vt100::Parser::new_with_callbacks(
+                    process::PTY_ROWS,
+                    process::PTY_COLS,
+                    0,
+                    Replies::default(),
+                ))
+            }),
         });
         registry.tasks.push(Arc::clone(&task));
         drop(registry);
@@ -427,8 +476,8 @@ fn short(elapsed: Duration) -> String {
 
 /// Drains one task's output into its log until EOF, never blocking the child on log limits.
 ///
-/// For a PTY, `answer` replies to cursor-position queries (`ESC[6n`): ConPTY sends one at
-/// startup and holds all output until a terminal answers.
+/// For a PTY, the output also feeds the task's terminal emulator, and `answer` carries its
+/// replies to terminal queries.
 fn capture(
     shared: &Tasks,
     task: &Task,
@@ -436,11 +485,8 @@ fn capture(
     log: File,
     answer: Option<mpsc::Sender<Input>>,
 ) {
-    const QUERY: &[u8] = b"[6n";
-    const REPLY: &[u8] = b"[1;1R";
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut last = Vec::with_capacity(8);
-    let mut seam = Vec::new();
     let mut log = Some(log);
     loop {
         let read = match output.read(&mut buffer) {
@@ -450,16 +496,20 @@ fn capture(
             Ok(read) => read,
         };
         let chunk = &buffer[..read];
-        if let Some(answer) = &answer {
-            // `seam` keeps the previous chunk's last bytes so a query split across reads is found.
-            seam.extend_from_slice(chunk);
-            for _ in seam.windows(QUERY.len()).filter(|window| *window == QUERY) {
-                // Replies share the input limit; past it they are dropped, never queued unbounded.
-                if task.admit(REPLY.len()) && answer.send(Input::Data(REPLY.to_vec())).is_err() {
-                    task.queued.fetch_sub(REPLY.len(), Ordering::SeqCst);
-                }
+        // The emulator stays locked until the chunk is in the log, so a screen and the log
+        // offset taken under that lock show the same output.
+        let mut terminal = task.terminal.as_ref().map(lock);
+        if let (Some(parser), Some(answer)) = (terminal.as_mut(), &answer) {
+            parser.process(chunk);
+            let reply = std::mem::take(&mut parser.callbacks_mut().0);
+            // Replies share the input limit; past it they are dropped, never queued unbounded.
+            if !reply.is_empty()
+                && task.admit(reply.len())
+                && let Err(error) = answer.send(Input::Data(reply))
+                && let Input::Data(reply) = error.0
+            {
+                task.queued.fetch_sub(reply.len(), Ordering::SeqCst);
             }
-            seam.drain(..seam.len().saturating_sub(QUERY.len() - 1));
         }
         // Storing stops at the first byte that does not fit, so the log stays a prefix of the
         // output: a later chunk that would fit is not stored after the gap.
@@ -503,6 +553,8 @@ fn capture(
             out.readable = out.written - incomplete_utf8_suffix(&last) as u64;
         }
         out.dropped += (chunk.len() - stored.len()) as u64;
+        drop(out);
+        drop(terminal);
     }
     let mut out = lock(&task.out);
     out.readable = out.written;
@@ -557,11 +609,43 @@ impl Task {
         true
     }
 
+    /// The program's keyboard modes; pipe tasks report the defaults.
+    pub fn modes(&self) -> crate::keys::Modes {
+        self.terminal
+            .as_ref()
+            .map_or_else(Default::default, |terminal| {
+                let parser = lock(terminal);
+                crate::keys::Modes {
+                    cursor: parser.screen().application_cursor(),
+                    keypad: parser.screen().application_keypad(),
+                }
+            })
+    }
+
+    /// The rendered terminal; `None` for pipe tasks.
+    pub fn screen(&self) -> Option<Screen> {
+        let parser = lock(self.terminal.as_ref()?);
+        let log_end = lock(&self.out).readable;
+        let screen = parser.screen();
+        let mut rows: Vec<String> = screen
+            .rows(0, screen.size().1)
+            .map(|row| row.trim_end().to_string())
+            .collect();
+        while rows.last().is_some_and(String::is_empty) {
+            rows.pop();
+        }
+        Some(Screen {
+            rows,
+            cursor: cursor(screen),
+            log_end,
+        })
+    }
+
     /// Queues `input`, then closes stdin when `eof` is set. Validation happens before any write.
-    pub fn send(&self, input: Option<&str>, eof: bool) -> Result<(), String> {
-        let data = input.filter(|text| !text.is_empty());
+    pub fn send(&self, input: Option<&[u8]>, eof: bool) -> Result<(), String> {
+        let data = input.filter(|bytes| !bytes.is_empty());
         if eof && self.pty {
-            return Err("EOF_UNSUPPORTED_IN_PTY: a PTY has no stdin half-close. Send \\u0004 (Ctrl-D) as input, or kill the task.".into());
+            return Err("EOF_UNSUPPORTED_IN_PTY: a PTY has no stdin half-close. Press Ctrl-D with keys: [\"C-d\"], or kill the task.".into());
         }
         let mut sender = lock(&self.input);
         let Some(tx) = sender.as_ref() else {
@@ -577,7 +661,7 @@ impl Task {
             if !self.admit(text.len()) {
                 return Err("INPUT_BACKPRESSURE: 1 MiB of earlier input is still waiting for the program to read it. Poll for output, then retry.".into());
             }
-            if tx.send(Input::Data(text.as_bytes().to_vec())).is_err() {
+            if tx.send(Input::Data(text.to_vec())).is_err() {
                 self.queued.fetch_sub(text.len(), Ordering::SeqCst);
                 *sender = None;
                 return Err("stdin is closed; the input was not delivered.".into());
@@ -607,13 +691,15 @@ impl Task {
         }
     }
 
-    /// Returns the output after the cursor, as a window, and advances the cursor past it.
+    /// Returns the output after the cursor, up to `until` when given, as a window, and
+    /// advances the cursor past it.
     pub fn read_window(
         &self,
         truncate: Truncate,
         budget: usize,
         raw: bool,
         encoding: &'static Encoding,
+        until: Option<u64>,
     ) -> std::io::Result<Window> {
         let mut view = lock(&self.view);
         let (readable, written, evicted, closed) = {
@@ -628,6 +714,7 @@ impl Task {
         } else {
             written - self.legacy_holdback(start, written, encoding)?
         };
+        let end = until.map_or(end, |until| end.min(until));
         let first_line = view.lines_before + 1;
         let spec = WindowSpec {
             truncate,

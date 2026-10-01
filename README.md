@@ -110,8 +110,8 @@ One tool takes an `action` and the parameters that apply to it:
 
 | Action | Parameters | Behavior |
 |---|---|---|
-| `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `waitMs` (default 30000), output options | Runs the command in bash and waits. Returns the final result when the command exits in time; otherwise returns a `taskId` and the output so far. |
-| `poll` | `taskId`, `input`, `eof`, `waitMs` (default 2000 with input, 30000 without), output options | Writes `input` exactly as given, closes stdin when `eof` is true, waits until the task ends or `waitMs` elapses, and returns output not yet seen. |
+| `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `waitMs` (default 30000), output options, `screen` | Runs the command in bash and waits. Returns the final result when the command exits in time; otherwise returns a `taskId` and the output so far. |
+| `poll` | `taskId`, `input`, `keys`, `eof`, `waitMs` (default 2000 with input or keys, 30000 without), output options, `screen` | Writes `input` exactly as given, then presses `keys`, closes stdin when `eof` is true, waits until the task ends or `waitMs` elapses, and returns output not yet seen. |
 | `kill` | `taskId` | Terminates the task's process tree and returns its final state. A failed termination call returns an error naming the cause. |
 | `list` | — | Lists this server's tasks, newest first. |
 
@@ -132,7 +132,8 @@ Behavior:
 - **Results.** Each `start` or `poll` text result ends with a status line such as `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/t3.log`. `FASTEXEC_STRUCTURED_CONTENT` enables task and window metadata as JSON by default; `false` selects text-only results. With structured content enabled, `FASTEXEC_OUTPUT_MODE` selects where the output body appears.
 - **Logs.** Each task's output is kept in a log file of up to 64 MiB, and omitted lines are named by their log line numbers. If writing the log fails, the task keeps running, its earlier output stays readable, and the status line and `logError` report the failure. The server keeps the 64 most recently finished tasks and deletes its log directory on exit. Log directories are `fastexec-<uid>-<pid>` on Unix and `fastexec-<pid>` on Windows, in the temp directory; at startup the server removes the current user's directories whose server process has ended, such as those left by a forced kill.
 - **Process trees.** A task is its whole process tree. When the root bash exits, the rest of the tree ends too, so long-lived servers run as their own task. Windows uses a kill-on-close Job Object. Linux kills the task's process group and every process in its session; a process that starts its own session (`setsid`, daemons) leaves the tree.
-- **PTY input.** In PTY mode, send a carriage return (`"\r"`) for Enter, `"\u0003"` for Ctrl-C, and `"\u0004"` for Ctrl-D.
+- **PTY keys.** `keys` presses keys in a PTY task after `input` is written, in array order, named as in tmux `send-keys`: `["Enter"]`, `["C-c"]`, `["Escape", ":", "q", "Enter"]`. Names cover Enter, Tab, Escape, arrows, editing and function keys, the keypad, single characters, and the `C-`, `M-`, and `S-` modifiers; arrow keys follow the program's cursor mode. An unknown name, or a modifier the key cannot carry such as `C-Enter`, returns an error and sends nothing.
+- **Screen.** `screen: true` on `start` or `poll` of a PTY task returns the rendered 120×30 terminal screen and the cursor position instead of the output stream, so full-screen and TUI programs show their current frame rather than every redraw. It marks the stream read and does not combine with `truncate`, `raw`, or `encoding`.
 - **Lifetime.** Tasks live as long as the server. The host stops the server when its session ends, and every task ends with it.
 
 ## Test

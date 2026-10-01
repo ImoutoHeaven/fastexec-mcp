@@ -497,6 +497,59 @@ fn pty_task_sees_a_terminal_and_accepts_a_hidden_password() {
 }
 
 #[test]
+fn pty_keys_follow_input_and_the_programs_cursor_mode() {
+    let mut server = Server::start();
+    // The program switches to application cursor mode (DECCKM), then dumps what it reads.
+    let command = "stty raw -echo; printf '\\033[?1hready\\r\\n'; head -c 9 | od -An -tx1";
+    let (_, text) =
+        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 3000}));
+    assert!(text.contains("ready"), "{text}");
+    let (_, text, is_error) =
+        server.call(json!({"action": "poll", "taskId": "t1", "keys": ["Up", "C-Enter"]}));
+    assert!(is_error && text.contains("C-Enter"), "{text}");
+    let (out, text) = server.ok(json!({
+        "action": "poll", "taskId": "t1", "input": "ab", "keys": ["Enter", "Up", "C-c", "M-x"], "waitMs": 10000
+    }));
+    assert_eq!(out["state"], "exited", "{text}");
+    assert!(
+        text.contains("61 62 0d 1b 4f 41 03 1b 78"),
+        "input, then keys in order, with Up in application cursor mode: {text}"
+    );
+
+    server.ok(json!({"action": "start", "command": "cat", "waitMs": 0}));
+    let (_, text, is_error) =
+        server.call(json!({"action": "poll", "taskId": "t2", "keys": ["Enter"]}));
+    assert!(is_error && text.contains("PTY tasks only"), "{text}");
+    server.ok(json!({"action": "kill", "taskId": "t2"}));
+}
+
+#[test]
+fn screen_shows_the_rendered_terminal_and_marks_the_stream_read() {
+    let mut server = Server::start();
+    // Frame 1 is printed, then cleared and overwritten in place at row 2.
+    let command =
+        "printf 'frame-1\\r\\n'; sleep 0.5; printf '\\033[H\\033[2J\\033[2;3Hframe-2'; read -r x";
+    let (out, text) = server.ok(json!({
+        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 3000
+    }));
+    assert_eq!(out["state"], "running", "{text}");
+    let body = text.split("\n\n[").next().unwrap();
+    assert_eq!(body.trim_end(), "\n  frame-2", "{text}");
+    assert_eq!(out["cursor"], json!([2, 10]), "{text}");
+    let (_, text) = server.ok(json!({"action": "poll", "taskId": "t1", "waitMs": 0}));
+    assert!(text.starts_with("(no new output)"), "{text}");
+    server.ok(json!({"action": "kill", "taskId": "t1"}));
+
+    // A full first row leaves the cursor in the last column, pending the wrap.
+    let command = "printf '%0120d' 0; read -r x";
+    let (out, text) = server.ok(json!({
+        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 3000
+    }));
+    assert_eq!(out["cursor"], json!([1, 120]), "{text}");
+    server.ok(json!({"action": "kill", "taskId": "t2"}));
+}
+
+#[test]
 fn kill_and_root_exit_end_the_whole_process_tree() {
     // Scratch guards are declared before the server so they outlive it, also when unwinding:
     // the server stops its writers before the files are removed.
@@ -794,6 +847,18 @@ fn invalid_parameters_are_rejected_and_null_means_omitted() {
         (
             json!({"action": "start", "command": "true", "encoding": "utf-16le"}),
             "unsupported encoding",
+        ),
+        (
+            json!({"action": "start", "command": "true", "keys": ["Enter"]}),
+            "`keys` does not apply",
+        ),
+        (
+            json!({"action": "start", "command": "true", "screen": true}),
+            "screen needs a PTY",
+        ),
+        (
+            json!({"action": "start", "command": "true", "pty": true, "screen": true, "raw": true}),
+            "does not apply with screen",
         ),
     ] {
         let (_, text, is_error) = server.call(arguments.clone());

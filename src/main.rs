@@ -1,6 +1,7 @@
 //! fastexec: an MCP stdio server with one tool that runs bash commands as tasks.
 
 mod bash;
+mod keys;
 mod output;
 mod process;
 mod tasks;
@@ -60,8 +61,10 @@ struct Request {
     kill_after_ms: Option<u64>,
     /// poll, kill: the task to act on.
     task_id: Option<String>,
-    /// poll: text written to the task before waiting, at most 16 KiB.
+    /// poll: text written to the task exactly as given, before `keys` and before waiting, at most 16 KiB.
     input: Option<String>,
+    /// poll, PTY only: keys pressed after `input` is written, in array order, e.g. ["Enter"] or ["Escape", ":", "q", "Enter"]. One key per item, named as in tmux send-keys: Enter, Tab, BTab, Escape, Space, BSpace, Up, Down, Left, Right, Home, End, PageUp/PgUp/PPage, PageDown/PgDn/NPage, Insert/IC, Delete/DC, F1-F12, KP0-KP9, KP/, KP*, KP-, KP+, KP., KPEnter, [NUL]-[US] for C0 controls, 0xHH for a code point, or one character; prefixes C- (Ctrl), M- (Meta/Alt), S- (Shift) combine, as in C-c, M-x, C-M-a, S-Up, and ^c means C-c. Names ignore case. Arrow and keypad keys follow the program's cursor and keypad modes. An unknown name or a modifier the key cannot carry (C-Enter, S-a) is an error and nothing is sent.
+    keys: Option<Vec<String>>,
     /// poll: close stdin after input (pipe mode only).
     eof: Option<bool>,
     /// start, poll: how long to wait, 0-240000 ms.
@@ -76,6 +79,8 @@ struct Request {
     raw: Option<bool>,
     /// start, poll: WHATWG label of the output encoding, e.g. "big5" or "gbk". On start it becomes the task default.
     encoding: Option<String>,
+    /// start, poll, PTY only: return the rendered terminal screen (120x30) and cursor position instead of the output stream; for full-screen and TUI programs. Marks the stream read. Not with truncate, raw, or encoding.
+    screen: Option<bool>,
 }
 
 /// Output options shared by start and poll.
@@ -84,6 +89,7 @@ struct View {
     max_bytes: usize,
     raw: bool,
     encoding: Option<&'static encoding_rs::Encoding>,
+    screen: bool,
 }
 
 fn validate(request: &Request) -> Result<View, String> {
@@ -101,14 +107,21 @@ fn validate(request: &Request) -> Result<View, String> {
         ("maxBytes", request.max_bytes.is_some()),
         ("raw", request.raw.is_some()),
         ("encoding", request.encoding.is_some()),
+        ("keys", request.keys.is_some()),
+        ("screen", request.screen.is_some()),
     ];
-    const VIEW: [&str; 5] = ["waitMs", "truncate", "maxBytes", "raw", "encoding"];
+    const VIEW: [&str; 6] = [
+        "waitMs", "truncate", "maxBytes", "raw", "encoding", "screen",
+    ];
     let allowed: Vec<&str> = match request.action {
         Action::Start => ["command", "cwd", "pty", "loginShell", "killAfterMs"]
             .into_iter()
             .chain(VIEW)
             .collect(),
-        Action::Poll => ["taskId", "input", "eof"].into_iter().chain(VIEW).collect(),
+        Action::Poll => ["taskId", "input", "eof", "keys"]
+            .into_iter()
+            .chain(VIEW)
+            .collect(),
         Action::Kill => vec!["taskId"],
         Action::List => vec![],
     };
@@ -136,6 +149,24 @@ fn validate(request: &Request) -> Result<View, String> {
             ));
         }
         _ => {}
+    }
+    let screen = request.screen.unwrap_or(false);
+    if screen {
+        if let Some(name) = [
+            ("truncate", request.truncate.is_some()),
+            ("raw", request.raw.is_some()),
+            ("encoding", request.encoding.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(name, set)| set.then_some(name))
+        {
+            return Err(format!(
+                "`{name}` does not apply with screen; remove one of them."
+            ));
+        }
+        if request.action == Action::Start && request.pty != Some(true) {
+            return Err("screen needs a PTY task; start with pty: true.".into());
+        }
     }
     if let Some(wait) = request.wait_ms.filter(|&wait| wait > MAX_WAIT_MS) {
         return Err(format!("waitMs {wait} is out of range 0-{MAX_WAIT_MS}."));
@@ -172,6 +203,7 @@ fn validate(request: &Request) -> Result<View, String> {
         max_bytes: request.max_bytes.unwrap_or(DEFAULT_MAX_BYTES) as usize,
         raw: request.raw.unwrap_or(false),
         encoding,
+        screen,
     })
 }
 
@@ -283,8 +315,30 @@ impl Server {
             }
             Action::Poll => {
                 let task = self.task(request.task_id.as_deref())?;
-                task.send(request.input.as_deref(), request.eof.unwrap_or(false))?;
-                let default_wait = if request.input.is_some() {
+                if (view.screen || request.keys.is_some()) && !task.pty {
+                    return Err(format!(
+                        "{} applies to PTY tasks only; in pipe mode, write text with input and end lines with a newline.",
+                        if view.screen { "screen" } else { "keys" }
+                    ));
+                }
+                if view.screen && task.encoding != encoding_rs::UTF_8 {
+                    return Err(
+                        "screen needs UTF-8 output; this task was started with an encoding.".into(),
+                    );
+                }
+                let mut data = request.input.clone().unwrap_or_default().into_bytes();
+                let modes = task.modes();
+                for name in request.keys.iter().flatten() {
+                    data.extend(keys::encode(name, keys::parse(name)?, modes)?);
+                }
+                if data.len() > MAX_INPUT_BYTES {
+                    return Err(
+                        "input and keys together exceed 16 KiB; send them in smaller pieces."
+                            .into(),
+                    );
+                }
+                task.send(Some(&data), request.eof.unwrap_or(false))?;
+                let default_wait = if request.input.is_some() || request.keys.is_some() {
                     2_000
                 } else {
                     30_000
@@ -422,6 +476,9 @@ impl Server {
         task: Arc<Task>,
         view: View,
     ) -> Result<CallToolResult, String> {
+        if view.screen {
+            return self.screen_result(action, task, view).await;
+        }
         let output_mode = self.output_mode;
         let reader = Arc::clone(&task);
         let encoding = view.encoding.unwrap_or(task.encoding);
@@ -443,7 +500,7 @@ impl Server {
             _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
         };
         let window = tokio::task::spawn_blocking(move || {
-            reader.read_window(view.truncate, budget, view.raw, encoding)
+            reader.read_window(view.truncate, budget, view.raw, encoding, None)
         })
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?
@@ -490,6 +547,76 @@ impl Server {
             structured["output"] = json!(output);
         }
         structured["cutLines"] = json!(cut_lines);
+        let result = success(text, structured);
+        report(&task, &snapshot, background);
+        Ok(result)
+    }
+}
+
+impl Server {
+    /// The rendered screen of a PTY task, bottom rows first to stay within `maxBytes`.
+    async fn screen_result(
+        &self,
+        action: Action,
+        task: Arc<Task>,
+        view: View,
+    ) -> Result<CallToolResult, String> {
+        let background = self
+            .tasks
+            .background(&task.id, FOOTER_LIMIT.min(view.max_bytes / 4));
+        let footer = background
+            .as_ref()
+            .map_or(String::new(), |(line, _)| format!("\n{line}"));
+        // A finished state, taken first, means the screen below holds all output.
+        let snapshot = task.snapshot();
+        let screen = task.screen().ok_or("screen applies to PTY tasks only.")?;
+        // The stream counts as read up to the output the screen shows.
+        let (reader, until) = (Arc::clone(&task), screen.log_end);
+        tokio::task::spawn_blocking(move || {
+            let encoding = reader.encoding;
+            reader.read_window(
+                Truncate::Tail,
+                MIN_BODY_BUDGET,
+                false,
+                encoding,
+                Some(until),
+            )
+        })
+        .await
+        .map_err(|error| format!("Internal failure while reading output: {error}."))?
+        .map_err(|error| format!("Cannot read the task log: {error}."))?;
+        let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
+        let mut status = status_line(&task, &snapshot);
+        status.push_str(&format!(" · screen, cursor row {row} col {col}"));
+        output::cut_to(&mut status, view.max_bytes / 2 + 1);
+        let room = view.max_bytes - status.len() - 2 - footer.len();
+        let mut omitted = 0;
+        let mut body = screen.rows.join("\n");
+        while body.len() > room && omitted < screen.rows.len() {
+            omitted += 1;
+            body = format!(
+                "... [{omitted} top rows omitted] ...\n{}",
+                screen.rows[omitted..].join("\n")
+            );
+        }
+        // cut_to keeps budget - 1 bytes; the separators are already outside `room`.
+        output::cut_to(&mut body, room + 1);
+        let shown = if body.is_empty() {
+            "(blank screen)"
+        } else {
+            &body
+        };
+        let text = if self.output_mode == OutputMode::Structured {
+            format!("{status}{footer}")
+        } else {
+            format!("{shown}\n\n{status}{footer}")
+        };
+        let mut structured = task_json(action, &task, &snapshot);
+        structured["cursor"] = json!([row, col]);
+        structured["omittedRows"] = json!(omitted);
+        if self.output_mode != OutputMode::Text {
+            structured["output"] = json!(body);
+        }
         let result = success(text, structured);
         report(&task, &snapshot, background);
         Ok(result)

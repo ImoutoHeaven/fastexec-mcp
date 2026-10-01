@@ -4,3 +4,7 @@ This product includes software derived from FastCtx
 (https://github.com/yc-duan/fastctx), Copyright (c) 2026 yc-duan,
 licensed under the Apache License, Version 2.0. The derived files are
 src/bash.rs, src/process.rs, and src/output.rs.
+
+src/keys.rs follows the key names and key encodings of tmux
+(https://github.com/tmux/tmux), Copyright (c) Nicholas Marriott and
+contributors, licensed under the ISC license.
