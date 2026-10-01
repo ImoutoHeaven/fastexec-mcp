@@ -271,6 +271,13 @@ fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         })
         .map_err(other)?;
     let mut builder = CommandBuilder::new(launch.bash);
+    // On Windows, portable-pty seeds the environment from the registry, overriding the server's
+    // own values (PATH entries added at runtime, host-configured env); start from the process
+    // environment instead so PTY tasks see exactly what pipe tasks see.
+    builder.env_clear();
+    for (name, value) in std::env::vars_os() {
+        builder.env(name, value);
+    }
     builder.args(bash_args(launch));
     builder.cwd(launch.cwd);
     for (name, value) in environment(launch) {

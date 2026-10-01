@@ -7,9 +7,9 @@ use encoding_rs::Encoding;
 use serde::Deserialize;
 use std::collections::VecDeque;
 
-/// Raw bytes kept per line in every mode; the rest of an oversized line is counted, then cut.
+/// Bytes kept per line in bounded windows; the rest of an oversized line is counted, then cut.
 const LINE_BYTES_LIMIT: usize = 64 * 1024;
-/// Characters kept per cleaned line.
+/// Characters kept per cleaned line in bounded windows. `Truncate::None` keeps whole lines.
 const LINE_CHARS_LIMIT: usize = 2000;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -51,6 +51,8 @@ pub struct Cleaner {
 struct Line {
     number: u64,
     text: String,
+    /// The line lost part of its text to a per-line limit or the budget.
+    cut: bool,
 }
 
 pub struct WindowSpec {
@@ -62,13 +64,47 @@ pub struct WindowSpec {
 }
 
 pub struct Window {
-    pub text: String,
+    /// Lines in display order, omission marker included, each with whether it lost text.
+    lines: Vec<(String, bool)>,
     /// Inclusive log line range left out of the window.
     pub omitted: Option<(u64, u64)>,
     /// Lines that held byte sequences invalid in the selected encoding.
     pub bad_lines: u64,
     /// LF bytes consumed, for the caller's line cursor.
     pub newlines: u64,
+}
+
+impl Window {
+    /// Joins the lines within `room` bytes. The line that crosses the limit is cut and later
+    /// lines are left out. Returns the text and how many shown lines lost part of their text.
+    pub fn fit(&self, room: usize) -> (String, u64) {
+        let mut text = String::new();
+        let mut cut_lines = 0;
+        for (index, (line, cut)) in self.lines.iter().enumerate() {
+            if index > 0 {
+                if text.len() >= room {
+                    break;
+                }
+                text.push('\n');
+            }
+            let available = room - text.len();
+            let trimmed = line.len() > available;
+            if trimmed {
+                let mut shown = line.clone();
+                cut_to(&mut shown, available + 1);
+                text.push_str(&shown);
+            } else {
+                text.push_str(line);
+            }
+            if *cut || trimmed {
+                cut_lines += 1;
+            }
+            if trimmed {
+                break;
+            }
+        }
+        (text, cut_lines)
+    }
 }
 
 /// Turns a byte range of the log into a bounded window. Feed chunks, then call `finish`.
@@ -184,7 +220,7 @@ impl<'a> WindowBuilder<'a> {
 
     fn append(&mut self, byte: u8) {
         self.line_started = true;
-        if self.line.len() < LINE_BYTES_LIMIT {
+        if self.line.len() < LINE_BYTES_LIMIT || self.spec.truncate == Truncate::None {
             self.line.push(byte);
         } else {
             self.line_overflow += 1;
@@ -207,11 +243,15 @@ impl<'a> WindowBuilder<'a> {
             self.bad_lines += 1;
         }
         let mut text = decoded.into_owned();
+        let mut cut = overflow > 0;
         if !self.spec.raw {
             // Terminals (ConPTY in particular) pad lines with spaces.
             text.truncate(text.trim_end_matches(' ').len());
+        }
+        if !self.spec.raw && self.spec.truncate != Truncate::None {
             let chars = text.chars().count();
             if chars > LINE_CHARS_LIMIT {
+                cut = true;
                 let cut = text
                     .char_indices()
                     .nth(LINE_CHARS_LIMIT)
@@ -225,7 +265,7 @@ impl<'a> WindowBuilder<'a> {
         if overflow > 0 {
             text.push_str(&format!(" … [line cut at 64 KiB; {overflow} more bytes]"));
         }
-        self.place(Line { number, text });
+        self.place(Line { number, text, cut });
     }
 
     fn place(&mut self, mut line: Line) {
@@ -247,14 +287,14 @@ impl<'a> WindowBuilder<'a> {
             }
             self.head_open = false;
             if self.head.is_empty() && self.spec.truncate == Truncate::Head {
-                cut_to(&mut line.text, head_budget);
+                line.cut |= cut_to(&mut line.text, head_budget);
                 self.head_bytes += line.text.len() + 1;
                 self.head.push(line);
                 return;
             }
         }
         if line.text.len() + 1 > tail_budget && tail_budget > 0 {
-            cut_to(&mut line.text, tail_budget);
+            line.cut |= cut_to(&mut line.text, tail_budget);
         }
         self.tail_bytes += line.text.len() + 1;
         self.tail.push_back(line);
@@ -278,16 +318,19 @@ impl<'a> WindowBuilder<'a> {
             self.end_line(false);
             self.cleaner.continued = true;
         }
-        let mut lines: Vec<String> = self.head.into_iter().map(|line| line.text).collect();
+        let mut lines: Vec<(String, bool)> = self
+            .head
+            .into_iter()
+            .map(|line| (line.text, line.cut))
+            .collect();
         if let Some((first, last)) = self.omitted {
             let count = last - first + 1;
-            lines.push(format!(
-                "... [{count} lines omitted: log lines {first}-{last}] ..."
-            ));
+            let marker = format!("... [{count} lines omitted: log lines {first}-{last}] ...");
+            lines.push((marker, false));
         }
-        lines.extend(self.tail.into_iter().map(|line| line.text));
+        lines.extend(self.tail.into_iter().map(|line| (line.text, line.cut)));
         Window {
-            text: lines.join("\n"),
+            lines,
             omitted: self.omitted,
             bad_lines: self.bad_lines,
             newlines: self.newlines,
@@ -295,11 +338,12 @@ impl<'a> WindowBuilder<'a> {
     }
 }
 
-/// Shortens `text` to at most `budget - 1` bytes plus a cut marker, on a char boundary.
-pub fn cut_to(text: &mut String, budget: usize) {
+/// Shortens `text` to at most `budget - 1` bytes, with a cut marker when it fits, on a char
+/// boundary. Returns whether it cut anything.
+pub fn cut_to(text: &mut String, budget: usize) -> bool {
     const MARK: &str = " … [cut]";
     if text.len() < budget {
-        return;
+        return false;
     }
     let limit = budget.saturating_sub(1);
     if limit < 2 * MARK.len() {
@@ -309,7 +353,7 @@ pub fn cut_to(text: &mut String, budget: usize) {
             end -= 1;
         }
         text.truncate(end);
-        return;
+        return true;
     }
     let keep = limit - MARK.len();
     let mut end = keep;
@@ -318,6 +362,7 @@ pub fn cut_to(text: &mut String, budget: usize) {
     }
     text.truncate(end);
     text.push_str(MARK);
+    true
 }
 
 /// Length of an incomplete UTF-8 sequence at the end of `tail` (the last 1..=3 bytes).
@@ -341,6 +386,10 @@ pub fn incomplete_utf8_suffix(tail: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text(window: &Window) -> String {
+        window.fit(usize::MAX).0
+    }
 
     fn window(chunks: &[&[u8]], truncate: Truncate, budget: usize, raw: bool) -> Window {
         let mut cleaner = Cleaner::default();
@@ -370,27 +419,27 @@ mod tests {
             0,
             false,
         );
-        assert_eq!(out.text, "ok\n100%\ndone");
+        assert_eq!(text(&out), "ok\n100%\ndone");
         assert_eq!(out.newlines, 2);
     }
 
     #[test]
     fn utf8_split_across_chunks_decodes_cleanly() {
-        let text = "中文😀\n".as_bytes();
+        let input = "中文😀\n".as_bytes();
         let out = window(
-            &[&text[..2], &text[2..5], &text[5..]],
+            &[&input[..2], &input[2..5], &input[5..]],
             Truncate::None,
             0,
             false,
         );
-        assert_eq!(out.text, "中文😀");
+        assert_eq!(text(&out), "中文😀");
         assert_eq!(out.bad_lines, 0);
     }
 
     #[test]
     fn raw_mode_keeps_escapes_and_carriage_returns() {
         let out = window(&[b"\x1b[1mA\r\nB\rC\n"], Truncate::None, 0, true);
-        assert_eq!(out.text, "\x1b[1mA\r\nB\rC");
+        assert_eq!(text(&out), "\x1b[1mA\r\nB\rC");
         // A raw window that ends inside a sequence leaves a cleaned window parsing it.
         let mut cleaner = Cleaner::default();
         let spec = |raw| WindowSpec {
@@ -404,7 +453,7 @@ mod tests {
         first.finish();
         let mut second = WindowBuilder::new(spec(false), &mut cleaner, 1);
         second.push(b"31mRED\n");
-        assert_eq!(second.finish().text, "RED");
+        assert_eq!(text(&second.finish()), "RED");
     }
 
     #[test]
@@ -417,7 +466,8 @@ mod tests {
         ] {
             let out = window(&[input.as_bytes()], mode, budget, false);
             let (first, last) = out.omitted.expect("lines must be omitted");
-            let shown: Vec<&str> = out.text.lines().filter(|l| l.starts_with("line")).collect();
+            let rendered = text(&out);
+            let shown: Vec<&str> = rendered.lines().filter(|l| l.starts_with("line")).collect();
             assert!(
                 shown.iter().map(|l| l.len() + 1).sum::<usize>() <= budget,
                 "{mode:?}"
@@ -428,7 +478,7 @@ mod tests {
                 Truncate::Tail => assert_eq!((first, *shown.last().unwrap()), (1, "line100")),
                 _ => assert_eq!((shown[0], *shown.last().unwrap()), ("line001", "line100")),
             }
-            assert!(out.text.contains(&format!("log lines {first}-{last}")));
+            assert!(text(&out).contains(&format!("log lines {first}-{last}")));
         }
     }
 
@@ -443,11 +493,11 @@ mod tests {
         };
         let mut first = WindowBuilder::new(spec(), &mut cleaner, 1);
         first.push(b"Password:\r");
-        assert_eq!(first.finish().text, "Password:");
+        assert_eq!(text(&first.finish()), "Password:");
         let mut second = WindowBuilder::new(spec(), &mut cleaner, 1);
         second.push(b"\nnext\n");
         let out = second.finish();
-        assert_eq!(out.text, "next");
+        assert_eq!(text(&out), "next");
         assert_eq!(out.newlines, 2);
     }
 
@@ -458,5 +508,28 @@ mod tests {
         assert_eq!(incomplete_utf8_suffix(emoji), 0);
         assert_eq!(incomplete_utf8_suffix(b"ab"), 0);
         assert_eq!(incomplete_utf8_suffix(&"中".as_bytes()[..1]), 1);
+    }
+
+    #[test]
+    fn fitting_a_window_counts_each_shown_cut_line_once() {
+        let line = format!(
+            "{}
+",
+            "x".repeat(3000)
+        );
+        let out = window(
+            &[
+                line.as_bytes(),
+                b"tail
+",
+            ],
+            Truncate::HeadTail,
+            16_000,
+            false,
+        );
+        assert_eq!(out.fit(usize::MAX).1, 1, "the 2000-char cap cut one line");
+        let (fitted, cut_lines) = out.fit(500);
+        assert!(fitted.len() <= 500 && !fitted.contains("tail"), "{fitted}");
+        assert_eq!(cut_lines, 1, "a line cut twice still counts once");
     }
 }

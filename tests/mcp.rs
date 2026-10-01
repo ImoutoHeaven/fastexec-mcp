@@ -17,18 +17,23 @@ struct Server {
 
 impl Server {
     fn start() -> Server {
-        Server::start_with_temp(None)
+        Server::start_with(|_| {})
     }
 
     /// Starts the server with its temp directory (and so its log directory) under `temp`.
-    fn start_with_temp(temp: Option<&std::path::Path>) -> Server {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
-        if let Some(temp) = temp {
+    fn start_with_temp(temp: &std::path::Path) -> Server {
+        Server::start_with(|command| {
             command
                 .env("TEMP", temp)
                 .env("TMP", temp)
                 .env("TMPDIR", temp);
-        }
+        })
+    }
+
+    /// Starts the server after `configure` adjusts its launch, such as its environment.
+    fn start_with(configure: impl FnOnce(&mut Command)) -> Server {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        configure(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -170,7 +175,7 @@ fn short_command_returns_its_final_result_in_one_call() {
 fn long_command_yields_then_poll_returns_only_unseen_output() {
     let mut server = Server::start();
     let (out, text) = server.ok(
-        json!({"action": "start", "command": "echo first; sleep 2; echo second", "waitMs": 500}),
+        json!({"action": "start", "command": "echo first; sleep 4; echo second", "waitMs": 2000}),
     );
     assert_eq!(out["state"], "running");
     assert!(text.starts_with("first\n"), "{text}");
@@ -318,7 +323,7 @@ fn output_window_respects_max_bytes_and_points_at_the_log() {
         root.join("長".repeat(80)).join("長".repeat(80))
     };
     std::fs::create_dir_all(&temp).unwrap();
-    let mut long = Server::start_with_temp(Some(&temp));
+    let mut long = Server::start_with_temp(&temp);
     let (_, text) = long.ok(
         json!({"action": "start", "command": "printf '\\xff\\n'; seq 1 5000", "maxBytes": 1024}),
     );
@@ -351,6 +356,56 @@ fn output_window_respects_max_bytes_and_points_at_the_log() {
             .count(),
         5000
     );
+
+    // Bounded windows cut long lines and count them; truncate none returns whole lines.
+    let line = |n: u32| format!("printf '%*s\\n' {n} '' | tr ' ' x");
+    let (out, text) = server.ok(json!({"action": "start", "command": line(3000)}));
+    assert_eq!(out["cutLines"], 1);
+    assert!(text.contains("line cut at 2000 of 3000 chars"), "{text}");
+    let (out, _) = server.ok(json!({"action": "start", "command": line(3000), "truncate": "none"}));
+    assert_eq!(
+        (out["output"].as_str().unwrap().len(), &out["cutLines"]),
+        (3000, &json!(0))
+    );
+    let (out, _) = server
+        .ok(json!({"action": "start", "command": line(70000), "truncate": "none", "raw": true}));
+    assert_eq!(
+        (out["output"].as_str().unwrap().len(), &out["cutLines"]),
+        (70000, &json!(0))
+    );
+}
+
+#[test]
+fn pty_and_pipe_tasks_inherit_the_server_path() {
+    let dir = std::env::temp_dir().join(format!("fastexec-test-{}-path", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let probe = dir.join("fastexec_env_probe");
+    std::fs::write(&probe, "#!/usr/bin/env bash\nprintf 'ENV_PATH_OK\\n'\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(dir.clone()).chain(std::env::split_paths(&inherited)))
+            .unwrap();
+    // Git Bash's login profile builds PATH from ORIGINAL_PATH when a Git Bash parent set it.
+    let mut server = Server::start_with(|command| {
+        command
+            .env("PATH", &path)
+            .env("MSYS2_PATH_TYPE", "inherit")
+            .env_remove("ORIGINAL_PATH");
+    });
+    // Debian's /etc/profile resets PATH for login shells; Git Bash's keeps it with inherit.
+    let login = cfg!(windows);
+    for pty in [false, true] {
+        let (out, text) = server.ok(json!({"action": "start", "command": "fastexec_env_probe", "pty": pty, "loginShell": login, "waitMs": 15000}));
+        assert_eq!(out["exitCode"], 0, "pty={pty}: {text}");
+        assert!(text.contains("ENV_PATH_OK"), "pty={pty}: {text}");
+    }
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

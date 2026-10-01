@@ -382,13 +382,15 @@ async fn window_result(
             encoding.name()
         ));
     }
-    let mut output = window.text.clone();
-    if view.truncate != Truncate::None {
+    let room = if view.truncate == Truncate::None {
+        usize::MAX
+    } else {
         // Hard guarantee: the whole text fits maxBytes. A status line longer than half the
         // budget is cut too; structuredContent.logPath keeps the full path.
         output::cut_to(&mut status, view.max_bytes / 2 + 1);
-        output::cut_to(&mut output, view.max_bytes - status.len() - 2 + 1);
-    }
+        view.max_bytes - status.len() - 2
+    };
+    let (output, cut_lines) = window.fit(room);
     let body = if output.is_empty() {
         "(no new output)"
     } else {
@@ -398,6 +400,7 @@ async fn window_result(
     let mut structured = task_json(action, &task, &snapshot);
     add_window(&mut structured, &window);
     structured["output"] = json!(output);
+    structured["cutLines"] = json!(cut_lines);
     Ok(success(text, structured))
 }
 
@@ -447,7 +450,6 @@ fn task_json(action: Action, task: &Task, snapshot: &Snapshot) -> Value {
 
 fn add_window(value: &mut Value, window: &Window) {
     let omitted = window.omitted.map_or(0, |(first, last)| last - first + 1);
-    value["output"] = json!(window.text);
     value["omittedLines"] = json!(omitted);
     value["omittedRange"] = json!(window.omitted.map(|(first, last)| [first, last]));
     value["encodingErrors"] = json!(window.bad_lines);

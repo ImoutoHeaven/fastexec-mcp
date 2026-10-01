@@ -87,7 +87,7 @@ One tool takes an `action` and the parameters that apply to it:
 
 Output options:
 
-- `truncate`: `head_tail` (default), `head`, `tail`, or `none`.
+- `truncate`: `head_tail` (default), `head`, `tail`, or `none`. The bounded modes cut lines longer than 2000 characters (64 KiB with `raw`) and count them in `cutLines`; `none` returns whole lines.
 - `maxBytes`: 1024–1048576, default 16384. It bounds the whole result, status line included.
 - `raw`: `true` skips cleaning.
 - `encoding`: a WHATWG label such as `big5` or `gbk`.
@@ -95,8 +95,9 @@ Output options:
 Behavior:
 
 - **Waits.** Each wait lasts at most 240 s. An ended wait, a cancelled call, or a timeout leaves the process running.
+- **Environment.** Pipe and PTY tasks inherit the server's environment, then fastexec sets terminal, pager, and locale variables.
 - **Output.** stdout and stderr share one stream. Cleaning strips ANSI sequences, collapses carriage-return progress bars to their final text, and trims trailing spaces.
-- **Results.** Each result ends with a status line such as `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1234/t3.log`. `structuredContent` carries the same data as JSON: `state`, `exitCode`, `output`, `omittedRange`, and `logPath`.
+- **Results.** Each result ends with a status line such as `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1234/t3.log`. `structuredContent` carries the same data as JSON: `state`, `exitCode`, `output`, `omittedRange`, `cutLines`, and `logPath`.
 - **Logs.** Each task's output is kept in a log file of up to 64 MiB, and omitted lines are named by their log line numbers. The server keeps the 64 most recently finished tasks and deletes its log directory on exit.
 - **Process trees.** A task is its whole process tree. When the root bash exits, the rest of the tree ends too, so long-lived servers run as their own task. Windows uses a kill-on-close Job Object. Linux kills the task's process group and every process in its session; a process that starts its own session (`setsid`, daemons) leaves the tree.
 - **PTY input.** In PTY mode, send a carriage return (`"\r"`) for Enter, `"\u0003"` for Ctrl-C, and `"\u0004"` for Ctrl-D.
