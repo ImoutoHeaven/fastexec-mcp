@@ -494,16 +494,24 @@ async fn main() {
         inner: tokio::io::stdin(),
         eof: Arc::clone(&eof),
     };
-    match server.serve((stdin, tokio::io::stdout())).await {
-        Ok(service) => {
+    // Signals are watched from the start, so an exit during initialization still cleans up.
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+    let served = tokio::select! {
+        served = server.serve((stdin, tokio::io::stdout())) => Some(served),
+        _ = &mut signal => None,
+    };
+    match served {
+        Some(Ok(service)) => {
             // Stdin EOF ends the session at once; rmcp would first drain in-flight waits.
             tokio::select! {
                 _ = service.waiting() => {}
                 _ = eof.notified() => {}
-                _ = shutdown_signal() => {}
+                _ = &mut signal => {}
             }
         }
-        Err(error) => eprintln!("fastexec: MCP initialization failed: {error}"),
+        Some(Err(error)) => eprintln!("fastexec: MCP initialization failed: {error}"),
+        None => {}
     }
     tasks.shutdown();
     std::process::exit(0);

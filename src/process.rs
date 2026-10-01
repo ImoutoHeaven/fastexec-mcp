@@ -408,7 +408,9 @@ pub fn is_alive(pid: u32) -> bool {
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if handle.is_null() {
-                return false;
+                // A process this user may not query still exists.
+                return std::io::Error::last_os_error().raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32);
             }
             let mut code = 0;
             let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;

@@ -119,16 +119,48 @@ impl Server {
 }
 
 impl Drop for Server {
+    /// Closes stdin like a real host, so the server removes its own log directory.
     fn drop(&mut self) {
+        drop(self.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
+/// A path under the temp directory that is removed on drop, after a panic too.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Scratch {
+        let path =
+            std::env::temp_dir().join(format!("fastexec-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&path);
+        Scratch(path)
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A scratch path bash can use on every platform.
-fn scratch(name: &str) -> (PathBuf, String) {
-    let path = std::env::temp_dir().join(format!("fastexec-test-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+fn scratch(name: &str) -> (Scratch, String) {
+    let path = Scratch::new(name);
     let bash_path = path.to_string_lossy().replace('\\', "/");
     (path, bash_path)
 }
@@ -239,33 +271,41 @@ fn pty_task_sees_a_terminal_and_accepts_a_hidden_password() {
 
 #[test]
 fn kill_and_root_exit_end_the_whole_process_tree() {
+    // Scratch guards are declared before the server so they outlive it, also when unwinding:
+    // the server stops its writers before the files are removed.
+    let files = [false, true].map(|pty| {
+        (
+            scratch(&format!("killed-{pty}")),
+            scratch(&format!("leaked-{pty}")),
+        )
+    });
     let mut server = Server::start();
-    for pty in [false, true] {
-        let (killed, killed_bash) = scratch(&format!("killed-{pty}"));
+    for (pty, ((killed, killed_bash), (leaked, leaked_bash))) in
+        [false, true].into_iter().zip(&files)
+    {
         // Job control moves the heartbeat into its own process group.
-        let command = format!("set -m; {} bash -c 'sleep 300'", heartbeat(&killed_bash));
+        let command = format!("set -m; {} bash -c 'sleep 300'", heartbeat(killed_bash));
         server.ok(json!({"action": "start", "command": command, "pty": pty, "waitMs": 1000}));
         let id = format!("t{}", if pty { 3 } else { 1 });
         let (out, _) = server.ok(json!({"action": "kill", "taskId": id}));
         assert_eq!(out["state"], "killed", "pty={pty}");
-        assert!(file_len(&killed) > 0, "the heartbeat never started");
-        assert_stops_growing(&killed);
+        assert!(file_len(killed) > 0, "the heartbeat never started");
+        assert_stops_growing(killed);
         let (again, _) = server.ok(json!({"action": "kill", "taskId": id}));
         assert_eq!(again["state"], "killed");
 
-        let (leaked, leaked_bash) = scratch(&format!("leaked-{pty}"));
-        let command = format!("{} echo started", heartbeat(&leaked_bash));
+        let command = format!("{} echo started", heartbeat(leaked_bash));
         let (out, _) =
             server.ok(json!({"action": "start", "command": command, "pty": pty, "waitMs": 10000}));
         assert_eq!(out["state"], "exited", "pty={pty}");
-        assert_stops_growing(&leaked);
+        assert_stops_growing(leaked);
     }
 }
 
 #[test]
 fn closing_the_server_ends_running_tasks_and_removes_logs() {
-    let mut server = Server::start();
     let (beat, beat_bash) = scratch("shutdown");
+    let mut server = Server::start();
     let (out, _) = server.ok(json!({"action": "start", "command": format!("{} sleep 300", heartbeat(&beat_bash)), "waitMs": 1000}));
     let log = PathBuf::from(out["logPath"].as_str().unwrap());
     assert!(log.exists());
@@ -310,15 +350,11 @@ fn finishing_after_many_short_tasks_keeps_its_own_output() {
 #[test]
 fn output_window_respects_max_bytes_and_points_at_the_log() {
     // A long log path makes the status line long; maxBytes still bounds the whole text.
-    let root = std::env::temp_dir().join(format!(
-        "fastexec-test-{}-{}",
-        std::process::id(),
-        "長".repeat(60)
-    ));
+    let root = Scratch::new(&"長".repeat(60));
     // Linux allows far longer paths than Windows' 260 characters: make the status alone
     // longer than maxBytes there.
     let temp = if cfg!(windows) {
-        root.clone()
+        root.to_path_buf()
     } else {
         root.join("長".repeat(80)).join("長".repeat(80))
     };
@@ -329,7 +365,6 @@ fn output_window_respects_max_bytes_and_points_at_the_log() {
     );
     assert!(text.len() <= 1024, "{} bytes: {text}", text.len());
     drop(long);
-    let _ = std::fs::remove_dir_all(&root);
 
     let mut server = Server::start();
     let (out, text) =
@@ -377,8 +412,8 @@ fn output_window_respects_max_bytes_and_points_at_the_log() {
 
 #[test]
 fn pty_and_pipe_tasks_inherit_the_server_path() {
-    let dir = std::env::temp_dir().join(format!("fastexec-test-{}-path", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new("path");
+    std::fs::create_dir_all(&*dir).unwrap();
     let probe = dir.join("fastexec_env_probe");
     std::fs::write(&probe, "#!/usr/bin/env bash\nprintf 'ENV_PATH_OK\\n'\n").unwrap();
     #[cfg(unix)]
@@ -387,9 +422,10 @@ fn pty_and_pipe_tasks_inherit_the_server_path() {
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let inherited = std::env::var_os("PATH").unwrap_or_default();
-    let path =
-        std::env::join_paths(std::iter::once(dir.clone()).chain(std::env::split_paths(&inherited)))
-            .unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap();
     // Git Bash's login profile builds PATH from ORIGINAL_PATH when a Git Bash parent set it.
     let mut server = Server::start_with(|command| {
         command
@@ -404,8 +440,6 @@ fn pty_and_pipe_tasks_inherit_the_server_path() {
         assert_eq!(out["exitCode"], 0, "pty={pty}: {text}");
         assert!(text.contains("ENV_PATH_OK"), "pty={pty}: {text}");
     }
-    drop(server);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -108,7 +108,7 @@ impl Tasks {
     pub fn new() -> std::io::Result<Arc<Self>> {
         let temp = std::env::temp_dir();
         remove_stale_dirs(&temp);
-        let dir = temp.join(format!("fastexec-{}", std::process::id()));
+        let dir = temp.join(format!("{}{}", dir_prefix(), std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
@@ -509,16 +509,27 @@ fn private_file(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// Removes log directories of fastexec servers that are no longer running.
+/// Log directories are `<prefix><pid>`. On Unix the prefix carries the user ID, so servers of
+/// different users sharing /tmp neither collide nor examine each other's directories.
+fn dir_prefix() -> String {
+    #[cfg(unix)]
+    // SAFETY: getuid has no preconditions and cannot fail.
+    return format!("fastexec-{}-", unsafe { libc::getuid() });
+    #[cfg(windows)]
+    return "fastexec-".to_string();
+}
+
+/// Removes this user's log directories of fastexec servers that are no longer running.
 fn remove_stale_dirs(temp: &Path) {
     let Ok(entries) = std::fs::read_dir(temp) else {
         return;
     };
+    let prefix = dir_prefix();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let pid = name
             .to_str()
-            .and_then(|name| name.strip_prefix("fastexec-"))
+            .and_then(|name| name.strip_prefix(prefix.as_str()))
             .and_then(|pid| pid.parse().ok());
         if pid.is_some_and(|pid| pid != std::process::id() && !process::is_alive(pid)) {
             let _ = std::fs::remove_dir_all(entry.path());
