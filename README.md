@@ -54,7 +54,7 @@ For any other MCP host, set its tool timeout to at least 300 s unless it sends p
 
 ### Output placement
 
-Set `FASTEXEC_OUTPUT_MODE` in the MCP server's `env` configuration. The mode applies to every `start` and `poll` result for that server:
+Set `FASTEXEC_OUTPUT_MODE` in the MCP server's `env` configuration. With `FASTEXEC_STRUCTURED_CONTENT=true` (default), the mode applies to every `start` and `poll` result for that server:
 
 | Mode | Text `content` | `structuredContent.output` |
 |---|---|---|
@@ -62,7 +62,7 @@ Set `FASTEXEC_OUTPUT_MODE` in the MCP server's `env` configuration. The mode app
 | `both` | Output body and status line | Output body |
 | `structured` | Status line | Output body |
 
-Every mode preserves structured task and window metadata, including `taskId`, `state`, `exitCode`, `logPath`, `omittedRange`, and `cutLines`. `list`, `kill`, and error results keep their text and metadata. An invalid mode fails at startup with a diagnostic on stderr.
+With structured content enabled, every mode preserves task and window metadata, including `taskId`, `state`, `exitCode`, `logPath`, `omittedRange`, and `cutLines`. `list`, `kill`, and error results keep their text and metadata. An invalid mode fails at startup with a diagnostic on stderr.
 
 Use `text` for pi and other text-consuming hosts. Use `structured` for hosts that expose structured results to the model, such as Codex. Use `both` for callers that require the body in both forms. A host that reads only `content` sees the status line in `structured` mode; the task log holds the body.
 
@@ -73,6 +73,14 @@ For example, add this field to the server configuration:
 ```
 
 Programmatic callers read the body from the text block in `text` mode, or from `structuredContent.output` in `both` and `structured` modes. Output cleaning, truncation, shell pipelines, and the poll cursor work identically in every mode.
+
+Set `FASTEXEC_STRUCTURED_CONTENT=false` for text-only results across all actions and operational errors. This omits the entire `structuredContent` field and uses `text` output placement, including when `FASTEXEC_OUTPUT_MODE=structured`:
+
+```json
+"env": { "FASTEXEC_STRUCTURED_CONTENT": "false" }
+```
+
+The accepted values are `true` and `false`, with `true` as the default. Invalid values fail at startup with a diagnostic on stderr. Environment settings take effect when the server starts.
 
 ## Agent instructions
 
@@ -121,7 +129,7 @@ Behavior:
 - **Background footer.** `start`, `poll`, and `kill` results end with a line such as `(Background: t3 exited 7, t5 running 4m3s.)` naming the server's other tasks that need attention: finished tasks whose final state no result has shown yet, failures first, then running tasks. It names at most three tasks, then counts the rest, within 512 bytes and a quarter of `maxBytes`. A finished task leaves the footer once a result or `list` has shown its final state.
 - **Environment.** Pipe and PTY tasks inherit the server's environment, then fastexec sets terminal, pager, and locale variables.
 - **Output.** stdout and stderr share one stream. Cleaning strips ANSI sequences, collapses carriage-return progress bars to their final text, and trims trailing spaces. A multibyte character that arrives in two parts, in UTF-8 or in an `encoding` such as `big5`, is shown whole once its last byte arrives.
-- **Results.** Each `start` or `poll` text result ends with a status line such as `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/t3.log`. `structuredContent` carries task and window metadata as JSON. `FASTEXEC_OUTPUT_MODE` selects where the output body appears.
+- **Results.** Each `start` or `poll` text result ends with a status line such as `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/t3.log`. `FASTEXEC_STRUCTURED_CONTENT` enables task and window metadata as JSON by default; `false` selects text-only results. With structured content enabled, `FASTEXEC_OUTPUT_MODE` selects where the output body appears.
 - **Logs.** Each task's output is kept in a log file of up to 64 MiB, and omitted lines are named by their log line numbers. If writing the log fails, the task keeps running, its earlier output stays readable, and the status line and `logError` report the failure. The server keeps the 64 most recently finished tasks and deletes its log directory on exit. Log directories are `fastexec-<uid>-<pid>` on Unix and `fastexec-<pid>` on Windows, in the temp directory; at startup the server removes the current user's directories whose server process has ended, such as those left by a forced kill.
 - **Process trees.** A task is its whole process tree. When the root bash exits, the rest of the tree ends too, so long-lived servers run as their own task. Windows uses a kill-on-close Job Object. Linux kills the task's process group and every process in its session; a process that starts its own session (`setsid`, daemons) leaves the tree.
 - **PTY input.** In PTY mode, send a carriage return (`"\r"`) for Enter, `"\u0003"` for Ctrl-C, and `"\u0004"` for Ctrl-D.

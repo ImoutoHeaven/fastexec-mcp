@@ -33,7 +33,9 @@ impl Server {
     /// Starts the server after `configure` adjusts its launch, such as its environment.
     fn start_with(configure: impl FnOnce(&mut Command)) -> Server {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
-        command.env_remove("FASTEXEC_OUTPUT_MODE");
+        command
+            .env_remove("FASTEXEC_OUTPUT_MODE")
+            .env_remove("FASTEXEC_STRUCTURED_CONTENT");
         configure(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
@@ -276,6 +278,76 @@ fn output_modes_place_start_and_poll_body_without_losing_metadata() {
         "an invalid mode must fail at startup"
     );
     assert!(String::from_utf8_lossy(&result.stderr).contains("FASTEXEC_OUTPUT_MODE"));
+}
+
+#[test]
+fn structured_content_can_be_disabled_for_every_action() {
+    for mode in ["text", "both", "structured"] {
+        let mut server = Server::start_with(|command| {
+            command
+                .env("FASTEXEC_OUTPUT_MODE", mode)
+                .env("FASTEXEC_STRUCTURED_CONTENT", "false");
+        });
+        for (arguments, expected, is_error) in [
+            (
+                json!({"action": "start", "command": "cat <<'EOF'\nHello, world!\nEOF"}),
+                "Hello, world!\n\n[exited 0] t1",
+                false,
+            ),
+            (
+                json!({"action": "start", "command": "read -r line; printf '%s\\n' \"$line\"", "waitMs": 0}),
+                "[running] t2",
+                false,
+            ),
+            (
+                json!({"action": "poll", "taskId": "t2", "input": "POLL_BODY\n", "eof": true, "waitMs": 10000}),
+                "POLL_BODY\n\n[exited 0] t2",
+                false,
+            ),
+            (json!({"action": "list"}), "t2 [exited 0]", false),
+            (
+                json!({"action": "kill", "taskId": "t2"}),
+                "[exited 0] t2",
+                false,
+            ),
+            (
+                json!({"action": "poll", "taskId": "missing"}),
+                "Unknown taskId",
+                true,
+            ),
+            (json!({"action": "start"}), "start needs a non-empty", true),
+        ] {
+            let message = server.request(
+                "tools/call",
+                json!({"name": "fastexec", "arguments": arguments}),
+            );
+            let result = &message["result"];
+            assert!(result.is_object(), "protocol error: {message}");
+            assert!(
+                result.get("structuredContent").is_none(),
+                "mode={mode}: {result}"
+            );
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "mode={mode}: {result}"
+            );
+            assert_eq!(result["isError"], json!(is_error));
+        }
+    }
+
+    let result = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+        .env("FASTEXEC_OUTPUT_MODE", "text")
+        .env("FASTEXEC_STRUCTURED_CONTENT", "bogus")
+        .output()
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "an invalid switch must fail at startup"
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("FASTEXEC_STRUCTURED_CONTENT"));
 }
 
 #[test]

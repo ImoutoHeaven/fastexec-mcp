@@ -186,6 +186,7 @@ enum OutputMode {
 struct Server {
     tasks: Arc<Tasks>,
     output_mode: OutputMode,
+    structured_content: bool,
 }
 
 /// Server instructions say when to use the tool; hosts that show one line take the first.
@@ -219,10 +220,14 @@ impl Server {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let action = request.action;
-        match self.handle(request, &context).await {
+        let mut result = match self.handle(request, &context).await {
             Ok(result) => result,
             Err(message) => error_result(action, &message),
+        };
+        if !self.structured_content {
+            result.structured_content = None;
         }
+        result
     }
 }
 
@@ -453,7 +458,7 @@ impl Server {
             usize::MAX
         } else {
             // Hard guarantee: the whole text fits maxBytes. A status line longer than half the
-            // budget is cut too; structuredContent.logPath keeps the full path.
+            // budget is cut too; structuredContent.logPath, when enabled, keeps the full path.
             output::cut_to(&mut status, view.max_bytes / 2 + 1);
             view.max_bytes - status.len() - 2 - footer.len()
         };
@@ -576,6 +581,16 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let structured_content = match std::env::var("FASTEXEC_STRUCTURED_CONTENT").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("true") => true,
+        Ok("false") => false,
+        value => {
+            eprintln!(
+                "fastexec: invalid FASTEXEC_STRUCTURED_CONTENT {value:?}; expected true or false"
+            );
+            std::process::exit(1);
+        }
+    };
     let tasks = match Tasks::new() {
         Ok(tasks) => tasks,
         Err(error) => {
@@ -585,7 +600,12 @@ async fn main() {
     };
     let server = Server {
         tasks: Arc::clone(&tasks),
-        output_mode,
+        output_mode: if structured_content {
+            output_mode
+        } else {
+            OutputMode::Text
+        },
+        structured_content,
     };
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
