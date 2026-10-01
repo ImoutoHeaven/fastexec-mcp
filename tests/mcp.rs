@@ -1,7 +1,7 @@
 //! Contract tests through the real MCP stdio boundary: each test drives the built binary.
 
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
@@ -639,6 +639,64 @@ fn output_window_respects_max_bytes_and_points_at_the_log() {
 }
 
 #[test]
+fn the_log_keeps_a_contiguous_prefix_past_its_limit() {
+    // 10 bytes below the 64 MiB limit, then a chunk that crosses it, then one that would fit.
+    let command = "head -c 67108854 /dev/zero | tr '\\0' x; sleep 0.3; printf '%100s' '' | tr ' ' A; sleep 0.3; printf B";
+    let mut server = Server::start();
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "loginShell": false, "waitMs": 60000, "maxBytes": 1024}));
+    assert_eq!(out["state"], "exited", "{text}");
+    let mut log = std::fs::File::open(out["logPath"].as_str().unwrap()).unwrap();
+    let mut tail = Vec::new();
+    log.seek(SeekFrom::End(-11)).unwrap();
+    log.read_to_end(&mut tail).unwrap();
+    assert_eq!(log.stream_position().unwrap(), 64 << 20);
+    assert_eq!(tail, b"xAAAAAAAAAA");
+    assert!(
+        text.contains("91 bytes past the log limit were not stored"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_exited_result_holds_output_written_while_its_window_was_read() {
+    // Reading a 16 MB backlog takes long enough for the task to print a marker and exit
+    // meanwhile; the delays move that exit across the read.
+    let mut server = Server::start();
+    for (index, delay) in ["0", "0.005", "0.01", "0.02", "0.04"].iter().enumerate() {
+        let id = format!("t{}", index + 1);
+        let command = format!(
+            "head -c 16000000 /dev/zero | tr '\\0' x; read -r go; sleep {delay}; printf '\\nFINAL_MARKER\\n'"
+        );
+        let (out, _) = server.ok(json!({"action": "start", "command": command, "loginShell": false, "waitMs": 0, "maxBytes": 1024}));
+        let log = PathBuf::from(out["logPath"].as_str().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while file_len(&log) < 16_000_000 {
+            assert!(
+                Instant::now() < deadline,
+                "the backlog did not reach the log"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut seen = String::new();
+        let mut poll =
+            json!({"action": "poll", "taskId": id, "input": "go\n", "waitMs": 0, "maxBytes": 1024});
+        loop {
+            let (out, text) = server.ok(poll);
+            seen.push_str(&text);
+            if out["state"] != "running" {
+                break;
+            }
+            poll = json!({"action": "poll", "taskId": id, "waitMs": 10000, "maxBytes": 1024});
+        }
+        assert_eq!(
+            seen.matches("FINAL_MARKER").count(),
+            1,
+            "delay {delay}: {seen}"
+        );
+    }
+}
+
+#[test]
 fn pty_and_pipe_tasks_inherit_the_server_path() {
     let dir = Scratch::new("path");
     std::fs::create_dir_all(&*dir).unwrap();
@@ -678,12 +736,20 @@ fn encoding_decodes_legacy_output_and_long_commands_run_from_a_script() {
     assert!(text.contains("invalid in UTF-8; pass encoding"), "{text}");
     let (_, text) = server.ok(json!({"action": "start", "command": big5, "encoding": "big5"}));
     assert!(text.starts_with("中文\n"), "{text}");
-    // A character split across polls decodes whole once its last byte arrives.
-    for (id, encoding, lead, trail) in [
-        ("t3", "big5", "\\xa4", "\\xa4"),
-        ("t4", "gbk", "\\xd6", "\\xd0"),
+    // A character split across polls decodes whole once its last byte arrives, also after
+    // more than 4 KiB without a newline.
+    for (id, encoding, prefix, lead, trail) in [
+        ("t3", "big5", "", "\\xa4", "\\xa4"),
+        ("t4", "gbk", "", "\\xd6", "\\xd0"),
+        (
+            "t5",
+            "big5",
+            "printf '%5000s' '' | tr ' ' a; ",
+            "\\xa4",
+            "\\xa4",
+        ),
     ] {
-        let command = format!("printf '{lead}'; read -r x; printf '{trail}\\n'");
+        let command = format!("{prefix}printf '{lead}'; read -r x; printf '{trail}\\n'");
         let (_, text) = server.ok(json!({"action": "start", "command": command, "encoding": encoding, "loginShell": false, "waitMs": 1000}));
         assert!(!text.contains('\u{fffd}'), "{encoding}: {text}");
         let (_, text) =

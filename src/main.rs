@@ -433,8 +433,11 @@ impl Server {
         let footer = background
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
-        // The status line can only grow by its notes while the window is read.
-        let reserved = status_line(&task, &task.snapshot()).len() + NOTES_RESERVE + footer.len();
+        // The state is taken before the read: a finished state means output reached EOF (or
+        // stayed open, which the status line notes), so the window below holds all of it. The
+        // status line can only grow by its notes.
+        let before = task.snapshot();
+        let reserved = status_line(&task, &before).len() + NOTES_RESERVE + footer.len();
         let budget = match view.truncate {
             Truncate::None => usize::MAX,
             _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
@@ -445,7 +448,15 @@ impl Server {
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?
         .map_err(|error| format!("Cannot read the task log: {error}."))?;
-        let snapshot = task.snapshot();
+        // Log metadata, such as an eviction during the read, is taken after it.
+        let after = task.snapshot();
+        let snapshot = Snapshot {
+            lines: after.lines,
+            dropped: after.dropped,
+            evicted: after.evicted,
+            log_error: after.log_error,
+            ..before
+        };
         let mut status = status_line(&task, &snapshot);
         if window.bad_lines > 0 {
             status.push_str(&format!(

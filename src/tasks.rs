@@ -461,18 +461,25 @@ fn capture(
             }
             seam.drain(..seam.len().saturating_sub(QUERY.len() - 1));
         }
-        let size = read as u64;
-        let fits = {
+        // Storing stops at the first byte that does not fit, so the log stays a prefix of the
+        // output: a later chunk that would fit is not stored after the gap.
+        let room = {
             let out = lock(&task.out);
-            !out.evicted && out.written + size <= TASK_LOG_LIMIT
+            if out.evicted || out.dropped > 0 {
+                0
+            } else {
+                TASK_LOG_LIMIT - out.written
+            }
         };
+        let keep = &chunk[..chunk.len().min(room as usize)];
+        let size = keep.len() as u64;
         let mut stored = false;
         let mut write_error = None;
-        if fits
+        if size > 0
             && let Some(file) = log.as_mut()
             && shared.reserve(size)
         {
-            match file.write_all(chunk) {
+            match file.write_all(keep) {
                 Ok(()) => stored = true,
                 Err(error) => {
                     // A partial write leaves bytes past `written`; storing nothing more keeps
@@ -487,15 +494,15 @@ fn capture(
         if write_error.is_some() {
             out.log_error = write_error;
         }
-        if stored {
-            last.extend_from_slice(chunk);
+        let stored = if stored { keep } else { &[] };
+        if !stored.is_empty() {
+            last.extend_from_slice(stored);
             last.drain(..last.len().saturating_sub(3));
             out.written += size;
-            out.lines += chunk.iter().filter(|&&byte| byte == b'\n').count() as u64;
+            out.lines += stored.iter().filter(|&&byte| byte == b'\n').count() as u64;
             out.readable = out.written - incomplete_utf8_suffix(&last) as u64;
-        } else {
-            out.dropped += size;
         }
+        out.dropped += (chunk.len() - stored.len()) as u64;
     }
     let mut out = lock(&task.out);
     out.readable = out.written;
@@ -651,30 +658,33 @@ impl Task {
     }
 
     /// Length of an unfinished `encoding` character at the end of the log range `start..end`.
-    /// Decoding starts after the last LF, a character boundary in every ASCII-compatible
-    /// encoding, or at `start`, where the previous window ended on a boundary.
+    /// Decoding starts after the last byte below 0x30, which no ASCII-compatible encoding uses
+    /// inside a multibyte character, or at `start`, where the previous window ended on a
+    /// boundary.
     fn legacy_holdback(
         &self,
         start: u64,
         end: u64,
         encoding: &'static Encoding,
     ) -> std::io::Result<u64> {
-        // ponytail: a final partial line longer than 4 KiB without a boundary is shown as is.
-        const TAIL: u64 = 4096;
-        let from = start.max(end.saturating_sub(TAIL));
-        if end <= from {
-            return Ok(0);
+        let mut file = File::open(&self.log_path)?;
+        let mut buffer = [0_u8; 4096];
+        let mut from = end;
+        while from > start {
+            let chunk_start = start.max(from.saturating_sub(buffer.len() as u64));
+            let chunk = &mut buffer[..(from - chunk_start) as usize];
+            file.seek(SeekFrom::Start(chunk_start))?;
+            file.read_exact(chunk)?;
+            if let Some(boundary) = chunk.iter().rposition(|&byte| byte < 0x30) {
+                from = chunk_start + boundary as u64 + 1;
+                break;
+            }
+            from = chunk_start;
         }
         let mut tail = vec![0_u8; (end - from) as usize];
-        let mut file = File::open(&self.log_path)?;
         file.seek(SeekFrom::Start(from))?;
         file.read_exact(&mut tail)?;
-        let line = match tail.iter().rposition(|&byte| byte == b'\n') {
-            Some(newline) => &tail[newline + 1..],
-            None if from == start => &tail[..],
-            None => return Ok(0),
-        };
-        Ok(incomplete_legacy_suffix(line, encoding) as u64)
+        Ok(incomplete_legacy_suffix(&tail, encoding) as u64)
     }
 }
 
