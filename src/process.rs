@@ -327,37 +327,60 @@ pub struct Tree {
 }
 
 impl Tree {
-    /// Terminates every process in the tree. Killing an empty tree is a no-op.
-    pub fn kill(&self) {
+    /// Terminates every process in the tree. Killing an empty tree succeeds.
+    pub fn kill(&self) -> std::io::Result<()> {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
             // SAFETY: the job handle is owned by this tree and alive.
-            unsafe {
+            let ended = unsafe {
                 windows_sys::Win32::System::JobObjects::TerminateJobObject(
                     self.job.as_raw_handle(),
                     1,
                 )
             };
+            if ended == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
         #[cfg(unix)]
-        if self.pgid > 0 {
+        {
+            if self.pgid <= 0 {
+                return Err(std::io::Error::other("the task has no process group"));
+            }
             // SAFETY: plain syscall; a group ID cannot be reused while the group has members.
-            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+            if unsafe { libc::kill(-self.pgid, libc::SIGKILL) } == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
             // Job control (`set -m`) moves descendants into other groups of the same session; the
             // root's PID is also its session ID. Processes that start a new session leave the tree.
             #[cfg(target_os = "linux")]
-            for _ in 0..3 {
-                let members = session_members(self.pgid);
-                if members.is_empty() {
-                    break;
+            {
+                let mut failure = None;
+                for _ in 0..3 {
+                    let members = session_members(self.pgid);
+                    if members.is_empty() {
+                        break;
+                    }
+                    for pid in members {
+                        // SAFETY: plain syscall on a PID read from /proc this pass.
+                        if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
+                            let error = std::io::Error::last_os_error();
+                            if error.raw_os_error() != Some(libc::ESRCH) {
+                                failure.get_or_insert(error);
+                            }
+                        }
+                    }
                 }
-                for pid in members {
-                    // SAFETY: plain syscall on a PID read from /proc this pass.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                if let Some(error) = failure {
+                    return Err(error);
                 }
             }
         }
+        Ok(())
     }
 
     #[cfg(windows)]

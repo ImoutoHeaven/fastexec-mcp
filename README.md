@@ -102,9 +102,9 @@ One tool takes an `action` and the parameters that apply to it:
 
 | Action | Parameters | Behavior |
 |---|---|---|
-| `start` | `command`, `cwd`, `pty`, `loginShell`, `waitMs` (default 30000), output options | Runs the command in bash and waits. Returns the final result when the command exits in time; otherwise returns a `taskId` and the output so far. |
+| `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `waitMs` (default 30000), output options | Runs the command in bash and waits. Returns the final result when the command exits in time; otherwise returns a `taskId` and the output so far. |
 | `poll` | `taskId`, `input`, `eof`, `waitMs` (default 2000 with input, 30000 without), output options | Writes `input` exactly as given, closes stdin when `eof` is true, waits until the task ends or `waitMs` elapses, and returns output not yet seen. |
-| `kill` | `taskId` | Terminates the task's process tree and returns its final state. |
+| `kill` | `taskId` | Terminates the task's process tree and returns its final state. A failed termination call returns an error naming the cause. |
 | `list` | — | Lists this server's tasks, newest first. |
 
 Output options:
@@ -117,10 +117,12 @@ Output options:
 Behavior:
 
 - **Waits.** Each wait lasts at most 240 s. An ended wait, a cancelled call, or a timeout leaves the process running.
+- **Lifetime limit.** `killAfterMs` on `start` kills the task's whole tree that many milliseconds after launch, independently of waits, polls, and cancelled calls; 0 or omitted means no limit. Such a task reports `state: killed`, `lifetimeExpired: true`, and `killed by killAfterMs` in its status line.
+- **Background footer.** `start`, `poll`, and `kill` results end with a line such as `(Background: t3 exited 7, t5 running 4m3s.)` naming the server's other tasks that need attention: finished tasks whose final state no result has shown yet, failures first, then running tasks. It names at most three tasks, then counts the rest, within 512 bytes and a quarter of `maxBytes`. A finished task leaves the footer once a result or `list` has shown its final state.
 - **Environment.** Pipe and PTY tasks inherit the server's environment, then fastexec sets terminal, pager, and locale variables.
-- **Output.** stdout and stderr share one stream. Cleaning strips ANSI sequences, collapses carriage-return progress bars to their final text, and trims trailing spaces.
+- **Output.** stdout and stderr share one stream. Cleaning strips ANSI sequences, collapses carriage-return progress bars to their final text, and trims trailing spaces. A multibyte character that arrives in two parts, in UTF-8 or in an `encoding` such as `big5`, is shown whole once its last byte arrives.
 - **Results.** Each `start` or `poll` text result ends with a status line such as `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/t3.log`. `structuredContent` carries task and window metadata as JSON. `FASTEXEC_OUTPUT_MODE` selects where the output body appears.
-- **Logs.** Each task's output is kept in a log file of up to 64 MiB, and omitted lines are named by their log line numbers. The server keeps the 64 most recently finished tasks and deletes its log directory on exit. Log directories are `fastexec-<uid>-<pid>` on Unix and `fastexec-<pid>` on Windows, in the temp directory; at startup the server removes the current user's directories whose server process has ended, such as those left by a forced kill.
+- **Logs.** Each task's output is kept in a log file of up to 64 MiB, and omitted lines are named by their log line numbers. If writing the log fails, the task keeps running, its earlier output stays readable, and the status line and `logError` report the failure. The server keeps the 64 most recently finished tasks and deletes its log directory on exit. Log directories are `fastexec-<uid>-<pid>` on Unix and `fastexec-<pid>` on Windows, in the temp directory; at startup the server removes the current user's directories whose server process has ended, such as those left by a forced kill.
 - **Process trees.** A task is its whole process tree. When the root bash exits, the rest of the tree ends too, so long-lived servers run as their own task. Windows uses a kill-on-close Job Object. Linux kills the task's process group and every process in its session; a process that starts its own session (`setsid`, daemons) leaves the tree.
 - **PTY input.** In PTY mode, send a carriage return (`"\r"`) for Enter, `"\u0003"` for Ctrl-C, and `"\u0004"` for Ctrl-D.
 - **Lifetime.** Tasks live as long as the server. The host stops the server when its session ends, and every task ends with it.

@@ -28,9 +28,16 @@ pub fn find() -> Result<PathBuf, String> {
     }
     let mut seen = HashSet::new();
     for candidate in candidates() {
+        // Windows paths compare case-insensitively; Unix paths that differ in case are distinct.
+        let key = candidate.to_string_lossy();
+        let key = if cfg!(windows) {
+            key.to_lowercase()
+        } else {
+            key.into_owned()
+        };
         if candidate.is_absolute()
             && !excluded(&candidate)
-            && seen.insert(candidate.to_string_lossy().to_lowercase())
+            && seen.insert(key)
             && validate(&candidate).is_ok()
         {
             return Ok(candidate);
@@ -77,19 +84,21 @@ fn validate(path: &Path) -> Result<(), String> {
         let _ = tx.send(bytes);
     });
     let text = rx.recv_timeout(timeout);
-    while child
-        .try_wait()
-        .map_err(|error| error.to_string())?
-        .is_none()
-    {
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
             return Err("--version did not finish within 5 s".to_string());
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    };
     let bytes = text.map_err(|_| "--version output stayed open past 5 s".to_string())?;
+    if !status.success() {
+        return Err(format!("--version failed ({status})"));
+    }
     if bytes.len() as u64 > BANNER_LIMIT {
         return Err("--version printed more than 4 KiB".to_string());
     }

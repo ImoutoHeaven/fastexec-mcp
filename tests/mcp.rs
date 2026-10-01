@@ -279,6 +279,86 @@ fn output_modes_place_start_and_poll_body_without_losing_metadata() {
 }
 
 #[test]
+fn kill_after_ms_bounds_task_lifetime_independently_of_waits() {
+    let mut server = Server::start();
+    let (out, _) = server
+        .ok(json!({"action": "start", "command": "sleep 30", "killAfterMs": 1000, "waitMs": 0}));
+    assert_eq!(
+        out["state"], "running",
+        "the deadline outlives the ended wait"
+    );
+    let (out, text) = server.ok(json!({"action": "poll", "taskId": "t1", "waitMs": 15000}));
+    assert_eq!(
+        (out["state"].as_str(), &out["lifetimeExpired"]),
+        (Some("killed"), &json!(true)),
+        "{text}"
+    );
+    assert!(text.contains("killAfterMs"), "{text}");
+    // Completion before the deadline and the disabled forms keep the natural result.
+    for limit in [json!(60000), json!(0), Value::Null] {
+        let (out, text) = server.ok(json!({"action": "start", "command": "sleep 1; exit 4", "killAfterMs": limit, "waitMs": 15000}));
+        assert_eq!(
+            (
+                out["state"].as_str(),
+                out["exitCode"].as_i64(),
+                &out["lifetimeExpired"]
+            ),
+            (Some("exited"), Some(4), &json!(false)),
+            "killAfterMs={limit}: {text}"
+        );
+    }
+}
+
+#[test]
+fn background_footer_names_unreported_tasks_once_failures_first() {
+    let mut server = Server::start();
+    server.ok(json!({"action": "start", "command": "sleep 60", "waitMs": 0}));
+    server.ok(json!({"action": "start", "command": "sleep 1; exit 0", "waitMs": 0}));
+    server.ok(json!({"action": "start", "command": "sleep 1; exit 7", "waitMs": 0}));
+    let (_, text) = server.ok(json!({"action": "poll", "taskId": "t1", "waitMs": 4000}));
+    let footer = text.lines().last().unwrap();
+    assert_eq!(footer, "(Background: t3 exited 7, t2 exited 0.)", "{text}");
+
+    // Reported completions leave the footer; running tasks stay in it.
+    let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
+    let footer = text.lines().last().unwrap();
+    assert!(
+        footer.starts_with("(Background: t1 running ") && !footer.contains("t2"),
+        "{text}"
+    );
+
+    // Many tasks: three IDs, then counts, within maxBytes.
+    for _ in 0..5 {
+        server.ok(json!({"action": "start", "command": "sleep 60", "waitMs": 0}));
+    }
+    let (_, text) =
+        server.ok(json!({"action": "start", "command": "seq 1 5000", "maxBytes": 1024}));
+    assert!(text.len() <= 1024, "{} bytes", text.len());
+    let footer = text.lines().last().unwrap();
+    assert!(
+        footer.starts_with("(Background: t9 running ")
+            && footer.ends_with("; 3 more; 6 running; use list.)"),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_override_must_exit_successfully() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("fake-bash");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let fake = dir.join("bash");
+    std::fs::write(&fake, "#!/bin/sh\necho 'GNU bash, version 5.2'\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut server = Server::start_with(|command| {
+        command.env("FASTEXEC_BASH", &fake);
+    });
+    let (_, text, is_error) = server.call(json!({"action": "start", "command": "true"}));
+    assert!(is_error && text.contains("Invalid FASTEXEC_BASH"), "{text}");
+}
+
+#[test]
 fn long_command_yields_then_poll_returns_only_unseen_output() {
     let mut server = Server::start();
     let (out, text) = server.ok(
@@ -526,6 +606,18 @@ fn encoding_decodes_legacy_output_and_long_commands_run_from_a_script() {
     assert!(text.contains("invalid in UTF-8; pass encoding"), "{text}");
     let (_, text) = server.ok(json!({"action": "start", "command": big5, "encoding": "big5"}));
     assert!(text.starts_with("中文\n"), "{text}");
+    // A character split across polls decodes whole once its last byte arrives.
+    for (id, encoding, lead, trail) in [
+        ("t3", "big5", "\\xa4", "\\xa4"),
+        ("t4", "gbk", "\\xd6", "\\xd0"),
+    ] {
+        let command = format!("printf '{lead}'; read -r x; printf '{trail}\\n'");
+        let (_, text) = server.ok(json!({"action": "start", "command": command, "encoding": encoding, "loginShell": false, "waitMs": 1000}));
+        assert!(!text.contains('\u{fffd}'), "{encoding}: {text}");
+        let (_, text) =
+            server.ok(json!({"action": "poll", "taskId": id, "input": "go\n", "waitMs": 10000}));
+        assert!(text.starts_with("中\n"), "{encoding}: {text}");
+    }
     let long = format!("x='{}'; echo ${{#x}}", "a".repeat(13_000));
     let (_, text) = server.ok(json!({"action": "start", "command": long}));
     assert!(text.starts_with("13000\n"), "{text}");
@@ -540,6 +632,10 @@ fn invalid_parameters_are_rejected_and_null_means_omitted() {
             "`taskId` does not apply",
         ),
         (json!({"action": "poll"}), "needs `taskId`"),
+        (
+            json!({"action": "poll", "taskId": "t1", "killAfterMs": 5}),
+            "`killAfterMs` does not apply",
+        ),
         (
             json!({"action": "start", "command": "true", "waitMs": 240001}),
             "out of range",

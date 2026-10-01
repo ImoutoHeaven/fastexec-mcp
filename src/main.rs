@@ -31,6 +31,8 @@ const MAX_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1024..=1024 * 1024;
 const NOTES_RESERVE: usize = 260;
 /// Smallest window body, so a long status line still leaves room for some output.
 const MIN_BODY_BUDGET: usize = 256;
+/// Largest background footer; bounded results give it at most a quarter of `maxBytes`.
+const FOOTER_LIMIT: usize = 512;
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +56,8 @@ struct Request {
     pty: Option<bool>,
     /// start: login shell, bash -lc, so profile-managed tools resolve (default true). false runs bash --noprofile --norc -c.
     login_shell: Option<bool>,
+    /// start: kill the task's whole process tree this many ms after launch, whatever the waits and polls; 0 or omitted means no limit.
+    kill_after_ms: Option<u64>,
     /// poll, kill: the task to act on.
     task_id: Option<String>,
     /// poll: text written to the task before waiting, at most 16 KiB.
@@ -88,6 +92,7 @@ fn validate(request: &Request) -> Result<View, String> {
         ("cwd", request.cwd.is_some()),
         ("pty", request.pty.is_some()),
         ("loginShell", request.login_shell.is_some()),
+        ("killAfterMs", request.kill_after_ms.is_some()),
         ("taskId", request.task_id.is_some()),
         ("input", request.input.is_some()),
         ("eof", request.eof.is_some()),
@@ -99,7 +104,7 @@ fn validate(request: &Request) -> Result<View, String> {
     ];
     const VIEW: [&str; 5] = ["waitMs", "truncate", "maxBytes", "raw", "encoding"];
     let allowed: Vec<&str> = match request.action {
-        Action::Start => ["command", "cwd", "pty", "loginShell"]
+        Action::Start => ["command", "cwd", "pty", "loginShell", "killAfterMs"]
             .into_iter()
             .chain(VIEW)
             .collect(),
@@ -256,9 +261,20 @@ impl Server {
                 let task = tokio::task::spawn_blocking(move || tasks.start(args))
                     .await
                     .map_err(|error| format!("Internal failure while starting: {error}."))??;
+                if let Some(limit) = request.kill_after_ms.filter(|&limit| limit > 0) {
+                    // The deadline belongs to the task, not to this request: it survives the
+                    // request's cancellation and every later wait.
+                    let (expiring, mut done) = (Arc::clone(&task), task.done());
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(limit)) => expiring.expire(),
+                            _ = done.wait_for(|done| *done) => {}
+                        }
+                    });
+                }
                 let wait = request.wait_ms.unwrap_or(30_000);
                 wait_for(&task, wait, context).await?;
-                window_result(Action::Start, task, view, self.output_mode).await
+                self.window_result(Action::Start, task, view).await
             }
             Action::Poll => {
                 let task = self.task(request.task_id.as_deref())?;
@@ -269,11 +285,16 @@ impl Server {
                     30_000
                 };
                 wait_for(&task, request.wait_ms.unwrap_or(default_wait), context).await?;
-                window_result(Action::Poll, task, view, self.output_mode).await
+                self.window_result(Action::Poll, task, view).await
             }
             Action::Kill => {
                 let task = self.task(request.task_id.as_deref())?;
-                task.kill();
+                task.kill().map_err(|error| {
+                    format!(
+                        "Cannot terminate the process tree of {}: {error}. Poll to see its state, or retry kill.",
+                        task.id
+                    )
+                })?;
                 let mut done = task.done();
                 let finished = async move {
                     let _ = done.wait_for(|done| *done).await;
@@ -284,7 +305,14 @@ impl Server {
                 if snapshot.state == "running" {
                     text.push_str(" · the tree did not exit within 5 s; poll later to confirm");
                 }
-                Ok(success(text, task_json(Action::Kill, &task, &snapshot)))
+                let background = self.tasks.background(&task.id, FOOTER_LIMIT);
+                if let Some((line, _)) = &background {
+                    text.push('\n');
+                    text.push_str(line);
+                }
+                let result = success(text, task_json(Action::Kill, &task, &snapshot));
+                report(&task, &snapshot, background);
+                Ok(result)
             }
         }
     }
@@ -300,8 +328,12 @@ impl Server {
         let tasks = self.tasks.all();
         let mut lines = Vec::new();
         let mut entries = Vec::new();
+        let mut shown_final = Vec::new();
         for task in &tasks {
             let snapshot = task.snapshot();
+            if snapshot.state != "running" {
+                shown_final.push(task);
+            }
             let command: String = task.command.chars().take(120).collect();
             let code = snapshot
                 .exit_code
@@ -317,7 +349,12 @@ impl Server {
             entries.push(json!({
                 "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
                 "elapsedMs": snapshot.elapsed.as_millis() as u64, "command": command, "logPath": task.log_path,
+                "lifetimeExpired": snapshot.expired,
             }));
+        }
+        // The list shows these final states, which settles the background footer's notices.
+        for task in shown_final {
+            task.mark_reported();
         }
         let text = if lines.is_empty() {
             "No tasks.".to_string()
@@ -362,61 +399,85 @@ async fn wait_for(
     }
 }
 
-async fn window_result(
-    action: Action,
-    task: Arc<Task>,
-    view: View,
-    output_mode: OutputMode,
-) -> Result<CallToolResult, String> {
-    let reader = Arc::clone(&task);
-    let encoding = view.encoding.unwrap_or(task.encoding);
-    // The status line can only grow by its notes while the window is read.
-    let reserved = status_line(&task, &task.snapshot()).len() + NOTES_RESERVE;
-    let budget = match view.truncate {
-        Truncate::None => usize::MAX,
-        _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
-    };
-    let window = tokio::task::spawn_blocking(move || {
-        reader.read_window(view.truncate, budget, view.raw, encoding)
-    })
-    .await
-    .map_err(|error| format!("Internal failure while reading output: {error}."))?
-    .map_err(|error| format!("Cannot read the task log: {error}."))?;
-    let snapshot = task.snapshot();
-    let mut status = status_line(&task, &snapshot);
-    if window.bad_lines > 0 {
-        status.push_str(&format!(
-            " · {} lines had bytes invalid in {}; pass encoding (e.g. big5, gbk)",
-            window.bad_lines,
-            encoding.name()
-        ));
+/// Marks the footer's finished tasks, and the task itself when its shown snapshot was final,
+/// reported once their result is built.
+fn report(task: &Task, shown: &Snapshot, background: Option<(String, Vec<Arc<Task>>)>) {
+    if shown.state != "running" {
+        task.mark_reported();
     }
-    let room = if view.truncate == Truncate::None {
-        usize::MAX
-    } else {
-        // Hard guarantee: the whole text fits maxBytes. A status line longer than half the
-        // budget is cut too; structuredContent.logPath keeps the full path.
-        output::cut_to(&mut status, view.max_bytes / 2 + 1);
-        view.max_bytes - status.len() - 2
-    };
-    let (output, cut_lines) = window.fit(room);
-    let body = if output.is_empty() {
-        "(no new output)"
-    } else {
-        output.as_str()
-    };
-    let text = if output_mode == OutputMode::Structured {
-        status
-    } else {
-        format!("{body}\n\n{status}")
-    };
-    let mut structured = task_json(action, &task, &snapshot);
-    add_window(&mut structured, &window);
-    if output_mode != OutputMode::Text {
-        structured["output"] = json!(output);
+    for shown in background.map(|(_, shown)| shown).unwrap_or_default() {
+        shown.mark_reported();
     }
-    structured["cutLines"] = json!(cut_lines);
-    Ok(success(text, structured))
+}
+
+impl Server {
+    async fn window_result(
+        &self,
+        action: Action,
+        task: Arc<Task>,
+        view: View,
+    ) -> Result<CallToolResult, String> {
+        let output_mode = self.output_mode;
+        let reader = Arc::clone(&task);
+        let encoding = view.encoding.unwrap_or(task.encoding);
+        let footer_cap = match view.truncate {
+            Truncate::None => FOOTER_LIMIT,
+            _ => FOOTER_LIMIT.min(view.max_bytes / 4),
+        };
+        let background = self.tasks.background(&task.id, footer_cap);
+        let footer = background
+            .as_ref()
+            .map_or(String::new(), |(line, _)| format!("\n{line}"));
+        // The status line can only grow by its notes while the window is read.
+        let reserved = status_line(&task, &task.snapshot()).len() + NOTES_RESERVE + footer.len();
+        let budget = match view.truncate {
+            Truncate::None => usize::MAX,
+            _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
+        };
+        let window = tokio::task::spawn_blocking(move || {
+            reader.read_window(view.truncate, budget, view.raw, encoding)
+        })
+        .await
+        .map_err(|error| format!("Internal failure while reading output: {error}."))?
+        .map_err(|error| format!("Cannot read the task log: {error}."))?;
+        let snapshot = task.snapshot();
+        let mut status = status_line(&task, &snapshot);
+        if window.bad_lines > 0 {
+            status.push_str(&format!(
+                " · {} lines had bytes invalid in {}; pass encoding (e.g. big5, gbk)",
+                window.bad_lines,
+                encoding.name()
+            ));
+        }
+        let room = if view.truncate == Truncate::None {
+            usize::MAX
+        } else {
+            // Hard guarantee: the whole text fits maxBytes. A status line longer than half the
+            // budget is cut too; structuredContent.logPath keeps the full path.
+            output::cut_to(&mut status, view.max_bytes / 2 + 1);
+            view.max_bytes - status.len() - 2 - footer.len()
+        };
+        let (output, cut_lines) = window.fit(room);
+        let body = if output.is_empty() {
+            "(no new output)"
+        } else {
+            output.as_str()
+        };
+        let text = if output_mode == OutputMode::Structured {
+            format!("{status}{footer}")
+        } else {
+            format!("{body}\n\n{status}{footer}")
+        };
+        let mut structured = task_json(action, &task, &snapshot);
+        add_window(&mut structured, &window);
+        if output_mode != OutputMode::Text {
+            structured["output"] = json!(output);
+        }
+        structured["cutLines"] = json!(cut_lines);
+        let result = success(text, structured);
+        report(&task, &snapshot, background);
+        Ok(result)
+    }
 }
 
 fn status_line(task: &Task, snapshot: &Snapshot) -> String {
@@ -435,7 +496,15 @@ fn status_line(task: &Task, snapshot: &Snapshot) -> String {
     if snapshot.state == "running" {
         line.push_str(" · poll to continue, kill to stop");
     }
-    if snapshot.dropped > 0 {
+    if snapshot.expired {
+        line.push_str(" · killed by killAfterMs");
+    }
+    if let Some(error) = &snapshot.log_error {
+        line.push_str(&format!(
+            " · log write failed ({error}); {} bytes were not stored",
+            snapshot.dropped
+        ));
+    } else if snapshot.dropped > 0 {
         line.push_str(&format!(
             " · {} bytes past the log limit were not stored",
             snapshot.dropped
@@ -460,6 +529,8 @@ fn task_json(action: Action, task: &Task, snapshot: &Snapshot) -> Value {
         "pty": task.pty,
         "elapsedMs": snapshot.elapsed.as_millis() as u64,
         "logPath": task.log_path,
+        "lifetimeExpired": snapshot.expired,
+        "logError": snapshot.log_error,
     })
 }
 

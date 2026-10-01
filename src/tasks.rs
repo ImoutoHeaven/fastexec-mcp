@@ -1,6 +1,9 @@
 //! Task registry: spawn, log capture, unseen-output cursors, input queues, and shutdown.
 
-use crate::output::{Cleaner, Truncate, Window, WindowBuilder, WindowSpec, incomplete_utf8_suffix};
+use crate::output::{
+    Cleaner, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix,
+    incomplete_utf8_suffix,
+};
 use crate::process::{self, Launch, Tree};
 use encoding_rs::Encoding;
 use std::fs::File;
@@ -47,6 +50,10 @@ pub struct Task {
     started: Instant,
     tree: Tree,
     kill_requested: AtomicBool,
+    /// Set when `killAfterMs` elapsed and ended the task.
+    expired: AtomicBool,
+    /// Set once a result has shown this task's final state.
+    reported: AtomicBool,
     out: Mutex<Output>,
     view: Mutex<View>,
     end: Mutex<Option<Final>>,
@@ -63,6 +70,10 @@ struct Output {
     lines: u64,
     dropped: u64,
     evicted: bool,
+    /// The first log write failure; capture stops storing output after it.
+    log_error: Option<String>,
+    /// Output reached EOF: every captured byte is final.
+    closed: bool,
 }
 
 #[derive(Default)]
@@ -76,6 +87,7 @@ struct View {
 struct Final {
     exit_code: i32,
     killed: bool,
+    expired: bool,
     elapsed: Duration,
     output_open: bool,
 }
@@ -94,6 +106,8 @@ pub struct Snapshot {
     pub dropped: u64,
     pub evicted: bool,
     pub output_open: bool,
+    pub expired: bool,
+    pub log_error: Option<String>,
 }
 
 pub struct StartArgs {
@@ -188,6 +202,8 @@ impl Tasks {
             started: Instant::now(),
             tree: spawned.tree,
             kill_requested: AtomicBool::new(false),
+            expired: AtomicBool::new(false),
+            reported: AtomicBool::new(false),
             out: Mutex::default(),
             view: Mutex::default(),
             end: Mutex::new(None),
@@ -227,15 +243,20 @@ impl Tasks {
             (Arc::clone(self), Arc::clone(&task), spawned.child);
         std::thread::spawn(move || {
             let exit_code = child.wait();
+            // Read at the root's exit, so a kill or deadline during the drain below leaves a
+            // natural exit labeled as such.
+            let killed = waiter_task.kill_requested.load(Ordering::SeqCst);
+            let expired = waiter_task.expired.load(Ordering::SeqCst);
             // A task is its whole tree: whatever the root leaves behind ends with it.
-            waiter_task.tree.kill();
+            let _ = waiter_task.tree.kill();
             // Closing a PTY lets its output reach EOF; ConPTY's close can block, so it runs apart.
             std::thread::spawn(move || drop(child));
             let output_open = eof_rx.recv_timeout(DRAIN_CAP).is_err();
             *lock(&waiter_task.input) = None;
             *lock(&waiter_task.end) = Some(Final {
                 exit_code,
-                killed: waiter_task.kill_requested.load(Ordering::SeqCst),
+                killed,
+                expired,
                 elapsed: waiter_task.started.elapsed(),
                 output_open,
             });
@@ -309,10 +330,98 @@ impl Tasks {
         for task in lock(&self.registry).tasks.iter() {
             if task.is_running() {
                 task.kill_requested.store(true, Ordering::SeqCst);
-                task.tree.kill();
+                let _ = task.tree.kill();
             }
         }
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+
+    /// One line naming the other tasks that need attention, at most `cap` bytes: finished tasks
+    /// whose final state no result has shown yet (failures first), then running tasks. Returns
+    /// the line and the finished tasks it names, which the caller marks reported once the line
+    /// is delivered.
+    pub fn background(&self, exclude: &str, cap: usize) -> Option<(String, Vec<Arc<Task>>)> {
+        // Rank 0: failed or expired; 1: other finished; 2: running. Newest first within a rank.
+        let mut entries: Vec<(u8, Arc<Task>, Snapshot)> = self
+            .all()
+            .into_iter()
+            .filter(|task| task.id != exclude)
+            .filter_map(|task| {
+                let snapshot = task.snapshot();
+                let rank = match snapshot.state {
+                    "running" => 2,
+                    _ if task.reported.load(Ordering::SeqCst) => return None,
+                    "exited" if snapshot.exit_code != Some(0) => 0,
+                    _ if snapshot.expired => 0,
+                    _ => 1,
+                };
+                Some((rank, task, snapshot))
+            })
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort_by_key(|(rank, ..)| *rank);
+        let count = |rank: u8| entries.iter().filter(|entry| entry.0 == rank).count();
+        let (failed, running) = (count(0), count(2));
+        let finished = entries.len() - running;
+        let mut counts = Vec::new();
+        if running > 0 {
+            counts.push(format!("{running} running"));
+        }
+        if finished > 0 {
+            counts.push(format!("{finished} finished"));
+        }
+        if failed > 0 {
+            counts.push(format!("{failed} failed"));
+        }
+        let counts = counts.join(", ");
+        let finished_tasks = |shown: usize| {
+            entries[..shown]
+                .iter()
+                .filter(|entry| entry.0 < 2)
+                .map(|entry| Arc::clone(&entry.1))
+                .collect()
+        };
+        for shown in (1..=entries.len().min(3)).rev() {
+            let named: Vec<String> = entries[..shown]
+                .iter()
+                .map(
+                    |(_, task, snapshot)| match (snapshot.state, snapshot.exit_code) {
+                        ("running", _) => {
+                            format!("{} running {}", task.id, short(snapshot.elapsed))
+                        }
+                        ("exited", Some(code)) => format!("{} exited {code}", task.id),
+                        _ if snapshot.expired => format!("{} killed by killAfterMs", task.id),
+                        _ => format!("{} killed", task.id),
+                    },
+                )
+                .collect();
+            let rest = entries.len() - shown;
+            let line = if rest == 0 {
+                format!("(Background: {}.)", named.join(", "))
+            } else {
+                format!(
+                    "(Background: {}; {rest} more; {counts}; use list.)",
+                    named.join(", ")
+                )
+            };
+            if line.len() <= cap {
+                return Some((line, finished_tasks(shown)));
+            }
+        }
+        let line = format!("(Background: {counts}; use list.)");
+        (line.len() <= cap).then(|| (line, Vec::new()))
+    }
+}
+
+/// Elapsed time in its largest two units: `42s`, `4m3s`, `2h5m`.
+fn short(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m{}s", seconds / 60, seconds % 60),
+        _ => format!("{}h{}m", seconds / 3600, seconds % 3600 / 60),
     }
 }
 
@@ -324,7 +433,7 @@ fn capture(
     shared: &Tasks,
     task: &Task,
     mut output: Box<dyn Read + Send>,
-    mut log: File,
+    log: File,
     answer: Option<mpsc::Sender<Input>>,
 ) {
     const QUERY: &[u8] = b"[6n";
@@ -332,9 +441,12 @@ fn capture(
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut last = Vec::with_capacity(8);
     let mut seam = Vec::new();
+    let mut log = Some(log);
     loop {
         let read = match output.read(&mut buffer) {
-            Ok(0) | Err(_) => break, // a closed PTY reports EIO on Unix
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break, // a closed PTY reports EIO on Unix
             Ok(read) => read,
         };
         let chunk = &buffer[..read];
@@ -354,14 +466,27 @@ fn capture(
             let out = lock(&task.out);
             !out.evicted && out.written + size <= TASK_LOG_LIMIT
         };
-        let stored = fits && shared.reserve(size) && {
-            let written = log.write_all(chunk).is_ok();
-            if !written {
-                shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+        let mut stored = false;
+        let mut write_error = None;
+        if fits
+            && let Some(file) = log.as_mut()
+            && shared.reserve(size)
+        {
+            match file.write_all(chunk) {
+                Ok(()) => stored = true,
+                Err(error) => {
+                    // A partial write leaves bytes past `written`; storing nothing more keeps
+                    // every readable offset valid.
+                    shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                    log = None;
+                    write_error = Some(error.to_string());
+                }
             }
-            written
-        };
+        }
         let mut out = lock(&task.out);
+        if write_error.is_some() {
+            out.log_error = write_error;
+        }
         if stored {
             last.extend_from_slice(chunk);
             last.drain(..last.len().saturating_sub(3));
@@ -374,6 +499,7 @@ fn capture(
     }
     let mut out = lock(&task.out);
     out.readable = out.written;
+    out.closed = true;
 }
 
 impl Task {
@@ -404,7 +530,15 @@ impl Task {
             dropped: out.dropped,
             evicted: out.evicted,
             output_open: end.is_some_and(|end| end.output_open),
+            expired: end.is_some_and(|end| end.expired),
+            log_error: out.log_error.clone(),
         }
+    }
+
+    /// Records that a delivered result showed this task's final state. Callers pass only
+    /// tasks whose shown snapshot was final, so a task that ends after its snapshot stays due.
+    pub fn mark_reported(&self) {
+        self.reported.store(true, Ordering::SeqCst);
     }
 
     /// Reserves room in the input queue for `size` bytes.
@@ -450,10 +584,19 @@ impl Task {
     }
 
     /// Marks the task killed and terminates its tree; the waiter thread records the exit.
-    pub fn kill(&self) {
+    pub fn kill(&self) -> std::io::Result<()> {
         if self.is_running() {
             self.kill_requested.store(true, Ordering::SeqCst);
-            self.tree.kill();
+            self.tree.kill()?;
+        }
+        Ok(())
+    }
+
+    /// Ends the task because its `killAfterMs` lifetime elapsed.
+    pub fn expire(&self) {
+        if self.is_running() {
+            self.expired.store(true, Ordering::SeqCst);
+            let _ = self.kill();
         }
     }
 
@@ -466,12 +609,19 @@ impl Task {
         encoding: &'static Encoding,
     ) -> std::io::Result<Window> {
         let mut view = lock(&self.view);
-        let (end, evicted) = {
+        let (readable, written, evicted, closed) = {
             let out = lock(&self.out);
-            (out.readable, out.evicted)
+            (out.readable, out.written, out.evicted, out.closed)
+        };
+        let start = view.cursor;
+        // `readable` holds back an unfinished UTF-8 sequence; other encodings hold back their
+        // own unfinished character here, until the rest arrives or output ends.
+        let end = if encoding == encoding_rs::UTF_8 || closed || evicted {
+            readable
+        } else {
+            written - self.legacy_holdback(start, written, encoding)?
         };
         let first_line = view.lines_before + 1;
-        let start = view.cursor;
         let spec = WindowSpec {
             truncate,
             budget,
@@ -498,6 +648,33 @@ impl Task {
         view.cursor = end.max(start);
         view.lines_before += window.newlines;
         Ok(window)
+    }
+
+    /// Length of an unfinished `encoding` character at the end of the log range `start..end`.
+    /// Decoding starts after the last LF, a character boundary in every ASCII-compatible
+    /// encoding, or at `start`, where the previous window ended on a boundary.
+    fn legacy_holdback(
+        &self,
+        start: u64,
+        end: u64,
+        encoding: &'static Encoding,
+    ) -> std::io::Result<u64> {
+        // ponytail: a final partial line longer than 4 KiB without a boundary is shown as is.
+        const TAIL: u64 = 4096;
+        let from = start.max(end.saturating_sub(TAIL));
+        if end <= from {
+            return Ok(0);
+        }
+        let mut tail = vec![0_u8; (end - from) as usize];
+        let mut file = File::open(&self.log_path)?;
+        file.seek(SeekFrom::Start(from))?;
+        file.read_exact(&mut tail)?;
+        let line = match tail.iter().rposition(|&byte| byte == b'\n') {
+            Some(newline) => &tail[newline + 1..],
+            None if from == start => &tail[..],
+            None => return Ok(0),
+        };
+        Ok(incomplete_legacy_suffix(line, encoding) as u64)
     }
 }
 

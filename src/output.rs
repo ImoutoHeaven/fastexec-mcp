@@ -383,6 +383,23 @@ pub fn incomplete_utf8_suffix(tail: &[u8]) -> usize {
     0
 }
 
+/// Length of an unfinished `encoding` character at the end of `line`, which starts on a
+/// character boundary: the 1..=3 trailing bytes whose removal lets the rest decode cleanly.
+/// A line with an invalid sequence elsewhere reports 0, so its replacement shows at once.
+pub fn incomplete_legacy_suffix(line: &[u8], encoding: &'static encoding_rs::Encoding) -> usize {
+    let decodes = |bytes: &[u8]| {
+        encoding
+            .decode_without_bom_handling_and_without_replacement(bytes)
+            .is_some()
+    };
+    if decodes(line) {
+        return 0;
+    }
+    (1..=line.len().min(3))
+        .find(|&back| decodes(&line[..line.len() - back]))
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
