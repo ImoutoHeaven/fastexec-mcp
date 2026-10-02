@@ -442,6 +442,35 @@ fn short(elapsed: Duration) -> String {
     }
 }
 
+/// Reads `output` until EOF and passes it on in chunks.
+fn read_chunks(mut output: Box<dyn Read + Send>, chunks: mpsc::SyncSender<Vec<u8>>) {
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        match output.read(&mut buffer) {
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break, // a closed PTY reports EIO on Unix
+            Ok(read) => {
+                if chunks.send(buffer[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Sends the terminal emulator's replies to the program. Replies share the input limit; past
+/// it they are dropped, never queued unbounded.
+fn answer_program(task: &Task, answer: &mpsc::Sender<Input>, reply: Vec<u8>) {
+    if !reply.is_empty()
+        && task.admit(reply.len())
+        && let Err(error) = answer.send(Input::Data(reply))
+        && let Input::Data(reply) = error.0
+    {
+        task.queued.fetch_sub(reply.len(), Ordering::SeqCst);
+    }
+}
+
 /// Drains one task's output into its log until EOF, never blocking the child on log limits.
 ///
 /// For a PTY, the output also feeds the task's terminal emulator, and `answer` carries its
@@ -449,34 +478,45 @@ fn short(elapsed: Duration) -> String {
 fn capture(
     shared: &Tasks,
     task: &Task,
-    mut output: Box<dyn Read + Send>,
+    output: Box<dyn Read + Send>,
     log: File,
     answer: Option<mpsc::Sender<Input>>,
 ) {
-    let mut buffer = vec![0_u8; 64 * 1024];
+    // Output is read on its own thread, so a synchronized update ends at its deadline while
+    // the program writes nothing.
+    let (chunks, received) = mpsc::sync_channel(1);
+    std::thread::spawn(move || read_chunks(output, chunks));
     let mut last = Vec::with_capacity(8);
     let mut log = Some(log);
     loop {
-        let read = match output.read(&mut buffer) {
-            Ok(0) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break, // a closed PTY reports EIO on Unix
-            Ok(read) => read,
+        let deadline = task
+            .terminal
+            .as_ref()
+            .and_then(|terminal| lock(terminal).sync_deadline());
+        let received = match deadline {
+            None => received.recv().ok(),
+            Some(deadline) => {
+                match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(chunk) => Some(chunk),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let (Some(terminal), Some(answer)) = (&task.terminal, &answer) {
+                            answer_program(task, answer, lock(terminal).end_sync());
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => None,
+                }
+            }
         };
-        let chunk = &buffer[..read];
+        let Some(chunk) = received else {
+            break;
+        };
+        let chunk = chunk.as_slice();
         // The emulator stays locked until the chunk is in the log, so a screen and the log
         // offset taken under that lock show the same output.
         let mut terminal = task.terminal.as_ref().map(lock);
         if let (Some(terminal), Some(answer)) = (terminal.as_mut(), &answer) {
-            let reply = terminal.process(chunk);
-            // Replies share the input limit; past it they are dropped, never queued unbounded.
-            if !reply.is_empty()
-                && task.admit(reply.len())
-                && let Err(error) = answer.send(Input::Data(reply))
-                && let Input::Data(reply) = error.0
-            {
-                task.queued.fetch_sub(reply.len(), Ordering::SeqCst);
-            }
+            answer_program(task, answer, terminal.process(chunk));
         }
         // Storing stops at the first byte that does not fit, so the log stays a prefix of the
         // output: a later chunk that would fit is not stored after the gap.
@@ -522,6 +562,11 @@ fn capture(
         out.dropped += (chunk.len() - stored.len()) as u64;
         drop(out);
         drop(terminal);
+    }
+    // No later output can end a synchronized update; the screen shows what it held.
+    let terminal = task.terminal.as_ref().map(lock);
+    if let Some(mut terminal) = terminal {
+        terminal.end_sync();
     }
     let mut out = lock(&task.out);
     out.readable = out.written;
@@ -576,19 +621,25 @@ impl Task {
         true
     }
 
-    /// The program's keyboard modes; pipe tasks report the defaults.
-    pub fn modes(&self) -> crate::keys::Modes {
-        self.terminal
+    /// The keyboard modes of a PTY task's program.
+    pub fn modes(&self) -> Result<crate::keys::Modes, String> {
+        let terminal = self
+            .terminal
             .as_ref()
-            .map_or_else(Default::default, |terminal| lock(terminal).modes())
+            .ok_or("keys applies to PTY tasks only.")?;
+        lock(terminal).modes()
     }
 
-    /// The rendered terminal; `None` for pipe tasks.
-    pub fn screen(&self) -> Option<Screen> {
-        let terminal = lock(self.terminal.as_ref()?);
-        let log_end = lock(&self.out).readable;
-        let (rows, cursor) = terminal.screen();
-        Some(Screen {
+    /// The rendered terminal of a PTY task.
+    pub fn screen(&self) -> Result<Screen, String> {
+        let terminal = lock(
+            self.terminal
+                .as_ref()
+                .ok_or("screen applies to PTY tasks only.")?,
+        );
+        let (rows, cursor) = terminal.screen()?;
+        let log_end = lock(&self.out).readable.min(terminal.shown());
+        Ok(Screen {
             rows,
             cursor,
             log_end,

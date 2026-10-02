@@ -204,6 +204,11 @@ impl<'a> WindowBuilder<'a> {
                 self.end_line(true);
                 return;
             }
+            // A Unix PTY sends `\r\n` as `\r\r\n`: a CR after a CR moves nothing.
+            if byte == b'\r' {
+                self.cleaner.pending_cr = true;
+                return;
+            }
             // A lone CR returns the cursor to column 0: the text that follows replaces the line.
             self.line.clear();
             self.line_overflow = 0;
@@ -431,7 +436,7 @@ mod tests {
     fn cleaning_strips_escapes_and_keeps_text_after_the_last_carriage_return() {
         let out = window(
             &[
-                b"\x1b[32mok\x1b[0m\r\n",
+                b"\x1b[32mok\x1b[0m\r\r\n",
                 b"10%\r50%\r\x1b[",
                 b"2K100%\n",
                 b"\x1b]0;title\x07done",

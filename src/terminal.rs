@@ -14,11 +14,11 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
-use alacritty_terminal::vte::{self, Params};
 use std::io::Read;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
-use unicode_width::UnicodeWidthChar;
+use std::time::Instant;
 
 /// Scrollback history kept while rendering a transcript; older lines are dropped.
 pub const HISTORY_LINES: usize = 10_000;
@@ -28,6 +28,17 @@ static RENDERING: Mutex<()> = Mutex::new(());
 
 /// Separates the normal screen's history from the alternate screen in a transcript.
 pub const ALTERNATE_MARKER: &str = "--- alternate screen ---";
+
+const STOPPED: &str = "The terminal emulator of this task stopped after an internal failure;";
+
+/// Kitty keyboard protocol enhancements, in the order of their flag bits (1, 2, 4, 8, 16).
+const KITTY_FLAGS: [TermMode; 5] = [
+    TermMode::DISAMBIGUATE_ESC_CODES,
+    TermMode::REPORT_EVENT_TYPES,
+    TermMode::REPORT_ALTERNATE_KEYS,
+    TermMode::REPORT_ALL_KEYS_AS_ESC,
+    TermMode::REPORT_ASSOCIATED_TEXT,
+];
 
 struct Size;
 
@@ -49,8 +60,11 @@ impl Dimensions for Size {
 pub struct Live {
     term: Term<Replies>,
     parser: Processor,
-    limiter: Limiter,
     replies: Replies,
+    /// Output bytes read, including those a synchronized update still holds.
+    read: u64,
+    /// The emulator panicked on some output; it stays stopped and the task runs without it.
+    stopped: bool,
 }
 
 /// The emulator's replies to the program, such as cursor-position reports. Requests that need
@@ -72,19 +86,54 @@ impl Live {
         let replies = Replies::default();
         let config = Config {
             scrolling_history: 0,
+            kitty_keyboard: true,
             ..Config::default()
         };
         Live {
             term: Term::new(config, &Size, replies.clone()),
             parser: Processor::new(),
-            limiter: Limiter::default(),
             replies,
+            read: 0,
+            stopped: false,
         }
     }
 
-    /// Reads one piece of output and returns the replies it asked for.
+    /// Reads one piece of output and returns the replies it asked for. A synchronized update
+    /// (mode 2026) past its deadline ends first, so it cannot outlast its timeout while output
+    /// keeps arriving.
     pub fn process(&mut self, output: &[u8]) -> Vec<u8> {
-        run(&mut self.term, &mut self.parser, &mut self.limiter, output);
+        self.read += output.len() as u64;
+        let expired = self
+            .sync_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now());
+        self.run(|term, parser| {
+            if expired {
+                parser.stop_sync(term);
+            }
+            parser.advance(term, output);
+        })
+    }
+
+    /// When the synchronized update in progress times out, if one is in progress.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        if self.stopped {
+            return None;
+        }
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// Ends the synchronized update in progress, applying the output it held, and returns the
+    /// replies that output asked for.
+    pub fn end_sync(&mut self) -> Vec<u8> {
+        self.run(|term, parser| parser.stop_sync(term))
+    }
+
+    fn run(&mut self, step: impl FnOnce(&mut Term<Replies>, &mut Processor)) -> Vec<u8> {
+        if !self.stopped {
+            let (term, parser) = (&mut self.term, &mut self.parser);
+            // A panic would end the capture thread, and the program would block on a full PTY.
+            self.stopped = catch_unwind(AssertUnwindSafe(|| step(term, parser))).is_err();
+        }
         let mut replies = self
             .replies
             .0
@@ -93,18 +142,38 @@ impl Live {
         std::mem::take(&mut *replies)
     }
 
-    /// The program's keyboard modes.
-    pub fn modes(&self) -> Modes {
+    /// The program's keyboard modes, which a stopped emulator no longer knows.
+    pub fn modes(&self) -> Result<Modes, String> {
+        if self.stopped {
+            return Err(format!(
+                "{STOPPED} keys need its keyboard modes; send the bytes with input instead."
+            ));
+        }
         let mode = self.term.mode();
-        Modes {
+        Ok(Modes {
             cursor: mode.contains(TermMode::APP_CURSOR),
             keypad: mode.contains(TermMode::APP_KEYPAD),
-        }
+            kitty: KITTY_FLAGS
+                .iter()
+                .enumerate()
+                .filter(|(_, flag)| mode.contains(**flag))
+                .fold(0, |flags, (bit, _)| flags | 1 << bit),
+        })
+    }
+
+    /// Output bytes the screen shows: those read, without the ones a synchronized update holds.
+    pub fn shown(&self) -> u64 {
+        self.read - self.parser.sync_bytes_count() as u64
     }
 
     /// The visible rows without trailing spaces, blank rows at the bottom dropped, and the
     /// zero-based cursor row and column.
-    pub fn screen(&self) -> (Vec<String>, (u16, u16)) {
+    pub fn screen(&self) -> Result<(Vec<String>, (u16, u16)), String> {
+        if self.stopped {
+            return Err(format!(
+                "{STOPPED} poll and transcript still read its output."
+            ));
+        }
         let grid = self.term.grid();
         let mut rows: Vec<String> = (0..grid.screen_lines() as i32)
             .map(|line| {
@@ -117,25 +186,7 @@ impl Live {
             rows.pop();
         }
         let point = grid.cursor.point;
-        (rows, (point.line.0 as u16, point.column.0 as u16))
-    }
-}
-
-/// Runs one piece of output through the limiter into the emulator, keeping each cell to its
-/// text after every part.
-fn run<L: EventListener>(
-    term: &mut Term<L>,
-    parser: &mut Processor,
-    limiter: &mut Limiter,
-    output: &[u8],
-) {
-    limiter.feed(output);
-    for part in limiter.parts() {
-        parser.advance(term, part);
-        // ponytail: a synchronized update ends with each part, so a screen can show a frame
-        // partly drawn; holding it until its end or a 150 ms timeout needs a timer.
-        parser.stop_sync(term);
-        keep_text(term.grid_mut());
+        Ok((rows, (point.line.0 as u16, point.column.0 as u16)))
     }
 }
 
@@ -158,7 +209,6 @@ pub fn render(mut log: impl Read, len: u64, path: &Path) -> std::io::Result<Tran
     };
     let mut term = Term::new(config, &Size, VoidListener);
     let mut parser: Processor = Processor::new();
-    let mut limiter = Limiter::default();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut remaining = len;
     while remaining > 0 {
@@ -167,9 +217,11 @@ pub fn render(mut log: impl Read, len: u64, path: &Path) -> std::io::Result<Tran
         if read == 0 {
             break;
         }
-        run(&mut term, &mut parser, &mut limiter, &buffer[..read]);
+        parser.advance(&mut term, &buffer[..read]);
         remaining -= read as u64;
     }
+    // The log keeps no timing: a synchronized update still open at its end shows what it holds.
+    parser.stop_sync(&mut term);
     let alternate_screen = term.mode().contains(TermMode::ALT_SCREEN);
     let alternate = alternate_screen.then(|| {
         let lines = lines(term.grid());
@@ -239,175 +291,6 @@ fn row_text(row: &Row<Cell>) -> String {
     text
 }
 
-/// Most zero-width characters a cell keeps.
-const MAX_ZERO_WIDTH: usize = 32;
-
-/// Keeps each visible cell to its text: at most `MAX_ZERO_WIDTH` zero-width characters, and
-/// no hyperlink or underline color, which text shows neither of. Zero-width characters stack
-/// on their cell without limit and a program can return to a cell, so this runs after each
-/// part of output, and before the screen switches, while its cells are still reachable; a cell
-/// that part scrolled into history keeps at most the part's worth.
-fn keep_text(grid: &mut Grid<Cell>) {
-    grid.cursor.template.extra = None;
-    grid.saved_cursor.template.extra = None;
-    for line in 0..grid.screen_lines() as i32 {
-        for cell in &mut grid[Line(line)][..] {
-            let Some(marks) = cell.zerowidth() else {
-                continue;
-            };
-            let kept = marks[..marks.len().min(MAX_ZERO_WIDTH)].to_vec();
-            if kept.len() == marks.len()
-                && cell.hyperlink().is_none()
-                && cell.underline_color().is_none()
-            {
-                continue;
-            }
-            cell.extra = None;
-            for mark in kept {
-                cell.push_zerowidth(mark);
-            }
-        }
-    }
-}
-
-/// Longest repeat (`CSI n b`) and backward tabulation (`CSI n Z`) passed on: one row.
-const MAX_COUNT: u16 = PTY_COLS;
-/// Most bytes passed on without the parser acting on any, as inside a string (OSC) that the
-/// parsers collect until it ends.
-const MAX_STRING: usize = 1 << 20;
-/// A CSI final byte the emulator ignores, which ends a sequence that is cut.
-const IGNORED_FINAL: u8 = b'Y';
-
-/// Bounds what a few bytes of output can cost the emulator, which acts on counts up to 65535
-/// and keeps what it is told. A repeat (`CSI n b`) or backward tabulation (`CSI n Z`) longer
-/// than a row becomes a row, a repeat of a zero-width character is dropped, a title pushed
-/// onto the title stack (`CSI 22 t`) is dropped, and a string that runs past `MAX_STRING`
-/// bytes is ended with BEL. The emulator's own parser reads every byte here too, so each cut
-/// lands exactly where the emulator would act; every other byte passes unchanged. The output
-/// is split in parts right before the final byte of each switch between the normal and the
-/// alternate screen.
-#[derive(Default)]
-struct Limiter {
-    parser: vte::Parser,
-    watch: Watch,
-    out: Vec<u8>,
-    /// Where the parts of `out` end, besides its end.
-    splits: Vec<usize>,
-    /// Bytes read since the parser last acted on one.
-    quiet: usize,
-}
-
-#[derive(Default)]
-struct Watch {
-    /// The last printed character has no width.
-    last_zero_width: bool,
-    /// The parser acted on the byte it just read.
-    acted: bool,
-    /// What replaces a sequence whose final byte the parser just read, after a final byte
-    /// that ends it without effect.
-    cut: Option<String>,
-    /// The sequence whose final byte the parser just read switches screens.
-    switch: bool,
-}
-
-impl vte::Perform for Watch {
-    fn print(&mut self, c: char) {
-        self.acted = true;
-        self.last_zero_width = c.width() == Some(0);
-    }
-
-    fn execute(&mut self, _: u8) {
-        self.acted = true;
-    }
-
-    fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {
-        self.acted = true;
-    }
-
-    fn put(&mut self, _: u8) {
-        self.acted = true;
-    }
-
-    fn unhook(&mut self) {
-        self.acted = true;
-    }
-
-    fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {
-        self.acted = true;
-    }
-
-    fn esc_dispatch(&mut self, _: &[u8], _: bool, _: u8) {
-        self.acted = true;
-    }
-
-    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
-        self.acted = true;
-        if ignore {
-            return;
-        }
-        if intermediates == b"?" && matches!(action, 'h' | 'l') {
-            self.switch = params
-                .iter()
-                .any(|param| matches!(param[0], 47 | 1047 | 1049));
-            return;
-        }
-        if !intermediates.is_empty() {
-            return;
-        }
-        // As the emulator reads a count, a missing or zero count meaning 1.
-        let count = params.iter().next().map_or(0, |param| param[0]).max(1);
-        self.cut = match action {
-            'b' if self.last_zero_width => Some(String::new()),
-            'b' | 'Z' if count > MAX_COUNT => Some(format!("\x1b[{MAX_COUNT}{action}")),
-            't' if count == 22 => Some(String::new()),
-            _ => None,
-        };
-    }
-}
-
-impl Limiter {
-    /// Takes `bytes` in, with the cuts made, for `parts` to pass on.
-    fn feed(&mut self, bytes: &[u8]) {
-        self.out.clear();
-        self.splits.clear();
-        for &byte in bytes {
-            self.parser.advance(&mut self.watch, &[byte]);
-            if std::mem::take(&mut self.watch.switch) {
-                self.splits.push(self.out.len());
-            }
-            self.quiet = if std::mem::take(&mut self.watch.acted) {
-                0
-            } else {
-                self.quiet + 1
-            };
-            match self.watch.cut.take() {
-                Some(replacement) => {
-                    self.out.push(IGNORED_FINAL);
-                    self.out.extend_from_slice(replacement.as_bytes());
-                }
-                None => self.out.push(byte),
-            }
-            if self.quiet > MAX_STRING {
-                self.parser.advance(&mut self.watch, b"\x07");
-                self.watch.acted = false;
-                self.quiet = 0;
-                self.out.push(0x07);
-            }
-        }
-    }
-
-    /// The output of the last `feed`, in its parts.
-    fn parts(&self) -> impl Iterator<Item = &[u8]> {
-        let mut start = 0;
-        let ends = self.splits.iter().copied().chain([self.out.len()]);
-        ends.map(move |end| {
-            let part = &self.out[start..end];
-            start = end;
-            part
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,16 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_keeps_its_bounded_marks_behind_the_alternate_screen() {
-        let log = format!("e{}\x1b[?1049h", "\u{301}".repeat(100));
-        let text = render_text(log.as_bytes());
-        assert_eq!(
-            text,
-            format!("e{}\n{ALTERNATE_MARKER}\n", "\u{301}".repeat(32))
-        );
-    }
-
-    #[test]
     fn a_moved_wide_character_placeholder_reads_as_a_blank() {
         // The wide character does not fit in the last column, which holds its placeholder;
         // deleting a character moves the placeholder left, and `z` lands in the last column.
@@ -444,20 +317,47 @@ mod tests {
     }
 
     #[test]
-    fn repeats_are_cut_where_the_emulator_runs_them_and_other_bytes_pass() {
-        // A long repeat prints one row; a short one prints as asked.
-        let text = render_text(b"x\x1b[65535b\r\ny\x1b[5b");
-        assert_eq!(text, format!("{}\nyyyyyy\n", "x".repeat(121)));
-        // A repeat of a zero-width character is dropped, also behind a byte the parser
-        // ignores (DEL after ESC) and across the renderer's 64 KiB reads.
-        let mut log = vec![b' '; 64 * 1024 - 4];
-        log.extend_from_slice("e\u{301}\x1b\x7f[65535b.".as_bytes());
-        assert!(render_text(&log).ends_with("e\u{301}.\n"));
-        // A combining mark inside a DCS string is not printed, so the repeat after it repeats
-        // the `x`; the line break after an ESC inside the string survives.
-        let text = render_text(
-            "x\x1bPq\x07\u{301}\x1b\\\x1b[5b.\r\nhello\x1bPq\x1b\r\n[0mworld".as_bytes(),
-        );
-        assert_eq!(text, "xxxxxx.\nhello\nworld\n");
+    fn output_renders_with_its_full_terminal_meaning() {
+        let osc = format!("\x1b]0;{}\x07ok", "t".repeat((1 << 20) + 10));
+        let dcs = format!("\x1bPq{}\x1b\\ok", "d".repeat((1 << 20) + 10));
+        for (log, expected) in [
+            // A repeat runs its whole count, wrapping onto the next rows and scrolling the
+            // screen into history.
+            (
+                "x\x1b[4000b\r\ny".to_string(),
+                format!("{}\ny\n", "x".repeat(4001)),
+            ),
+            // A repeat of a combining mark stacks the mark on its base.
+            (
+                "e\u{301}\x1b[3b.".to_string(),
+                format!("e{}.\n", "\u{301}".repeat(4)),
+            ),
+            (
+                format!("e{}", "\u{301}".repeat(100)),
+                format!("e{}\n", "\u{301}".repeat(100)),
+            ),
+            // Strings longer than a MiB end where the program ends them, not earlier.
+            (osc, "ok\n".to_string()),
+            (dcs, "ok\n".to_string()),
+        ] {
+            let text = render_text(log.as_bytes());
+            assert!(text == expected, "{:?}", &text[..text.len().min(200)]);
+        }
+    }
+
+    #[test]
+    fn a_synchronized_update_shows_once_it_ends_across_reads() {
+        let mut live = Live::new();
+        live.process(b"before\r\n\x1b[?2026h");
+        live.process(b"held");
+        let (rows, _) = live.screen().unwrap();
+        assert_eq!(rows, ["before"]);
+        assert_eq!(live.shown(), 16, "the held bytes are not shown yet");
+        assert!(live.sync_deadline().is_some());
+        live.process(b"\x1b[?2026l");
+        let (rows, _) = live.screen().unwrap();
+        assert_eq!(rows, ["before", "held"]);
+        assert_eq!(live.shown(), 28);
+        assert!(live.sync_deadline().is_none());
     }
 }

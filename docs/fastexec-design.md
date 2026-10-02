@@ -64,15 +64,19 @@ The tool takes one flat object with `deny_unknown_fields`. `action` selects the 
 
 ### Keys
 
-`keys` names keys as tmux `send-keys` does (`key-string.c`), and each key sends the bytes tmux sends to a pane in its standard key mode (`input-keys.c`):
+`keys` names keys as tmux `send-keys` does (`key-string.c`):
 
 - Names, case-insensitive: `Enter`, `Tab`, `BTab`, `Escape`, `Space`, `BSpace`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`/`PgUp`/`PPage`, `PageDown`/`PgDn`/`NPage`, `Insert`/`IC`, `Delete`/`DC`, `F1`–`F12`, `KP0`–`KP9`, `KP/`, `KP*`, `KP-`, `KP+`, `KP.`, `KPEnter`, and `[NUL]`–`[US]` for C0 controls.
 - One character (printable ASCII or any Unicode character), or `0xHH` for a code point.
 - Modifier prefixes `C-`, `M-`, and `S-` combine in any order; `^c` means `C-c`.
-- Arrow keys send `ESC O x` when the program has enabled application cursor mode (DECCKM), and keypad keys do so in application keypad mode (DECKPAM); the PTY task's terminal emulator (§5) tracks both modes.
-- Modified function, arrow, and editing keys use the xterm form `ESC [ <n> ; <m> <final>`. `M-` before any other key sends `ESC` first; `C-` maps characters to C0 controls as a VT terminal does.
+- A key is a base key plus modifiers. An uppercase or shifted character is Shift plus its base on a US layout: `A` is `S-a`, `!` is `S-1`, `BTab` is `S-Tab`. Ctrl with an uppercase letter and no `S-` is Ctrl with the letter, so `C-C` is `^C`. A C0 control is Ctrl plus its character, as in tmux (`[ETX]` is `C-c`, `[NUL]` is `C-Space`), apart from Tab, Enter, and Escape.
 
-fastexec differs from tmux in two cases, both errors that deliver nothing: a name tmux would send as literal text (literal text belongs in `input`), and a modifier that the key's legacy encoding cannot carry, which tmux drops silently (`C-Enter`, `C-Tab`, `S-a`, `C-é`, `C-BSpace`, any modified `BTab`, Ctrl or Shift on a keypad key). Pipe tasks reject `keys`.
+The bytes follow the program's keyboard mode, which the PTY task's terminal emulator (§5) tracks:
+
+- By default each key sends the bytes tmux sends to a pane in its standard key mode (`input-keys.c`). Arrow keys send `ESC O x` in application cursor mode (DECCKM), and keypad keys do so in application keypad mode (DECKPAM). Modified function, arrow, and editing keys use the xterm form `ESC [ <n> ; <m> <final>`. `M-` sends `ESC` first; `C-` maps characters to C0 controls as a VT terminal does; `S-` sends the shifted character.
+- When the program enables the kitty keyboard protocol with a disambiguation, event-type, or all-keys flag (`CSI > flags u`, `CSI = flags ; mode u`), keys follow that protocol as Windows Terminal's `terminalInput.cpp` encodes it, for a US layout with no lock key on. With the disambiguation flag, `Escape`, keypad keys, modified `Enter`, `Tab`, and `BSpace`, and text keys with Ctrl or Alt send `CSI <code> ; <m> u`, so `C-i` and `Tab` differ; the all-keys flag does so for every key but the legacy functional keys (F1–F12, arrows, and editing keys), and the alternate-key and associated-text flags add their fields. A press neither flag turns into `CSI u` keeps the legacy form Windows Terminal sends under the protocol: F1–F4 as `CSI P`–`CSI S` with F3 as `CSI 13 ~`, arrows, Home, and End in their CSI forms in either cursor mode, and other keys as typed characters, with Ctrl applied as Windows Terminal's `_makeCtrlChar` does. With the event-type flag, each key is pressed, then released, as the protocol encodes a release; Enter, Tab, and BSpace report a release only with the all-keys flag. The emulator answers the program's flag query (`CSI ? u`) and keeps the flag stacks of both screens.
+
+fastexec differs from tmux in two cases, both errors that deliver nothing: a name tmux would send as literal text (literal text belongs in `input`), and, in the legacy mode, a modifier that the key's legacy encoding cannot carry, which tmux drops silently (`C-Enter`, `C-Tab`, `S-Enter`, `S-Space`, `C-S-a`, `C-é`, `C-BSpace`, a modified `BTab`, Ctrl or Shift on a keypad key). Pipe tasks reject `keys`.
 
 ### Waiting
 
@@ -139,24 +143,25 @@ The tool description (`src/description.md`, at most 3 KB) says how to use the to
 
 ### Screen
 
-Each PTY task feeds all of its output into a 120×30 terminal emulator (`vt100` 0.16) without scrollback. `screen: true` returns the emulator's visible rows instead of the output window, after the usual wait:
+Each PTY task feeds all of its output into a 120×30 terminal emulator (`alacritty_terminal` 0.26) without scrollback. The emulator receives every byte unchanged and acts on each sequence as the crate implements it. `screen: true` returns the emulator's visible rows instead of the output window, after the usual wait:
 
 - Each row loses its trailing spaces, and blank rows at the bottom are dropped. An empty screen shows `(blank screen)`.
 - The status line ends with `screen, cursor row R col C` (1-based).
 - The rows, status line, and footer fit `maxBytes`. When the rows do not fit, the top rows are dropped first, behind the marker `... [N top rows omitted] ...`.
-- The output stream counts as read up to the screen, so a later stream poll starts after it. The log keeps every byte.
+- A synchronized update (`ESC[?2026h` to `ESC[?2026l`) shows once it ends, whichever read its end arrives in, or 150 ms after it began, the emulator's timeout, even while the program writes nothing.
+- The output stream counts as read up to the output the screen shows, so a later stream poll starts after it; output a synchronized update still holds stays unread. The log keeps every byte.
 - The emulator decodes UTF-8.
+- If the emulator panics on some output (`alacritty_terminal` 0.26 does past 4096 kitty keyboard pushes), it stops for that task. Capture, the log, `poll`, and `transcript` continue; `screen` and `keys` return errors, since the emulator no longer knows the screen or the keyboard mode.
 
 ### Transcript
 
-`transcript` replays a PTY task's stored log through a second terminal emulator (`alacritty_terminal` 0.26) of the same 120×30 size with 10,000 lines of scrollback history, and reads its history and screen:
+`transcript` replays a PTY task's stored log through a separate instance of the same emulator, 120×30 with 10,000 lines of scrollback history, and reads its history and screen:
 
 - A line a program pushes off the screen enters the history whether it scrolls away, leaves a scroll region whose top margin is the first row (how Codex inserts its history above its composer), or is cleared with the screen before a full redraw. Clearing the history (`ESC[3J`, sent by pi before a full redraw) removes the lines it holds. Each line therefore appears once, in the order a user scrolling up would read it.
 - Rows the terminal wrapped join into one logical line; tabs become spaces; trailing spaces and blank lines at the end are dropped. Wide characters appear once, with their combining marks.
-- Output held for a synchronized update (`ESC[?2026h`) that never ended is shown as received.
+- A synchronized update ends where its end sequence is, or at the end of the log, which keeps no timing; the final screen matches the live one for the same bytes.
 - A program on the alternate screen keeps no history there. The transcript holds the normal screen's history and screen, then a `--- alternate screen ---` line and the alternate screen; the status line says so. TUIs with an inline mode, such as `codex --no-alt-screen`, keep their replies in the history.
 - Once the history holds 10,000 lines, older lines are dropped and the status line says so. One render runs at a time. The history grid takes about 30 MiB; combining marks stored in cells add memory in proportion to the log. A 28 MiB log renders in about 0.4 s.
-- Repeats (`CSI n b`) print the last character up to 65535 times, so a few bytes could cost minutes of rendering, and a repeated zero-width character stacks on one cell without limit. Before the emulator, a second instance of the emulator's parser reads every byte and finds each repeat where the emulator would run it. A repeat longer than a row becomes a row, and a repeat of a zero-width character is dropped: its final byte is replaced with one the emulator ignores. Every other byte passes unchanged, so a render's time and memory stay proportional to the log.
 - The transcript covers the stored log, at most its first 64 MiB, as the status line's dropped-bytes note shows; an evicted log returns an error.
 - The window follows the output-window rules of this section: `maxBytes` covers the window, status line, and footer, and the omission marker names transcript lines, such as `... [70 lines omitted: transcript lines 1-70] ...`. The status line names the transcript file; `grep` and `sed` read it. The file is removed with the task's log.
 
@@ -171,7 +176,7 @@ Every window decodes its text as UTF-8, or with `encoding` when given. Invalid s
 **Cleaning** (default; `raw: false`):
 
 - Strip ANSI escape sequences: CSI, OSC, and two-byte ESC sequences.
-- Treat CRLF as a newline.
+- Treat CRLF as a newline, and CR CR LF, the form a Unix PTY gives a program's CRLF, too.
 - Treat a lone CR as overwriting the current line: the text after the last CR remains.
 - Drop other C0 control characters and DEL, except tab.
 - Trim trailing spaces; terminals such as ConPTY pad lines with them.
@@ -242,7 +247,7 @@ PTY commands start from the server's process environment: portable-pty's own see
   - `portable-pty` 0.9.0 (ConPTY on Windows, Unix PTY elsewhere), size 120×30.
   - Input goes through the master writer, fed by the same per-task queue.
   - The reader drains `try_clone_reader()` into the same log path as pipe mode.
-  - The reader feeds every chunk into the task's terminal emulator (§5), which answers each cursor-position query (`ESC[6n`) with the cursor's position and each primary device-attributes query (`ESC[c`) with `ESC[?1;2c`. ConPTY sends both at startup and holds output until a terminal answers. Replies share the 1 MiB input limit; replies past it are dropped.
+  - A reader thread passes each chunk to the capture thread, which feeds it into the task's terminal emulator (§5) and the log; while a synchronized update is open, the capture thread also wakes at its deadline. The emulator answers terminal queries as `alacritty_terminal` does, such as the cursor-position report (`ESC[6n`) and primary device attributes (`ESC[c`), which ConPTY sends at startup and holds output until a terminal answers. Replies share the 1 MiB input limit; replies past it are dropped.
   - Windows x64 builds embed Microsoft's ConPTY 1.24.260710001 (`vendor/conpty`: `conpty.dll` and its host `OpenConsole.exe`, MIT). Before the first PTY opens, the server writes both files to `%TEMP%\fastexec-conpty-1.24.260710001`, shared by every server of this version: a file whose bytes differ from the embedded copy is rewritten under a temporary name and renamed into place. The server then opens each file sharing only read access, checks its bytes through that handle, and keeps the handle open for its lifetime, so no process can change, replace, or delete a verified file while `conpty.dll` loads and `OpenConsole.exe` starts with each PTY. It then loads `conpty.dll` by its full path, so portable-pty's load of `conpty.dll` by name resolves to it. The system ConPTY of earlier Windows releases re-renders a program's output and loses scroll-region inserts, history clears, and alternate-screen switches; the bundled one passes them through to the log. When extraction or loading fails, stderr names the cause, PTY tasks use the system ConPTY, and `transcript` results warn that lines may be missing.
 
 ### 6.3 Process-tree ownership
@@ -260,7 +265,7 @@ PTY commands start from the server's process environment: portable-pty's own see
 
 ### 6.4 Concurrency
 
-Each task runs three threads: an output reader, an input writer, and a waiter. Short locks guard the output counters, the cursor, the input sender, and the final status; waits subscribe to a completion channel and hold no lock. Tool calls run in parallel, so a 240 s `poll` on one task leaves `kill` and other polls responsive. At most 16 tasks run at once; a further `start` returns `TOO_MANY_TASKS`.
+Each task runs four threads: an output reader, a capture thread that stores the output and feeds the emulator, an input writer, and a waiter. Short locks guard the output counters, the cursor, the input sender, and the final status; waits subscribe to a completion channel and hold no lock. Tool calls run in parallel, so a 240 s `poll` on one task leaves `kill` and other polls responsive. At most 16 tasks run at once; a further `start` returns `TOO_MANY_TASKS`.
 
 A task is its whole process tree. When the root bash exits, the waiter terminates whatever remains of the tree, closes a PTY, and waits up to 2 s for the reader to reach EOF. It then closes stdin and commits the final state once. Long-lived processes such as development servers therefore run as their own task. If output stays open past the 2 s cap, the status line says so and later polls show any further output.
 
@@ -307,15 +312,15 @@ pi with the `pi-mcp-adapter` extension (2.26), which replaces the built-in MCP s
 | `src/process.rs` | launch, environment, locale, Job Object, process session, PTY spawn | FastCtx `src/shell/process.rs` and `src/process_policy.rs`, plus PTY |
 | `src/output.rs` | streaming ANSI/CR cleaning and head/tail windows under a byte budget | FastCtx `src/shell/normalize.rs` and `src/shell/output.rs`, with CR overwrite |
 | `src/tasks.rs` | task registry, log capture, cursors, input queues, retention, shutdown | new |
-| `src/keys.rs` | tmux key names to terminal input bytes (§3 Keys) | tmux `key-string.c` and `input-keys.c` |
-| `src/transcript.rs` | log replay through `alacritty_terminal` into history and screen lines (§5 Transcript) | new |
+| `src/keys.rs` | tmux key names to terminal input bytes, legacy and kitty keyboard protocol (§3 Keys) | tmux `key-string.c` and `input-keys.c`; Windows Terminal `terminalInput.cpp` |
+| `src/terminal.rs` | the `alacritty_terminal` emulator of a PTY task, and log replay into history and screen lines (§5 Screen, Transcript) | new |
 | `src/conpty.rs` | extraction and loading of the bundled ConPTY (§6.2) | new |
 | `vendor/conpty` | Microsoft ConPTY 1.24.260710001 x64 binaries, license, and hashes | Microsoft (MIT) |
 | `tests/mcp.rs` | contract tests that drive the built binary over MCP stdio | new |
 
 `Cargo.toml` lists the dependencies and pins rmcp (`=2.2.0`), portable-pty (`=0.9.0`), and alacritty_terminal (`=0.26.0`) exactly.
 
-Files derived from FastCtx open with a header that names the FastCtx source files and credits FastCtx (Apache-2.0, Copyright 2026 yc-duan). The repository `NOTICE` lists those files and credits tmux (ISC) for the key names and encodings in `src/keys.rs`.
+Files derived from FastCtx open with a header that names the FastCtx source files and credits FastCtx (Apache-2.0, Copyright 2026 yc-duan). The repository `NOTICE` lists those files and credits tmux (ISC) for the key names and legacy encodings and Windows Terminal (MIT) for the kitty keyboard protocol encoding in `src/keys.rs`.
 
 ## 9. Acceptance
 
@@ -328,7 +333,7 @@ Run every case on Windows 11 x64 with Git for Windows and on Ubuntu x64 with bas
 | A3 | 240 s poll | Completes within pi's request timeout; progress appears in the TUI; an early exit returns early |
 | A4 | Cancel during wait | The call ends; the task keeps running; `list` shows a task whose `start` was cancelled |
 | A5 | Pipe input | A line-reading program receives each exact `input`; `eof` delivers EOF |
-| A6 | PTY input | The program sees a TTY; `keys` Enter, C-c, and C-d behave as terminal keys after `input`; arrows follow the program's cursor mode; an ssh password prompt accepts `input` |
+| A6 | PTY input | The program sees a TTY; `keys` Enter, C-c, and C-d behave as terminal keys after `input`; arrows follow the program's cursor mode; keys follow the kitty keyboard protocol once the program pushes it; an ssh password prompt accepts `input` |
 | A7 | `kill` | Shell → child → grandchild trees end on both platforms; repeated `kill` returns the same final state |
 | A8 | Session end | `/reload`, `/new`, and quit end every task tree and remove the log directory |
 | A9 | Output windows | All four `truncate` modes respect `maxBytes`; the omitted line range matches the log; `raw` keeps ANSI and CR |

@@ -524,6 +524,51 @@ fn pty_keys_follow_input_and_the_programs_cursor_mode() {
 }
 
 #[test]
+fn pty_keys_follow_the_kitty_keyboard_protocol_the_program_pushes() {
+    let mut server = Server::start();
+    // The program pushes the disambiguation flag, queries the flags, and dumps what it reads;
+    // then it pops the flag and dumps again.
+    let command = concat!(
+        "stty raw -echo; printf '\\033[>1u\\033[?u'; IFS= read -r -d u flags; ",
+        "printf 'flags=%s\\r\\n' \"${flags#?}\"; head -c 14 | od -An -tx1; ",
+        "printf '\\033[<upopped\\r\\n'; head -c 2 | od -An -tx1"
+    );
+    let (_, text) =
+        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 3000}));
+    assert!(text.contains("flags=[?1"), "{text}");
+    let (_, text) = server.ok(json!({
+        "action": "poll", "taskId": "t1", "keys": ["Escape", "C-i", "Tab"], "waitMs": 3000
+    }));
+    assert!(
+        text.contains("1b 5b 32 37 75 1b 5b 31 30 35 3b 35 75 09") && text.contains("popped"),
+        "Escape and C-i as CSI u, Tab as itself: {text}"
+    );
+    let (out, text) = server.ok(json!({
+        "action": "poll", "taskId": "t1", "keys": ["Escape", "Tab"], "waitMs": 10000
+    }));
+    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("1b 09"), "legacy bytes once popped: {text}");
+}
+
+#[test]
+fn a_terminal_emulator_failure_leaves_the_output_flowing() {
+    let mut server = Server::start();
+    // alacritty_terminal 0.26 panics past 4096 kitty keyboard pushes.
+    let command = "printf '\\033[>1u%.0s' $(seq 1 4097); printf 'alive\\r\\n'; read -r x; printf 'done\\r\\n'";
+    let (_, text) =
+        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 5000}));
+    assert!(text.contains("alive"), "{text}");
+    let (_, text, is_error) =
+        server.call(json!({"action": "poll", "taskId": "t1", "keys": ["Enter"]}));
+    assert!(is_error && text.contains("stopped"), "{text}");
+    let (out, text) = server.ok(json!({
+        "action": "poll", "taskId": "t1", "input": "\r", "waitMs": 10000
+    }));
+    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("done"), "{text}");
+}
+
+#[test]
 fn screen_shows_the_rendered_terminal_and_marks_the_stream_read() {
     let mut server = Server::start();
     // Frame 1 is printed, then cleared and overwritten in place at row 2.
@@ -547,6 +592,14 @@ fn screen_shows_the_rendered_terminal_and_marks_the_stream_read() {
     }));
     assert_eq!(out["cursor"], json!([1, 120]), "{text}");
     server.ok(json!({"action": "kill", "taskId": "t2"}));
+
+    // A synchronized update the program leaves open shows once it times out.
+    let command = "printf 'shown\\r\\n\\033[?2026hheld'; read -r x";
+    let (_, text) = server.ok(json!({
+        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 2000
+    }));
+    assert_eq!(text.split("\n\n[").next().unwrap(), "shown\nheld", "{text}");
+    server.ok(json!({"action": "kill", "taskId": "t3"}));
 }
 
 #[test]
@@ -554,7 +607,7 @@ fn screen_and_transcript_render_the_same_terminal() {
     let mut server = Server::start();
     // Each row needs the terminal to act on a sequence: REP repeats the last character, IRM
     // inserts, a combining mark joins its base, a wide character fills two columns, combining
-    // marks stack on their cell only up to a bound (DEL between them moves nothing), a tab
+    // marks all stack on their cell (DEL between them moves nothing), a tab
     // moves to its stop, and deleting the first half of a wide character leaves a blank.
     let command = concat!(
         "printf 'rep x\\033[4b\\r\\n'; ",
@@ -568,7 +621,7 @@ fn screen_and_transcript_render_the_same_terminal() {
         "rep xxxxx".to_string(),
         "irm aZbc".to_string(),
         "mix e\u{301} 中文!".to_string(),
-        format!("cap e{}", "\u{301}".repeat(32)),
+        format!("cap e{}", "\u{301}".repeat(40)),
         "tab a   b".to_string(),
         "dch  a".to_string(),
     ]

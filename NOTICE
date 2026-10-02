@@ -7,7 +7,10 @@ src/bash.rs, src/process.rs, and src/output.rs.
 
 src/keys.rs follows the key names and key encodings of tmux
 (https://github.com/tmux/tmux), Copyright (c) Nicholas Marriott and
-contributors, licensed under the ISC license.
+contributors, licensed under the ISC license. Its kitty keyboard protocol
+encoding follows Windows Terminal src/terminal/input/terminalInput.cpp
+(https://github.com/microsoft/terminal), Copyright (c) Microsoft
+Corporation, licensed under the MIT license.
 
 vendor/conpty/x64/conpty.dll and vendor/conpty/x64/OpenConsole.exe are
 Microsoft's ConPTY (https://github.com/microsoft/terminal), Copyright (c)

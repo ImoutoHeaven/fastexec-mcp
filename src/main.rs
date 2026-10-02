@@ -337,9 +337,11 @@ impl Server {
                     );
                 }
                 let mut data = request.input.clone().unwrap_or_default().into_bytes();
-                let modes = task.modes();
-                for name in request.keys.iter().flatten() {
-                    data.extend(keys::encode(name, keys::parse(name)?, modes)?);
+                if let Some(names) = &request.keys {
+                    let modes = task.modes()?;
+                    for name in names {
+                        data.extend(keys::encode(name, keys::parse(name)?, modes)?);
+                    }
                 }
                 if data.len() > MAX_INPUT_BYTES {
                     return Err(
@@ -691,7 +693,7 @@ impl Server {
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
         // A finished state, taken first, means the screen below holds all output.
         let snapshot = task.snapshot();
-        let screen = task.screen().ok_or("screen applies to PTY tasks only.")?;
+        let screen = task.screen()?;
         // The stream counts as read up to the output the screen shows.
         let (reader, until) = (Arc::clone(&task), screen.log_end);
         tokio::task::spawn_blocking(move || {
