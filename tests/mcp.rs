@@ -550,6 +550,64 @@ fn screen_shows_the_rendered_terminal_and_marks_the_stream_read() {
 }
 
 #[test]
+fn screen_and_transcript_render_the_same_terminal() {
+    let mut server = Server::start();
+    // Each row needs the terminal to act on a sequence: REP repeats the last character, IRM
+    // inserts, a combining mark joins its base, a wide character fills two columns, combining
+    // marks stack on their cell only up to a bound (DEL between them moves nothing), a tab
+    // moves to its stop, and deleting the first half of a wide character leaves a blank.
+    let command = concat!(
+        "printf 'rep x\\033[4b\\r\\n'; ",
+        "printf 'irm abc\\r\\033[5C\\033[4hZ\\033[4l\\r\\n'; ",
+        "printf 'mix e\\314\\201 \\344\\270\\255\\346\\226\\207!\\r\\n'; ",
+        "printf 'cap e'; for i in $(seq 40); do printf '\\314\\201\\177'; done; printf '\\r\\n'; ",
+        "printf 'tab a\\tb\\r\\n'; ",
+        "printf 'dch \\344\\270\\255a\\r\\033[4C\\033[P\\r\\n'; read -r x"
+    );
+    let expected = [
+        "rep xxxxx".to_string(),
+        "irm aZbc".to_string(),
+        "mix e\u{301} 中文!".to_string(),
+        format!("cap e{}", "\u{301}".repeat(32)),
+        "tab a   b".to_string(),
+        "dch  a".to_string(),
+    ]
+    .join("\n");
+    let (out, text) = server.ok(json!({
+        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 3000
+    }));
+    assert_eq!(out["state"], "running", "{text}");
+    assert_eq!(
+        text.split("\n\n[").next().unwrap(),
+        expected,
+        "screen: {text}"
+    );
+    assert_eq!(out["cursor"], json!([7, 1]), "{text}");
+    let (_, text) = server.ok(json!({"action": "transcript", "taskId": "t1", "truncate": "none"}));
+    assert_eq!(
+        text.split("\n\n[").next().unwrap(),
+        expected,
+        "transcript: {text}"
+    );
+    server.ok(json!({"action": "kill", "taskId": "t1"}));
+}
+
+#[test]
+fn pty_programs_get_answers_to_terminal_queries() {
+    let mut server = Server::start();
+    // A cursor-position report (DSR 6) and primary device attributes (DA1), read raw.
+    let command = concat!(
+        "stty raw -echo; printf 'ab\\033[6n'; IFS= read -r -d R cpr; ",
+        "printf '\\033[c'; IFS= read -r -d c da; ",
+        "printf '\\r\\ncpr=%s da=%s\\r\\n' \"${cpr#?}\" \"${da#?}\""
+    );
+    let (out, text) =
+        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 10000}));
+    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("cpr=[1;3 da=[?"), "{text}");
+}
+
+#[test]
 fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
     let mut server = Server::start();
     // Like pi, a full redraw clears the screen and its history (ED2, ED3), then reprints.

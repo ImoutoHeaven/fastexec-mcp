@@ -5,6 +5,7 @@ use crate::output::{
     incomplete_utf8_suffix,
 };
 use crate::process::{self, Launch, Tree};
+use crate::terminal::Live;
 use encoding_rs::Encoding;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -60,42 +61,10 @@ pub struct Task {
     done: watch::Sender<bool>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
     queued: AtomicUsize,
-    /// PTY tasks: a terminal emulator fed with every output byte.
-    terminal: Option<Mutex<vt100::Parser<Replies>>>,
-}
-
-/// Replies to the terminal queries the emulator sees: cursor-position reports (`ESC[6n`) and
-/// primary device attributes (`ESC[c`). ConPTY asks both at startup and holds output until a
-/// terminal answers.
-#[derive(Default)]
-struct Replies(Vec<u8>);
-
-impl vt100::Callbacks for Replies {
-    fn unhandled_csi(
-        &mut self,
-        screen: &mut vt100::Screen,
-        i1: Option<u8>,
-        _: Option<u8>,
-        params: &[&[u16]],
-        c: char,
-    ) {
-        if c == 'c' && i1.is_none() && matches!(params, [] | [[0]]) {
-            // A VT100 with advanced video, as xterm reports itself.
-            self.0.extend_from_slice(b"\x1b[?1;2c");
-        }
-        if c == 'n' && i1.is_none() && params == [&[6][..]] {
-            let (row, col) = cursor(screen);
-            self.0
-                .extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
-        }
-    }
-}
-
-/// Zero-based cursor row and column. After a write to the last column, vt100 keeps the
-/// pending wrap as column `width`; a terminal reports the last column.
-fn cursor(screen: &vt100::Screen) -> (u16, u16) {
-    let (row, col) = screen.cursor_position();
-    (row, col.min(screen.size().1 - 1))
+    /// PTY tasks: a terminal emulator fed with every output byte. Its replies to terminal
+    /// queries, such as the cursor-position report and device attributes ConPTY waits for at
+    /// startup, go to the program as input.
+    terminal: Option<Mutex<Live>>,
 }
 
 /// The rendered terminal of a PTY task.
@@ -256,14 +225,7 @@ impl Tasks {
             done: watch::Sender::new(false),
             input: Mutex::new(Some(input_tx.clone())),
             queued: AtomicUsize::new(0),
-            terminal: args.pty.then(|| {
-                Mutex::new(vt100::Parser::new_with_callbacks(
-                    process::PTY_ROWS,
-                    process::PTY_COLS,
-                    0,
-                    Replies::default(),
-                ))
-            }),
+            terminal: args.pty.then(|| Mutex::new(Live::new())),
         });
         registry.tasks.push(Arc::clone(&task));
         drop(registry);
@@ -505,9 +467,8 @@ fn capture(
         // The emulator stays locked until the chunk is in the log, so a screen and the log
         // offset taken under that lock show the same output.
         let mut terminal = task.terminal.as_ref().map(lock);
-        if let (Some(parser), Some(answer)) = (terminal.as_mut(), &answer) {
-            parser.process(chunk);
-            let reply = std::mem::take(&mut parser.callbacks_mut().0);
+        if let (Some(terminal), Some(answer)) = (terminal.as_mut(), &answer) {
+            let reply = terminal.process(chunk);
             // Replies share the input limit; past it they are dropped, never queued unbounded.
             if !reply.is_empty()
                 && task.admit(reply.len())
@@ -619,30 +580,17 @@ impl Task {
     pub fn modes(&self) -> crate::keys::Modes {
         self.terminal
             .as_ref()
-            .map_or_else(Default::default, |terminal| {
-                let parser = lock(terminal);
-                crate::keys::Modes {
-                    cursor: parser.screen().application_cursor(),
-                    keypad: parser.screen().application_keypad(),
-                }
-            })
+            .map_or_else(Default::default, |terminal| lock(terminal).modes())
     }
 
     /// The rendered terminal; `None` for pipe tasks.
     pub fn screen(&self) -> Option<Screen> {
-        let parser = lock(self.terminal.as_ref()?);
+        let terminal = lock(self.terminal.as_ref()?);
         let log_end = lock(&self.out).readable;
-        let screen = parser.screen();
-        let mut rows: Vec<String> = screen
-            .rows(0, screen.size().1)
-            .map(|row| row.trim_end().to_string())
-            .collect();
-        while rows.last().is_some_and(String::is_empty) {
-            rows.pop();
-        }
+        let (rows, cursor) = terminal.screen();
         Some(Screen {
             rows,
-            cursor: cursor(screen),
+            cursor,
             log_end,
         })
     }
@@ -654,7 +602,7 @@ impl Task {
     }
 
     /// Renders the stored log as a terminal shows it and writes it to `transcript_path`.
-    pub fn transcript(&self) -> Result<crate::transcript::Transcript, String> {
+    pub fn transcript(&self) -> Result<crate::terminal::Transcript, String> {
         let (stored, evicted) = {
             let out = lock(&self.out);
             (out.written, out.evicted)
@@ -665,7 +613,7 @@ impl Task {
         let log = File::open(&self.log_path)
             .map_err(|error| format!("Cannot read the task log: {error}."))?;
         let path = self.transcript_path();
-        let transcript = crate::transcript::render(log, stored, &path)
+        let transcript = crate::terminal::render(log, stored, &path)
             .map_err(|error| format!("Cannot render the transcript: {error}."))?;
         // An eviction during the render removed the log; the transcript goes with it. Eviction
         // after this check removes the file itself.

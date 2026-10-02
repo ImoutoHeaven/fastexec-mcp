@@ -6,7 +6,7 @@ mod keys;
 mod output;
 mod process;
 mod tasks;
-mod transcript;
+mod terminal;
 
 use output::{Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
 use rmcp::handler::server::wrapper::Parameters;
@@ -588,13 +588,13 @@ impl Server {
         if transcript.history_full {
             status.push_str(&format!(
                 " · history holds the last {} lines; older lines are not shown",
-                transcript::HISTORY_LINES
+                terminal::HISTORY_LINES
             ));
         }
         if transcript.alternate_screen {
             status.push_str(&format!(
                 " · the program is on the alternate screen, which keeps no history; it follows the {:?} line",
-                transcript::ALTERNATE_MARKER
+                terminal::ALTERNATE_MARKER
             ));
         }
         if let Some(warning) = conpty::load() {
