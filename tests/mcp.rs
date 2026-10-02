@@ -550,6 +550,68 @@ fn screen_shows_the_rendered_terminal_and_marks_the_stream_read() {
 }
 
 #[test]
+fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
+    let mut server = Server::start();
+    // Like pi, a full redraw clears the screen and its history (ED2, ED3), then reprints.
+    // Like Codex, history lines are then inserted through a scroll region above a fixed
+    // composer row. Both push lines past the 30-row screen.
+    let command = concat!(
+        "seq -f 'stale %g' 1 40; printf '\\033[2J\\033[H\\033[3J'; seq -f 'plain %g' 1 40; ",
+        "printf '\\033[30;1H> composer'; ",
+        "for k in $(seq 1 40); do ",
+        "printf '\\033[1;29r\\033[29;1H\\r\\ninsert %d\\033[r\\033[30;1H> composer\\033[K' $k; done"
+    );
+    let (out, text) =
+        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000}));
+    assert_eq!(out["state"], "exited", "{text}");
+    let (out, text) =
+        server.ok(json!({"action": "transcript", "taskId": "t1", "truncate": "none"}));
+    let body = text.split("\n\n[").next().unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    let expected: Vec<String> = (1..=40)
+        .map(|k| format!("plain {k}"))
+        .chain((1..=40).map(|k| format!("insert {k}")))
+        .chain(["> composer".to_string()])
+        .collect();
+    let positions: Vec<usize> = expected
+        .iter()
+        .map(|line| {
+            let found: Vec<usize> = (0..lines.len()).filter(|&i| lines[i] == line).collect();
+            assert_eq!(found.len(), 1, "{line:?} must appear once: {text}");
+            found[0]
+        })
+        .collect();
+    assert!(positions.is_sorted(), "lines out of order: {text}");
+    assert!(!body.contains("stale"), "cleared history came back: {text}");
+    let file = std::fs::read_to_string(out["transcriptPath"].as_str().unwrap()).unwrap();
+    assert_eq!(file.trim_end(), body.trim_end());
+
+    // A program on the alternate screen: the normal screen's history, then the full-screen view.
+    let command =
+        "seq -f 'normal %g' 1 40; printf 'a\\tb\\n\\033[?1049h\\033[Hfull-screen view'; read -r x";
+    server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 3000}));
+    let (out, text) =
+        server.ok(json!({"action": "transcript", "taskId": "t2", "truncate": "none"}));
+    assert_eq!(out["alternateScreen"], true, "{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    let normal = lines.iter().position(|line| *line == "normal 1");
+    let marker = lines
+        .iter()
+        .position(|line| *line == "--- alternate screen ---");
+    assert!(normal.is_some_and(|normal| Some(normal) < marker), "{text}");
+    assert_eq!(lines[marker.unwrap() + 1], "full-screen view", "{text}");
+    assert!(
+        lines.contains(&"a       b"),
+        "a tab reads as spaces to its stop: {text}"
+    );
+    server.ok(json!({"action": "kill", "taskId": "t2"}));
+
+    server.ok(json!({"action": "start", "command": "echo pipe"}));
+    let (_, text, is_error) = server.call(json!({"action": "transcript", "taskId": "t3"}));
+    assert!(is_error && text.contains("PTY tasks only"), "{text}");
+}
+
+#[test]
 fn kill_and_root_exit_end_the_whole_process_tree() {
     // Scratch guards are declared before the server so they outlive it, also when unwinding:
     // the server stops its writers before the files are removed.
@@ -859,6 +921,11 @@ fn invalid_parameters_are_rejected_and_null_means_omitted() {
         (
             json!({"action": "start", "command": "true", "pty": true, "screen": true, "raw": true}),
             "does not apply with screen",
+        ),
+        (json!({"action": "transcript"}), "needs `taskId`"),
+        (
+            json!({"action": "transcript", "taskId": "t1", "waitMs": 0}),
+            "`waitMs` does not apply",
         ),
     ] {
         let (_, text, is_error) = server.call(arguments.clone());

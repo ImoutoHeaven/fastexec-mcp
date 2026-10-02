@@ -7,12 +7,14 @@ license = "Apache-2.0"
 description = "MCP server that runs bash commands with background tasks, stdin input, and PTY"
 
 [dependencies]
+alacritty_terminal = "=0.26.0"
 encoding_rs = "0.8"
 portable-pty = "=0.9.0"
 rmcp = { version = "=2.2.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+unicode-width = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-std"] }
 vt100 = "0.16"
 
@@ -20,7 +22,7 @@ vt100 = "0.16"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
 
 [profile.release]
 strip = true

@@ -266,6 +266,8 @@ fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     fn other(error: impl std::fmt::Display) -> std::io::Error {
         std::io::Error::other(error.to_string())
     }
+    // Before portable-pty first opens ConPTY, so it picks the bundled one.
+    crate::conpty::load();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: PTY_ROWS,

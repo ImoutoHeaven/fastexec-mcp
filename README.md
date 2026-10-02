@@ -6,6 +6,7 @@ fastexec is a stdio MCP server with one tool, `fastexec`, that runs bash command
 - A command that outlives the window keeps running in the background; the model continues with `poll`.
 - Running tasks accept input through a stdin pipe or, on request, a pseudo-terminal (PTY). The PTY handles interactive prompts such as ssh passwords.
 - `kill` terminates a task's whole process tree.
+- `transcript` renders a PTY task's whole output as a terminal shows it, so a long reply inside a TUI reads in full.
 
 It runs on Windows (Git Bash) and Linux (GNU bash) and ships as a single binary.
 
@@ -54,7 +55,7 @@ For any other MCP host, set its tool timeout to at least 300 s unless it sends p
 
 ### Output placement
 
-Set `FASTEXEC_OUTPUT_MODE` in the MCP server's `env` configuration. With `FASTEXEC_STRUCTURED_CONTENT=true` (default), the mode applies to every `start` and `poll` result for that server:
+Set `FASTEXEC_OUTPUT_MODE` in the MCP server's `env` configuration. With `FASTEXEC_STRUCTURED_CONTENT=true` (default), the mode applies to every `start`, `poll`, and `transcript` result for that server:
 
 | Mode | Text `content` | `structuredContent.output` |
 |---|---|---|
@@ -114,6 +115,7 @@ One tool takes an `action` and the parameters that apply to it:
 | `poll` | `taskId`, `input`, `keys`, `eof`, `waitMs` (default 2000 with input or keys, 30000 without), output options, `screen` | Writes `input` exactly as given, then presses `keys`, closes stdin when `eof` is true, waits until the task ends or `waitMs` elapses, and returns output not yet seen. |
 | `kill` | `taskId` | Terminates the task's process tree and returns its final state. A failed termination call returns an error naming the cause. |
 | `list` | — | Lists this server's tasks, newest first. |
+| `transcript` | `taskId`, `truncate` (default `tail`), `maxBytes` | Renders a PTY task's stored output as a terminal shows it: the scrollback history, then the screen. Writes the full text beside the log and returns its last lines. |
 
 Output options:
 
@@ -126,7 +128,7 @@ Behavior:
 
 - **Waits.** Each wait lasts at most 240 s. An ended wait, a cancelled call, or a timeout leaves the process running.
 - **Lifetime limit.** `killAfterMs` on `start` kills the task's whole tree that many milliseconds after launch, independently of waits, polls, and cancelled calls; 0 or omitted means no limit. Such a task reports `state: killed`, `lifetimeExpired: true`, and `killed by killAfterMs` in its status line.
-- **Background footer.** `start`, `poll`, and `kill` results end with a line such as `(Background: t3 exited 7, t5 running 4m3s.)` naming the server's other tasks that need attention: finished tasks whose final state no result has shown yet, failures first, then running tasks. It names at most three tasks, then counts the rest, within 512 bytes and a quarter of `maxBytes`. A finished task leaves the footer once a result or `list` has shown its final state.
+- **Background footer.** `start`, `poll`, `kill`, and `transcript` results end with a line such as `(Background: t3 exited 7, t5 running 4m3s.)` naming the server's other tasks that need attention: finished tasks whose final state no result has shown yet, failures first, then running tasks. It names at most three tasks, then counts the rest, within 512 bytes and a quarter of `maxBytes`. A finished task leaves the footer once a result or `list` has shown its final state.
 - **Environment.** Pipe and PTY tasks inherit the server's environment, then fastexec sets terminal, pager, and locale variables.
 - **Output.** stdout and stderr share one stream. Cleaning strips ANSI sequences, collapses carriage-return progress bars to their final text, and trims trailing spaces. A multibyte character that arrives in two parts, in UTF-8 or in an `encoding` such as `big5`, is shown whole once its last byte arrives.
 - **Results.** Each `start` or `poll` text result ends with a status line such as `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/t3.log`. `FASTEXEC_STRUCTURED_CONTENT` enables task and window metadata as JSON by default; `false` selects text-only results. With structured content enabled, `FASTEXEC_OUTPUT_MODE` selects where the output body appears.
@@ -134,6 +136,8 @@ Behavior:
 - **Process trees.** A task is its whole process tree. When the root bash exits, the rest of the tree ends too, so long-lived servers run as their own task. Windows uses a kill-on-close Job Object. Linux kills the task's process group and every process in its session; a process that starts its own session (`setsid`, daemons) leaves the tree.
 - **PTY keys.** `keys` presses keys in a PTY task after `input` is written, in array order, named as in tmux `send-keys`: `["Enter"]`, `["C-c"]`, `["Escape", ":", "q", "Enter"]`. Names cover Enter, Tab, Escape, arrows, editing and function keys, the keypad, single characters, and the `C-`, `M-`, and `S-` modifiers; arrow keys follow the program's cursor mode. An unknown name, or a modifier the key cannot carry such as `C-Enter`, returns an error and sends nothing.
 - **Screen.** `screen: true` on `start` or `poll` of a PTY task returns the rendered 120×30 terminal screen and the cursor position instead of the output stream, so full-screen and TUI programs show their current frame rather than every redraw. It marks the stream read and does not combine with `truncate`, `raw`, or `encoding`.
+- **Transcript.** `transcript` replays the task log through a terminal emulator with 10,000 lines of history. Each line a program pushed off the screen appears once, in order, whether it scrolled away, moved up through a scroll region, or was reprinted after a full redraw that cleared the history. Rows the terminal wrapped join into one line, and tabs become spaces. The status line names the file `<taskId>.transcript.txt` that holds the whole text; `grep` and `sed` read it. A program on the alternate screen keeps no history there: the transcript shows the normal screen's history and screen, then the current view after a `--- alternate screen ---` line. Run TUIs in their inline mode, such as `codex --no-alt-screen`, to keep their replies readable. `transcript` neither waits nor moves the poll cursor.
+- **ConPTY.** On Windows x64, PTY tasks use Microsoft's ConPTY 1.24, which the binary carries and extracts to `%TEMP%\fastexec-conpty-1.24.260710001`. It passes a program's terminal output through unchanged, which `transcript` needs. If it cannot load, PTY tasks use the system ConPTY, stderr says why, and `transcript` results warn that lines may be missing.
 - **Lifetime.** Tasks live as long as the server. The host stops the server when its session ends, and every task ends with it.
 
 ## Test
@@ -146,4 +150,4 @@ The integration tests in `tests/mcp.rs` drive the built binary over MCP stdio.
 
 ## License
 
-Apache-2.0. Parts of `src/bash.rs`, `src/process.rs`, and `src/output.rs` derive from [FastCtx](https://github.com/yc-duan/fastctx); see `NOTICE`.
+Apache-2.0. Parts of `src/bash.rs`, `src/process.rs`, and `src/output.rs` derive from [FastCtx](https://github.com/yc-duan/fastctx); see `NOTICE`. `vendor/conpty` holds Microsoft's ConPTY binaries under the MIT license; see `vendor/conpty/README.md`.

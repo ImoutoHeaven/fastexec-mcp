@@ -64,8 +64,9 @@ pub struct Task {
     terminal: Option<Mutex<vt100::Parser<Replies>>>,
 }
 
-/// Replies to the terminal queries the emulator sees: cursor-position reports (`ESC[6n`).
-/// ConPTY sends one at startup and holds all output until a terminal answers.
+/// Replies to the terminal queries the emulator sees: cursor-position reports (`ESC[6n`) and
+/// primary device attributes (`ESC[c`). ConPTY asks both at startup and holds output until a
+/// terminal answers.
 #[derive(Default)]
 struct Replies(Vec<u8>);
 
@@ -78,6 +79,10 @@ impl vt100::Callbacks for Replies {
         params: &[&[u16]],
         c: char,
     ) {
+        if c == 'c' && i1.is_none() && matches!(params, [] | [[0]]) {
+            // A VT100 with advanced video, as xterm reports itself.
+            self.0.extend_from_slice(b"\x1b[?1;2c");
+        }
         if c == 'n' && i1.is_none() && params == [&[6][..]] {
             let (row, col) = cursor(screen);
             self.0
@@ -347,6 +352,7 @@ impl Tasks {
             out.evicted = true;
             self.log_bytes.fetch_sub(out.written, Ordering::SeqCst);
             let _ = std::fs::remove_file(&task.log_path);
+            let _ = std::fs::remove_file(task.transcript_path());
         }
     }
 
@@ -641,6 +647,35 @@ impl Task {
         })
     }
 
+    /// Where `transcript` writes its text, beside the log.
+    pub fn transcript_path(&self) -> PathBuf {
+        self.log_path
+            .with_file_name(format!("{}.transcript.txt", self.id))
+    }
+
+    /// Renders the stored log as a terminal shows it and writes it to `transcript_path`.
+    pub fn transcript(&self) -> Result<crate::transcript::Transcript, String> {
+        let (stored, evicted) = {
+            let out = lock(&self.out);
+            (out.written, out.evicted)
+        };
+        if evicted {
+            return Err("The log of this task was evicted under the 1 GiB total limit; no transcript can be rendered.".into());
+        }
+        let log = File::open(&self.log_path)
+            .map_err(|error| format!("Cannot read the task log: {error}."))?;
+        let path = self.transcript_path();
+        let transcript = crate::transcript::render(log, stored, &path)
+            .map_err(|error| format!("Cannot render the transcript: {error}."))?;
+        // An eviction during the render removed the log; the transcript goes with it. Eviction
+        // after this check removes the file itself.
+        if lock(&self.out).evicted {
+            let _ = std::fs::remove_file(&path);
+            return Err("The log of this task was evicted under the 1 GiB total limit while the transcript was rendered.".into());
+        }
+        Ok(transcript)
+    }
+
     /// Queues `input`, then closes stdin when `eof` is set. Validation happens before any write.
     pub fn send(&self, input: Option<&[u8]>, eof: bool) -> Result<(), String> {
         let data = input.filter(|bytes| !bytes.is_empty());
@@ -721,6 +756,7 @@ impl Task {
             budget,
             raw,
             encoding,
+            source: "log",
         };
         let mut builder = WindowBuilder::new(spec, &mut view.cleaner, first_line);
         if !evicted && end > start {

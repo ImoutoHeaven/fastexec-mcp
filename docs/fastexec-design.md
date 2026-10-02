@@ -9,7 +9,8 @@ fastexec is a stdio MCP server written in Rust. It ships as one binary and expos
 - a command that finishes within its wait window returns like a foreground command;
 - a command that outlives the window keeps running as a task, and the model returns to it with `poll`;
 - running tasks accept input through a stdin pipe or, on request, a pseudo-terminal (PTY);
-- `kill` terminates a task's whole process tree.
+- `kill` terminates a task's whole process tree;
+- `transcript` renders a PTY task's whole output as a terminal shows it, so the model reads a long reply inside a TUI in full.
 
 Tasks belong to the server process. The host starts the server with the session and stops it when the session ends, so every task ends with its session. The model learns about task completion by calling `poll`; the server sends nothing to the model on its own.
 
@@ -35,19 +36,19 @@ The tool takes one flat object with `deny_unknown_fields`. `action` selects the 
 
 | Parameter | Actions | Type, default, range | Meaning |
 |---|---|---|---|
-| `action` | all | `start` / `poll` / `kill` / `list` | Required |
+| `action` | all | `start` / `poll` / `kill` / `list` / `transcript` | Required |
 | `command` | start | non-blank string | Bash command line |
 | `cwd` | start | existing absolute directory; default: the server working directory | Working directory |
 | `pty` | start | boolean, `false` | Run inside a pseudo-terminal |
 | `loginShell` | start | boolean, `true` | `bash -lc` when true; `bash --noprofile --norc -c` when false |
 | `killAfterMs` | start | nonnegative integer; 0 or omitted: no limit | Kill the whole tree this long after launch, independently of waits, polls, and request cancellation |
-| `taskId` | poll, kill | string | Task returned by `start` or `list` |
+| `taskId` | poll, kill, transcript | string | Task returned by `start` or `list` |
 | `input` | poll | string, at most 16 KiB UTF-8 | Written exactly as given, before `keys` and before waiting |
 | `keys` | poll, PTY tasks | array of key names | Pressed after `input`, in array order (§3 Keys). `input` and the encoded keys together hold at most 16 KiB |
 | `eof` | poll | boolean, `false` | Pipe mode: close stdin after `input`. PTY mode: returns an error |
 | `waitMs` | start, poll | integer 0–240000 | Defaults: start 30000; poll with `input` or `keys` 2000; other polls 30000 |
-| `truncate` | start, poll | `head_tail` (default) / `head` / `tail` / `none` | Output window mode (§5) |
-| `maxBytes` | start, poll | integer 1024–1048576, default 16384 | Output window budget; rejected with `truncate: "none"` |
+| `truncate` | start, poll, transcript | `head_tail` (default; `tail` for transcript) / `head` / `tail` / `none` | Output window mode (§5) |
+| `maxBytes` | start, poll, transcript | integer 1024–1048576, default 16384 | Output window budget; rejected with `truncate: "none"` |
 | `raw` | start, poll | boolean, `false` | Return output without cleaning (§5) |
 | `encoding` | start, poll | ASCII-compatible WHATWG label, e.g. `gbk`, `big5` | Decode output from this encoding. A value on `start` becomes the task default; a value on `poll` applies to that call. UTF-16 labels are rejected because lines split on the LF byte |
 | `screen` | start, poll; PTY tasks | boolean, `false` | Return the rendered terminal screen instead of the output window (§5). Rejected with `truncate`, `raw`, or `encoding`, on `start` without `pty: true`, and on a task started with a non-UTF-8 `encoding` |
@@ -59,6 +60,7 @@ The tool takes one flat object with `deny_unknown_fields`. `action` selects the 
 - **`kill`** terminates the whole process tree (§6.3), waits up to 5 s for the exit, and returns the status with `state: "killed"`; a tree still running after 5 s returns `state: "running"` with a note to poll later. Unseen output stays available to `poll`. Killing a finished task returns its existing final state. A failed native termination call returns an error result naming the cause; an already empty tree counts as terminated.
 - **Lifetime limit.** A positive `killAfterMs` arms a timer owned by the task. When it fires while the task runs, the task is killed through the same tree termination and reports `state: "killed"` with `lifetimeExpired: true`. The kill and expiry flags are read when the root exits, so a root that exits before a kill keeps its natural result while its output drains.
 - **`list`** returns every task of this server, newest first.
+- **`transcript`** renders the task's stored log (§5 Transcript), writes the text to `<taskId>.transcript.txt` beside the log, and returns a window of it, the last lines by default. It applies to PTY tasks with UTF-8 output, works on running and finished tasks, does not wait, and leaves the poll cursor where it is.
 
 ### Keys
 
@@ -95,9 +97,10 @@ fastexec differs from tmux in two cases, both errors that deliver nothing: a nam
   - for `start`, `poll`, and `kill`: `ok`, `action`, `taskId`, `state` (`running` / `exited` / `killed`), `exitCode`, `pty`, `elapsedMs`, `logPath`, `lifetimeExpired`, and `logError` (the first log write failure, or `null`);
   - for `start` and `poll` with `screen`, additionally: `cursor` (`[row, column]`, 1-based) and `omittedRows`; in `both` and `structured` modes also `output`, the screen text;
   - for other `start` and `poll` results, additionally: `omittedLines`, `omittedRange` (`[first, last]` log lines or `null`), `cutLines` (shown lines that lost part of their text to a per-line limit or the budget), and `encodingErrors` (lines with invalid byte sequences). In `both` and `structured` modes they also carry `output`, the window text, with an empty string for an empty window; `content` displays `(no new output)` for that empty window in `text` and `both` modes;
+  - for `transcript`: the `start`/`poll`/`kill` fields, `omittedLines`, `omittedRange` (transcript lines), `cutLines`, `encodingErrors`, `transcriptPath`, `transcriptLines`, `alternateScreen`, and `historyFull`; in `both` and `structured` modes also `output`;
   - for `list`: `ok`, `action`, and a `tasks` array of `{taskId, state, exitCode, pty, elapsedMs, command (first 120 chars), logPath, lifetimeExpired}`;
   - for operational errors: `ok: false`, `action`, and `error`.
-- **Background footer.** `start`, `poll`, and `kill` results append one line after the status line, such as `(Background: t3 exited 7, t5 running 4m3s.)`. It names the other tasks that need attention: finished tasks whose final state no delivered result has shown, ranked failures (nonzero exit or `killAfterMs` expiry) first, then other completions, then running tasks, newest first within a rank. It names at most three, then appends the remaining count, aggregate counts, and `use list`; when that exceeds the cap it shows counts only. The cap is 512 bytes, and at most a quarter of `maxBytes` for bounded windows; the footer is reserved before the output window is sized, so the whole text still fits `maxBytes`. Showing a finished task's final state in a result, in the footer, or in `list` marks it reported. Results without such tasks carry no footer. The footer is best-effort delivery; `list` remains the complete view.
+- **Background footer.** `start`, `poll`, `kill`, and `transcript` results append one line after the status line, such as `(Background: t3 exited 7, t5 running 4m3s.)`. It names the other tasks that need attention: finished tasks whose final state no delivered result has shown, ranked failures (nonzero exit or `killAfterMs` expiry) first, then other completions, then running tasks, newest first within a rank. It names at most three, then appends the remaining count, aggregate counts, and `use list`; when that exceeds the cap it shows counts only. The cap is 512 bytes, and at most a quarter of `maxBytes` for bounded windows; the footer is reserved before the output window is sized, so the whole text still fits `maxBytes`. Showing a finished task's final state in a result, in the footer, or in `list` marks it reported. Results without such tasks carry no footer. The footer is best-effort delivery; `list` remains the complete view.
 - Task IDs are short and server-scoped: `t1`, `t2`, and so on.
 - Exit codes follow the bash convention: a signal exit reports `128 + signal`. On Windows the msys runtime reports signal N as status `N << 8`, which the server converts the same way. A Windows Job Object termination reports 1.
 - A non-zero exit code is a normal result with `ok: true`. Operational failures set `isError: true` and `ok: false` and carry a message that tells the model what to do next. They cover invalid parameter values and combinations, spawn errors, too many running tasks, unknown task IDs, closed stdin, input backpressure, `eof` in PTY mode, failed tree termination, and cancellation.
@@ -109,7 +112,7 @@ The tool description (`src/description.md`, at most 3 KB) says how to use the to
 
 `src/description.md` is the authoritative text. It covers:
 
-- the four actions, their defaults, and the 240 s wait limit; a non-zero exit code is a normal result;
+- the five actions, their defaults, and the 240 s wait limit; a non-zero exit code is a normal result;
 - GNU bash (Git Bash on Windows) and a fresh shell per `start`: calls pass `cwd` or chain with `&&`;
 - wait sizing: long waits for builds and tests, short ones for prompts, no repeated `waitMs: 0` polls or `sleep` commands;
 - task lifetime: tasks end with the session, and the rest of a tree ends with its root bash, so long-lived servers run as their own task;
@@ -143,6 +146,19 @@ Each PTY task feeds all of its output into a 120×30 terminal emulator (`vt100` 
 - The rows, status line, and footer fit `maxBytes`. When the rows do not fit, the top rows are dropped first, behind the marker `... [N top rows omitted] ...`.
 - The output stream counts as read up to the screen, so a later stream poll starts after it. The log keeps every byte.
 - The emulator decodes UTF-8.
+
+### Transcript
+
+`transcript` replays a PTY task's stored log through a second terminal emulator (`alacritty_terminal` 0.26) of the same 120×30 size with 10,000 lines of scrollback history, and reads its history and screen:
+
+- A line a program pushes off the screen enters the history whether it scrolls away, leaves a scroll region whose top margin is the first row (how Codex inserts its history above its composer), or is cleared with the screen before a full redraw. Clearing the history (`ESC[3J`, sent by pi before a full redraw) removes the lines it holds. Each line therefore appears once, in the order a user scrolling up would read it.
+- Rows the terminal wrapped join into one logical line; tabs become spaces; trailing spaces and blank lines at the end are dropped. Wide characters appear once, with their combining marks.
+- Output held for a synchronized update (`ESC[?2026h`) that never ended is shown as received.
+- A program on the alternate screen keeps no history there. The transcript holds the normal screen's history and screen, then a `--- alternate screen ---` line and the alternate screen; the status line says so. TUIs with an inline mode, such as `codex --no-alt-screen`, keep their replies in the history.
+- Once the history holds 10,000 lines, older lines are dropped and the status line says so. One render runs at a time. The history grid takes about 30 MiB; combining marks stored in cells add memory in proportion to the log. A 28 MiB log renders in about 0.4 s.
+- Repeats (`CSI n b`) print the last character up to 65535 times, so a few bytes could cost minutes of rendering, and a repeated zero-width character stacks on one cell without limit. Before the emulator, a second instance of the emulator's parser reads every byte and finds each repeat where the emulator would run it. A repeat longer than a row becomes a row, and a repeat of a zero-width character is dropped: its final byte is replaced with one the emulator ignores. Every other byte passes unchanged, so a render's time and memory stay proportional to the log.
+- The transcript covers the stored log, at most its first 64 MiB, as the status line's dropped-bytes note shows; an evicted log returns an error.
+- The window follows the output-window rules of this section: `maxBytes` covers the window, status line, and footer, and the omission marker names transcript lines, such as `... [70 lines omitted: transcript lines 1-70] ...`. The status line names the transcript file; `grep` and `sed` read it. The file is removed with the task's log.
 
 ### Model-facing window
 
@@ -226,7 +242,8 @@ PTY commands start from the server's process environment: portable-pty's own see
   - `portable-pty` 0.9.0 (ConPTY on Windows, Unix PTY elsewhere), size 120×30.
   - Input goes through the master writer, fed by the same per-task queue.
   - The reader drains `try_clone_reader()` into the same log path as pipe mode.
-  - The reader feeds every chunk into the task's terminal emulator (§5), which answers each cursor-position query (`ESC[6n`) with the cursor's position. ConPTY sends one at startup and holds all output until a terminal answers. Replies share the 1 MiB input limit; replies past it are dropped.
+  - The reader feeds every chunk into the task's terminal emulator (§5), which answers each cursor-position query (`ESC[6n`) with the cursor's position and each primary device-attributes query (`ESC[c`) with `ESC[?1;2c`. ConPTY sends both at startup and holds output until a terminal answers. Replies share the 1 MiB input limit; replies past it are dropped.
+  - Windows x64 builds embed Microsoft's ConPTY 1.24.260710001 (`vendor/conpty`: `conpty.dll` and its host `OpenConsole.exe`, MIT). Before the first PTY opens, the server writes both files to `%TEMP%\fastexec-conpty-1.24.260710001`, shared by every server of this version: a file whose bytes differ from the embedded copy is rewritten under a temporary name and renamed into place. The server then opens each file sharing only read access, checks its bytes through that handle, and keeps the handle open for its lifetime, so no process can change, replace, or delete a verified file while `conpty.dll` loads and `OpenConsole.exe` starts with each PTY. It then loads `conpty.dll` by its full path, so portable-pty's load of `conpty.dll` by name resolves to it. The system ConPTY of earlier Windows releases re-renders a program's output and loses scroll-region inserts, history clears, and alternate-screen switches; the bundled one passes them through to the log. When extraction or loading fails, stderr names the cause, PTY tasks use the system ConPTY, and `transcript` results warn that lines may be missing.
 
 ### 6.3 Process-tree ownership
 
@@ -291,9 +308,12 @@ pi with the `pi-mcp-adapter` extension (2.26), which replaces the built-in MCP s
 | `src/output.rs` | streaming ANSI/CR cleaning and head/tail windows under a byte budget | FastCtx `src/shell/normalize.rs` and `src/shell/output.rs`, with CR overwrite |
 | `src/tasks.rs` | task registry, log capture, cursors, input queues, retention, shutdown | new |
 | `src/keys.rs` | tmux key names to terminal input bytes (§3 Keys) | tmux `key-string.c` and `input-keys.c` |
+| `src/transcript.rs` | log replay through `alacritty_terminal` into history and screen lines (§5 Transcript) | new |
+| `src/conpty.rs` | extraction and loading of the bundled ConPTY (§6.2) | new |
+| `vendor/conpty` | Microsoft ConPTY 1.24.260710001 x64 binaries, license, and hashes | Microsoft (MIT) |
 | `tests/mcp.rs` | contract tests that drive the built binary over MCP stdio | new |
 
-`Cargo.toml` lists the dependencies and pins rmcp (`=2.2.0`) and portable-pty (`=0.9.0`) exactly.
+`Cargo.toml` lists the dependencies and pins rmcp (`=2.2.0`), portable-pty (`=0.9.0`), and alacritty_terminal (`=0.26.0`) exactly.
 
 Files derived from FastCtx open with a header that names the FastCtx source files and credits FastCtx (Apache-2.0, Copyright 2026 yc-duan). The repository `NOTICE` lists those files and credits tmux (ISC) for the key names and encodings in `src/keys.rs`.
 
@@ -317,3 +337,4 @@ Run every case on Windows 11 x64 with Git for Windows and on Ubuntu x64 with bas
 | A12 | Windows specifics | `MSYS_NO_PATHCONV=1` passes `/F` intact to a native tool; commands over 12000 bytes run; every child runs windowless |
 | A13 | Parameters | Misplaced or out-of-range parameters return errors; `null` optional fields behave as omitted |
 | A14 | TUI | pi's interactive TUI accepts a prompt typed with `input` and submitted with `keys: ["Enter"]`; `screen: true` shows one rendered frame |
+| A15 | Transcript | After pi and `codex --no-alt-screen` answer with 120 numbered lines, `transcript` shows each line once, in order |

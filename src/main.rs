@@ -1,12 +1,14 @@
 //! fastexec: an MCP stdio server with one tool that runs bash commands as tasks.
 
 mod bash;
+mod conpty;
 mod keys;
 mod output;
 mod process;
 mod tasks;
+mod transcript;
 
-use output::{Truncate, Window};
+use output::{Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities,
@@ -42,12 +44,13 @@ enum Action {
     Poll,
     Kill,
     List,
+    Transcript,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Request {
-    /// start: run a command. poll: send input and/or wait, then read unseen output. kill: terminate a task's process tree. list: this server's tasks.
+    /// start: run a command. poll: send input and/or wait, then read unseen output. kill: terminate a task's process tree. list: this server's tasks. transcript: a PTY task's whole output rendered as a terminal shows it, scrollback history then screen.
     action: Action,
     /// start: the bash command line.
     command: Option<String>,
@@ -59,7 +62,7 @@ struct Request {
     login_shell: Option<bool>,
     /// start: kill the task's whole process tree this many ms after launch, whatever the waits and polls; 0 or omitted means no limit.
     kill_after_ms: Option<u64>,
-    /// poll, kill: the task to act on.
+    /// poll, kill, transcript: the task to act on.
     task_id: Option<String>,
     /// poll: text written to the task exactly as given, before `keys` and before waiting, at most 16 KiB.
     input: Option<String>,
@@ -70,9 +73,9 @@ struct Request {
     /// start, poll: how long to wait, 0-240000 ms.
     #[schemars(range(min = 0, max = 240000))]
     wait_ms: Option<u64>,
-    /// start, poll: output window mode (default head_tail).
+    /// start, poll, transcript: output window mode (default head_tail; transcript defaults to tail).
     truncate: Option<Truncate>,
-    /// start, poll: byte budget of the result, 1024-1048576 (default 16384).
+    /// start, poll, transcript: byte budget of the result, 1024-1048576 (default 16384).
     #[schemars(range(min = 1024, max = 1048576))]
     max_bytes: Option<u64>,
     /// start, poll: return output without cleaning (default false).
@@ -124,6 +127,7 @@ fn validate(request: &Request) -> Result<View, String> {
             .collect(),
         Action::Kill => vec!["taskId"],
         Action::List => vec![],
+        Action::Transcript => vec!["taskId", "truncate", "maxBytes"],
     };
     for (name, set) in present {
         if set && !allowed.contains(&name) {
@@ -142,7 +146,7 @@ fn validate(request: &Request) -> Result<View, String> {
         {
             return Err("start needs a non-empty `command`.".into());
         }
-        Action::Poll | Action::Kill if request.task_id.is_none() => {
+        Action::Poll | Action::Kill | Action::Transcript if request.task_id.is_none() => {
             return Err(format!(
                 "{:?} needs `taskId`; use action list to find it.",
                 request.action
@@ -199,7 +203,13 @@ fn validate(request: &Request) -> Result<View, String> {
         })?),
     };
     Ok(View {
-        truncate: request.truncate.unwrap_or_default(),
+        truncate: request
+            .truncate
+            .unwrap_or(if request.action == Action::Transcript {
+                Truncate::Tail
+            } else {
+                Truncate::HeadTail
+            }),
         max_bytes: request.max_bytes.unwrap_or(DEFAULT_MAX_BYTES) as usize,
         raw: request.raw.unwrap_or(false),
         encoding,
@@ -373,6 +383,19 @@ impl Server {
                 report(&task, &snapshot, background);
                 Ok(result)
             }
+            Action::Transcript => {
+                let task = self.task(request.task_id.as_deref())?;
+                if !task.pty {
+                    return Err("transcript applies to PTY tasks only; poll returns a pipe task's output, and its log holds every byte.".into());
+                }
+                if task.encoding != encoding_rs::UTF_8 {
+                    return Err(
+                        "transcript needs UTF-8 output; this task was started with an encoding."
+                            .into(),
+                    );
+                }
+                self.transcript_result(task, view).await
+            }
         }
     }
 
@@ -479,7 +502,6 @@ impl Server {
         if view.screen {
             return self.screen_result(action, task, view).await;
         }
-        let output_mode = self.output_mode;
         let reader = Arc::clone(&task);
         let encoding = view.encoding.unwrap_or(task.encoding);
         let footer_cap = match view.truncate {
@@ -522,6 +544,109 @@ impl Server {
                 encoding.name()
             ));
         }
+        let mut structured = task_json(action, &task, &snapshot);
+        let text = self.layout(
+            &window,
+            status,
+            &footer,
+            &view,
+            "(no new output)",
+            &mut structured,
+        );
+        let result = success(text, structured);
+        report(&task, &snapshot, background);
+        Ok(result)
+    }
+
+    /// A PTY task's stored log rendered as a terminal shows it, written beside the log; the
+    /// result shows its last lines by default, where a program's newest output is.
+    async fn transcript_result(
+        &self,
+        task: Arc<Task>,
+        view: View,
+    ) -> Result<CallToolResult, String> {
+        let snapshot = task.snapshot();
+        let renderer = Arc::clone(&task);
+        let transcript = tokio::task::spawn_blocking(move || renderer.transcript())
+            .await
+            .map_err(|error| format!("Internal failure while rendering: {error}."))??;
+        let path = task.transcript_path();
+        let footer_cap = match view.truncate {
+            Truncate::None => FOOTER_LIMIT,
+            _ => FOOTER_LIMIT.min(view.max_bytes / 4),
+        };
+        let background = self.tasks.background(&task.id, footer_cap);
+        let footer = background
+            .as_ref()
+            .map_or(String::new(), |(line, _)| format!("\n{line}"));
+        let mut status = status_line(&task, &snapshot);
+        status.push_str(&format!(
+            " · transcript {} lines · {}",
+            transcript.lines,
+            path.display()
+        ));
+        if transcript.history_full {
+            status.push_str(&format!(
+                " · history holds the last {} lines; older lines are not shown",
+                transcript::HISTORY_LINES
+            ));
+        }
+        if transcript.alternate_screen {
+            status.push_str(&format!(
+                " · the program is on the alternate screen, which keeps no history; it follows the {:?} line",
+                transcript::ALTERNATE_MARKER
+            ));
+        }
+        if let Some(warning) = conpty::load() {
+            status.push_str(&format!(" · {warning}, so lines may be missing"));
+        }
+        let budget = match view.truncate {
+            Truncate::None => usize::MAX,
+            _ => view
+                .max_bytes
+                .saturating_sub(status.len() + NOTES_RESERVE + footer.len())
+                .max(MIN_BODY_BUDGET),
+        };
+        let spec = WindowSpec {
+            truncate: view.truncate,
+            budget,
+            raw: false,
+            encoding: encoding_rs::UTF_8,
+            source: "transcript",
+        };
+        let mut cleaner = Cleaner::default();
+        let mut builder = WindowBuilder::new(spec, &mut cleaner, 1);
+        builder.push(transcript.text.as_bytes());
+        let window = builder.finish();
+        let mut structured = task_json(Action::Transcript, &task, &snapshot);
+        structured["transcriptPath"] = json!(path);
+        structured["transcriptLines"] = json!(transcript.lines);
+        structured["alternateScreen"] = json!(transcript.alternate_screen);
+        structured["historyFull"] = json!(transcript.history_full);
+        let text = self.layout(
+            &window,
+            status,
+            &footer,
+            &view,
+            "(blank terminal)",
+            &mut structured,
+        );
+        let result = success(text, structured);
+        report(&task, &snapshot, background);
+        Ok(result)
+    }
+
+    /// Fits `window` with the status line and footer into `maxBytes`, adds the window metadata
+    /// to `structured`, and returns the text content; `empty` stands in for an empty window.
+    fn layout(
+        &self,
+        window: &Window,
+        mut status: String,
+        footer: &str,
+        view: &View,
+        empty: &str,
+        structured: &mut Value,
+    ) -> String {
         let room = if view.truncate == Truncate::None {
             usize::MAX
         } else {
@@ -532,24 +657,21 @@ impl Server {
         };
         let (output, cut_lines) = window.fit(room);
         let body = if output.is_empty() {
-            "(no new output)"
+            empty
         } else {
             output.as_str()
         };
-        let text = if output_mode == OutputMode::Structured {
+        let text = if self.output_mode == OutputMode::Structured {
             format!("{status}{footer}")
         } else {
             format!("{body}\n\n{status}{footer}")
         };
-        let mut structured = task_json(action, &task, &snapshot);
-        add_window(&mut structured, &window);
-        if output_mode != OutputMode::Text {
+        add_window(structured, window);
+        if self.output_mode != OutputMode::Text {
             structured["output"] = json!(output);
         }
         structured["cutLines"] = json!(cut_lines);
-        let result = success(text, structured);
-        report(&task, &snapshot, background);
-        Ok(result)
+        text
     }
 }
 
@@ -690,6 +812,7 @@ fn action_name(action: Action) -> &'static str {
         Action::Poll => "poll",
         Action::Kill => "kill",
         Action::List => "list",
+        Action::Transcript => "transcript",
     }
 }
 

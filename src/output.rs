@@ -61,12 +61,14 @@ pub struct WindowSpec {
     pub budget: usize,
     pub raw: bool,
     pub encoding: &'static Encoding,
+    /// What the line numbers count, named in the omission marker: "log" or "transcript".
+    pub source: &'static str,
 }
 
 pub struct Window {
     /// Lines in display order, omission marker included, each with whether it lost text.
     lines: Vec<(String, bool)>,
-    /// Inclusive log line range left out of the window.
+    /// Inclusive line range left out of the window.
     pub omitted: Option<(u64, u64)>,
     /// Lines that held byte sequences invalid in the selected encoding.
     pub bad_lines: u64,
@@ -325,7 +327,8 @@ impl<'a> WindowBuilder<'a> {
             .collect();
         if let Some((first, last)) = self.omitted {
             let count = last - first + 1;
-            let marker = format!("... [{count} lines omitted: log lines {first}-{last}] ...");
+            let source = self.spec.source;
+            let marker = format!("... [{count} lines omitted: {source} lines {first}-{last}] ...");
             lines.push((marker, false));
         }
         lines.extend(self.tail.into_iter().map(|line| (line.text, line.cut)));
@@ -415,6 +418,7 @@ mod tests {
             budget,
             raw,
             encoding: encoding_rs::UTF_8,
+            source: "log",
         };
         let mut builder = WindowBuilder::new(spec, &mut cleaner, 1);
         for chunk in chunks {
@@ -464,6 +468,7 @@ mod tests {
             budget: 0,
             raw,
             encoding: encoding_rs::UTF_8,
+            source: "log",
         };
         let mut first = WindowBuilder::new(spec(true), &mut cleaner, 1);
         first.push(b"x\x1b[");
@@ -507,6 +512,7 @@ mod tests {
             budget: 0,
             raw: false,
             encoding: encoding_rs::UTF_8,
+            source: "log",
         };
         let mut first = WindowBuilder::new(spec(), &mut cleaner, 1);
         first.push(b"Password:\r");
