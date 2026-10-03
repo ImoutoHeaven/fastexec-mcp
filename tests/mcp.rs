@@ -527,6 +527,41 @@ fn pty_keys_follow_input_and_the_programs_cursor_mode() {
 }
 
 #[test]
+fn keys_pause_after_input_and_follow_the_modes_set_meanwhile() {
+    let mut server = Server::start();
+    // The program dumps each read, which returns the bytes that have arrived, and switches to
+    // application cursor mode after the first one.
+    let command = concat!(
+        "stty raw -echo; printf 'ready\\r\\n'; dd bs=64 count=1 2>/dev/null | od -An -tx1; ",
+        "printf '\\033[?1h'; for i in 1 2; do dd bs=64 count=1 2>/dev/null | od -An -tx1; done"
+    );
+    // By default the keys come after the text, Up after the mode switch; without a pause,
+    // the text and keys go out in one write, read at once, before it.
+    for (task, delay, first, up) in [
+        ("t1", None, " 61 62\n", "1b 4f 41"),
+        ("t2", Some(0), " 61 62 0d 1b 5b 41\n", "1b 5b 41"),
+    ] {
+        server.ok(json!({
+            "action": "start", "command": command, "pty": true, "waitMs": 20000,
+            "returnWhen": {"outputContains": ["ready"]}
+        }));
+        let mut poll = json!({
+            "action": "poll", "taskId": task, "input": "ab", "keys": ["Enter", "Up"],
+            "waitMs": 10000, "returnWhen": {"outputContains": [" 41"]}
+        });
+        if let Some(delay) = delay {
+            poll["keyDelayMs"] = json!(delay);
+        }
+        let (_, text) = server.ok(poll);
+        assert!(
+            text.starts_with(first) && text.contains(up),
+            "{first:?}, {up}: {text}"
+        );
+        server.ok(json!({"action": "kill", "taskId": task}));
+    }
+}
+
+#[test]
 fn pty_keys_follow_the_kitty_keyboard_protocol_the_program_pushes() {
     let mut server = Server::start();
     // The program pushes the disambiguation flag, queries the flags, and dumps what it reads;
@@ -613,51 +648,66 @@ fn return_when_ends_a_wait_on_unseen_output_text_or_quiet() {
     let begun = Instant::now();
     let (out, text) = server.ok(json!({
         "action": "start", "command": command, "waitMs": 20000,
-        "returnWhen": {"outputContains": {"text": "server LISTENING", "caseSensitive": false}}
+        "returnWhen": {"outputContains": ["error:", "Server listening"]}
     }));
     assert!(begun.elapsed() < Duration::from_secs(10), "{text}");
-    assert_eq!(out["waitEndedBy"], "output_contains", "{text}");
+    assert_eq!(
+        out["waitEndedBy"],
+        json!({"condition": "output_contains", "text": "Server listening"}),
+        "{text}"
+    );
     assert_eq!(out["state"], "running", "{text}");
     assert!(
-        text.contains("Server listening") && text.contains("wait: output matched"),
+        text.contains("wait: output matched \"Server listening\""),
         "{text}"
     );
     // Output an earlier result showed does not match again.
     let (out, text) = server.ok(json!({
         "action": "poll", "taskId": "t1", "waitMs": 500,
-        "returnWhen": {"outputContains": {"text": "listening"}}
+        "returnWhen": {"outputContains": ["listening"]}
     }));
-    assert_eq!(out["waitEndedBy"], "max_wait", "{text}");
+    assert_eq!(
+        out["waitEndedBy"],
+        json!({"condition": "max_wait"}),
+        "{text}"
+    );
     assert!(text.contains("wait: waitMs elapsed"), "{text}");
     server.ok(json!({"action": "kill", "taskId": "t1"}));
 
-    // Silence before any output does not count as quiet.
-    let command =
-        "sleep 1; echo first; sleep 1; echo stale; read -r x; sleep 2.5; echo \"got $x\"; sleep 30";
+    // Every output restarts the quiet time.
+    let command = "echo a; sleep 0.5; echo b; sleep 0.5; echo c; sleep 30";
     let begun = Instant::now();
     let (out, text) = server.ok(json!({
-        "action": "start", "command": command, "waitMs": 20000,
-        "returnWhen": {"outputQuietForMs": 300}
+        "action": "start", "command": command, "loginShell": false, "waitMs": 20000,
+        "returnWhen": {"quietMs": 1500}
     }));
-    assert!(begun.elapsed() >= Duration::from_secs(1), "{text}");
-    assert_eq!(out["waitEndedBy"], "output_quiet", "{text}");
-    assert!(text.starts_with("first\n"), "{text}");
-    // Unseen output, long quiet, does not end a wait after input; only the reply does. The
-    // reply comes after the 2 s default of a plain poll with input.
-    std::thread::sleep(Duration::from_millis(1500));
+    assert!(begun.elapsed() >= Duration::from_millis(2400), "{text}");
+    assert_eq!(out["waitEndedBy"], json!({"condition": "quiet"}), "{text}");
+    assert!(text.starts_with("a\nb\nc\n"), "{text}");
+    // The quiet time counts from the start of the wait, so a program already quiet ends a
+    // wait that sees no output, after the full time.
+    let begun = Instant::now();
     let (out, text) = server.ok(json!({
-        "action": "poll", "taskId": "t2", "input": "hi\n",
-        "returnWhen": {"outputQuietForMs": 300}
+        "action": "poll", "taskId": "t2", "waitMs": 20000, "returnWhen": {"quietMs": 300}
     }));
-    assert_eq!(out["waitEndedBy"], "output_quiet", "{text}");
-    assert!(text.starts_with("stale\ngot hi\n"), "{text}");
+    let waited = begun.elapsed();
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_secs(10),
+        "{waited:?} {text}"
+    );
+    assert_eq!(out["waitEndedBy"], json!({"condition": "quiet"}), "{text}");
+    assert!(text.starts_with("(no new output)"), "{text}");
     server.ok(json!({"action": "kill", "taskId": "t2"}));
 
     let (out, text) = server.ok(json!({
         "action": "start", "command": "echo hi",
-        "returnWhen": {"outputContains": {"text": "nope"}}
+        "returnWhen": {"outputContains": ["nope"]}
     }));
-    assert_eq!(out["waitEndedBy"], "task_ended", "{text}");
+    assert_eq!(
+        out["waitEndedBy"],
+        json!({"condition": "task_ended"}),
+        "{text}"
+    );
 }
 
 #[test]
@@ -667,14 +717,22 @@ fn screen_contains_and_quiet_see_only_committed_frames() {
     let command = "printf 'GONE\\r\\n'; sleep 0.3; printf '\\033[2J\\033[H\\033[1;4Hdy\\033[1;1HRea'; read -r x";
     let (out, text) = server.ok(json!({
         "action": "start", "command": command, "pty": true, "waitMs": 20000,
-        "returnWhen": {"screenContains": {"text": "Ready"}}
+        "returnWhen": {"screenContains": ["Ready"]}
     }));
-    assert_eq!(out["waitEndedBy"], "screen_contains", "{text}");
+    assert_eq!(
+        out["waitEndedBy"],
+        json!({"condition": "screen_contains", "text": "Ready"}),
+        "{text}"
+    );
     let (out, text) = server.ok(json!({
         "action": "poll", "taskId": "t1", "waitMs": 500,
-        "returnWhen": {"screenContains": {"text": "GONE"}}
+        "returnWhen": {"screenContains": ["GONE"]}
     }));
-    assert_eq!(out["waitEndedBy"], "max_wait", "{text}");
+    assert_eq!(
+        out["waitEndedBy"],
+        json!({"condition": "max_wait"}),
+        "{text}"
+    );
     server.ok(json!({"action": "kill", "taskId": "t1"}));
 
     // A synchronized update the program leaves open shows at its timeout, while the program
@@ -683,24 +741,81 @@ fn screen_contains_and_quiet_see_only_committed_frames() {
     let begun = Instant::now();
     let (out, text) = server.ok(json!({
         "action": "start", "command": command, "pty": true, "waitMs": 20000,
-        "returnWhen": {"screenContains": {"text": "HELD", "caseSensitive": false}}
+        "returnWhen": {"screenContains": ["held"]}
     }));
     assert!(begun.elapsed() < Duration::from_secs(10), "{text}");
-    assert_eq!(out["waitEndedBy"], "screen_contains", "{text}");
+    assert_eq!(
+        out["waitEndedBy"],
+        json!({"condition": "screen_contains", "text": "held"}),
+        "{text}"
+    );
     server.ok(json!({"action": "kill", "taskId": "t2"}));
     let command =
         "stty -echo; printf 'shown\\r\\n'; read -r x; printf '\\033[?2026hheld'; read -r x";
     server.ok(json!({
         "action": "start", "command": command, "pty": true, "waitMs": 20000,
-        "returnWhen": {"screenContains": {"text": "shown"}}
+        "returnWhen": {"screenContains": ["shown"]}
     }));
     let (out, text) = server.ok(json!({
         "action": "poll", "taskId": "t3", "keys": ["Enter"], "screen": true, "waitMs": 20000,
-        "returnWhen": {"outputQuietForMs": 100}
+        "returnWhen": {"quietMs": 100}
     }));
-    assert_eq!(out["waitEndedBy"], "output_quiet", "{text}");
+    assert_eq!(out["waitEndedBy"], json!({"condition": "quiet"}), "{text}");
     assert_eq!(text.split("\n\n[").next().unwrap(), "shown\nheld", "{text}");
     server.ok(json!({"action": "kill", "taskId": "t3"}));
+}
+
+#[test]
+fn screen_appears_and_gone_compare_with_the_screen_before_the_input() {
+    let mut server = Server::start();
+    // Enter shows a busy line, then replaces it with a done line like the old one.
+    let command = concat!(
+        "stty -echo; printf 'Done 1\\r\\n'; read -r x; printf 'Busy'; sleep 0.5; ",
+        "printf '\\r\\033[KDone 1\\r\\n'; read -r x"
+    );
+    server.ok(json!({
+        "action": "start", "command": command, "pty": true, "waitMs": 20000,
+        "returnWhen": {"screenContains": ["Done 1"]}
+    }));
+    // The old done line shows throughout; only the second one is new.
+    let (out, text) = server.ok(json!({
+        "action": "poll", "taskId": "t1", "keys": ["Enter"], "screen": true, "waitMs": 20000,
+        "returnWhen": {"screenAppears": ["Done 1"]}
+    }));
+    assert_eq!(
+        out["waitEndedBy"],
+        json!({"condition": "screen_appears", "text": "Done 1"}),
+        "{text}"
+    );
+    assert_eq!(
+        text.split("\n\n[").next().unwrap(),
+        "Done 1\nDone 1",
+        "{text}"
+    );
+    server.ok(json!({"action": "kill", "taskId": "t1"}));
+
+    // The busy line is absent when the poll begins; the wait ends only once it has shown, for
+    // half a second, and gone.
+    server.ok(json!({
+        "action": "start", "command": command, "pty": true, "waitMs": 20000,
+        "returnWhen": {"screenContains": ["Done 1"]}
+    }));
+    let begun = Instant::now();
+    let (out, text) = server.ok(json!({
+        "action": "poll", "taskId": "t2", "keys": ["Enter"], "screen": true, "waitMs": 20000,
+        "returnWhen": {"screenGone": ["Busy"]}
+    }));
+    assert_eq!(
+        out["waitEndedBy"],
+        json!({"condition": "screen_gone", "text": "Busy"}),
+        "{text}"
+    );
+    assert!(begun.elapsed() >= Duration::from_millis(400), "{text}");
+    assert!(
+        !text.split("\n\n[").next().unwrap().contains("Busy"),
+        "{text}"
+    );
+    server.ok(json!({"action": "kill", "taskId": "t2"}));
 }
 
 #[test]
@@ -1144,12 +1259,24 @@ fn invalid_parameters_are_rejected_and_null_means_omitted() {
             "returnWhen needs",
         ),
         (
-            json!({"action": "start", "command": "true", "returnWhen": {"outputContains": {"text": "a\nb"}}}),
+            json!({"action": "start", "command": "true", "returnWhen": {"outputContains": ["a\nb"]}}),
             "without line breaks",
         ),
         (
-            json!({"action": "start", "command": "true", "returnWhen": {"screenContains": {"text": "x"}}}),
-            "screenContains needs a PTY",
+            json!({"action": "start", "command": "true", "returnWhen": {"outputContains": []}}),
+            "takes 1-16 texts",
+        ),
+        (
+            json!({"action": "start", "command": "true", "returnWhen": {"screenGone": ["x"]}}),
+            "screenGone needs a PTY",
+        ),
+        (
+            json!({"action": "poll", "taskId": "t1", "keyDelayMs": 100}),
+            "keyDelayMs applies only with keys",
+        ),
+        (
+            json!({"action": "poll", "taskId": "t1", "input": "x", "keys": vec!["a"; 16], "keyDelayMs": 2000}),
+            "over the 30000 ms limit",
         ),
     ] {
         let (_, text, is_error) = server.call(arguments.clone());

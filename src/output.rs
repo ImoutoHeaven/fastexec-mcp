@@ -116,13 +116,16 @@ impl Cleaner {
     }
 }
 
-/// Finds literal text in output cleaned as windows clean it, fed in pieces of any size. Every
+/// Finds literal texts in output cleaned as windows clean it, fed in pieces of any size. Every
 /// state a cleaned line passes through counts, before a carriage return rewrites it and before
 /// trailing spaces are trimmed, so how the output is split never changes the answer.
 pub struct Matcher {
-    /// The text sought, ASCII-lowercased when the search ignores case.
-    needle: String,
-    ignore_case: bool,
+    /// The texts sought, any of which ends the search.
+    needles: Vec<String>,
+    /// The lowest index of a needle found so far.
+    best: Option<usize>,
+    /// The longest needle, in bytes.
+    longest: usize,
     encoding: &'static Encoding,
     cleaner: Cleaner,
     decoder: encoding_rs::Decoder,
@@ -134,19 +137,11 @@ pub struct Matcher {
 
 impl Matcher {
     /// A matcher that continues from `cleaner`, the cleaning state where its output starts.
-    pub fn new(
-        needle: &str,
-        case_sensitive: bool,
-        encoding: &'static Encoding,
-        cleaner: Cleaner,
-    ) -> Self {
+    pub fn new(needles: &[String], encoding: &'static Encoding, cleaner: Cleaner) -> Self {
         Self {
-            needle: if case_sensitive {
-                needle.to_string()
-            } else {
-                needle.to_ascii_lowercase()
-            },
-            ignore_case: !case_sensitive,
+            needles: needles.to_vec(),
+            best: None,
+            longest: needles.iter().map(String::len).max().unwrap_or(0),
             encoding,
             cleaner,
             decoder: encoding.new_decoder_without_bom_handling(),
@@ -155,36 +150,42 @@ impl Matcher {
         }
     }
 
-    /// Feeds the next output bytes; returns true once the text has appeared.
-    pub fn push(&mut self, bytes: &[u8]) -> bool {
+    /// Feeds the next output bytes; returns the lowest index of a needle the output fed so far
+    /// contains. Reading stops early only at the first needle, which nothing can precede.
+    pub fn push(&mut self, bytes: &[u8]) -> Option<usize> {
         for &byte in bytes {
             let (clear, step) = self.cleaner.step(byte);
-            if clear && self.found(true) {
-                return true;
-            }
             if clear {
+                self.found(true);
                 self.new_line();
             }
             match step {
                 Step::Append => self.pending.push(byte),
                 Step::EndLine => {
-                    if self.found(true) {
-                        return true;
-                    }
+                    self.found(true);
                     self.new_line();
                 }
                 Step::Nothing | Step::Control | Step::SwallowedLf => {}
             }
+            if self.best == Some(0) {
+                return self.best;
+            }
         }
-        self.found(false)
+        self.found(false);
+        self.best
     }
 
-    /// Ends the output: an unfinished last line ends as a window shows it. Returns true when
-    /// the text appears; a repeated call finds nothing more.
-    pub fn finish(&mut self) -> bool {
-        let found = self.found(true);
+    /// The lowest index of a needle the output fed so far contains.
+    pub fn best(&self) -> Option<usize> {
+        self.best
+    }
+
+    /// Ends the output: an unfinished last line ends as a window shows it. Returns the lowest
+    /// needle found.
+    pub fn finish(&mut self) -> Option<usize> {
+        self.found(true);
         self.new_line();
-        found
+        self.best
     }
 
     fn new_line(&mut self) {
@@ -196,7 +197,7 @@ impl Matcher {
     /// Decodes the pending bytes and searches the line, then keeps only the end of the line
     /// that a later match could start in. `last` ends the line's text, so an unfinished
     /// character decodes as the replacement character a window shows.
-    fn found(&mut self, last: bool) -> bool {
+    fn found(&mut self, last: bool) {
         let pending = std::mem::take(&mut self.pending);
         if let Some(room) = self.decoder.max_utf8_buffer_length(pending.len()) {
             self.line.reserve(room);
@@ -204,17 +205,19 @@ impl Matcher {
         let _ = self
             .decoder
             .decode_to_string(&pending, &mut self.line, last);
-        let found = if self.ignore_case {
-            self.line.to_ascii_lowercase().contains(&self.needle)
-        } else {
-            self.line.contains(&self.needle)
-        };
-        let mut cut = self.line.len().saturating_sub(self.needle.len());
+        // Only needles before the best one found can improve it.
+        let before = self.best.unwrap_or(self.needles.len());
+        if let Some(found) = self.needles[..before]
+            .iter()
+            .position(|needle| self.line.contains(needle.as_str()))
+        {
+            self.best = Some(found);
+        }
+        let mut cut = self.line.len().saturating_sub(self.longest);
         while !self.line.is_char_boundary(cut) {
             cut -= 1;
         }
         self.line.drain(..cut);
-        found
     }
 }
 
@@ -661,45 +664,59 @@ mod tests {
     #[test]
     fn matcher_finds_text_in_cleaned_output_however_it_is_split() {
         let utf8 = encoding_rs::UTF_8;
-        let cases: [(&[u8], &str, bool, &'static Encoding, bool); 10] = [
+        // Output, needles, encoding, and the needle found.
+        type Case<'a> = (&'a [u8], &'a [&'a str], &'static Encoding, Option<usize>);
+        let cases: [Case; 9] = [
             (
                 b"\x1b[32mServer\x1b[0m listening\r\n",
-                "Server listening",
-                true,
+                &["Server listening"],
                 utf8,
-                true,
+                Some(0),
             ),
             // Text a carriage return rewrites still counts.
-            (b"10%\r50%\r100%\r\x1b[Kdone", "100%", true, utf8, true),
-            (b"Password: ", "Password: ", true, utf8, true),
-            (b"SERVER READY", "server ready", false, utf8, true),
-            (b"SERVER READY", "server ready", true, utf8, false),
-            // Only ASCII letters fold.
-            ("\u{c9}COLE".as_bytes(), "\u{e9}cole", false, utf8, false),
+            (b"10%\r50%\r100%\r\x1b[Kdone", &["100%"], utf8, Some(0)),
+            (b"Password: ", &["Password: "], utf8, Some(0)),
+            (b"SERVER READY", &["server ready"], utf8, None),
+            // Any needle ends the search; the line keeps enough text for the longest one.
+            (
+                b"boot\nerror: port in use",
+                &["ready", "error: port"],
+                utf8,
+                Some(1),
+            ),
             (
                 b"\xd6\xd0\xce\xc4 ok",
-                "\u{4e2d}\u{6587} ok",
-                true,
+                &["\u{4e2d}\u{6587} ok"],
                 encoding_rs::GBK,
-                true,
+                Some(0),
             ),
-            (b"ab\ncd", "bc", true, utf8, false),
+            (b"ab\ncd", &["bc"], utf8, None),
             // A line ending inside a character shows, and matches, the replacement character.
-            (b"\xe2\n", "\u{fffd}", true, utf8, true),
-            (b"\xe2", "\u{fffd}", true, utf8, true),
+            (b"\xe2\n", &["\u{fffd}"], utf8, Some(0)),
+            (b"\xe2", &["\u{fffd}"], utf8, Some(0)),
         ];
-        for (output, needle, case_sensitive, encoding, expected) in cases {
-            let matcher = || Matcher::new(needle, case_sensitive, encoding, Cleaner::default());
+        for (output, needles, encoding, expected) in cases {
+            let needles: Vec<String> = needles.iter().map(|needle| needle.to_string()).collect();
+            let matcher = || Matcher::new(&needles, encoding, Cleaner::default());
             for split in 0..=output.len() {
                 let mut two = matcher();
-                let found =
-                    two.push(&output[..split]) || two.push(&output[split..]) || two.finish();
-                assert_eq!(found, expected, "{needle:?} split at {split}");
+                let found = two
+                    .push(&output[..split])
+                    .or_else(|| two.push(&output[split..]))
+                    .or_else(|| two.finish());
+                assert_eq!(found, expected, "{needles:?} split at {split}");
             }
             let mut bytes = matcher();
-            let found = output.iter().any(|byte| bytes.push(&[*byte])) || bytes.finish();
-            assert_eq!(found, expected, "{needle:?} byte by byte");
+            let found = output
+                .iter()
+                .find_map(|byte| bytes.push(&[*byte]))
+                .or_else(|| bytes.finish());
+            assert_eq!(found, expected, "{needles:?} byte by byte");
         }
+        // Across lines, the lowest needle the output holds wins, wherever it stands.
+        let needles = ["first".to_string(), "second".to_string()];
+        let mut matcher = Matcher::new(&needles, utf8, Cleaner::default());
+        assert_eq!(matcher.push(b"second\nfirst\n"), Some(0));
     }
 
     #[test]

@@ -91,7 +91,8 @@ struct Output {
     log_error: Option<String>,
     /// Output reached EOF: every captured byte is final.
     closed: bool,
-    /// When the last output byte arrived, stored or not.
+    /// When the last output byte arrived, stored or not, or the end of a synchronized update by
+    /// timeout or end of output showed the frame it held.
     last_output: Option<Instant>,
 }
 
@@ -505,7 +506,11 @@ fn capture(
                     Ok(chunk) => Some(chunk),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if let (Some(terminal), Some(answer)) = (&task.terminal, &answer) {
-                            answer_program(task, answer, lock(terminal).end_sync());
+                            let mut terminal = lock(terminal);
+                            answer_program(task, answer, terminal.end_sync());
+                            // The held frame shows now, so quiet counts from now; the time is
+                            // set under the terminal lock that `last_output` also takes.
+                            lock(&task.out).last_output = Some(Instant::now());
                         }
                         task.activity.send_replace(());
                         continue;
@@ -572,15 +577,23 @@ fn capture(
         drop(terminal);
         task.activity.send_replace(());
     }
-    // No later output can end a synchronized update; the screen shows what it held.
-    let terminal = task.terminal.as_ref().map(lock);
-    if let Some(mut terminal) = terminal {
+    // No later output can end a synchronized update; the screen shows what it held, and that
+    // frame restarts the quiet time as a timeout's does.
+    let mut terminal = task.terminal.as_ref().map(lock);
+    let held = terminal
+        .as_mut()
+        .is_some_and(|terminal| terminal.sync_deadline().is_some());
+    if let Some(terminal) = terminal.as_mut() {
         terminal.end_sync();
     }
     let mut out = lock(&task.out);
     out.readable = out.written;
     out.closed = true;
+    if held {
+        out.last_output = Some(Instant::now());
+    }
     drop(out);
+    drop(terminal);
     task.activity.send_replace(());
 }
 
@@ -601,38 +614,30 @@ impl Task {
         self.activity.subscribe()
     }
 
-    /// Output bytes captured so far, stored or not, when the last one arrived, and whether a
-    /// PTY task's terminal holds output in a synchronized update that has not ended yet, all
-    /// taken together.
-    pub fn received(&self) -> (u64, Option<Instant>, bool) {
+    /// When output last arrived or showed, and whether a PTY task's terminal holds output in a
+    /// synchronized update that has not ended yet, taken together.
+    pub fn last_output(&self) -> (Option<Instant>, bool) {
         let terminal = self.terminal.as_ref().map(lock);
         let out = lock(&self.out);
         let sync_pending = terminal.is_some_and(|terminal| terminal.sync_deadline().is_some());
-        (out.written + out.dropped, out.last_output, sync_pending)
+        (out.last_output, sync_pending)
     }
 
-    /// Where unseen output starts: the poll cursor, the cleaning state there, whether stored
-    /// output lies past it, and the output bytes captured so far, all taken together.
-    pub fn unseen(&self) -> (u64, Cleaner, bool, u64) {
+    /// Where unseen output starts: the poll cursor and the cleaning state there.
+    pub fn unseen(&self) -> (u64, Cleaner) {
         let view = lock(&self.view);
-        let out = lock(&self.out);
-        (
-            view.cursor,
-            view.cleaner.clone(),
-            out.written > view.cursor,
-            out.written + out.dropped,
-        )
+        (view.cursor, view.cleaner.clone())
     }
 
     /// Feeds `matcher` the stored output from `from` on, advancing `from` past what it read,
-    /// and ends it once output has ended; returns true once the matcher finds its text.
-    pub fn scan(&self, matcher: &mut Matcher, from: &mut u64) -> std::io::Result<bool> {
+    /// and ends it once output has ended; returns the lowest needle the matcher has found.
+    pub fn scan(&self, matcher: &mut Matcher, from: &mut u64) -> std::io::Result<Option<usize>> {
         let (written, evicted, closed) = {
             let out = lock(&self.out);
             (out.written, out.evicted, out.closed)
         };
         if evicted {
-            return Ok(false);
+            return Ok(None);
         }
         if written > *from {
             let mut file = File::open(&self.log_path)?;
@@ -645,12 +650,16 @@ impl Task {
                     break;
                 }
                 *from += read as u64;
-                if matcher.push(&buffer[..read]) {
-                    return Ok(true);
+                if matcher.push(&buffer[..read]) == Some(0) {
+                    return Ok(Some(0));
                 }
             }
         }
-        Ok(closed && *from >= written && matcher.finish())
+        Ok(if closed && *from >= written {
+            matcher.finish()
+        } else {
+            matcher.best()
+        })
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -677,6 +686,11 @@ impl Task {
     /// tasks whose shown snapshot was final, so a task that ends after its snapshot stays due.
     pub fn mark_reported(&self) {
         self.reported.store(true, Ordering::SeqCst);
+    }
+
+    /// Input still queued for the writer: bytes the program's stdin has not accepted yet.
+    pub fn input_pending(&self) -> bool {
+        self.queued.load(Ordering::SeqCst) > 0
     }
 
     /// Reserves room in the input queue for `size` bytes.

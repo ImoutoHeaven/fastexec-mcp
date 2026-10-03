@@ -26,6 +26,12 @@ use wait::WaitEnd;
 const MAX_WAIT_MS: u64 = 240_000;
 const KILL_WAIT: Duration = Duration::from_secs(5);
 const MAX_INPUT_BYTES: usize = 16 * 1024;
+const DEFAULT_KEY_DELAY_MS: u64 = 150;
+const MAX_KEY_DELAY_MS: u64 = 2_000;
+/// Longest pause the keys of one poll add up to before its wait begins.
+const MAX_KEY_PAUSE_MS: u64 = 30_000;
+/// Longest a key waits for the program's stdin to accept the input before it.
+const INPUT_ACCEPT_LIMIT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_BYTES: u64 = 16 * 1024;
 const MAX_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1024..=1024 * 1024;
 /// Room in `maxBytes` for the omission marker, the encoding note, and separators.
@@ -64,14 +70,17 @@ struct Request {
     task_id: Option<String>,
     /// poll: text written to the task exactly as given, before `keys` and before waiting, at most 16 KiB.
     input: Option<String>,
-    /// poll, PTY only: keys pressed after `input` is written, in array order, e.g. ["Enter"] or ["Escape", ":", "q", "Enter"]. One key per item, named as in tmux send-keys: Enter, Tab, BTab, Escape, Space, BSpace, Up, Down, Left, Right, Home, End, PageUp/PgUp/PPage, PageDown/PgDn/NPage, Insert/IC, Delete/DC, F1-F12, KP0-KP9, KP/, KP*, KP-, KP+, KP., KPEnter, [NUL]-[US] for C0 controls, 0xHH for a code point, or one character; prefixes C- (Ctrl), M- (Meta/Alt), S- (Shift) combine, as in C-c, M-x, C-M-a, S-Up, and ^c means C-c. Names ignore case. Arrow and keypad keys follow the program's cursor and keypad modes. An unknown name or a modifier the key cannot carry (C-Enter, S-a) is an error and nothing is sent.
+    /// poll, PTY only: keys pressed after `input` is written, in array order, e.g. ["Enter"] or ["Escape", ":", "q", "Enter"]. One key per item, named as in tmux send-keys: Enter, Tab, BTab, Escape, Space, BSpace, Up, Down, Left, Right, Home, End, PageUp/PgUp/PPage, PageDown/PgDn/NPage, Insert/IC, Delete/DC, F1-F12, KP0-KP9, KP/, KP*, KP-, KP+, KP., KPEnter, [NUL]-[US] for C0 controls, 0xHH for a code point, or one character; prefixes C- (Ctrl), M- (Meta/Alt), S- (Shift) combine, as in C-c, M-x, C-M-a, S-Up, and ^c means C-c. Names ignore case. Arrow and keypad keys follow the program's cursor and keypad modes. An unknown name, or a modifier the key cannot carry (C-Enter, S-a) in the program's mode when the poll starts, is an error before anything is sent.
     keys: Option<Vec<String>>,
+    /// poll, with keys: pause before each key, the first one after input included, 0-2000 ms (default 150); 0 writes input and keys at once. Programs that time keystrokes to detect pastes, such as Codex, read a key sent right after text as part of the paste; programs with an escape timeout read Escape and the next key as one Alt key unless the pause exceeds it (often 500).
+    #[schemars(range(min = 0, max = 2000))]
+    key_delay_ms: Option<u64>,
     /// poll: close stdin after input (pipe mode only).
     eof: Option<bool>,
     /// start, poll: how long to wait at most, 0-240000 ms.
     #[schemars(range(min = 0, max = 240000))]
     wait_ms: Option<u64>,
-    /// start, poll: end the wait early when any condition holds; the task keeps running. waitMs stays the longest wait and defaults to 30000 with returnWhen.
+    /// start, poll: end the wait early when any condition holds; the task keeps running. Texts are literal and case-sensitive, 1-16 per condition, each 1-4096 bytes without line breaks. waitMs stays the longest wait and defaults to 30000 with returnWhen.
     return_when: Option<wait::ReturnWhen>,
     /// start, poll, transcript: output window mode (default head_tail; transcript defaults to tail).
     truncate: Option<Truncate>,
@@ -113,6 +122,7 @@ fn validate(request: &Request) -> Result<View, String> {
         ("raw", request.raw.is_some()),
         ("encoding", request.encoding.is_some()),
         ("keys", request.keys.is_some()),
+        ("keyDelayMs", request.key_delay_ms.is_some()),
         ("screen", request.screen.is_some()),
         ("returnWhen", request.return_when.is_some()),
     ];
@@ -130,7 +140,7 @@ fn validate(request: &Request) -> Result<View, String> {
             .into_iter()
             .chain(VIEW)
             .collect(),
-        Action::Poll => ["taskId", "input", "eof", "keys"]
+        Action::Poll => ["taskId", "input", "eof", "keys", "keyDelayMs"]
             .into_iter()
             .chain(VIEW)
             .collect(),
@@ -183,8 +193,30 @@ fn validate(request: &Request) -> Result<View, String> {
     }
     if let Some(when) = &request.return_when {
         when.validate()?;
-        if when.watches_screen() && request.action == Action::Start && request.pty != Some(true) {
-            return Err("screenContains needs a PTY task; start with pty: true.".into());
+        if let Some(name) = when.screen_condition()
+            && request.action == Action::Start
+            && request.pty != Some(true)
+        {
+            return Err(format!("{name} needs a PTY task; start with pty: true."));
+        }
+    }
+    if let Some(delay) = request.key_delay_ms {
+        if request.keys.is_none() {
+            return Err("keyDelayMs applies only with keys; remove it.".into());
+        }
+        if delay > MAX_KEY_DELAY_MS {
+            return Err(format!(
+                "keyDelayMs {delay} is out of range 0-{MAX_KEY_DELAY_MS}."
+            ));
+        }
+    }
+    if let Some(keys) = &request.keys {
+        let delay = request.key_delay_ms.unwrap_or(DEFAULT_KEY_DELAY_MS);
+        let pause = keys.len() as u64 * delay;
+        if pause > MAX_KEY_PAUSE_MS {
+            return Err(format!(
+                "The keys would pause {pause} ms in all at keyDelayMs {delay}, over the {MAX_KEY_PAUSE_MS} ms limit; send fewer keys per poll or lower keyDelayMs."
+            ));
         }
     }
     if let Some(wait) = request.wait_ms.filter(|&wait| wait > MAX_WAIT_MS) {
@@ -218,13 +250,13 @@ fn validate(request: &Request) -> Result<View, String> {
         })?),
     };
     if request.action == Action::Start
-        && request
+        && let Some(name) = request
             .return_when
             .as_ref()
-            .is_some_and(|when| when.watches_screen())
+            .and_then(|when| when.screen_condition())
         && encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8)
     {
-        return Err("screenContains needs UTF-8 output; remove encoding.".into());
+        return Err(format!("{name} needs UTF-8 output; remove encoding."));
     }
     Ok(View {
         truncate: request
@@ -344,46 +376,44 @@ impl Server {
                         }
                     });
                 }
-                let mark = wait::mark(&task, false);
+                let when = request.return_when.as_ref();
+                let mark = wait::mark(&task, when)?;
                 let encoding = view.encoding.unwrap_or(task.encoding);
                 let wait = request.wait_ms.unwrap_or(30_000);
-                let when = request.return_when.as_ref();
                 let ended = wait::wait(&task, wait, when, mark, encoding, context).await?;
                 self.window_result(Action::Start, task, view, ended).await
             }
             Action::Poll => {
                 let task = self.task(request.task_id.as_deref())?;
-                let watches_screen = request
-                    .return_when
-                    .as_ref()
-                    .is_some_and(|when| when.watches_screen());
-                let needs_pty = [
-                    ("screen", view.screen),
-                    ("keys", request.keys.is_some()),
-                    ("screenContains", watches_screen),
-                ]
-                .into_iter()
-                .find_map(|(name, set)| set.then_some(name));
+                let when = request.return_when.as_ref();
+                let watches_screen = when.and_then(|when| when.screen_condition());
+                let needs_pty = [("screen", view.screen), ("keys", request.keys.is_some())]
+                    .into_iter()
+                    .find_map(|(name, set)| set.then_some(name))
+                    .or(watches_screen);
                 if let Some(name) = needs_pty.filter(|_| !task.pty) {
                     return Err(format!(
                         "{name} applies to PTY tasks only; in pipe mode, write text with input and end lines with a newline."
                     ));
                 }
-                if (view.screen || watches_screen) && task.encoding != encoding_rs::UTF_8 {
+                if let Some(name) = view.screen.then_some("screen").or(watches_screen)
+                    && task.encoding != encoding_rs::UTF_8
+                {
                     return Err(format!(
-                        "{} needs UTF-8 output; this task was started with an encoding.",
-                        if view.screen {
-                            "screen"
-                        } else {
-                            "screenContains"
-                        }
+                        "{name} needs UTF-8 output; this task was started with an encoding."
                     ));
                 }
-                let mut data = request.input.clone().unwrap_or_default().into_bytes();
-                if let Some(names) = &request.keys {
+                let input = request.input.as_deref().unwrap_or_default().as_bytes();
+                let names = request.keys.as_deref().unwrap_or_default();
+                // Every key is checked against the current modes before anything is written.
+                let mut parsed = Vec::with_capacity(names.len());
+                let mut data = input.to_vec();
+                if !names.is_empty() {
                     let modes = task.modes()?;
                     for name in names {
-                        data.extend(keys::encode(name, keys::parse(name)?, modes)?);
+                        let key = keys::parse(name)?;
+                        data.extend(keys::encode(name, key, modes)?);
+                        parsed.push(key);
                     }
                 }
                 if data.len() > MAX_INPUT_BYTES {
@@ -392,9 +422,16 @@ impl Server {
                             .into(),
                     );
                 }
-                let mark = wait::mark(&task, !data.is_empty());
-                task.send(Some(&data), request.eof.unwrap_or(false))?;
-                let when = request.return_when.as_ref();
+                let mark = wait::mark(&task, when)?;
+                let delay =
+                    Duration::from_millis(request.key_delay_ms.unwrap_or(DEFAULT_KEY_DELAY_MS));
+                if delay.is_zero() {
+                    // Without a pause, input and keys go out as one write, like a typed burst.
+                    task.send(Some(&data), request.eof.unwrap_or(false))?;
+                } else {
+                    task.send(Some(input), request.eof.unwrap_or(false))?;
+                    press(&task, input, names, parsed, delay, context).await?;
+                }
                 let default_wait =
                     if (request.input.is_some() || request.keys.is_some()) && when.is_none() {
                         2_000
@@ -500,6 +537,58 @@ impl Server {
     }
 }
 
+/// Writes each key on its own after `input`, pausing `delay` after the program's stdin has
+/// accepted what came before, and encodes it in the modes the program has set by then.
+async fn press(
+    task: &Task,
+    input: &[u8],
+    names: &[String],
+    parsed: Vec<keys::Key>,
+    delay: Duration,
+    context: &RequestContext<RoleServer>,
+) -> Result<(), String> {
+    let mut size = input.len();
+    for (index, (name, key)) in names.iter().zip(parsed).enumerate() {
+        let sent = |error: String| format!("{error} The first {index} keys were sent.");
+        // Input still queued, from this poll or an earlier one, goes first.
+        let mut follows = index > 0 || !input.is_empty();
+        let accepted = tokio::time::Instant::now() + INPUT_ACCEPT_LIMIT;
+        // ponytail: polls the input queue; a delivery signal from the writer if 5 ms
+        // granularity ever matters.
+        while task.input_pending() {
+            follows = true;
+            if tokio::time::Instant::now() >= accepted {
+                return Err(sent(
+                    "The program has not accepted earlier input for 5 s; the task keeps running."
+                        .into(),
+                ));
+            }
+            tokio::select! {
+                _ = context.ct.cancelled() => return Err(sent("Cancelled; the task keeps running.".into())),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        if follows {
+            tokio::select! {
+                _ = context.ct.cancelled() => return Err(sent("Cancelled; the task keeps running.".into())),
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+        let bytes = task
+            .modes()
+            .and_then(|modes| keys::encode(name, key, modes))
+            .map_err(sent)?;
+        size += bytes.len();
+        if size > MAX_INPUT_BYTES {
+            return Err(sent(format!(
+                "Key {name:?} in the program's current keyboard mode takes input and keys past 16 KiB; send fewer keys per poll."
+            )));
+        }
+        task.send(Some(&bytes), false).map_err(sent)?;
+    }
+    Ok(())
+}
+
 /// Marks the footer's finished tasks, and the task itself when its shown snapshot was final,
 /// reported once their result is built.
 fn report(task: &Task, shown: &Snapshot, background: Option<(String, Vec<Arc<Task>>)>) {
@@ -560,7 +649,7 @@ impl Server {
             ..before
         };
         let mut status = status_line(&task, &snapshot);
-        status.push_str(ended.note(view.conditions));
+        status.push_str(&ended.note(view.conditions));
         if window.bad_lines > 0 {
             status.push_str(&format!(
                 " · {} lines had bytes invalid in {}; pass encoding (e.g. big5, gbk)",
@@ -569,7 +658,7 @@ impl Server {
             ));
         }
         let mut structured = task_json(action, &task, &snapshot);
-        structured["waitEndedBy"] = json!(ended.name());
+        structured["waitEndedBy"] = ended.json();
         let text = self.layout(
             &window,
             status,
@@ -735,7 +824,7 @@ impl Server {
         .map_err(|error| format!("Cannot read the task log: {error}."))?;
         let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
         let mut status = status_line(&task, &snapshot);
-        status.push_str(ended.note(view.conditions));
+        status.push_str(&ended.note(view.conditions));
         status.push_str(&format!(" · screen, cursor row {row} col {col}"));
         output::cut_to(&mut status, view.max_bytes / 2 + 1);
         let room = view.max_bytes - status.len() - 2 - footer.len();
@@ -761,7 +850,7 @@ impl Server {
             format!("{shown}\n\n{status}{footer}")
         };
         let mut structured = task_json(action, &task, &snapshot);
-        structured["waitEndedBy"] = json!(ended.name());
+        structured["waitEndedBy"] = ended.json();
         structured["cursor"] = json!([row, col]);
         structured["omittedRows"] = json!(omitted);
         if self.output_mode != OutputMode::Text {
