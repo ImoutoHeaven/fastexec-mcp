@@ -96,7 +96,7 @@ fastexec differs from tmux in two cases, both errors that deliver nothing: a nam
 
 - `content` holds one text block.
   - Example status line: `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/t3.log`
-  - A wait a `returnWhen` condition ended adds `wait: output matched`, `wait: screen matched`, or `wait: output quiet` to the status line.
+  - A wait a `returnWhen` condition ended adds `wait: output matched`, `wait: screen matched`, or `wait: output quiet` to the status line; a wait with `returnWhen` that reached `waitMs` adds `wait: waitMs elapsed`.
   - Example omission marker in the output window: `... [770 lines omitted: log lines 21-790] ...`
 - Two environment variables, read at server startup, shape results. Any other value fails startup with a diagnostic on stderr.
   - `FASTEXEC_STRUCTURED_CONTENT`: unset or `true` includes `structuredContent`; `false` selects text-only results for all actions and operational errors, with the output window and status line in `content`.

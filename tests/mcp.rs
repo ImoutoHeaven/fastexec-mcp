@@ -437,7 +437,10 @@ fn long_command_yields_then_poll_returns_only_unseen_output() {
         json!({"action": "start", "command": "echo first; sleep 4; echo second", "waitMs": 2000}),
     );
     assert_eq!(out["state"], "running");
-    assert!(text.starts_with("first\n"), "{text}");
+    assert!(
+        text.starts_with("first\n") && !text.contains("wait:"),
+        "a wait without returnWhen adds no note: {text}"
+    );
     let (out, text) = server.ok(json!({"action": "poll", "taskId": "t1", "waitMs": 10000}));
     assert_eq!(
         (out["state"].as_str(), out["exitCode"].as_i64()),
@@ -625,6 +628,7 @@ fn return_when_ends_a_wait_on_unseen_output_text_or_quiet() {
         "returnWhen": {"outputContains": {"text": "listening"}}
     }));
     assert_eq!(out["waitEndedBy"], "max_wait", "{text}");
+    assert!(text.contains("wait: waitMs elapsed"), "{text}");
     server.ok(json!({"action": "kill", "taskId": "t1"}));
 
     // Silence before any output does not count as quiet.

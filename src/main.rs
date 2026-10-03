@@ -93,6 +93,8 @@ struct View {
     raw: bool,
     encoding: Option<&'static encoding_rs::Encoding>,
     screen: bool,
+    /// The call set `returnWhen`.
+    conditions: bool,
 }
 
 fn validate(request: &Request) -> Result<View, String> {
@@ -236,6 +238,7 @@ fn validate(request: &Request) -> Result<View, String> {
         raw: request.raw.unwrap_or(false),
         encoding,
         screen,
+        conditions: request.return_when.is_some(),
     })
 }
 
@@ -533,8 +536,10 @@ impl Server {
         // stayed open, which the status line notes), so the window below holds all of it. The
         // status line can only grow by its notes.
         let before = task.snapshot();
-        let reserved =
-            status_line(&task, &before).len() + ended.note().len() + NOTES_RESERVE + footer.len();
+        let reserved = status_line(&task, &before).len()
+            + ended.note(view.conditions).len()
+            + NOTES_RESERVE
+            + footer.len();
         let budget = match view.truncate {
             Truncate::None => usize::MAX,
             _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
@@ -555,7 +560,7 @@ impl Server {
             ..before
         };
         let mut status = status_line(&task, &snapshot);
-        status.push_str(ended.note());
+        status.push_str(ended.note(view.conditions));
         if window.bad_lines > 0 {
             status.push_str(&format!(
                 " · {} lines had bytes invalid in {}; pass encoding (e.g. big5, gbk)",
@@ -730,7 +735,7 @@ impl Server {
         .map_err(|error| format!("Cannot read the task log: {error}."))?;
         let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
         let mut status = status_line(&task, &snapshot);
-        status.push_str(ended.note());
+        status.push_str(ended.note(view.conditions));
         status.push_str(&format!(" · screen, cursor row {row} col {col}"));
         output::cut_to(&mut status, view.max_bytes / 2 + 1);
         let room = view.max_bytes - status.len() - 2 - footer.len();

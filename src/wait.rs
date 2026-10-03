@@ -108,12 +108,14 @@ impl WaitEnd {
         }
     }
 
-    /// The status line note for a wait a condition ended.
-    pub fn note(self) -> &'static str {
+    /// The status line note for a wait a condition ended, or that reached `waitMs` with
+    /// `returnWhen` conditions (`conditions`) none of which held.
+    pub fn note(self, conditions: bool) -> &'static str {
         match self {
             WaitEnd::OutputContains => " · wait: output matched",
             WaitEnd::ScreenContains => " · wait: screen matched",
             WaitEnd::OutputQuiet => " · wait: output quiet",
+            WaitEnd::MaxWait if conditions => " · wait: waitMs elapsed",
             WaitEnd::TaskEnded | WaitEnd::MaxWait => "",
         }
     }
