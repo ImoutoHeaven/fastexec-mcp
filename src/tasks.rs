@@ -7,7 +7,9 @@ use crate::output::{
 use crate::process::{self, Launch, Tree};
 use crate::terminal::Live;
 use encoding_rs::Encoding;
+use std::collections::HashSet;
 use std::fs::File;
+use std::hash::{BuildHasher, RandomState};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -38,8 +40,25 @@ pub struct Tasks {
 
 #[derive(Default)]
 struct Registry {
-    next_id: u64,
+    /// Every ID this server has issued, so a retired task's ID never names a later task.
+    issued: HashSet<String>,
     tasks: Vec<Arc<Task>>,
+}
+
+/// Five random characters from Crockford's base32 alphabet in lowercase, at least one of them
+/// a letter, unique within this server. Random IDs make an ID from another fastexec server,
+/// such as a nested one, unlikely to name a task here.
+fn new_id(issued: &mut HashSet<String>) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+    loop {
+        let bits = RandomState::new().hash_one(issued.len());
+        let id: String = (0..5)
+            .map(|i| ALPHABET[(bits >> (5 * i)) as usize & 31] as char)
+            .collect();
+        if id.bytes().any(|b| b.is_ascii_alphabetic()) && issued.insert(id.clone()) {
+            return id;
+        }
+    }
 }
 
 pub struct Task {
@@ -183,8 +202,7 @@ impl Tasks {
                 "TOO_MANY_TASKS: {MAX_RUNNING} tasks are running. Wait for one to finish or kill one, then retry."
             ));
         }
-        registry.next_id += 1;
-        let id = format!("t{}", registry.next_id);
+        let id = new_id(&mut registry.issued);
         let log_path = self.dir.join(format!("{id}.log"));
         let log = private_file(&log_path)
             .map_err(|error| format!("Cannot create the task log: {error}."))?;
