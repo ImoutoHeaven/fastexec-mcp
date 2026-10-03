@@ -46,7 +46,8 @@ The tool takes one flat object with `deny_unknown_fields`. `action` selects the 
 | `input` | poll | string, at most 16 KiB UTF-8 | Written exactly as given, before `keys` and before waiting |
 | `keys` | poll, PTY tasks | array of key names | Pressed after `input`, in array order (§3 Keys). `input` and the encoded keys together hold at most 16 KiB |
 | `eof` | poll | boolean, `false` | Pipe mode: close stdin after `input`. PTY mode: returns an error |
-| `waitMs` | start, poll | integer 0–240000 | Defaults: start 30000; poll with `input` or `keys` 2000; other polls 30000 |
+| `waitMs` | start, poll | integer 0–240000 | Longest wait. Defaults: poll with `input` or `keys` and no `returnWhen` 2000; otherwise 30000 |
+| `returnWhen` | start, poll | object with at least one of `outputContains` (`{text, caseSensitive}`), `outputQuietForMs` (integer 10–60000), `screenContains` (`{text, caseSensitive}`, PTY tasks with UTF-8 output) | Conditions that end the wait early (§3 Waiting) |
 | `truncate` | start, poll, transcript | `head_tail` (default; `tail` for transcript) / `head` / `tail` / `none` | Output window mode (§5) |
 | `maxBytes` | start, poll, transcript | integer 1024–1048576, default 16384 | Output window budget; rejected with `truncate: "none"` |
 | `raw` | start, poll | boolean, `false` | Return output without cleaning (§5) |
@@ -80,6 +81,12 @@ fastexec differs from tmux in two cases, both errors that deliver nothing: a nam
 
 ### Waiting
 
+- A wait ends when the task ends, `waitMs` elapses, or a `returnWhen` condition holds, whichever comes first. When several hold at once, the result names the first of task end, `outputContains`, `screenContains`, `outputQuietForMs`. An early end leaves the task running.
+- `outputContains`: the call's unseen output contains the text: for `poll`, output from the cursor on, including output that arrives during the wait; for `start`, all output. The output is cleaned as results clean it and decoded with the call's encoding. Every state a cleaned line passes through counts, before a CR rewrites it and before trailing spaces are trimmed, so the way output splits into reads never changes the answer. A match lies within one line of the stored log.
+- `outputQuietForMs`: once the call has output to see, no output byte arrives for the given time. Output to see is unseen output when the call begins or output that arrives during it; a poll with `input` or `keys` counts only output that arrives after them, a PTY's echo of them included. Every captured byte restarts the time, escape sequences and redraws included. A PTY task is not quiet while a synchronized update holds output. On Windows, ConPTY writes terminal setup sequences when a PTY task starts, and they count as output.
+- `screenContains`: a row of the live emulator's screen (§5 Screen) contains the text. Output a synchronized update holds counts once the update ends or times out. Text split across a wrapped row does not match. A stopped emulator returns an error.
+- `text` is literal, 1–4096 bytes, without line breaks. `caseSensitive` defaults to true; false ignores the case of ASCII letters only.
+- Waits wake on captured output, on synchronized-update timeouts, and when output ends; a condition that holds by the deadline still ends the wait. Two polls of one task share its cursor, so an `outputContains` match one of them sees may land in the other's result.
 - An MCP cancellation ends the wait, and the process keeps running.
 - If a `start` is cancelled, its task ID is lost with the response; `list` recovers it.
 - While a wait is in progress and the request carries a `progressToken`, the server sends `notifications/progress` every 20 s, so a 240 s wait stays inside pi's 60 s request timeout.
@@ -89,6 +96,7 @@ fastexec differs from tmux in two cases, both errors that deliver nothing: a nam
 
 - `content` holds one text block.
   - Example status line: `[exited 0] t3 · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/t3.log`
+  - A wait a `returnWhen` condition ended adds `wait: output matched`, `wait: screen matched`, or `wait: output quiet` to the status line.
   - Example omission marker in the output window: `... [770 lines omitted: log lines 21-790] ...`
 - Two environment variables, read at server startup, shape results. Any other value fails startup with a diagnostic on stderr.
   - `FASTEXEC_STRUCTURED_CONTENT`: unset or `true` includes `structuredContent`; `false` selects text-only results for all actions and operational errors, with the output window and status line in `content`.
@@ -99,6 +107,7 @@ fastexec differs from tmux in two cases, both errors that deliver nothing: a nam
   - Every mode uses the same output window, byte budget, and poll cursor. `list`, `kill`, and operational error results keep their text in every mode.
 - `structuredContent` carries:
   - for `start`, `poll`, and `kill`: `ok`, `action`, `taskId`, `state` (`running` / `exited` / `killed`), `exitCode`, `pty`, `elapsedMs`, `logPath`, `lifetimeExpired`, and `logError` (the first log write failure, or `null`);
+  - for `start` and `poll`, additionally: `waitEndedBy` (`task_ended` / `output_contains` / `screen_contains` / `output_quiet` / `max_wait`);
   - for `start` and `poll` with `screen`, additionally: `cursor` (`[row, column]`, 1-based) and `omittedRows`; in `both` and `structured` modes also `output`, the screen text;
   - for other `start` and `poll` results, additionally: `omittedLines`, `omittedRange` (`[first, last]` log lines or `null`), `cutLines` (shown lines that lost part of their text to a per-line limit or the budget), and `encodingErrors` (lines with invalid byte sequences). In `both` and `structured` modes they also carry `output`, the window text, with an empty string for an empty window; `content` displays `(no new output)` for that empty window in `text` and `both` modes;
   - for `transcript`: the `start`/`poll`/`kill` fields, `omittedLines`, `omittedRange` (transcript lines), `cutLines`, `encodingErrors`, `transcriptPath`, `transcriptLines`, `alternateScreen`, and `historyFull`; in `both` and `structured` modes also `output`;
@@ -112,13 +121,13 @@ fastexec differs from tmux in two cases, both errors that deliver nothing: a nam
 
 ## 4. Tool Description
 
-The tool description (`src/description.md`, at most 3 KB) says how to use the tool, and the server instructions returned by `initialize` say when. pi-mcp-adapter shows the instructions in its `mcp` proxy description. pi's built-in MCP lists one line for each server with `codemode` or `deferred` tools, taken from the configured `description` or else the first line of the instructions, so that first line stands alone; `describeNamespace()` returns the full instructions. `serverInfo` reports `fastexec` and the crate version.
+The tool description (`src/description.md`, at most 3.5 KB) says how to use the tool, and the server instructions returned by `initialize` say when. pi-mcp-adapter shows the instructions in its `mcp` proxy description. pi's built-in MCP lists one line for each server with `codemode` or `deferred` tools, taken from the configured `description` or else the first line of the instructions, so that first line stands alone; `describeNamespace()` returns the full instructions. `serverInfo` reports `fastexec` and the crate version.
 
 `src/description.md` is the authoritative text. It covers:
 
 - the five actions, their defaults, and the 240 s wait limit; a non-zero exit code is a normal result;
 - GNU bash (Git Bash on Windows) and a fresh shell per `start`: calls pass `cwd` or chain with `&&`;
-- wait sizing: long waits for builds and tests, short ones for prompts, no repeated `waitMs: 0` polls or `sleep` commands;
+- wait sizing: long waits for builds and tests, `returnWhen` for prompts and TUIs, no repeated `waitMs: 0` polls or `sleep` commands;
 - task lifetime: tasks end with the session, and the rest of a tree ends with its root bash, so long-lived servers run as their own task;
 - output: one merged stream, cleaning and `raw`, the `truncate` modes and per-line caps, narrowing with pipelines and `set -o pipefail`, and reading the log file with `sed` or `grep`;
 - stdin: pipe-mode stdin stays open until `eof` or exit; `< /dev/null` for programs that read it;
@@ -265,7 +274,7 @@ PTY commands start from the server's process environment: portable-pty's own see
 
 ### 6.4 Concurrency
 
-Each task runs four threads: an output reader, a capture thread that stores the output and feeds the emulator, an input writer, and a waiter. Short locks guard the output counters, the cursor, the input sender, and the final status; waits subscribe to a completion channel and hold no lock. Tool calls run in parallel, so a 240 s `poll` on one task leaves `kill` and other polls responsive. At most 16 tasks run at once; a further `start` returns `TOO_MANY_TASKS`.
+Each task runs four threads: an output reader, a capture thread that stores the output and feeds the emulator, an input writer, and a waiter. Short locks guard the output counters, the cursor, the input sender, and the final status; waits subscribe to completion and capture-activity channels and hold no lock. Tool calls run in parallel, so a 240 s `poll` on one task leaves `kill` and other polls responsive. At most 16 tasks run at once; a further `start` returns `TOO_MANY_TASKS`.
 
 A task is its whole process tree. When the root bash exits, the waiter terminates whatever remains of the tree, closes a PTY, and waits up to 2 s for the reader to reach EOF. It then closes stdin and commits the final state once. Long-lived processes such as development servers therefore run as their own task. If output stays open past the 2 s cap, the status line says so and later polls show any further output.
 
@@ -306,11 +315,12 @@ pi with the `pi-mcp-adapter` extension (2.26), which replaces the built-in MCP s
 
 | File | Content | Origin |
 |---|---|---|
-| `src/main.rs` | rmcp stdio server, tool schema, validation, waits, progress, results, shutdown | new |
+| `src/main.rs` | rmcp stdio server, tool schema, validation, results, shutdown | new |
+| `src/wait.rs` | waits, `returnWhen` conditions, progress | new |
 | `src/description.md` | tool description shown to the model (§4) | new |
 | `src/bash.rs` | bash discovery | FastCtx `src/shell/bash.rs` |
 | `src/process.rs` | launch, environment, locale, Job Object, process session, PTY spawn | FastCtx `src/shell/process.rs` and `src/process_policy.rs`, plus PTY |
-| `src/output.rs` | streaming ANSI/CR cleaning and head/tail windows under a byte budget | FastCtx `src/shell/normalize.rs` and `src/shell/output.rs`, with CR overwrite |
+| `src/output.rs` | streaming ANSI/CR cleaning, head/tail windows under a byte budget, and text matching over cleaned output | FastCtx `src/shell/normalize.rs` and `src/shell/output.rs`, with CR overwrite |
 | `src/tasks.rs` | task registry, log capture, cursors, input queues, retention, shutdown | new |
 | `src/keys.rs` | tmux key names to terminal input bytes, legacy and kitty keyboard protocol (§3 Keys) | tmux `key-string.c` and `input-keys.c`; Windows Terminal `terminalInput.cpp` |
 | `src/terminal.rs` | the `alacritty_terminal` emulator of a PTY task, and log replay into history and screen lines (§5 Screen, Transcript) | new |
@@ -343,3 +353,4 @@ Run every case on Windows 11 x64 with Git for Windows and on Ubuntu x64 with bas
 | A13 | Parameters | Misplaced or out-of-range parameters return errors; `null` optional fields behave as omitted |
 | A14 | TUI | pi's interactive TUI accepts a prompt typed with `input` and submitted with `keys: ["Enter"]`; `screen: true` shows one rendered frame |
 | A15 | Transcript | After pi and `codex --no-alt-screen` answer with 120 numbered lines, `transcript` shows each line once, in order |
+| A16 | Early return | A dev server `start` with `outputContains` returns at its ready line; a TUI `poll` with `keys` and `outputQuietForMs` returns its redrawn screen; `waitEndedBy` names the condition |

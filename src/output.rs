@@ -37,7 +37,7 @@ enum EscState {
 }
 
 /// Per-task cleaning state carried between windows so sequences split across reads stay intact.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Cleaner {
     escape: EscState,
     pending_cr: bool,
@@ -45,6 +45,177 @@ pub struct Cleaner {
     swallow_lf: bool,
     /// The previous window ended inside a line; an empty remainder of it is not shown again.
     continued: bool,
+}
+
+/// What one output byte does to the cleaned line, after clearing it when `Cleaner::step` says so.
+enum Step {
+    Nothing,
+    /// The byte is text.
+    Append,
+    /// A control byte: it starts the line without adding text.
+    Control,
+    EndLine,
+    /// The LF completing a CRLF whose line the previous window already showed.
+    SwallowedLf,
+}
+
+impl Cleaner {
+    /// Advances the ANSI CSI/OSC parser; returns true when `byte` belongs to a sequence.
+    fn escape(&mut self, byte: u8) -> bool {
+        self.escape = match (self.escape, byte) {
+            (EscState::Text, 0x1b) => EscState::Esc,
+            (EscState::Text, _) => return false,
+            (EscState::Esc, b'[') => EscState::Csi,
+            (EscState::Esc, b']') => EscState::Osc,
+            (EscState::Esc, _) | (EscState::Csi, 0x40..=0x7e) => EscState::Text,
+            (EscState::Csi, _) => EscState::Csi,
+            (EscState::Osc, 0x07) | (EscState::OscEsc, b'\\') => EscState::Text,
+            (EscState::Osc, 0x1b) | (EscState::OscEsc, 0x1b) => EscState::OscEsc,
+            (EscState::Osc, _) | (EscState::OscEsc, _) => EscState::Osc,
+        };
+        true
+    }
+
+    /// Cleans one byte: returns whether the line is cleared first, and what the byte does.
+    fn step(&mut self, byte: u8) -> (bool, Step) {
+        if std::mem::take(&mut self.swallow_lf) && byte == b'\n' {
+            return (false, Step::SwallowedLf);
+        }
+        let mut clear = false;
+        if byte == 0x1b && self.escape == EscState::Text && self.pending_cr {
+            // CR then an escape sequence (often ESC[K) starts rewriting the line.
+            self.pending_cr = false;
+            clear = true;
+        }
+        if self.escape(byte) {
+            return (clear, Step::Nothing);
+        }
+        if std::mem::take(&mut self.pending_cr) {
+            if byte == b'\n' {
+                return (false, Step::EndLine);
+            }
+            // A Unix PTY sends `\r\n` as `\r\r\n`: a CR after a CR moves nothing.
+            if byte == b'\r' {
+                self.pending_cr = true;
+                return (false, Step::Nothing);
+            }
+            // A lone CR returns the cursor to column 0: the text that follows replaces the line.
+            clear = true;
+        }
+        let step = match byte {
+            b'\n' => Step::EndLine,
+            b'\r' => {
+                self.pending_cr = true;
+                Step::Control
+            }
+            b'\t' => Step::Append,
+            0x00..=0x1f | 0x7f => Step::Control,
+            _ => Step::Append,
+        };
+        (clear, step)
+    }
+}
+
+/// Finds literal text in output cleaned as windows clean it, fed in pieces of any size. Every
+/// state a cleaned line passes through counts, before a carriage return rewrites it and before
+/// trailing spaces are trimmed, so how the output is split never changes the answer.
+pub struct Matcher {
+    /// The text sought, ASCII-lowercased when the search ignores case.
+    needle: String,
+    ignore_case: bool,
+    encoding: &'static Encoding,
+    cleaner: Cleaner,
+    decoder: encoding_rs::Decoder,
+    /// The decoded end of the current line, long enough to hold a match that ends later.
+    line: String,
+    /// Text bytes of the current line not decoded yet.
+    pending: Vec<u8>,
+}
+
+impl Matcher {
+    /// A matcher that continues from `cleaner`, the cleaning state where its output starts.
+    pub fn new(
+        needle: &str,
+        case_sensitive: bool,
+        encoding: &'static Encoding,
+        cleaner: Cleaner,
+    ) -> Self {
+        Self {
+            needle: if case_sensitive {
+                needle.to_string()
+            } else {
+                needle.to_ascii_lowercase()
+            },
+            ignore_case: !case_sensitive,
+            encoding,
+            cleaner,
+            decoder: encoding.new_decoder_without_bom_handling(),
+            line: String::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Feeds the next output bytes; returns true once the text has appeared.
+    pub fn push(&mut self, bytes: &[u8]) -> bool {
+        for &byte in bytes {
+            let (clear, step) = self.cleaner.step(byte);
+            if clear && self.found(true) {
+                return true;
+            }
+            if clear {
+                self.new_line();
+            }
+            match step {
+                Step::Append => self.pending.push(byte),
+                Step::EndLine => {
+                    if self.found(true) {
+                        return true;
+                    }
+                    self.new_line();
+                }
+                Step::Nothing | Step::Control | Step::SwallowedLf => {}
+            }
+        }
+        self.found(false)
+    }
+
+    /// Ends the output: an unfinished last line ends as a window shows it. Returns true when
+    /// the text appears; a repeated call finds nothing more.
+    pub fn finish(&mut self) -> bool {
+        let found = self.found(true);
+        self.new_line();
+        found
+    }
+
+    fn new_line(&mut self) {
+        self.line.clear();
+        self.pending.clear();
+        self.decoder = self.encoding.new_decoder_without_bom_handling();
+    }
+
+    /// Decodes the pending bytes and searches the line, then keeps only the end of the line
+    /// that a later match could start in. `last` ends the line's text, so an unfinished
+    /// character decodes as the replacement character a window shows.
+    fn found(&mut self, last: bool) -> bool {
+        let pending = std::mem::take(&mut self.pending);
+        if let Some(room) = self.decoder.max_utf8_buffer_length(pending.len()) {
+            self.line.reserve(room);
+        }
+        let _ = self
+            .decoder
+            .decode_to_string(&pending, &mut self.line, last);
+        let found = if self.ignore_case {
+            self.line.to_ascii_lowercase().contains(&self.needle)
+        } else {
+            self.line.contains(&self.needle)
+        };
+        let mut cut = self.line.len().saturating_sub(self.needle.len());
+        while !self.line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.line.drain(..cut);
+        found
+    }
 }
 
 /// One line ready for the window, with its 1-based log line number.
@@ -160,7 +331,7 @@ impl<'a> WindowBuilder<'a> {
 
     fn raw_byte(&mut self, byte: u8) {
         // The parser still advances so a later cleaned window starts in the right state.
-        self.escape(byte);
+        self.cleaner.escape(byte);
         if byte == b'\n' {
             self.end_line(true);
         } else {
@@ -168,60 +339,18 @@ impl<'a> WindowBuilder<'a> {
         }
     }
 
-    /// Advances the ANSI CSI/OSC parser; returns true when `byte` belongs to a sequence.
-    fn escape(&mut self, byte: u8) -> bool {
-        let state = &mut self.cleaner.escape;
-        *state = match (*state, byte) {
-            (EscState::Text, 0x1b) => EscState::Esc,
-            (EscState::Text, _) => return false,
-            (EscState::Esc, b'[') => EscState::Csi,
-            (EscState::Esc, b']') => EscState::Osc,
-            (EscState::Esc, _) | (EscState::Csi, 0x40..=0x7e) => EscState::Text,
-            (EscState::Csi, _) => EscState::Csi,
-            (EscState::Osc, 0x07) | (EscState::OscEsc, b'\\') => EscState::Text,
-            (EscState::Osc, 0x1b) | (EscState::OscEsc, 0x1b) => EscState::OscEsc,
-            (EscState::Osc, _) | (EscState::OscEsc, _) => EscState::Osc,
-        };
-        true
-    }
-
     fn clean_byte(&mut self, byte: u8) {
-        if std::mem::take(&mut self.cleaner.swallow_lf) && byte == b'\n' {
-            self.newlines += 1;
-            return;
-        }
-        if byte == 0x1b && self.cleaner.escape == EscState::Text && self.cleaner.pending_cr {
-            // CR then an escape sequence (often ESC[K) starts rewriting the line.
-            self.cleaner.pending_cr = false;
+        let (clear, step) = self.cleaner.step(byte);
+        if clear {
             self.line.clear();
             self.line_overflow = 0;
         }
-        if self.escape(byte) {
-            return;
-        }
-        if std::mem::take(&mut self.cleaner.pending_cr) {
-            if byte == b'\n' {
-                self.end_line(true);
-                return;
-            }
-            // A Unix PTY sends `\r\n` as `\r\r\n`: a CR after a CR moves nothing.
-            if byte == b'\r' {
-                self.cleaner.pending_cr = true;
-                return;
-            }
-            // A lone CR returns the cursor to column 0: the text that follows replaces the line.
-            self.line.clear();
-            self.line_overflow = 0;
-        }
-        match byte {
-            b'\n' => self.end_line(true),
-            b'\r' => {
-                self.cleaner.pending_cr = true;
-                self.line_started = true;
-            }
-            b'\t' => self.append(byte),
-            0x00..=0x1f | 0x7f => self.line_started = true,
-            _ => self.append(byte),
+        match step {
+            Step::Nothing => {}
+            Step::Append => self.append(byte),
+            Step::Control => self.line_started = true,
+            Step::EndLine => self.end_line(true),
+            Step::SwallowedLf => self.newlines += 1,
         }
     }
 
@@ -527,6 +656,50 @@ mod tests {
         let out = second.finish();
         assert_eq!(text(&out), "next");
         assert_eq!(out.newlines, 2);
+    }
+
+    #[test]
+    fn matcher_finds_text_in_cleaned_output_however_it_is_split() {
+        let utf8 = encoding_rs::UTF_8;
+        let cases: [(&[u8], &str, bool, &'static Encoding, bool); 10] = [
+            (
+                b"\x1b[32mServer\x1b[0m listening\r\n",
+                "Server listening",
+                true,
+                utf8,
+                true,
+            ),
+            // Text a carriage return rewrites still counts.
+            (b"10%\r50%\r100%\r\x1b[Kdone", "100%", true, utf8, true),
+            (b"Password: ", "Password: ", true, utf8, true),
+            (b"SERVER READY", "server ready", false, utf8, true),
+            (b"SERVER READY", "server ready", true, utf8, false),
+            // Only ASCII letters fold.
+            ("\u{c9}COLE".as_bytes(), "\u{e9}cole", false, utf8, false),
+            (
+                b"\xd6\xd0\xce\xc4 ok",
+                "\u{4e2d}\u{6587} ok",
+                true,
+                encoding_rs::GBK,
+                true,
+            ),
+            (b"ab\ncd", "bc", true, utf8, false),
+            // A line ending inside a character shows, and matches, the replacement character.
+            (b"\xe2\n", "\u{fffd}", true, utf8, true),
+            (b"\xe2", "\u{fffd}", true, utf8, true),
+        ];
+        for (output, needle, case_sensitive, encoding, expected) in cases {
+            let matcher = || Matcher::new(needle, case_sensitive, encoding, Cleaner::default());
+            for split in 0..=output.len() {
+                let mut two = matcher();
+                let found =
+                    two.push(&output[..split]) || two.push(&output[split..]) || two.finish();
+                assert_eq!(found, expected, "{needle:?} split at {split}");
+            }
+            let mut bytes = matcher();
+            let found = output.iter().any(|byte| bytes.push(&[*byte])) || bytes.finish();
+            assert_eq!(found, expected, "{needle:?} byte by byte");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Task registry: spawn, log capture, unseen-output cursors, input queues, and shutdown.
 
 use crate::output::{
-    Cleaner, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix,
+    Cleaner, Matcher, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix,
     incomplete_utf8_suffix,
 };
 use crate::process::{self, Launch, Tree};
@@ -59,6 +59,8 @@ pub struct Task {
     view: Mutex<View>,
     end: Mutex<Option<Final>>,
     done: watch::Sender<bool>,
+    /// Signals each captured output chunk and each synchronized update its timeout ends.
+    activity: watch::Sender<()>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
     queued: AtomicUsize,
     /// PTY tasks: a terminal emulator fed with every output byte. Its replies to terminal
@@ -89,6 +91,8 @@ struct Output {
     log_error: Option<String>,
     /// Output reached EOF: every captured byte is final.
     closed: bool,
+    /// When the last output byte arrived, stored or not.
+    last_output: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -223,6 +227,7 @@ impl Tasks {
             view: Mutex::default(),
             end: Mutex::new(None),
             done: watch::Sender::new(false),
+            activity: watch::Sender::new(()),
             input: Mutex::new(Some(input_tx.clone())),
             queued: AtomicUsize::new(0),
             terminal: args.pty.then(|| Mutex::new(Live::new())),
@@ -502,6 +507,7 @@ fn capture(
                         if let (Some(terminal), Some(answer)) = (&task.terminal, &answer) {
                             answer_program(task, answer, lock(terminal).end_sync());
                         }
+                        task.activity.send_replace(());
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => None,
@@ -511,6 +517,7 @@ fn capture(
         let Some(chunk) = received else {
             break;
         };
+        let arrived = Instant::now();
         let chunk = chunk.as_slice();
         // The emulator stays locked until the chunk is in the log, so a screen and the log
         // offset taken under that lock show the same output.
@@ -560,8 +567,10 @@ fn capture(
             out.readable = out.written - incomplete_utf8_suffix(&last) as u64;
         }
         out.dropped += (chunk.len() - stored.len()) as u64;
+        out.last_output = Some(arrived);
         drop(out);
         drop(terminal);
+        task.activity.send_replace(());
     }
     // No later output can end a synchronized update; the screen shows what it held.
     let terminal = task.terminal.as_ref().map(lock);
@@ -571,6 +580,8 @@ fn capture(
     let mut out = lock(&task.out);
     out.readable = out.written;
     out.closed = true;
+    drop(out);
+    task.activity.send_replace(());
 }
 
 impl Task {
@@ -584,6 +595,62 @@ impl Task {
 
     pub fn done(&self) -> watch::Receiver<bool> {
         self.done.subscribe()
+    }
+
+    pub fn activity(&self) -> watch::Receiver<()> {
+        self.activity.subscribe()
+    }
+
+    /// Output bytes captured so far, stored or not, when the last one arrived, and whether a
+    /// PTY task's terminal holds output in a synchronized update that has not ended yet, all
+    /// taken together.
+    pub fn received(&self) -> (u64, Option<Instant>, bool) {
+        let terminal = self.terminal.as_ref().map(lock);
+        let out = lock(&self.out);
+        let sync_pending = terminal.is_some_and(|terminal| terminal.sync_deadline().is_some());
+        (out.written + out.dropped, out.last_output, sync_pending)
+    }
+
+    /// Where unseen output starts: the poll cursor, the cleaning state there, whether stored
+    /// output lies past it, and the output bytes captured so far, all taken together.
+    pub fn unseen(&self) -> (u64, Cleaner, bool, u64) {
+        let view = lock(&self.view);
+        let out = lock(&self.out);
+        (
+            view.cursor,
+            view.cleaner.clone(),
+            out.written > view.cursor,
+            out.written + out.dropped,
+        )
+    }
+
+    /// Feeds `matcher` the stored output from `from` on, advancing `from` past what it read,
+    /// and ends it once output has ended; returns true once the matcher finds its text.
+    pub fn scan(&self, matcher: &mut Matcher, from: &mut u64) -> std::io::Result<bool> {
+        let (written, evicted, closed) = {
+            let out = lock(&self.out);
+            (out.written, out.evicted, out.closed)
+        };
+        if evicted {
+            return Ok(false);
+        }
+        if written > *from {
+            let mut file = File::open(&self.log_path)?;
+            file.seek(SeekFrom::Start(*from))?;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            while *from < written {
+                let want = (written - *from).min(buffer.len() as u64) as usize;
+                let read = file.read(&mut buffer[..want])?;
+                if read == 0 {
+                    break;
+                }
+                *from += read as u64;
+                if matcher.push(&buffer[..read]) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(closed && *from >= written && matcher.finish())
     }
 
     pub fn snapshot(&self) -> Snapshot {

@@ -7,13 +7,11 @@ mod output;
 mod process;
 mod tasks;
 mod terminal;
+mod wait;
 
 use output::{Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities,
-    ServerInfo,
-};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -21,11 +19,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tasks::{Snapshot, StartArgs, Task, Tasks};
+use wait::WaitEnd;
 
 const MAX_WAIT_MS: u64 = 240_000;
-const PROGRESS_EVERY: Duration = Duration::from_secs(20);
 const KILL_WAIT: Duration = Duration::from_secs(5);
 const MAX_INPUT_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BYTES: u64 = 16 * 1024;
@@ -70,9 +68,11 @@ struct Request {
     keys: Option<Vec<String>>,
     /// poll: close stdin after input (pipe mode only).
     eof: Option<bool>,
-    /// start, poll: how long to wait, 0-240000 ms.
+    /// start, poll: how long to wait at most, 0-240000 ms.
     #[schemars(range(min = 0, max = 240000))]
     wait_ms: Option<u64>,
+    /// start, poll: end the wait early when any condition holds; the task keeps running. waitMs stays the longest wait and defaults to 30000 with returnWhen.
+    return_when: Option<wait::ReturnWhen>,
     /// start, poll, transcript: output window mode (default head_tail; transcript defaults to tail).
     truncate: Option<Truncate>,
     /// start, poll, transcript: byte budget of the result, 1024-1048576 (default 16384).
@@ -112,9 +112,16 @@ fn validate(request: &Request) -> Result<View, String> {
         ("encoding", request.encoding.is_some()),
         ("keys", request.keys.is_some()),
         ("screen", request.screen.is_some()),
+        ("returnWhen", request.return_when.is_some()),
     ];
-    const VIEW: [&str; 6] = [
-        "waitMs", "truncate", "maxBytes", "raw", "encoding", "screen",
+    const VIEW: [&str; 7] = [
+        "waitMs",
+        "returnWhen",
+        "truncate",
+        "maxBytes",
+        "raw",
+        "encoding",
+        "screen",
     ];
     let allowed: Vec<&str> = match request.action {
         Action::Start => ["command", "cwd", "pty", "loginShell", "killAfterMs"]
@@ -172,6 +179,12 @@ fn validate(request: &Request) -> Result<View, String> {
             return Err("screen needs a PTY task; start with pty: true.".into());
         }
     }
+    if let Some(when) = &request.return_when {
+        when.validate()?;
+        if when.watches_screen() && request.action == Action::Start && request.pty != Some(true) {
+            return Err("screenContains needs a PTY task; start with pty: true.".into());
+        }
+    }
     if let Some(wait) = request.wait_ms.filter(|&wait| wait > MAX_WAIT_MS) {
         return Err(format!("waitMs {wait} is out of range 0-{MAX_WAIT_MS}."));
     }
@@ -202,6 +215,15 @@ fn validate(request: &Request) -> Result<View, String> {
             format!("Unknown or unsupported encoding {label:?}; use an ASCII-compatible WHATWG label such as \"utf-8\", \"big5\", or \"gbk\" (UTF-16 output is not supported).")
         })?),
     };
+    if request.action == Action::Start
+        && request
+            .return_when
+            .as_ref()
+            .is_some_and(|when| when.watches_screen())
+        && encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8)
+    {
+        return Err("screenContains needs UTF-8 output; remove encoding.".into());
+    }
     Ok(View {
         truncate: request
             .truncate
@@ -319,22 +341,40 @@ impl Server {
                         }
                     });
                 }
+                let mark = wait::mark(&task, false);
+                let encoding = view.encoding.unwrap_or(task.encoding);
                 let wait = request.wait_ms.unwrap_or(30_000);
-                wait_for(&task, wait, context).await?;
-                self.window_result(Action::Start, task, view).await
+                let when = request.return_when.as_ref();
+                let ended = wait::wait(&task, wait, when, mark, encoding, context).await?;
+                self.window_result(Action::Start, task, view, ended).await
             }
             Action::Poll => {
                 let task = self.task(request.task_id.as_deref())?;
-                if (view.screen || request.keys.is_some()) && !task.pty {
+                let watches_screen = request
+                    .return_when
+                    .as_ref()
+                    .is_some_and(|when| when.watches_screen());
+                let needs_pty = [
+                    ("screen", view.screen),
+                    ("keys", request.keys.is_some()),
+                    ("screenContains", watches_screen),
+                ]
+                .into_iter()
+                .find_map(|(name, set)| set.then_some(name));
+                if let Some(name) = needs_pty.filter(|_| !task.pty) {
                     return Err(format!(
-                        "{} applies to PTY tasks only; in pipe mode, write text with input and end lines with a newline.",
-                        if view.screen { "screen" } else { "keys" }
+                        "{name} applies to PTY tasks only; in pipe mode, write text with input and end lines with a newline."
                     ));
                 }
-                if view.screen && task.encoding != encoding_rs::UTF_8 {
-                    return Err(
-                        "screen needs UTF-8 output; this task was started with an encoding.".into(),
-                    );
+                if (view.screen || watches_screen) && task.encoding != encoding_rs::UTF_8 {
+                    return Err(format!(
+                        "{} needs UTF-8 output; this task was started with an encoding.",
+                        if view.screen {
+                            "screen"
+                        } else {
+                            "screenContains"
+                        }
+                    ));
                 }
                 let mut data = request.input.clone().unwrap_or_default().into_bytes();
                 if let Some(names) = &request.keys {
@@ -349,14 +389,19 @@ impl Server {
                             .into(),
                     );
                 }
+                let mark = wait::mark(&task, !data.is_empty());
                 task.send(Some(&data), request.eof.unwrap_or(false))?;
-                let default_wait = if request.input.is_some() || request.keys.is_some() {
-                    2_000
-                } else {
-                    30_000
-                };
-                wait_for(&task, request.wait_ms.unwrap_or(default_wait), context).await?;
-                self.window_result(Action::Poll, task, view).await
+                let when = request.return_when.as_ref();
+                let default_wait =
+                    if (request.input.is_some() || request.keys.is_some()) && when.is_none() {
+                        2_000
+                    } else {
+                        30_000
+                    };
+                let wait = request.wait_ms.unwrap_or(default_wait);
+                let encoding = view.encoding.unwrap_or(task.encoding);
+                let ended = wait::wait(&task, wait, when, mark, encoding, context).await?;
+                self.window_result(Action::Poll, task, view, ended).await
             }
             Action::Kill => {
                 let task = self.task(request.task_id.as_deref())?;
@@ -452,37 +497,6 @@ impl Server {
     }
 }
 
-/// Waits until the task ends, `wait_ms` elapses, or the call is cancelled, sending progress.
-async fn wait_for(
-    task: &Task,
-    wait_ms: u64,
-    context: &RequestContext<RoleServer>,
-) -> Result<(), String> {
-    let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
-    let token = context.meta.get_progress_token();
-    let mut ticks =
-        tokio::time::interval_at(tokio::time::Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
-    let mut done = task.done();
-    let finished = async move {
-        let _ = done.wait_for(|done| *done).await;
-    };
-    tokio::pin!(finished);
-    loop {
-        tokio::select! {
-            _ = &mut finished => return Ok(()),
-            _ = tokio::time::sleep_until(deadline) => return Ok(()),
-            _ = context.ct.cancelled() => return Err("Cancelled; the task keeps running.".into()),
-            _ = ticks.tick(), if token.is_some() => {
-                let seconds = started.elapsed().as_secs_f64();
-                let message = format!("{} running, waited {seconds:.0}s of {}s", task.id, wait_ms / 1000);
-                let progress = ProgressNotificationParam::new(token.clone().expect("guarded"), seconds).with_message(message);
-                let _ = context.peer.notify_progress(progress).await;
-            }
-        }
-    }
-}
-
 /// Marks the footer's finished tasks, and the task itself when its shown snapshot was final,
 /// reported once their result is built.
 fn report(task: &Task, shown: &Snapshot, background: Option<(String, Vec<Arc<Task>>)>) {
@@ -500,9 +514,10 @@ impl Server {
         action: Action,
         task: Arc<Task>,
         view: View,
+        ended: WaitEnd,
     ) -> Result<CallToolResult, String> {
         if view.screen {
-            return self.screen_result(action, task, view).await;
+            return self.screen_result(action, task, view, ended).await;
         }
         let reader = Arc::clone(&task);
         let encoding = view.encoding.unwrap_or(task.encoding);
@@ -518,7 +533,8 @@ impl Server {
         // stayed open, which the status line notes), so the window below holds all of it. The
         // status line can only grow by its notes.
         let before = task.snapshot();
-        let reserved = status_line(&task, &before).len() + NOTES_RESERVE + footer.len();
+        let reserved =
+            status_line(&task, &before).len() + ended.note().len() + NOTES_RESERVE + footer.len();
         let budget = match view.truncate {
             Truncate::None => usize::MAX,
             _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
@@ -539,6 +555,7 @@ impl Server {
             ..before
         };
         let mut status = status_line(&task, &snapshot);
+        status.push_str(ended.note());
         if window.bad_lines > 0 {
             status.push_str(&format!(
                 " · {} lines had bytes invalid in {}; pass encoding (e.g. big5, gbk)",
@@ -547,6 +564,7 @@ impl Server {
             ));
         }
         let mut structured = task_json(action, &task, &snapshot);
+        structured["waitEndedBy"] = json!(ended.name());
         let text = self.layout(
             &window,
             status,
@@ -684,6 +702,7 @@ impl Server {
         action: Action,
         task: Arc<Task>,
         view: View,
+        ended: WaitEnd,
     ) -> Result<CallToolResult, String> {
         let background = self
             .tasks
@@ -711,6 +730,7 @@ impl Server {
         .map_err(|error| format!("Cannot read the task log: {error}."))?;
         let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
         let mut status = status_line(&task, &snapshot);
+        status.push_str(ended.note());
         status.push_str(&format!(" · screen, cursor row {row} col {col}"));
         output::cut_to(&mut status, view.max_bytes / 2 + 1);
         let room = view.max_bytes - status.len() - 2 - footer.len();
@@ -736,6 +756,7 @@ impl Server {
             format!("{shown}\n\n{status}{footer}")
         };
         let mut structured = task_json(action, &task, &snapshot);
+        structured["waitEndedBy"] = json!(ended.name());
         structured["cursor"] = json!([row, col]);
         structured["omittedRows"] = json!(omitted);
         if self.output_mode != OutputMode::Text {
