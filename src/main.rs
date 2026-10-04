@@ -2,6 +2,7 @@
 
 mod bash;
 mod conpty;
+mod frames;
 mod keys;
 mod output;
 mod process;
@@ -705,9 +706,10 @@ impl Server {
                 terminal::HISTORY_LINES
             ));
         }
-        if transcript.alternate_screen {
+        if transcript.alternate_sessions > 0 {
             status.push_str(&format!(
-                " · the program is on the alternate screen, which keeps no history; it follows the {:?} line",
+                " · {} alternate-screen session(s), each after a {:?} line and merged from the frames it showed",
+                transcript.alternate_sessions,
                 terminal::ALTERNATE_MARKER
             ));
         }
@@ -735,7 +737,7 @@ impl Server {
         let mut structured = task_json(Action::Transcript, &task, &snapshot);
         structured["transcriptPath"] = json!(path);
         structured["transcriptLines"] = json!(transcript.lines);
-        structured["alternateScreen"] = json!(transcript.alternate_screen);
+        structured["alternateSessions"] = json!(transcript.alternate_sessions);
         structured["historyFull"] = json!(transcript.history_full);
         let text = self.layout(
             &window,

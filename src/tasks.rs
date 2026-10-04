@@ -22,6 +22,12 @@ const MAX_FINISHED: usize = 64;
 const TASK_LOG_LIMIT: u64 = 64 << 20;
 const TOTAL_LOG_LIMIT: u64 = 1 << 30;
 const INPUT_QUEUE_LIMIT: usize = 1 << 20;
+/// Output that pauses this long has finished a frame: the chunks of one redraw arrive within
+/// a millisecond or two of each other, frames 8 ms or more apart.
+const FRAME_PAUSE: Duration = Duration::from_millis(4);
+// ponytail: fixed cap of 8 MiB per task; past it, transcript frames come only from screen
+// operations. Thin the list if long-lived TUIs need more.
+const MAX_PAUSES: usize = 1 << 20;
 /// How long output may stay open after the root exits and its tree is killed.
 const DRAIN_CAP: Duration = Duration::from_secs(2);
 
@@ -113,6 +119,9 @@ struct Output {
     /// When the last output byte arrived, stored or not, or the end of a synchronized update by
     /// timeout or end of output showed the frame it held.
     last_output: Option<Instant>,
+    /// PTY tasks: log offsets where the output paused for `FRAME_PAUSE`, so the screen showed
+    /// a finished frame there.
+    pauses: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -578,6 +587,17 @@ fn capture(
             }
         }
         let mut out = lock(&task.out);
+        let paused = out
+            .last_output
+            .is_some_and(|last| arrived.duration_since(last) >= FRAME_PAUSE);
+        if task.terminal.is_some()
+            && paused
+            && out.pauses.last() != Some(&out.written)
+            && out.pauses.len() < MAX_PAUSES
+        {
+            let end = out.written;
+            out.pauses.push(end);
+        }
         if write_error.is_some() {
             out.log_error = write_error;
         }
@@ -753,9 +773,9 @@ impl Task {
 
     /// Renders the stored log as a terminal shows it and writes it to `transcript_path`.
     pub fn transcript(&self) -> Result<crate::terminal::Transcript, String> {
-        let (stored, evicted) = {
+        let (stored, evicted, pauses) = {
             let out = lock(&self.out);
-            (out.written, out.evicted)
+            (out.written, out.evicted, out.pauses.clone())
         };
         if evicted {
             return Err("The log of this task was evicted under the 1 GiB total limit; no transcript can be rendered.".into());
@@ -763,7 +783,7 @@ impl Task {
         let log = File::open(&self.log_path)
             .map_err(|error| format!("Cannot read the task log: {error}."))?;
         let path = self.transcript_path();
-        let transcript = crate::terminal::render(log, stored, &path)
+        let transcript = crate::terminal::render(log, stored, &pauses, &path)
             .map_err(|error| format!("Cannot render the transcript: {error}."))?;
         // An eviction during the render removed the log; the transcript goes with it. Eviction
         // after this check removes the file itself.

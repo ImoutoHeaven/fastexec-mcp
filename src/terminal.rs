@@ -5,7 +5,10 @@
 //! The transcript keeps a scrollback history, so the lines a program pushed off the screen,
 //! by scrolling, by inserting through a scroll region, or by a full redraw that clears the
 //! history first, come back once each, in the order a user scrolling up would read them.
+//! The alternate screen keeps no history, so the replay records its frames and merges each
+//! alternate-screen session into one.
 
+use crate::frames::History;
 use crate::keys::Modes;
 use crate::process::{PTY_COLS, PTY_ROWS};
 use alacritty_terminal::event::{Event, EventListener, VoidListener};
@@ -13,7 +16,12 @@ use alacritty_terminal::grid::{Dimensions, Grid, Row};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
+use alacritty_terminal::vte::ansi::{
+    Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
+    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedPrivateMode,
+    PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
+};
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -26,7 +34,7 @@ pub const HISTORY_LINES: usize = 10_000;
 /// One transcript render at a time: the history holds up to `HISTORY_LINES` rows of cells.
 static RENDERING: Mutex<()> = Mutex::new(());
 
-/// Separates the normal screen's history from the alternate screen in a transcript.
+/// Begins each alternate-screen session in a transcript, after the normal screen's history.
 pub const ALTERNATE_MARKER: &str = "--- alternate screen ---";
 
 const STOPPED: &str = "The terminal emulator of this task stopped after an internal failure;";
@@ -175,13 +183,7 @@ impl Live {
             ));
         }
         let grid = self.term.grid();
-        let mut rows: Vec<String> = (0..grid.screen_lines() as i32)
-            .map(|line| {
-                let mut text = row_text(&grid[Line(line)]);
-                text.truncate(text.trim_end().len());
-                text
-            })
-            .collect();
+        let mut rows = screen_rows(grid);
         while rows.last().is_some_and(String::is_empty) {
             rows.pop();
         }
@@ -194,46 +196,68 @@ pub struct Transcript {
     /// Logical lines: rows the terminal wrapped are joined, trailing spaces trimmed.
     pub text: String,
     pub lines: usize,
-    /// The program ended on the alternate screen, which has no history.
-    pub alternate_screen: bool,
-    /// The history reached `HISTORY_LINES`, so older lines may be missing.
+    /// Alternate-screen sessions, each after an `ALTERNATE_MARKER` line.
+    pub alternate_sessions: usize,
+    /// A history reached `HISTORY_LINES`, so older lines may be missing.
     pub history_full: bool,
 }
 
-/// Renders the first `len` bytes of `log` and writes the text to `path`.
-pub fn render(mut log: impl Read, len: u64, path: &Path) -> std::io::Result<Transcript> {
+/// Renders the first `len` bytes of `log` and writes the text to `path`. `pauses` are log
+/// offsets where the output paused, so the screen showed a finished frame there.
+pub fn render(
+    mut log: impl Read,
+    len: u64,
+    pauses: &[u64],
+    path: &Path,
+) -> std::io::Result<Transcript> {
     let _rendering = RENDERING.lock().unwrap_or_else(PoisonError::into_inner);
     let config = Config {
         scrolling_history: HISTORY_LINES,
         ..Config::default()
     };
-    let mut term = Term::new(config, &Size, VoidListener);
+    let mut replay = Replay {
+        term: Term::new(config, &Size, VoidListener),
+        sessions: Vec::new(),
+        open: false,
+        region: (0, usize::from(PTY_ROWS) - 1),
+        last_scroll: None,
+    };
     let mut parser: Processor = Processor::new();
     let mut buffer = vec![0_u8; 64 * 1024];
-    let mut remaining = len;
-    while remaining > 0 {
-        let want = remaining.min(buffer.len() as u64) as usize;
+    let mut offset = 0;
+    let mut pauses = pauses.iter().copied().peekable();
+    while offset < len {
+        let want = (len - offset).min(buffer.len() as u64) as usize;
         let read = log.read(&mut buffer[..want])?;
         if read == 0 {
             break;
         }
-        parser.advance(&mut term, &buffer[..read]);
-        remaining -= read as u64;
+        let mut start = 0;
+        while let Some(pause) = pauses.next_if(|&pause| pause <= offset + read as u64) {
+            let end = pause.saturating_sub(offset) as usize;
+            if end > start {
+                parser.advance(&mut replay, &buffer[start..end]);
+                start = end;
+            }
+            replay.frame();
+        }
+        parser.advance(&mut replay, &buffer[start..read]);
+        offset += read as u64;
     }
     // The log keeps no timing: a synchronized update still open at its end shows what it holds.
-    parser.stop_sync(&mut term);
-    let alternate_screen = term.mode().contains(TermMode::ALT_SCREEN);
-    let alternate = alternate_screen.then(|| {
-        let lines = lines(term.grid());
+    parser.stop_sync(&mut replay);
+    replay.frame();
+    let mut term = replay.term;
+    if term.mode().contains(TermMode::ALT_SCREEN) {
         // The normal screen and its history sit behind the alternate screen.
         term.swap_alt();
-        lines
-    });
-    let history_full = term.grid().history_size() >= HISTORY_LINES;
+    }
+    let history_full = term.grid().history_size() >= HISTORY_LINES
+        || replay.sessions.iter().any(|session| session.truncated);
     let mut lines = lines(term.grid());
-    if let Some(alternate) = alternate {
+    for session in &replay.sessions {
         lines.push(ALTERNATE_MARKER.to_string());
-        lines.extend(alternate);
+        lines.extend(session.text());
     }
     let mut text = lines.join("\n");
     text.push('\n');
@@ -241,9 +265,316 @@ pub fn render(mut log: impl Read, len: u64, path: &Path) -> std::io::Result<Tran
     Ok(Transcript {
         text,
         lines: lines.len(),
-        alternate_screen,
+        alternate_sessions: replay.sessions.len(),
         history_full,
     })
+}
+
+/// The replayed terminal, recording the alternate screen's frames: before each operation that
+/// ends a frame or destroys visible text, and where the output paused.
+struct Replay {
+    term: Term<VoidListener>,
+    /// One history per alternate-screen session.
+    sessions: Vec<History>,
+    /// The last frame was on the alternate screen, so the next one continues its session.
+    open: bool,
+    /// The scroll region's first and last rows, zero-based.
+    region: (usize, usize),
+    /// The rows of the frame taken before the last scroll by one row, upward or not, while the
+    /// only change since is to the row that scroll uncovered.
+    last_scroll: Option<(Vec<String>, bool)>,
+}
+
+impl Replay {
+    /// Whether the terminal is on the alternate screen; leaving it ends the session.
+    fn alternate(&mut self) -> bool {
+        let alternate = self.term.mode().contains(TermMode::ALT_SCREEN);
+        if !alternate {
+            self.open = false;
+            self.last_scroll = None;
+        }
+        alternate
+    }
+
+    fn record(&mut self, rows: &[String]) {
+        if !self.open {
+            self.sessions.push(History::default());
+            self.open = true;
+        }
+        if let Some(session) = self.sessions.last_mut() {
+            session.show(rows, HISTORY_LINES);
+        }
+    }
+
+    fn frame(&mut self) {
+        self.last_scroll = None;
+        if self.alternate() {
+            let rows = screen_rows(self.term.grid());
+            self.record(&rows);
+        }
+    }
+
+    /// A frame before the scroll region scrolls by one row. Every scroll takes one, so each
+    /// row is recorded before it leaves; while a program only scrolls and writes the row each
+    /// scroll uncovers, the frame is the last one shifted with that row read again.
+    fn scroll(&mut self, up: bool) {
+        if !self.alternate() {
+            return;
+        }
+        let (top, bottom) = self.region;
+        let rows = match self.last_scroll.take() {
+            Some((mut rows, last_up)) if last_up == up && top < bottom && bottom < rows.len() => {
+                let uncovered = if up {
+                    rows[top..=bottom].rotate_left(1);
+                    bottom
+                } else {
+                    rows[top..=bottom].rotate_right(1);
+                    top
+                };
+                rows[uncovered] = screen_row(self.term.grid(), uncovered);
+                rows
+            }
+            _ => screen_rows(self.term.grid()),
+        };
+        self.record(&rows);
+        self.last_scroll = Some((rows, up));
+    }
+
+    /// The next character or tab wraps, which scrolls at the scroll region's bottom.
+    fn wraps_at_bottom(&self) -> bool {
+        self.term.grid().cursor.input_needs_wrap
+            && self.term.mode().contains(TermMode::LINE_WRAP)
+            && self.cursor_line() == self.region.1
+    }
+
+    /// Setting or resetting column mode (DECCOLM) resets the scroll region, as the terminal does.
+    fn column_mode(&mut self, mode: PrivateMode) {
+        if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
+            self.region = (0, usize::from(PTY_ROWS) - 1);
+        }
+    }
+
+    /// Before or after a change to the cursor's row.
+    fn draw(&mut self) {
+        if let Some((_, up)) = self.last_scroll {
+            let uncovered = if up { self.region.1 } else { self.region.0 };
+            if self.cursor_line() != uncovered {
+                self.last_scroll = None;
+            }
+        }
+    }
+
+    fn cursor_line(&self) -> usize {
+        self.term.grid().cursor.point.line.0 as usize
+    }
+}
+
+/// Forwards `Handler` methods to the replayed terminal unchanged.
+macro_rules! forward {
+    ($($name:ident($($arg:ident: $ty:ty),*);)*) => {
+        $(fn $name(&mut self, $($arg: $ty),*) { Handler::$name(&mut self.term, $($arg),*) })*
+    };
+}
+
+impl Handler for Replay {
+    fn input(&mut self, c: char) {
+        // A character past the last column wraps first, which scrolls at the region's bottom.
+        // A character not ASCII may be wide and wrap from the last column, or a combining mark
+        // that does not wrap, so only a full frame is certain to be right before it.
+        if self.wraps_at_bottom() {
+            match c.is_ascii() {
+                true => self.scroll(true),
+                false => self.frame(),
+            }
+        } else if !c.is_ascii()
+            && self.cursor_line() == self.region.1
+            && self.term.grid().cursor.point.column.0 + 1 >= usize::from(PTY_COLS)
+        {
+            self.frame();
+        }
+        self.draw();
+        Handler::input(&mut self.term, c);
+        // A wrap may have written to the next row.
+        self.draw();
+    }
+
+    fn put_tab(&mut self, count: u16) {
+        // A tab past the last column wraps.
+        if self.wraps_at_bottom() {
+            self.scroll(true);
+        }
+        Handler::put_tab(&mut self.term, count);
+        self.draw();
+    }
+
+    fn insert_blank(&mut self, count: usize) {
+        self.draw();
+        Handler::insert_blank(&mut self.term, count);
+    }
+
+    fn erase_chars(&mut self, count: usize) {
+        self.draw();
+        Handler::erase_chars(&mut self.term, count);
+    }
+
+    fn delete_chars(&mut self, count: usize) {
+        self.draw();
+        Handler::delete_chars(&mut self.term, count);
+    }
+
+    fn clear_line(&mut self, mode: LineClearMode) {
+        self.draw();
+        Handler::clear_line(&mut self.term, mode);
+    }
+
+    fn decaln(&mut self) {
+        self.frame();
+        Handler::decaln(&mut self.term);
+    }
+
+    fn linefeed(&mut self) {
+        if self.cursor_line() == self.region.1 {
+            self.scroll(true);
+        }
+        Handler::linefeed(&mut self.term);
+    }
+
+    fn newline(&mut self) {
+        if self.cursor_line() == self.region.1 {
+            self.scroll(true);
+        }
+        Handler::newline(&mut self.term);
+    }
+
+    fn reverse_index(&mut self) {
+        if self.cursor_line() == self.region.0 {
+            self.scroll(false);
+        }
+        Handler::reverse_index(&mut self.term);
+    }
+
+    fn scroll_up(&mut self, lines: usize) {
+        self.frame();
+        Handler::scroll_up(&mut self.term, lines);
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        self.frame();
+        Handler::scroll_down(&mut self.term, lines);
+    }
+
+    fn insert_blank_lines(&mut self, lines: usize) {
+        self.frame();
+        Handler::insert_blank_lines(&mut self.term, lines);
+    }
+
+    fn delete_lines(&mut self, lines: usize) {
+        self.frame();
+        Handler::delete_lines(&mut self.term, lines);
+    }
+
+    fn clear_screen(&mut self, mode: ClearMode) {
+        self.frame();
+        Handler::clear_screen(&mut self.term, mode);
+    }
+
+    fn reset_state(&mut self) {
+        self.frame();
+        Handler::reset_state(&mut self.term);
+        self.region = (0, usize::from(PTY_ROWS) - 1);
+    }
+
+    // Programs switch screens, hide the cursor, and begin synchronized updates between frames.
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        self.frame();
+        self.column_mode(mode);
+        Handler::set_private_mode(&mut self.term, mode);
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        self.frame();
+        self.column_mode(mode);
+        Handler::unset_private_mode(&mut self.term, mode);
+    }
+
+    fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+        Handler::set_scrolling_region(&mut self.term, top, bottom);
+        self.last_scroll = None;
+        // As the terminal does: 1-based rows, ignored unless the top is above the bottom.
+        let rows = usize::from(PTY_ROWS);
+        let bottom = bottom.unwrap_or(rows);
+        if top < bottom {
+            self.region = (top.saturating_sub(1).min(rows), bottom.min(rows) - 1);
+        }
+    }
+
+    forward! {
+        set_title(title: Option<String>);
+        set_cursor_style(style: Option<CursorStyle>);
+        set_cursor_shape(shape: CursorShape);
+        goto(line: i32, col: usize);
+        goto_line(line: i32);
+        goto_col(col: usize);
+        move_up(count: usize);
+        move_down(count: usize);
+        identify_terminal(intermediate: Option<char>);
+        device_status(arg: usize);
+        move_forward(col: usize);
+        move_backward(col: usize);
+        move_down_and_cr(row: usize);
+        move_up_and_cr(row: usize);
+        backspace();
+        carriage_return();
+        bell();
+        substitute();
+        set_horizontal_tabstop();
+        move_backward_tabs(count: u16);
+        move_forward_tabs(count: u16);
+        save_cursor_position();
+        restore_cursor_position();
+        clear_tabs(mode: TabulationClearMode);
+        set_tabs(interval: u16);
+        terminal_attribute(attr: Attr);
+        set_mode(mode: Mode);
+        unset_mode(mode: Mode);
+        report_mode(mode: Mode);
+        report_private_mode(mode: PrivateMode);
+        set_keypad_application_mode();
+        unset_keypad_application_mode();
+        set_active_charset(index: CharsetIndex);
+        configure_charset(index: CharsetIndex, charset: StandardCharset);
+        set_color(index: usize, color: Rgb);
+        dynamic_color_sequence(prefix: String, index: usize, terminator: &str);
+        reset_color(index: usize);
+        clipboard_store(clipboard: u8, data: &[u8]);
+        clipboard_load(clipboard: u8, terminator: &str);
+        push_title();
+        pop_title();
+        text_area_size_pixels();
+        text_area_size_chars();
+        set_hyperlink(link: Option<Hyperlink>);
+        set_mouse_cursor_icon(icon: CursorIcon);
+        report_keyboard_mode();
+        push_keyboard_mode(mode: KeyboardModes);
+        pop_keyboard_modes(to_pop: u16);
+        set_keyboard_mode(mode: KeyboardModes, behavior: KeyboardModesApplyBehavior);
+        set_modify_other_keys(mode: ModifyOtherKeys);
+        report_modify_other_keys();
+        set_scp(char_path: ScpCharPath, update_mode: ScpUpdateMode);
+    }
+}
+
+/// The screen's rows without trailing spaces.
+fn screen_rows(grid: &Grid<Cell>) -> Vec<String> {
+    (0..grid.screen_lines())
+        .map(|line| screen_row(grid, line))
+        .collect()
+}
+
+fn screen_row(grid: &Grid<Cell>, line: usize) -> String {
+    let mut text = row_text(&grid[Line(line as i32)]);
+    text.truncate(text.trim_end().len());
+    text
 }
 
 /// A grid's history and screen as logical lines, without trailing blank lines.
@@ -302,9 +633,69 @@ mod tests {
             std::process::id(),
             log.len()
         ));
-        let transcript = render(log, log.len() as u64, &path).unwrap();
+        let transcript = render(log, log.len() as u64, &[], &path).unwrap();
         let _ = std::fs::remove_file(&path);
         transcript.text
+    }
+
+    #[test]
+    fn alternate_screen_rows_pushed_off_stay_in_the_transcript() {
+        // Full-width rows, all read at once with no pause, each scrolling the screen: by
+        // wrapping, written back to back, followed by a tab, or carrying a combining mark that
+        // lands in the last column; and printed on new lines below a fixed header, also after
+        // column mode reset a smaller scroll region.
+        let rows: Vec<String> = (0..80)
+            .map(|k| format!("row {k:03} {}", "x".repeat(112)))
+            .collect();
+        let accented: Vec<String> = rows.iter().map(|row| format!("{row}\u{301}")).collect();
+        let lines = |prefix: &str| {
+            let lines: String = rows.iter().map(|row| format!("\r\n{row}")).collect();
+            format!("\x1b[?1049h{prefix}{lines}")
+        };
+        for (log, expected) in [
+            (format!("\x1b[?1049h{}", rows.concat()), &rows),
+            (format!("\x1b[?1049h{}", rows.join("\t")), &rows),
+            (format!("\x1b[?1049h{}", accented.concat()), &accented),
+            (lines("header\x1b[2;30r\x1b[30;1H"), &rows),
+            (lines("\x1b[2;20r\x1b[?3l\x1b[H"), &rows),
+        ] {
+            let text = render_text(log.as_bytes());
+            let session: Vec<&str> = text
+                .lines()
+                .skip_while(|line| *line != ALTERNATE_MARKER)
+                .filter(|line| line.starts_with("row "))
+                .collect();
+            assert_eq!(&session, expected, "{text}");
+        }
+        // Scrolling back: a character wraps from the uncovered top row into the next one.
+        let screen: String = (1..=30).map(|k| format!("\x1b[{k};1Hline{k:02}")).collect();
+        let log = format!(
+            "\x1b[?1049h{screen}\x1b[H\x1bM{}Y\x1b[H{}",
+            "x".repeat(120),
+            "\x1bM".repeat(30)
+        );
+        let text = render_text(log.as_bytes());
+        assert!(text.lines().any(|line| line == "Yine01"), "{text}");
+        // Each new line marks the one above it done before the next scroll.
+        let mut log = String::from("\x1b[?1049h");
+        for k in 0..80 {
+            log += &format!("\r\nitem {k:03}");
+            if k > 0 {
+                log += &format!("\x1b[A\ritem {:03} done\x1b[B", k - 1);
+            }
+        }
+        let text = render_text(log.as_bytes());
+        let items: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("item "))
+            .collect();
+        let expected: Vec<String> = (0..80)
+            .map(|k| match k {
+                79 => "item 079".to_string(),
+                _ => format!("item {k:03} done"),
+            })
+            .collect();
+        assert_eq!(items, expected, "{text}");
     }
 
     #[test]

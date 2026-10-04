@@ -958,20 +958,36 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
     let file = std::fs::read_to_string(out["transcriptPath"].as_str().unwrap()).unwrap();
     assert_eq!(file.trim_end(), body.trim_end());
 
-    // A program on the alternate screen: the normal screen's history, then the full-screen view.
-    let command =
-        "seq -f 'normal %g' 1 40; printf 'a\\tb\\n\\033[?1049h\\033[Hfull-screen view'; read -r x";
+    // A program on the alternate screen: the normal screen's history, then the session merged
+    // from its frames. A page drawn in place, a pause, a second page drawn over it, a pause,
+    // then lines that scroll the screen: the alternate screen keeps none of them.
+    let command = concat!(
+        "seq -f 'normal %g' 1 40; printf 'a\\tb\\n\\033[?1049h'; rows=$(seq 1 30 | sed 'p'); ",
+        "printf '\\033[%d;1Hfirst %d\\033[K' $rows; sleep 0.5; ",
+        "printf '\\033[%d;1Hsecond %d\\033[K' $rows; sleep 0.5; ",
+        "printf '\\r\\nscrolled %d' $(seq 1 40); read -r x"
+    );
     server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 3000}));
     let (out, text) =
         server.ok(json!({"action": "transcript", "taskId": server.id(2), "truncate": "none"}));
-    assert_eq!(out["alternateScreen"], true, "{text}");
+    assert_eq!(out["alternateSessions"], 1, "{text}");
     let lines: Vec<&str> = text.lines().collect();
     let normal = lines.iter().position(|line| *line == "normal 1");
     let marker = lines
         .iter()
         .position(|line| *line == "--- alternate screen ---");
     assert!(normal.is_some_and(|normal| Some(normal) < marker), "{text}");
-    assert_eq!(lines[marker.unwrap() + 1], "full-screen view", "{text}");
+    let session: Vec<&str> = lines[marker.unwrap() + 1..]
+        .iter()
+        .copied()
+        .take_while(|line| !line.is_empty())
+        .collect();
+    let expected: Vec<String> = (1..=30)
+        .map(|k| format!("first {k}"))
+        .chain((1..=30).map(|k| format!("second {k}")))
+        .chain((1..=40).map(|k| format!("scrolled {k}")))
+        .collect();
+    assert_eq!(session, expected, "{text}");
     assert!(
         lines.contains(&"a       b"),
         "a tab reads as spaces to its stop: {text}"
