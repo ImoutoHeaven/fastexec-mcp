@@ -495,7 +495,11 @@ fn long_command_yields_then_poll_returns_only_unseen_output() {
 
 #[test]
 fn pipe_input_arrives_verbatim_and_eof_closes_stdin() {
-    let mut server = Server::start();
+    // Git for Windows' bin/bash.exe launcher retains an inherited stdin handle.
+    // Use discovery's real usr/bin/bash.exe so closing fd 0 closes the pipe reader.
+    let mut server = Server::start_with(|command| {
+        command.env_remove("FASTEXEC_BASH");
+    });
     server.ok(json!({"action": "start", "command": "while IFS= read -r l || [ -n \"$l\" ]; do echo \"got:$l\"; done; echo end", "waitMs": 0}));
     let (_, text) = server.ok(json!({"action": "poll", "taskId": server.id(1), "input": "a b\n"}));
     assert!(text.starts_with("got:a b\n"), "{text}");
@@ -513,11 +517,23 @@ fn pipe_input_arrives_verbatim_and_eof_closes_stdin() {
     );
 
     // A program that closes its stdin refuses later input instead of queueing it.
-    server.ok(json!({"action": "start", "command": "exec 0<&-; sleep 30", "waitMs": 500}));
-    server.ok(json!({"action": "poll", "taskId": server.id(2), "input": "x\n", "waitMs": 500}));
-    let (_, text, is_error) =
-        server.call(json!({"action": "poll", "taskId": server.id(2), "input": "y\n", "waitMs": 0}));
-    assert!(is_error && text.contains("stdin is closed"), "{text}");
+    let (_, text) = server.ok(json!({"action": "start", "command": "exec 0<&-; echo stdin-closed; sleep 30", "waitMs": 5000, "returnWhen": {"outputContains": ["stdin-closed"]}}));
+    assert!(text.starts_with("stdin-closed\n"), "{text}");
+    // A write discovers the closed reader asynchronously. Wait for rejection,
+    // rather than assuming the writer thread has finished after a fixed sleep.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, text, is_error) = server
+            .call(json!({"action": "poll", "taskId": server.id(2), "input": "x\n", "waitMs": 50}));
+        if is_error {
+            assert!(text.contains("stdin is closed"), "{text}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "closed stdin still accepts input: {text}"
+        );
+    }
     server.ok(json!({"action": "kill", "taskId": server.id(2)}));
 }
 
