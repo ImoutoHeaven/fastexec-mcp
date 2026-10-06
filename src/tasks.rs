@@ -25,9 +25,12 @@ const INPUT_QUEUE_LIMIT: usize = 1 << 20;
 /// Output that pauses this long has finished a frame: the chunks of one redraw arrive within
 /// a millisecond or two of each other, frames 8 ms or more apart.
 const FRAME_PAUSE: Duration = Duration::from_millis(4);
+/// A pause this long showed its frame long enough to read, even in the middle of a redraw.
+const LONG_PAUSE: Duration = Duration::from_millis(100);
 // ponytail: fixed cap of 8 MiB per task; past it, transcript frames come only from screen
-// operations. Thin the list if long-lived TUIs need more.
-const MAX_PAUSES: usize = 1 << 20;
+// operations and synchronized updates end only where the output ends them. Thin the list if
+// long-lived TUIs need more.
+const MAX_MARKS: usize = 1 << 20;
 /// How long output may stay open after the root exits and its tree is killed.
 const DRAIN_CAP: Duration = Duration::from_secs(2);
 
@@ -119,9 +122,23 @@ struct Output {
     /// When the last output byte arrived, stored or not, or the end of a synchronized update by
     /// timeout or end of output showed the frame it held.
     last_output: Option<Instant>,
-    /// PTY tasks: log offsets where the output paused for `FRAME_PAUSE`, so the screen showed
-    /// a finished frame there.
-    pauses: Vec<u64>,
+    /// PTY tasks: what the screen did at log offsets, for the transcript's replay
+    /// (`terminal::Mark`).
+    marks: Vec<u64>,
+}
+
+impl Output {
+    /// Records `flags` at the end of the stored log, beside any mark already there.
+    fn mark(&mut self, flags: u64) {
+        let at = self.written;
+        if let Some(last) = self.marks.last_mut()
+            && crate::terminal::mark_offset(*last) == at
+        {
+            *last |= flags;
+        } else if self.marks.len() < MAX_MARKS {
+            self.marks.push(at | flags);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -475,8 +492,8 @@ fn short(elapsed: Duration) -> String {
     }
 }
 
-/// Reads `output` until EOF and passes it on in chunks.
-fn read_chunks(mut output: Box<dyn Read + Send>, chunks: mpsc::SyncSender<Vec<u8>>) {
+/// Reads `output` until EOF and passes it on in chunks, each with the time it was read.
+fn read_chunks(mut output: Box<dyn Read + Send>, chunks: mpsc::SyncSender<(Instant, Vec<u8>)>) {
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         match output.read(&mut buffer) {
@@ -484,7 +501,10 @@ fn read_chunks(mut output: Box<dyn Read + Send>, chunks: mpsc::SyncSender<Vec<u8
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break, // a closed PTY reports EIO on Unix
             Ok(read) => {
-                if chunks.send(buffer[..read].to_vec()).is_err() {
+                if chunks
+                    .send((Instant::now(), buffer[..read].to_vec()))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -537,7 +557,9 @@ fn capture(
                             answer_program(task, answer, terminal.end_sync());
                             // The held frame shows now, so quiet counts from now; the time is
                             // set under the terminal lock that `last_output` also takes.
-                            lock(&task.out).last_output = Some(Instant::now());
+                            let mut out = lock(&task.out);
+                            out.last_output = Some(Instant::now());
+                            out.mark(crate::terminal::SYNC_END);
                         }
                         task.activity.send_replace(());
                         continue;
@@ -546,16 +568,18 @@ fn capture(
                 }
             }
         };
-        let Some(chunk) = received else {
+        let Some((arrived, chunk)) = received else {
             break;
         };
-        let arrived = Instant::now();
         let chunk = chunk.as_slice();
         // The emulator stays locked until the chunk is in the log, so a screen and the log
         // offset taken under that lock show the same output.
         let mut terminal = task.terminal.as_ref().map(lock);
+        let mut expired = false;
         if let (Some(terminal), Some(answer)) = (terminal.as_mut(), &answer) {
-            answer_program(task, answer, terminal.process(chunk));
+            let (replies, ended) = terminal.process(chunk, arrived);
+            answer_program(task, answer, replies);
+            expired = ended;
         }
         // Storing stops at the first byte that does not fit, so the log stays a prefix of the
         // output: a later chunk that would fit is not stored after the gap.
@@ -587,16 +611,19 @@ fn capture(
             }
         }
         let mut out = lock(&task.out);
-        let paused = out
-            .last_output
-            .is_some_and(|last| arrived.duration_since(last) >= FRAME_PAUSE);
-        if task.terminal.is_some()
-            && paused
-            && out.pauses.last() != Some(&out.written)
-            && out.pauses.len() < MAX_PAUSES
-        {
-            let end = out.written;
-            out.pauses.push(end);
+        if task.terminal.is_some() {
+            // A synchronized update past its deadline ended before this chunk.
+            if expired {
+                out.mark(crate::terminal::SYNC_END);
+            }
+            let gap = out.last_output.map_or(Duration::ZERO, |last| {
+                arrived.saturating_duration_since(last)
+            });
+            if gap >= LONG_PAUSE {
+                out.mark(crate::terminal::PAUSE | crate::terminal::LONG);
+            } else if gap >= FRAME_PAUSE {
+                out.mark(crate::terminal::PAUSE);
+            }
         }
         if write_error.is_some() {
             out.log_error = write_error;
@@ -773,9 +800,9 @@ impl Task {
 
     /// Renders the stored log as a terminal shows it and writes it to `transcript_path`.
     pub fn transcript(&self) -> Result<crate::terminal::Transcript, String> {
-        let (stored, evicted, pauses) = {
+        let (stored, evicted, marks, closed) = {
             let out = lock(&self.out);
-            (out.written, out.evicted, out.pauses.clone())
+            (out.written, out.evicted, out.marks.clone(), out.closed)
         };
         if evicted {
             return Err("The log of this task was evicted under the 1 GiB total limit; no transcript can be rendered.".into());
@@ -783,7 +810,7 @@ impl Task {
         let log = File::open(&self.log_path)
             .map_err(|error| format!("Cannot read the task log: {error}."))?;
         let path = self.transcript_path();
-        let transcript = crate::terminal::render(log, stored, &pauses, &path)
+        let transcript = crate::terminal::render(log, stored, &marks, closed, &path)
             .map_err(|error| format!("Cannot render the transcript: {error}."))?;
         // An eviction during the render removed the log; the transcript goes with it. Eviction
         // after this check removes the file itself.

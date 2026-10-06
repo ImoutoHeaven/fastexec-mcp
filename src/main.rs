@@ -708,9 +708,10 @@ impl Server {
         }
         if transcript.alternate_sessions > 0 {
             status.push_str(&format!(
-                " · {} alternate-screen session(s), each after a {:?} line and merged from the frames it showed",
+                " · {} alternate-screen session(s) where they ran, each after a {:?} line and merged from the frames it showed, normal-screen lines after it resuming after a {:?} line",
                 transcript.alternate_sessions,
-                terminal::ALTERNATE_MARKER
+                terminal::ALTERNATE_MARKER,
+                terminal::NORMAL_MARKER
             ));
         }
         if let Some(warning) = conpty::load() {
@@ -738,6 +739,7 @@ impl Server {
         structured["transcriptPath"] = json!(path);
         structured["transcriptLines"] = json!(transcript.lines);
         structured["alternateSessions"] = json!(transcript.alternate_sessions);
+        structured["alternateRanges"] = json!(transcript.alternate_ranges);
         structured["historyFull"] = json!(transcript.history_full);
         let text = self.layout(
             &window,

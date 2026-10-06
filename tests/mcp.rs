@@ -1004,6 +1004,12 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
         .chain((1..=40).map(|k| format!("scrolled {k}")))
         .collect();
     assert_eq!(session, expected, "{text}");
+    let first = marker.unwrap() + 1;
+    assert_eq!(
+        out["alternateRanges"],
+        json!([[first, first + expected.len()]]),
+        "{text}"
+    );
     assert!(
         lines.contains(&"a       b"),
         "a tab reads as spaces to its stop: {text}"
@@ -1271,9 +1277,12 @@ fn encoding_decodes_legacy_output_and_long_commands_run_from_a_script() {
         );
         assert!(text.starts_with("中\n"), "{encoding}: {text}");
     }
-    let long = format!("x='{}'; echo ${{#x}}", "a".repeat(13_000));
-    let (_, text) = server.ok(json!({"action": "start", "command": long}));
-    assert!(text.starts_with("13000\n"), "{text}");
+    // Past 8,190 characters an argument would be cut on Windows; the script carries it whole.
+    for length in [9_000, 100_000] {
+        let long = format!("x='{}'; echo ${{#x}}", "a".repeat(length));
+        let (_, text) = server.ok(json!({"action": "start", "command": long}));
+        assert!(text.starts_with(&format!("{length}\n")), "{text}");
+    }
 }
 
 #[test]

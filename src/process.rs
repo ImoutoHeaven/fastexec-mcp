@@ -10,9 +10,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// Commands longer than this run from a script file: Windows caps a command line at 32,767
-/// UTF-16 units and argument quoting can double the text.
-pub const SCRIPT_THRESHOLD_BYTES: usize = 12_000;
+/// Commands longer than this run from a script file: the Git for Windows runtime cuts an
+/// argument past 8,190 UTF-16 units, and a UTF-8 command has at least as many bytes as units.
+pub const SCRIPT_THRESHOLD_BYTES: usize = 8_000;
 
 pub struct Launch<'a> {
     pub bash: &'a Path,

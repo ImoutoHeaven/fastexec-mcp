@@ -8,7 +8,7 @@
 //! The alternate screen keeps no history, so the replay records its frames and merges each
 //! alternate-screen session into one.
 
-use crate::frames::History;
+use crate::frames::{History, Row as FrameRow};
 use crate::keys::Modes;
 use crate::process::{PTY_COLS, PTY_ROWS};
 use alacritty_terminal::event::{Event, EventListener, VoidListener};
@@ -27,6 +27,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
+use unicode_width::UnicodeWidthChar;
 
 /// Scrollback history kept while rendering a transcript; older lines are dropped.
 pub const HISTORY_LINES: usize = 10_000;
@@ -34,8 +35,43 @@ pub const HISTORY_LINES: usize = 10_000;
 /// One transcript render at a time: the history holds up to `HISTORY_LINES` rows of cells.
 static RENDERING: Mutex<()> = Mutex::new(());
 
-/// Begins each alternate-screen session in a transcript, after the normal screen's history.
+/// Marks: a log offset in the low bits and what the screen did there in the high bits.
+/// The output paused, so the screen showed a finished frame.
+pub const PAUSE: u64 = 1 << 61;
+/// The pause lasted long enough to read the frame.
+pub const LONG: u64 = 1 << 62;
+/// A synchronized update ended at its timeout and showed the output it held.
+pub const SYNC_END: u64 = 1 << 63;
+
+pub fn mark_offset(mark: u64) -> u64 {
+    mark & (PAUSE - 1)
+}
+
+/// Begins each alternate-screen session in a transcript, among the normal screen's lines where
+/// the session began.
 pub const ALTERNATE_MARKER: &str = "--- alternate screen ---";
+/// Follows an alternate-screen session when normal-screen lines come after it.
+pub const NORMAL_MARKER: &str = "--- normal screen ---";
+
+/// The replay marks the normal-screen rows shown when an alternate-screen session began with
+/// a zero-width character from Unicode's private use planes 15 and 16, one per session: a mark
+/// moves with its row through the history, and a program never stores one as zero-width.
+const PLANE: u32 = 0xFFFE;
+const SESSION_MARKS: [u32; 2] = [0xF0000, 0x100000];
+
+/// The mark of session `session`, if one is left.
+fn session_char(session: usize) -> Option<char> {
+    let plane = SESSION_MARKS.get(session / PLANE as usize)?;
+    char::from_u32(plane + (session % PLANE as usize) as u32)
+}
+
+/// The session a mark names.
+fn session_mark(c: char) -> Option<usize> {
+    SESSION_MARKS.iter().enumerate().find_map(|(plane, &base)| {
+        let index = (c as u32).checked_sub(base)?;
+        (index < PLANE).then_some(plane * PLANE as usize + index as usize)
+    })
+}
 
 const STOPPED: &str = "The terminal emulator of this task stopped after an internal failure;";
 
@@ -106,20 +142,21 @@ impl Live {
         }
     }
 
-    /// Reads one piece of output and returns the replies it asked for. A synchronized update
-    /// (mode 2026) past its deadline ends first, so it cannot outlast its timeout while output
-    /// keeps arriving.
-    pub fn process(&mut self, output: &[u8]) -> Vec<u8> {
+    /// Reads one piece of output, read from the program at `arrived`, and returns the replies
+    /// it asked for and whether a synchronized update (mode 2026) past its deadline ended
+    /// first, so it cannot outlast its timeout while output keeps arriving.
+    pub fn process(&mut self, output: &[u8], arrived: Instant) -> (Vec<u8>, bool) {
         self.read += output.len() as u64;
         let expired = self
             .sync_deadline()
-            .is_some_and(|deadline| deadline <= Instant::now());
-        self.run(|term, parser| {
+            .is_some_and(|deadline| deadline <= arrived);
+        let replies = self.run(|term, parser| {
             if expired {
                 parser.stop_sync(term);
             }
             parser.advance(term, output);
-        })
+        });
+        (replies, expired)
     }
 
     /// When the synchronized update in progress times out, if one is in progress.
@@ -198,16 +235,20 @@ pub struct Transcript {
     pub lines: usize,
     /// Alternate-screen sessions, each after an `ALTERNATE_MARKER` line.
     pub alternate_sessions: usize,
+    /// Each session's lines in `text`, one-based, from its marker to its last line.
+    pub alternate_ranges: Vec<(usize, usize)>,
     /// A history reached `HISTORY_LINES`, so older lines may be missing.
     pub history_full: bool,
 }
 
-/// Renders the first `len` bytes of `log` and writes the text to `path`. `pauses` are log
-/// offsets where the output paused, so the screen showed a finished frame there.
+/// Renders the first `len` bytes of `log` and writes the text to `path`, replaying `marks`
+/// where they fall. `closed` says the log is complete: a synchronized update still open at
+/// its end shows what it holds, as the live terminal does once output ends.
 pub fn render(
     mut log: impl Read,
     len: u64,
-    pauses: &[u64],
+    marks: &[u64],
+    closed: bool,
     path: &Path,
 ) -> std::io::Result<Transcript> {
     let _rendering = RENDERING.lock().unwrap_or_else(PoisonError::into_inner);
@@ -215,17 +256,11 @@ pub fn render(
         scrolling_history: HISTORY_LINES,
         ..Config::default()
     };
-    let mut replay = Replay {
-        term: Term::new(config, &Size, VoidListener),
-        sessions: Vec::new(),
-        open: false,
-        region: (0, usize::from(PTY_ROWS) - 1),
-        last_scroll: None,
-    };
+    let mut replay = Replay::new(Term::new(config, &Size, VoidListener));
     let mut parser: Processor = Processor::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut offset = 0;
-    let mut pauses = pauses.iter().copied().peekable();
+    let mut marks = marks.iter().copied().peekable();
     while offset < len {
         let want = (len - offset).min(buffer.len() as u64) as usize;
         let read = log.read(&mut buffer[..want])?;
@@ -233,20 +268,26 @@ pub fn render(
             break;
         }
         let mut start = 0;
-        while let Some(pause) = pauses.next_if(|&pause| pause <= offset + read as u64) {
-            let end = pause.saturating_sub(offset) as usize;
+        while let Some(mark) = marks.next_if(|&mark| mark_offset(mark) <= offset + read as u64) {
+            let end = mark_offset(mark).saturating_sub(offset) as usize;
             if end > start {
                 parser.advance(&mut replay, &buffer[start..end]);
                 start = end;
             }
-            replay.frame();
+            if mark & SYNC_END != 0 {
+                parser.stop_sync(&mut replay);
+            }
+            if mark & PAUSE != 0 {
+                replay.pause(mark & LONG != 0);
+            }
         }
         parser.advance(&mut replay, &buffer[start..read]);
         offset += read as u64;
     }
-    // The log keeps no timing: a synchronized update still open at its end shows what it holds.
-    parser.stop_sync(&mut replay);
-    replay.frame();
+    if closed {
+        parser.stop_sync(&mut replay);
+    }
+    replay.present();
     let mut term = replay.term;
     if term.mode().contains(TermMode::ALT_SCREEN) {
         // The normal screen and its history sit behind the alternate screen.
@@ -254,10 +295,45 @@ pub fn render(
     }
     let history_full = term.grid().history_size() >= HISTORY_LINES
         || replay.sessions.iter().any(|session| session.truncated);
-    let mut lines = lines(term.grid());
-    for session in &replay.sessions {
-        lines.push(ALTERNATE_MARKER.to_string());
-        lines.extend(session.text());
+    let (normal, marks) = lines(term.grid());
+    // Each session follows the last line still marked of those shown when it began, and the
+    // session before it. A session whose marked lines are all gone, cleared, past the
+    // history's limit, or written over, follows the session before it, or comes first.
+    let mut after: Vec<Option<usize>> = vec![None; replay.sessions.len()];
+    for (line, session) in marks {
+        if let Some(after) = after.get_mut(session) {
+            *after = Some(line + 1);
+        }
+    }
+    let mut previous = 0;
+    let after: Vec<usize> = after
+        .into_iter()
+        .map(|after| {
+            previous = previous.max(after.unwrap_or(previous));
+            previous
+        })
+        .collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut alternate_ranges = Vec::new();
+    for at in 0..=normal.len() {
+        let mut began = false;
+        for (session, _) in after
+            .iter()
+            .enumerate()
+            .filter(|&(_, &after)| after.min(normal.len()) == at)
+        {
+            lines.push(ALTERNATE_MARKER.to_string());
+            let first = lines.len();
+            lines.extend(replay.sessions[session].text());
+            alternate_ranges.push((first, lines.len()));
+            began = true;
+        }
+        if let Some(line) = normal.get(at) {
+            if began {
+                lines.push(NORMAL_MARKER.to_string());
+            }
+            lines.push(line.clone());
+        }
     }
     let mut text = lines.join("\n");
     text.push('\n');
@@ -266,106 +342,141 @@ pub fn render(
         text,
         lines: lines.len(),
         alternate_sessions: replay.sessions.len(),
+        alternate_ranges,
         history_full,
     })
 }
 
-/// The replayed terminal, recording the alternate screen's frames: before each operation that
-/// ends a frame or destroys visible text, and where the output paused.
+/// The replayed terminal, telling each alternate-screen session's history what its screen
+/// does: the rows each scroll moves, and the frames the program finished drawing.
 struct Replay {
     term: Term<VoidListener>,
     /// One history per alternate-screen session.
     sessions: Vec<History>,
-    /// The last frame was on the alternate screen, so the next one continues its session.
+    /// The last session is still on screen.
     open: bool,
     /// The scroll region's first and last rows, zero-based.
     region: (usize, usize),
-    /// The rows of the frame taken before the last scroll by one row, upward or not, while the
-    /// only change since is to the row that scroll uncovered.
-    last_scroll: Option<(Vec<String>, bool)>,
+    /// Inside a synchronized update, whose drawing no one sees until it ends.
+    held: bool,
+    /// Times the program showed the cursor again after hiding it.
+    redraws: usize,
+    /// Rows written since the history last read the screen, one bit per row.
+    written: u64,
+    /// The frame read from the rows written alone, kept to reuse its memory.
+    frame: Vec<FrameRow>,
 }
 
 impl Replay {
-    /// Whether the terminal is on the alternate screen; leaving it ends the session.
-    fn alternate(&mut self) -> bool {
-        let alternate = self.term.mode().contains(TermMode::ALT_SCREEN);
-        if !alternate {
-            self.open = false;
-            self.last_scroll = None;
+    fn new(term: Term<VoidListener>) -> Replay {
+        Replay {
+            term,
+            sessions: Vec::new(),
+            open: false,
+            region: (0, usize::from(PTY_ROWS) - 1),
+            held: false,
+            redraws: 0,
+            written: 0,
+            frame: Vec::new(),
         }
-        alternate
     }
 
-    fn record(&mut self, rows: &[String]) {
+    /// The cursor's row is being written.
+    fn write(&mut self) {
+        self.written |= 1 << self.cursor_line().min(63);
+    }
+
+    /// The history of the alternate screen on screen; leaving it ends the session.
+    fn session(&mut self) -> Option<&mut History> {
+        if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+            self.open = false;
+            return None;
+        }
         if !self.open {
-            self.sessions.push(History::default());
+            self.sessions
+                .push(History::new(self.term.grid().screen_lines(), HISTORY_LINES));
             self.open = true;
         }
-        if let Some(session) = self.sessions.last_mut() {
-            session.show(rows, HISTORY_LINES);
-        }
+        self.sessions.last_mut()
     }
 
-    fn frame(&mut self) {
-        self.last_scroll = None;
-        if self.alternate() {
-            let rows = screen_rows(self.term.grid());
-            self.record(&rows);
-        }
-    }
-
-    /// A frame before the scroll region scrolls by one row. Every scroll takes one, so each
-    /// row is recorded before it leaves; while a program only scrolls and writes the row each
-    /// scroll uncovers, the frame is the last one shifted with that row read again.
-    fn scroll(&mut self, up: bool) {
-        if !self.alternate() {
+    /// The screen is a finished frame, unless a synchronized update holds its drawing.
+    fn present(&mut self) {
+        if self.held || !self.term.mode().contains(TermMode::ALT_SCREEN) {
             return;
         }
-        let (top, bottom) = self.region;
-        let rows = match self.last_scroll.take() {
-            Some((mut rows, last_up)) if last_up == up && top < bottom && bottom < rows.len() => {
-                let uncovered = if up {
-                    rows[top..=bottom].rotate_left(1);
-                    bottom
-                } else {
-                    rows[top..=bottom].rotate_right(1);
-                    top
-                };
-                rows[uncovered] = screen_row(self.term.grid(), uncovered);
-                rows
-            }
-            _ => screen_rows(self.term.grid()),
-        };
-        self.record(&rows);
-        self.last_scroll = Some((rows, up));
+        let rows = frame_rows(self.term.grid());
+        if let Some(session) = self.session() {
+            session.present(&rows);
+        }
+        self.written = 0;
     }
 
-    /// The next character or tab wraps, which scrolls at the scroll region's bottom.
-    fn wraps_at_bottom(&self) -> bool {
-        self.term.grid().cursor.input_needs_wrap
-            && self.term.mode().contains(TermMode::LINE_WRAP)
-            && self.cursor_line() == self.region.1
-    }
-
-    /// Setting or resetting column mode (DECCOLM) resets the scroll region, as the terminal does.
-    fn column_mode(&mut self, mode: PrivateMode) {
-        if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
-            self.region = (0, usize::from(PTY_ROWS) - 1);
+    /// Where the output paused the screen shows a finished frame, unless the program hides the
+    /// cursor while it draws, as it has before, and the cursor is hidden: then the pause fell
+    /// inside a redraw, and the frame that shows the cursor again holds it whole. A long pause
+    /// showed the screen long enough to read either way.
+    fn pause(&mut self, long: bool) {
+        let hidden = !self.term.mode().contains(TermMode::SHOW_CURSOR);
+        if long || !hidden || self.redraws < 2 {
+            self.present();
         }
     }
 
-    /// Before or after a change to the cursor's row.
-    fn draw(&mut self) {
-        if let Some((_, up)) = self.last_scroll {
-            let uncovered = if up { self.region.1 } else { self.region.0 };
-            if self.cursor_line() != uncovered {
-                self.last_scroll = None;
+    /// Rows `top..end` scroll by `n` rows.
+    fn shift(&mut self, top: usize, end: usize, n: usize, up: bool) {
+        if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        // Rows written since the last frame show before they move: a frame of the screen, read
+        // from the rows written alone when that is the cursor's row, as a program printing
+        // lines writes it.
+        if !self.held && self.written != 0 {
+            let cursor = self.cursor_line();
+            if self.written == 1 << cursor.min(63) {
+                let row = frame_row(self.term.grid(), cursor);
+                let mut frame = std::mem::take(&mut self.frame);
+                if let Some(session) = self.session() {
+                    let known = session.rows();
+                    frame.truncate(known.len());
+                    for (mine, known) in frame.iter_mut().zip(known) {
+                        mine.clone_from(known);
+                    }
+                    frame.extend_from_slice(&known[frame.len()..]);
+                    frame[cursor] = row;
+                    session.present(&frame);
+                }
+                self.frame = frame;
+                self.written = 0;
+            } else {
+                self.present();
             }
+        }
+        let n = n.min(end.saturating_sub(top));
+        let gone = if up { top..top + n } else { end - n..end };
+        let leaving: Option<Vec<FrameRow>> = (!self.held).then(|| {
+            let grid = self.term.grid();
+            gone.map(|line| frame_row(grid, line)).collect()
+        });
+        if let Some(session) = self.session() {
+            session.shift(top, end, n, up, leaving.as_deref());
+        }
+    }
+
+    /// One row scrolls up within the scroll region, as a line feed at its bottom does.
+    fn feed(&mut self) {
+        if self.cursor_line() == self.region.1 {
+            self.shift(self.region.0, self.region.1 + 1, 1, true);
         }
     }
 
     fn cursor_line(&self) -> usize {
         self.term.grid().cursor.point.line.0 as usize
+    }
+
+    /// The next character or tab past the last column wraps, if the terminal wraps lines.
+    fn wraps(&self) -> bool {
+        self.term.grid().cursor.input_needs_wrap && self.term.mode().contains(TermMode::LINE_WRAP)
     }
 }
 
@@ -378,128 +489,132 @@ macro_rules! forward {
 
 impl Handler for Replay {
     fn input(&mut self, c: char) {
-        // A character past the last column wraps first, which scrolls at the region's bottom.
-        // A character not ASCII may be wide and wrap from the last column, or a combining mark
-        // that does not wrap, so only a full frame is certain to be right before it.
-        if self.wraps_at_bottom() {
-            match c.is_ascii() {
-                true => self.scroll(true),
-                false => self.frame(),
-            }
-        } else if !c.is_ascii()
-            && self.cursor_line() == self.region.1
-            && self.term.grid().cursor.point.column.0 + 1 >= usize::from(PTY_COLS)
-        {
-            self.frame();
+        // As the terminal does: a character with width wraps past the last column, and a wide
+        // character wraps from it; wrapping at the scroll region's bottom scrolls.
+        let width = c.width().unwrap_or(0);
+        let last_column = self.term.grid().cursor.point.column.0 + 1 >= self.term.columns();
+        let wide_wraps =
+            width == 2 && last_column && self.term.mode().contains(TermMode::LINE_WRAP);
+        if width > 0 && (self.wraps() || wide_wraps) {
+            self.feed();
         }
-        self.draw();
         Handler::input(&mut self.term, c);
-        // A wrap may have written to the next row.
-        self.draw();
+        self.write();
     }
 
     fn put_tab(&mut self, count: u16) {
         // A tab past the last column wraps.
-        if self.wraps_at_bottom() {
-            self.scroll(true);
+        if self.wraps() {
+            self.feed();
         }
         Handler::put_tab(&mut self.term, count);
-        self.draw();
+        self.write();
     }
 
     fn insert_blank(&mut self, count: usize) {
-        self.draw();
+        self.write();
         Handler::insert_blank(&mut self.term, count);
     }
 
     fn erase_chars(&mut self, count: usize) {
-        self.draw();
+        self.write();
         Handler::erase_chars(&mut self.term, count);
     }
 
     fn delete_chars(&mut self, count: usize) {
-        self.draw();
+        self.write();
         Handler::delete_chars(&mut self.term, count);
     }
 
     fn clear_line(&mut self, mode: LineClearMode) {
-        self.draw();
+        self.write();
         Handler::clear_line(&mut self.term, mode);
     }
 
-    fn decaln(&mut self) {
-        self.frame();
-        Handler::decaln(&mut self.term);
-    }
-
     fn linefeed(&mut self) {
-        if self.cursor_line() == self.region.1 {
-            self.scroll(true);
-        }
+        self.feed();
         Handler::linefeed(&mut self.term);
     }
 
     fn newline(&mut self) {
-        if self.cursor_line() == self.region.1 {
-            self.scroll(true);
-        }
+        self.feed();
         Handler::newline(&mut self.term);
     }
 
     fn reverse_index(&mut self) {
         if self.cursor_line() == self.region.0 {
-            self.scroll(false);
+            self.shift(self.region.0, self.region.1 + 1, 1, false);
         }
         Handler::reverse_index(&mut self.term);
     }
 
     fn scroll_up(&mut self, lines: usize) {
-        self.frame();
+        self.shift(self.region.0, self.region.1 + 1, lines, true);
         Handler::scroll_up(&mut self.term, lines);
     }
 
     fn scroll_down(&mut self, lines: usize) {
-        self.frame();
+        self.shift(self.region.0, self.region.1 + 1, lines, false);
         Handler::scroll_down(&mut self.term, lines);
     }
 
     fn insert_blank_lines(&mut self, lines: usize) {
-        self.frame();
+        let origin = self.cursor_line();
+        if (self.region.0..=self.region.1).contains(&origin) {
+            self.shift(origin, self.region.1 + 1, lines, false);
+        }
         Handler::insert_blank_lines(&mut self.term, lines);
     }
 
     fn delete_lines(&mut self, lines: usize) {
-        self.frame();
+        let origin = self.cursor_line();
+        if (self.region.0..=self.region.1).contains(&origin) {
+            self.shift(origin, self.region.1 + 1, lines, true);
+        }
         Handler::delete_lines(&mut self.term, lines);
     }
 
+    // Erasing destroys what the screen showed, so the frame before it is recorded.
     fn clear_screen(&mut self, mode: ClearMode) {
-        self.frame();
+        self.present();
         Handler::clear_screen(&mut self.term, mode);
     }
 
-    fn reset_state(&mut self) {
-        self.frame();
-        Handler::reset_state(&mut self.term);
-        self.region = (0, usize::from(PTY_ROWS) - 1);
+    fn decaln(&mut self) {
+        self.present();
+        Handler::decaln(&mut self.term);
     }
 
-    // Programs switch screens, hide the cursor, and begin synchronized updates between frames.
+    fn reset_state(&mut self) {
+        self.present();
+        Handler::reset_state(&mut self.term);
+        self.region = (0, usize::from(PTY_ROWS) - 1);
+        self.held = false;
+    }
+
+    // Programs hide the cursor before they draw and show it once done, switch screens between
+    // frames, and hold a frame's drawing in a synchronized update.
     fn set_private_mode(&mut self, mode: PrivateMode) {
-        self.frame();
-        self.column_mode(mode);
+        self.mode_change(mode, true);
+        let entering = mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor)
+            && !self.term.mode().contains(TermMode::ALT_SCREEN);
+        if entering {
+            self.mark_session_start();
+        }
         Handler::set_private_mode(&mut self.term, mode);
+        if entering {
+            self.open = false;
+            self.session();
+        }
     }
 
     fn unset_private_mode(&mut self, mode: PrivateMode) {
-        self.frame();
-        self.column_mode(mode);
+        self.mode_change(mode, false);
         Handler::unset_private_mode(&mut self.term, mode);
     }
 
     fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
         Handler::set_scrolling_region(&mut self.term, top, bottom);
-        self.last_scroll = None;
         // As the terminal does: 1-based rows, ignored unless the top is above the bottom.
         let rows = usize::from(PTY_ROWS);
         let bottom = bottom.unwrap_or(rows);
@@ -564,27 +679,106 @@ impl Handler for Replay {
     }
 }
 
+impl Replay {
+    /// Marks the normal-screen text shown before the session about to begin: the first
+    /// character of each screen row with text, and the last line of the history, which no
+    /// program writes over. Text the program erases or writes over later loses its mark; the
+    /// last mark left tells where the session began.
+    fn mark_session_start(&mut self) {
+        let Some(mark) = session_char(self.sessions.len()) else {
+            return;
+        };
+        let grid = self.term.grid_mut();
+        if grid.history_size() > 0 {
+            grid[Line(-1)][Column(0)].push_zerowidth(mark);
+        }
+        for line in 0..grid.screen_lines() as i32 {
+            let row = &mut grid[Line(line)];
+            // A glyph is a base character other than whitespace, or a combining mark on a blank;
+            // a combining mark precedes any session marks on its cell.
+            let text = row[..].iter().position(|cell| {
+                (!cell.c.is_whitespace() && cell.c != '\0')
+                    || cell
+                        .zerowidth()
+                        .is_some_and(|marks| marks.iter().any(|&c| session_mark(c).is_none()))
+            });
+            if let Some(column) = text {
+                row[Column(column)].push_zerowidth(mark);
+            }
+        }
+    }
+
+    /// Before private mode `mode` is set or reset: the frame it ends, if it ends one.
+    fn mode_change(&mut self, mode: PrivateMode, set: bool) {
+        let PrivateMode::Named(named) = mode else {
+            return;
+        };
+        match named {
+            NamedPrivateMode::ShowCursor => {
+                self.present();
+                if set && !self.term.mode().contains(TermMode::SHOW_CURSOR) {
+                    self.redraws += 1;
+                }
+            }
+            NamedPrivateMode::SyncUpdate => {
+                self.present();
+                self.held = set;
+                self.present();
+            }
+            // Switching screens ends the frame on screen; column mode clears it.
+            NamedPrivateMode::SwapScreenAndSetRestoreCursor => self.present(),
+            NamedPrivateMode::ColumnMode => {
+                self.present();
+                self.region = (0, usize::from(PTY_ROWS) - 1);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The screen's rows without trailing spaces.
 fn screen_rows(grid: &Grid<Cell>) -> Vec<String> {
     (0..grid.screen_lines())
-        .map(|line| screen_row(grid, line))
+        .map(|line| frame_row(grid, line).text)
         .collect()
 }
 
-fn screen_row(grid: &Grid<Cell>, line: usize) -> String {
-    let mut text = row_text(&grid[Line(line as i32)]);
-    text.truncate(text.trim_end().len());
-    text
+/// The screen's rows as a frame.
+fn frame_rows(grid: &Grid<Cell>) -> Vec<FrameRow> {
+    (0..grid.screen_lines())
+        .map(|line| frame_row(grid, line))
+        .collect()
 }
 
-/// A grid's history and screen as logical lines, without trailing blank lines.
-fn lines(grid: &Grid<Cell>) -> Vec<String> {
+fn frame_row(grid: &Grid<Cell>, line: usize) -> FrameRow {
+    let row = &grid[Line(line as i32)];
+    let mut text = row_text(row);
+    text.truncate(text.trim_end().len());
+    FrameRow {
+        text,
+        wraps: row[Column(grid.columns() - 1)]
+            .flags
+            .contains(Flags::WRAPLINE),
+    }
+}
+
+/// A grid's history and screen as logical lines, without trailing blank lines, and the
+/// session marks they carry: the index of each marked line and the session.
+fn lines(grid: &Grid<Cell>) -> (Vec<String>, Vec<(usize, usize)>) {
     let last = Column(grid.columns() - 1);
     let mut lines = Vec::new();
+    let mut marks = Vec::new();
     let mut line = String::new();
     for index in -(grid.history_size() as i32)..grid.screen_lines() as i32 {
         let row = &grid[Line(index)];
         line.push_str(&row_text(row));
+        marks.extend(
+            row[..]
+                .iter()
+                .flat_map(|cell| cell.zerowidth().into_iter().flatten())
+                .filter_map(|&c| session_mark(c))
+                .map(|mark| (lines.len(), mark)),
+        );
         if !row[last].flags.contains(Flags::WRAPLINE) {
             line.truncate(line.trim_end().len());
             lines.push(std::mem::take(&mut line));
@@ -597,7 +791,7 @@ fn lines(grid: &Grid<Cell>) -> Vec<String> {
     while lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
-    lines
+    (lines, marks)
 }
 
 /// A row as shown: a wide character once, a tab as a space, combining marks after their base.
@@ -617,7 +811,8 @@ fn row_text(row: &Row<Cell>) -> String {
         }
         // A tab leaves `\t` in its first cell and blanks up to the tab stop.
         text.push(if cell.c == '\t' { ' ' } else { cell.c });
-        text.extend(cell.zerowidth().into_iter().flatten());
+        let marks = cell.zerowidth().into_iter().flatten();
+        text.extend(marks.filter(|&&c| session_mark(c).is_none()));
     }
     text
 }
@@ -628,36 +823,217 @@ mod tests {
 
     /// Renders `log` as the transcript action does, reading it in 64 KiB pieces.
     fn render_text(log: &[u8]) -> String {
+        render_marked(log, &[], true)
+    }
+
+    fn render_marked(log: &[u8], marks: &[u64], closed: bool) -> String {
         let path = std::env::temp_dir().join(format!(
-            "fastexec-transcript-test-{}-{}.txt",
+            "fastexec-transcript-test-{}-{}-{}.txt",
             std::process::id(),
-            log.len()
+            log.len(),
+            marks.len()
         ));
-        let transcript = render(log, log.len() as u64, &[], &path).unwrap();
+        let transcript = render(log, log.len() as u64, marks, closed, &path).unwrap();
         let _ = std::fs::remove_file(&path);
         transcript.text
     }
 
     #[test]
+    fn alternate_screen_sessions_appear_where_they_ran() {
+        let session = |k: usize| format!("\x1b[?1049h\x1b[Hinside {k}\x1b[?1049l");
+        let ran = format!("before\r\n{}first\r\n{}second\r\n", session(1), session(2));
+        let cleared = format!("before\r\n{}\x1b[H\x1b[2J\x1b[3Jafter\r\n", session(1));
+        let rewritten = format!("first\r\nprompt{}\r\x1b[2Klast\r\n", session(1));
+        let beside = format!("before\r{}\r\nafter\r\n", session(1));
+        let moved = format!("a\r\nb\r\nc\r\n{}\x1b[2;1H{}", session(1), session(2));
+        let erased = format!(
+            "first\r\n{}between\r\nanchor\r\nprompt{}\x1b[3;1H\x1b[2K\x1b[4;1H\x1b[2Kafter\r\n",
+            session(1),
+            session(2)
+        );
+        let above = format!("a\r\nb\r\nc\r\n\x1b[H{}", session(1));
+        let combining = format!(" \u{301}{}\r\nafter\r\n", session(1));
+        let wide_blank = format!("before\r\n\u{3000}{}after\r\n", session(1));
+        let indented = format!(
+            "  before\r\nmiddle\r\nlast{}\x1b[1;3H\x1b[Kafter\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K",
+            session(1)
+        );
+        for (log, expected) in [
+            // Text below the cursor was shown before the session too.
+            (above, vec!["a", "b", "c", ALTERNATE_MARKER, "inside 1"]),
+            // A combining mark on a blank is text; an ideographic space is not.
+            (
+                combining,
+                vec![
+                    " \u{301}",
+                    ALTERNATE_MARKER,
+                    "inside 1",
+                    NORMAL_MARKER,
+                    "after",
+                ],
+            ),
+            (
+                wide_blank,
+                vec![
+                    "before",
+                    ALTERNATE_MARKER,
+                    "inside 1",
+                    NORMAL_MARKER,
+                    "\u{3000}after",
+                ],
+            ),
+            // Erasing the text of a row erases its mark, though its indentation stays.
+            (
+                indented,
+                vec![ALTERNATE_MARKER, "inside 1", NORMAL_MARKER, "  after"],
+            ),
+            (
+                ran,
+                vec![
+                    "before",
+                    ALTERNATE_MARKER,
+                    "inside 1",
+                    NORMAL_MARKER,
+                    "first",
+                    ALTERNATE_MARKER,
+                    "inside 2",
+                    NORMAL_MARKER,
+                    "second",
+                ],
+            ),
+            // The history the session followed was cleared after it.
+            (
+                cleared,
+                vec![ALTERNATE_MARKER, "inside 1", NORMAL_MARKER, "after"],
+            ),
+            // The program wrote over the cursor's row after the session.
+            (
+                rewritten,
+                vec!["first", ALTERNATE_MARKER, "inside 1", NORMAL_MARKER, "last"],
+            ),
+            // The session began on the row of the text before the cursor's column.
+            (
+                beside,
+                vec![
+                    "before",
+                    ALTERNATE_MARKER,
+                    "inside 1",
+                    NORMAL_MARKER,
+                    "after",
+                ],
+            ),
+            // The cursor moved up between sessions; they keep their order.
+            (
+                moved,
+                vec![
+                    "a",
+                    "b",
+                    "c",
+                    ALTERNATE_MARKER,
+                    "inside 1",
+                    ALTERNATE_MARKER,
+                    "inside 2",
+                ],
+            ),
+            // The rows the second session began below were erased or written over; the line
+            // above them still precedes it.
+            (
+                erased,
+                vec![
+                    "first",
+                    ALTERNATE_MARKER,
+                    "inside 1",
+                    NORMAL_MARKER,
+                    "between",
+                    ALTERNATE_MARKER,
+                    "inside 2",
+                    NORMAL_MARKER,
+                    "",
+                    "after",
+                ],
+            ),
+        ] {
+            let text = render_text(log.as_bytes());
+            assert_eq!(text.lines().collect::<Vec<_>>(), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_pause_inside_a_redraw_is_a_frame_only_when_long() {
+        // The program hides the cursor while it draws, as it has twice before; a pause leaves
+        // a row half drawn.
+        let pages: String = (0..2)
+            .map(|k| format!("\x1b[?25l\x1b[H\x1b[2Kpage {k}\x1b[?25h"))
+            .collect();
+        let torn = format!("\x1b[?1049h{pages}\x1b[?25l\x1b[H\x1b[2Kdrawing row");
+        let log = format!("{torn}\x1b[H\x1b[2Kfinal row\x1b[?25h");
+        let pause = torn.len() as u64 | PAUSE;
+        for (marks, shown) in [(vec![pause], false), (vec![pause | LONG], true)] {
+            let text = render_marked(log.as_bytes(), &marks, true);
+            assert_eq!(text.contains("drawing row"), shown, "{marks:?}: {text}");
+            assert!(text.contains("final row"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_replay_ends_synchronized_updates_where_the_terminal_did() {
+        // The first page shows at the update's timeout, then the second replaces it before the
+        // update ends; a running task's update still open at the end of its log shows nothing.
+        let first = "\x1b[?1049h\x1b[?2026h\x1b[Hfirst page";
+        let log = format!("{first}\x1b[Hsecond page\x1b[?2026l\x1b[?2026h\x1b[H\x1b[2Kheld page");
+        let timeout = first.len() as u64 | SYNC_END;
+        let lines = |text: String| -> Vec<String> {
+            text.lines()
+                .filter(|line| line.ends_with("page"))
+                .map(str::to_string)
+                .collect()
+        };
+        let cases = [
+            (vec![timeout], false, vec!["first page", "second page"]),
+            (vec![], false, vec!["second page"]),
+            (
+                vec![timeout],
+                true,
+                vec!["first page", "second page", "held page"],
+            ),
+        ];
+        for (marks, closed, expected) in cases {
+            let text = render_marked(log.as_bytes(), &marks, closed);
+            assert_eq!(lines(text), expected, "marks {marks:?}, closed {closed}");
+        }
+    }
+
+    #[test]
     fn alternate_screen_rows_pushed_off_stay_in_the_transcript() {
         // Full-width rows, all read at once with no pause, each scrolling the screen: by
-        // wrapping, written back to back, followed by a tab, or carrying a combining mark that
-        // lands in the last column; and printed on new lines below a fixed header, also after
-        // column mode reset a smaller scroll region.
+        // wrapping, written back to back, followed by a tab, carrying a combining mark that
+        // lands in the last column, or ending in a wide character that does not fit, which
+        // joins them into one line as the terminal wrapped them; and printed on new lines below
+        // a fixed header, also after column mode reset a smaller scroll region.
         let rows: Vec<String> = (0..80)
             .map(|k| format!("row {k:03} {}", "x".repeat(112)))
             .collect();
         let accented: Vec<String> = rows.iter().map(|row| format!("{row}\u{301}")).collect();
+        let wide: Vec<String> = (0..80)
+            .map(|k| format!("row {k:03} {}\u{4e2d}", "x".repeat(111)))
+            .collect();
         let lines = |prefix: &str| {
             let lines: String = rows.iter().map(|row| format!("\r\n{row}")).collect();
             format!("\x1b[?1049h{prefix}{lines}")
         };
         for (log, expected) in [
-            (format!("\x1b[?1049h{}", rows.concat()), &rows),
-            (format!("\x1b[?1049h{}", rows.join("\t")), &rows),
-            (format!("\x1b[?1049h{}", accented.concat()), &accented),
-            (lines("header\x1b[2;30r\x1b[30;1H"), &rows),
-            (lines("\x1b[2;20r\x1b[?3l\x1b[H"), &rows),
+            (format!("\x1b[?1049h{}", rows.concat()), vec![rows.concat()]),
+            (
+                format!("\x1b[?1049h{}", rows.join("\t")),
+                vec![rows.concat()],
+            ),
+            (
+                format!("\x1b[?1049h{}", accented.concat()),
+                vec![accented.concat()],
+            ),
+            (format!("\x1b[?1049h{}", wide.concat()), vec![wide.concat()]),
+            (lines("header\x1b[2;30r\x1b[30;1H"), rows.clone()),
+            (lines("\x1b[2;20r\x1b[?3l\x1b[H"), rows.clone()),
         ] {
             let text = render_text(log.as_bytes());
             let session: Vec<&str> = text
@@ -665,7 +1041,7 @@ mod tests {
                 .skip_while(|line| *line != ALTERNATE_MARKER)
                 .filter(|line| line.starts_with("row "))
                 .collect();
-            assert_eq!(&session, expected, "{text}");
+            assert_eq!(session, expected, "{text}");
         }
         // Scrolling back: a character wraps from the uncovered top row into the next one.
         let screen: String = (1..=30).map(|k| format!("\x1b[{k};1Hline{k:02}")).collect();
@@ -739,13 +1115,13 @@ mod tests {
     #[test]
     fn a_synchronized_update_shows_once_it_ends_across_reads() {
         let mut live = Live::new();
-        live.process(b"before\r\n\x1b[?2026h");
-        live.process(b"held");
+        live.process(b"before\r\n\x1b[?2026h", Instant::now());
+        live.process(b"held", Instant::now());
         let (rows, _) = live.screen().unwrap();
         assert_eq!(rows, ["before"]);
         assert_eq!(live.shown(), 16, "the held bytes are not shown yet");
         assert!(live.sync_deadline().is_some());
-        live.process(b"\x1b[?2026l");
+        live.process(b"\x1b[?2026l", Instant::now());
         let (rows, _) = live.screen().unwrap();
         assert_eq!(rows, ["before", "held"]);
         assert_eq!(live.shown(), 28);
