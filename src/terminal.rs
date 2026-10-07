@@ -958,6 +958,217 @@ mod tests {
         }
     }
 
+    /// The transcript lines with text of an alternate-screen session drawing each of `frames`
+    /// as a synchronized update: a header, the frame's rows from row 20 on, and a footer.
+    fn streamed(frames: &[[&str; 5]]) -> Vec<String> {
+        let mut log = String::from("[?1049h");
+        for rows in frames {
+            log.push_str("[?2026h[1;1H[2Kheader");
+            for (k, row) in rows.iter().enumerate() {
+                log.push_str(&format!("[{};1H[2K{row}", 20 + k));
+            }
+            log.push_str("[27;1H[2Kfooter[?2026l");
+        }
+        render_text(log.as_bytes())
+            .lines()
+            .filter(|line| !matches!(*line, "" | "header" | "footer" | ALTERNATE_MARKER))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_streamed_preview_leaves_no_copy_behind() {
+        // A reply's last row previews the sentence being streamed; it moves on to the next
+        // sentence before the one it previewed, without its final full stop, shows in full.
+        let [s1, s2, s3, s4] = [
+            "第一句話寫進終端機。",
+            "第二句話重建歷史。",
+            "第三句話說明預覽。",
+            "第四句話結束說明。",
+        ];
+        let (p3, p4) = (s3.trim_end_matches('。'), "第四句話");
+        let frames = [
+            ["", "", s1, s2, p3],
+            ["", "", s1, s2, p4],
+            ["", s1, s2, s3, p4],
+            [s1, s2, s3, s4, ""],
+        ];
+        assert_eq!(streamed(&frames), [s1, s2, s3, s4]);
+    }
+
+    #[test]
+    fn a_preview_finished_after_another_page_continues_its_line() {
+        // A reply's last row previews a sentence all but its full stop; another page shows,
+        // then the reply again with the sentence finished and more below it.
+        let s = [
+            "第一句話寫進終端機。",
+            "第二句話重建歷史。",
+            "第三句話說明預覽。",
+            "第四句話結束說明。",
+            "第五句話收尾完成。",
+            "第六句話繼續寫。",
+            "第七句話還沒完。",
+            "第八句話到此為止。",
+        ];
+        let page = ["page 1", "page 2", "page 3", "page 4", "page 5"];
+        let frames = [
+            ["", s[0], s[1], s[2], s[3].trim_end_matches('。')],
+            page,
+            [s[0], s[1], s[2], s[3], ""],
+            [s[1], s[2], s[3], s[4], ""],
+            [s[2], s[3], s[4], s[5], ""],
+            [s[3], s[4], s[5], s[6], ""],
+            [s[4], s[5], s[6], s[7], ""],
+        ];
+        let mut reply = streamed(&frames);
+        reply.retain(|line| !line.starts_with("page"));
+        assert_eq!(reply, s);
+    }
+
+    #[test]
+    fn a_preview_cleared_and_shown_finished_stays_one_line() {
+        // The reply's last row previews line 5 in full, clears, and starts line 6 with the
+        // word every line starts with; then line 5 shows finished above line 6.
+        let rows: Vec<String> = (3..=6)
+            .map(|n| format!("ITEM {n:03} - the value of item {n:03} is {n:03}"))
+            .collect();
+        let [r3, r4, r5, r6] = [0, 1, 2, 3].map(|k| rows[k].as_str());
+        let frames = [
+            ["", "", "", r3, r4],
+            ["", "", r3, r4, r5],
+            ["", "", r3, r4, "ITEM"],
+            ["", r3, r4, r5, "ITEM 006 - the"],
+            [r3, r4, r5, r6, ""],
+        ];
+        assert_eq!(streamed(&frames), rows);
+    }
+
+    #[test]
+    fn printed_lines_count_as_frames_for_a_line_that_left() {
+        // `cat` leaves the screen; lines then print into a scroll region frame by frame, the
+        // last of them longer than `cat`, before an unrelated row changes.
+        let mut log = String::from("\x1b[?1049h");
+        for tail in ["cat", "seed"] {
+            log.push_str(&format!(
+                "\x1b[?2026h\x1b[1;1H\x1b[2Kheader\x1b[30;1H\x1b[2K{tail}\x1b[?2026l"
+            ));
+        }
+        log.push_str("\x1b[2;30r\x1b[30;1H");
+        for k in 1..=7 {
+            let text = if k < 7 {
+                format!("noise {k}")
+            } else {
+                "catalog".into()
+            };
+            log.push_str(&format!("\x1b[?2026h\r\n{text}\x1b[?2026l"));
+        }
+        log.push_str("\x1b[?2026h\x1b[1;1H\x1b[2Kheader done\x1b[?2026l");
+        let text = render_text(log.as_bytes());
+        assert!(text.lines().any(|line| line == "cat"), "{text}");
+    }
+
+    #[test]
+    fn a_preview_shows_again_when_its_finished_line_leaves() {
+        // A preview's finished line shows, then reflows into a changed condition, so the
+        // preview holds the only copy of the old one.
+        let frames = [
+            [
+                "",
+                "alpha one apple",
+                "beta two pear",
+                "gamma three plum",
+                "delta four grape",
+            ],
+            [
+                "",
+                "beta two pear",
+                "gamma three plum",
+                "delta four grape",
+                "check left == right",
+            ],
+            [
+                "",
+                "alpha one apple",
+                "beta two pear",
+                "gamma three plum",
+                "delta four grape",
+            ],
+            ["", "gamma three plum", "delta four grape", "check", ""],
+            [
+                "",
+                "beta two pear",
+                "gamma three plum",
+                "delta four grape",
+                "check left == right done",
+            ],
+            [
+                "",
+                "beta two pear",
+                "gamma three plum",
+                "delta four grape",
+                "check left != right done",
+            ],
+        ];
+        let reply = streamed(&frames);
+        assert!(reply.iter().any(|line| line.contains("==")), "{reply:?}");
+    }
+
+    #[test]
+    fn an_entry_below_a_fixed_header_is_no_preview() {
+        // A list's entries give way to a new page under a fixed header, and a longer entry is
+        // inserted at the top of the list where `cat` showed before.
+        let mut log = String::from("\x1b[?1049h");
+        for frame in [
+            [
+                "files",
+                "",
+                "old one apple",
+                "old two pear",
+                "old three plum",
+                "cat",
+                "footer",
+            ],
+            ["files", "", "cat", "", "", "", "footer"],
+            [
+                "files",
+                "",
+                "new one red",
+                "new two green",
+                "new three blue",
+                "new four white",
+                "footer",
+            ],
+        ] {
+            log.push_str("\x1b[?2026h");
+            for (k, row) in frame.iter().enumerate() {
+                log.push_str(&format!("\x1b[{};1H\x1b[2K{row}", k + 1));
+            }
+            log.push_str("\x1b[?2026l");
+        }
+        log.push_str("\x1b[?2026h\x1b[2;7r\x1b[2;1H\x1b[1Lcatalog\x1b[?2026l");
+        let text = render_text(log.as_bytes());
+        assert!(text.lines().any(|line| line == "cat"), "{text}");
+    }
+
+    #[test]
+    fn a_numbered_line_shown_late_keeps_its_place() {
+        // A reply's last row moves on to line 55 before line 54 shows; the rows differ only in
+        // numbers, as a counter's do.
+        let rows: Vec<String> = (52..=56)
+            .map(|n| {
+                format!("ITEM-{n:03} | the quick brown fox jumps over the lazy dog | END-{n:03}")
+            })
+            .collect();
+        let [r52, r53, r54, r55, r56] = [0, 1, 2, 3, 4].map(|k| rows[k].as_str());
+        let frames = [
+            ["", "", r52, r53, r54],
+            ["", "", r52, r53, r55],
+            ["", "", r53, r54, r56],
+            ["", "", r54, r55, r56],
+        ];
+        assert_eq!(streamed(&frames), rows);
+    }
+
     #[test]
     fn a_pause_inside_a_redraw_is_a_frame_only_when_long() {
         // The program hides the cursor while it draws, as it has twice before; a pause leaves

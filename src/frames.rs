@@ -32,6 +32,8 @@ const CONTINUE_REACH: usize = 8;
 const MAX_NUMBER_UPDATES: usize = 3;
 /// Lines around a row's line where a shorter copy of it is an echo.
 const ECHO_REACH: usize = 3;
+/// Frames after a preview leaves the screen in which its finished line may first show.
+const ECHO_FRAMES: usize = 3;
 /// Rows around a changed region whose words can absorb a reflowed row.
 const REFLOW_CONTEXT: usize = 2;
 /// Words a reflowed row needs, so a short row is never taken for part of another.
@@ -56,10 +58,22 @@ struct Line {
     /// The first and last frames that showed the line; `first` is `usize::MAX` until one does.
     first: usize,
     last: usize,
+    /// The row that last showed the line, and the first frame that showed it with text.
+    last_row: usize,
+    text_first: usize,
+    /// The line, and its serial, that showed soon after this one left, on its row or the row
+    /// above, continuing it with no line shown with both between them: the finished line of a
+    /// preview.
+    finished: Option<(usize, u64)>,
+    /// Its text changed while a row showed it, as a row the program streams into does.
+    changed: bool,
     /// Left the screen by a scroll, so no later line is a version of it.
     scrolled: bool,
     /// Lines added before it, counting lines out of the history; ids are reused, serials not.
     serial: u64,
+    /// The text a numbers update replaced: a row showing it again in place of the line is an
+    /// earlier line the program showed ahead of, not an older value.
+    was: Option<String>,
 }
 
 pub struct History {
@@ -77,6 +91,8 @@ pub struct History {
     free: Vec<usize>,
     /// Lines added so far.
     added: u64,
+    /// Lines that left the screen in the last `ECHO_FRAMES` frames.
+    left: Vec<usize>,
     /// Lines left the history once it held its limit.
     pub truncated: bool,
 }
@@ -105,6 +121,7 @@ impl History {
             limit,
             free: Vec::new(),
             added: 0,
+            left: Vec::new(),
             truncated: false,
         };
         history.screen = (0..height).map(|k| history.insert(k, "", true)).collect();
@@ -124,8 +141,13 @@ impl History {
             let id = self.screen[row];
             match leaving {
                 Some(rows) => {
-                    let line = self.take(id, &rows[k]);
-                    self.lines[line].scrolled = true;
+                    let id = self.take(id, &rows[k]);
+                    let line = &mut self.lines[id];
+                    line.scrolled = true;
+                    // The screen showed the text it leaves with.
+                    if !blank(&rows[k].text) {
+                        line.text_first = line.text_first.min(self.frame);
+                    }
                 }
                 None if self.lines[id].placeholder => self.lines[id].dropped = true,
                 None => self.lines[id].scrolled = true,
@@ -190,6 +212,9 @@ impl History {
         {
             // Without a frame around it, a row whose numbers changed may be another row.
             let line = &mut self.lines[id];
+            if line.text != row.text {
+                line.was = None;
+            }
             line.text.clone_from(&row.text);
             line.wraps = row.wraps;
             return id;
@@ -258,12 +283,9 @@ impl History {
                 && self.beside(id, true).is_none()
                 && self.beside(id, false).is_none()
             {
-                let line = &mut self.lines[id];
-                line.placeholder = false;
-                line.text.clone_from(&rows[j].text);
-                line.wraps = rows[j].wraps;
-                self.rows[j].clone_from(&rows[j]);
-                self.limit();
+                self.frame += 1;
+                // No line leaves the screen.
+                self.record(rows, &[]);
                 return;
             }
         }
@@ -291,6 +313,7 @@ impl History {
                 false => row.text.as_str(),
             })
             .collect();
+        let mut skip = uncovered.clone();
         let (mut i0, mut j0) = (0, 0);
         for (i, j) in align(&old, &new)
             .into_iter()
@@ -298,7 +321,15 @@ impl History {
         {
             if i > i0 || j > j0 {
                 let gone = self.screen[i0..i].to_vec();
-                self.update_region(&gone, rows, &uncovered, j0..j, &mut shown, &mut fills);
+                // A row showing again a line beside the lines around the region is that line,
+                // which `reuse` finds.
+                let above = j0.checked_sub(1).and_then(|j| shown[j]);
+                let below = self.screen.get(i).copied();
+                for k in j0..j {
+                    let text = &rows[k].text;
+                    skip[k] |= !blank(text) && self.waits_beside(above, below, text, &shown);
+                }
+                self.update_region(&gone, rows, &skip, j0..j, &mut shown, &mut fills);
                 regions.push((gone, j0..j));
             }
             if j < new.len() {
@@ -307,7 +338,7 @@ impl History {
             (i0, j0) = (i + 1, j + 1);
         }
         self.reuse(rows, &mut shown);
-        self.continue_lines(rows, &mut shown);
+        self.continue_lines(rows, &uncovered, &mut shown);
         self.fill(rows, &mut shown, &fills);
         for (gone, new) in &regions {
             self.reflow(rows, &shown, &uncovered, gone, new.clone());
@@ -335,30 +366,115 @@ impl History {
                 self.lines[id].dropped = true;
             }
         }
-        for (&id, row) in self.screen.iter().zip(rows) {
+        self.record(rows, &old_screen);
+    }
+
+    /// Records that the screen shows `rows`, its lines now in `screen` and before this frame
+    /// in `old_screen`: their texts, the frames and rows that showed them, the lines that left,
+    /// and the previews whose finished lines the frame shows.
+    fn record(&mut self, rows: &[Row], old_screen: &[usize]) {
+        // Rows that show a line first, or new text of their line.
+        let mut fresh = Vec::new();
+        for (j, (&id, row)) in self.screen.iter().zip(rows).enumerate() {
             let line = &mut self.lines[id];
+            if line.first == usize::MAX || line.text != row.text {
+                fresh.push(j);
+            }
             if line.text != row.text {
+                line.changed |= line.first != usize::MAX && !blank(&line.text);
+                // Only a numbers update keeps the text it replaced.
+                if line.was.as_deref() != Some(line.text.as_str()) {
+                    line.was = None;
+                }
                 line.text.clone_from(&row.text);
             }
             line.wraps = row.wraps;
             line.placeholder = false;
             line.first = line.first.min(self.frame);
-            line.last = self.frame;
+            if line.text_first == usize::MAX && !blank(&row.text) {
+                line.text_first = self.frame;
+            }
+            (line.last, line.last_row, line.finished) = (self.frame, j, None);
         }
+        let frame = self.frame;
+        let (lines, screen) = (&self.lines, &self.screen);
+        self.left.retain(|&id| {
+            let line = &lines[id];
+            !screen.contains(&id) && !line.dropped && line.last + ECHO_FRAMES >= frame
+        });
+        self.left
+            .extend(old_screen.iter().filter(|&id| !self.screen.contains(id)));
+        self.find_finished(&fresh);
         self.rows.clone_from_slice(rows);
         self.limit();
+    }
+
+    /// Marks the lines that left the screen whose finished versions rows `fresh` show. A
+    /// preview, a row the program streams into, leaves, and within a few frames the
+    /// finished line shows on the preview's row or the row above, and may be added far from
+    /// the preview in the document. The line before it in the document continues the reply:
+    /// it showed text with the preview and shows it still. A line between the two that
+    /// showed text both before the preview left and now tells them apart.
+    fn find_finished(&mut self, fresh: &[usize]) {
+        let mut finished = Vec::new();
+        for &j in fresh {
+            let id = self.screen[j];
+            let line = &self.lines[id];
+            if blank(&line.text) {
+                continue;
+            }
+            let before = self.order[..self.pos[id]]
+                .iter()
+                .rev()
+                .copied()
+                .find(|&other| {
+                    let line = &self.lines[other];
+                    !line.dropped && !line.placeholder && !blank(&line.text)
+                });
+            let Some(before) = before.filter(|before| self.screen.contains(before)) else {
+                continue;
+            };
+            for &left in &self.left {
+                let preview = &self.lines[left];
+                if !preview.changed || self.lines[before].text_first > preview.last {
+                    continue;
+                }
+                let (lo, hi) = (
+                    self.pos[left].min(self.pos[id]),
+                    self.pos[left].max(self.pos[id]),
+                );
+                let apart = |&other: &usize| {
+                    let line = &self.lines[other];
+                    (lo + 1..hi).contains(&self.pos[other])
+                        && !blank(&line.text)
+                        && line.text_first <= preview.last
+                };
+                if !preview.scrolled
+                    && (preview.last_row == j || preview.last_row == j + 1)
+                    && core(&preview.text).chars().count() >= 3
+                    && continues(&line.text, &preview.text)
+                    && !self.screen.iter().any(apart)
+                {
+                    finished.push((left, id));
+                }
+            }
+        }
+        for (id, by) in finished {
+            self.lines[id].finished = Some((by, self.lines[by].serial));
+        }
     }
 
     /// Rows `new` replace the lines `gone`: a row that updates a replaced line takes it, and a
     /// blank line a row fills waits in `fills` until rows that show other lines are placed.
     /// Numbers change in place only where every row with text updates a replaced line and few
-    /// do so: a status area ticking, not a page of similar rows drawn over another. A row a
-    /// scroll uncovered updates no line: it fills its placeholder.
+    /// do so: a status area ticking, not a page of similar rows drawn over another. Rows in
+    /// `skip` update no line: a row a scroll uncovered fills its placeholder, and a row showing
+    /// again a line beside the region is that line.
     fn update_region(
         &mut self,
         gone: &[usize],
         rows: &[Row],
-        uncovered: &[bool],
+        skip: &[bool],
         new: Range<usize>,
         shown: &mut [Option<usize>],
         fills: &mut Vec<(usize, usize)>,
@@ -367,8 +483,11 @@ impl History {
             .iter()
             .map(|&id| self.lines[id].text.as_str())
             .collect();
-        let pairs = pair(&old, &rows[new.clone()], &uncovered[new.clone()]);
-        for j in new.clone().filter(|&j| uncovered[j]) {
+        let pairs = pair(&old, &rows[new.clone()], &skip[new.clone()]);
+        for j in new
+            .clone()
+            .filter(|&j| skip[j] && self.lines[self.screen[j]].placeholder)
+        {
             if gone.contains(&self.screen[j]) {
                 fills.push((self.screen[j], j));
             }
@@ -398,6 +517,11 @@ impl History {
                 }
                 Update::Fill => fills.push((gone[k], new.start + j)),
                 Update::Numbers if numbers > MAX_NUMBER_UPDATES => {}
+                Update::Numbers => {
+                    let line = &mut self.lines[gone[k]];
+                    line.was = Some(line.text.clone());
+                    shown[new.start + j] = Some(gone[k]);
+                }
                 _ => shown[new.start + j] = Some(gone[k]),
             }
         }
@@ -504,20 +628,19 @@ impl History {
     }
 
     /// A row that grew from a line near its neighbours, no longer shown and not scrolled away,
-    /// continues that line, as a streamed reply redrawn below the row it started on.
-    fn continue_lines(&mut self, rows: &[Row], shown: &mut [Option<usize>]) {
+    /// continues that line, as a streamed reply redrawn below the row it started on. A row a
+    /// scroll uncovered is new space, which continues no line.
+    fn continue_lines(&mut self, rows: &[Row], uncovered: &[bool], shown: &mut [Option<usize>]) {
         for j in 0..rows.len() {
-            if shown[j].is_some() || blank(&rows[j].text) {
+            if shown[j].is_some() || uncovered[j] || blank(&rows[j].text) {
                 continue;
             }
             let (lo, hi, above, below) = self.bounds(rows, shown, j, j + 1);
-            let row = core(&rows[j].text);
             let grows = |&id: &usize| {
-                let line = core(&self.lines[id].text);
+                let line = &self.lines[id].text;
                 !self.lines[id].scrolled
-                    && line.chars().count() >= 3
-                    && row.len() > line.len()
-                    && row.starts_with(line)
+                    && core(line).chars().count() >= 3
+                    && continues(&rows[j].text, line)
             };
             let near = |range: Box<dyn Iterator<Item = usize>>| {
                 range
@@ -650,7 +773,8 @@ impl History {
     }
 
     /// Rows `new` still without lines add them: after the rows above and the lines the region
-    /// replaced, before the row below.
+    /// replaced, before the row below; a row showing the text a replaced line had before a
+    /// numbers update goes just before that line.
     fn add(
         &mut self,
         rows: &[Row],
@@ -664,9 +788,10 @@ impl History {
                 // A reflowed line still marks where the region's text was.
                 !shown.contains(&Some(id)) && !self.lines[id].placeholder
             })
-            .map(|&id| self.pos[id])
-            .max();
+            .max_by_key(|&&id| self.pos[id])
+            .copied();
         for j in new {
+            let after_gone = after_gone.map(|id| self.pos[id]);
             if shown[j].is_some() {
                 continue;
             }
@@ -685,10 +810,22 @@ impl History {
                 shown[j] = Some(after);
                 continue;
             }
+            let floor = prev.map_or(0, |pos| pos + 1);
+            // A row showing the text a replaced line had before a numbers update is the line
+            // before it, which a program streaming ahead showed late.
+            let ahead = gone.iter().copied().find(|&id| {
+                !shown.contains(&Some(id))
+                    && self.pos[id] >= floor
+                    && self.lines[id].was.as_deref() == Some(rows[j].text.as_str())
+            });
+            if let Some(id) = ahead {
+                self.lines[id].was = None;
+                shown[j] = Some(self.insert(self.pos[id], &rows[j].text, false));
+                continue;
+            }
             let next = self
                 .filled_neighbour(rows, shown, j, true)
                 .map(|id| self.pos[id]);
-            let floor = prev.map_or(0, |pos| pos + 1);
             let mut at = match prev.max(after_gone) {
                 Some(pos) => pos + 1,
                 None => next.unwrap_or(self.order.len()),
@@ -701,7 +838,9 @@ impl History {
     }
 
     /// Where rows `start..end` may find their lines again: between the lines of the nearest
-    /// rows above and below that show text, and whether each of those rows exists.
+    /// rows above and below that show text, and whether each of those rows bounds them. A row
+    /// below whose line comes before the line above, such as a prompt fixed below a reply,
+    /// bounds nothing.
     fn bounds(
         &self,
         rows: &[Row],
@@ -710,10 +849,37 @@ impl History {
         end: usize,
     ) -> (usize, usize, bool, bool) {
         let above = self.filled_neighbour(rows, shown, start, false);
-        let below = self.filled_neighbour(rows, shown, end - 1, true);
         let lo = above.map_or(0, |id| self.pos[id] + 1);
+        let below = self
+            .filled_neighbour(rows, shown, end - 1, true)
+            .filter(|&id| self.pos[id] >= lo);
         let hi = below.map_or(self.order.len(), |id| self.pos[id]);
-        (lo, hi.max(lo), above.is_some(), below.is_some())
+        (lo, hi, above.is_some(), below.is_some())
+    }
+
+    /// Whether a line no row shows, among the `NEAR` lines with text after line `above` or
+    /// before line `below`, has text `text`. As in `bounds`, a line `below` that comes before
+    /// line `above` bounds nothing.
+    fn waits_beside(
+        &self,
+        above: Option<usize>,
+        below: Option<usize>,
+        text: &str,
+        shown: &[Option<usize>],
+    ) -> bool {
+        let has_text = |&&id: &&usize| {
+            let line = &self.lines[id];
+            !line.dropped && !line.placeholder && !blank(&line.text)
+        };
+        let lo = above.map_or(0, |id| self.pos[id] + 1);
+        let after = above.map(|_| &self.order[lo..]);
+        let before = below
+            .filter(|&id| self.pos[id] >= lo)
+            .map(|id| &self.order[lo..self.pos[id]]);
+        let matches = |id: &usize| self.usable(*id, shown) && self.lines[*id].text == text;
+        after.is_some_and(|lines| lines.iter().filter(has_text).take(NEAR).any(matches))
+            || before
+                .is_some_and(|lines| lines.iter().rev().filter(has_text).take(NEAR).any(matches))
     }
 
     /// A line a row may show again: in the history and not shown by another row.
@@ -730,8 +896,13 @@ impl History {
             placeholder,
             first: usize::MAX,
             last: 0,
+            last_row: 0,
+            text_first: usize::MAX,
+            finished: None,
+            changed: false,
             scrolled: false,
             serial: self.added,
+            was: None,
         };
         self.added += 1;
         let id = match self.free.pop() {
@@ -813,9 +984,12 @@ impl History {
         out
     }
 
-    /// Lines no longer shown, and not scrolled away, that a longer line near them continues,
-    /// where frames never showed the two together: a reply redrawn while it streams leaves its
-    /// shorter copies behind.
+    /// Lines the program changed in place, no longer shown and not scrolled away, that a longer
+    /// line near them shown only later continues: a reply redrawn while it streams leaves its
+    /// shorter copies behind; a line no row changed is an entry of its own. A
+    /// preview may lack only the final punctuation, which `core` leaves out. A preview far
+    /// from its finished line in the document is `finished`, while that line stays in the
+    /// history and continues it.
     fn echoes(&self) -> HashSet<usize> {
         let kept: Vec<usize> = self
             .order
@@ -831,6 +1005,7 @@ impl History {
             let line = &self.lines[id];
             let text = core(&line.text);
             if self.screen.contains(&id)
+                || !line.changed
                 || line.first == usize::MAX
                 || line.scrolled
                 || text.chars().count() < 3
@@ -838,15 +1013,21 @@ impl History {
                 continue;
             }
             let near = &kept[k.saturating_sub(ECHO_REACH)..(k + ECHO_REACH + 1).min(kept.len())];
-            if near.iter().any(|&other| {
-                let longer = &self.lines[other];
-                let apart = line.last < longer.first || longer.last < line.first;
-                let continues = core(&longer.text);
-                longer.first != usize::MAX
-                    && apart
-                    && continues.len() > text.len()
-                    && continues.starts_with(text)
-            }) {
+            let finished = line.finished.is_some_and(|(by, serial)| {
+                let by = &self.lines[by];
+                by.serial == serial
+                    && !by.dropped
+                    && !by.placeholder
+                    && continues(&by.text, &line.text)
+            });
+            if finished
+                || near.iter().any(|&other| {
+                    let longer = &self.lines[other];
+                    longer.first != usize::MAX
+                        && line.last < longer.first
+                        && continues(&longer.text, &line.text)
+                })
+            {
                 echoes.insert(id);
             }
         }
@@ -1090,6 +1271,14 @@ fn contains_run(whole: &[&str], part: &[&str]) -> bool {
     })
 }
 
+/// Text `longer` continues text `shorter`: it adds to its core, or to the text itself, as a
+/// finished line adds the final punctuation `core` leaves out to its preview.
+fn continues(longer: &str, shorter: &str) -> bool {
+    let (long, short) = (core(longer), core(shorter));
+    (long.len() > short.len() && long.starts_with(short))
+        || (longer.len() > shorter.len() && longer.starts_with(shorter))
+}
+
 /// A row without a trailing cursor glyph, border, or padding.
 fn core(row: &str) -> &str {
     row.trim_end_matches(|c: char| !c.is_alphanumeric() && !c.is_ascii_punctuation())
@@ -1317,6 +1506,183 @@ mod tests {
                 ]),
             ),
             (
+                "a short entry a list moves away is no copy of a longer one it shows",
+                vec![
+                    frame(&[
+                        "header", "first", "second", "third", "fourth", "cat", "footer",
+                    ]),
+                    frame(&[
+                        "header", "catalog", "first", "second", "third", "fourth", "footer",
+                    ]),
+                ],
+                lines(&[
+                    "header", "catalog", "first", "second", "third", "fourth", "cat", "footer",
+                ]),
+            ),
+            (
+                "a short entry stays when the entries between it and a longer one reflow",
+                vec![
+                    frame(&[
+                        "header",
+                        "first red apple",
+                        "second green pear",
+                        "third blue plum",
+                        "fourth white grape",
+                        "cat",
+                        "footer",
+                    ]),
+                    frame(&[
+                        "header",
+                        "catalog",
+                        "first red apple",
+                        "second green pear",
+                        "third blue plum",
+                        "fourth white grape",
+                        "footer",
+                    ]),
+                    frame(&[
+                        "header",
+                        "catalog",
+                        "1. first red apple",
+                        "2. second green pear",
+                        "3. third blue plum",
+                        "4. fourth white grape",
+                        "footer",
+                    ]),
+                ],
+                lines(&[
+                    "header",
+                    "catalog",
+                    "1. first red apple",
+                    "2. second green pear",
+                    "3. third blue plum",
+                    "4. fourth white grape",
+                    "cat",
+                    "footer",
+                ]),
+            ),
+            (
+                "a heading changed above where a short entry was is no finished version of it",
+                vec![
+                    frame(&[
+                        "header",
+                        "summary",
+                        "first red apple",
+                        "second green pear",
+                        "third blue plum",
+                        "cat",
+                        "footer",
+                    ]),
+                    frame(&["header", "summary", "cat", "", "", "", "footer"]),
+                    frame(&[
+                        "header",
+                        "summary",
+                        "first red apple",
+                        "second green pear",
+                        "third blue plum",
+                        "",
+                        "footer",
+                    ]),
+                    frame(&[
+                        "header",
+                        "catalog",
+                        "first red apple",
+                        "second green pear",
+                        "third blue plum",
+                        "",
+                        "footer",
+                    ]),
+                ],
+                lines(&[
+                    "header",
+                    "summary",
+                    "catalog",
+                    "first red apple",
+                    "second green pear",
+                    "third blue plum",
+                    "cat",
+                    "",
+                    "footer",
+                ]),
+            ),
+            (
+                "a heading changed below where a short entry was is no finished version of it",
+                vec![
+                    frame(&[
+                        "header",
+                        "one",
+                        "two",
+                        "summary",
+                        "first red apple",
+                        "second green pear",
+                        "third blue plum",
+                        "cat",
+                        "footer",
+                    ]),
+                    frame(&["header", "one", "cat", "", "", "", "", "", "footer"]),
+                    frame(&[
+                        "header",
+                        "one",
+                        "two",
+                        "summary",
+                        "first red apple",
+                        "second green pear",
+                        "third blue plum",
+                        "",
+                        "footer",
+                    ]),
+                    frame(&[
+                        "header",
+                        "one",
+                        "two",
+                        "catalog",
+                        "first red apple",
+                        "second green pear",
+                        "third blue plum",
+                        "",
+                        "footer",
+                    ]),
+                ],
+                lines(&[
+                    "header",
+                    "one",
+                    "two",
+                    "summary",
+                    "catalog",
+                    "first red apple",
+                    "second green pear",
+                    "third blue plum",
+                    "cat",
+                    "",
+                    "footer",
+                ]),
+            ),
+            (
+                "a shorter line shown after a longer one is no copy of it",
+                vec![
+                    frame(&["h", "第一句話。", "f"]),
+                    frame(&["h", "other", "f"]),
+                    frame(&["h", "第一句話", "f"]),
+                    frame(&["h", "more", "f"]),
+                ],
+                lines(&["h", "第一句話。", "other", "第一句話", "more", "f"]),
+            ),
+            (
+                "a counter's old value is forgotten once its row changes otherwise",
+                vec![
+                    frame(&["header", "job 1 running", "footer"]),
+                    frame(&["header", "job 2 running", "footer"]),
+                    frame(&["header", "job 2 running, complete", "footer"]),
+                    frame(&["header", "job 1 running", "footer"]),
+                ],
+                lines(&[
+                    "header",
+                    "job 2 running, complete",
+                    "job 1 running",
+                    "footer",
+                ]),
+            ),
+            (
                 "operators and punctuation tell rows apart",
                 vec![frame(&["a", "x == y", ":"]), frame(&["a", "x != y", "}"])],
                 lines(&["a", "x == y", ":", "x != y", "}"]),
@@ -1342,6 +1708,128 @@ mod tests {
         for (name, frames, expected) in cases {
             assert_eq!(merge(&frames), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn a_preview_left_below_the_reply_goes_once_its_line_shows() {
+        // The reply's last row streams a preview of item 5, the reply redraws one row lower
+        // without it, and item 5 shows finished a row above where its preview was; more items
+        // then push the preview's line away in the document.
+        let items: Vec<String> = (1..=9)
+            .map(|k| format!("ITEM {k} - the value of item {k} is {k}"))
+            .collect();
+        let r: Vec<&str> = items.iter().map(String::as_str).collect();
+        let frames = [
+            frame(&[r[0], r[1], r[2], r[3], "> ask"]),
+            frame(&[r[1], r[2], r[3], "ITEM 5 - the value", "> ask"]),
+            frame(&[r[1], r[2], r[3], "ITEM 5 - the value of item 5 is", "> ask"]),
+            frame(&[r[0], r[1], r[2], r[3], "> ask"]),
+            frame(&[r[2], r[3], "ITEM", "", "> ask"]),
+            frame(&[r[1], r[2], r[3], r[4], "> ask"]),
+            frame(&[r[2], r[3], r[4], "ITEM 6 - the", "> ask"]),
+            frame(&[r[3], r[4], r[5], "ITEM 7 - the", "> ask"]),
+            frame(&[r[4], r[5], r[6], "ITEM 8 - the", "> ask"]),
+            frame(&[r[5], r[6], r[7], "ITEM 9 - the", "> ask"]),
+            frame(&[r[6], r[7], r[8], "", "> ask"]),
+        ];
+        let mut reply = merge(&frames);
+        reply.retain(|line| line.starts_with("ITEM"));
+        assert_eq!(reply, items);
+    }
+
+    #[test]
+    fn rows_read_while_scrolling_tell_a_short_entry_from_a_longer_one() {
+        // Three entries scroll away before `cat` shows, show again between it and where
+        // `catalog` appears, and so were shown with both.
+        let entries = ["first red apple", "second green pear", "third blue plum"];
+        let mut history = History::new(5, 10_000);
+        history.present(&frame(&["header", "", "", "", ""]));
+        history.shift(1, 5, 3, true, Some(&frame(&entries)));
+        history.present(&frame(&["header", "cat", "", "", "foot"]));
+        let [a, b, c] = entries;
+        history.present(&frame(&["header", a, b, c, "foot"]));
+        history.present(&frame(&["catalog", a, b, c, "foot"]));
+        let text = history.text();
+        assert!(text.iter().any(|line| line == "cat"), "{text:?}");
+    }
+
+    #[test]
+    fn an_entry_on_an_earlier_page_is_no_preview() {
+        let frames = [
+            frame(&[
+                "files",
+                "old one apple",
+                "old two pear",
+                "old three plum",
+                "old four grape",
+                "cat",
+                "footer",
+            ]),
+            frame(&[
+                "files",
+                "new one red",
+                "new two green",
+                "new three blue",
+                "new four white",
+                "new five black",
+                "footer",
+            ]),
+            frame(&[
+                "files",
+                "new one red",
+                "new two green",
+                "new three blue",
+                "new four white",
+                "catalog",
+                "footer",
+            ]),
+        ];
+        let text = merge(&frames);
+        assert!(text.iter().any(|line| line == "cat"), "{text:?}");
+    }
+
+    #[test]
+    fn a_row_above_a_prompt_shown_again_reuses_its_line() {
+        // The prompt below a reply shows its placeholder again after a message was typed into
+        // it, so its line comes before the reply's. The reply's last row clears and shows
+        // again one row up.
+        let frames = [
+            frame(&["top", "", "", "", "", "", "> ask", "foot"]),
+            frame(&["top", "", "", "", "> do it", "  please", "", "foot"]),
+            frame(&["top", "> do it", "  please", "", "", "", "> ask", "foot"]),
+            frame(&[
+                "top", "> do it", "  please", "", "r1 one.", "r2 two.", "> ask", "foot",
+            ]),
+            frame(&[
+                "top",
+                "> do it",
+                "  please",
+                "r1 one.",
+                "r2 two.",
+                "r3 three.",
+                "> ask",
+                "foot",
+            ]),
+            frame(&[
+                "top", "", "> do it", "  please", "r1 one.", "r2 two.", "> ask", "foot",
+            ]),
+            frame(&[
+                "top",
+                "  please",
+                "r1 one.",
+                "r2 two.",
+                "r3 three.",
+                "r4 four",
+                "> ask",
+                "foot",
+            ]),
+        ];
+        let mut reply = merge(&frames);
+        reply.retain(|line| line.starts_with('r'));
+        assert_eq!(
+            reply,
+            lines(&["r1 one.", "r2 two.", "r3 three.", "r4 four"])
+        );
     }
 
     #[test]
