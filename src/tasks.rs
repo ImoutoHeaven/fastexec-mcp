@@ -27,10 +27,6 @@ const INPUT_QUEUE_LIMIT: usize = 1 << 20;
 const FRAME_PAUSE: Duration = Duration::from_millis(4);
 /// A pause this long showed its frame long enough to read, even in the middle of a redraw.
 const LONG_PAUSE: Duration = Duration::from_millis(100);
-// ponytail: fixed cap of 8 MiB per task; past it, transcript frames come only from screen
-// operations and synchronized updates end only where the output ends them. Thin the list if
-// long-lived TUIs need more.
-const MAX_MARKS: usize = 1 << 20;
 /// How long output may stay open after the root exits and its tree is killed.
 const DRAIN_CAP: Duration = Duration::from_secs(2);
 
@@ -91,10 +87,49 @@ pub struct Task {
     activity: watch::Sender<()>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
     queued: AtomicUsize,
-    /// PTY tasks: a terminal emulator fed with every output byte. Its replies to terminal
-    /// queries, such as the cursor-position report and device attributes ConPTY waits for at
-    /// startup, go to the program as input.
-    terminal: Option<Mutex<Live>>,
+    /// PTY tasks: a terminal emulator fed with every output byte, and the transcript it
+    /// records. Its replies to terminal queries, such as the cursor-position report and device
+    /// attributes ConPTY waits for at startup, go to the program as input.
+    terminal: Option<Mutex<Pty>>,
+}
+
+struct Pty {
+    live: Live,
+    spool: Spool,
+}
+
+/// A PTY task's transcript file: the final lines, those the terminal wrote out, then the
+/// pending lines as the last `transcript` read them.
+struct Spool {
+    /// `None` for a task started with an encoding, or once the log was evicted.
+    file: Option<File>,
+    /// Bytes and lines of the final lines.
+    bytes: u64,
+    lines: u64,
+    /// Bytes of the pending lines after them.
+    pending: u64,
+    /// Bytes and lines of the final lines a `transcript` result has shown.
+    shown: (u64, u64),
+    /// Why the file takes no more lines.
+    stopped: Option<String>,
+}
+
+/// What a `transcript` call reads: the file's final lines from the first one no result has
+/// shown, then the pending lines.
+pub struct Transcript {
+    pub path: PathBuf,
+    /// Where this read starts: its first line, one-based, and that line's byte in the file.
+    pub first_line: u64,
+    pub start: u64,
+    /// Final lines, and their bytes.
+    pub lines: u64,
+    pub bytes: u64,
+    /// The lines the terminal has not written out yet, each ending in a newline.
+    pub pending: String,
+    /// Pending lines past the per-task limit are left out.
+    pub cut: bool,
+    /// Why the file takes no more lines.
+    pub stopped: Option<String>,
 }
 
 /// The rendered terminal of a PTY task.
@@ -122,23 +157,8 @@ struct Output {
     /// When the last output byte arrived, stored or not, or the end of a synchronized update by
     /// timeout or end of output showed the frame it held.
     last_output: Option<Instant>,
-    /// PTY tasks: what the screen did at log offsets, for the transcript's replay
-    /// (`terminal::Mark`).
-    marks: Vec<u64>,
-}
-
-impl Output {
-    /// Records `flags` at the end of the stored log, beside any mark already there.
-    fn mark(&mut self, flags: u64) {
-        let at = self.written;
-        if let Some(last) = self.marks.last_mut()
-            && crate::terminal::mark_offset(*last) == at
-        {
-            *last |= flags;
-        } else if self.marks.len() < MAX_MARKS {
-            self.marks.push(at | flags);
-        }
-    }
+    /// Bytes the transcript file holds, counted under the total log limit.
+    transcript: u64,
 }
 
 #[derive(Default)]
@@ -257,6 +277,26 @@ impl Tasks {
             }
         };
         let (input_tx, input_rx) = mpsc::channel();
+        let terminal = args.pty.then(|| {
+            let mut spool = Spool {
+                file: None,
+                bytes: 0,
+                lines: 0,
+                pending: 0,
+                shown: (0, 0),
+                stopped: None,
+            };
+            if args.encoding == encoding_rs::UTF_8 {
+                match private_file(&self.dir.join(format!("{id}.transcript.txt"))) {
+                    Ok(file) => spool.file = Some(file),
+                    Err(error) => spool.stopped = Some(format!("it cannot be created: {error}")),
+                }
+            }
+            Mutex::new(Pty {
+                live: Live::new(),
+                spool,
+            })
+        });
         let task = Arc::new(Task {
             id,
             command: args.command,
@@ -275,7 +315,7 @@ impl Tasks {
             activity: watch::Sender::new(()),
             input: Mutex::new(Some(input_tx.clone())),
             queued: AtomicUsize::new(0),
-            terminal: args.pty.then(|| Mutex::new(Live::new())),
+            terminal,
         });
         registry.tasks.push(Arc::clone(&task));
         drop(registry);
@@ -362,7 +402,8 @@ impl Tasks {
         let mut out = lock(&task.out);
         if !out.evicted {
             out.evicted = true;
-            self.log_bytes.fetch_sub(out.written, Ordering::SeqCst);
+            self.log_bytes
+                .fetch_sub(out.written + out.transcript, Ordering::SeqCst);
             let _ = std::fs::remove_file(&task.log_path);
             let _ = std::fs::remove_file(task.transcript_path());
         }
@@ -390,6 +431,26 @@ impl Tasks {
         }
         self.log_bytes.fetch_sub(bytes, Ordering::SeqCst);
         false
+    }
+
+    /// Counts `bytes` a task's transcript file took, reserved before; an evicted task's files
+    /// are gone, and the bytes go back.
+    fn hold(&self, task: &Task, bytes: u64) {
+        let mut out = lock(&task.out);
+        if out.evicted {
+            self.log_bytes.fetch_sub(bytes, Ordering::SeqCst);
+        } else {
+            out.transcript += bytes;
+        }
+    }
+
+    /// Gives back `bytes` a task's transcript file no longer holds.
+    fn release(&self, task: &Task, bytes: u64) {
+        let mut out = lock(&task.out);
+        if !out.evicted {
+            out.transcript -= bytes;
+            self.log_bytes.fetch_sub(bytes, Ordering::SeqCst);
+        }
     }
 
     /// Kills every running tree and removes the log directory.
@@ -482,6 +543,72 @@ impl Tasks {
     }
 }
 
+impl Spool {
+    /// Appends final lines, each ending in a newline, in place of the pending lines. Past the
+    /// per-task limit, the file keeps the lines that fit and takes no more.
+    fn append(&mut self, text: &str, task: &Task, shared: &Tasks) {
+        if text.is_empty() || self.stopped.is_some() {
+            return;
+        }
+        let mut text = text.as_bytes();
+        let room = (TASK_LOG_LIMIT - self.bytes) as usize;
+        if text.len() > room {
+            let fit = text[..room].iter().rposition(|&byte| byte == b'\n');
+            text = &text[..fit.map_or(0, |end| end + 1)];
+            self.stopped = Some(format!("it reached its {} MiB limit", TASK_LOG_LIMIT >> 20));
+        }
+        self.write(text, true, task, shared);
+    }
+
+    /// Writes `text` after the final lines in place of the pending lines, as final lines or as
+    /// the new pending lines; returns whether the file holds `text`.
+    fn write(&mut self, text: &[u8], as_final: bool, task: &Task, shared: &Tasks) -> bool {
+        let Some(file) = &mut self.file else {
+            return false;
+        };
+        if lock(&task.out).evicted {
+            self.file = None;
+            return false;
+        }
+        if self.pending > 0 {
+            if let Err(error) = file.set_len(self.bytes) {
+                self.stopped = Some(format!("writing it failed: {error}"));
+                return false;
+            }
+            shared.release(task, self.pending);
+            self.pending = 0;
+        }
+        let size = text.len() as u64;
+        if text.is_empty() {
+            return true;
+        }
+        if !shared.reserve(size) {
+            self.stopped = Some("the 1 GiB total log limit is reached".into());
+            return false;
+        }
+        match file
+            .seek(SeekFrom::Start(self.bytes))
+            .and_then(|_| file.write_all(text))
+        {
+            Ok(()) => {
+                shared.hold(task, size);
+                if as_final {
+                    self.bytes += size;
+                    self.lines += text.iter().filter(|&&byte| byte == b'\n').count() as u64;
+                } else {
+                    self.pending = size;
+                }
+                true
+            }
+            Err(error) => {
+                shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                self.stopped = Some(format!("writing it failed: {error}"));
+                false
+            }
+        }
+    }
+}
+
 /// Elapsed time in its largest two units: `42s`, `4m3s`, `2h5m`.
 fn short(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
@@ -545,7 +672,7 @@ fn capture(
         let deadline = task
             .terminal
             .as_ref()
-            .and_then(|terminal| lock(terminal).sync_deadline());
+            .and_then(|terminal| lock(terminal).live.sync_deadline());
         let received = match deadline {
             None => received.recv().ok(),
             Some(deadline) => {
@@ -553,13 +680,13 @@ fn capture(
                     Ok(chunk) => Some(chunk),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         if let (Some(terminal), Some(answer)) = (&task.terminal, &answer) {
-                            let mut terminal = lock(terminal);
-                            answer_program(task, answer, terminal.end_sync());
+                            let mut pty = lock(terminal);
+                            answer_program(task, answer, pty.live.end_sync());
+                            let written = pty.live.take_written();
+                            pty.spool.append(&written, task, shared);
                             // The held frame shows now, so quiet counts from now; the time is
                             // set under the terminal lock that `last_output` also takes.
-                            let mut out = lock(&task.out);
-                            out.last_output = Some(Instant::now());
-                            out.mark(crate::terminal::SYNC_END);
+                            lock(&task.out).last_output = Some(Instant::now());
                         }
                         task.activity.send_replace(());
                         continue;
@@ -575,11 +702,15 @@ fn capture(
         // The emulator stays locked until the chunk is in the log, so a screen and the log
         // offset taken under that lock show the same output.
         let mut terminal = task.terminal.as_ref().map(lock);
-        let mut expired = false;
-        if let (Some(terminal), Some(answer)) = (terminal.as_mut(), &answer) {
-            let (replies, ended) = terminal.process(chunk, arrived);
-            answer_program(task, answer, replies);
-            expired = ended;
+        if let (Some(pty), Some(answer)) = (terminal.as_mut(), &answer) {
+            // Output that paused showed a finished frame before this chunk.
+            let gap = lock(&task.out).last_output.map_or(Duration::ZERO, |last| {
+                arrived.saturating_duration_since(last)
+            });
+            let pause = (gap >= FRAME_PAUSE).then_some(gap >= LONG_PAUSE);
+            answer_program(task, answer, pty.live.process(chunk, arrived, pause));
+            let written = pty.live.take_written();
+            pty.spool.append(&written, task, shared);
         }
         // Storing stops at the first byte that does not fit, so the log stays a prefix of the
         // output: a later chunk that would fit is not stored after the gap.
@@ -611,20 +742,6 @@ fn capture(
             }
         }
         let mut out = lock(&task.out);
-        if task.terminal.is_some() {
-            // A synchronized update past its deadline ended before this chunk.
-            if expired {
-                out.mark(crate::terminal::SYNC_END);
-            }
-            let gap = out.last_output.map_or(Duration::ZERO, |last| {
-                arrived.saturating_duration_since(last)
-            });
-            if gap >= LONG_PAUSE {
-                out.mark(crate::terminal::PAUSE | crate::terminal::LONG);
-            } else if gap >= FRAME_PAUSE {
-                out.mark(crate::terminal::PAUSE);
-            }
-        }
         if write_error.is_some() {
             out.log_error = write_error;
         }
@@ -643,13 +760,17 @@ fn capture(
         task.activity.send_replace(());
     }
     // No later output can end a synchronized update; the screen shows what it held, and that
-    // frame restarts the quiet time as a timeout's does.
+    // frame restarts the quiet time as a timeout's does. Every pending transcript line is
+    // final now.
     let mut terminal = task.terminal.as_ref().map(lock);
     let held = terminal
         .as_mut()
-        .is_some_and(|terminal| terminal.sync_deadline().is_some());
-    if let Some(terminal) = terminal.as_mut() {
-        terminal.end_sync();
+        .is_some_and(|pty| pty.live.sync_deadline().is_some());
+    if let Some(pty) = terminal.as_mut() {
+        pty.live.end_sync();
+        pty.live.finish();
+        let written = pty.live.take_written();
+        pty.spool.append(&written, task, shared);
     }
     let mut out = lock(&task.out);
     out.readable = out.written;
@@ -684,7 +805,7 @@ impl Task {
     pub fn last_output(&self) -> (Option<Instant>, bool) {
         let terminal = self.terminal.as_ref().map(lock);
         let out = lock(&self.out);
-        let sync_pending = terminal.is_some_and(|terminal| terminal.sync_deadline().is_some());
+        let sync_pending = terminal.is_some_and(|pty| pty.live.sync_deadline().is_some());
         (out.last_output, sync_pending)
     }
 
@@ -773,7 +894,7 @@ impl Task {
             .terminal
             .as_ref()
             .ok_or("keys applies to PTY tasks only.")?;
-        lock(terminal).modes()
+        lock(terminal).live.modes()
     }
 
     /// The rendered terminal of a PTY task.
@@ -783,8 +904,8 @@ impl Task {
                 .as_ref()
                 .ok_or("screen applies to PTY tasks only.")?,
         );
-        let (rows, cursor) = terminal.screen()?;
-        let log_end = lock(&self.out).readable.min(terminal.shown());
+        let (rows, cursor) = terminal.live.screen()?;
+        let log_end = lock(&self.out).readable.min(terminal.live.shown());
         Ok(Screen {
             rows,
             cursor,
@@ -798,27 +919,57 @@ impl Task {
             .with_file_name(format!("{}.transcript.txt", self.id))
     }
 
-    /// Renders the stored log as a terminal shows it and writes it to `transcript_path`.
-    pub fn transcript(&self) -> Result<crate::terminal::Transcript, String> {
-        let (stored, evicted, marks, closed) = {
-            let out = lock(&self.out);
-            (out.written, out.evicted, out.marks.clone(), out.closed)
-        };
-        if evicted {
-            return Err("The log of this task was evicted under the 1 GiB total limit; no transcript can be rendered.".into());
-        }
-        let log = File::open(&self.log_path)
-            .map_err(|error| format!("Cannot read the task log: {error}."))?;
-        let path = self.transcript_path();
-        let transcript = crate::terminal::render(log, stored, &marks, closed, &path)
-            .map_err(|error| format!("Cannot render the transcript: {error}."))?;
-        // An eviction during the render removed the log; the transcript goes with it. Eviction
-        // after this check removes the file itself.
+    /// Writes the pending lines into the transcript file after its final lines, and returns
+    /// what this read covers: the final lines no earlier read has shown, then the pending
+    /// lines. The next read starts after these final lines.
+    pub fn transcript(&self, shared: &Tasks) -> Result<Transcript, String> {
+        let terminal = self
+            .terminal
+            .as_ref()
+            .ok_or("transcript applies to PTY tasks only.")?;
+        let mut pty = lock(terminal);
         if lock(&self.out).evicted {
-            let _ = std::fs::remove_file(&path);
-            return Err("The log of this task was evicted under the 1 GiB total limit while the transcript was rendered.".into());
+            return Err("The files of this task were evicted under the 1 GiB total limit; its transcript is gone.".into());
         }
-        Ok(transcript)
+        let Pty { live, spool } = &mut *pty;
+        if spool.file.is_none() {
+            let reason = spool.stopped.as_deref().unwrap_or("it is gone");
+            return Err(format!("The transcript file is missing: {reason}."));
+        }
+        // The result shows the pending lines only as the file holds them, those that fit the
+        // per-task limit.
+        let mut pending = String::new();
+        let mut cut = false;
+        if spool.stopped.is_none() {
+            pending = live.pending();
+            let room = (TASK_LOG_LIMIT - spool.bytes) as usize;
+            if pending.len() > room {
+                let fit = pending.as_bytes()[..room]
+                    .iter()
+                    .rposition(|&byte| byte == b'\n');
+                pending.truncate(fit.map_or(0, |end| end + 1));
+                cut = true;
+            }
+            if !spool.write(pending.as_bytes(), false, self, shared) {
+                pending.clear();
+            }
+        }
+        let stopped = if live.stopped() {
+            Some("the terminal emulator stopped after an internal failure".to_string())
+        } else {
+            spool.stopped.clone()
+        };
+        let (start, shown) = std::mem::replace(&mut spool.shown, (spool.bytes, spool.lines));
+        Ok(Transcript {
+            path: self.transcript_path(),
+            first_line: shown + 1,
+            start,
+            lines: spool.lines,
+            bytes: spool.bytes,
+            pending,
+            cut,
+            stopped,
+        })
     }
 
     /// Queues `input`, then closes stdin when `eof` is set. Validation happens before any write.

@@ -18,6 +18,8 @@ use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_route
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +57,7 @@ enum Action {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Request {
-    /// start: run a command. poll: send input and/or wait, then read unseen output. kill: terminate a task's process tree. list: this server's tasks. transcript: a PTY task's whole output rendered as a terminal shows it, scrollback history then screen.
+    /// start: run a command. poll: send input and/or wait, then read unseen output. kill: terminate a task's process tree. list: this server's tasks. transcript: a PTY task's output as a terminal shows it, from the first line no earlier transcript returned, then the pending lines still on screen.
     action: Action,
     /// start: the bash command line.
     command: Option<String>,
@@ -673,19 +675,22 @@ impl Server {
         Ok(result)
     }
 
-    /// A PTY task's stored log rendered as a terminal shows it, written beside the log; the
-    /// result shows its last lines by default, where a program's newest output is.
+    /// A PTY task's transcript from the first line no earlier read showed: its final lines,
+    /// then the pending ones, which the file also holds after the final lines until output
+    /// changes them. The result shows the last lines by default, where a program's newest
+    /// output is.
     async fn transcript_result(
         &self,
         task: Arc<Task>,
         view: View,
     ) -> Result<CallToolResult, String> {
         let snapshot = task.snapshot();
-        let renderer = Arc::clone(&task);
-        let transcript = tokio::task::spawn_blocking(move || renderer.transcript())
+        let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
+        let transcript = tokio::task::spawn_blocking(move || reader.transcript(&tasks))
             .await
-            .map_err(|error| format!("Internal failure while rendering: {error}."))??;
-        let path = task.transcript_path();
+            .map_err(|error| format!("Internal failure while reading: {error}."))??;
+        let pending_lines = transcript.pending.matches('\n').count() as u64;
+        let total = transcript.lines + pending_lines;
         let footer_cap = match view.truncate {
             Truncate::None => FOOTER_LIMIT,
             _ => FOOTER_LIMIT.min(view.max_bytes / 4),
@@ -696,22 +701,18 @@ impl Server {
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
         let mut status = status_line(&task, &snapshot);
         status.push_str(&format!(
-            " · transcript {} lines · {}",
+            " · transcript {total} lines, final through {}; this read starts at line {} · {}",
             transcript.lines,
-            path.display()
+            transcript.first_line,
+            transcript.path.display()
         ));
-        if transcript.history_full {
-            status.push_str(&format!(
-                " · history holds the last {} lines; older lines are not shown",
-                terminal::HISTORY_LINES
-            ));
+        if transcript.cut {
+            status.push_str(" · pending lines past the transcript's 64 MiB limit are left out");
         }
-        if transcript.alternate_sessions > 0 {
+        if let Some(reason) = &transcript.stopped {
             status.push_str(&format!(
-                " · {} alternate-screen session(s) where they ran, each after a {:?} line and merged from the frames it showed, normal-screen lines after it resuming after a {:?} line",
-                transcript.alternate_sessions,
-                terminal::ALTERNATE_MARKER,
-                terminal::NORMAL_MARKER
+                " · the transcript stops after line {}: {reason}",
+                transcript.lines
             ));
         }
         if let Some(warning) = conpty::load() {
@@ -731,22 +732,40 @@ impl Server {
             encoding: encoding_rs::UTF_8,
             source: "transcript",
         };
-        let mut cleaner = Cleaner::default();
-        let mut builder = WindowBuilder::new(spec, &mut cleaner, 1);
-        builder.push(transcript.text.as_bytes());
-        let window = builder.finish();
         let mut structured = task_json(Action::Transcript, &task, &snapshot);
-        structured["transcriptPath"] = json!(path);
-        structured["transcriptLines"] = json!(transcript.lines);
-        structured["alternateSessions"] = json!(transcript.alternate_sessions);
-        structured["alternateRanges"] = json!(transcript.alternate_ranges);
-        structured["historyFull"] = json!(transcript.history_full);
+        structured["transcriptPath"] = json!(transcript.path);
+        structured["transcriptLines"] = json!(total);
+        structured["finalLines"] = json!(transcript.lines);
+        structured["firstLine"] = json!(transcript.first_line);
+        let window = tokio::task::spawn_blocking(move || {
+            let mut cleaner = Cleaner::default();
+            let mut builder = WindowBuilder::new(spec, &mut cleaner, transcript.first_line);
+            // Final lines only grow, so the range read stays as it was.
+            let mut file = File::open(&transcript.path)?;
+            file.seek(SeekFrom::Start(transcript.start))?;
+            let mut remaining = transcript.bytes - transcript.start;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            while remaining > 0 {
+                let want = remaining.min(buffer.len() as u64) as usize;
+                let read = file.read(&mut buffer[..want])?;
+                if read == 0 {
+                    break;
+                }
+                builder.push(&buffer[..read]);
+                remaining -= read as u64;
+            }
+            builder.push(transcript.pending.as_bytes());
+            Ok::<_, std::io::Error>(builder.finish())
+        })
+        .await
+        .map_err(|error| format!("Internal failure while reading: {error}."))?
+        .map_err(|error| format!("Cannot read the transcript file: {error}."))?;
         let text = self.layout(
             &window,
             status,
             &footer,
             &view,
-            "(blank terminal)",
+            "(no transcript lines since the last read)",
             &mut structured,
         );
         let result = success(text, structured);

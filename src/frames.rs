@@ -16,8 +16,12 @@
 //!
 //! Every row that leaves the screen stays in the history. When a row may be a new line or an
 //! old one changed, it is a new line: a duplicate is preferable to a lost line.
+//!
+//! The history writes its lines out as they settle: a line no frame is likely to change any
+//! more is written once, in document order, and again only if a later frame changes it.
 
 use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
 /// Rows with text that show a stretch of the history again away from their neighbours' lines.
@@ -38,6 +42,9 @@ const ECHO_FRAMES: usize = 3;
 const REFLOW_CONTEXT: usize = 2;
 /// Words a reflowed row needs, so a short row is never taken for part of another.
 const REFLOW_WORDS: usize = 3;
+/// Lines with text between a line no row shows and the lines rows show, past which no frame
+/// continues the line or finds it an echo.
+const SETTLE_REACH: usize = CONTINUE_REACH + ECHO_REACH;
 
 /// One screen row: its text without trailing spaces, and whether the terminal wrapped it
 /// onto the next row.
@@ -47,6 +54,7 @@ pub struct Row {
     pub wraps: bool,
 }
 
+#[derive(Clone)]
 struct Line {
     text: String,
     wraps: bool,
@@ -74,8 +82,11 @@ struct Line {
     /// The text a numbers update replaced: a row showing it again in place of the line is an
     /// earlier line the program showed ahead of, not an older value.
     was: Option<String>,
+    /// The digest of the text last written out.
+    written: Option<u64>,
 }
 
+#[derive(Clone)]
 pub struct History {
     lines: Vec<Line>,
     /// Line ids in document order, and each line's index in it.
@@ -85,7 +96,7 @@ pub struct History {
     screen: Vec<usize>,
     rows: Vec<Row>,
     frame: usize,
-    /// Lines the history holds before the oldest leave.
+    /// Lines the history holds before the oldest leave, written out.
     limit: usize,
     /// Ids of lines that left the history, for new lines to reuse.
     free: Vec<usize>,
@@ -93,8 +104,12 @@ pub struct History {
     added: u64,
     /// Lines that left the screen in the last `ECHO_FRAMES` frames.
     left: Vec<usize>,
-    /// Lines left the history once it held its limit.
-    pub truncated: bool,
+    /// Lines written out and not taken yet.
+    out: Vec<String>,
+    /// A blank line written out after text, held until text follows it.
+    owed: Option<String>,
+    /// Text has been written out.
+    started: bool,
 }
 
 /// How a row of a changed region relates to the line of the row it replaced.
@@ -122,7 +137,9 @@ impl History {
             free: Vec::new(),
             added: 0,
             left: Vec::new(),
-            truncated: false,
+            out: Vec::new(),
+            owed: None,
+            started: false,
         };
         history.screen = (0..height).map(|k| history.insert(k, "", true)).collect();
         history
@@ -903,6 +920,7 @@ impl History {
             scrolled: false,
             serial: self.added,
             was: None,
+            written: None,
         };
         self.added += 1;
         let id = match self.free.pop() {
@@ -927,61 +945,169 @@ impl History {
         }
     }
 
-    /// Past `limit` lines, drops the oldest lines the screen no longer shows.
-    /// Past the limit, drops the oldest lines the screen no longer shows, and frees the ids of
-    /// lines out of the history.
+    /// Past the limit, the oldest lines the screen no longer shows leave the history, written
+    /// out first, and the ids of lines out of the history are freed.
     fn limit(&mut self) {
         // Trimming in batches keeps the reindexing rare.
         if self.order.len() <= self.limit + self.limit / 8 {
             return;
         }
         let on_screen: HashSet<usize> = self.screen.iter().copied().collect();
-        let lines = &mut self.lines;
-        let kept = self.order.iter().filter(|&&id| !lines[id].dropped).count();
-        let over = kept.saturating_sub(self.limit);
-        let mut excess = over;
-        let free = &mut self.free;
-        self.order.retain(|&id| {
+        let kept = self
+            .order
+            .iter()
+            .filter(|&&id| !self.lines[id].dropped)
+            .count();
+        let mut excess = kept.saturating_sub(self.limit);
+        let mut leaving = HashSet::new();
+        let mut oldest = Vec::new();
+        for &id in &self.order {
             if on_screen.contains(&id) {
+                continue;
+            }
+            if self.lines[id].dropped {
+                leaving.insert(id);
+            } else if excess > 0 {
+                excess -= 1;
+                leaving.insert(id);
+                oldest.push(id);
+            }
+        }
+        if !oldest.is_empty() {
+            let echoes = self.echoes();
+            let mut runs = Vec::new();
+            let (mut run, mut due) = (String::new(), false);
+            for (k, &id) in oldest.iter().enumerate() {
+                let line = &self.lines[id];
+                if line.placeholder || echoes.contains(&id) {
+                    continue;
+                }
+                due |= line.written != Some(digest(&line.text));
+                run.push_str(&line.text);
+                if !line.wraps || k + 1 == oldest.len() {
+                    let run = std::mem::take(&mut run);
+                    if std::mem::take(&mut due) {
+                        runs.push(run);
+                    }
+                }
+            }
+            for run in runs {
+                self.emit(run);
+            }
+        }
+        let (lines, free) = (&mut self.lines, &mut self.free);
+        self.order.retain(|&id| {
+            if !leaving.contains(&id) {
                 return true;
             }
-            let oldest = excess > 0 && !lines[id].dropped;
-            if oldest {
-                excess -= 1;
-            }
-            if oldest || lines[id].dropped {
-                lines[id].text = String::new();
-                free.push(id);
-                return false;
-            }
-            true
+            lines[id].text = String::new();
+            free.push(id);
+            false
         });
-        self.truncated |= over > 0;
         self.reindex(0);
     }
 
-    /// The history in order: rows the terminal wrapped joined into one line, runs of blank
-    /// lines collapsed to one, without blank lines at the start or end.
-    pub fn text(&self) -> Vec<String> {
+    /// Writes out the lines no frame is likely to change any more, and returns every line
+    /// written out since the last call.
+    pub fn commit(&mut self) -> Vec<String> {
+        self.write(false);
+        std::mem::take(&mut self.out)
+    }
+
+    /// Writes out every line not written yet, as when the session ends, and returns every line
+    /// written out since the last `commit`.
+    pub fn finish(mut self) -> Vec<String> {
+        self.write(true);
+        self.out
+    }
+
+    /// Writes out, in document order, each line not written yet or changed since: every one
+    /// with `all`, otherwise those up to the last one settled, but for lines a row shows,
+    /// which wait until they leave. Rows the terminal wrapped join into one line.
+    ///
+    /// A line settles once the screen moved past it, so a line a row shows comes after it, and
+    /// no frame is likely to change it: it scrolled away, or it is more than `SETTLE_REACH`
+    /// lines with text before the next line a row shows and left the screen over
+    /// `ECHO_FRAMES` frames ago. Lines after every line a row shows wait, so lines are written
+    /// in document order whichever way the screen moves.
+    fn write(&mut self, all: bool) {
         let echoes = self.echoes();
-        let mut out: Vec<String> = Vec::new();
-        let mut joined = false;
+        // Lines with text before each position.
+        let mut before = Vec::with_capacity(self.order.len());
+        let mut count = 0;
         for &id in &self.order {
+            before.push(count);
             let line = &self.lines[id];
-            if line.dropped || line.placeholder || echoes.contains(&id) {
-                continue;
-            }
-            if joined && let Some(last) = out.last_mut() {
-                last.push_str(&line.text);
-            } else if !blank(&line.text) || out.last().is_some_and(|last| !blank(last)) {
-                out.push(line.text.clone());
-            }
-            joined = line.wraps;
+            count += usize::from(!line.dropped && !line.placeholder && !blank(&line.text));
         }
-        while out.last().is_some_and(|last| blank(last)) {
-            out.pop();
+        let mut anchors: Vec<usize> = self.screen.iter().map(|&id| self.pos[id]).collect();
+        anchors.sort_unstable();
+        let settled = |id: usize| {
+            let line = &self.lines[id];
+            let pos = self.pos[id];
+            let Some(&next) = anchors.get(anchors.partition_point(|&anchor| anchor <= pos)) else {
+                return false;
+            };
+            !self.screen.contains(&id)
+                && (line.scrolled
+                    || (before[next] - before[pos] > SETTLE_REACH
+                        && (line.first == usize::MAX || line.last + ECHO_FRAMES < self.frame)))
+        };
+        let kept: Vec<usize> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|id| {
+                let line = &self.lines[*id];
+                !line.dropped && !line.placeholder && !echoes.contains(id)
+            })
+            .collect();
+        // Runs due to be written, and whether each settled.
+        let mut runs = Vec::new();
+        let mut k = 0;
+        while k < kept.len() {
+            let start = k;
+            while self.lines[kept[k]].wraps && k + 1 < kept.len() {
+                k += 1;
+            }
+            k += 1;
+            let run = &kept[start..k];
+            let due = run.iter().any(|&id| {
+                let line = &self.lines[id];
+                line.written != Some(digest(&line.text))
+            });
+            if due {
+                runs.push((run.to_vec(), all || run.iter().all(|&id| settled(id))));
+            }
         }
-        out
+        let last = runs.iter().rposition(|(_, settled)| *settled);
+        runs.truncate(last.map_or(0, |last| last + 1));
+        if !all {
+            runs.retain(|(run, _)| !run.iter().any(|id| self.screen.contains(id)));
+        }
+        for (run, _) in runs {
+            let mut text = String::new();
+            for id in run {
+                let line = &mut self.lines[id];
+                line.written = Some(digest(&line.text));
+                text.push_str(&line.text);
+            }
+            self.emit(text);
+        }
+    }
+
+    /// Writes out one line: runs of blank lines collapse to one, and no blank line starts the
+    /// output or ends it.
+    fn emit(&mut self, text: String) {
+        if blank(&text) {
+            if self.started {
+                self.owed = Some(text);
+            }
+            return;
+        }
+        self.out.extend(self.owed.take());
+        self.out.push(text);
+        self.started = true;
     }
 
     /// Lines the program changed in place, no longer shown and not scrolled away, that a longer
@@ -1033,6 +1159,12 @@ impl History {
         }
         echoes
     }
+}
+
+fn digest(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A text no row has: the terminal never puts NUL in a cell.
@@ -1328,13 +1460,24 @@ mod tests {
             .collect()
     }
 
-    /// The history of `frames`, each shown in turn on a screen as tall as the first.
+    impl History {
+        /// Every line written out so far, then the rest as if the session ended.
+        fn text(&self) -> Vec<String> {
+            self.clone().finish()
+        }
+    }
+
+    /// The lines written out for `frames`, each shown in turn on a screen as tall as the
+    /// first, committing after each; the lines committed must match those written at the end.
     fn merge(frames: &[Vec<Row>]) -> Vec<String> {
         let mut history = History::new(frames[0].len(), 10_000);
+        let mut out = Vec::new();
         for rows in frames {
             history.present(rows);
+            out.extend(history.commit());
         }
-        history.text()
+        out.extend(history.finish());
+        out
     }
 
     fn lines(lines: &[&str]) -> Vec<String> {
@@ -1921,17 +2064,49 @@ mod tests {
         }
         let text = history.text();
         assert!(text.contains(&"important archive".to_string()), "{text:?}");
-        assert!(!history.truncated);
-        // Past the limit, the oldest lines leave and the screen's lines stay.
+        // Past the limit, the oldest lines are written out and leave; the screen's lines stay.
         let log: Vec<String> = (0..40_u8)
             .map(|k| format!("log {}{}", (b'a' + k / 10) as char, (b'a' + k % 10) as char))
             .collect();
         for line in &log {
             history.present(&frame(&["header", line, ""]));
         }
-        let text = history.text();
-        assert!(history.truncated && text.len() <= 16 + 16 / 8, "{text:?}");
-        assert_eq!(text.first().map(String::as_str), Some("header"));
-        assert!(text.ends_with(&log[log.len() - 8..]), "{text:?}");
+        assert!(
+            history.order.len() <= 16 + 16 / 8 + 3,
+            "{}",
+            history.order.len()
+        );
+        // The header shows throughout, so the oldest lines are written out before it.
+        let mut text = history.text();
+        assert_eq!(text[0], "important archive");
+        assert_eq!(text.iter().filter(|line| *line == "header").count(), 1);
+        text.retain(|line| line.starts_with("log "));
+        assert_eq!(text, log);
+    }
+
+    #[test]
+    fn settled_lines_are_written_out_once_while_the_screen_moves_on() {
+        // A reply streams below a fixed header: each frame shows the last rows, the newest
+        // one previewed before it shows finished.
+        let items: Vec<String> = (0..200).map(|k| format!("item {k:03} done")).collect();
+        let mut history = History::new(6, 10_000);
+        let mut out = Vec::new();
+        for k in 0..items.len() {
+            let mut rows = vec!["header".to_string()];
+            rows.extend(items[k.saturating_sub(3)..k].iter().cloned());
+            rows.push(format!("item {k:03}"));
+            rows.resize(5, String::new());
+            rows.push("footer".into());
+            history.present(&frame(&rows.iter().map(String::as_str).collect::<Vec<_>>()));
+            out.extend(history.commit());
+            // Only lines near the screen wait.
+            assert!(out.len() + SETTLE_REACH + 8 >= k, "{k}: {out:?}");
+        }
+        out.extend(history.finish());
+        // The last item shows only as its preview.
+        let mut expected = items[..items.len() - 1].to_vec();
+        expected.push("item 199".into());
+        out.retain(|line| line.starts_with("item"));
+        assert_eq!(out, expected);
     }
 }

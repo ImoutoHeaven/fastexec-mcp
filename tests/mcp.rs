@@ -940,11 +940,13 @@ fn pty_programs_get_answers_to_terminal_queries() {
 #[test]
 fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
     let mut server = Server::start();
-    // Like pi, a full redraw clears the screen and its history (ED2, ED3), then reprints.
+    // Like pi, a full redraw clears the screen and its history (ED2, ED3), then reprints the
+    // lines it showed and new ones. Like `clear`, a clear before new lines keeps what showed.
     // Like Codex, history lines are then inserted through a scroll region above a fixed
-    // composer row. Both push lines past the 30-row screen.
+    // composer row. All push lines past the 30-row screen.
     let command = concat!(
-        "seq -f 'stale %g' 1 40; printf '\\033[2J\\033[H\\033[3J'; seq -f 'plain %g' 1 40; ",
+        "seq -f 'kept %g' 1 40; printf '\\033[2J\\033[H\\033[3J'; seq -f 'kept %g' 1 45; ",
+        "printf '\\033[2J\\033[H\\033[3J'; seq -f 'plain %g' 1 40; ",
         "printf '\\033[30;1H> composer'; ",
         "for k in $(seq 1 40); do ",
         "printf '\\033[1;29r\\033[29;1H\\r\\ninsert %d\\033[r\\033[30;1H> composer\\033[K' $k; done"
@@ -956,8 +958,9 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
         server.ok(json!({"action": "transcript", "taskId": server.id(1), "truncate": "none"}));
     let body = text.split("\n\n[").next().unwrap();
     let lines: Vec<&str> = body.lines().collect();
-    let expected: Vec<String> = (1..=40)
-        .map(|k| format!("plain {k}"))
+    let expected: Vec<String> = (1..=45)
+        .map(|k| format!("kept {k}"))
+        .chain((1..=40).map(|k| format!("plain {k}")))
         .chain((1..=40).map(|k| format!("insert {k}")))
         .chain(["> composer".to_string()])
         .collect();
@@ -970,9 +973,16 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
         })
         .collect();
     assert!(positions.is_sorted(), "lines out of order: {text}");
-    assert!(!body.contains("stale"), "cleared history came back: {text}");
     let file = std::fs::read_to_string(out["transcriptPath"].as_str().unwrap()).unwrap();
     assert_eq!(file.trim_end(), body.trim_end());
+    // Output ended, so every line is final, and a second read has none left.
+    assert_eq!(out["finalLines"], out["transcriptLines"], "{text}");
+    let (out, text) = server.ok(json!({"action": "transcript", "taskId": server.id(1)}));
+    assert!(
+        text.starts_with("(no transcript lines since the last read)"),
+        "{text}"
+    );
+    assert_eq!(out["firstLine"], json!(lines.len() + 1), "{text}");
 
     // A program on the alternate screen: the normal screen's history, then the session merged
     // from its frames. A page drawn in place, a pause, a second page drawn over it, a pause,
@@ -983,10 +993,12 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
         "printf '\\033[%d;1Hsecond %d\\033[K' $rows; sleep 0.5; ",
         "printf '\\r\\nscrolled %d' $(seq 1 40); read -r x"
     );
-    server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 3000}));
+    server.ok(json!({
+        "action": "start", "command": command, "pty": true, "waitMs": 30000,
+        "returnWhen": {"outputContains": ["scrolled 40"], "quietMs": 3000}
+    }));
     let (out, text) =
         server.ok(json!({"action": "transcript", "taskId": server.id(2), "truncate": "none"}));
-    assert_eq!(out["alternateSessions"], 1, "{text}");
     let lines: Vec<&str> = text.lines().collect();
     let normal = lines.iter().position(|line| *line == "normal 1");
     let marker = lines
@@ -1004,16 +1016,20 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
         .chain((1..=40).map(|k| format!("scrolled {k}")))
         .collect();
     assert_eq!(session, expected, "{text}");
-    let first = marker.unwrap() + 1;
-    assert_eq!(
-        out["alternateRanges"],
-        json!([[first, first + expected.len()]]),
-        "{text}"
-    );
     assert!(
         lines.contains(&"a       b"),
         "a tab reads as spaces to its stop: {text}"
     );
+    // The screen's rows are pending; the next read starts after the final lines and shows
+    // the pending rows again, with the line typed since.
+    let first = out["finalLines"].as_u64().unwrap() + 1;
+    assert!(out["transcriptLines"].as_u64().unwrap() >= first, "{text}");
+    server.ok(json!({"action": "poll", "taskId": server.id(2), "input": "typed", "waitMs": 500}));
+    let (out, text) =
+        server.ok(json!({"action": "transcript", "taskId": server.id(2), "truncate": "none"}));
+    assert_eq!(out["firstLine"], json!(first), "{text}");
+    assert!(!text.contains("normal 1\n"), "{text}");
+    assert!(text.contains("scrolled 40typed"), "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(2)}));
 
     server.ok(json!({"action": "start", "command": "echo pipe"}));

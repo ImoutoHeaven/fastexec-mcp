@@ -1,17 +1,18 @@
 //! The terminal emulator of a PTY task. One engine shows the live screen, reports the
-//! program's keyboard modes, answers its terminal queries, and replays the stored log into a
-//! transcript.
+//! program's keyboard modes, answers its terminal queries, and records the transcript as the
+//! output arrives.
 //!
-//! The transcript keeps a scrollback history, so the lines a program pushed off the screen,
-//! by scrolling, by inserting through a scroll region, or by a full redraw that clears the
-//! history first, come back once each, in the order a user scrolling up would read them.
-//! The alternate screen keeps no history, so the replay records its frames and merges each
-//! alternate-screen session into one.
+//! The transcript holds each line a program pushed off the normal screen once, in the order a
+//! user scrolling up would read them, whether it scrolled away, moved up through a scroll
+//! region, or was cleared with the screen; a reprint of written lines after the program
+//! cleared the history is no new text. The alternate screen keeps no history, so each
+//! alternate-screen session is merged from its frames. Lines are written out once they
+//! settle; the rest, such as the screen, is pending until it settles or the output ends.
 
 use crate::frames::{History, Row as FrameRow};
 use crate::keys::Modes;
 use crate::process::{PTY_COLS, PTY_ROWS};
-use alacritty_terminal::event::{Event, EventListener, VoidListener};
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Row};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
@@ -22,30 +23,24 @@ use alacritty_terminal::vte::ansi::{
     KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedPrivateMode,
     PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
-use std::io::Read;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 
-/// Scrollback history kept while rendering a transcript; older lines are dropped.
-pub const HISTORY_LINES: usize = 10_000;
-
-/// One transcript render at a time: the history holds up to `HISTORY_LINES` rows of cells.
-static RENDERING: Mutex<()> = Mutex::new(());
-
-/// Marks: a log offset in the low bits and what the screen did there in the high bits.
-/// The output paused, so the screen showed a finished frame.
-pub const PAUSE: u64 = 1 << 61;
-/// The pause lasted long enough to read the frame.
-pub const LONG: u64 = 1 << 62;
-/// A synchronized update ended at its timeout and showed the output it held.
-pub const SYNC_END: u64 = 1 << 63;
-
-pub fn mark_offset(mark: u64) -> u64 {
-    mark & (PAUSE - 1)
-}
+/// Lines an alternate-screen session keeps to match redrawn rows against; older lines are
+/// written out before they leave.
+const SESSION_LINES: usize = 10_000;
+/// Normal-screen lines written out that a reprint after a cleared history is matched against.
+const REPRINT_REACH: usize = 100_000;
+/// Lines with text that must repeat written lines in a row before a reprint is taken for one:
+/// a screen of them, more than a command run again after `clear` usually prints.
+const REPRINT_CONFIRM: usize = PTY_ROWS as usize;
+/// A line whose rows wrap for longer is written out in pieces this long, so a program that
+/// prints without line breaks holds no more than this in memory.
+const LINE_LIMIT: usize = 1 << 20;
 
 /// Begins each alternate-screen session in a transcript, among the normal screen's lines where
 /// the session began.
@@ -53,23 +48,25 @@ pub const ALTERNATE_MARKER: &str = "--- alternate screen ---";
 /// Follows an alternate-screen session when normal-screen lines come after it.
 pub const NORMAL_MARKER: &str = "--- normal screen ---";
 
-/// The replay marks the normal-screen rows shown when an alternate-screen session began with
-/// a zero-width character from Unicode's private use planes 15 and 16, one per session: a mark
-/// moves with its row through the history, and a program never stores one as zero-width.
+/// The normal-screen lines written out while still on screen, as an alternate-screen session
+/// begins, carry a zero-width character from Unicode's private use planes 15 and 16 on their
+/// first row: a mark moves with its row, a program never stores one as zero-width, and text
+/// written over the row erases it.
 const PLANE: u32 = 0xFFFE;
-const SESSION_MARKS: [u32; 2] = [0xF0000, 0x100000];
+const MARK_PLANES: [u32; 2] = [0xF0000, 0x100000];
 
-/// The mark of session `session`, if one is left.
-fn session_char(session: usize) -> Option<char> {
-    let plane = SESSION_MARKS.get(session / PLANE as usize)?;
-    char::from_u32(plane + (session % PLANE as usize) as u32)
+/// Mark number `serial`, reusing the marks after the last.
+fn mark_char(serial: usize) -> char {
+    let serial = serial % (MARK_PLANES.len() * PLANE as usize);
+    let (plane, index) = (serial / PLANE as usize, serial % PLANE as usize);
+    char::from_u32(MARK_PLANES[plane] + index as u32).expect("a private use character")
 }
 
-/// The session a mark names.
-fn session_mark(c: char) -> Option<usize> {
-    SESSION_MARKS.iter().enumerate().find_map(|(plane, &base)| {
-        let index = (c as u32).checked_sub(base)?;
-        (index < PLANE).then_some(plane * PLANE as usize + index as usize)
+fn is_mark(c: char) -> bool {
+    MARK_PLANES.iter().any(|&base| {
+        (c as u32)
+            .checked_sub(base)
+            .is_some_and(|index| index < PLANE)
     })
 }
 
@@ -102,7 +99,7 @@ impl Dimensions for Size {
 
 /// The emulator a PTY task's output feeds as it arrives.
 pub struct Live {
-    term: Term<Replies>,
+    recorder: Recorder,
     parser: Processor,
     replies: Replies,
     /// Output bytes read, including those a synchronized update still holds.
@@ -129,12 +126,14 @@ impl Live {
     pub fn new() -> Live {
         let replies = Replies::default();
         let config = Config {
-            scrolling_history: 0,
+            // One operation pushes at most a screen of rows, and the recorder takes the history
+            // after each.
+            scrolling_history: usize::from(PTY_ROWS),
             kitty_keyboard: true,
             ..Config::default()
         };
         Live {
-            term: Term::new(config, &Size, replies.clone()),
+            recorder: Recorder::new(Term::new(config, &Size, replies.clone())),
             parser: Processor::new(),
             replies,
             read: 0,
@@ -142,21 +141,25 @@ impl Live {
         }
     }
 
-    /// Reads one piece of output, read from the program at `arrived`, and returns the replies
-    /// it asked for and whether a synchronized update (mode 2026) past its deadline ended
-    /// first, so it cannot outlast its timeout while output keeps arriving.
-    pub fn process(&mut self, output: &[u8], arrived: Instant) -> (Vec<u8>, bool) {
+    /// Reads one piece of output, read from the program at `arrived` after the output paused
+    /// if `pause` says so, long or not, and returns the replies it asked for. A synchronized
+    /// update (mode 2026) past its deadline ends first, so it cannot outlast its timeout while
+    /// output keeps arriving.
+    pub fn process(&mut self, output: &[u8], arrived: Instant, pause: Option<bool>) -> Vec<u8> {
         self.read += output.len() as u64;
         let expired = self
             .sync_deadline()
             .is_some_and(|deadline| deadline <= arrived);
-        let replies = self.run(|term, parser| {
+        self.run(|recorder, parser| {
             if expired {
-                parser.stop_sync(term);
+                parser.stop_sync(recorder);
             }
-            parser.advance(term, output);
-        });
-        (replies, expired)
+            if let Some(long) = pause {
+                recorder.pause(long);
+            }
+            parser.advance(recorder, output);
+            recorder.commit();
+        })
     }
 
     /// When the synchronized update in progress times out, if one is in progress.
@@ -170,14 +173,48 @@ impl Live {
     /// Ends the synchronized update in progress, applying the output it held, and returns the
     /// replies that output asked for.
     pub fn end_sync(&mut self) -> Vec<u8> {
-        self.run(|term, parser| parser.stop_sync(term))
+        self.run(|recorder, parser| {
+            parser.stop_sync(recorder);
+            recorder.commit();
+        })
     }
 
-    fn run(&mut self, step: impl FnOnce(&mut Term<Replies>, &mut Processor)) -> Vec<u8> {
+    /// The output ended: every pending line is written out.
+    pub fn finish(&mut self) {
+        self.run(|recorder, _| recorder.finish());
+    }
+
+    /// The transcript lines written out since the last call, each ending in a newline.
+    pub fn take_written(&mut self) -> String {
+        std::mem::take(&mut self.recorder.out)
+    }
+
+    /// The lines not written out yet, as they would be written if the output ended now, each
+    /// ending in a newline.
+    pub fn pending(&mut self) -> String {
+        if self.stopped {
+            return String::new();
+        }
+        let recorder = &self.recorder;
+        match catch_unwind(AssertUnwindSafe(|| recorder.pending())) {
+            Ok(text) => text,
+            Err(_) => {
+                self.stopped = true;
+                String::new()
+            }
+        }
+    }
+
+    /// The emulator stopped after an internal failure, and with it the transcript.
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    fn run(&mut self, step: impl FnOnce(&mut Recorder, &mut Processor)) -> Vec<u8> {
         if !self.stopped {
-            let (term, parser) = (&mut self.term, &mut self.parser);
+            let (recorder, parser) = (&mut self.recorder, &mut self.parser);
             // A panic would end the capture thread, and the program would block on a full PTY.
-            self.stopped = catch_unwind(AssertUnwindSafe(|| step(term, parser))).is_err();
+            self.stopped = catch_unwind(AssertUnwindSafe(|| step(recorder, parser))).is_err();
         }
         let mut replies = self
             .replies
@@ -194,7 +231,7 @@ impl Live {
                 "{STOPPED} keys need its keyboard modes; send the bytes with input instead."
             ));
         }
-        let mode = self.term.mode();
+        let mode = self.recorder.term.mode();
         Ok(Modes {
             cursor: mode.contains(TermMode::APP_CURSOR),
             keypad: mode.contains(TermMode::APP_KEYPAD),
@@ -215,12 +252,12 @@ impl Live {
     /// zero-based cursor row and column.
     pub fn screen(&self) -> Result<(Vec<String>, (u16, u16)), String> {
         if self.stopped {
-            return Err(format!(
-                "{STOPPED} poll and transcript still read its output."
-            ));
+            return Err(format!("{STOPPED} poll still reads its output."));
         }
-        let grid = self.term.grid();
-        let mut rows = screen_rows(grid);
+        let grid = self.recorder.term.grid();
+        let mut rows: Vec<String> = (0..grid.screen_lines())
+            .map(|line| frame_row(grid, line).text)
+            .collect();
         while rows.last().is_some_and(String::is_empty) {
             rows.pop();
         }
@@ -229,211 +266,440 @@ impl Live {
     }
 }
 
-pub struct Transcript {
-    /// Logical lines: rows the terminal wrapped are joined, trailing spaces trimmed.
-    pub text: String,
-    pub lines: usize,
-    /// Alternate-screen sessions, each after an `ALTERNATE_MARKER` line.
-    pub alternate_sessions: usize,
-    /// Each session's lines in `text`, one-based, from its marker to its last line.
-    pub alternate_ranges: Vec<(usize, usize)>,
-    /// A history reached `HISTORY_LINES`, so older lines may be missing.
-    pub history_full: bool,
+/// Digests of the normal-screen lines written out, the last `REPRINT_REACH` of them, by the
+/// index of each among all.
+#[derive(Default)]
+struct Written {
+    digests: VecDeque<u64>,
+    first: usize,
 }
 
-/// Renders the first `len` bytes of `log` and writes the text to `path`, replaying `marks`
-/// where they fall. `closed` says the log is complete: a synchronized update still open at
-/// its end shows what it holds, as the live terminal does once output ends.
-pub fn render(
-    mut log: impl Read,
-    len: u64,
-    marks: &[u64],
-    closed: bool,
-    path: &Path,
-) -> std::io::Result<Transcript> {
-    let _rendering = RENDERING.lock().unwrap_or_else(PoisonError::into_inner);
-    let config = Config {
-        scrolling_history: HISTORY_LINES,
-        ..Config::default()
-    };
-    let mut replay = Replay::new(Term::new(config, &Size, VoidListener));
-    let mut parser: Processor = Processor::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    let mut offset = 0;
-    let mut marks = marks.iter().copied().peekable();
-    while offset < len {
-        let want = (len - offset).min(buffer.len() as u64) as usize;
-        let read = log.read(&mut buffer[..want])?;
-        if read == 0 {
-            break;
-        }
-        let mut start = 0;
-        while let Some(mark) = marks.next_if(|&mark| mark_offset(mark) <= offset + read as u64) {
-            let end = mark_offset(mark).saturating_sub(offset) as usize;
-            if end > start {
-                parser.advance(&mut replay, &buffer[start..end]);
-                start = end;
-            }
-            if mark & SYNC_END != 0 {
-                parser.stop_sync(&mut replay);
-            }
-            if mark & PAUSE != 0 {
-                replay.pause(mark & LONG != 0);
-            }
-        }
-        parser.advance(&mut replay, &buffer[start..read]);
-        offset += read as u64;
-    }
-    if closed {
-        parser.stop_sync(&mut replay);
-    }
-    replay.present();
-    let mut term = replay.term;
-    if term.mode().contains(TermMode::ALT_SCREEN) {
-        // The normal screen and its history sit behind the alternate screen.
-        term.swap_alt();
-    }
-    let history_full = term.grid().history_size() >= HISTORY_LINES
-        || replay.sessions.iter().any(|session| session.truncated);
-    let (normal, marks) = lines(term.grid());
-    // Each session follows the last line still marked of those shown when it began, and the
-    // session before it. A session whose marked lines are all gone, cleared, past the
-    // history's limit, or written over, follows the session before it, or comes first.
-    let mut after: Vec<Option<usize>> = vec![None; replay.sessions.len()];
-    for (line, session) in marks {
-        if let Some(after) = after.get_mut(session) {
-            *after = Some(line + 1);
+impl Written {
+    fn push(&mut self, text: &str) {
+        self.digests.push_back(digest(text));
+        if self.digests.len() > REPRINT_REACH {
+            self.digests.pop_front();
+            self.first += 1;
         }
     }
-    let mut previous = 0;
-    let after: Vec<usize> = after
-        .into_iter()
-        .map(|after| {
-            previous = previous.max(after.unwrap_or(previous));
-            previous
-        })
-        .collect();
-    let mut lines: Vec<String> = Vec::new();
-    let mut alternate_ranges = Vec::new();
-    for at in 0..=normal.len() {
-        let mut began = false;
-        for (session, _) in after
+
+    fn get(&self, index: usize) -> Option<u64> {
+        let k = index.checked_sub(self.first)?;
+        self.digests.get(k).copied()
+    }
+
+    fn find(&self, digest: u64) -> Vec<usize> {
+        self.digests
             .iter()
             .enumerate()
-            .filter(|&(_, &after)| after.min(normal.len()) == at)
-        {
-            lines.push(ALTERNATE_MARKER.to_string());
-            let first = lines.len();
-            lines.extend(replay.sessions[session].text());
-            alternate_ranges.push((first, lines.len()));
-            began = true;
-        }
-        if let Some(line) = normal.get(at) {
-            if began {
-                lines.push(NORMAL_MARKER.to_string());
-            }
-            lines.push(line.clone());
-        }
+            .filter(|&(_, &d)| d == digest)
+            .map(|(k, _)| self.first + k)
+            .collect()
     }
-    let mut text = lines.join("\n");
-    text.push('\n');
-    std::fs::write(path, &text)?;
-    Ok(Transcript {
-        text,
-        lines: lines.len(),
-        alternate_sessions: replay.sessions.len(),
-        alternate_ranges,
-        history_full,
-    })
 }
 
-/// The replayed terminal, telling each alternate-screen session's history what its screen
-/// does: the rows each scroll moves, and the frames the program finished drawing.
-struct Replay {
-    term: Term<VoidListener>,
-    /// One history per alternate-screen session.
-    sessions: Vec<History>,
-    /// The last session is still on screen.
-    open: bool,
+/// A program that clears the history may print the lines written out again, as a full redraw
+/// does: lines repeating written ones from some line on are copies, once `REPRINT_CONFIRM` with
+/// text did in a row, until a line differs.
+#[derive(Clone, Default)]
+enum Reprint {
+    #[default]
+    Off,
+    /// The history was cleared: lines that repeat written lines from each of `starts` on are
+    /// held, `texts` of them with text.
+    Anchoring {
+        held: Vec<String>,
+        starts: Vec<usize>,
+        texts: usize,
+    },
+    /// A reprint is under way: the index of the written line the next line repeats.
+    Following(usize),
+}
+
+impl Reprint {
+    fn anchoring() -> Reprint {
+        Reprint::Anchoring {
+            held: Vec::new(),
+            starts: Vec::new(),
+            texts: 0,
+        }
+    }
+
+    /// The lines `line` lets through to be written out: none while it repeats written lines.
+    fn step(&mut self, written: &Written, line: String) -> Vec<String> {
+        let line_digest = digest(&line);
+        match self {
+            Reprint::Off => vec![line],
+            Reprint::Following(at) => {
+                if written.get(*at) == Some(line_digest) {
+                    *at += 1;
+                    Vec::new()
+                } else {
+                    *self = Reprint::Off;
+                    vec![line]
+                }
+            }
+            Reprint::Anchoring {
+                held,
+                starts,
+                texts,
+            } => {
+                if held.is_empty() {
+                    *starts = written.find(line_digest);
+                } else {
+                    let k = held.len();
+                    starts.retain(|&start| written.get(start + k) == Some(line_digest));
+                }
+                if starts.is_empty() {
+                    let mut out = std::mem::take(held);
+                    out.push(line);
+                    *self = Reprint::Off;
+                    return out;
+                }
+                *texts += usize::from(!blank(&line));
+                held.push(line);
+                if *texts >= REPRINT_CONFIRM {
+                    *self = Reprint::Following(starts[0] + held.len());
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Ends the matching: the lines held are no reprint after all.
+    fn release(&mut self) -> Vec<String> {
+        match std::mem::take(self) {
+            Reprint::Anchoring { held, .. } => held,
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// A normal-screen line still on screen, or whose first rows left it.
+struct ScreenLine {
+    text: String,
+    /// Bytes of `text` from rows that already left the screen.
+    left: usize,
+    /// The mark the line was written out with, if it carries one.
+    mark: Option<char>,
+    /// The row it starts on, and that row's mark.
+    row: usize,
+    row_mark: Option<char>,
+}
+
+/// The terminal as the program drives it, recording the transcript: the rows it pushes off the
+/// normal screen, and the scrolls and frames of each alternate-screen session.
+struct Recorder {
+    term: Term<Replies>,
+    /// The history of the alternate-screen session on screen.
+    session: Option<History>,
     /// The scroll region's first and last rows, zero-based.
     region: (usize, usize),
     /// Inside a synchronized update, whose drawing no one sees until it ends.
     held: bool,
     /// Times the program showed the cursor again after hiding it.
     redraws: usize,
-    /// Rows written since the history last read the screen, one bit per row.
-    written: u64,
+    /// Rows written since the session's history last read the screen, one bit per row.
+    drawn: u64,
     /// The frame read from the rows written alone, kept to reuse its memory.
     frame: Vec<FrameRow>,
+    /// A line whose first rows left the screen while its last one wraps onto it, and the mark
+    /// of its first row.
+    partial: Option<(String, Option<char>)>,
+    /// The text of the lines written out while on screen, by the mark on their first row.
+    marked: HashMap<char, String>,
+    /// Marks issued.
+    marks: usize,
+    /// An alternate-screen session ended, and no normal-screen line was written out since.
+    after_session: bool,
+    written: Written,
+    reprint: Reprint,
+    /// Lines written out and not taken yet, each ending in a newline.
+    out: String,
 }
 
-impl Replay {
-    fn new(term: Term<VoidListener>) -> Replay {
-        Replay {
+impl Recorder {
+    fn new(term: Term<Replies>) -> Recorder {
+        Recorder {
             term,
-            sessions: Vec::new(),
-            open: false,
+            session: None,
             region: (0, usize::from(PTY_ROWS) - 1),
             held: false,
             redraws: 0,
-            written: 0,
+            drawn: 0,
             frame: Vec::new(),
+            partial: None,
+            marked: HashMap::new(),
+            marks: 0,
+            after_session: false,
+            written: Written::default(),
+            reprint: Reprint::Off,
+            out: String::new(),
+        }
+    }
+
+    fn alternate(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    fn push(&mut self, line: &str) {
+        self.out.push_str(line);
+        self.out.push('\n');
+    }
+
+    /// Writes out the lines settled since the last call.
+    fn commit(&mut self) {
+        self.spill();
+        let lines = self.session.as_mut().map(History::commit);
+        for line in lines.into_iter().flatten() {
+            self.push(&line);
+        }
+    }
+
+    /// The output ended: the session on screen ends, and the normal screen's lines are written.
+    fn finish(&mut self) {
+        self.present();
+        if self.session.is_some() {
+            self.end_session(true);
+        } else {
+            self.spill();
+            self.write_screen();
+        }
+        for line in self.reprint.release() {
+            self.write_normal(&line);
+        }
+    }
+
+    /// The lines `finish` would write out now, leaving everything as it is.
+    fn pending(&self) -> String {
+        let lines = if self.alternate() {
+            // No session is on screen once the output ended.
+            self.session.clone().map_or_else(Vec::new, |mut session| {
+                if self.shows_frame(false) {
+                    session.present(&frame_rows(self.term.grid()));
+                }
+                session.finish()
+            })
+        } else {
+            let mut reprint = self.reprint.clone();
+            let mut lines = Vec::new();
+            for line in self.screen_lines() {
+                if !self.already_written(&line) {
+                    lines.extend(reprint.step(&self.written, line.text));
+                }
+            }
+            lines.extend(reprint.release());
+            if self.after_session && !lines.is_empty() {
+                lines.insert(0, NORMAL_MARKER.to_string());
+            }
+            lines
+        };
+        lines.iter().map(|line| format!("{line}\n")).collect()
+    }
+
+    /// Writes out a normal-screen line that passed the reprint check.
+    fn write_normal(&mut self, line: &str) {
+        if std::mem::take(&mut self.after_session) {
+            self.push(NORMAL_MARKER);
+        }
+        self.written.push(line);
+        self.push(line);
+    }
+
+    /// Writes out a normal-screen line unless it repeats written lines.
+    fn write_checked(&mut self, line: String) {
+        for line in self.reprint.step(&self.written, line) {
+            self.write_normal(&line);
+        }
+    }
+
+    /// Writes out the rows the terminal pushed into its history, as lines; a line whose last
+    /// row wraps onto the screen waits in `partial`. A line written out while on screen, still
+    /// as it was, is not written again.
+    fn spill(&mut self) {
+        let grid = self.term.grid();
+        let size = grid.history_size();
+        if size == 0 {
+            return;
+        }
+        let rows: Vec<(String, bool, Option<char>)> = (1..=size as i32)
+            .rev()
+            .map(|k| {
+                let row = &grid[Line(-k)];
+                (row_text(row), wraps(grid, row), row_mark(row))
+            })
+            .collect();
+        self.term.grid_mut().clear_history();
+        for (text, wraps, mark) in rows {
+            let (mut line, mark) = self.partial.take().unwrap_or((String::new(), mark));
+            line.push_str(&text);
+            if wraps && line.len() < LINE_LIMIT {
+                self.partial = Some((line, mark));
+                continue;
+            }
+            if !wraps {
+                line.truncate(line.trim_end().len());
+            }
+            let known = mark.and_then(|mark| self.marked.remove(&mark));
+            if known.as_ref() != Some(&line) {
+                self.write_checked(line);
+            }
+        }
+    }
+
+    /// The normal screen's lines, after `partial`, up to the last row with text.
+    fn screen_lines(&self) -> Vec<ScreenLine> {
+        let grid = self.term.grid();
+        let last_text = (0..grid.screen_lines())
+            .rev()
+            .find(|&line| !blank(&row_text(&grid[Line(line as i32)])));
+        let mut lines = Vec::new();
+        let Some(last_text) = last_text else {
+            if let Some((text, mark)) = &self.partial {
+                lines.push(ScreenLine {
+                    text: text.trim_end().to_string(),
+                    left: text.len(),
+                    mark: *mark,
+                    row: 0,
+                    row_mark: None,
+                });
+            }
+            return lines;
+        };
+        let (mut text, mut mark) = self.partial.clone().unwrap_or_default();
+        let mut left = text.len();
+        let mut start = 0;
+        for line in 0..=last_text {
+            let row = &grid[Line(line as i32)];
+            if text.is_empty() && left == 0 {
+                mark = row_mark(row);
+            }
+            text.push_str(&row_text(row));
+            if wraps(grid, row) && line < last_text {
+                continue;
+            }
+            text.truncate(text.trim_end().len());
+            lines.push(ScreenLine {
+                text: std::mem::take(&mut text),
+                left,
+                mark,
+                row: start,
+                row_mark: row_mark(&grid[Line(start as i32)]),
+            });
+            (left, start, mark) = (0, line + 1, None);
+        }
+        lines
+    }
+
+    fn already_written(&self, line: &ScreenLine) -> bool {
+        line.mark
+            .is_some_and(|mark| self.marked.get(&mark) == Some(&line.text))
+    }
+
+    /// Writes out the normal screen's lines, as an alternate-screen session begins or the
+    /// output ends, and marks each, so it is not written again when it leaves the screen.
+    fn write_screen(&mut self) {
+        let lines = self.screen_lines();
+        self.partial = None;
+        for line in lines {
+            if !self.already_written(&line) {
+                self.write_checked(line.text.clone());
+            }
+            let on_screen = line.text.get(line.left..).unwrap_or_default().to_string();
+            if line
+                .row_mark
+                .is_some_and(|mark| self.marked.get(&mark) == Some(&on_screen))
+            {
+                continue;
+            }
+            self.marks += 1;
+            let mark = mark_char(self.marks);
+            let row = &mut self.term.grid_mut()[Line(line.row as i32)];
+            // A glyph is a base character other than whitespace, or a combining mark on a blank;
+            // a blank row carries its mark in its first cell.
+            let column = row[..]
+                .iter()
+                .position(|cell| {
+                    (!cell.c.is_whitespace() && cell.c != '\0')
+                        || cell
+                            .zerowidth()
+                            .is_some_and(|marks| marks.iter().any(|&c| !is_mark(c)))
+                })
+                .unwrap_or(0);
+            row[Column(column)].push_zerowidth(mark);
+            self.marked.insert(mark, on_screen);
+        }
+    }
+
+    /// The history of the alternate-screen session on screen.
+    fn session(&mut self) -> Option<&mut History> {
+        if !self.alternate() {
+            return None;
+        }
+        let height = self.term.grid().screen_lines();
+        Some(
+            self.session
+                .get_or_insert_with(|| History::new(height, SESSION_LINES)),
+        )
+    }
+
+    /// The session ends once the alternate screen is gone, or with `now`: its lines are
+    /// written out.
+    fn end_session(&mut self, now: bool) {
+        if !now && self.alternate() {
+            return;
+        }
+        if let Some(session) = self.session.take() {
+            for line in session.finish() {
+                self.push(&line);
+            }
+            self.after_session = true;
         }
     }
 
     /// The cursor's row is being written.
-    fn write(&mut self) {
-        self.written |= 1 << self.cursor_line().min(63);
-    }
-
-    /// The history of the alternate screen on screen; leaving it ends the session.
-    fn session(&mut self) -> Option<&mut History> {
-        if !self.term.mode().contains(TermMode::ALT_SCREEN) {
-            self.open = false;
-            return None;
-        }
-        if !self.open {
-            self.sessions
-                .push(History::new(self.term.grid().screen_lines(), HISTORY_LINES));
-            self.open = true;
-        }
-        self.sessions.last_mut()
+    fn draw(&mut self) {
+        self.drawn |= 1 << self.cursor_line().min(63);
     }
 
     /// The screen is a finished frame, unless a synchronized update holds its drawing.
     fn present(&mut self) {
-        if self.held || !self.term.mode().contains(TermMode::ALT_SCREEN) {
+        if self.held || !self.alternate() {
             return;
         }
         let rows = frame_rows(self.term.grid());
         if let Some(session) = self.session() {
             session.present(&rows);
         }
-        self.written = 0;
+        self.drawn = 0;
     }
 
     /// Where the output paused the screen shows a finished frame, unless the program hides the
     /// cursor while it draws, as it has before, and the cursor is hidden: then the pause fell
     /// inside a redraw, and the frame that shows the cursor again holds it whole. A long pause
     /// showed the screen long enough to read either way.
-    fn pause(&mut self, long: bool) {
+    fn shows_frame(&self, long: bool) -> bool {
         let hidden = !self.term.mode().contains(TermMode::SHOW_CURSOR);
-        if long || !hidden || self.redraws < 2 {
+        !self.held && (long || !hidden || self.redraws < 2)
+    }
+
+    fn pause(&mut self, long: bool) {
+        if self.shows_frame(long) {
             self.present();
         }
     }
 
     /// Rows `top..end` scroll by `n` rows.
     fn shift(&mut self, top: usize, end: usize, n: usize, up: bool) {
-        if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+        if !self.alternate() {
             return;
         }
         // Rows written since the last frame show before they move: a frame of the screen, read
         // from the rows written alone when that is the cursor's row, as a program printing
         // lines writes it.
-        if !self.held && self.written != 0 {
+        if !self.held && self.drawn != 0 {
             let cursor = self.cursor_line();
-            if self.written == 1 << cursor.min(63) {
+            if self.drawn == 1 << cursor.min(63) {
                 let row = frame_row(self.term.grid(), cursor);
                 let mut frame = std::mem::take(&mut self.frame);
                 if let Some(session) = self.session() {
@@ -447,7 +713,7 @@ impl Replay {
                     session.present(&frame);
                 }
                 self.frame = frame;
-                self.written = 0;
+                self.drawn = 0;
             } else {
                 self.present();
             }
@@ -480,14 +746,15 @@ impl Replay {
     }
 }
 
-/// Forwards `Handler` methods to the replayed terminal unchanged.
+/// Forwards `Handler` methods to the terminal unchanged.
 macro_rules! forward {
     ($($name:ident($($arg:ident: $ty:ty),*);)*) => {
         $(fn $name(&mut self, $($arg: $ty),*) { Handler::$name(&mut self.term, $($arg),*) })*
     };
 }
 
-impl Handler for Replay {
+// The operations that can push rows into the normal screen's history write them out after.
+impl Handler for Recorder {
     fn input(&mut self, c: char) {
         // As the terminal does: a character with width wraps past the last column, and a wide
         // character wraps from it; wrapping at the scroll region's bottom scrolls.
@@ -499,7 +766,8 @@ impl Handler for Replay {
             self.feed();
         }
         Handler::input(&mut self.term, c);
-        self.write();
+        self.draw();
+        self.spill();
     }
 
     fn put_tab(&mut self, count: u16) {
@@ -508,37 +776,40 @@ impl Handler for Replay {
             self.feed();
         }
         Handler::put_tab(&mut self.term, count);
-        self.write();
+        self.draw();
+        self.spill();
     }
 
     fn insert_blank(&mut self, count: usize) {
-        self.write();
+        self.draw();
         Handler::insert_blank(&mut self.term, count);
     }
 
     fn erase_chars(&mut self, count: usize) {
-        self.write();
+        self.draw();
         Handler::erase_chars(&mut self.term, count);
     }
 
     fn delete_chars(&mut self, count: usize) {
-        self.write();
+        self.draw();
         Handler::delete_chars(&mut self.term, count);
     }
 
     fn clear_line(&mut self, mode: LineClearMode) {
-        self.write();
+        self.draw();
         Handler::clear_line(&mut self.term, mode);
     }
 
     fn linefeed(&mut self) {
         self.feed();
         Handler::linefeed(&mut self.term);
+        self.spill();
     }
 
     fn newline(&mut self) {
         self.feed();
         Handler::newline(&mut self.term);
+        self.spill();
     }
 
     fn reverse_index(&mut self) {
@@ -551,6 +822,7 @@ impl Handler for Replay {
     fn scroll_up(&mut self, lines: usize) {
         self.shift(self.region.0, self.region.1 + 1, lines, true);
         Handler::scroll_up(&mut self.term, lines);
+        self.spill();
     }
 
     fn scroll_down(&mut self, lines: usize) {
@@ -572,12 +844,22 @@ impl Handler for Replay {
             self.shift(origin, self.region.1 + 1, lines, true);
         }
         Handler::delete_lines(&mut self.term, lines);
+        self.spill();
     }
 
-    // Erasing destroys what the screen showed, so the frame before it is recorded.
+    // Erasing destroys what the screen showed, so the frame before it is recorded. Clearing
+    // the normal screen pushes its rows into the history; clearing the history starts to
+    // match a reprint against the lines written out.
     fn clear_screen(&mut self, mode: ClearMode) {
         self.present();
+        if matches!(mode, ClearMode::Saved) && !self.alternate() {
+            for line in self.reprint.release() {
+                self.write_normal(&line);
+            }
+            self.reprint = Reprint::anchoring();
+        }
         Handler::clear_screen(&mut self.term, mode);
+        self.spill();
     }
 
     fn decaln(&mut self) {
@@ -585,32 +867,41 @@ impl Handler for Replay {
         Handler::decaln(&mut self.term);
     }
 
+    // A reset erases the normal screen, so what it showed is written out first.
     fn reset_state(&mut self) {
         self.present();
+        self.spill();
+        if !self.alternate() {
+            self.write_screen();
+        }
         Handler::reset_state(&mut self.term);
         self.region = (0, usize::from(PTY_ROWS) - 1);
         self.held = false;
+        self.end_session(false);
     }
 
     // Programs hide the cursor before they draw and show it once done, switch screens between
     // frames, and hold a frame's drawing in a synchronized update.
     fn set_private_mode(&mut self, mode: PrivateMode) {
         self.mode_change(mode, true);
-        let entering = mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor)
-            && !self.term.mode().contains(TermMode::ALT_SCREEN);
-        if entering {
-            self.mark_session_start();
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor)
+            && !self.alternate()
+        {
+            self.write_screen();
+            // Lines held as a possible reprint precede the session.
+            for line in self.reprint.release() {
+                self.write_normal(&line);
+            }
+            self.push(ALTERNATE_MARKER);
         }
         Handler::set_private_mode(&mut self.term, mode);
-        if entering {
-            self.open = false;
-            self.session();
-        }
+        self.session();
     }
 
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         self.mode_change(mode, false);
         Handler::unset_private_mode(&mut self.term, mode);
+        self.end_session(false);
     }
 
     fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
@@ -679,35 +970,7 @@ impl Handler for Replay {
     }
 }
 
-impl Replay {
-    /// Marks the normal-screen text shown before the session about to begin: the first
-    /// character of each screen row with text, and the last line of the history, which no
-    /// program writes over. Text the program erases or writes over later loses its mark; the
-    /// last mark left tells where the session began.
-    fn mark_session_start(&mut self) {
-        let Some(mark) = session_char(self.sessions.len()) else {
-            return;
-        };
-        let grid = self.term.grid_mut();
-        if grid.history_size() > 0 {
-            grid[Line(-1)][Column(0)].push_zerowidth(mark);
-        }
-        for line in 0..grid.screen_lines() as i32 {
-            let row = &mut grid[Line(line)];
-            // A glyph is a base character other than whitespace, or a combining mark on a blank;
-            // a combining mark precedes any session marks on its cell.
-            let text = row[..].iter().position(|cell| {
-                (!cell.c.is_whitespace() && cell.c != '\0')
-                    || cell
-                        .zerowidth()
-                        .is_some_and(|marks| marks.iter().any(|&c| session_mark(c).is_none()))
-            });
-            if let Some(column) = text {
-                row[Column(column)].push_zerowidth(mark);
-            }
-        }
-    }
-
+impl Recorder {
     /// Before private mode `mode` is set or reset: the frame it ends, if it ends one.
     fn mode_change(&mut self, mode: PrivateMode, set: bool) {
         let PrivateMode::Named(named) = mode else {
@@ -736,11 +999,14 @@ impl Replay {
     }
 }
 
-/// The screen's rows without trailing spaces.
-fn screen_rows(grid: &Grid<Cell>) -> Vec<String> {
-    (0..grid.screen_lines())
-        .map(|line| frame_row(grid, line).text)
-        .collect()
+fn blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+fn digest(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The screen's rows as a frame.
@@ -756,42 +1022,24 @@ fn frame_row(grid: &Grid<Cell>, line: usize) -> FrameRow {
     text.truncate(text.trim_end().len());
     FrameRow {
         text,
-        wraps: row[Column(grid.columns() - 1)]
-            .flags
-            .contains(Flags::WRAPLINE),
+        wraps: wraps(grid, row),
     }
 }
 
-/// A grid's history and screen as logical lines, without trailing blank lines, and the
-/// session marks they carry: the index of each marked line and the session.
-fn lines(grid: &Grid<Cell>) -> (Vec<String>, Vec<(usize, usize)>) {
-    let last = Column(grid.columns() - 1);
-    let mut lines = Vec::new();
-    let mut marks = Vec::new();
-    let mut line = String::new();
-    for index in -(grid.history_size() as i32)..grid.screen_lines() as i32 {
-        let row = &grid[Line(index)];
-        line.push_str(&row_text(row));
-        marks.extend(
-            row[..]
-                .iter()
-                .flat_map(|cell| cell.zerowidth().into_iter().flatten())
-                .filter_map(|&c| session_mark(c))
-                .map(|mark| (lines.len(), mark)),
-        );
-        if !row[last].flags.contains(Flags::WRAPLINE) {
-            line.truncate(line.trim_end().len());
-            lines.push(std::mem::take(&mut line));
-        }
-    }
-    if !line.is_empty() {
-        line.truncate(line.trim_end().len());
-        lines.push(line);
-    }
-    while lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-    (lines, marks)
+/// The terminal wrapped the row onto the next one.
+fn wraps(grid: &Grid<Cell>, row: &Row<Cell>) -> bool {
+    row[Column(grid.columns() - 1)]
+        .flags
+        .contains(Flags::WRAPLINE)
+}
+
+/// The last mark a row carries.
+fn row_mark(row: &Row<Cell>) -> Option<char> {
+    row[..]
+        .iter()
+        .flat_map(|cell| cell.zerowidth().into_iter().flatten())
+        .copied()
+        .rfind(|&c| is_mark(c))
 }
 
 /// A row as shown: a wide character once, a tab as a space, combining marks after their base.
@@ -812,7 +1060,7 @@ fn row_text(row: &Row<Cell>) -> String {
         // A tab leaves `\t` in its first cell and blanks up to the tab stop.
         text.push(if cell.c == '\t' { ' ' } else { cell.c });
         let marks = cell.zerowidth().into_iter().flatten();
-        text.extend(marks.filter(|&&c| session_mark(c).is_none()));
+        text.extend(marks.filter(|&&c| !is_mark(c)));
     }
     text
 }
@@ -821,21 +1069,44 @@ fn row_text(row: &Row<Cell>) -> String {
 mod tests {
     use super::*;
 
-    /// Renders `log` as the transcript action does, reading it in 64 KiB pieces.
-    fn render_text(log: &[u8]) -> String {
-        render_marked(log, &[], true)
+    /// What happened to the output at a point of a test log.
+    #[derive(Clone, Copy, Debug)]
+    enum Mark {
+        /// The output paused, long enough to read the screen or not.
+        Pause(bool),
+        /// A synchronized update ended at its timeout.
+        SyncEnd,
     }
 
-    fn render_marked(log: &[u8], marks: &[u64], closed: bool) -> String {
-        let path = std::env::temp_dir().join(format!(
-            "fastexec-transcript-test-{}-{}-{}.txt",
-            std::process::id(),
-            log.len(),
-            marks.len()
-        ));
-        let transcript = render(log, log.len() as u64, marks, closed, &path).unwrap();
-        let _ = std::fs::remove_file(&path);
-        transcript.text
+    /// The transcript of `log`, read in pieces split where `marks` fall: the lines written out,
+    /// then those pending. `closed` ends the output.
+    fn record(log: &[u8], marks: &[(usize, Mark)], closed: bool) -> String {
+        let mut live = Live::new();
+        let mut text = String::new();
+        let (mut start, mut pause) = (0, None);
+        for &(at, mark) in marks {
+            live.process(&log[start..at], Instant::now(), pause.take());
+            start = at;
+            match mark {
+                Mark::Pause(long) => pause = Some(long),
+                Mark::SyncEnd => {
+                    live.end_sync();
+                }
+            }
+        }
+        live.process(&log[start..], Instant::now(), pause);
+        if closed {
+            live.end_sync();
+            live.finish();
+        }
+        text.push_str(&live.take_written());
+        text.push_str(&live.pending());
+        assert!(!live.stopped());
+        text
+    }
+
+    fn render_text(log: &[u8]) -> String {
+        record(log, &[], true)
     }
 
     #[test]
@@ -858,6 +1129,7 @@ mod tests {
             "  before\r\nmiddle\r\nlast{}\x1b[1;3H\x1b[Kafter\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K",
             session(1)
         );
+        let scrolled = format!("a\r\nb{}{}", session(1), "\r\nmore".repeat(40));
         for (log, expected) in [
             // Text below the cursor was shown before the session too.
             (above, vec!["a", "b", "c", ALTERNATE_MARKER, "inside 1"]),
@@ -882,10 +1154,18 @@ mod tests {
                     "\u{3000}after",
                 ],
             ),
-            // Erasing the text of a row erases its mark, though its indentation stays.
+            // Text written over a row after the session is new; the rows erased stay written.
             (
                 indented,
-                vec![ALTERNATE_MARKER, "inside 1", NORMAL_MARKER, "  after"],
+                vec![
+                    "  before",
+                    "middle",
+                    "last",
+                    ALTERNATE_MARKER,
+                    "inside 1",
+                    NORMAL_MARKER,
+                    "  after",
+                ],
             ),
             (
                 ran,
@@ -901,15 +1181,28 @@ mod tests {
                     "second",
                 ],
             ),
-            // The history the session followed was cleared after it.
+            // The screen the session followed was cleared after it, and its history too.
             (
                 cleared,
-                vec![ALTERNATE_MARKER, "inside 1", NORMAL_MARKER, "after"],
+                vec![
+                    "before",
+                    ALTERNATE_MARKER,
+                    "inside 1",
+                    NORMAL_MARKER,
+                    "after",
+                ],
             ),
             // The program wrote over the cursor's row after the session.
             (
                 rewritten,
-                vec!["first", ALTERNATE_MARKER, "inside 1", NORMAL_MARKER, "last"],
+                vec![
+                    "first",
+                    "prompt",
+                    ALTERNATE_MARKER,
+                    "inside 1",
+                    NORMAL_MARKER,
+                    "last",
+                ],
             ),
             // The session began on the row of the text before the cursor's column.
             (
@@ -935,8 +1228,7 @@ mod tests {
                     "inside 2",
                 ],
             ),
-            // The rows the second session began below were erased or written over; the line
-            // above them still precedes it.
+            // Rows written before the second session were erased or written over after it.
             (
                 erased,
                 vec![
@@ -945,6 +1237,8 @@ mod tests {
                     "inside 1",
                     NORMAL_MARKER,
                     "between",
+                    "anchor",
+                    "prompt",
                     ALTERNATE_MARKER,
                     "inside 2",
                     NORMAL_MARKER,
@@ -956,18 +1250,144 @@ mod tests {
             let text = render_text(log.as_bytes());
             assert_eq!(text.lines().collect::<Vec<_>>(), expected, "{text}");
         }
+        // Rows written before a session scroll away after it, written once.
+        let text = render_text(scrolled.as_bytes());
+        let mut expected = vec!["a", "b", ALTERNATE_MARKER, "inside 1", NORMAL_MARKER];
+        expected.extend(["more"; 40]);
+        assert_eq!(text.lines().collect::<Vec<_>>(), expected, "{text}");
+    }
+
+    #[test]
+    fn a_reprint_after_a_cleared_history_is_no_new_text() {
+        let lines = |range: std::ops::RangeInclusive<usize>| -> String {
+            range.map(|k| format!("line {k}\r\n")).collect()
+        };
+        // A full redraw clears the screen and its history, then prints every line again, one
+        // more after them.
+        let log = format!("{}\x1b[2J\x1b[3J\x1b[H{}", lines(1..=50), lines(1..=51));
+        let text = render_text(log.as_bytes());
+        let expected: Vec<String> = (1..=51).map(|k| format!("line {k}")).collect();
+        assert_eq!(text.lines().collect::<Vec<_>>(), expected, "{text}");
+        // Lines that may begin a reprint come before a session that begins after them.
+        let log = format!(
+            "{}\x1b[2J\x1b[3J\x1b[H{}\x1b[?1049hinside",
+            lines(1..=50),
+            lines(1..=3)
+        );
+        let text = render_text(log.as_bytes());
+        let mut expected: Vec<String> =
+            (1..=50).chain(1..=3).map(|k| format!("line {k}")).collect();
+        expected.extend([ALTERNATE_MARKER.to_string(), "inside".into()]);
+        assert_eq!(text.lines().collect::<Vec<_>>(), expected, "{text}");
+        // Fewer lines repeating written ones than a screen are new, even repeating every line
+        // written.
+        let log = "a\r\nb\r\nc\r\n\x1b[2J\x1b[3J\x1b[Ha\r\nb\r\nc\r\nd";
+        let text = render_text(log.as_bytes());
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            ["a", "b", "c", "a", "b", "c", "d"],
+            "{text}"
+        );
+        // `clear` keeps what the screen showed; what follows is new, even where it repeats an
+        // older line or two.
+        let log = "a\r\nb\r\n$ ls\r\nx\r\n$ clear\r\n\x1b[H\x1b[2J\x1b[3J$ ls\r\nx\r\n$ ";
+        let text = render_text(log.as_bytes());
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            ["a", "b", "$ ls", "x", "$ clear", "$ ls", "x", "$"],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn long_output_is_written_out_whole() {
+        // Lines scrolling the normal screen, then the alternate screen, then pages a program
+        // redraws in place, each frame a synchronized update showing the next rows.
+        let mut log: String = (0..15_000).map(|k| format!("normal {k}\r\n")).collect();
+        log += "\x1b[?1049h";
+        log += &(0..15_000)
+            .map(|k| format!("\r\nscrolled {k}"))
+            .collect::<String>();
+        log += "\x1b[?1049l\x1b[?1049h";
+        for k in 0..2_100 {
+            log += "\x1b[?2026h\x1b[H\x1b[2Kheader";
+            for (row, item) in (k * 5..k * 5 + 5).enumerate() {
+                log += &format!("\x1b[{};1H\x1b[2Kframed {item:05}", row + 2);
+            }
+            log += "\x1b[?2026l";
+        }
+        // Read in pieces, as a program's output arrives.
+        let mut live = Live::new();
+        let mut text = String::new();
+        for piece in log.as_bytes().chunks(4096) {
+            live.process(piece, Instant::now(), None);
+            text += &live.take_written();
+        }
+        live.finish();
+        text += &live.take_written();
+        for (prefix, count) in [
+            ("normal ", 15_000),
+            ("scrolled ", 15_000),
+            ("framed ", 10_500),
+        ] {
+            let found: Vec<&str> = text
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .collect();
+            let expected: Vec<String> = (0..count)
+                .map(|k| match prefix {
+                    "framed " => format!("{prefix}{k:05}"),
+                    _ => format!("{prefix}{k}"),
+                })
+                .collect();
+            assert!(found == expected, "{prefix}: {} lines", found.len());
+        }
+    }
+
+    #[test]
+    fn a_reset_or_a_line_without_end_loses_nothing() {
+        // A reset erases the screen it showed and a line wrapped onto it.
+        let log = format!("a\r\n{}\x1bcc", "w".repeat(120 * 31));
+        let text = render_text(log.as_bytes());
+        let expected = ["a".to_string(), "w".repeat(120 * 31), "c".to_string()];
+        assert_eq!(text.lines().collect::<Vec<_>>(), expected);
+        // Output without line breaks is written out in pieces, spaces and all.
+        // The first piece ends with the row that reaches 1 MiB, here a space.
+        let log = format!("{} {}", "x".repeat(1_048_679), "y".repeat(4000));
+        let text = render_text(log.as_bytes());
+        assert!(text.lines().count() > 1, "one line");
+        assert_eq!(text.lines().collect::<String>(), log);
+    }
+
+    #[test]
+    fn written_lines_and_pending_lines_make_the_transcript() {
+        let mut live = Live::new();
+        let log: String = (0..100).map(|k| format!("line {k}\r\n")).collect();
+        live.process(log.as_bytes(), Instant::now(), None);
+        let written = live.take_written();
+        // The screen's rows are pending: they may still change.
+        assert_eq!(written.lines().count(), 71, "{written}");
+        let pending = live.pending();
+        assert_eq!(pending.lines().count(), 29, "{pending}");
+        assert_eq!(live.pending(), pending, "pending changes nothing");
+        live.process(b"\x1b[Hchanged", Instant::now(), None);
+        assert!(live.pending().starts_with("changed"));
+        live.finish();
+        let rest = live.take_written();
+        assert_eq!(format!("{written}{rest}").lines().count(), 100);
+        assert!(live.pending().is_empty());
     }
 
     /// The transcript lines with text of an alternate-screen session drawing each of `frames`
     /// as a synchronized update: a header, the frame's rows from row 20 on, and a footer.
     fn streamed(frames: &[[&str; 5]]) -> Vec<String> {
-        let mut log = String::from("[?1049h");
+        let mut log = String::from("\x1b[?1049h");
         for rows in frames {
-            log.push_str("[?2026h[1;1H[2Kheader");
+            log.push_str("\x1b[?2026h\x1b[1;1H\x1b[2Kheader");
             for (k, row) in rows.iter().enumerate() {
-                log.push_str(&format!("[{};1H[2K{row}", 20 + k));
+                log.push_str(&format!("\x1b[{};1H\x1b[2K{row}", 20 + k));
             }
-            log.push_str("[27;1H[2Kfooter[?2026l");
+            log.push_str("\x1b[27;1H\x1b[2Kfooter\x1b[?2026l");
         }
         render_text(log.as_bytes())
             .lines()
@@ -1178,21 +1598,20 @@ mod tests {
             .collect();
         let torn = format!("\x1b[?1049h{pages}\x1b[?25l\x1b[H\x1b[2Kdrawing row");
         let log = format!("{torn}\x1b[H\x1b[2Kfinal row\x1b[?25h");
-        let pause = torn.len() as u64 | PAUSE;
-        for (marks, shown) in [(vec![pause], false), (vec![pause | LONG], true)] {
-            let text = render_marked(log.as_bytes(), &marks, true);
-            assert_eq!(text.contains("drawing row"), shown, "{marks:?}: {text}");
+        for (long, shown) in [(false, false), (true, true)] {
+            let text = record(log.as_bytes(), &[(torn.len(), Mark::Pause(long))], true);
+            assert_eq!(text.contains("drawing row"), shown, "long {long}: {text}");
             assert!(text.contains("final row"), "{text}");
         }
     }
 
     #[test]
-    fn the_replay_ends_synchronized_updates_where_the_terminal_did() {
+    fn synchronized_updates_end_where_the_terminal_ended_them() {
         // The first page shows at the update's timeout, then the second replaces it before the
-        // update ends; a running task's update still open at the end of its log shows nothing.
+        // update ends; a running task's update still open at the end shows nothing.
         let first = "\x1b[?1049h\x1b[?2026h\x1b[Hfirst page";
         let log = format!("{first}\x1b[Hsecond page\x1b[?2026l\x1b[?2026h\x1b[H\x1b[2Kheld page");
-        let timeout = first.len() as u64 | SYNC_END;
+        let timeout = (first.len(), Mark::SyncEnd);
         let lines = |text: String| -> Vec<String> {
             text.lines()
                 .filter(|line| line.ends_with("page"))
@@ -1209,7 +1628,7 @@ mod tests {
             ),
         ];
         for (marks, closed, expected) in cases {
-            let text = render_marked(log.as_bytes(), &marks, closed);
+            let text = record(log.as_bytes(), &marks, closed);
             assert_eq!(lines(text), expected, "marks {marks:?}, closed {closed}");
         }
     }
@@ -1326,16 +1745,81 @@ mod tests {
     #[test]
     fn a_synchronized_update_shows_once_it_ends_across_reads() {
         let mut live = Live::new();
-        live.process(b"before\r\n\x1b[?2026h", Instant::now());
-        live.process(b"held", Instant::now());
+        live.process(b"before\r\n\x1b[?2026h", Instant::now(), None);
+        live.process(b"held", Instant::now(), None);
         let (rows, _) = live.screen().unwrap();
         assert_eq!(rows, ["before"]);
         assert_eq!(live.shown(), 16, "the held bytes are not shown yet");
         assert!(live.sync_deadline().is_some());
-        live.process(b"\x1b[?2026l", Instant::now());
+        live.process(b"\x1b[?2026l", Instant::now(), None);
         let (rows, _) = live.screen().unwrap();
         assert_eq!(rows, ["before", "held"]);
         assert_eq!(live.shown(), 28);
         assert!(live.sync_deadline().is_none());
+    }
+
+    #[test]
+    fn arbitrary_output_never_stops_the_recorder() {
+        // Pieces of terminal output in random order, read in random pieces with random pauses.
+        const PIECES: [&str; 32] = [
+            "text ",
+            "\r\n",
+            "\n",
+            "\r",
+            "\t",
+            "中文",
+            "e\u{301}",
+            "\x1b[?1049h",
+            "\x1b[?1049l",
+            "\x1b[?2026h",
+            "\x1b[?2026l",
+            "\x1b[?25l",
+            "\x1b[?25h",
+            "\x1b[H",
+            "\x1b[2J",
+            "\x1b[3J",
+            "\x1b[K",
+            "\x1b[2K",
+            "\x1b[5;20r",
+            "\x1b[r",
+            "\x1b[3L",
+            "\x1b[2M",
+            "\x1bM",
+            "\x1b[4S",
+            "\x1b[2T",
+            "\x1b[12;40H",
+            "\x1b[200b",
+            "\x1bc",
+            "\x1b[?3l",
+            "\x1b[P",
+            "\x1b[4@",
+            "\x1b[30;1H",
+        ];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for _ in 0..150 {
+            let log: String = (0..400).map(|_| PIECES[next(PIECES.len())]).collect();
+            let log = log.as_bytes();
+            let mut live = Live::new();
+            let mut start = 0;
+            while start < log.len() {
+                let end = (start + 1 + next(200)).min(log.len());
+                let pause = [None, Some(false), Some(true)][next(3)];
+                live.process(&log[start..end], Instant::now(), pause);
+                start = end;
+                if next(10) == 0 {
+                    live.pending();
+                }
+            }
+            live.end_sync();
+            live.finish();
+            live.take_written();
+            assert!(!live.stopped(), "{:?}", String::from_utf8_lossy(log));
+        }
     }
 }
