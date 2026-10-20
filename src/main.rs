@@ -36,7 +36,7 @@ const MAX_KEY_PAUSE_MS: u64 = 30_000;
 /// Longest a key waits for the program's stdin to accept the input before it.
 const INPUT_ACCEPT_LIMIT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_BYTES: u64 = 16 * 1024;
-const MAX_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1024..=1024 * 1024;
+const MAX_BYTES_RANGE: std::ops::RangeInclusive<u64> = 100..=1024 * 1024;
 /// Room in `maxBytes` for the omission marker, the encoding note, and separators.
 const NOTES_RESERVE: usize = 260;
 /// Smallest window body, so a long status line still leaves room for some output.
@@ -80,15 +80,15 @@ struct Request {
     key_delay_ms: Option<u64>,
     /// poll: close stdin after input (pipe mode only).
     eof: Option<bool>,
-    /// start, poll: how long to wait at most, 0-240000 ms.
+    /// start, poll: how long to wait at most, 0-240000 ms; the cap returns each call within a 5-minute prompt-cache lifetime, so poll again to wait longer. kill ignores it.
     #[schemars(range(min = 0, max = 240000))]
     wait_ms: Option<u64>,
     /// start, poll: end the wait early when any condition holds; the task keeps running. Texts are literal and case-sensitive, 1-16 per condition, each 1-4096 bytes without line breaks. waitMs stays the longest wait and defaults to 30000 with returnWhen.
     return_when: Option<wait::ReturnWhen>,
     /// start, poll, transcript: output window mode (default head_tail; transcript defaults to tail).
     truncate: Option<Truncate>,
-    /// start, poll, transcript: byte budget of the result, 1024-1048576 (default 16384).
-    #[schemars(range(min = 1024, max = 1048576))]
+    /// start, poll, kill, transcript: byte budget of the result, 100-1048576 (default 16384); error messages stay whole.
+    #[schemars(range(min = 100, max = 1048576))]
     max_bytes: Option<u64>,
     /// start, poll: return output without cleaning (default false).
     raw: Option<bool>,
@@ -147,7 +147,7 @@ fn validate(request: &Request) -> Result<View, String> {
             .into_iter()
             .chain(VIEW)
             .collect(),
-        Action::Kill => vec!["taskId"],
+        Action::Kill => vec!["taskId", "waitMs", "maxBytes"],
         Action::List => vec![],
         Action::Transcript => vec!["taskId", "truncate", "maxBytes"],
     };
@@ -227,7 +227,7 @@ fn validate(request: &Request) -> Result<View, String> {
     }
     if let Some(bytes) = request.max_bytes {
         if !MAX_BYTES_RANGE.contains(&bytes) {
-            return Err(format!("maxBytes {bytes} is out of range 1024-1048576."));
+            return Err(format!("maxBytes {bytes} is out of range 100-1048576."));
         }
         if request.truncate == Some(Truncate::None) {
             return Err(
@@ -464,7 +464,10 @@ impl Server {
                 if snapshot.state == "running" {
                     text.push_str(" · the tree did not exit within 5 s; poll later to confirm");
                 }
-                let background = self.tasks.background(&task.id, FOOTER_LIMIT);
+                output::cut_to(&mut text, view.max_bytes / 2 + 1);
+                let background = self
+                    .tasks
+                    .background(&task.id, FOOTER_LIMIT.min(view.max_bytes / 4));
                 if let Some((line, _)) = &background {
                     text.push('\n');
                     text.push_str(line);
@@ -793,8 +796,9 @@ impl Server {
             view.max_bytes - status.len() - 2 - footer.len()
         };
         let (output, cut_lines) = window.fit(room);
+        // A small maxBytes may leave no room for the placeholder.
         let body = if output.is_empty() {
-            empty
+            if empty.len() <= room { empty } else { "" }
         } else {
             output.as_str()
         };
@@ -862,7 +866,7 @@ impl Server {
         }
         // cut_to keeps budget - 1 bytes; the separators are already outside `room`.
         output::cut_to(&mut body, room + 1);
-        let shown = if body.is_empty() {
+        let shown = if body.is_empty() && room >= "(blank screen)".len() {
             "(blank screen)"
         } else {
             &body

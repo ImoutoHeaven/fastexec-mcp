@@ -113,14 +113,14 @@ One tool takes an `action` and the parameters that apply to it:
 |---|---|---|
 | `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `waitMs` (default 30000), `returnWhen`, output options, `screen` | Runs the command in bash and waits. Returns the final result when the command exits in time; otherwise returns a `taskId` and the output so far. |
 | `poll` | `taskId`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs` (default 2000 with input or keys and no `returnWhen`, 30000 otherwise), `returnWhen`, output options, `screen` | Writes `input` exactly as given, then presses `keys`, closes stdin when `eof` is true, waits until the task ends, a `returnWhen` condition holds, or `waitMs` elapses, and returns output not yet seen. |
-| `kill` | `taskId` | Terminates the task's process tree and returns its final state. A failed termination call returns an error naming the cause. |
+| `kill` | `taskId`, `maxBytes` | Terminates the task's process tree and returns its final state. It accepts and ignores `waitMs`. A failed termination call returns an error naming the cause. |
 | `list` | — | Lists this server's tasks, newest first. |
 | `transcript` | `taskId`, `truncate` (default `tail`), `maxBytes` | Returns a PTY task's transcript from the first final line no earlier `transcript` returned, then the pending lines, such as the screen's. The file it names holds the whole text. |
 
 Output options:
 
 - `truncate`: `head_tail` (default), `head`, `tail`, or `none`. The bounded modes cut lines longer than 2000 characters (64 KiB with `raw`) and count them in `cutLines`; `none` returns whole lines.
-- `maxBytes`: 1024–1048576, default 16384. It bounds the output window and status line together. `both` includes a second copy of the window in JSON; metadata and JSON serialization add bytes to the MCP response.
+- `maxBytes`: 100–1048576, default 16384. It bounds the output window and status line together; error messages stay whole. `both` includes a second copy of the window in JSON; metadata and JSON serialization add bytes to the MCP response.
 - `raw`: `true` skips cleaning.
 - `encoding`: a WHATWG label such as `big5` or `gbk`.
 

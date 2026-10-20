@@ -453,6 +453,8 @@ fn background_footer_names_unreported_tasks_once_failures_first() {
             && footer.ends_with("; 3 more; 6 running; use list.)"),
         "{text}"
     );
+    let (_, text) = server.ok(json!({"action": "start", "command": "seq 1 5000", "maxBytes": 100}));
+    assert!(text.len() <= 100, "{} bytes: {text}", text.len());
 }
 
 #[cfg(unix)]
@@ -1060,8 +1062,10 @@ fn kill_and_root_exit_end_the_whole_process_tree() {
         assert_eq!(out["state"], "killed", "pty={pty}");
         assert!(file_len(killed) > 0, "the heartbeat never started");
         assert_stops_growing(killed);
-        let (again, _) = server.ok(json!({"action": "kill", "taskId": id}));
+        let (again, text) =
+            server.ok(json!({"action": "kill", "taskId": id, "waitMs": 0, "maxBytes": 100}));
         assert_eq!(again["state"], "killed");
+        assert!(text.len() <= 100, "{} bytes: {text}", text.len());
 
         let command = format!("{} echo started", heartbeat(leaked_bash));
         let (out, _) =
@@ -1178,6 +1182,22 @@ fn output_window_respects_max_bytes_and_points_at_the_log() {
         (text.split_once("\n\n").unwrap().0.len(), &out["cutLines"]),
         (70000, &json!(0))
     );
+
+    // Small budgets leave out a placeholder that does not fit beside the status and footer.
+    let (pty, _) = server.ok(json!({"action": "start", "command": "true", "pty": true}));
+    let id = &pty["taskId"];
+    server.ok(json!({"action": "transcript", "taskId": id}));
+    server.ok(json!({"action": "start", "command": "sleep 30", "waitMs": 0}));
+    for max in [100, 128, 144, 160] {
+        for call in [
+            json!({"action": "transcript", "taskId": id, "maxBytes": max}),
+            json!({"action": "poll", "taskId": id, "waitMs": 0, "maxBytes": max}),
+            json!({"action": "poll", "taskId": id, "waitMs": 0, "screen": true, "maxBytes": max}),
+        ] {
+            let (_, text) = server.ok(call);
+            assert!(text.len() <= max, "{} bytes: {text}", text.len());
+        }
+    }
 }
 
 #[test]
@@ -1319,7 +1339,7 @@ fn invalid_parameters_are_rejected_and_null_means_omitted() {
             "out of range",
         ),
         (
-            json!({"action": "start", "command": "true", "maxBytes": 1000}),
+            json!({"action": "start", "command": "true", "maxBytes": 99}),
             "out of range",
         ),
         (
