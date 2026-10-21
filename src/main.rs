@@ -461,7 +461,6 @@ impl Server {
             }
             Action::Kill => {
                 let task = self.task(request.task_id.as_deref())?;
-                let kept = task.snapshot().kept;
                 task.kill().map_err(|error| {
                     format!(
                         "Cannot terminate the process tree of {}: {error}. Poll to see its state, or retry kill.",
@@ -474,12 +473,10 @@ impl Server {
                     let _ = tree_done.wait_for(|done| *done).await;
                 };
                 let _ = tokio::time::timeout(KILL_WAIT, finished).await;
-                let snapshot = task.snapshot();
+                let snapshot = task.snapshot_held();
                 let mut text = status_line(&task, &snapshot);
                 if snapshot.state == "running" || snapshot.kept {
                     text.push_str(" · the tree did not exit within 5 s; poll later to confirm");
-                } else if kept {
-                    text.push_str(" · the kept processes ended");
                 }
                 output::cut_to(&mut text, view.max_bytes / 2 + 1);
                 let background = self
@@ -520,12 +517,9 @@ impl Server {
         let tasks = self.tasks.all();
         let mut lines = Vec::new();
         let mut entries = Vec::new();
-        let mut shown_final = Vec::new();
+        let mut shown = Vec::new();
         for task in &tasks {
-            let snapshot = task.snapshot();
-            if snapshot.state != "running" {
-                shown_final.push(task);
-            }
+            let snapshot = task.snapshot_held();
             let command: String = task.command.chars().take(120).collect();
             let code = snapshot
                 .exit_code
@@ -537,7 +531,9 @@ impl Server {
                 snapshot.elapsed.as_secs_f64(),
                 if task.pty { " pty" } else { "" },
                 if snapshot.kept {
-                    format!(" · keeps {}", members(&snapshot.leftovers))
+                    format!(" · keeps {}", members(&snapshot.held))
+                } else if snapshot.tree_ended {
+                    " · kept processes ended".to_string()
                 } else {
                     String::new()
                 },
@@ -547,11 +543,13 @@ impl Server {
                 "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
                 "elapsedMs": snapshot.elapsed.as_millis() as u64, "command": command, "logPath": task.log_path,
                 "lifetimeExpired": snapshot.expired, "keepTree": task.keep, "keptRunning": snapshot.kept,
+                "held": members_json(&snapshot.held),
             }));
+            shown.push((task, snapshot));
         }
-        // The list shows these final states, which settles the background footer's notices.
-        for task in shown_final {
-            task.mark_reported();
+        // The list shows these states, which settles the background footer's notices.
+        for (task, snapshot) in shown {
+            task.mark_reported(&snapshot);
         }
         let text = if lines.is_empty() {
             "No tasks.".to_string()
@@ -617,14 +615,12 @@ async fn press(
     Ok(())
 }
 
-/// Marks the footer's finished tasks, and the task itself when its shown snapshot was final,
-/// reported once their result is built.
-fn report(task: &Task, shown: &Snapshot, background: Option<(String, Vec<Arc<Task>>)>) {
-    if shown.state != "running" {
-        task.mark_reported();
-    }
-    for shown in background.map(|(_, shown)| shown).unwrap_or_default() {
-        shown.mark_reported();
+/// Marks what the result showed of the task and of the footer's tasks reported, once the
+/// result is built.
+fn report(task: &Task, shown: &Snapshot, background: Option<(String, Vec<tasks::Shown>)>) {
+    task.mark_reported(shown);
+    for (task, shown) in background.map(|(_, shown)| shown).unwrap_or_default() {
+        task.mark_reported(&shown);
     }
 }
 
@@ -652,7 +648,7 @@ impl Server {
         // The state is taken before the read: a finished state means output reached EOF (or
         // stayed open, which the status line notes), so the window below holds all of it. The
         // status line can only grow by its notes.
-        let before = task.snapshot();
+        let before = task.snapshot_held();
         let reserved = status_line(&task, &before).len()
             + ended.note(view.conditions).len()
             + NOTES_RESERVE
@@ -709,7 +705,7 @@ impl Server {
         task: Arc<Task>,
         view: View,
     ) -> Result<CallToolResult, String> {
-        let snapshot = task.snapshot();
+        let snapshot = task.snapshot_held();
         let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
         let transcript = tokio::task::spawn_blocking(move || reader.transcript(&tasks))
             .await
@@ -854,7 +850,7 @@ impl Server {
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
         // A finished state, taken first, means the screen below holds all output.
-        let snapshot = task.snapshot();
+        let snapshot = task.snapshot_held();
         let screen = task.screen()?;
         // The stream counts as read up to the output the screen shows.
         let (reader, until) = (Arc::clone(&task), screen.log_end);
@@ -944,18 +940,19 @@ fn status_line(task: &Task, snapshot: &Snapshot) -> String {
     if snapshot.evicted {
         line.push_str(" · log evicted under the 1 GiB total limit");
     }
-    if !snapshot.leftovers.is_empty() {
-        let names = members(&snapshot.leftovers);
-        match (&snapshot.kill_error, snapshot.kept) {
-            (Some(error), true) => {
-                line.push_str(&format!(" · could not end {names}: {error}; kill retries"));
-            }
-            (None, true) => line.push_str(&format!(" · keeps {names} running; kill ends them")),
-            (None, false) if !task.keep => line.push_str(&format!(
-                " · ended with bash: {names}; start with keepTree: true to keep them"
-            )),
-            _ => {}
-        }
+    if snapshot.kept {
+        let names = members(&snapshot.held);
+        line.push_str(&match &snapshot.kill_error {
+            Some(error) => format!(" · could not end {names}: {error}; kill retries"),
+            None => format!(" · keeps {names} running; kill ends them"),
+        });
+    } else if snapshot.tree_ended {
+        line.push_str(" · kept processes ended");
+    } else if !snapshot.leftovers.is_empty() && !task.keep {
+        line.push_str(&format!(
+            " · ended with bash: {}; start with keepTree: true to keep them",
+            members(&snapshot.leftovers)
+        ));
     }
     if snapshot.output_open {
         line.push_str(if snapshot.kept {
@@ -969,6 +966,9 @@ fn status_line(task: &Task, snapshot: &Snapshot) -> String {
 
 /// Names processes as `adb.exe (4120), sleep (77) and 3 more`.
 fn members(members: &[process::Member]) -> String {
+    if members.is_empty() {
+        return "processes".into();
+    }
     let mut text = members
         .iter()
         .take(3)
@@ -994,10 +994,20 @@ fn task_json(action: Action, task: &Task, snapshot: &Snapshot) -> Value {
         "lifetimeExpired": snapshot.expired,
         "logError": snapshot.log_error,
         "keepTree": task.keep,
-        "leftovers": snapshot.leftovers.iter().map(|member| json!({"pid": member.pid, "name": member.name})).collect::<Vec<_>>(),
+        "leftovers": members_json(&snapshot.leftovers),
         "keptRunning": snapshot.kept,
+        "held": members_json(&snapshot.held),
         "killError": snapshot.kill_error,
     })
+}
+
+fn members_json(members: &[process::Member]) -> Value {
+    json!(
+        members
+            .iter()
+            .map(|member| json!({"pid": member.pid, "name": member.name}))
+            .collect::<Vec<_>>()
+    )
 }
 
 fn add_window(value: &mut Value, window: &Window) {

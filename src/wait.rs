@@ -1,5 +1,6 @@
 //! The wait of `start` and `poll`: it ends when the task ends, `waitMs` elapses, or a
-//! `returnWhen` condition holds.
+//! `returnWhen` condition holds. For a task that holds processes past its root's exit, the
+//! task ends when they do, once a result has shown the root's exit.
 
 use crate::output::{Cleaner, Matcher};
 use crate::tasks::Task;
@@ -82,6 +83,8 @@ impl ReturnWhen {
 /// that matched.
 pub enum WaitEnd {
     TaskEnded,
+    /// The processes a task held past its root's exit ended.
+    TreeEnded,
     OutputContains(String),
     ScreenContains(String),
     ScreenAppears(String),
@@ -94,6 +97,7 @@ impl WaitEnd {
     fn parts(&self) -> (&'static str, Option<&str>) {
         match self {
             WaitEnd::TaskEnded => ("task_ended", None),
+            WaitEnd::TreeEnded => ("tree_ended", None),
             WaitEnd::OutputContains(text) => ("output_contains", Some(text)),
             WaitEnd::ScreenContains(text) => ("screen_contains", Some(text)),
             WaitEnd::ScreenAppears(text) => ("screen_appears", Some(text)),
@@ -130,7 +134,7 @@ impl WaitEnd {
             WaitEnd::ScreenGone(text) => format!(" · wait: screen text gone {}", quote(text)),
             WaitEnd::Quiet => " · wait: output quiet".into(),
             WaitEnd::MaxWait if conditions => " · wait: waitMs elapsed".into(),
-            WaitEnd::TaskEnded | WaitEnd::MaxWait => String::new(),
+            WaitEnd::TaskEnded | WaitEnd::TreeEnded | WaitEnd::MaxWait => String::new(),
         }
     }
 }
@@ -141,6 +145,8 @@ pub struct Mark {
     cursor: u64,
     cleaner: Cleaner,
     rows: Vec<String>,
+    /// A result had shown the root's exit before this call, so the exit is not news to it.
+    root_reported: bool,
 }
 
 pub fn mark(task: &Task, when: Option<&ReturnWhen>) -> Result<Mark, String> {
@@ -156,7 +162,43 @@ pub fn mark(task: &Task, when: Option<&ReturnWhen>) -> Result<Mark, String> {
         cursor,
         cleaner,
         rows,
+        root_reported: task.is_reported(),
     })
+}
+
+/// Whether the end of the task's root or tree ends this wait, and how. The root's exit ends a
+/// wait that has not seen it, unless the call waits for conditions, the root exited 0, and the
+/// task held processes past the exit that can still meet them. Past that, a task that holds
+/// processes counts as running until they end.
+fn ended(task: &Task, root_reported: bool, conditions: bool) -> Option<WaitEnd> {
+    let (code, held_past_exit) = task.root_end()?;
+    let waits_past_exit = conditions && code == 0 && held_past_exit;
+    if !root_reported && !waits_past_exit {
+        return Some(WaitEnd::TaskEnded);
+    }
+    let holds = task.keeps_processes();
+    match (holds, held_past_exit) {
+        (true, _) => None,
+        (false, true) => Some(WaitEnd::TreeEnded),
+        (false, false) => Some(WaitEnd::TaskEnded),
+    }
+}
+
+/// Ends a wait the end of the task or its tree ended. After the tree, the output those
+/// processes held open reaches EOF shortly: the wait gives it up to the drain cap, within its
+/// deadline, so the result holds their last output.
+async fn finish(task: &Task, end: WaitEnd, deadline: tokio::time::Instant) -> WaitEnd {
+    if matches!(end, WaitEnd::TreeEnded) {
+        let until = deadline.min(tokio::time::Instant::now() + crate::tasks::DRAIN_CAP);
+        let mut activity = task.activity();
+        while !task.output_closed() {
+            tokio::select! {
+                _ = activity.changed() => {}
+                _ = tokio::time::sleep_until(until) => break,
+            }
+        }
+    }
+    end
 }
 
 /// The screen conditions of a wait, with what they compare against.
@@ -242,7 +284,9 @@ pub async fn wait(
     let mut ticks =
         tokio::time::interval_at(tokio::time::Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
     let mut done = task.done();
+    let mut tree_done = task.tree_done();
     let mut activity = task.activity();
+    let (root_reported, conditions) = (mark.root_reported, when.is_some());
     let output_texts = when
         .and_then(|when| when.output_contains.as_deref())
         .unwrap_or_default();
@@ -256,8 +300,10 @@ pub async fn wait(
     // Set once the deadline passes: the conditions get one last look at what arrived by then.
     let mut expired = false;
     loop {
-        if *done.borrow_and_update() {
-            return Ok(WaitEnd::TaskEnded);
+        done.borrow_and_update();
+        tree_done.borrow_and_update();
+        if let Some(end) = ended(task, root_reported, conditions) {
+            return Ok(finish(task, end, deadline).await);
         }
         let mut quiet_until = None;
         let met = 'check: {
@@ -301,16 +347,16 @@ pub async fn wait(
         };
         // A task that ended while the conditions were checked takes precedence.
         if let Some(met) = met.or(expired.then_some(WaitEnd::MaxWait)) {
-            return Ok(if *done.borrow() {
-                WaitEnd::TaskEnded
-            } else {
-                met
+            return Ok(match ended(task, root_reported, conditions) {
+                Some(end) => finish(task, end, deadline).await,
+                None => met,
             });
         }
         tokio::select! {
             biased;
             _ = context.ct.cancelled() => return Err("Cancelled; the task keeps running.".into()),
             _ = done.changed() => {}
+            _ = tree_done.changed() => {}
             _ = tokio::time::sleep_until(deadline) => expired = true,
             _ = activity.changed() => {}
             _ = tokio::time::sleep_until(quiet_until.unwrap_or(deadline)), if quiet_until.is_some() => {}

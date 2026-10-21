@@ -198,11 +198,24 @@ fn heartbeat(bash_path: &str) -> String {
     format!("(while :; do echo x >> '{bash_path}'; sleep 0.1; done) &")
 }
 
-/// Waits up to 10 s for a heartbeat's first line; a loaded machine can start it late.
+/// Waits up to 30 s for a heartbeat's first line; a loaded machine can start it late.
 fn wait_for_heartbeat(path: &PathBuf) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while file_len(path) == 0 {
         assert!(Instant::now() < deadline, "the heartbeat never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits up to 30 s for a file a command creates.
+fn wait_for_file(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -428,11 +441,17 @@ fn kill_after_ms_bounds_task_lifetime_independently_of_waits() {
 
 #[test]
 fn background_footer_names_unreported_tasks_once_failures_first() {
+    let markers = ["footer-0", "footer-7"].map(scratch);
+    let [(_, zero), (_, seven)] = &markers;
     let mut server = Server::start();
-    server.ok(json!({"action": "start", "command": "sleep 60", "waitMs": 0}));
-    server.ok(json!({"action": "start", "command": "sleep 1; exit 0", "waitMs": 0}));
-    server.ok(json!({"action": "start", "command": "sleep 1; exit 7", "waitMs": 0}));
-    let (_, text) = server.ok(json!({"action": "poll", "taskId": server.id(1), "waitMs": 4000}));
+    // The first task prints once both others have run their last command, and some time after.
+    let first = format!(
+        "until [ -e {zero} ] && [ -e {seven} ]; do sleep 0.1; done; sleep 2; echo both; sleep 60"
+    );
+    server.ok(json!({"action": "start", "command": first, "waitMs": 0}));
+    server.ok(json!({"action": "start", "command": format!("sleep 1; touch {zero}; exit 0"), "waitMs": 0}));
+    server.ok(json!({"action": "start", "command": format!("sleep 1; touch {seven}; exit 7"), "waitMs": 0}));
+    let (_, text) = server.ok(json!({"action": "poll", "taskId": server.id(1), "waitMs": 60000, "returnWhen": {"outputContains": ["both"]}}));
     let footer = text.lines().last().unwrap();
     let expected = format!(
         "(Background: {} exited 7, {} exited 0.)",
@@ -486,22 +505,17 @@ fn bash_override_must_exit_successfully() {
 #[test]
 fn long_command_yields_then_poll_returns_only_unseen_output() {
     let mut server = Server::start();
-    let (out, text) = server.ok(
-        json!({"action": "start", "command": "echo first; sleep 4; echo second", "waitMs": 2000}),
-    );
+    let (out, text) = server.ok(json!({"action": "start", "command": "echo first; sleep 4; echo second", "waitMs": 30000, "returnWhen": {"outputContains": ["first"]}}));
     assert_eq!(out["state"], "running");
-    assert!(
-        text.starts_with("first\n") && !text.contains("wait:"),
-        "a wait without returnWhen adds no note: {text}"
-    );
-    let (out, text) = server.ok(json!({"action": "poll", "taskId": server.id(1), "waitMs": 10000}));
+    assert!(text.starts_with("first\n"), "{text}");
+    let (out, text) = server.ok(json!({"action": "poll", "taskId": server.id(1), "waitMs": 30000}));
     assert_eq!(
         (out["state"].as_str(), out["exitCode"].as_i64()),
         (Some("exited"), Some(0))
     );
     assert!(
-        text.starts_with("second\n") && !text.contains("first"),
-        "{text}"
+        text.starts_with("second\n") && !text.contains("first") && !text.contains("wait:"),
+        "a wait without returnWhen adds no note: {text}"
     );
 }
 
@@ -513,7 +527,7 @@ fn pipe_input_arrives_verbatim_and_eof_closes_stdin() {
         command.env_remove("FASTEXEC_BASH");
     });
     server.ok(json!({"action": "start", "command": "while IFS= read -r l || [ -n \"$l\" ]; do echo \"got:$l\"; done; echo end", "waitMs": 0}));
-    let (_, text) = server.ok(json!({"action": "poll", "taskId": server.id(1), "input": "a b\n"}));
+    let (_, text) = server.ok(json!({"action": "poll", "taskId": server.id(1), "input": "a b\n", "waitMs": 30000, "returnWhen": {"outputContains": ["got:a b"]}}));
     assert!(text.starts_with("got:a b\n"), "{text}");
     let (out, text) = server
         .ok(json!({"action": "poll", "taskId": server.id(1), "input": "c", "eof": true, "waitMs": 10000}));
@@ -529,7 +543,7 @@ fn pipe_input_arrives_verbatim_and_eof_closes_stdin() {
     );
 
     // A program that closes its stdin refuses later input instead of queueing it.
-    let (_, text) = server.ok(json!({"action": "start", "command": "exec 0<&-; echo stdin-closed; sleep 30", "waitMs": 5000, "returnWhen": {"outputContains": ["stdin-closed"]}}));
+    let (_, text) = server.ok(json!({"action": "start", "command": "exec 0<&-; echo stdin-closed; sleep 30", "waitMs": 30000, "returnWhen": {"outputContains": ["stdin-closed"]}}));
     assert!(text.starts_with("stdin-closed\n"), "{text}");
     // A write discovers the closed reader asynchronously. Wait for rejection,
     // rather than assuming the writer thread has finished after a fixed sleep.
@@ -553,8 +567,7 @@ fn pipe_input_arrives_verbatim_and_eof_closes_stdin() {
 fn pty_task_sees_a_terminal_and_accepts_a_hidden_password() {
     let mut server = Server::start();
     let command = "[ -t 0 ] && echo tty; read -r -s -p 'Password: ' p; echo; echo \"len=${#p}\"";
-    let (out, text) =
-        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 5000}));
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["Password:"]}}));
     assert_eq!(out["state"], "running", "{text}");
     assert!(text.contains("tty") && text.contains("Password:"), "{text}");
     let (out, text) = server.ok(
@@ -575,8 +588,7 @@ fn pty_keys_follow_input_and_the_programs_cursor_mode() {
     let mut server = Server::start();
     // The program switches to application cursor mode (DECCKM), then dumps what it reads.
     let command = "stty raw -echo; printf '\\033[?1hready\\r\\n'; head -c 9 | od -An -tx1";
-    let (_, text) =
-        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 3000}));
+    let (_, text) = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["ready"]}}));
     assert!(text.contains("ready"), "{text}");
     let (_, text, is_error) =
         server.call(json!({"action": "poll", "taskId": server.id(1), "keys": ["Up", "C-Enter"]}));
@@ -635,11 +647,14 @@ fn keys_pause_after_input_and_follow_the_modes_set_meanwhile() {
         "stty raw -echo; printf 'ready\\r\\n'; dd bs=64 count=1 2>/dev/null | od -An -tx1; ",
         "printf '\\033[?1h'; for i in 1 2; do dd bs=64 count=1 2>/dev/null | od -An -tx1; done"
     );
-    // By default the keys come after the text, Up after the mode switch; without a pause,
-    // the text and keys go out in one write, read at once, before it.
+    // With a pause the keys come after the text, Up after the mode switch; without one, the
+    // text and keys go out in one write, read at once, before it. The pause is longer than the
+    // default, so a slow machine starts the program's next read in time; the default pause is
+    // measured below.
     for (delay, first, up) in [
-        (None, " 61 62\n", "1b 4f 41"),
+        (Some(1000), " 61 62\n", "1b 4f 41"),
         (Some(0), " 61 62 0d 1b 5b 41\n", "1b 5b 41"),
+        (None, "", ""),
     ] {
         let (out, _) = server.ok(json!({
             "action": "start", "command": command, "pty": true, "waitMs": 20000,
@@ -653,7 +668,12 @@ fn keys_pause_after_input_and_follow_the_modes_set_meanwhile() {
         if let Some(delay) = delay {
             poll["keyDelayMs"] = json!(delay);
         }
+        let begun = Instant::now();
         let (_, text) = server.ok(poll);
+        if delay.is_none() {
+            // 150 ms before each of the two keys.
+            assert!(begun.elapsed() >= Duration::from_millis(300), "{text}");
+        }
         assert!(
             text.starts_with(first) && text.contains(up),
             "{first:?}, {up}: {text}"
@@ -672,11 +692,11 @@ fn pty_keys_follow_the_kitty_keyboard_protocol_the_program_pushes() {
         "printf 'flags=%s\\r\\n' \"${flags#?}\"; head -c 14 | od -An -tx1; ",
         "printf '\\033[<upopped\\r\\n'; head -c 2 | od -An -tx1"
     );
-    let (_, text) =
-        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 3000}));
+    let (_, text) = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["flags=[?1"]}}));
     assert!(text.contains("flags=[?1"), "{text}");
     let (_, text) = server.ok(json!({
-        "action": "poll", "taskId": server.id(1), "keys": ["Escape", "C-i", "Tab"], "waitMs": 3000
+        "action": "poll", "taskId": server.id(1), "keys": ["Escape", "C-i", "Tab"], "waitMs": 30000,
+        "returnWhen": {"outputContains": ["popped"]}
     }));
     assert!(
         text.contains("1b 5b 32 37 75 1b 5b 31 30 35 3b 35 75 09") && text.contains("popped"),
@@ -694,8 +714,7 @@ fn a_terminal_emulator_failure_leaves_the_output_flowing() {
     let mut server = Server::start();
     // alacritty_terminal 0.26 panics past 4096 kitty keyboard pushes.
     let command = "printf '\\033[>1u%.0s' $(seq 1 4097); printf 'alive\\r\\n'; read -r x; printf 'done\\r\\n'";
-    let (_, text) =
-        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 5000}));
+    let (_, text) = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["alive"]}}));
     assert!(text.contains("alive"), "{text}");
     let (_, text, is_error) =
         server.call(json!({"action": "poll", "taskId": server.id(1), "keys": ["Enter"]}));
@@ -714,7 +733,8 @@ fn screen_shows_the_rendered_terminal_and_marks_the_stream_read() {
     let command =
         "printf 'frame-1\\r\\n'; sleep 0.5; printf '\\033[H\\033[2J\\033[2;3Hframe-2'; read -r x";
     let (out, text) = server.ok(json!({
-        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 3000
+        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 30000,
+        "returnWhen": {"screenContains": ["frame-2"]}
     }));
     assert_eq!(out["state"], "running", "{text}");
     let body = text.split("\n\n[").next().unwrap();
@@ -727,7 +747,8 @@ fn screen_shows_the_rendered_terminal_and_marks_the_stream_read() {
     // A full first row leaves the cursor in the last column, pending the wrap.
     let command = "printf '%0120d' 0; read -r x";
     let (out, text) = server.ok(json!({
-        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 3000
+        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 30000,
+        "returnWhen": {"screenContains": ["0000000000"]}
     }));
     assert_eq!(out["cursor"], json!([1, 120]), "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(2)}));
@@ -735,7 +756,8 @@ fn screen_shows_the_rendered_terminal_and_marks_the_stream_read() {
     // A synchronized update the program leaves open shows once it times out.
     let command = "printf 'shown\\r\\n\\033[?2026hheld'; read -r x";
     let (_, text) = server.ok(json!({
-        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 2000
+        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 30000,
+        "returnWhen": {"screenContains": ["held"]}
     }));
     assert_eq!(text.split("\n\n[").next().unwrap(), "shown\nheld", "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(3)}));
@@ -944,7 +966,8 @@ fn screen_and_transcript_render_the_same_terminal() {
     ]
     .join("\n");
     let (out, text) = server.ok(json!({
-        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 3000
+        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 30000,
+        "returnWhen": {"screenContains": ["dch  a"]}
     }));
     assert_eq!(out["state"], "running", "{text}");
     assert_eq!(
@@ -1065,7 +1088,7 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
     // the pending rows again, with the line typed since.
     let first = out["finalLines"].as_u64().unwrap() + 1;
     assert!(out["transcriptLines"].as_u64().unwrap() >= first, "{text}");
-    server.ok(json!({"action": "poll", "taskId": server.id(2), "input": "typed", "waitMs": 500}));
+    server.ok(json!({"action": "poll", "taskId": server.id(2), "input": "typed", "waitMs": 30000, "returnWhen": {"screenContains": ["40typed"]}}));
     let (out, text) =
         server.ok(json!({"action": "transcript", "taskId": server.id(2), "truncate": "none"}));
     assert_eq!(out["firstLine"], json!(first), "{text}");
@@ -1108,7 +1131,7 @@ fn kill_and_root_exit_end_the_whole_process_tree() {
 
         let command = format!("{} echo started", heartbeat(leaked_bash));
         let (out, text) =
-            server.ok(json!({"action": "start", "command": command, "pty": pty, "waitMs": 10000}));
+            server.ok(json!({"action": "start", "command": command, "pty": pty, "waitMs": 60000}));
         assert_eq!(out["state"], "exited", "pty={pty}");
         assert!(
             text.contains("ended with bash: ") && text.contains("keepTree: true"),
@@ -1157,19 +1180,27 @@ fn keep_tree_keeps_what_bash_leaves_until_kill_or_deadline() {
             .cloned()
             .unwrap();
         assert_eq!(entry["keptRunning"], true);
+        assert!(!entry["held"].as_array().unwrap().is_empty(), "{entry}");
         let (out, text) = server.ok(json!({"action": "kill", "taskId": id}));
         assert_eq!(
             out["state"], "exited",
             "kill keeps the root's result: {text}"
         );
         assert_eq!(out["keptRunning"], false, "{text}");
-        assert!(text.contains("the kept processes ended"), "{text}");
+        assert_eq!(out["held"], json!([]), "{text}");
+        assert!(text.contains("kept processes ended"), "{text}");
         assert_stops_growing(kept);
 
         let command = format!("{} echo started", heartbeat(expiring_bash));
-        let (out, text) = server.ok(json!({"action": "start", "command": command, "pty": pty, "keepTree": true, "killAfterMs": 2000, "waitMs": 10000}));
+        let (out, text) = server.ok(json!({"action": "start", "command": command, "pty": pty, "keepTree": true, "killAfterMs": 8000, "waitMs": 60000}));
         assert_eq!(out["keptRunning"], true, "pty={pty}: {text}");
-        std::thread::sleep(Duration::from_millis(2000));
+        let id = out["taskId"].clone();
+        let (out, text) = server.ok(json!({"action": "poll", "taskId": id, "waitMs": 60000}));
+        assert_eq!(
+            out["waitEndedBy"]["condition"], "tree_ended",
+            "killAfterMs ends the kept processes: {text}"
+        );
+        assert_eq!(out["exitCode"], 0, "and keeps the root's result: {text}");
         assert_stops_growing(expiring);
     }
     let (out, text) = server.ok(json!({"action": "start", "command": "true", "keepTree": true}));
@@ -1178,6 +1209,71 @@ fn keep_tree_keeps_what_bash_leaves_until_kill_or_deadline() {
         "nothing left, nothing kept: {text}"
     );
     assert_eq!(out["leftovers"], json!([]));
+}
+
+#[test]
+fn waits_on_kept_processes_last_until_they_end_or_a_condition_holds() {
+    let markers = ["late-go", "short-done"].map(scratch);
+    let [(go, go_bash), (done, done_bash)] = &markers;
+    let mut server = Server::start();
+    // Without returnWhen, the root's exit is the result, however long the kept processes run:
+    // these wait for a file the test writes later.
+    let command =
+        format!("(until [ -e {go_bash} ]; do sleep 0.1; done; echo late; sleep 2) & echo early");
+    let (out, text) = server
+        .ok(json!({"action": "start", "command": command, "keepTree": true, "waitMs": 60000}));
+    assert_eq!(out["waitEndedBy"]["condition"], "task_ended", "{text}");
+    assert_eq!(out["keptRunning"], true, "{text}");
+    let id = server.id(1);
+    // Once a result showed the exit, waits outlast it: conditions on the kept processes' output
+    // hold, and without them the wait ends with the tree.
+    std::fs::write(&**go, "").unwrap();
+    let (out, text) = server.ok(json!({"action": "poll", "taskId": id, "waitMs": 60000, "returnWhen": {"outputContains": ["late"]}}));
+    assert_eq!(out["waitEndedBy"]["condition"], "output_contains", "{text}");
+    assert!(text.starts_with("late"), "{text}");
+    let (out, text) = server.ok(json!({"action": "poll", "taskId": id, "waitMs": 20000}));
+    assert_eq!(out["waitEndedBy"]["condition"], "tree_ended", "{text}");
+    assert_eq!(out["keptRunning"], false, "{text}");
+    assert!(text.contains("kept processes ended"), "{text}");
+    let (out, _) = server.ok(json!({"action": "poll", "taskId": id, "waitMs": 20000}));
+    assert_eq!(
+        out["waitEndedBy"]["condition"], "tree_ended",
+        "an ended tree ends waits at once"
+    );
+
+    // returnWhen waits past a root exit 0 for what the kept processes print.
+    let command = "(sleep 2; echo ready; sleep 300) & echo started";
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "keepTree": true, "waitMs": 20000, "returnWhen": {"outputContains": ["ready"]}}));
+    assert_eq!(out["waitEndedBy"]["condition"], "output_contains", "{text}");
+    assert!(text.contains("started\nready"), "{text}");
+    let ready = server.id(2);
+    // A root that fails ends the wait at once.
+    let command = "sleep 300 & exit 3";
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "keepTree": true, "waitMs": 20000, "returnWhen": {"outputContains": ["never"]}}));
+    assert_eq!(out["waitEndedBy"]["condition"], "task_ended", "{text}");
+    assert_eq!(out["exitCode"], 3, "{text}");
+    let failed = server.id(3);
+
+    // The footer names the tasks that keep processes, and once the end of a tree it did not show.
+    let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
+    assert!(text.contains(&format!("{ready} keeps ")), "{text}");
+    server.ok(json!({"action": "kill", "taskId": failed}));
+    let command = format!("(sleep 1; touch {done_bash}) & echo short");
+    server.ok(json!({"action": "start", "command": command, "keepTree": true, "waitMs": 60000}));
+    let short = server.id(5);
+    wait_for_file(done);
+    std::thread::sleep(Duration::from_millis(2000));
+    let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
+    assert!(
+        text.contains(&format!("{short} kept processes ended")),
+        "{text}"
+    );
+    let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
+    assert!(
+        !text.contains(&format!("{short} kept")),
+        "shown once: {text}"
+    );
+    server.ok(json!({"action": "kill", "taskId": ready}));
 }
 
 /// A heartbeat in a new session through a double fork, as daemonizing servers (adb) start;
@@ -1580,8 +1676,14 @@ fn encoding_decodes_legacy_output_and_long_commands_run_from_a_script() {
         ("gbk", "", "\\xd6", "\\xd0"),
         ("big5", "printf '%5000s' '' | tr ' ' a; ", "\\xa4", "\\xa4"),
     ] {
-        let command = format!("{prefix}printf '{lead}'; read -r x; printf '{trail}\\n'");
-        let (out, text) = server.ok(json!({"action": "start", "command": command, "encoding": encoding, "loginShell": false, "waitMs": 1000}));
+        // The marker shows when the lead byte is out, so the poll after it reads up to it.
+        let (marker, marker_bash) = scratch(&format!("lead-{encoding}-{}", prefix.len()));
+        let command =
+            format!("{prefix}printf '{lead}'; touch {marker_bash}; read -r x; printf '{trail}\\n'");
+        let (out, _) = server.ok(json!({"action": "start", "command": command, "encoding": encoding, "loginShell": false, "waitMs": 0}));
+        wait_for_file(&marker);
+        std::thread::sleep(Duration::from_millis(300));
+        let (_, text) = server.ok(json!({"action": "poll", "taskId": out["taskId"], "waitMs": 0}));
         assert!(!text.contains('\u{fffd}'), "{encoding}: {text}");
         let (_, text) = server.ok(
             json!({"action": "poll", "taskId": out["taskId"], "input": "go\n", "waitMs": 10000}),

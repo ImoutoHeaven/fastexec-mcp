@@ -28,7 +28,7 @@ const FRAME_PAUSE: Duration = Duration::from_millis(4);
 /// A pause this long showed its frame long enough to read, even in the middle of a redraw.
 const LONG_PAUSE: Duration = Duration::from_millis(100);
 /// How long output may stay open after the root exits and its tree is killed.
-const DRAIN_CAP: Duration = Duration::from_secs(2);
+pub const DRAIN_CAP: Duration = Duration::from_secs(2);
 /// Kept processes may hold the output open for good, so with them the drain also ends once the
 /// output pauses this long.
 const KEPT_PAUSE: Duration = Duration::from_millis(100);
@@ -88,6 +88,8 @@ pub struct Task {
     expired: AtomicBool,
     /// Set once a result has shown this task's final state.
     reported: AtomicBool,
+    /// Set once a result has shown that the processes held past the root's exit ended.
+    tree_end_reported: AtomicBool,
     out: Mutex<Output>,
     view: Mutex<View>,
     end: Mutex<Option<Final>>,
@@ -197,6 +199,7 @@ enum Input {
 }
 
 /// Task state for rendering.
+#[derive(Clone)]
 pub struct Snapshot {
     pub state: &'static str,
     pub exit_code: Option<i32>,
@@ -211,6 +214,10 @@ pub struct Snapshot {
     pub leftovers: Vec<Member>,
     /// The task holds its tree past the root's exit, and some of it still runs.
     pub kept: bool,
+    /// The processes the task held past the root's exit have ended.
+    pub tree_ended: bool,
+    /// The processes the task holds, when [`Task::snapshot_held`] took the snapshot.
+    pub held: Vec<Member>,
     /// Why the last kill of the processes it holds failed.
     pub kill_error: Option<String>,
 }
@@ -332,6 +339,7 @@ impl Tasks {
             kill_requested: AtomicBool::new(false),
             expired: AtomicBool::new(false),
             reported: AtomicBool::new(false),
+            tree_end_reported: AtomicBool::new(false),
             out: Mutex::default(),
             view: Mutex::default(),
             end: Mutex::new(None),
@@ -517,25 +525,40 @@ impl Tasks {
     }
 
     /// One line naming the other tasks that need attention, at most `cap` bytes: finished tasks
-    /// whose final state no result has shown yet (failures first), then running tasks. Returns
-    /// the line and the finished tasks it names, which the caller marks reported once the line
-    /// is delivered.
-    pub fn background(&self, exclude: &str, cap: usize) -> Option<(String, Vec<Arc<Task>>)> {
-        // Rank 0: failed or expired; 1: other finished; 2: running. Newest first within a rank.
-        let mut entries: Vec<(u8, Arc<Task>, Snapshot)> = self
+    /// whose final state no result has shown yet (failures first), tasks whose held processes
+    /// ended unseen, then running tasks and tasks that hold processes. Returns the line and the
+    /// tasks it names with the snapshots it showed, which the caller marks reported once the
+    /// line is delivered.
+    pub fn background(&self, exclude: &str, cap: usize) -> Option<(String, Vec<Shown>)> {
+        // Rank 0: failed or expired; 1: other finished, or held processes ended; 2: running or
+        // holding processes. Newest first within a rank.
+        #[derive(PartialEq)]
+        enum Notice {
+            Root,
+            TreeEnded,
+            Keeps,
+            Running,
+        }
+        let mut entries: Vec<(u8, Notice, Arc<Task>, Snapshot)> = self
             .all()
             .into_iter()
             .filter(|task| task.id != exclude)
             .filter_map(|task| {
                 let snapshot = task.snapshot();
-                let rank = match snapshot.state {
-                    "running" => 2,
-                    _ if task.reported.load(Ordering::SeqCst) => return None,
-                    "exited" if snapshot.exit_code != Some(0) => 0,
-                    _ if snapshot.expired => 0,
-                    _ => 1,
+                let (rank, notice) = match snapshot.state {
+                    "running" => (2, Notice::Running),
+                    _ if !task.is_reported() => {
+                        let failed = snapshot.state == "exited" && snapshot.exit_code != Some(0)
+                            || snapshot.expired;
+                        (if failed { 0 } else { 1 }, Notice::Root)
+                    }
+                    _ if snapshot.tree_ended && !task.tree_end_reported.load(Ordering::SeqCst) => {
+                        (1, Notice::TreeEnded)
+                    }
+                    _ if snapshot.kept => (2, Notice::Keeps),
+                    _ => return None,
                 };
-                Some((rank, task, snapshot))
+                Some((rank, notice, task, snapshot))
             })
             .collect();
         if entries.is_empty() {
@@ -543,39 +566,66 @@ impl Tasks {
         }
         entries.sort_by_key(|(rank, ..)| *rank);
         let count = |rank: u8| entries.iter().filter(|entry| entry.0 == rank).count();
-        let (failed, running) = (count(0), count(2));
-        let finished = entries.len() - running;
+        let failed = count(0);
+        let running = entries
+            .iter()
+            .filter(|entry| entry.1 == Notice::Running)
+            .count();
+        let keeping = count(2) - running;
+        let finished = entries.len() - count(2);
         let mut counts = Vec::new();
-        if running > 0 {
-            counts.push(format!("{running} running"));
-        }
-        if finished > 0 {
-            counts.push(format!("{finished} finished"));
-        }
-        if failed > 0 {
-            counts.push(format!("{failed} failed"));
+        for (number, label) in [
+            (running, "running"),
+            (keeping, "keeping processes"),
+            (finished, "finished"),
+            (failed, "failed"),
+        ] {
+            if number > 0 {
+                counts.push(format!("{number} {label}"));
+            }
         }
         let counts = counts.join(", ");
-        let finished_tasks = |shown: usize| {
+        // Only the tasks the line names have their held processes listed.
+        for (_, notice, task, snapshot) in entries.iter_mut().take(3) {
+            if *notice == Notice::Keeps {
+                snapshot.held = task.snapshot_held().held;
+            }
+        }
+        let shown_tasks = |shown: usize| {
             entries[..shown]
                 .iter()
-                .filter(|entry| entry.0 < 2)
-                .map(|entry| Arc::clone(&entry.1))
+                .map(|(_, _, task, snapshot)| (Arc::clone(task), snapshot.clone()))
                 .collect()
         };
         for shown in (1..=entries.len().min(3)).rev() {
             let named: Vec<String> = entries[..shown]
                 .iter()
-                .map(
-                    |(_, task, snapshot)| match (snapshot.state, snapshot.exit_code) {
-                        ("running", _) => {
-                            format!("{} running {}", task.id, short(snapshot.elapsed))
+                .map(|(_, notice, task, snapshot)| {
+                    let id = &task.id;
+                    match (notice, snapshot.exit_code) {
+                        (Notice::Running, _) => {
+                            format!("{id} running {}", short(snapshot.elapsed))
                         }
-                        ("exited", Some(code)) => format!("{} exited {code}", task.id),
-                        _ if snapshot.expired => format!("{} killed by killAfterMs", task.id),
-                        _ => format!("{} killed", task.id),
-                    },
-                )
+                        (Notice::Keeps, _) => format!("{id} keeps {}", brief(&snapshot.held)),
+                        (Notice::TreeEnded, _) => format!("{id} kept processes ended"),
+                        (_, code) => {
+                            let root = match code {
+                                Some(code) if snapshot.state == "exited" => {
+                                    format!("exited {code}")
+                                }
+                                _ if snapshot.expired => "killed by killAfterMs".into(),
+                                _ => "killed".into(),
+                            };
+                            // The notice marks the end of the held processes shown too.
+                            let tree = if snapshot.tree_ended {
+                                " and its kept processes ended"
+                            } else {
+                                ""
+                            };
+                            format!("{id} {root}{tree}")
+                        }
+                    }
+                })
                 .collect();
             let rest = entries.len() - shown;
             let line = if rest == 0 {
@@ -587,7 +637,7 @@ impl Tasks {
                 )
             };
             if line.len() <= cap {
-                return Some((line, finished_tasks(shown)));
+                return Some((line, shown_tasks(shown)));
             }
         }
         let line = format!("(Background: {counts}; use list.)");
@@ -685,6 +735,18 @@ fn drain(task: &Task, eof: &mpsc::Receiver<()>, kept: bool) -> bool {
         {
             return true;
         }
+    }
+}
+
+/// A task and the snapshot a result showed of it.
+pub type Shown = (Arc<Task>, Snapshot);
+
+/// The first held process and how many more: `adb.exe +2`.
+fn brief(held: &[Member]) -> String {
+    match held {
+        [] => "processes".into(),
+        [one] => one.name.clone(),
+        [first, rest @ ..] => format!("{} +{}", first.name, rest.len()),
     }
 }
 
@@ -875,7 +937,7 @@ impl Task {
 
     /// The root has exited, and processes it left run on, under `keepTree` or because killing
     /// them failed.
-    fn keeps_processes(&self) -> bool {
+    pub fn keeps_processes(&self) -> bool {
         lock(&self.end).as_ref().is_some_and(|end| end.kept) && !*self.tree_done.borrow()
     }
 
@@ -940,9 +1002,37 @@ impl Task {
         })
     }
 
+    /// Whether a result has shown this task's final state.
+    pub fn is_reported(&self) -> bool {
+        self.reported.load(Ordering::SeqCst)
+    }
+
+    /// How the root ended, once it has: its exit code, and whether the task held processes past
+    /// the exit.
+    pub fn root_end(&self) -> Option<(i32, bool)> {
+        lock(&self.end)
+            .as_ref()
+            .map(|end| (end.exit_code, end.kept))
+    }
+
+    /// Output has reached EOF.
+    pub fn output_closed(&self) -> bool {
+        lock(&self.out).closed
+    }
+
+    /// A snapshot that also lists the processes the task holds.
+    pub fn snapshot_held(&self) -> Snapshot {
+        let mut snapshot = self.snapshot();
+        if snapshot.kept {
+            snapshot.held = self.tree.members();
+        }
+        snapshot
+    }
+
     pub fn snapshot(&self) -> Snapshot {
-        let kept = self.keeps_processes();
         let end = lock(&self.end).clone();
+        let tree_done = *self.tree_done.borrow();
+        let held_past_exit = end.as_ref().is_some_and(|end| end.kept);
         let out = lock(&self.out);
         Snapshot {
             state: match &end {
@@ -957,19 +1047,26 @@ impl Task {
             lines: out.lines,
             dropped: out.dropped,
             evicted: out.evicted,
-            output_open: end.as_ref().is_some_and(|end| end.output_open),
+            output_open: end.as_ref().is_some_and(|end| end.output_open) && !out.closed,
             expired: end.as_ref().is_some_and(|end| end.expired),
             log_error: out.log_error.clone(),
             kill_error: lock(&self.kill_error).clone(),
             leftovers: end.map(|end| end.leftovers).unwrap_or_default(),
-            kept,
+            kept: held_past_exit && !tree_done,
+            tree_ended: held_past_exit && tree_done,
+            held: Vec::new(),
         }
     }
 
-    /// Records that a delivered result showed this task's final state. Callers pass only
-    /// tasks whose shown snapshot was final, so a task that ends after its snapshot stays due.
-    pub fn mark_reported(&self) {
-        self.reported.store(true, Ordering::SeqCst);
+    /// Records what a delivered result showed: the task's final state, and the end of the
+    /// processes it held. A task that ends after its snapshot stays due.
+    pub fn mark_reported(&self, shown: &Snapshot) {
+        if shown.state != "running" {
+            self.reported.store(true, Ordering::SeqCst);
+        }
+        if shown.tree_ended {
+            self.tree_end_reported.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Input still queued for the writer: bytes the program's stdin has not accepted yet.

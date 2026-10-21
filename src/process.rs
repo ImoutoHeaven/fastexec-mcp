@@ -679,7 +679,9 @@ pub const LOCALE: &str = if cfg!(target_os = "macos") {
 mod windows {
     use super::Member;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
@@ -689,8 +691,8 @@ mod windows {
         JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-        ResumeThread, THREAD_SUSPEND_RESUME,
+        GetExitCodeProcess, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW, ResumeThread, THREAD_SUSPEND_RESUME,
     };
 
     /// Creates a job that terminates its processes when its last handle closes, and assigns
@@ -723,8 +725,9 @@ mod windows {
     }
 
     /// The live processes of a job, without console hosts, which come and go with the
-    /// console programs they serve. A process this user may not query is named `?`. Processes
-    /// past the first 1024 are left out.
+    /// console programs they serve. A process that has exited but not left the job's list yet
+    /// is left out; one this user may not query counts, named `?`. Processes past the first
+    /// 1024 are left out.
     pub fn job_members(job: RawHandle) -> Vec<Member> {
         // JOBOBJECT_BASIC_PROCESS_ID_LIST with room for 1024 IDs.
         #[repr(C)]
@@ -754,27 +757,35 @@ mod windows {
             .iter()
             .filter_map(|&pid| {
                 let pid = pid as u32;
-                let name = image_name(pid).unwrap_or_else(|| "?".into());
+                let name = live_name(pid)?;
                 (!name.eq_ignore_ascii_case("conhost.exe")).then_some(Member { pid, name })
             })
             .collect()
     }
 
-    /// The file name of a live process's image.
-    fn image_name(pid: u32) -> Option<String> {
-        // SAFETY: the handle is checked and closed; the buffer outlives the call.
+    /// The file name of a process's image, `?` when it cannot be read, or `None` when the
+    /// process has exited or is gone.
+    fn live_name(pid: u32) -> Option<String> {
+        // SAFETY: the handle is checked and closed; the buffers outlive the calls.
         unsafe {
             let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if process.is_null() {
-                return None;
+                // An ID no process has any more is an invalid parameter.
+                return (GetLastError() != ERROR_INVALID_PARAMETER).then(|| "?".into());
             }
+            let mut code = 0;
+            let exited = GetExitCodeProcess(process, &mut code) != 0 && code != STILL_ACTIVE as u32;
             // The longest path Windows supports.
             let mut buffer = vec![0_u16; 32_768];
             let mut size = buffer.len() as u32;
-            let named = QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size);
+            let named = !exited
+                && QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) != 0;
             CloseHandle(process);
-            if named == 0 {
+            if exited {
                 return None;
+            }
+            if !named {
+                return Some("?".into());
             }
             let path = String::from_utf16_lossy(&buffer[..size as usize]);
             Some(path.rsplit('\\').next().unwrap_or(&path).to_string())
