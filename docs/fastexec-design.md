@@ -9,12 +9,12 @@ fastexec is a stdio MCP server written in Rust. It ships as one binary and expos
 - a command that finishes within its wait window returns like a foreground command;
 - a command that outlives the window keeps running as a task, and the model returns to it with `poll`;
 - running tasks accept input through a stdin pipe or, on request, a pseudo-terminal (PTY);
-- `kill` terminates a task's whole process tree;
+- `kill` terminates a task's whole process tree; processes a command leaves running end with its root bash unless the task keeps them;
 - `transcript` renders a PTY task's whole output as a terminal shows it, so the model reads a long reply inside a TUI in full.
 
 Tasks belong to the server process. The host starts the server with the session and stops it when the session ends, so every task ends with its session. The model learns about task completion by calling `poll`; the server sends nothing to the model on its own.
 
-Release platforms are Windows x64 with Git for Windows and Linux x64 with GNU bash. Other Unix systems build from the same Unix code; the `/proc` session sweep in `kill` (§6.3) runs only on Linux. pi 0.99.2 is the reference host; any MCP host that supports tools can run fastexec.
+Release platforms are Windows x64 with Git for Windows and Linux x64 with GNU bash. Other Unix systems build from the same Unix code; the task host's subreaper and its `/proc` view of the tree (§6.3) work only on Linux. pi 0.99.2 is the reference host; any MCP host that supports tools can run fastexec.
 
 ## 2. Host Facts (pi 0.99.2)
 
@@ -41,7 +41,8 @@ The tool takes one flat object with `deny_unknown_fields`. `action` selects the 
 | `cwd` | start | existing absolute directory; default: the server working directory | Working directory |
 | `pty` | start | boolean, `false` | Run inside a pseudo-terminal |
 | `loginShell` | start | boolean, `true` | `bash -lc` when true; `bash --noprofile --norc -c` when false |
-| `killAfterMs` | start | nonnegative integer; 0 or omitted: no limit | Kill the whole tree this long after launch, independently of waits, polls, and request cancellation |
+| `killAfterMs` | start | nonnegative integer; 0 or omitted: no limit | Kill the whole tree, kept processes included, this long after launch, independently of waits, polls, and request cancellation |
+| `keepTree` | start | boolean, `false` | Keep the processes the command leaves running when its root bash exits, until `kill`, `killAfterMs`, or session end (§3 Root exit) |
 | `taskId` | poll, kill, transcript | string | Task returned by `start` or `list` |
 | `input` | poll | string, at most 16 KiB UTF-8 | Written exactly as given, before `keys` and before waiting |
 | `keys` | poll, PTY tasks | array of key names | Pressed after `input`, in array order (§3 Keys). `input` and the encoded keys together hold at most 16 KiB |
@@ -59,9 +60,19 @@ The tool takes one flat object with `deny_unknown_fields`. `action` selects the 
 
 - **`start`** spawns the command and waits up to `waitMs`. If the command exits within the window, the result carries the final state and all of its output, as a foreground command would. Otherwise the result carries `state: "running"`, the task ID, and the output so far. `waitMs: 0` returns immediately.
 - **`poll`** writes `input`, then presses `keys` one at a time (§3 Keys), then applies `eof`. It then waits until the task ends, a `returnWhen` condition holds, or `waitMs` elapses, and returns the output the caller has not seen yet. New output during the window leaves the wait running. `waitMs: 0` takes an immediate snapshot. A poll without `input` always reads, including on a finished task, where it returns the final state and any remaining unseen output. `input` after stdin has closed (by `eof`, by the program, or by exit) returns an error and delivers nothing. An invalid key name also returns an error and delivers nothing.
-- **`kill`** terminates the whole process tree (§6.3), waits up to 5 s for the exit, and returns the status with `state: "killed"`; a tree still running after 5 s returns `state: "running"` with a note to poll later. Unseen output stays available to `poll`. Killing a finished task returns its existing final state. A failed native termination call returns an error result naming the cause; an already empty tree counts as terminated.
-- **Lifetime limit.** A positive `killAfterMs` arms a timer owned by the task. When it fires while the task runs, the task is killed through the same tree termination and reports `state: "killed"` with `lifetimeExpired: true`. The kill and expiry flags are read when the root exits, so a root that exits before a kill keeps its natural result while its output drains.
-- **`list`** returns every task of this server, newest first.
+- **`kill`** terminates the whole process tree (§6.3), waits up to 5 s for the root and the tree to end, and returns the status with `state: "killed"`; a tree still running after 5 s adds a note to poll later. Unseen output stays available to `poll`. On a finished task that keeps processes, `kill` ends them, keeps the root's result, and notes `the kept processes ended`; on any other finished task it returns the existing final state. A failed native termination call returns an error result naming the cause; an already empty tree counts as terminated.
+- **Lifetime limit.** A positive `killAfterMs` arms a timer owned by the task. When it fires while the root runs, the task is killed through the same tree termination and reports `state: "killed"` with `lifetimeExpired: true`; when it fires after the root exited, it ends the kept processes and the root's result stays. The kill and expiry flags are read when the root exits, so a root that exits before a kill keeps its natural result while its output drains.
+- **`list`** returns every task of this server, newest first, with the processes each keeps.
+
+### Root exit
+
+When the root bash exits, the processes it leaves in the tree are its leftovers: background jobs, daemons, and servers a CLI starts for itself, such as the adb server. The result lists them in `leftovers` (`pid` and name) and in the status line.
+
+- By default the leftovers end with the root, and the status line reads `ended with bash: adb.exe (4120); start with keepTree: true to keep them`.
+- With `keepTree: true`, the leftovers run on, and the result reads `keeps adb.exe (4120) running; kill ends them` while they run, with `keptRunning: true`. They end with `kill` on the task, `killAfterMs`, or session end. The task stays in the registry until then, past the retention of finished tasks (§5 Capture), and their output keeps flowing into its log. stdin closes when the root exits.
+- When killing the leftovers fails, as for a process sudo runs as root, the task holds its tree as a kept one, reports `keptRunning: true`, and the status line reads `could not end <names>: <error>; kill retries`, and `killError` holds the error; `kill` on the task returns the error while it persists. A later `kill` or `killAfterMs` that fails to end the processes a task holds records its error the same way.
+- A task whose root a kill or `killAfterMs` ended has no leftovers, and a task with no leftovers keeps nothing.
+- Tasks that hold processes past their root's exit count toward the limit of 16 running tasks (§6.4).
 - **`transcript`** renders the task's stored log (§5 Transcript), writes the text to `<taskId>.transcript.txt` beside the log, and returns a window of it, the last lines by default. It applies to PTY tasks with UTF-8 output, works on running and finished tasks, does not wait, and leaves the poll cursor where it is.
 
 ### Keys
@@ -117,22 +128,22 @@ Before anything is written, every key is checked against the modes current at th
     - `structured`: `content` holds the status line; `structuredContent.output` holds the window. This mode suits hosts that expose structured results to the model. pi's text-consuming path sees the status line.
   - Every mode uses the same output window, byte budget, and poll cursor. `list`, `kill`, and operational error results keep their text in every mode.
 - `structuredContent` carries:
-  - for `start`, `poll`, and `kill`: `ok`, `action`, `taskId`, `state` (`running` / `exited` / `killed`), `exitCode`, `pty`, `elapsedMs`, `logPath`, `lifetimeExpired`, and `logError` (the first log write failure, or `null`);
+  - for `start`, `poll`, and `kill`: `ok`, `action`, `taskId`, `state` (`running` / `exited` / `killed`), `exitCode`, `pty`, `elapsedMs`, `logPath`, `lifetimeExpired`, `logError` (the first log write failure, or `null`), `keepTree`, `leftovers` (`[{pid, name}]`, §3 Root exit), `keptRunning`, and `killError` (why the last kill of the processes it holds failed, or `null`);
   - for `start` and `poll`, additionally: `waitEndedBy`, an object with `condition` (`task_ended` / `output_contains` / `screen_contains` / `screen_appears` / `screen_gone` / `quiet` / `max_wait`) and, for the text conditions, `text`, the text that matched;
   - for `start` and `poll` with `screen`, additionally: `cursor` (`[row, column]`, 1-based) and `omittedRows`; in `both` and `structured` modes also `output`, the screen text;
   - for other `start` and `poll` results, additionally: `omittedLines`, `omittedRange` (`[first, last]` log lines or `null`), `cutLines` (shown lines that lost part of their text to a per-line limit or the budget), and `encodingErrors` (lines with invalid byte sequences). In `both` and `structured` modes they also carry `output`, the window text, with an empty string for an empty window; `content` displays `(no new output)` for that empty window in `text` and `both` modes;
   - for `transcript`: the `start`/`poll`/`kill` fields, `omittedLines`, `omittedRange` (transcript lines), `cutLines`, `encodingErrors`, `transcriptPath`, `transcriptLines`, `alternateSessions`, `alternateRanges`, and `historyFull`; in `both` and `structured` modes also `output`;
-  - for `list`: `ok`, `action`, and a `tasks` array of `{taskId, state, exitCode, pty, elapsedMs, command (first 120 chars), logPath, lifetimeExpired}`;
+  - for `list`: `ok`, `action`, and a `tasks` array of `{taskId, state, exitCode, pty, elapsedMs, command (first 120 chars), logPath, lifetimeExpired, keepTree, keptRunning}`;
   - for operational errors: `ok: false`, `action`, and `error`.
 - **Background footer.** `start`, `poll`, `kill`, and `transcript` results append one line after the status line, such as `(Background: t3 exited 7, t5 running 4m3s.)`. It names the other tasks that need attention: finished tasks whose final state no delivered result has shown, ranked failures (nonzero exit or `killAfterMs` expiry) first, then other completions, then running tasks, newest first within a rank. It names at most three, then appends the remaining count, aggregate counts, and `use list`; when that exceeds the cap it shows counts only. The cap is 512 bytes, and at most a quarter of `maxBytes` for bounded windows; the footer is reserved before the output window is sized, so the whole text still fits `maxBytes`. Showing a finished task's final state in a result, in the footer, or in `list` marks it reported. Results without such tasks carry no footer. The footer is best-effort delivery; `list` remains the complete view.
-- Task IDs are short and server-scoped: `t1`, `t2`, and so on.
+- Task IDs are five random characters from Crockford's base32 alphabet in lowercase, at least one a letter, unique within the server.
 - Exit codes follow the bash convention: a signal exit reports `128 + signal`. On Windows the msys runtime reports signal N as status `N << 8`, which the server converts the same way. A Windows Job Object termination reports 1.
 - A non-zero exit code is a normal result with `ok: true`. Operational failures set `isError: true` and `ok: false` and carry a message that tells the model what to do next. They cover invalid parameter values and combinations, spawn errors, too many running tasks, unknown task IDs, closed stdin, input backpressure, `eof` in PTY mode, failed tree termination, and cancellation.
 - Arguments that fail schema decoding (unknown fields, wrong types, negative numbers) are rejected by the MCP layer before the tool runs, as an error result without `structuredContent`.
 
 ## 4. Tool Description
 
-The tool description (`src/description.md`, at most 4.5 KB) says how to use the tool, and the server instructions returned by `initialize` say when. pi-mcp-adapter shows the instructions in its `mcp` proxy description. pi's built-in MCP lists one line for each server with `codemode` or `deferred` tools, taken from the configured `description` or else the first line of the instructions, so that first line stands alone; `describeNamespace()` returns the full instructions. `serverInfo` reports `fastexec` and the crate version.
+The tool description (`src/description.md`, at most 5 KB) says how to use the tool, and the server instructions returned by `initialize` say when. pi-mcp-adapter shows the instructions in its `mcp` proxy description. pi's built-in MCP lists one line for each server with `codemode` or `deferred` tools, taken from the configured `description` or else the first line of the instructions, so that first line stands alone; `describeNamespace()` returns the full instructions. `serverInfo` reports `fastexec` and the crate version.
 
 `src/description.md` is the authoritative text. It covers:
 
@@ -140,7 +151,7 @@ The tool description (`src/description.md`, at most 4.5 KB) says how to use the 
 - GNU bash (Git Bash on Windows) and a fresh shell per `start`: calls pass `cwd` or chain with `&&`;
 - wait sizing: long waits for builds and tests, `returnWhen` for servers, prompts, and TUIs, no repeated `waitMs: 0` polls or `sleep` commands;
 - `returnWhen` for TUIs: screen conditions over `outputContains`, `screenAppears` for a completion line and `screenGone` for a busy indicator with the pi and Codex examples, `quietMs` as the fallback, and the prompt and Enter sent in the poll that waits;
-- task lifetime: tasks end with the session, and the rest of a tree ends with its root bash, so long-lived servers run as their own task;
+- task lifetime: tasks end with the session; the processes a command leaves running, CLI-started servers such as the adb server included, end with its root bash and the result names them; `keepTree` keeps them until `kill`, `killAfterMs`, or session end; a server can also run as its own task; `explorer.exe` hands a Windows GUI app to the desktop;
 - output: one merged stream, cleaning and `raw`, the `truncate` modes and per-line caps, narrowing with pipelines and `set -o pipefail`, and reading the log file with `sed` or `grep`;
 - stdin: pipe-mode stdin stays open until `eof` or exit; `< /dev/null` for programs that read it;
 - PTY: `keys` with tmux names for Enter and control keys, since a newline in `input` is not Enter to a TUI; the `keyDelayMs` pause for paste-detecting TUIs and escape timeouts; password prompts need `pty: true`; `screen: true` for full-screen and TUI programs; `input` is recorded in the transcript;
@@ -159,7 +170,7 @@ The tool description (`src/description.md`, at most 4.5 KB) says how to use the 
   - All logs of one server together hold up to 1 GiB; past that, logs of finished tasks are evicted, oldest task first.
   - Past a limit, the reader keeps draining, stops writing, and records the drop, so the child process keeps running at full speed.
   - A failed log write stops writing for that task in the same way and records the first error. The readable range ends at the last fully written chunk. Interrupted reads are retried; any other read error ends capture like EOF.
-- The server keeps the 64 most recently finished tasks. Each time a task finishes, the tasks that finished earliest beyond that count are removed with their logs; the task that just finished always stays.
+- The server keeps the 64 most recently finished tasks, apart from those that keep processes, which stay until their tree ends. Each time a task finishes, the tasks that finished earliest beyond that count are removed with their logs; the task that just finished always stays.
 - The server deletes its log directory on shutdown. At startup it deletes the current user's log directories whose server process has ended; a forced kill is the only way to leave one behind. A process the user may not query (Windows access denied, Unix `EPERM`) counts as running.
 
 ### Screen
@@ -246,10 +257,10 @@ Launch copies FastCtx [`src/shell/process.rs`](https://github.com/yc-duan/fastct
 - `-l -c <command>` or `--noprofile --norc -c <command>`.
 - A command longer than 8000 bytes runs from a script file in the log directory, so a command of any length reaches bash whole: the Git for Windows runtime cuts a single argument past 8190 UTF-16 units.
 - On Windows, a login shell gets `MSYS2_PATH_TYPE=inherit` unless the variable is already set. A non-login shell gets `usr/bin` and the existing `mingw64`, `mingw32`, and `clangarm64` `bin` directories prepended to `PATH`.
-- Pipe-mode children and `--version` probes are created with `CREATE_NO_WINDOW`; PTY children attach to a ConPTY pseudoconsole.
+- On Windows, pipe-mode children and `--version` probes are created with `CREATE_NO_WINDOW`; PTY children attach to a ConPTY pseudoconsole. On Unix, bash runs under the task host (§6.3).
 - Commands get the `C.UTF-8` locale, which glibc 2.35+, musl, and msys provide; macOS gets `en_US.UTF-8`. `ponytail:` a fixed locale; probing `locale -a` covers older distributions if they matter.
 
-PTY commands start from the server's process environment: portable-pty's own seeding, which on Windows reads the registry and drops runtime PATH entries and host-set values, is cleared first. Both modes then apply these overrides:
+Commands start from the server's process environment; on Windows, portable-pty's own seeding of a PTY command, which reads the registry and drops runtime PATH entries and host-set values, is cleared first. Both modes then apply these overrides:
 
 | Variable | Pipe mode | PTY mode |
 |---|---|---|
@@ -267,30 +278,43 @@ PTY commands start from the server's process environment: portable-pty's own see
   - stdin is a pipe owned by a per-task writer thread with a 1 MiB queue; a full queue returns `INPUT_BACKPRESSURE`. When a write fails because the program closed stdin, the task's stdin counts as closed.
   - `eof` drops the pipe after the queued input has been written.
 - **PTY:**
-  - `portable-pty` 0.9.0 (ConPTY on Windows, Unix PTY elsewhere), size 120×30.
-  - Input goes through the master writer, fed by the same per-task queue.
-  - The reader drains `try_clone_reader()` into the same log path as pipe mode.
+  - Windows: `portable-pty` 0.9.0 over ConPTY. Unix: `openpty`, with the slave as the task host's controlling terminal. Size 120×30.
+  - Input goes through the master, fed by the same per-task queue.
+  - The reader drains the master into the same log path as pipe mode.
   - A reader thread passes each chunk to the capture thread, which feeds it into the task's terminal emulator (§5) and the log; while a synchronized update is open, the capture thread also wakes at its deadline. The emulator answers terminal queries as `alacritty_terminal` does, such as the cursor-position report (`ESC[6n`) and primary device attributes (`ESC[c`), which ConPTY sends at startup and holds output until a terminal answers. Replies share the 1 MiB input limit; replies past it are dropped.
   - Windows x64 builds embed Microsoft's ConPTY 1.24.260710001 (`vendor/conpty`: `conpty.dll` and its host `OpenConsole.exe`, MIT). Before the first PTY opens, the server writes both files to `%TEMP%\fastexec-conpty-1.24.260710001`, shared by every server of this version: a file whose bytes differ from the embedded copy is rewritten under a temporary name and renamed into place. The server then opens each file sharing only read access, checks its bytes through that handle, and keeps the handle open for its lifetime, so no process can change, replace, or delete a verified file while `conpty.dll` loads and `OpenConsole.exe` starts with each PTY. It then loads `conpty.dll` by its full path, so portable-pty's load of `conpty.dll` by name resolves to it. The system ConPTY of earlier Windows releases re-renders a program's output and loses scroll-region inserts, history clears, and alternate-screen switches; the bundled one passes them through to the log. When extraction or loading fails, stderr names the cause, PTY tasks use the system ConPTY, and `transcript` results warn that lines may be missing.
 
 ### 6.3 Process-tree ownership
 
-| Platform | Pipe | PTY | `kill` |
-|---|---|---|---|
-| Windows | FastCtx `KillOnCloseJobObject`: spawn with `CREATE_SUSPENDED`, assign to a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then resume | `AssignProcessToJobObject` on `Child::as_raw_handle()` right after `spawn_command` | `TerminateJobObject` |
-| Unix | `setsid` in `pre_exec`, so the child PID is the session and group ID | portable-pty calls `setsid` before exec, so the child PID is the session and group ID | `kill(-pgid, SIGKILL)`, then on Linux SIGKILL to every process whose session ID (from `/proc/<pid>/stat`) is the task's, which covers job-control groups |
+**Windows.** Each task's root bash runs in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (FastCtx `KillOnCloseJobObject`), and its descendants join the job.
 
-- On stdin EOF, SIGTERM, SIGINT, or SIGHUP (on Windows: stdin EOF or Ctrl-C), the server kills every task tree at once, removes its log directory, and exits. Stdin EOF ends the server even while waits are in flight, inside pi's 500 ms grace period.
-- Windows: job handles close when the server exits, including when the server itself is killed. The kernel then terminates every task tree.
-- Windows PTY: a process the child starts between spawn and job assignment stays outside the job. `ponytail:` assign-after-spawn race; the upgrade path is a portable-pty patch that spawns suspended.
-- Unix: a process that starts its own session (`setsid`, daemonizing tools) leaves the task's tree. `ponytail:` session-based ownership; a per-task cgroup is the upgrade path for full containment.
-- Unix: if the server receives SIGKILL before its shutdown cleanup runs, task groups survive it. `ponytail:` the upgrade path is FastCtx's helper-pipe watchdog ([`src/shell/jobs/host.rs`](https://github.com/yc-duan/fastctx/blob/ccaa157790d02328a60786eb94ee5ad698995a5f/src/shell/jobs/host.rs), "EOF means the host died and the command group must die").
+- Pipe: spawn with `CREATE_SUSPENDED`, assign to the job, then resume.
+- PTY: `AssignProcessToJobObject` on `Child::as_raw_handle()` right after `spawn_command`. A process the child starts between spawn and job assignment stays outside the job. `ponytail:` assign-after-spawn race; the upgrade path is a portable-pty patch that spawns suspended.
+- Members: `JobObjectBasicProcessIdList`, named by `QueryFullProcessImageNameW`, or `?` for a process this user may not query, without console hosts (`conhost.exe`), which come and go with their console programs. A kept tree ends when the list is empty, polled at 10 ms doubling to 500 ms.
+- `kill`: `TerminateJobObject`.
+- Job handles close when the server exits, including when the server itself is killed. The kernel then terminates every task tree.
+- A program that asks to leave its job (`CREATE_BREAKAWAY_FROM_JOB`, as the adb client does for its server) stays in it: the job does not allow breakaway, since the msys runtime asks the same for background jobs.
+
+**Unix.** Each task's root is a task host (`src/host.rs`): the fastexec binary, started again (`/proc/self/exe` on Linux) with `--fastexec-task-host` as the leader of a new session, so its PID is the session and group ID. A PTY task's slave becomes its controlling terminal. The host:
+
+- on Linux, sets `PR_SET_CHILD_SUBREAPER`, so a process that daemonizes (`setsid`, a double fork) is adopted by the host instead of init and stays in the tree;
+- runs bash in its own session and group. Ctrl-C, Ctrl-Z, a terminal hangup, and a command's `kill 0` reach the host too, so it handles every signal that would end or stop it with a no-op handler, apart from SIGKILL and SIGSTOP, which cannot be handled, synchronous faults, and SIGPIPE, which stays ignored as Rust sets it. The kernel resets handled signals to the default action at exec, and the host sets SIGCHLD to the default and clears its signal mask first, so bash starts with default dispositions and no blocked signal, whatever the server inherited;
+- points its own standard streams at `/dev/null` once bash runs, so the output reaches EOF when the rest of the tree closes it;
+- writes bash's exit code (`128 + signal` for a signal) to a status pipe, then reaps every child until none is left, and exits. As the session leader it keeps a PTY's session and terminal up while kept processes run, so no hangup reaches them;
+- reads a lifeline pipe whose write end only the server holds. EOF there, when the server drops the tree or dies, even by SIGKILL, makes the host kill the tree and itself.
+
+The server passes both pipes as descriptors, which only the host inherits; it reads the exit code from the status pipe and, from its EOF, learns that the host exited. Members are the host's live descendants and the live members of its session and group, from `/proc/<pid>/stat`; job control (`set -m`) moves processes into other groups of the session. Other Unix systems list no members, so their results name no leftovers, and `keepTree` keeps nothing there. `kill` sends SIGKILL to the members, repeating while new orphans reach the host, up to eight passes, then to the host's group. A member the server may not signal, such as a process sudo runs as root, fails the kill with its error and leaves the host alive to hold the tree. When the host dies before bash, from SIGKILL to its group (`kill -9 0`), the server kills what remains in its session and group; a daemon that left both is out of reach then. The host stays unreaped until the tree is marked ended, under the lock `kill` holds, so a kill never reaches a group ID freed for reuse.
+
+**Both.**
+
+- On stdin EOF, SIGTERM, SIGINT, or SIGHUP (on Windows: stdin EOF or Ctrl-C), the server kills every task tree at once, kept processes included, removes its log directory, and exits. Stdin EOF ends the server even while waits are in flight, inside pi's 500 ms grace period.
+- A process started outside the tree, such as through a service manager, WMI, or `explorer.exe`, is not the task's.
 
 ### 6.4 Concurrency
 
-Each task runs four threads: an output reader, a capture thread that stores the output and feeds the emulator, an input writer, and a waiter. Short locks guard the output counters, the cursor, the input sender, and the final status; waits subscribe to completion and capture-activity channels and hold no lock. Tool calls run in parallel, so a 240 s `poll` on one task leaves `kill` and other polls responsive. At most 16 tasks run at once; a further `start` returns `TOO_MANY_TASKS`.
+Each task runs five threads: an output reader, a capture thread that stores the output and feeds the emulator, an input writer, a waiter, and, once the root exits, a thread that waits for the end of the tree. Short locks guard the output counters, the cursor, the input sender, and the final status; waits subscribe to completion and capture-activity channels and hold no lock. Tool calls run in parallel, so a 240 s `poll` on one task leaves `kill` and other polls responsive. At most 16 tasks run or hold processes past their root's exit at once; a further `start` returns `TOO_MANY_TASKS`.
 
-A task is its whole process tree. When the root bash exits, the waiter terminates whatever remains of the tree, closes a PTY, and waits up to 2 s for the reader to reach EOF. It then closes stdin and commits the final state once. Long-lived processes such as development servers therefore run as their own task. If output stays open past the 2 s cap, the status line says so and later polls show any further output.
+A task is its whole process tree. When the root bash exits, the waiter lists the tree's other members as the leftovers and terminates them unless the task keeps them (§3 Root exit). The tree's thread then waits until no member runs, closes a PTY, and marks the tree ended. Meanwhile the waiter waits up to 2 s for the reader to reach EOF; with kept processes, which may hold the output open for good, it also stops once no output has arrived for 100 ms. It then closes stdin and commits the final state once. If output stays open past the wait, the status line says so and later polls show any further output.
 
 ## 7. Host Configuration
 
@@ -333,7 +357,8 @@ pi with the `pi-mcp-adapter` extension (2.26), which replaces the built-in MCP s
 | `src/wait.rs` | waits, `returnWhen` conditions, progress | new |
 | `src/description.md` | tool description shown to the model (§4) | new |
 | `src/bash.rs` | bash discovery | FastCtx `src/shell/bash.rs` |
-| `src/process.rs` | launch, environment, locale, Job Object, process session, PTY spawn | FastCtx `src/shell/process.rs` and `src/process_policy.rs`, plus PTY |
+| `src/process.rs` | launch, environment, locale, Job Object, task host launch, tree members and kill, PTY spawn | FastCtx `src/shell/process.rs` and `src/process_policy.rs`, plus PTY |
+| `src/host.rs` | the Unix task host (§6.3) | new |
 | `src/output.rs` | streaming ANSI/CR cleaning, head/tail windows under a byte budget, and text matching over cleaned output | FastCtx `src/shell/normalize.rs` and `src/shell/output.rs`, with CR overwrite |
 | `src/tasks.rs` | task registry, log capture, cursors, input queues, retention, shutdown | new |
 | `src/keys.rs` | tmux key names to terminal input bytes, legacy and kitty keyboard protocol (§3 Keys) | tmux `key-string.c` and `input-keys.c`; Windows Terminal `terminalInput.cpp` |
@@ -343,7 +368,7 @@ pi with the `pi-mcp-adapter` extension (2.26), which replaces the built-in MCP s
 | `vendor/conpty` | Microsoft ConPTY 1.24.260710001 x64 binaries, license, and hashes | Microsoft (MIT) |
 | `tests/mcp.rs` | contract tests that drive the built binary over MCP stdio | new |
 
-`Cargo.toml` lists the dependencies and pins rmcp (`=2.2.0`), portable-pty (`=0.9.0`), and alacritty_terminal (`=0.26.0`) exactly.
+`Cargo.toml` lists the dependencies and pins rmcp (`=2.2.0`), portable-pty (`=0.9.0`, Windows only), and alacritty_terminal (`=0.26.0`) exactly.
 
 Files derived from FastCtx open with a header that names the FastCtx source files and credits FastCtx (Apache-2.0, Copyright 2026 yc-duan). The repository `NOTICE` lists those files and credits tmux (ISC) for the key names and legacy encodings and Windows Terminal (MIT) for the kitty keyboard protocol encoding in `src/keys.rs`.
 
@@ -359,7 +384,8 @@ Run every case on Windows 11 x64 with Git for Windows and on Ubuntu x64 with bas
 | A4 | Cancel during wait | The call ends; the task keeps running; `list` shows a task whose `start` was cancelled |
 | A5 | Pipe input | A line-reading program receives each exact `input`; `eof` delivers EOF |
 | A6 | PTY input | The program sees a TTY; `keys` Enter, C-c, and C-d behave as terminal keys after `input`; arrows follow the program's cursor mode; keys follow the kitty keyboard protocol once the program pushes it; an ssh password prompt accepts `input` |
-| A7 | `kill` | Shell → child → grandchild trees end on both platforms; repeated `kill` returns the same final state |
+| A7 | `kill` and root exit | Shell → child → grandchild trees end on both platforms; repeated `kill` returns the same final state; at root exit the result names the leftovers it ended, a daemon that starts its own session included; on Unix, a SIGKILLed server's trees end |
+| A17 | `keepTree` | `adb connect 127.0.0.1:5555` with `keepTree: true` keeps the adb server, so a later task's `adb -s 127.0.0.1:5555 get-state` prints `device`; `kill` on the first task ends the server and keeps its result; `killAfterMs` and session end end kept processes |
 | A8 | Session end | `/reload`, `/new`, and quit end every task tree and remove the log directory |
 | A9 | Output windows | All four `truncate` modes respect `maxBytes`; the omitted line range matches the log; `raw` keeps ANSI and CR |
 | A10 | Cleaning | Progress bars that use CR collapse to their final text; split UTF-8 and ANSI sequences across chunks decode correctly; `encoding: "big5"` decodes cp950 output |

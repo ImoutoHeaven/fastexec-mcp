@@ -3,6 +3,8 @@
 mod bash;
 mod conpty;
 mod frames;
+#[cfg(unix)]
+mod host;
 mod keys;
 mod output;
 mod process;
@@ -67,8 +69,10 @@ struct Request {
     pty: Option<bool>,
     /// start: login shell, bash -lc, so profile-managed tools resolve (default true). false runs bash --noprofile --norc -c.
     login_shell: Option<bool>,
-    /// start: kill the task's whole process tree this many ms after launch, whatever the waits and polls; 0 or omitted means no limit.
+    /// start: kill the task's whole process tree this many ms after launch, whatever the waits and polls, kept processes included; 0 or omitted means no limit.
     kill_after_ms: Option<u64>,
+    /// start: keep the processes the command leaves running when its bash exits, such as a server a CLI starts for itself (adb, Gradle daemon), until kill on this task or session end (default false: they end with bash).
+    keep_tree: Option<bool>,
     /// poll, kill, transcript: the task to act on.
     task_id: Option<String>,
     /// poll: text written to the task exactly as given, before `keys` and before waiting, at most 16 KiB.
@@ -116,6 +120,7 @@ fn validate(request: &Request) -> Result<View, String> {
         ("pty", request.pty.is_some()),
         ("loginShell", request.login_shell.is_some()),
         ("killAfterMs", request.kill_after_ms.is_some()),
+        ("keepTree", request.keep_tree.is_some()),
         ("taskId", request.task_id.is_some()),
         ("input", request.input.is_some()),
         ("eof", request.eof.is_some()),
@@ -139,10 +144,17 @@ fn validate(request: &Request) -> Result<View, String> {
         "screen",
     ];
     let allowed: Vec<&str> = match request.action {
-        Action::Start => ["command", "cwd", "pty", "loginShell", "killAfterMs"]
-            .into_iter()
-            .chain(VIEW)
-            .collect(),
+        Action::Start => [
+            "command",
+            "cwd",
+            "pty",
+            "loginShell",
+            "killAfterMs",
+            "keepTree",
+        ]
+        .into_iter()
+        .chain(VIEW)
+        .collect(),
         Action::Poll => ["taskId", "input", "eof", "keys", "keyDelayMs"]
             .into_iter()
             .chain(VIEW)
@@ -362,6 +374,7 @@ impl Server {
                     cwd,
                     pty: request.pty.unwrap_or(false),
                     login: request.login_shell.unwrap_or(true),
+                    keep: request.keep_tree.unwrap_or(false),
                     encoding: view.encoding.unwrap_or(encoding_rs::UTF_8),
                 };
                 let tasks = Arc::clone(&self.tasks);
@@ -370,8 +383,8 @@ impl Server {
                     .map_err(|error| format!("Internal failure while starting: {error}."))??;
                 if let Some(limit) = request.kill_after_ms.filter(|&limit| limit > 0) {
                     // The deadline belongs to the task, not to this request: it survives the
-                    // request's cancellation and every later wait.
-                    let (expiring, mut done) = (Arc::clone(&task), task.done());
+                    // request's cancellation and every later wait, and bounds kept processes.
+                    let (expiring, mut done) = (Arc::clone(&task), task.tree_done());
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_millis(limit)) => expiring.expire(),
@@ -448,21 +461,25 @@ impl Server {
             }
             Action::Kill => {
                 let task = self.task(request.task_id.as_deref())?;
+                let kept = task.snapshot().kept;
                 task.kill().map_err(|error| {
                     format!(
                         "Cannot terminate the process tree of {}: {error}. Poll to see its state, or retry kill.",
                         task.id
                     )
                 })?;
-                let mut done = task.done();
+                let (mut done, mut tree_done) = (task.done(), task.tree_done());
                 let finished = async move {
                     let _ = done.wait_for(|done| *done).await;
+                    let _ = tree_done.wait_for(|done| *done).await;
                 };
                 let _ = tokio::time::timeout(KILL_WAIT, finished).await;
                 let snapshot = task.snapshot();
                 let mut text = status_line(&task, &snapshot);
-                if snapshot.state == "running" {
+                if snapshot.state == "running" || snapshot.kept {
                     text.push_str(" · the tree did not exit within 5 s; poll later to confirm");
+                } else if kept {
+                    text.push_str(" · the kept processes ended");
                 }
                 output::cut_to(&mut text, view.max_bytes / 2 + 1);
                 let background = self
@@ -514,17 +531,22 @@ impl Server {
                 .exit_code
                 .map_or(String::new(), |code| format!(" {code}"));
             lines.push(format!(
-                "{} [{}{code}] {:.1}s{} · {}",
+                "{} [{}{code}] {:.1}s{}{} · {}",
                 task.id,
                 snapshot.state,
                 snapshot.elapsed.as_secs_f64(),
                 if task.pty { " pty" } else { "" },
+                if snapshot.kept {
+                    format!(" · keeps {}", members(&snapshot.leftovers))
+                } else {
+                    String::new()
+                },
                 command.replace('\n', " ")
             ));
             entries.push(json!({
                 "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
                 "elapsedMs": snapshot.elapsed.as_millis() as u64, "command": command, "logPath": task.log_path,
-                "lifetimeExpired": snapshot.expired,
+                "lifetimeExpired": snapshot.expired, "keepTree": task.keep, "keptRunning": snapshot.kept,
             }));
         }
         // The list shows these final states, which settles the background footer's notices.
@@ -922,10 +944,41 @@ fn status_line(task: &Task, snapshot: &Snapshot) -> String {
     if snapshot.evicted {
         line.push_str(" · log evicted under the 1 GiB total limit");
     }
+    if !snapshot.leftovers.is_empty() {
+        let names = members(&snapshot.leftovers);
+        match (&snapshot.kill_error, snapshot.kept) {
+            (Some(error), true) => {
+                line.push_str(&format!(" · could not end {names}: {error}; kill retries"));
+            }
+            (None, true) => line.push_str(&format!(" · keeps {names} running; kill ends them")),
+            (None, false) if !task.keep => line.push_str(&format!(
+                " · ended with bash: {names}; start with keepTree: true to keep them"
+            )),
+            _ => {}
+        }
+    }
     if snapshot.output_open {
-        line.push_str(" · output stayed open 2 s after exit; later output may follow");
+        line.push_str(if snapshot.kept {
+            " · processes it keeps hold the output open; later output may follow"
+        } else {
+            " · output stayed open after exit; later output may follow"
+        });
     }
     line
+}
+
+/// Names processes as `adb.exe (4120), sleep (77) and 3 more`.
+fn members(members: &[process::Member]) -> String {
+    let mut text = members
+        .iter()
+        .take(3)
+        .map(|member| format!("{} ({})", member.name, member.pid))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if members.len() > 3 {
+        text.push_str(&format!(" and {} more", members.len() - 3));
+    }
+    text
 }
 
 fn task_json(action: Action, task: &Task, snapshot: &Snapshot) -> Value {
@@ -940,6 +993,10 @@ fn task_json(action: Action, task: &Task, snapshot: &Snapshot) -> Value {
         "logPath": task.log_path,
         "lifetimeExpired": snapshot.expired,
         "logError": snapshot.log_error,
+        "keepTree": task.keep,
+        "leftovers": snapshot.leftovers.iter().map(|member| json!({"pid": member.pid, "name": member.name})).collect::<Vec<_>>(),
+        "keptRunning": snapshot.kept,
+        "killError": snapshot.kill_error,
     })
 }
 
@@ -973,8 +1030,19 @@ fn error_result(action: Action, message: &str) -> CallToolResult {
     result
 }
 
+fn main() {
+    #[cfg(unix)]
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        if args.first().is_some_and(|arg| arg == host::FLAG) {
+            host::main(&args[1..]);
+        }
+    }
+    serve();
+}
+
 #[tokio::main]
-async fn main() {
+async fn serve() {
     let output_mode = match std::env::var("FASTEXEC_OUTPUT_MODE").as_deref() {
         Err(std::env::VarError::NotPresent) | Ok("text") => OutputMode::Text,
         Ok("both") => OutputMode::Both,

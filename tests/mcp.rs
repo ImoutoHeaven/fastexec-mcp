@@ -198,6 +198,15 @@ fn heartbeat(bash_path: &str) -> String {
     format!("(while :; do echo x >> '{bash_path}'; sleep 0.1; done) &")
 }
 
+/// Waits up to 10 s for a heartbeat's first line; a loaded machine can start it late.
+fn wait_for_heartbeat(path: &PathBuf) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while file_len(path) == 0 {
+        assert!(Instant::now() < deadline, "the heartbeat never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn assert_stops_growing(path: &PathBuf) {
     std::thread::sleep(Duration::from_millis(800));
     let before = file_len(path);
@@ -213,6 +222,7 @@ fn short_command_returns_its_final_result_in_one_call() {
         server.ok(json!({"action": "start", "command": "echo hello; echo oops >&2; exit 3"}));
     assert_eq!(out["state"], "exited");
     assert_eq!(out["exitCode"], 3);
+    assert_eq!(out["leftovers"], json!([]), "{text}");
     assert!(
         text.starts_with(&format!("hello\noops\n\n[exited 3] {}", server.id(1))),
         "{text}"
@@ -585,6 +595,35 @@ fn pty_keys_follow_input_and_the_programs_cursor_mode() {
         server.call(json!({"action": "poll", "taskId": server.id(2), "keys": ["Enter"]}));
     assert!(is_error && text.contains("PTY tasks only"), "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(2)}));
+}
+
+/// The task host shares the terminal's foreground group with bash and must leave Ctrl-C to it.
+// ConPTY delivers Ctrl-C to msys programs after a variable delay, so Windows is left out.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_interrupts_the_program_of_a_pty_task() {
+    use std::os::unix::process::CommandExt;
+    // Also from a server that inherited SIGINT ignored and blocked, as a background job can.
+    let hostile = Server::start_with(|command| unsafe {
+        command.pre_exec(|| {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGINT);
+            libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+            Ok(())
+        });
+    });
+    for mut server in [Server::start(), hostile] {
+        let (_, text) = server.ok(json!({"action": "start", "command": "echo ready; sleep 30; echo after", "pty": true, "waitMs": 10000, "returnWhen": {"outputContains": ["ready"]}}));
+        assert!(text.contains("[running]"), "{text}");
+        let (out, text) = server.ok(
+            json!({"action": "poll", "taskId": server.id(1), "keys": ["C-c"], "waitMs": 10000}),
+        );
+        assert_eq!(out["state"], "exited", "{text}");
+        assert_eq!(out["exitCode"], 130, "{text}");
+        assert!(!text.contains("after"), "{text}");
+    }
 }
 
 #[test]
@@ -1058,9 +1097,9 @@ fn kill_and_root_exit_end_the_whole_process_tree() {
         let (out, _) =
             server.ok(json!({"action": "start", "command": command, "pty": pty, "waitMs": 1000}));
         let id = out["taskId"].clone();
+        wait_for_heartbeat(killed);
         let (out, _) = server.ok(json!({"action": "kill", "taskId": id}));
         assert_eq!(out["state"], "killed", "pty={pty}");
-        assert!(file_len(killed) > 0, "the heartbeat never started");
         assert_stops_growing(killed);
         let (again, text) =
             server.ok(json!({"action": "kill", "taskId": id, "waitMs": 0, "maxBytes": 100}));
@@ -1068,11 +1107,247 @@ fn kill_and_root_exit_end_the_whole_process_tree() {
         assert!(text.len() <= 100, "{} bytes: {text}", text.len());
 
         let command = format!("{} echo started", heartbeat(leaked_bash));
-        let (out, _) =
+        let (out, text) =
             server.ok(json!({"action": "start", "command": command, "pty": pty, "waitMs": 10000}));
         assert_eq!(out["state"], "exited", "pty={pty}");
+        assert!(
+            text.contains("ended with bash: ") && text.contains("keepTree: true"),
+            "the result names what bash left (pty={pty}): {text}"
+        );
+        assert!(!out["leftovers"].as_array().unwrap().is_empty(), "{text}");
+        assert_eq!(out["keptRunning"], false);
         assert_stops_growing(leaked);
     }
+}
+
+#[test]
+fn keep_tree_keeps_what_bash_leaves_until_kill_or_deadline() {
+    let files = [false, true].map(|pty| {
+        (
+            scratch(&format!("kept-{pty}")),
+            scratch(&format!("expiring-{pty}")),
+        )
+    });
+    let mut server = Server::start();
+    for (pty, ((kept, kept_bash), (expiring, expiring_bash))) in
+        [false, true].into_iter().zip(&files)
+    {
+        let command = format!("{} echo started", heartbeat(kept_bash));
+        let (out, text) = server.ok(json!({"action": "start", "command": command, "pty": pty, "keepTree": true, "waitMs": 10000}));
+        assert_eq!(out["state"], "exited", "pty={pty}: {text}");
+        assert_eq!(out["keptRunning"], true, "pty={pty}: {text}");
+        assert!(
+            text.contains("started") && text.contains(" running; kill ends them"),
+            "{text}"
+        );
+        let id = out["taskId"].clone();
+        std::thread::sleep(Duration::from_millis(800));
+        let before = file_len(kept);
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(
+            file_len(kept) > before,
+            "a kept process stopped (pty={pty})"
+        );
+        let (list, _) = server.ok(json!({"action": "list"}));
+        let entry = list["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["taskId"] == id)
+            .cloned()
+            .unwrap();
+        assert_eq!(entry["keptRunning"], true);
+        let (out, text) = server.ok(json!({"action": "kill", "taskId": id}));
+        assert_eq!(
+            out["state"], "exited",
+            "kill keeps the root's result: {text}"
+        );
+        assert_eq!(out["keptRunning"], false, "{text}");
+        assert!(text.contains("the kept processes ended"), "{text}");
+        assert_stops_growing(kept);
+
+        let command = format!("{} echo started", heartbeat(expiring_bash));
+        let (out, text) = server.ok(json!({"action": "start", "command": command, "pty": pty, "keepTree": true, "killAfterMs": 2000, "waitMs": 10000}));
+        assert_eq!(out["keptRunning"], true, "pty={pty}: {text}");
+        std::thread::sleep(Duration::from_millis(2000));
+        assert_stops_growing(expiring);
+    }
+    let (out, text) = server.ok(json!({"action": "start", "command": "true", "keepTree": true}));
+    assert_eq!(
+        out["keptRunning"], false,
+        "nothing left, nothing kept: {text}"
+    );
+    assert_eq!(out["leftovers"], json!([]));
+}
+
+/// A heartbeat in a new session through a double fork, as daemonizing servers (adb) start;
+/// `program` runs bash's loop under another name.
+#[cfg(unix)]
+fn daemon(program: &str, bash_path: &str) -> String {
+    format!(
+        "setsid -f {program} -c 'while :; do echo x >> {bash_path}; sleep 0.1; done'; sleep 0.5;"
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn processes_that_start_their_own_session_stay_in_the_tree() {
+    let files = ["daemon", "group-term", "odd-name", "odd-name-bin"].map(scratch);
+    let mut server = Server::start();
+    let [
+        (plain, plain_bash),
+        (term, term_bash),
+        (odd, odd_bash),
+        (_, bin_bash),
+    ] = &files;
+    let command = format!("{} echo started", daemon("bash", plain_bash));
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
+    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("ended with bash: bash ("), "{text}");
+    assert!(file_len(plain) > 0, "the daemon never started");
+    assert_stops_growing(plain);
+
+    // A command's `kill 0` reaches the task host too, which must outlive it.
+    let command = format!("{} kill -TERM 0", daemon("bash", term_bash));
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
+    assert_eq!(out["exitCode"], 143, "{text}");
+    assert!(text.contains("ended with bash: bash ("), "{text}");
+    assert_stops_growing(term);
+
+    // A process name that is not UTF-8 still counts the process in.
+    let command = format!(
+        "mkdir -p {bin_bash}; cp \"$(command -v bash)\" {bin_bash}/$'\\xff'beat; {}",
+        daemon(&format!("{bin_bash}/$'\\xff'beat"), odd_bash)
+    );
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
+    assert!(text.contains("ended with bash: \u{fffd}beat ("), "{out}");
+    assert!(file_len(odd) > 0, "the daemon never started");
+    assert_stops_growing(odd);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_killed_server_takes_its_task_trees_with_it() {
+    let files = ["orphaned", "orphaned-daemon"].map(scratch);
+    let [(beat, beat_bash), (daemon_beat, daemon_bash)] = &files;
+    let mut server = Server::start();
+    let command = format!("{} sleep 300", heartbeat(beat_bash));
+    server.ok(json!({"action": "start", "command": command, "keepTree": true, "waitMs": 1000}));
+    let command = format!("{} echo started", daemon("bash", daemon_bash));
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "keepTree": true, "pty": true, "waitMs": 10000}));
+    assert_eq!(out["keptRunning"], true, "{text}");
+    // SIGKILL: no shutdown code runs, so only the hosts' lifelines can end the trees.
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    for beat in [beat, daemon_beat] {
+        assert!(file_len(beat) > 0, "a heartbeat never started");
+        assert_stops_growing(beat);
+    }
+}
+
+/// A process the server may not signal, as one sudo runs as root, stays held and reported. The
+/// fixture needs root and a C compiler, as in the Linux test container; elsewhere it is skipped.
+#[cfg(target_os = "linux")]
+#[test]
+fn processes_the_server_may_not_kill_stay_held_and_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    // SAFETY: plain syscall.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipped: a setuid-root fixture needs root");
+        return;
+    }
+    let (dir, _) = scratch("root-daemon");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let source = dir.join("daemon.c");
+    std::fs::write(
+        &source,
+        // It ends by itself after 60 s, so a failing run leaves no immortal root process.
+        "#define _GNU_SOURCE\n#include <stdio.h>\n#include <unistd.h>\nint main(int argc, char **argv) {\n  if (argc < 2 || setresuid(0, 0, 0) != 0) return 1;\n  for (int i = 0; i < 600; i++) { FILE *f = fopen(argv[1], \"a\"); if (f) { fputs(\"x\\n\", f); fclose(f); } usleep(100000); }\n  return 0;\n}\n",
+    )
+    .unwrap();
+    let fixture = dir.join("root-daemon");
+    match Command::new("cc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&fixture)
+        .status()
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipped: no C compiler");
+            return;
+        }
+        built => assert!(built.unwrap().success(), "the fixture did not compile"),
+    }
+    std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    let (fixture, beats) = (fixture.display(), [dir.join("exit"), dir.join("kill")]);
+    let mut server = Server::start_with(|command| {
+        command.uid(65534).gid(65534);
+    });
+    let mut pids = Vec::new();
+
+    // At the root's exit.
+    let command = format!("{fixture} {} & sleep 0.5; echo started", beats[0].display());
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
+    assert_eq!(out["keptRunning"], true, "{text}");
+    assert!(
+        text.contains("could not end root-daemon (") && text.contains("kill retries"),
+        "{text}"
+    );
+    assert!(out["killError"].is_string(), "{out}");
+    pids.extend(
+        out["leftovers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["pid"].as_i64().unwrap()),
+    );
+    let (_, text, is_error) = server.call(json!({"action": "kill", "taskId": server.id(1)}));
+    assert!(is_error && text.contains("Cannot terminate"), "{text}");
+
+    // After a kill of the running root.
+    let command = format!("{fixture} {} & sleep 300", beats[1].display());
+    server.ok(json!({"action": "start", "command": command, "waitMs": 1000}));
+    let (_, text, is_error) = server.call(json!({"action": "kill", "taskId": server.id(2)}));
+    assert!(is_error && text.contains("Cannot terminate"), "{text}");
+    let (out, text) = server.ok(json!({"action": "poll", "taskId": server.id(2), "waitMs": 10000}));
+    assert_eq!(out["state"], "killed", "{text}");
+    assert_eq!(out["keptRunning"], true, "{text}");
+    assert!(text.contains("could not end root-daemon ("), "{text}");
+    pids.extend(
+        out["leftovers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["pid"].as_i64().unwrap()),
+    );
+
+    for beat in &beats {
+        let before = file_len(beat);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(file_len(beat) > before, "the fixture should still run");
+    }
+    for pid in pids {
+        // SAFETY: plain syscall, as root, on the fixtures' PIDs.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    for beat in &beats {
+        assert_stops_growing(beat);
+    }
+}
+
+#[test]
+fn trees_a_task_keeps_count_toward_the_task_limit() {
+    let mut server = Server::start();
+    for _ in 0..16 {
+        let (out, text) = server.ok(json!({"action": "start", "command": "sleep 300 & echo started", "keepTree": true, "waitMs": 10000}));
+        assert_eq!(out["keptRunning"], true, "{text}");
+    }
+    let (_, text, is_error) = server.call(json!({"action": "start", "command": "true"}));
+    assert!(is_error && text.contains("TOO_MANY_TASKS"), "{text}");
+    server.ok(json!({"action": "kill", "taskId": server.id(1)}));
+    server.ok(json!({"action": "start", "command": "true"}));
 }
 
 #[test]

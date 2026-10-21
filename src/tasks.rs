@@ -4,7 +4,7 @@ use crate::output::{
     Cleaner, Matcher, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix,
     incomplete_utf8_suffix,
 };
-use crate::process::{self, Launch, Tree};
+use crate::process::{self, Launch, Member, Tree};
 use crate::terminal::Live;
 use encoding_rs::Encoding;
 use std::collections::HashSet;
@@ -29,6 +29,9 @@ const FRAME_PAUSE: Duration = Duration::from_millis(4);
 const LONG_PAUSE: Duration = Duration::from_millis(100);
 /// How long output may stay open after the root exits and its tree is killed.
 const DRAIN_CAP: Duration = Duration::from_secs(2);
+/// Kept processes may hold the output open for good, so with them the drain also ends once the
+/// output pauses this long.
+const KEPT_PAUSE: Duration = Duration::from_millis(100);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -72,8 +75,14 @@ pub struct Task {
     pub pty: bool,
     pub log_path: PathBuf,
     pub encoding: &'static Encoding,
+    /// `keepTree`: processes the root leaves running stay until kill or session end.
+    pub keep: bool,
     started: Instant,
     tree: Tree,
+    /// Set once no process of the tree runs.
+    tree_done: watch::Sender<bool>,
+    /// Why the last kill of the processes held past the root's exit failed.
+    kill_error: Mutex<Option<String>>,
     kill_requested: AtomicBool,
     /// Set when `killAfterMs` elapsed and ended the task.
     expired: AtomicBool,
@@ -168,13 +177,18 @@ struct View {
     cleaner: Cleaner,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Final {
     exit_code: i32,
     killed: bool,
     expired: bool,
     elapsed: Duration,
     output_open: bool,
+    /// Processes the root left running when it exited.
+    leftovers: Vec<Member>,
+    /// The task holds its tree past the root's exit: it keeps the leftovers, or killing them
+    /// failed.
+    kept: bool,
 }
 
 enum Input {
@@ -193,6 +207,12 @@ pub struct Snapshot {
     pub output_open: bool,
     pub expired: bool,
     pub log_error: Option<String>,
+    /// Processes the root left running when it exited.
+    pub leftovers: Vec<Member>,
+    /// The task holds its tree past the root's exit, and some of it still runs.
+    pub kept: bool,
+    /// Why the last kill of the processes it holds failed.
+    pub kill_error: Option<String>,
 }
 
 pub struct StartArgs {
@@ -200,6 +220,7 @@ pub struct StartArgs {
     pub cwd: PathBuf,
     pub pty: bool,
     pub login: bool,
+    pub keep: bool,
     pub encoding: &'static Encoding,
 }
 
@@ -241,11 +262,11 @@ impl Tasks {
         let running = registry
             .tasks
             .iter()
-            .filter(|task| task.is_running())
+            .filter(|task| task.is_running() || task.keeps_processes())
             .count();
         if running >= MAX_RUNNING {
             return Err(format!(
-                "TOO_MANY_TASKS: {MAX_RUNNING} tasks are running. Wait for one to finish or kill one, then retry."
+                "TOO_MANY_TASKS: {MAX_RUNNING} tasks are running or keep processes. Wait for one to finish or kill one, then retry."
             ));
         }
         let id = new_id(&mut registry.issued);
@@ -303,8 +324,11 @@ impl Tasks {
             pty: args.pty,
             log_path,
             encoding: args.encoding,
+            keep: args.keep,
             started: Instant::now(),
             tree: spawned.tree,
+            tree_done: watch::Sender::new(false),
+            kill_error: Mutex::new(None),
             kill_requested: AtomicBool::new(false),
             expired: AtomicBool::new(false),
             reported: AtomicBool::new(false),
@@ -348,16 +372,40 @@ impl Tasks {
         let (waiter_shared, waiter_task, mut child) =
             (Arc::clone(self), Arc::clone(&task), spawned.child);
         std::thread::spawn(move || {
-            let exit_code = child.wait();
+            let exit_code = child.wait(&waiter_task.tree);
             // Read at the root's exit, so a kill or deadline during the drain below leaves a
             // natural exit labeled as such.
             let killed = waiter_task.kill_requested.load(Ordering::SeqCst);
             let expired = waiter_task.expired.load(Ordering::SeqCst);
-            // A task is its whole tree: whatever the root leaves behind ends with it.
-            let _ = waiter_task.tree.kill();
-            // Closing a PTY lets its output reach EOF; ConPTY's close can block, so it runs apart.
-            std::thread::spawn(move || drop(child));
-            let output_open = eof_rx.recv_timeout(DRAIN_CAP).is_err();
+            // A task is its whole tree: whatever the root leaves behind ends with it, unless
+            // the task keeps it.
+            let mut leftovers = if killed {
+                Vec::new()
+            } else {
+                waiter_task.tree.members()
+            };
+            let mut kept = waiter_task.keep && !leftovers.is_empty();
+            let kill_error = if kept {
+                None
+            } else {
+                waiter_task.tree.kill().err().map(|error| error.to_string())
+            };
+            // A tree that could not be killed stays held, so kill and shutdown retry, and the
+            // leftovers are what survived, also after a kill of the root.
+            if kill_error.is_some() {
+                kept = true;
+                leftovers = waiter_task.tree.members();
+                *lock(&waiter_task.kill_error) = kill_error;
+            }
+            // The end of the tree closes a PTY, so its output reaches EOF; ConPTY's close can
+            // block, so it runs apart.
+            let ender = Arc::clone(&waiter_task);
+            std::thread::spawn(move || {
+                child.wait_tree(&ender.tree);
+                drop(child);
+                ender.tree_done.send_replace(true);
+            });
+            let output_open = drain(&waiter_task, &eof_rx, kept);
             *lock(&waiter_task.input) = None;
             *lock(&waiter_task.end) = Some(Final {
                 exit_code,
@@ -365,6 +413,8 @@ impl Tasks {
                 expired,
                 elapsed: waiter_task.started.elapsed(),
                 output_open,
+                leftovers,
+                kept,
             });
             let _ = std::fs::remove_file(&script_path);
             waiter_task.done.send_replace(true);
@@ -376,9 +426,11 @@ impl Tasks {
     /// Keeps the [`MAX_FINISHED`] most recently finished tasks and deletes the logs of older
     /// ones. Runs right after each completion, so the task that just finished always stays.
     fn retire_finished(&self, registry: &mut Registry) {
+        // A task that keeps processes stays, so kill can still reach them.
         let mut finished: Vec<(Instant, String)> = registry
             .tasks
             .iter()
+            .filter(|task| !task.keeps_processes())
             .filter_map(|task| task.ended_at().map(|at| (at, task.id.clone())))
             .collect();
         if finished.len() <= MAX_FINISHED {
@@ -453,13 +505,13 @@ impl Tasks {
         }
     }
 
-    /// Kills every running tree and removes the log directory.
+    /// Kills every tree, kept processes included, and removes the log directory.
     pub fn shutdown(&self) {
         for task in lock(&self.registry).tasks.iter() {
             if task.is_running() {
                 task.kill_requested.store(true, Ordering::SeqCst);
-                let _ = task.tree.kill();
             }
+            let _ = task.tree.kill();
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -605,6 +657,33 @@ impl Spool {
                 self.stopped = Some(format!("writing it failed: {error}"));
                 false
             }
+        }
+    }
+}
+
+/// Waits for the output to reach EOF, at most [`DRAIN_CAP`], and returns whether it stayed
+/// open. With kept processes, which may hold it open for good, the wait also ends once the
+/// output pauses for [`KEPT_PAUSE`].
+fn drain(task: &Task, eof: &mpsc::Receiver<()>, kept: bool) -> bool {
+    let deadline = Instant::now() + DRAIN_CAP;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        let step = if kept { left.min(KEPT_PAUSE) } else { left };
+        match eof.recv_timeout(step) {
+            Ok(()) => return false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if kept
+            && task
+                .last_output()
+                .0
+                .is_none_or(|last| last.elapsed() >= KEPT_PAUSE)
+        {
+            return true;
         }
     }
 }
@@ -789,11 +868,24 @@ impl Task {
     }
 
     fn ended_at(&self) -> Option<Instant> {
-        lock(&self.end).map(|end| self.started + end.elapsed)
+        lock(&self.end)
+            .as_ref()
+            .map(|end| self.started + end.elapsed)
+    }
+
+    /// The root has exited, and processes it left run on, under `keepTree` or because killing
+    /// them failed.
+    fn keeps_processes(&self) -> bool {
+        lock(&self.end).as_ref().is_some_and(|end| end.kept) && !*self.tree_done.borrow()
     }
 
     pub fn done(&self) -> watch::Receiver<bool> {
         self.done.subscribe()
+    }
+
+    /// Becomes true once no process of the task's tree runs.
+    pub fn tree_done(&self) -> watch::Receiver<bool> {
+        self.tree_done.subscribe()
     }
 
     pub fn activity(&self) -> watch::Receiver<()> {
@@ -849,22 +941,28 @@ impl Task {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let end = *lock(&self.end);
+        let kept = self.keeps_processes();
+        let end = lock(&self.end).clone();
         let out = lock(&self.out);
         Snapshot {
-            state: match end {
+            state: match &end {
                 None => "running",
                 Some(end) if end.killed => "killed",
                 Some(_) => "exited",
             },
-            exit_code: end.map(|end| end.exit_code),
-            elapsed: end.map_or_else(|| self.started.elapsed(), |end| end.elapsed),
+            exit_code: end.as_ref().map(|end| end.exit_code),
+            elapsed: end
+                .as_ref()
+                .map_or_else(|| self.started.elapsed(), |end| end.elapsed),
             lines: out.lines,
             dropped: out.dropped,
             evicted: out.evicted,
-            output_open: end.is_some_and(|end| end.output_open),
-            expired: end.is_some_and(|end| end.expired),
+            output_open: end.as_ref().is_some_and(|end| end.output_open),
+            expired: end.as_ref().is_some_and(|end| end.expired),
             log_error: out.log_error.clone(),
+            kill_error: lock(&self.kill_error).clone(),
+            leftovers: end.map(|end| end.leftovers).unwrap_or_default(),
+            kept,
         }
     }
 
@@ -1005,21 +1103,27 @@ impl Task {
         Ok(())
     }
 
-    /// Marks the task killed and terminates its tree; the waiter thread records the exit.
+    /// Terminates the task's tree. A running task is marked killed, and the waiter thread records
+    /// the exit; a finished task keeps its result while its kept processes end.
     pub fn kill(&self) -> std::io::Result<()> {
         if self.is_running() {
             self.kill_requested.store(true, Ordering::SeqCst);
-            self.tree.kill()?;
+        } else if !self.keeps_processes() {
+            return Ok(());
         }
-        Ok(())
+        // Recorded for a running task too: its root may have exited already, with the waiter
+        // past its own kill.
+        let killed = self.tree.kill();
+        *lock(&self.kill_error) = killed.as_ref().err().map(|error| error.to_string());
+        killed
     }
 
-    /// Ends the task because its `killAfterMs` lifetime elapsed.
+    /// Ends the task's tree because its `killAfterMs` lifetime elapsed.
     pub fn expire(&self) {
         if self.is_running() {
             self.expired.store(true, Ordering::SeqCst);
-            let _ = self.kill();
         }
+        let _ = self.kill();
     }
 
     /// Returns the output after the cursor, up to `until` when given, as a window, and
