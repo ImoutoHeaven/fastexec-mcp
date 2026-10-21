@@ -37,7 +37,8 @@ impl Server {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
         command
             .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT");
+            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT");
         configure(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
@@ -1209,6 +1210,132 @@ fn keep_tree_keeps_what_bash_leaves_until_kill_or_deadline() {
         "nothing left, nothing kept: {text}"
     );
     assert_eq!(out["leftovers"], json!([]));
+}
+
+/// The total log limit evicts finished logs only: a task that keeps processes keeps its log and
+/// transcript until they end. The debug build takes a 1 MiB limit for the test.
+#[cfg(debug_assertions)]
+#[test]
+fn log_eviction_spares_tasks_that_keep_processes() {
+    let mut server = Server::start_with(|command| {
+        command.env("FASTEXEC_TEST_TOTAL_LOG_LIMIT", "1048576");
+    });
+    let marker = "KEPT-MARKER";
+    for pty in [false, true] {
+        let command = format!("sleep 300 & echo {marker}");
+        let (out, text) = server.ok(json!({"action": "start", "command": command, "pty": pty, "keepTree": true, "loginShell": false, "waitMs": 10000}));
+        assert_eq!(out["keptRunning"], true, "pty={pty}: {text}");
+    }
+    let (pipe, pty) = (server.id(1), server.id(2));
+    let write = |bytes: u32| format!("head -c {bytes} /dev/zero | tr '\\0' x");
+    let status = |server: &mut Server, id: &str| {
+        server
+            .ok(json!({"action": "poll", "taskId": id, "waitMs": 0}))
+            .1
+    };
+    // Files are checked on disk: a transcript call would reserve log space itself.
+    let files = |server: &mut Server, id: &str| {
+        let (out, text) = server.ok(json!({"action": "poll", "taskId": id, "waitMs": 0}));
+        let log = PathBuf::from(out["logPath"].as_str().unwrap());
+        let transcript = log.with_file_name(format!("{id}.transcript.txt"));
+        (text, log, transcript)
+    };
+    let assert_kept = |server: &mut Server| {
+        for id in [&pipe, &pty] {
+            let (text, log, _) = files(server, id);
+            assert!(!text.contains("log evicted"), "{text}");
+            let log = std::fs::read_to_string(log).unwrap();
+            assert!(log.contains(marker), "{id}: {log}");
+        }
+        assert!(files(server, &pty).2.exists(), "the transcript is gone");
+    };
+
+    // Nothing can be evicted: the running writer's excess is dropped, and the kept logs stay.
+    let (_, text) = server.ok(json!({"action": "start", "command": write(1_572_864), "loginShell": false, "waitMs": 60000}));
+    assert!(
+        text.contains("bytes past the log limit were not stored"),
+        "{text}"
+    );
+    let full = server.id(3);
+    assert_kept(&mut server);
+
+    // A finished log goes in their place.
+    let (_, text) = server.ok(
+        json!({"action": "start", "command": write(614_400), "loginShell": false, "waitMs": 60000}),
+    );
+    assert!(!text.contains("not stored"), "{text}");
+    let text = status(&mut server, &full);
+    assert!(text.contains("log evicted"), "{text}");
+    assert_kept(&mut server);
+
+    // Once their processes end, they are finished too.
+    for id in [&pipe, &pty] {
+        server.ok(json!({"action": "kill", "taskId": id}));
+    }
+    server.ok(
+        json!({"action": "start", "command": write(614_400), "loginShell": false, "waitMs": 60000}),
+    );
+    for id in [&pipe, &pty] {
+        let (text, log, _) = files(&mut server, id);
+        assert!(text.contains("log evicted") && !log.exists(), "{text}");
+    }
+    assert!(
+        !files(&mut server, &pty).2.exists(),
+        "the transcript remains"
+    );
+}
+
+/// A task that keeps processes finishes when they end, so it is not the first to be retired
+/// when they outlived later tasks.
+#[test]
+fn retirement_counts_kept_processes_ending_as_finishing() {
+    let mut server = Server::start();
+    let (out, text) = server.ok(json!({"action": "start", "command": "sleep 300 & echo kept", "keepTree": true, "waitMs": 10000}));
+    assert_eq!(out["keptRunning"], true, "{text}");
+    let kept = server.id(1);
+    for _ in 0..64 {
+        server.ok(json!({"action": "start", "command": "true"}));
+    }
+    server.ok(json!({"action": "kill", "taskId": kept}));
+    server.ok(json!({"action": "start", "command": "true"}));
+    // Retirement follows the result that shows the completion.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (out, _) = server.ok(json!({"action": "list"}));
+        let tasks = out["tasks"].as_array().unwrap();
+        if tasks.len() == 64 {
+            let listed = |id: &str| tasks.iter().any(|task| task["taskId"] == id);
+            assert!(
+                listed(&kept) && !listed(&server.id(2)) && !listed(&server.id(3)),
+                "the earliest finishers go first"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "no task was retired");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A long command runs from a script file, which stays while kept processes may run it as `$0`.
+#[test]
+fn kept_processes_can_run_the_command_script() {
+    let [(gate, gate_bash), (child, child_bash)] = ["script-gate", "script-child"].map(scratch);
+    let command = format!(
+        "#{}\nif [ \"$1\" = child ]; then echo ran > '{child_bash}'; else (until [ -e '{gate_bash}' ]; do sleep 0.1; done; \"$BASH\" \"$0\" child; sleep 300) & echo parent; fi",
+        "x".repeat(8_100)
+    );
+    let mut server = Server::start();
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "keepTree": true, "loginShell": false, "waitMs": 10000}));
+    assert_eq!(out["keptRunning"], true, "{text}");
+    // The result shows the root's end, so the child runs `$0` only after it.
+    std::fs::write(&*gate, "").unwrap();
+    wait_for_file(&child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&*child).unwrap() != "ran\n" {
+        assert!(Instant::now() < deadline, "the script ran incompletely");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    server.ok(json!({"action": "kill", "taskId": server.id(1)}));
 }
 
 #[test]

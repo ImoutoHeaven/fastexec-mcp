@@ -43,6 +43,9 @@ pub struct Tasks {
     dir: PathBuf,
     registry: Mutex<Registry>,
     log_bytes: AtomicU64,
+    /// [`TOTAL_LOG_LIMIT`]; debug builds take a smaller one from
+    /// `FASTEXEC_TEST_TOTAL_LOG_LIMIT`, so tests reach it without writing 1 GiB.
+    log_limit: u64,
     bash: OnceLock<Result<PathBuf, String>>,
 }
 
@@ -81,6 +84,8 @@ pub struct Task {
     tree: Tree,
     /// Set once no process of the tree runs.
     tree_done: watch::Sender<bool>,
+    /// When the tree ended, set before `tree_done`.
+    tree_ended_at: OnceLock<Instant>,
     /// Why the last kill of the processes held past the root's exit failed.
     kill_error: Mutex<Option<String>>,
     kill_requested: AtomicBool,
@@ -246,6 +251,11 @@ impl Tasks {
             dir,
             registry: Mutex::default(),
             log_bytes: AtomicU64::new(0),
+            log_limit: std::env::var("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
+                .ok()
+                .and_then(|limit| limit.parse().ok())
+                .filter(|limit| cfg!(debug_assertions) && (1..=TOTAL_LOG_LIMIT).contains(limit))
+                .unwrap_or(TOTAL_LOG_LIMIT),
             bash: OnceLock::new(),
         }))
     }
@@ -335,6 +345,7 @@ impl Tasks {
             started: Instant::now(),
             tree: spawned.tree,
             tree_done: watch::Sender::new(false),
+            tree_ended_at: OnceLock::new(),
             kill_error: Mutex::new(None),
             kill_requested: AtomicBool::new(false),
             expired: AtomicBool::new(false),
@@ -406,11 +417,13 @@ impl Tasks {
                 *lock(&waiter_task.kill_error) = kill_error;
             }
             // The end of the tree closes a PTY, so its output reaches EOF; ConPTY's close can
-            // block, so it runs apart.
+            // block, so it runs apart. The script stays until then: kept processes may run `$0`.
             let ender = Arc::clone(&waiter_task);
             std::thread::spawn(move || {
                 child.wait_tree(&ender.tree);
                 drop(child);
+                let _ = std::fs::remove_file(&script_path);
+                let _ = ender.tree_ended_at.set(Instant::now());
                 ender.tree_done.send_replace(true);
             });
             let output_open = drain(&waiter_task, &eof_rx, kept);
@@ -424,7 +437,6 @@ impl Tasks {
                 leftovers,
                 kept,
             });
-            let _ = std::fs::remove_file(&script_path);
             waiter_task.done.send_replace(true);
             waiter_shared.retire_finished(&mut lock(&waiter_shared.registry));
         });
@@ -470,23 +482,24 @@ impl Tasks {
     }
 
     /// Reserves log space under the total limit, evicting the oldest finished logs if needed.
+    /// A task that keeps processes is not finished: they may still write to its log.
     fn reserve(&self, bytes: u64) -> bool {
-        if self.log_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes <= TOTAL_LOG_LIMIT {
+        if self.log_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes <= self.log_limit {
             return true;
         }
         let candidates: Vec<Arc<Task>> = lock(&self.registry)
             .tasks
             .iter()
-            .filter(|task| !task.is_running())
+            .filter(|task| !task.is_running() && !task.keeps_processes())
             .cloned()
             .collect();
         for task in candidates {
-            if self.log_bytes.load(Ordering::SeqCst) <= TOTAL_LOG_LIMIT {
+            if self.log_bytes.load(Ordering::SeqCst) <= self.log_limit {
                 break;
             }
             self.evict_log(&task);
         }
-        if self.log_bytes.load(Ordering::SeqCst) <= TOTAL_LOG_LIMIT {
+        if self.log_bytes.load(Ordering::SeqCst) <= self.log_limit {
             return true;
         }
         self.log_bytes.fetch_sub(bytes, Ordering::SeqCst);
@@ -886,6 +899,12 @@ fn capture(
         if write_error.is_some() {
             out.log_error = write_error;
         }
+        // An eviction since the room check, its own reservation's included, already gave back
+        // what the log held; the chunk's reservation goes back too.
+        if stored && out.evicted {
+            shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+            stored = false;
+        }
         let stored = if stored { keep } else { &[] };
         if !stored.is_empty() {
             last.extend_from_slice(stored);
@@ -929,10 +948,17 @@ impl Task {
         lock(&self.end).is_none()
     }
 
+    /// When the task finished: its root, or the processes it held past the root's exit if they
+    /// ended later.
     fn ended_at(&self) -> Option<Instant> {
-        lock(&self.end)
+        let root = lock(&self.end)
             .as_ref()
-            .map(|end| self.started + end.elapsed)
+            .map(|end| self.started + end.elapsed)?;
+        Some(
+            self.tree_ended_at
+                .get()
+                .map_or(root, |&tree| tree.max(root)),
+        )
     }
 
     /// The root has exited, and processes it left run on, under `keepTree` or because killing
@@ -1341,5 +1367,49 @@ fn remove_stale_dirs(temp: &Path) {
         if pid.is_some_and(|pid| pid != std::process::id() && !process::is_alive(pid)) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+// Unix tasks run under the fastexec binary as their host, which a test binary is not.
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chunk_whose_reservation_evicts_its_own_log_gives_it_back() {
+        let tasks = Tasks::new().unwrap();
+        let task = tasks
+            .start(StartArgs {
+                command: "printf abc".into(),
+                cwd: std::env::temp_dir(),
+                pty: false,
+                login: false,
+                keep: false,
+                encoding: encoding_rs::UTF_8,
+            })
+            .unwrap();
+        // Its own capture is done too, so nothing else touches the accounting below.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while task.is_running() || !task.output_closed() {
+            assert!(Instant::now() < deadline, "the task never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Reserving the 99-byte chunk crosses the limit and evicts the finished task's 3 bytes.
+        let before = tasks.log_limit - 97;
+        tasks.log_bytes.store(before, Ordering::SeqCst);
+        let log = File::create(tasks.dir.join("extra.log")).unwrap();
+        capture(
+            &tasks,
+            &task,
+            Box::new(std::io::Cursor::new([b'x'; 99])),
+            log,
+            None,
+        );
+        let out = lock(&task.out);
+        assert!(out.evicted);
+        assert_eq!((out.written, out.dropped), (3, 99));
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), before - 3);
+        drop(out);
+        tasks.shutdown();
     }
 }
