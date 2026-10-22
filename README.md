@@ -1,32 +1,26 @@
 # fastexec
 
-fastexec is a stdio MCP server with one tool, `fastexec`, that runs bash commands as tasks:
+`fastexec` is a stdio MCP server that runs bash commands as background tasks,
+with stdin pipes, interactive PTYs, bounded output, and process-tree termination.
 
-- A command that finishes within its wait window returns its full result in one call.
-- A command that outlives the window keeps running in the background; the model continues with `poll`.
-- Running tasks accept input through a stdin pipe or, on request, a pseudo-terminal (PTY). The PTY handles interactive prompts such as ssh passwords.
-- `kill` terminates a task's whole process tree.
-- `transcript` records a PTY task's output as a terminal shows it, as the output arrives, so a long conversation inside a TUI reads in full, piece by piece, or with `grep` over its file.
+## Requirements and Quickstart
 
-It runs on Windows (Git Bash) and Linux (GNU bash) and ships as a single binary.
+- **Build**: Rust `1.92+` (`edition = "2024"`).
+- **Runtime**: GNU bash on Linux, or [Git for Windows](https://git-scm.com/downloads)
+  on Windows. Set `FASTEXEC_BASH` to an absolute GNU bash path to override discovery.
 
-## Build
+Build `target/release/fastexec` (`fastexec.exe` on Windows), then register its
+absolute path in Pi's `~/.pi/agent/mcp.json`:
 
 ```bash
 cargo build --release
 ```
 
-The binary is `target/release/fastexec` (`fastexec.exe` on Windows). Windows needs [Git for Windows](https://git-scm.com/downloads); fastexec finds its bash automatically. Set `FASTEXEC_BASH` to an absolute path to choose a specific GNU bash.
-
-## Configure a host
-
-pi with its built-in MCP support (`~/.pi/agent/mcp.json`):
-
 ```json
 {
   "mcpServers": {
     "fastexec": {
-      "command": "/path/to/fastexec",
+      "command": "/absolute/path/to/fastexec",
       "exposure": "direct",
       "description": "Run long-running, stdin-driven, and terminal (PTY) bash commands as tasks"
     }
@@ -34,123 +28,58 @@ pi with its built-in MCP support (`~/.pi/agent/mcp.json`):
 }
 ```
 
-The model sees the tool as `mcp__fastexec__fastexec`. pi sends progress tokens, and fastexec reports progress every 20 s, so long waits stay within pi's default 60 s request timeout.
+Hosts without progress-aware timeouts need at least 300 seconds per tool call.
 
-pi with the `pi-mcp-adapter` extension:
+## Tool Usage and Example
 
-```json
-"fastexec": {
-  "command": "C:/path/to/fastexec.exe",
-  "lifecycle": "eager",
-  "requestTimeoutMs": 300000,
-  "directTools": true
-}
-```
+The server exposes one MCP tool, `fastexec` (`mcp__fastexec__fastexec` in Pi).
+Operations are selected via the tool's `action` field (`start`, `poll`, `kill`,
+`list`, `transcript`)—these are MCP tool arguments, not CLI subcommands. See
+[`src/description.md`](src/description.md) for the runtime parameter contract.
 
-- `requestTimeoutMs` must exceed the 240 s wait limit, because the adapter sends no progress token.
-- `eager` keeps the server connected for the whole session. With `lazy`, an idle disconnect after 10 minutes ends every running task.
-- The model sees the tool as `fastexec_fastexec`.
-
-For any other MCP host, set its tool timeout to at least 300 s unless it sends progress tokens.
-
-### Output placement
-
-Set `FASTEXEC_OUTPUT_MODE` in the MCP server's `env` configuration. With `FASTEXEC_STRUCTURED_CONTENT=true` (default), the mode applies to every `start`, `poll`, and `transcript` result for that server:
-
-| Mode | Text `content` | `structuredContent.output` |
-|---|---|---|
-| `text` (default) | Output body and status line | Omitted |
-| `both` | Output body and status line | Output body |
-| `structured` | Status line | Output body |
-
-With structured content enabled, every mode preserves task and window metadata, including `taskId`, `state`, `exitCode`, `logPath`, `omittedRange`, and `cutLines`. `list`, `kill`, and error results keep their text and metadata. An invalid mode fails at startup with a diagnostic on stderr.
-
-Use `text` for pi and other text-consuming hosts. Use `structured` for hosts that expose structured results to the model, such as Codex. Use `both` for callers that require the body in both forms. A host that reads only `content` sees the status line in `structured` mode; the task log holds the body.
-
-For example, add this field to the server configuration:
+Start a command through the tool:
 
 ```json
-"env": { "FASTEXEC_OUTPUT_MODE": "structured" }
+{"action": "start", "command": "printf 'ready\\n'; sleep 5; printf 'done\\n'", "waitMs": 1000}
 ```
 
-Programmatic callers read the body from the text block in `text` mode, or from `structuredContent.output` in `both` and `structured` modes. Output cleaning, truncation, shell pipelines, and the poll cursor work identically in every mode.
-
-Set `FASTEXEC_STRUCTURED_CONTENT=false` for text-only results across all actions and operational errors. This omits the entire `structuredContent` field and uses `text` output placement, including when `FASTEXEC_OUTPUT_MODE=structured`:
+If it is still running, poll with the returned `taskId` (replace the placeholder):
 
 ```json
-"env": { "FASTEXEC_STRUCTURED_CONTENT": "false" }
+{"action": "poll", "taskId": "<returned taskId>", "waitMs": 10000}
 ```
 
-The accepted values are `true` and `false`, with `true` as the default. Invalid values fail at startup with a diagnostic on stderr. Environment settings take effect when the server starts.
+## Key Constraints
 
-## Agent instructions
+- **Wait window vs. process deadline**: `waitMs` (`0–240000` ms) bounds only how
+  long the current `start` or `poll` call waits. If `waitMs` elapses,
+  `returnWhen` matches, or the call is cancelled, the task keeps running. Use
+  `killAfterMs` on `start` or `action: "kill"` to bound or stop the process tree.
+- **Session-bound process trees**: Tasks inherit server permissions, without a
+  sandbox. Every `start` runs a fresh bash (`cd` and exports do not persist).
+  Processes left behind when root bash exits are killed
+  unless started with `keepTree: true`, and all tasks end when the server exits.
+- **Pipe stdin vs. PTY keys**: Pipe-mode stdin stays open until `eof: true` or
+  exit (pass `< /dev/null` when stdin is unused). In PTY mode (`pty: true`),
+  send text with `input` and terminal keys (such as `"Enter"` or `"C-c"`) with `keys`.
+- **Sensitive input and logs**: MCP hosts may log tool arguments (`command`,
+  `input`, `keys`). Task output is written to temp log files (up to `64` MiB per
+  task), and PTY transcripts record terminal-rendered screen text, including
+  echoed input.
+- **Windows path conversion**: Git Bash rewrites POSIX-shaped arguments (`/c`,
+  `/tmp/x`) for native Windows binaries; prefix commands with `MSYS_NO_PATHCONV=1`.
 
-The tool description explains how to use fastexec, and the server instructions explain when. To make an agent prefer fastexec for long-running and interactive work, append this section to its global instructions file, such as `~/.pi/agent/AGENTS.md`, `~/.codex/AGENTS.md`, or `~/.claude/CLAUDE.md`. The markers let a later update replace the block in place.
-
-```markdown
-<!-- fastexec:begin -->
-### fastexec
-
-- Use the fastexec tool for commands that may run longer than a minute, servers and
-  watchers, programs that read stdin, and programs that need a terminal (`pty: true`),
-  including password prompts.
-- Start with `start`; continue with `poll`, using long `waitMs` values (up to 240000)
-  for builds and tests and short ones for interactive prompts. Stop with `kill`.
-- fastexec tasks end with the session. Use a persistent job runner for work that must
-  survive a session restart.
-- Each `start` runs a fresh bash: `cd` and exported variables do not carry over; pass
-  `cwd` or chain commands with `&&`.
-<!-- fastexec:end -->
-```
-
-The tool's name depends on the host, for example `mcp__fastexec__fastexec` in pi and `fastexec_fastexec` with `pi-mcp-adapter`, so the section names it "the fastexec tool". If the file already routes work to other shell tools, keep one owner per kind of work: one-shot commands, in-session long-running or interactive tasks, and jobs that outlive the session.
-
-## Tool
-
-One tool takes an `action` and the parameters that apply to it:
-
-| Action | Parameters | Behavior |
-|---|---|---|
-| `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `keepTree`, `waitMs` (default 30000), `returnWhen`, output options, `screen` | Runs the command in bash and waits. Returns the final result when the command exits in time; otherwise returns a `taskId` and the output so far. |
-| `poll` | `taskId`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs` (default 2000 with input or keys and no `returnWhen`, 30000 otherwise), `returnWhen`, output options, `screen` | Writes `input` exactly as given, then presses `keys`, closes stdin when `eof` is true, waits until the task ends, a `returnWhen` condition holds, or `waitMs` elapses, and returns output not yet seen. |
-| `kill` | `taskId`, `maxBytes` | Terminates the task's process tree and returns its final state. On a finished task that keeps processes, it ends them and keeps the root's result. It accepts and ignores `waitMs`. A failed termination call returns an error naming the cause. |
-| `list` | — | Lists this server's tasks, newest first, with the processes each keeps. |
-| `transcript` | `taskId`, `truncate` (default `tail`), `maxBytes` | Returns a PTY task's transcript from the first final line no earlier `transcript` returned, then the pending lines, such as the screen's. The file it names holds the whole text. |
-
-Output options:
-
-- `truncate`: `head_tail` (default), `head`, `tail`, or `none`. The bounded modes cut lines longer than 2000 characters (64 KiB with `raw`) and count them in `cutLines`; `none` returns whole lines.
-- `maxBytes`: 100–1048576, default 16384. It bounds the output window and status line together; error messages stay whole. `both` includes a second copy of the window in JSON; metadata and JSON serialization add bytes to the MCP response.
-- `raw`: `true` skips cleaning.
-- `encoding`: a WHATWG label such as `big5` or `gbk`.
-
-Behavior:
-
-- **Waits.** Each wait lasts at most 240 s. An ended wait, a cancelled call, or a timeout leaves the process running.
-- **Early return.** `returnWhen` ends a wait at the first condition that holds, and `waitEndedBy` names it with the matched text. `outputContains` watches unseen output for a line containing one of its texts. In a PTY task, `screenContains` watches the screen for one of its texts, `screenAppears` for a row containing one that the screen did not show before the call's input, and `screenGone` for one that showed and then no longer does. `quietMs` holds once no output has arrived for that long since the later of the last output and the start of the wait. A TUI that redraws old text needs the screen conditions: `screenAppears: ["Worked for"]` ends a Codex turn and `screenGone: ["Working"]` a pi turn, with `quietMs` as a fallback.
-- **Lifetime limit.** `killAfterMs` on `start` kills the task's whole tree, kept processes included, that many milliseconds after launch, independently of waits, polls, and cancelled calls; 0 or omitted means no limit. A task still running then reports `state: killed`, `lifetimeExpired: true`, and `killed by killAfterMs` in its status line.
-- **Background footer.** `start`, `poll`, `kill`, and `transcript` results end with a line such as `(Background: k7q2m exited 7, 3vx9a running 4m3s.)` naming the server's other tasks that need attention: finished tasks whose final state no result has shown yet, failures first, tasks whose held processes ended unseen, then running tasks and tasks that hold processes (`k7q2m keeps adb.exe`). It names at most three tasks, then counts the rest, within 512 bytes and a quarter of `maxBytes`. A finished task leaves the footer once a result or `list` has shown its final state.
-- **Environment.** Pipe and PTY tasks inherit the server's environment, then fastexec sets terminal, pager, and locale variables.
-- **Output.** stdout and stderr share one stream. Cleaning strips ANSI sequences, collapses carriage-return progress bars to their final text, and trims trailing spaces. A multibyte character that arrives in two parts, in UTF-8 or in an `encoding` such as `big5`, is shown whole once its last byte arrives.
-- **Results.** Each `start` or `poll` text result ends with a status line such as `[exited 0] k7q2m · 41.2s · 812 lines · log /tmp/fastexec-1000-1234/k7q2m.log`. `FASTEXEC_STRUCTURED_CONTENT` enables task and window metadata as JSON by default; `false` selects text-only results. With structured content enabled, `FASTEXEC_OUTPUT_MODE` selects where the output body appears.
-- **Logs.** Each task's output is kept in a log file of up to 64 MiB, and omitted lines are named by their log line numbers. If writing the log fails, the task keeps running, its earlier output stays readable, and the status line and `logError` report the failure. The server keeps the 64 most recently finished tasks and deletes its log directory on exit. Log directories are `fastexec-<uid>-<pid>` on Unix and `fastexec-<pid>` on Windows, in the temp directory; at startup the server removes the current user's directories whose server process has ended, such as those left by a forced kill.
-- **Process trees.** A task is its whole process tree. Processes a command leaves running, including those started with `&`, `nohup`, `setsid`, `start`, or `Start-Process` and servers a CLI starts for itself, such as the adb server, end when its root bash exits, and the result names them (`leftovers`). With `keepTree: true` they run on until `kill` on the task, `killAfterMs`, or session end; the status line and `list` name them while they run, `keptRunning` reports it, and `held` lists them. Once a result has shown the root's exit, waits treat such a task as running until its processes end (`waitEndedBy: tree_ended`); a call with `returnWhen` waits past a root exit 0 for what they print. `explorer.exe <app.exe>` hands a Windows GUI app to the desktop for good. Windows holds each tree in a kill-on-close Job Object. On Unix a task host, the fastexec binary itself, leads each tree's session, adopts processes that daemonize (Linux), and ends the tree when the server dies, even by SIGKILL.
-- **PTY keys.** `keys` presses keys in a PTY task after `input` is written, in array order, named as in tmux `send-keys`: `["Enter"]`, `["C-c"]`, `["Escape", ":", "q", "Enter"]`. Names cover Enter, Tab, Escape, arrows, editing and function keys, the keypad, single characters, and the `C-`, `M-`, and `S-` modifiers; an uppercase or shifted character is Shift plus its US-layout base (`A` is `S-a`). Keys follow the program's keyboard mode: the xterm encodings tmux sends, with arrows in the program's cursor mode, or the kitty keyboard protocol once the program enables it, as Windows Terminal encodes it; with the protocol's disambiguation flag, `C-i` and `Tab` differ and `C-Enter` has its own code. An unknown name, or in the legacy mode a modifier the key cannot carry, such as `C-Enter`, returns an error before anything is sent when the poll starts in that mode; a mode the program sets during the poll can fail a later key, after the keys before it. Each key is written `keyDelayMs` (default 150) after the program has accepted the input or key before it, in the keyboard mode the program has set by then, so a TUI that detects pastes by timing, such as Codex, takes Enter as a key press; `keyDelayMs: 0` writes input and keys at once.
-- **Terminal.** One terminal emulator, `alacritty_terminal`, renders `screen`, tracks the program's keyboard modes for `keys`, answers its terminal queries such as cursor-position reports, and records the transcript. Every output byte reaches it unchanged, and it acts on each sequence as the crate implements it. A synchronized update (mode 2026) shows on `screen` once it ends or after the emulator's 150 ms timeout, and output it still holds stays unread for the next poll. If the emulator fails on some output, the task keeps running and its log stays readable through `poll`, the transcript keeps the lines written before, and `screen` and `keys` return errors.
-- **Screen.** `screen: true` on `start` or `poll` of a PTY task returns the rendered 120×30 terminal screen and the cursor position instead of the output stream, so full-screen and TUI programs show their current frame rather than every redraw. It marks the stream read and does not combine with `truncate`, `raw`, or `encoding`.
-- **Transcript.** The terminal emulator of a PTY task records its transcript as the output arrives, into the file `<taskId>.transcript.txt` beside the log, which the status line names; `grep` and `sed` read it. Each line a program pushed off the screen is written once, in order, whether it scrolled away, moved up through a scroll region, or was cleared with the screen. A program that clears the history (ED3) and prints at least a screen of written lines again, as a full redraw does, adds only its new lines; fewer repeated lines are written again. Rows the terminal wrapped join into one line, written in pieces past 1 MiB, and tabs become spaces. The alternate screen keeps no history, so each alternate-screen session is merged from what it showed: scrolls move its rows by known distances, and frames show what the program finished drawing, where it shows or hides the cursor, ends a synchronized update, switches screens, or erases the screen, and where the output paused for 4 ms. A pause inside the redraw of a program that hides the cursor while it draws counts only if it lasted 100 ms. Every row that left the screen stays; a row shown again keeps its line; a row that grew, lost a little of its end, or changed only its numbers or spinner symbols in a small status area keeps its last text; a row reflowed into the rows around it drops out. A session matches redrawn rows against its last 10,000 lines. Each session follows the normal-screen lines shown when it began, from a `--- alternate screen ---` line, and normal-screen lines after it resume after a `--- normal screen ---` line. A line is final once no later frame is likely to change it; the rest, such as the screen's rows and the session lines just above them, are pending. A row that stays on screen while the lines after it are written, such as a fixed header, is written once it leaves the screen or the output ends. Each `transcript` call writes the pending lines after the final ones, where they stay until new final lines replace them, and returns the lines from the first final line no earlier call returned, then the pending lines; `firstLine`, `finalLines`, and `transcriptLines` count them. Once the output ends, every line is final. The file holds up to 64 MiB of final lines, counted under the 1 GiB total limit, and goes with the log. Text a program never showed on screen is absent. `transcript` neither waits nor moves the poll cursor.
-- **ConPTY.** On Windows x64, PTY tasks use Microsoft's ConPTY 1.24, which the binary carries and extracts to `%TEMP%\fastexec-conpty-1.24.260710001`. It passes a program's terminal output through unchanged, which `transcript` needs. If it cannot load, PTY tasks use the system ConPTY, stderr says why, and `transcript` results warn that lines may be missing.
-- **Task IDs.** Each task ID is five random characters from Crockford's base32 alphabet in lowercase, at least one a letter, such as `k7q2m`. A server never reuses an ID, and each server draws its own, so an ID from another fastexec server, such as one running as a task, almost never names a task here and returns `Unknown taskId`.
-- **Lifetime.** Tasks live as long as the server. The host stops the server when its session ends, and every task ends with it.
-
-## Test
+## Testing, Reference, and License
 
 ```bash
 cargo test
 ```
 
-The integration tests in `tests/mcp.rs` drive the built binary over MCP stdio.
+See [`docs/fastexec-design.md`](docs/fastexec-design.md) for host timeouts,
+`FASTEXEC_OUTPUT_MODE`, PTY keys, transcript spooling, and process trees, and
+[`src/description.md`](src/description.md) for agent usage rules.
 
-## License
-
-Apache-2.0. Parts of `src/bash.rs`, `src/process.rs`, and `src/output.rs` derive from [FastCtx](https://github.com/yc-duan/fastctx); see `NOTICE`. `vendor/conpty` holds Microsoft's ConPTY binaries under the MIT license; see `vendor/conpty/README.md`.
+Licensed under [Apache-2.0](LICENSE). Derived parts from
+[FastCtx](https://github.com/yc-duan/fastctx) and key-encoding credits are in
+[`NOTICE`](NOTICE). Windows x64 builds embed Microsoft ConPTY under the MIT
+license in [`vendor/conpty/README.md`](vendor/conpty/README.md).
