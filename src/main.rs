@@ -89,9 +89,9 @@ struct Request {
     wait_ms: Option<u64>,
     /// start, poll: end the wait early when any condition holds; the task keeps running. Texts are literal and case-sensitive, 1-16 per condition, each 1-4096 bytes without line breaks. waitMs stays the longest wait and defaults to 30000 with returnWhen.
     return_when: Option<wait::ReturnWhen>,
-    /// start, poll, transcript: output window mode (default head_tail; transcript defaults to tail).
+    /// start, poll, list, transcript: output window mode (default head_tail; transcript defaults to tail).
     truncate: Option<Truncate>,
-    /// start, poll, kill, transcript: byte budget of the result, 100-1048576 (default 16384); error messages stay whole.
+    /// start, poll, kill, list, transcript: byte budget of the result, 100-1048576 (default 16384); error messages stay whole.
     #[schemars(range(min = 100, max = 1048576))]
     max_bytes: Option<u64>,
     /// start, poll: return output without cleaning (default false).
@@ -160,7 +160,7 @@ fn validate(request: &Request) -> Result<View, String> {
             .chain(VIEW)
             .collect(),
         Action::Kill => vec!["taskId", "waitMs", "maxBytes"],
-        Action::List => vec![],
+        Action::List => vec!["truncate", "maxBytes"],
         Action::Transcript => vec!["taskId", "truncate", "maxBytes"],
     };
     for (name, set) in present {
@@ -353,7 +353,7 @@ impl Server {
     ) -> Result<CallToolResult, String> {
         let view = validate(&request)?;
         match request.action {
-            Action::List => Ok(self.list()),
+            Action::List => Ok(self.list(&view)),
             Action::Start => {
                 let cwd = match request.cwd {
                     None => std::env::current_dir()
@@ -513,7 +513,7 @@ impl Server {
             .ok_or_else(|| format!("Unknown taskId {id:?}. Tasks live as long as this server; use action list to see them."))
     }
 
-    fn list(&self) -> CallToolResult {
+    fn list(&self, view: &View) -> CallToolResult {
         let tasks = self.tasks.all();
         let mut lines = Vec::new();
         let mut entries = Vec::new();
@@ -547,20 +547,67 @@ impl Server {
             }));
             shown.push((task, snapshot));
         }
-        // The list shows these states, which settles the background footer's notices.
-        for (task, snapshot) in shown {
-            task.mark_reported(&snapshot);
+        let (kept, text) = fit_lines(&lines, view.truncate, view.max_bytes);
+        // The list shows these states, which settles the background footer's notices; a task
+        // the window leaves out stays due.
+        for index in kept {
+            let (task, snapshot) = &shown[index];
+            task.mark_reported(snapshot);
+            task.mark_keeps_reported(snapshot);
         }
         let text = if lines.is_empty() {
             "No tasks.".to_string()
         } else {
-            lines.join("\n")
+            text
         };
         success(
             text,
             json!({ "ok": true, "action": "list", "tasks": entries }),
         )
     }
+}
+
+/// Joins the whole `lines` that fit `budget` bytes, picked from the ends `truncate` names, with
+/// one marker line where lines were left out. Returns the indexes of the lines shown and the
+/// text.
+fn fit_lines(lines: &[String], truncate: Truncate, budget: usize) -> (Vec<usize>, String) {
+    let all = || ((0..lines.len()).collect(), lines.join("\n"));
+    if truncate == Truncate::None
+        || lines.iter().map(|line| line.len() + 1).sum::<usize>() <= budget + 1
+    {
+        return all();
+    }
+    let marker =
+        |omitted: usize| format!("... [{omitted} tasks omitted; raise maxBytes to see them] ...");
+    let last = lines.len() - 1;
+    let order: Vec<usize> = match truncate {
+        Truncate::Head => (0..=last).collect(),
+        Truncate::Tail => (0..=last).rev().collect(),
+        _ => (0..=last / 2).flat_map(|i| [i, last - i]).collect(),
+    };
+    // Room for the marker at its longest, with the newlines around it.
+    let mut room = budget.saturating_sub(marker(lines.len()).len() + 2);
+    let mut kept = Vec::new();
+    for index in order {
+        if kept.contains(&index) {
+            continue;
+        }
+        if lines[index].len() + 1 > room {
+            break;
+        }
+        room -= lines[index].len() + 1;
+        kept.push(index);
+    }
+    kept.sort_unstable();
+    let mut text: Vec<String> = Vec::new();
+    for index in 0..=last {
+        if kept.contains(&index) {
+            text.push(lines[index].clone());
+        } else if index == 0 || kept.contains(&(index - 1)) {
+            text.push(marker(lines.len() - kept.len()));
+        }
+    }
+    (kept, text.join("\n"))
 }
 
 /// Writes each key on its own after `input`, pausing `delay` after the program's stdin has
@@ -621,6 +668,7 @@ fn report(task: &Task, shown: &Snapshot, background: Option<(String, Vec<tasks::
     task.mark_reported(shown);
     for (task, shown) in background.map(|(_, shown)| shown).unwrap_or_default() {
         task.mark_reported(&shown);
+        task.mark_keeps_reported(&shown);
     }
 }
 

@@ -15,7 +15,7 @@ outside declared ranges return an error before execution.
 | `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `keepTree`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Spawns `command` in GNU bash and waits up to `waitMs` (default `30000`, range `0–240000`). |
 | `poll` | `taskId`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only), waits (`2000` ms with `input`/`keys` and no `returnWhen`, `30000` ms otherwise), and returns unseen output. |
 | `kill` | `taskId`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns its final state. On a finished `keepTree` task, ends held processes while keeping the root exit result. |
-| `list` | *(none)* | Lists all tasks in this server (newest first) with their state and held processes. |
+| `list` | `truncate`, `maxBytes` | Lists tasks in this server (newest first) with their state and held processes; text fits `maxBytes` while `structuredContent.tasks` stays complete. |
 | `transcript` | `taskId`, `truncate` (default `"tail"`), `maxBytes` | Reads a UTF-8 PTY task's terminal transcript from the first unseen final line, followed by pending lines. Does not wait or advance the `poll` cursor. |
 
 ### Key Parameter Rules
@@ -101,8 +101,8 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
   `keepTree`, `keptRunning`, `held`).
 - **Background footer**: Appended to `start`, `poll`, `kill`, and `transcript`
   results (up to `512` bytes and `maxBytes / 4`) naming up to three other tasks
-  that finished unseen, had held processes end, or are still running/holding
-  processes.
+  that finished unseen, had held processes end, are still running, or have a
+  changed (or failed-to-kill) set of held processes not yet shown.
 
 ## 3. Logs, Terminal Emulator, and Transcript Spool
 

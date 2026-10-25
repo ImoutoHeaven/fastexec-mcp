@@ -487,6 +487,74 @@ fn background_footer_names_unreported_tasks_once_failures_first() {
     assert!(text.len() <= 100, "{} bytes: {text}", text.len());
 }
 
+#[test]
+fn list_fits_max_bytes_and_leaves_the_tasks_it_omits_due() {
+    let mut server = Server::start();
+    // The tasks end together, after the footers of the starts showed them running; long
+    // commands make lines that do not all fit.
+    let (go, go_bash) = scratch("list-go");
+    let command = format!(
+        "until [ -e {go_bash} ]; do sleep 0.1; done; exit 3 # {}",
+        "x".repeat(100)
+    );
+    for _ in 0..8 {
+        server.ok(json!({"action": "start", "command": command, "loginShell": false, "waitMs": 0}));
+    }
+    std::fs::write(&*go, "").unwrap();
+    std::thread::sleep(Duration::from_millis(3000));
+    let (out, text) = server.ok(json!({"action": "list", "truncate": "head", "maxBytes": 400}));
+    assert!(text.len() <= 400, "{} bytes: {text}", text.len());
+    assert_eq!(
+        out["tasks"].as_array().unwrap().len(),
+        8,
+        "structuredContent lists every task"
+    );
+    let (first, last) = (text.lines().next().unwrap(), text.lines().last().unwrap());
+    assert!(
+        first.starts_with(&format!("{} [exited 3]", server.id(8))),
+        "newest first: {text}"
+    );
+    assert!(
+        last.starts_with("... [")
+            && last.ends_with(" tasks omitted; raise maxBytes to see them] ..."),
+        "{text}"
+    );
+    assert!(!text.contains(&server.id(1)), "{text}");
+    // The footer still names the tasks the list left out, newest first, and none it showed.
+    let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
+    let footer = text.lines().last().unwrap();
+    assert!(
+        footer.starts_with(&format!("(Background: {} exited 3", server.id(6))),
+        "{text}"
+    );
+    assert!(
+        !footer.contains(&server.id(8)) && !footer.contains(&server.id(7)),
+        "{text}"
+    );
+
+    let (_, text) = server.ok(json!({"action": "list", "maxBytes": 400}));
+    assert!(text.len() <= 400, "{} bytes: {text}", text.len());
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].starts_with(&server.id(9)) && lines.last().unwrap().starts_with(&server.id(1)),
+        "head_tail keeps both ends: {text}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("... ["))
+            .count(),
+        1,
+        "{text}"
+    );
+    let (_, text, is_error) =
+        server.call(json!({"action": "list", "truncate": "none", "maxBytes": 400}));
+    assert!(
+        is_error && text.contains("maxBytes does not apply with truncate"),
+        "{text}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn bash_override_must_exit_successfully() {
@@ -1380,10 +1448,16 @@ fn waits_on_kept_processes_last_until_they_end_or_a_condition_holds() {
     assert_eq!(out["waitEndedBy"]["condition"], "task_ended", "{text}");
     assert_eq!(out["exitCode"], 3, "{text}");
     let failed = server.id(3);
-
-    // The footer names the tasks that keep processes, and once the end of a tree it did not show.
-    let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
+    // The footer names the processes a task keeps once.
     assert!(text.contains(&format!("{ready} keeps ")), "{text}");
+
+    // The footer leaves out held processes it showed, and names the end of a tree it did not
+    // show once.
+    let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
+    assert!(
+        !text.contains(&format!("{ready} keeps ")),
+        "shown once: {text}"
+    );
     server.ok(json!({"action": "kill", "taskId": failed}));
     let command = format!("(sleep 1; touch {done_bash}) & echo short");
     server.ok(json!({"action": "start", "command": command, "keepTree": true, "waitMs": 60000}));
@@ -1400,6 +1474,18 @@ fn waits_on_kept_processes_last_until_they_end_or_a_condition_holds() {
         !text.contains(&format!("{short} kept")),
         "shown once: {text}"
     );
+    // The footer names held processes once, and again once they change; a task's own result,
+    // here too small to show them, counts for nothing.
+    let command = "sleep 300 & sleep 2 & echo two";
+    let (out, text) = server.ok(json!({"action": "start", "command": command, "keepTree": true, "waitMs": 10000, "maxBytes": 100}));
+    assert_eq!(out["keptRunning"], true, "{text}");
+    let two = server.id(8);
+    for (pause, shown) in [(0, true), (0, false), (3000, true), (0, false)] {
+        std::thread::sleep(Duration::from_millis(pause));
+        let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
+        assert_eq!(text.contains(&format!("{two} keeps ")), shown, "{text}");
+    }
+    server.ok(json!({"action": "kill", "taskId": two}));
     server.ok(json!({"action": "kill", "taskId": ready}));
 }
 
@@ -1882,7 +1968,7 @@ fn invalid_parameters_are_rejected_and_null_means_omitted() {
         ),
         (
             json!({"action": "start", "command": "true", "returnWhen": {"outputContains": ["a\nb"]}}),
-            "without line breaks",
+            "without line breaks (outputContains matches within one output line; to avoid matching an echoed command, print a marker",
         ),
         (
             json!({"action": "start", "command": "true", "returnWhen": {"outputContains": []}}),

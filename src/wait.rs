@@ -60,8 +60,13 @@ impl ReturnWhen {
             if texts.iter().any(|text| {
                 text.is_empty() || text.len() > MAX_TEXT_BYTES || text.contains(['\n', '\r'])
             }) {
+                let why = if name == "outputContains" {
+                    " (outputContains matches within one output line; to avoid matching an echoed command, print a marker the command line does not contain, such as one built with printf '%s_%s\\n' DONE 42, instead of adding a line break)"
+                } else {
+                    ""
+                };
                 return Err(format!(
-                    "Each {name} text must be 1-{MAX_TEXT_BYTES} bytes without line breaks."
+                    "Each {name} text must be 1-{MAX_TEXT_BYTES} bytes without line breaks{why}."
                 ));
             }
         }

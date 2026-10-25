@@ -95,6 +95,8 @@ pub struct Task {
     reported: AtomicBool,
     /// Set once a result has shown that the processes held past the root's exit ended.
     tree_end_reported: AtomicBool,
+    /// The sorted PIDs of the held processes a result last showed; None until one did.
+    keeps_reported: Mutex<Option<Vec<u32>>>,
     out: Mutex<Output>,
     view: Mutex<View>,
     end: Mutex<Option<Final>>,
@@ -351,6 +353,7 @@ impl Tasks {
             expired: AtomicBool::new(false),
             reported: AtomicBool::new(false),
             tree_end_reported: AtomicBool::new(false),
+            keeps_reported: Mutex::default(),
             out: Mutex::default(),
             view: Mutex::default(),
             end: Mutex::new(None),
@@ -539,7 +542,8 @@ impl Tasks {
 
     /// One line naming the other tasks that need attention, at most `cap` bytes: finished tasks
     /// whose final state no result has shown yet (failures first), tasks whose held processes
-    /// ended unseen, then running tasks and tasks that hold processes. Returns the line and the
+    /// ended unseen, then running tasks and tasks whose held processes changed since a result
+    /// showed them or failed to be killed. Returns the line and the
     /// tasks it names with the snapshots it showed, which the caller marks reported once the
     /// line is delivered.
     pub fn background(&self, exclude: &str, cap: usize) -> Option<(String, Vec<Shown>)> {
@@ -557,7 +561,7 @@ impl Tasks {
             .into_iter()
             .filter(|task| task.id != exclude)
             .filter_map(|task| {
-                let snapshot = task.snapshot();
+                let mut snapshot = task.snapshot();
                 let (rank, notice) = match snapshot.state {
                     "running" => (2, Notice::Running),
                     _ if !task.is_reported() => {
@@ -568,7 +572,15 @@ impl Tasks {
                     _ if snapshot.tree_ended && !task.tree_end_reported.load(Ordering::SeqCst) => {
                         (1, Notice::TreeEnded)
                     }
-                    _ if snapshot.kept => (2, Notice::Keeps),
+                    _ if snapshot.kept => {
+                        snapshot.held = task.tree.members();
+                        if snapshot.kill_error.is_none()
+                            && lock(&task.keeps_reported).as_ref() == Some(&pids(&snapshot.held))
+                        {
+                            return None;
+                        }
+                        (2, Notice::Keeps)
+                    }
                     _ => return None,
                 };
                 Some((rank, notice, task, snapshot))
@@ -598,12 +610,6 @@ impl Tasks {
             }
         }
         let counts = counts.join(", ");
-        // Only the tasks the line names have their held processes listed.
-        for (_, notice, task, snapshot) in entries.iter_mut().take(3) {
-            if *notice == Notice::Keeps {
-                snapshot.held = task.snapshot_held().held;
-            }
-        }
         let shown_tasks = |shown: usize| {
             entries[..shown]
                 .iter()
@@ -753,6 +759,13 @@ fn drain(task: &Task, eof: &mpsc::Receiver<()>, kept: bool) -> bool {
 
 /// A task and the snapshot a result showed of it.
 pub type Shown = (Arc<Task>, Snapshot);
+
+/// The sorted PIDs of `held`.
+fn pids(held: &[Member]) -> Vec<u32> {
+    let mut pids: Vec<u32> = held.iter().map(|member| member.pid).collect();
+    pids.sort_unstable();
+    pids
+}
 
 /// The first held process and how many more: `adb.exe +2`.
 fn brief(held: &[Member]) -> String {
@@ -1092,6 +1105,14 @@ impl Task {
         }
         if shown.tree_ended {
             self.tree_end_reported.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Records the held processes a background footer or the list showed by name; a task's own
+    /// status line may be cut before them.
+    pub fn mark_keeps_reported(&self, shown: &Snapshot) {
+        if shown.kept && shown.kill_error.is_none() {
+            *lock(&self.keeps_reported) = Some(pids(&shown.held));
         }
     }
 
