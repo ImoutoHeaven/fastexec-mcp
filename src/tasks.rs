@@ -1,24 +1,50 @@
 //! Task registry: spawn, log capture, unseen-output cursors, input queues, and shutdown.
 
 use crate::output::{
-    Cleaner, Matcher, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix,
+    Matcher, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix,
     incomplete_utf8_suffix,
 };
 use crate::process::{self, Launch, Member, Tree};
+use crate::session::{LaunchContext, ReadState, Session};
 use crate::terminal::Live;
 use encoding_rs::Encoding;
-use std::collections::HashSet;
 use std::fs::File;
-use std::hash::{BuildHasher, RandomState};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
 use tokio::sync::watch;
 
-pub const MAX_RUNNING: usize = 16;
-const MAX_FINISHED: usize = 64;
+/// What a server admits and keeps: how many tasks may run at once, how many finished tasks stay
+/// in the registry, and how long a finished one is kept.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub max_running: usize,
+    pub max_finished: usize,
+    pub finished_ttl: Option<Duration>,
+}
+
+impl Limits {
+    /// A stdio server's limits: a session ends with the client, so finished tasks are kept and
+    /// never expire.
+    pub const OFF: Limits = Limits {
+        max_running: 16,
+        max_finished: 64,
+        finished_ttl: None,
+    };
+
+    /// A daemon's limits: it serves more than one client and lives longer, so it admits more
+    /// tasks and lets finished ones go after a day.
+    #[allow(dead_code)] // the daemon entry point picks it in block 9
+    pub const ON: Limits = Limits {
+        max_running: 64,
+        max_finished: 256,
+        finished_ttl: Some(Duration::from_secs(24 * 60 * 60)),
+    };
+}
+
 const TASK_LOG_LIMIT: u64 = 64 << 20;
 const TOTAL_LOG_LIMIT: u64 = 1 << 30;
 const INPUT_QUEUE_LIMIT: usize = 1 << 20;
@@ -41,36 +67,99 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub struct Tasks {
     dir: PathBuf,
+    /// Arms `killAfterMs`: the deadline belongs to the Core, not to the starting request.
+    handle: Handle,
+    /// This server's ID epoch: 128 bits from the OS random source as 26 Crockford base32
+    /// characters. Every task ID starts with it, so an ID from another server is told apart.
+    epoch: String,
+    /// The counter value of the next ID; IDs never repeat within an epoch.
+    next: AtomicU64,
     registry: Mutex<Registry>,
+    limits: Limits,
     log_bytes: AtomicU64,
     /// [`TOTAL_LOG_LIMIT`]; debug builds take a smaller one from
     /// `FASTEXEC_TEST_TOTAL_LOG_LIMIT`, so tests reach it without writing 1 GiB.
     log_limit: u64,
-    bash: OnceLock<Result<PathBuf, String>>,
 }
 
 #[derive(Default)]
 struct Registry {
-    /// Every ID this server has issued, so a retired task's ID never names a later task.
-    issued: HashSet<String>,
     tasks: Vec<Arc<Task>>,
+    /// Starts admitted but not yet inserted; they count against [`Limits::max_running`].
+    pending: usize,
+    /// Set by [`Tasks::shutdown`]: no start is admitted from then on.
+    stopping: bool,
 }
 
-/// Five random characters from Crockford's base32 alphabet in lowercase, at least one of them
-/// a letter, unique within this server. Random IDs make an ID from another fastexec server,
-/// such as a nested one, unlikely to name a task here.
-fn new_id(issued: &mut HashSet<String>) -> String {
-    const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
-    loop {
-        let bits = RandomState::new().hash_one(issued.len());
-        let id: String = (0..5)
-            .map(|i| ALPHABET[(bits >> (5 * i)) as usize & 31] as char)
-            .collect();
-        if id.bytes().any(|b| b.is_ascii_alphabetic()) && issued.insert(id.clone()) {
-            return id;
+/// A start in flight: it holds a place against [`Limits::max_running`] until it is inserted
+/// or fails.
+struct Pending<'a> {
+    registry: &'a Mutex<Registry>,
+    counted: bool,
+}
+
+impl Pending<'_> {
+    /// Gives the place back inside the caller's critical section: its own drop must never
+    /// re-lock a registry mutex the caller still holds.
+    fn release(&mut self, registry: &mut Registry) {
+        if self.counted {
+            registry.pending -= 1;
+            self.counted = false;
         }
     }
 }
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            lock(self.registry).pending -= 1;
+        }
+    }
+}
+
+/// Crockford's base32 alphabet in lowercase.
+const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// `value` in Crockford's base32, most significant digit first, no padding beyond `digits`.
+fn base32(mut value: u128, digits: usize) -> String {
+    let digits = digits.max(1);
+    let mut out = Vec::with_capacity(digits);
+    loop {
+        out.push(ALPHABET[(value & 31) as usize] as char);
+        value >>= 5;
+        if value == 0 && out.len() >= digits {
+            break;
+        }
+    }
+    out.iter().rev().collect()
+}
+
+/// An epoch and a counter value as a task ID.
+fn task_id(epoch: &str, number: u64) -> String {
+    format!("{epoch}-{}", base32(number as u128, 1))
+}
+
+/// `digits` characters (at most 26) from 128 random bits, for the epoch and session names.
+pub fn random_chars(digits: usize) -> std::io::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        std::io::Error::other(format!(
+            "Cannot read the OS random source for the task ID epoch: {error}."
+        ))
+    })?;
+    let mut out = base32(u128::from_be_bytes(bytes), 26);
+    out.truncate(digits);
+    Ok(out)
+}
+
+/// A fresh 128-bit epoch from the OS random source: 26 characters, the top two bits zero.
+fn new_epoch() -> std::io::Result<String> {
+    random_chars(26)
+}
+
+/// The error a transcript read returns for a task whose files the total log limit evicted.
+pub const EVICTED_TRANSCRIPT: &str =
+    "The files of this task were evicted under the 1 GiB total limit; its transcript is gone.";
 
 pub struct Task {
     pub id: String,
@@ -80,6 +169,10 @@ pub struct Task {
     pub encoding: &'static Encoding,
     /// `keepTree`: processes the root leaves running stay until kill or session end.
     pub keep: bool,
+    /// The session that started the task: its client name and short session ID.
+    pub owner: String,
+    /// The session ID and daemon call that started the task, when a daemon call started it.
+    pub started_by: Option<(String, u64)>,
     started: Instant,
     tree: Tree,
     /// Set once no process of the tree runs.
@@ -91,20 +184,16 @@ pub struct Task {
     kill_requested: AtomicBool,
     /// Set when `killAfterMs` elapsed and ended the task.
     expired: AtomicBool,
-    /// Set once a result has shown this task's final state.
-    reported: AtomicBool,
-    /// Set once a result has shown that the processes held past the root's exit ended.
-    tree_end_reported: AtomicBool,
-    /// The sorted PIDs of the held processes a result last showed; None until one did.
-    keeps_reported: Mutex<Option<Vec<u32>>>,
     out: Mutex<Output>,
-    view: Mutex<View>,
     end: Mutex<Option<Final>>,
     done: watch::Sender<bool>,
     /// Signals each captured output chunk and each synchronized update its timeout ends.
     activity: watch::Sender<()>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
     queued: AtomicUsize,
+    /// One poll's `input`, `keys`, and `eof` go out as one sequence: this gate holds the next
+    /// sequence out, so a delayed key press cannot land in the middle of another write.
+    pub input_gate: tokio::sync::Mutex<()>,
     /// PTY tasks: a terminal emulator fed with every output byte, and the transcript it
     /// records. Its replies to terminal queries, such as the cursor-position report and device
     /// attributes ConPTY waits for at startup, go to the program as input.
@@ -126,8 +215,6 @@ struct Spool {
     lines: u64,
     /// Bytes of the pending lines after them.
     pending: u64,
-    /// Bytes and lines of the final lines a `transcript` result has shown.
-    shown: (u64, u64),
     /// Why the file takes no more lines.
     stopped: Option<String>,
 }
@@ -177,13 +264,6 @@ struct Output {
     last_output: Option<Instant>,
     /// Bytes the transcript file holds, counted under the total log limit.
     transcript: u64,
-}
-
-#[derive(Default)]
-struct View {
-    cursor: u64,
-    lines_before: u64,
-    cleaner: Cleaner,
 }
 
 #[derive(Clone)]
@@ -236,29 +316,57 @@ pub struct StartArgs {
     pub login: bool,
     pub keep: bool,
     pub encoding: &'static Encoding,
+    /// `killAfterMs`: end the task's tree this many ms after launch; 0 or None means no limit.
+    pub kill_after_ms: Option<u64>,
+    /// The session that starts the task, shown as its owner.
+    pub owner: String,
+    /// The session ID and daemon call that started the task, shown by `list`; `None` for a
+    /// stdio call, which has neither.
+    pub started_by: Option<(String, u64)>,
+    /// What the task inherits: its environment, and the bash found in it.
+    pub launch: Arc<LaunchContext>,
 }
 
+/// `Tasks::new` uses one directory per process, so only one test builds one at a time.
+#[cfg(test)]
+pub(crate) static ONE_TASKS: Mutex<()> = Mutex::new(());
+
 impl Tasks {
-    pub fn new() -> std::io::Result<Arc<Self>> {
+    pub fn new(limits: Limits) -> std::io::Result<Arc<Self>> {
         let temp = std::env::temp_dir();
         remove_stale_dirs(&temp);
         let dir = temp.join(format!("{}{}", dir_prefix(), std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        Self::new_in(limits, dir)
+    }
+
+    /// A registry whose task logs live in `dir`, which is created if it is missing.
+    pub fn new_in(limits: Limits, dir: PathBuf) -> std::io::Result<Arc<Self>> {
+        let epoch = new_epoch()?;
+        let handle = Handle::try_current().map_err(|error| {
+            std::io::Error::other(format!(
+                "Tasks needs a tokio runtime for the killAfterMs timer: {error}."
+            ))
+        })?;
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         builder.create(&dir)?;
         Ok(Arc::new(Self {
             dir,
+            handle,
+            epoch,
+            next: AtomicU64::new(1),
             registry: Mutex::default(),
+            limits,
             log_bytes: AtomicU64::new(0),
             log_limit: std::env::var("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
                 .ok()
                 .and_then(|limit| limit.parse().ok())
                 .filter(|limit| cfg!(debug_assertions) && (1..=TOTAL_LOG_LIMIT).contains(limit))
                 .unwrap_or(TOTAL_LOG_LIMIT),
-            bash: OnceLock::new(),
         }))
     }
 
@@ -270,25 +378,72 @@ impl Tasks {
             .cloned()
     }
 
+    /// This server's ID epoch, the prefix every task ID of this server carries.
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
+    /// The next task ID: this epoch and the next counter value.
+    fn next_id(&self) -> String {
+        let number = self.next.fetch_add(1, Ordering::Relaxed);
+        task_id(&self.epoch, number)
+    }
+
     /// Every task, newest first.
     pub fn all(&self) -> Vec<Arc<Task>> {
         lock(&self.registry).tasks.iter().rev().cloned().collect()
     }
 
-    pub fn start(self: &Arc<Self>, args: StartArgs) -> Result<Arc<Task>, String> {
-        let bash = self.bash.get_or_init(crate::bash::find).clone()?;
+    /// Takes a place against [`Limits::max_running`] and the next task ID. The guard gives the
+    /// place back on drop, so every failed start releases it.
+    fn admit(&self) -> Result<(String, Pending<'_>), String> {
         let mut registry = lock(&self.registry);
+        if registry.stopping {
+            return Err("The server is shutting down; the task was not started.".into());
+        }
         let running = registry
             .tasks
             .iter()
             .filter(|task| task.is_running() || task.keeps_processes())
             .count();
-        if running >= MAX_RUNNING {
+        let limit = self.limits.max_running;
+        if running + registry.pending >= limit {
             return Err(format!(
-                "TOO_MANY_TASKS: {MAX_RUNNING} tasks are running or keep processes. Wait for one to finish or kill one, then retry."
+                "TOO_MANY_TASKS: {limit} tasks are running or keep processes. Wait for one to finish or kill one, then retry."
             ));
         }
-        let id = new_id(&mut registry.issued);
+        registry.pending += 1;
+        Ok((
+            self.next_id(),
+            Pending {
+                registry: &self.registry,
+                counted: true,
+            },
+        ))
+    }
+
+    /// Ends the task when `killAfterMs` elapses. The deadline belongs to the task, not to the
+    /// request that started it: it survives that request's cancellation and every later wait,
+    /// and bounds kept processes.
+    fn arm_deadline(&self, task: &Arc<Task>, kill_after_ms: Option<u64>) {
+        let Some(limit) = kill_after_ms.filter(|&limit| limit > 0) else {
+            return;
+        };
+        let (expiring, mut done) = (Arc::clone(task), task.tree_done());
+        self.handle.spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(limit)) => expiring.expire(),
+                _ = done.wait_for(|done| *done) => {}
+            }
+        });
+    }
+
+    pub fn start(self: &Arc<Self>, args: StartArgs) -> Result<Arc<Task>, String> {
+        let kill_after_ms = args.kill_after_ms;
+        // Admission holds a place against the running limit, so the bash lookup, the file
+        // creation, and the spawn below all run without the registry lock.
+        let (id, mut pending) = self.admit()?;
+        let bash = args.launch.bash()?.to_path_buf();
         let log_path = self.dir.join(format!("{id}.log"));
         let log = private_file(&log_path)
             .map_err(|error| format!("Cannot create the task log: {error}."))?;
@@ -305,6 +460,7 @@ impl Tasks {
             command: &args.command,
             script,
             cwd: &args.cwd,
+            env: &args.launch,
             login: args.login,
             pty: args.pty,
         };
@@ -323,7 +479,6 @@ impl Tasks {
                 bytes: 0,
                 lines: 0,
                 pending: 0,
-                shown: (0, 0),
                 stopped: None,
             };
             if args.encoding == encoding_rs::UTF_8 {
@@ -344,6 +499,8 @@ impl Tasks {
             log_path,
             encoding: args.encoding,
             keep: args.keep,
+            owner: args.owner,
+            started_by: args.started_by,
             started: Instant::now(),
             tree: spawned.tree,
             tree_done: watch::Sender::new(false),
@@ -351,20 +508,27 @@ impl Tasks {
             kill_error: Mutex::new(None),
             kill_requested: AtomicBool::new(false),
             expired: AtomicBool::new(false),
-            reported: AtomicBool::new(false),
-            tree_end_reported: AtomicBool::new(false),
-            keeps_reported: Mutex::default(),
             out: Mutex::default(),
-            view: Mutex::default(),
             end: Mutex::new(None),
             done: watch::Sender::new(false),
             activity: watch::Sender::new(()),
             input: Mutex::new(Some(input_tx.clone())),
             queued: AtomicUsize::new(0),
+            input_gate: tokio::sync::Mutex::new(()),
             terminal,
         });
+        let mut registry = lock(&self.registry);
         registry.tasks.push(Arc::clone(&task));
+        pending.release(&mut registry);
+        let stopping = registry.stopping;
         drop(registry);
+        if stopping {
+            // The server began stopping while this tree was created: it ends now, and it joins
+            // the registry anyway so the capture, input, and waiter threads clean up as usual.
+            task.kill_requested.store(true, Ordering::SeqCst);
+            let _ = task.tree.kill();
+        }
+        self.arm_deadline(&task, kill_after_ms);
 
         let (eof_tx, eof_rx) = mpsc::channel::<()>();
         let (shared, reader_task, output) = (Arc::clone(self), Arc::clone(&task), spawned.output);
@@ -446,8 +610,8 @@ impl Tasks {
         Ok(task)
     }
 
-    /// Keeps the [`MAX_FINISHED`] most recently finished tasks and deletes the logs of older
-    /// ones. Runs right after each completion, so the task that just finished always stays.
+    /// Keeps the [`Limits::max_finished`] most recently finished tasks and deletes the logs of
+    /// older ones. Runs right after each completion, so the task that just finished always stays.
     fn retire_finished(&self, registry: &mut Registry) {
         // A task that keeps processes stays, so kill can still reach them.
         let mut finished: Vec<(Instant, String)> = registry
@@ -456,11 +620,12 @@ impl Tasks {
             .filter(|task| !task.keeps_processes())
             .filter_map(|task| task.ended_at().map(|at| (at, task.id.clone())))
             .collect();
-        if finished.len() <= MAX_FINISHED {
+        let keep = self.limits.max_finished;
+        if finished.len() <= keep {
             return;
         }
         finished.sort();
-        let victims: Vec<String> = finished[..finished.len() - MAX_FINISHED]
+        let victims: Vec<String> = finished[..finished.len() - keep]
             .iter()
             .map(|(_, id)| id.clone())
             .collect();
@@ -471,6 +636,45 @@ impl Tasks {
             self.evict_log(task);
             false
         });
+    }
+
+    /// Removes every finished task that ended at least `finished_ttl` before `now`, deleting its
+    /// log as `retire_finished` does. A task that keeps processes is not finished, so it stays.
+    pub fn expire_finished(&self, now: Instant) {
+        let Some(ttl) = self.limits.finished_ttl else {
+            return;
+        };
+        // The victims leave the registry under the lock; their logs are deleted after it, so no
+        // file work happens under the registry.
+        let expired: Vec<Arc<Task>> = {
+            let mut registry = lock(&self.registry);
+            let mut expired = Vec::new();
+            registry.tasks.retain(|task| {
+                let gone = !task.keeps_processes()
+                    && task
+                        .ended_at()
+                        .is_some_and(|ended| now.saturating_duration_since(ended) >= ttl);
+                if gone {
+                    expired.push(Arc::clone(task));
+                }
+                !gone
+            });
+            expired
+        };
+        for task in &expired {
+            self.evict_log(task);
+        }
+    }
+
+    /// Whether the registry holds nothing at all: no task and no start in flight.
+    pub fn idle(&self) -> bool {
+        let registry = lock(&self.registry);
+        registry.tasks.is_empty() && registry.pending == 0
+    }
+
+    /// How many starts are admitted but not yet inserted.
+    pub fn pending(&self) -> usize {
+        lock(&self.registry).pending
     }
 
     fn evict_log(&self, task: &Task) {
@@ -490,13 +694,17 @@ impl Tasks {
         if self.log_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes <= self.log_limit {
             return true;
         }
-        let candidates: Vec<Arc<Task>> = lock(&self.registry)
+        let mut candidates: Vec<(Instant, Arc<Task>)> = lock(&self.registry)
             .tasks
             .iter()
             .filter(|task| !task.is_running() && !task.keeps_processes())
-            .cloned()
+            .filter_map(|task| task.ended_at().map(|at| (at, Arc::clone(task))))
             .collect();
-        for task in candidates {
+        // The log that ended earliest goes first, as retire_finished removes it: registry order
+        // is start order, and a task that started first can end last.
+        candidates
+            .sort_by(|(a, first), (b, second)| a.cmp(b).then_with(|| first.id.cmp(&second.id)));
+        for (_, task) in candidates {
             if self.log_bytes.load(Ordering::SeqCst) <= self.log_limit {
                 break;
             }
@@ -531,7 +739,11 @@ impl Tasks {
 
     /// Kills every tree, kept processes included, and removes the log directory.
     pub fn shutdown(&self) {
-        for task in lock(&self.registry).tasks.iter() {
+        let mut registry = lock(&self.registry);
+        // Admission closes first: no start is admitted from here on, and one already admitted
+        // still inserts its task and then ends its tree.
+        registry.stopping = true;
+        for task in registry.tasks.iter() {
             if task.is_running() {
                 task.kill_requested.store(true, Ordering::SeqCst);
             }
@@ -546,7 +758,25 @@ impl Tasks {
     /// showed them or failed to be killed. Returns the line and the
     /// tasks it names with the snapshots it showed, which the caller marks reported once the
     /// line is delivered.
-    pub fn background(&self, exclude: &str, cap: usize) -> Option<(String, Vec<Shown>)> {
+    /// Drops this session's views of tasks that have retired. Registry then session locks, the
+    /// order every other reader takes them in.
+    pub fn prune_views(&self, session: &Session) {
+        let registry = lock(&self.registry);
+        session.touched(&registry.tasks);
+    }
+
+    pub fn background(
+        &self,
+        session: &Session,
+        exclude: &str,
+        cap: usize,
+    ) -> Option<(String, Vec<Shown>)> {
+        // Registry and session locks are taken together, in that order, so a task that starts
+        // meanwhile cannot be pruned as retired; both are released before any snapshot.
+        let touched = {
+            let registry = lock(&self.registry);
+            session.touched(&registry.tasks)
+        };
         // Rank 0: failed or expired; 1: other finished, or held processes ended; 2: running or
         // holding processes. Newest first within a rank.
         #[derive(PartialEq)]
@@ -556,26 +786,23 @@ impl Tasks {
             Keeps,
             Running,
         }
-        let mut entries: Vec<(u8, Notice, Arc<Task>, Snapshot)> = self
-            .all()
+        let mut entries: Vec<(u8, Notice, Arc<Task>, Snapshot)> = touched
             .into_iter()
-            .filter(|task| task.id != exclude)
-            .filter_map(|task| {
+            .filter(|(task, _)| task.id != exclude)
+            .filter_map(|(task, view)| {
                 let mut snapshot = task.snapshot();
                 let (rank, notice) = match snapshot.state {
                     "running" => (2, Notice::Running),
-                    _ if !task.is_reported() => {
+                    _ if !view.is_reported() => {
                         let failed = snapshot.state == "exited" && snapshot.exit_code != Some(0)
                             || snapshot.expired;
                         (if failed { 0 } else { 1 }, Notice::Root)
                     }
-                    _ if snapshot.tree_ended && !task.tree_end_reported.load(Ordering::SeqCst) => {
-                        (1, Notice::TreeEnded)
-                    }
+                    _ if snapshot.tree_ended && !view.tree_end_reported() => (1, Notice::TreeEnded),
                     _ if snapshot.kept => {
                         snapshot.held = task.tree.members();
                         if snapshot.kill_error.is_none()
-                            && lock(&task.keeps_reported).as_ref() == Some(&pids(&snapshot.held))
+                            && view.keeps_reported().as_ref() == Some(&pids(&snapshot.held))
                         {
                             return None;
                         }
@@ -761,7 +988,7 @@ fn drain(task: &Task, eof: &mpsc::Receiver<()>, kept: bool) -> bool {
 pub type Shown = (Arc<Task>, Snapshot);
 
 /// The sorted PIDs of `held`.
-fn pids(held: &[Member]) -> Vec<u32> {
+pub(crate) fn pids(held: &[Member]) -> Vec<u32> {
     let mut pids: Vec<u32> = held.iter().map(|member| member.pid).collect();
     pids.sort_unstable();
     pids
@@ -1002,12 +1229,6 @@ impl Task {
         (out.last_output, sync_pending)
     }
 
-    /// Where unseen output starts: the poll cursor and the cleaning state there.
-    pub fn unseen(&self) -> (u64, Cleaner) {
-        let view = lock(&self.view);
-        (view.cursor, view.cleaner.clone())
-    }
-
     /// Feeds `matcher` the stored output from `from` on, advancing `from` past what it read,
     /// and ends it once output has ended; returns the lowest needle the matcher has found.
     pub fn scan(&self, matcher: &mut Matcher, from: &mut u64) -> std::io::Result<Option<usize>> {
@@ -1019,19 +1240,15 @@ impl Task {
             return Ok(None);
         }
         if written > *from {
-            let mut file = File::open(&self.log_path)?;
-            file.seek(SeekFrom::Start(*from))?;
-            let mut buffer = vec![0_u8; 64 * 1024];
-            while *from < written {
-                let want = (written - *from).min(buffer.len() as u64) as usize;
-                let read = file.read(&mut buffer[..want])?;
-                if read == 0 {
-                    break;
+            if let Err(error) = self.scan_log(matcher, from, written) {
+                // Eviction can delete the log between the flags above and this read.
+                if !lock(&self.out).evicted {
+                    return Err(error);
                 }
-                *from += read as u64;
-                if matcher.push(&buffer[..read]) == Some(0) {
-                    return Ok(Some(0));
-                }
+                return Ok(None);
+            }
+            if matcher.best() == Some(0) {
+                return Ok(Some(0));
             }
         }
         Ok(if closed && *from >= written {
@@ -1041,9 +1258,24 @@ impl Task {
         })
     }
 
-    /// Whether a result has shown this task's final state.
-    pub fn is_reported(&self) -> bool {
-        self.reported.load(Ordering::SeqCst)
+    /// Feeds the matcher the stored output from `from` to `written`, advancing `from`; an error
+    /// leaves `from` where the last complete read put it.
+    fn scan_log(&self, matcher: &mut Matcher, from: &mut u64, written: u64) -> std::io::Result<()> {
+        let mut file = File::open(&self.log_path)?;
+        file.seek(SeekFrom::Start(*from))?;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        while *from < written {
+            let want = (written - *from).min(buffer.len() as u64) as usize;
+            let read = file.read(&mut buffer[..want])?;
+            if read == 0 {
+                break;
+            }
+            *from += read as u64;
+            if matcher.push(&buffer[..read]) == Some(0) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// How the root ended, once it has: its exit code, and whether the task held processes past
@@ -1057,6 +1289,11 @@ impl Task {
     /// Output has reached EOF.
     pub fn output_closed(&self) -> bool {
         lock(&self.out).closed
+    }
+
+    /// Whether the total log limit took this task's files.
+    pub fn evicted(&self) -> bool {
+        lock(&self.out).evicted
     }
 
     /// A snapshot that also lists the processes the task holds.
@@ -1094,25 +1331,6 @@ impl Task {
             kept: held_past_exit && !tree_done,
             tree_ended: held_past_exit && tree_done,
             held: Vec::new(),
-        }
-    }
-
-    /// Records what a delivered result showed: the task's final state, and the end of the
-    /// processes it held. A task that ends after its snapshot stays due.
-    pub fn mark_reported(&self, shown: &Snapshot) {
-        if shown.state != "running" {
-            self.reported.store(true, Ordering::SeqCst);
-        }
-        if shown.tree_ended {
-            self.tree_end_reported.store(true, Ordering::SeqCst);
-        }
-    }
-
-    /// Records the held processes a background footer or the list showed by name; a task's own
-    /// status line may be cut before them.
-    pub fn mark_keeps_reported(&self, shown: &Snapshot) {
-        if shown.kept && shown.kill_error.is_none() {
-            *lock(&self.keeps_reported) = Some(pids(&shown.held));
         }
     }
 
@@ -1162,16 +1380,16 @@ impl Task {
     }
 
     /// Writes the pending lines into the transcript file after its final lines, and returns
-    /// what this read covers: the final lines no earlier read has shown, then the pending
-    /// lines. The next read starts after these final lines.
-    pub fn transcript(&self, shared: &Tasks) -> Result<Transcript, String> {
+    /// what this read covers: the final lines no earlier read of this session has shown, then
+    /// the pending lines. The next read starts after these final lines.
+    pub fn transcript(&self, shared: &Tasks, state: &mut ReadState) -> Result<Transcript, String> {
         let terminal = self
             .terminal
             .as_ref()
             .ok_or("transcript applies to PTY tasks only.")?;
         let mut pty = lock(terminal);
         if lock(&self.out).evicted {
-            return Err("The files of this task were evicted under the 1 GiB total limit; its transcript is gone.".into());
+            return Err(EVICTED_TRANSCRIPT.into());
         }
         let Pty { live, spool } = &mut *pty;
         if spool.file.is_none() {
@@ -1201,7 +1419,7 @@ impl Task {
         } else {
             spool.stopped.clone()
         };
-        let (start, shown) = std::mem::replace(&mut spool.shown, (spool.bytes, spool.lines));
+        let (start, shown) = std::mem::replace(&mut state.shown, (spool.bytes, spool.lines));
         Ok(Transcript {
             path: self.transcript_path(),
             first_line: shown + 1,
@@ -1270,31 +1488,46 @@ impl Task {
         let _ = self.kill();
     }
 
-    /// Returns the output after the cursor, up to `until` when given, as a window, and
-    /// advances the cursor past it.
+    /// Returns the output after the session's cursor, up to `until` when given, as a window,
+    /// and advances that cursor past it.
     pub fn read_window(
         &self,
+        state: &mut ReadState,
         truncate: Truncate,
         budget: usize,
         raw: bool,
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> std::io::Result<Window> {
-        let mut view = lock(&self.view);
-        let (readable, written, evicted, closed) = {
-            let out = lock(&self.out);
-            (out.readable, out.written, out.evicted, out.closed)
-        };
-        let start = view.cursor;
-        // `readable` holds back an unfinished UTF-8 sequence; other encodings hold back their
-        // own unfinished character here, until the rest arrives or output ends.
-        let end = if encoding == encoding_rs::UTF_8 || closed || evicted {
-            readable
-        } else {
-            written - self.legacy_holdback(start, written, encoding)?
-        };
+        if lock(&self.out).evicted {
+            return Ok(self.read_evicted(state, truncate, budget, raw, encoding, until));
+        }
+        match self.read_stored(state, truncate, budget, raw, encoding, until) {
+            Ok(window) => Ok(window),
+            Err(_) if lock(&self.out).evicted => {
+                // Eviction deleted the log between the flags above and the read. The window is
+                // empty either way, so the half-read state is simply not committed.
+                Ok(self.read_evicted(state, truncate, budget, raw, encoding, until))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The window of an evicted task: an empty one. The cursor moves past the bytes that are
+    /// gone, so the next read starts where this one would have ended; the eviction itself is
+    /// reported by the snapshot, not by inventing an omitted line range.
+    fn read_evicted(
+        &self,
+        state: &mut ReadState,
+        truncate: Truncate,
+        budget: usize,
+        raw: bool,
+        encoding: &'static Encoding,
+        until: Option<u64>,
+    ) -> Window {
+        let end = lock(&self.out).readable;
+        let start = state.cursor;
         let end = until.map_or(end, |until| end.min(until));
-        let first_line = view.lines_before + 1;
         let spec = WindowSpec {
             truncate,
             budget,
@@ -1302,8 +1535,46 @@ impl Task {
             encoding,
             source: "log",
         };
-        let mut builder = WindowBuilder::new(spec, &mut view.cleaner, first_line);
-        if !evicted && end > start {
+        let window = WindowBuilder::new(spec, &mut state.cleaner, state.lines_before + 1).finish();
+        state.cursor = end.max(start);
+        window
+    }
+
+    fn read_stored(
+        &self,
+        state: &mut ReadState,
+        truncate: Truncate,
+        budget: usize,
+        raw: bool,
+        encoding: &'static Encoding,
+        until: Option<u64>,
+    ) -> std::io::Result<Window> {
+        let (readable, written, closed) = {
+            let out = lock(&self.out);
+            (out.readable, out.written, out.closed)
+        };
+        let start = state.cursor;
+        // `readable` holds back an unfinished UTF-8 sequence; other encodings hold back their
+        // own unfinished character here, until the rest arrives or output ends.
+        let end = if encoding == encoding_rs::UTF_8 || closed {
+            readable
+        } else {
+            written - self.legacy_holdback(start, written, encoding)?
+        };
+        let end = until.map_or(end, |until| end.min(until));
+        let first_line = state.lines_before + 1;
+        let spec = WindowSpec {
+            truncate,
+            budget,
+            raw,
+            encoding,
+            source: "log",
+        };
+        // A read that fails part way leaves the cleaning state as it was: the fallback starts
+        // from the same bytes, so nothing is half-consumed.
+        let mut cleaner = state.cleaner.clone();
+        let mut builder = WindowBuilder::new(spec, &mut cleaner, first_line);
+        if end > start {
             let mut file = File::open(&self.log_path)?;
             file.seek(SeekFrom::Start(start))?;
             let mut remaining = end - start;
@@ -1319,8 +1590,9 @@ impl Task {
             }
         }
         let window = builder.finish();
-        view.cursor = end.max(start);
-        view.lines_before += window.newlines;
+        state.cursor = end.max(start);
+        state.lines_before += window.newlines;
+        state.cleaner = cleaner;
         Ok(window)
     }
 
@@ -1391,24 +1663,98 @@ fn remove_stale_dirs(temp: &Path) {
     }
 }
 
+// Pure ID logic, so it runs on every platform; the tests below launch commands.
+#[cfg(test)]
+mod ids {
+    use super::*;
+
+    #[test]
+    fn epoch_is_26_crockford_characters_and_differs_between_servers() {
+        let epoch = new_epoch().unwrap();
+        assert_eq!(epoch.len(), 26, "{epoch}");
+        assert!(epoch.bytes().all(|b| ALPHABET.contains(&b)), "{epoch}");
+        assert_ne!(epoch, new_epoch().unwrap());
+    }
+
+    #[test]
+    fn base32_is_minimal_and_most_significant_first() {
+        assert_eq!(base32(1, 1), "1");
+        assert_eq!(base32(31, 1), "z");
+        assert_eq!(base32(32, 1), "10");
+        assert_eq!(base32(0, 1), "0");
+        // A zero source still fills the whole epoch width.
+        assert_eq!(base32(0, 26), "0".repeat(26));
+    }
+
+    #[test]
+    fn task_ids_carry_the_epoch_and_never_repeat() {
+        let epoch = new_epoch().unwrap();
+        let first = task_id(&epoch, 1);
+        let second = task_id(&epoch, 2);
+        assert_eq!(first, format!("{epoch}-1"));
+        assert_eq!(second, format!("{epoch}-2"));
+        assert_ne!(first, second);
+        assert_ne!(task_id(&epoch, 1), task_id(&new_epoch().unwrap(), 1));
+    }
+}
+
 // Unix tasks run under the fastexec binary as their host, which a test binary is not.
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use crate::output::Cleaner;
+    use crate::service::{Call, OutputMode, Render, Request, Service};
+
+    /// A `Tasks` for a test: it needs a runtime for its `killAfterMs` timer, which these tests
+    /// do not arm.
+    fn tasks() -> (tokio::runtime::Runtime, Arc<Tasks>) {
+        tasks_with(Limits::OFF)
+    }
+
+    fn tasks_with(limits: Limits) -> (tokio::runtime::Runtime, Arc<Tasks>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let tasks = {
+            let _entered = runtime.enter();
+            Tasks::new(limits).unwrap()
+        };
+        (runtime, tasks)
+    }
+
+    /// This process's environment, as a session's launch context.
+    fn launch() -> Arc<LaunchContext> {
+        Arc::new(LaunchContext::new(
+            std::env::temp_dir(),
+            std::env::vars_os().collect(),
+        ))
+    }
+
+    fn session(label: &str) -> Arc<Session> {
+        Session::new(label.into(), label.into(), launch())
+    }
+
+    fn start_args() -> StartArgs {
+        StartArgs {
+            command: "printf abc".into(),
+            cwd: std::env::temp_dir(),
+            pty: false,
+            login: false,
+            keep: false,
+            encoding: encoding_rs::UTF_8,
+            kill_after_ms: None,
+            owner: "test-client".into(),
+            started_by: None,
+            launch: launch(),
+        }
+    }
 
     #[test]
     fn a_chunk_whose_reservation_evicts_its_own_log_gives_it_back() {
-        let tasks = Tasks::new().unwrap();
-        let task = tasks
-            .start(StartArgs {
-                command: "printf abc".into(),
-                cwd: std::env::temp_dir(),
-                pty: false,
-                login: false,
-                keep: false,
-                encoding: encoding_rs::UTF_8,
-            })
-            .unwrap();
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (_runtime, tasks) = tasks();
+        let task = tasks.start(start_args()).unwrap();
         // Its own capture is done too, so nothing else touches the accounting below.
         let deadline = Instant::now() + Duration::from_secs(30);
         while task.is_running() || !task.output_closed() {
@@ -1431,6 +1777,433 @@ mod tests {
         assert_eq!((out.written, out.dropped), (3, 99));
         assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), before - 3);
         drop(out);
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn a_list_call_drops_the_views_of_tasks_that_have_retired() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        // One finished task is kept, so the earlier ones retire as the loop goes on.
+        let (runtime, tasks) = tasks_with(Limits {
+            max_running: 16,
+            max_finished: 1,
+            finished_ttl: None,
+        });
+        let session = session("prune");
+        let mut started = Vec::new();
+        for _ in 0..3 {
+            let task = tasks.start(start_args()).unwrap();
+            // What a start does with the task it created, and what a retired one leaves behind.
+            session.view(&task);
+            finish(&task);
+            started.push(task);
+        }
+        let retired = &started[0];
+        assert!(
+            tasks.find(&retired.id).is_none(),
+            "the registry kept the retired task"
+        );
+        assert!(
+            session.existing(retired).is_some(),
+            "the view was gone before the call"
+        );
+        // A list call is all it takes; it never reaches the background footer.
+        let service = Service::new(Arc::clone(&tasks), false);
+        let request: Request =
+            serde_json::from_value(serde_json::json!({"action": "list"})).unwrap();
+        let call = Call {
+            session: &session,
+            render: Render {
+                output_mode: OutputMode::Text,
+                structured_content: true,
+            },
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: None,
+            call_id: None,
+        };
+        runtime.block_on(service.call(request, call));
+        assert!(
+            session.existing(retired).is_none(),
+            "a retired task's view survived a list call"
+        );
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn expire_finished_drops_a_task_past_its_ttl_and_keeps_a_running_one() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (_runtime, tasks) = tasks_with(Limits::ON);
+        let finished = tasks.start(start_args()).unwrap();
+        finish(&finished);
+        let running = tasks
+            .start(StartArgs {
+                command: "sleep 30".into(),
+                ..start_args()
+            })
+            .unwrap();
+        let ttl = Limits::ON.finished_ttl.unwrap();
+        // Nothing is old enough yet, so nothing goes.
+        tasks.expire_finished(Instant::now());
+        assert!(tasks.find(&finished.id).is_some(), "a fresh finish expired");
+        // A day later the finished task goes, its log with it, and the running one stays.
+        tasks.expire_finished(Instant::now() + ttl);
+        assert!(
+            tasks.find(&finished.id).is_none(),
+            "the expired task stays in the registry"
+        );
+        assert!(
+            !tasks.dir.join(format!("{}.log", finished.id)).exists(),
+            "the expired task's log stays"
+        );
+        assert!(
+            tasks.find(&running.id).is_some(),
+            "a running task expired with the finished ones"
+        );
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn idle_and_pending_report_an_empty_registry() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (_runtime, tasks) = tasks_with(Limits::OFF);
+        assert!(tasks.idle(), "a fresh registry is not idle");
+        assert_eq!(tasks.pending(), 0);
+        // A start in flight is not idle, even before its task is inserted.
+        lock(&tasks.registry).pending = 1;
+        assert_eq!(tasks.pending(), 1);
+        assert!(!tasks.idle(), "a start in flight counts as idle");
+        lock(&tasks.registry).pending = 0;
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn the_running_limit_is_the_configured_one_and_the_refusal_names_it() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (_runtime, tasks) = tasks_with(Limits {
+            max_running: 2,
+            ..Limits::OFF
+        });
+        let long = || StartArgs {
+            command: "sleep 30".into(),
+            ..start_args()
+        };
+        let first = tasks.start(long()).unwrap();
+        let second = tasks.start(long()).unwrap();
+        let Err(refused) = tasks.start(start_args()) else {
+            panic!("a third task was admitted under a limit of 2");
+        };
+        assert!(refused.starts_with("TOO_MANY_TASKS"), "{refused}");
+        assert!(refused.contains('2'), "{refused}");
+        // The limit is the configured one, not a constant.
+        assert_eq!(
+            tasks.all().iter().filter(|task| task.is_running()).count(),
+            2
+        );
+        drop((first, second));
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn admission_counts_pending_starts_and_closes_while_stopping() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (_runtime, tasks) = tasks();
+        // A start in flight counts against the limit as if its task were already running.
+        lock(&tasks.registry).pending = Limits::OFF.max_running;
+        let Err(refused) = tasks.start(start_args()) else {
+            panic!(
+                "a start was admitted with {} starts in flight",
+                Limits::OFF.max_running
+            );
+        };
+        assert!(refused.starts_with("TOO_MANY_TASKS"), "{refused}");
+        lock(&tasks.registry).pending = 0;
+        // A stopping server admits nothing.
+        lock(&tasks.registry).stopping = true;
+        let Err(refused) = tasks.start(start_args()) else {
+            panic!("a start was admitted while the server was stopping");
+        };
+        assert!(refused.contains("shutting down"), "{refused}");
+        lock(&tasks.registry).stopping = false;
+        // A start that fails after admission gives its place back, so the limit is not eaten.
+        let failed = StartArgs {
+            cwd: std::env::temp_dir().join("fastexec-no-such-directory"),
+            ..start_args()
+        };
+        assert!(
+            tasks.start(failed).is_err(),
+            "a start with a missing cwd ran"
+        );
+        assert_eq!(lock(&tasks.registry).pending, 0);
+        tasks.shutdown();
+    }
+
+    /// The text of a result, whatever its content blocks.
+    fn result_text(result: &rmcp::model::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+            .collect()
+    }
+
+    /// Waits for `task` to finish: its root ended, its output closed, and its tree done, since
+    /// `ended_at` takes the later of the root's end and the tree's.
+    fn finish(task: &Arc<Task>) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while task.is_running() || !task.output_closed() || !*task.tree_done().borrow() {
+            assert!(Instant::now() < deadline, "the task never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn eviction_takes_the_log_that_ended_earliest_not_the_one_that_started_first() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (_runtime, tasks) = tasks();
+        // The first task cannot finish until it gets a line: no timing guess.
+        let slow = tasks
+            .start(StartArgs {
+                command: "read -r line; printf '%s' \"$line\"".into(),
+                ..start_args()
+            })
+            .unwrap();
+        let quick = tasks.start(start_args()).unwrap();
+        finish(&quick);
+        slow.send(
+            Some(
+                b"done
+",
+            ),
+            false,
+        )
+        .unwrap();
+        finish(&slow);
+        // Registry order is start order here, and the end times are the other way round.
+        let (slow_end, quick_end) = (slow.ended_at().unwrap(), quick.ended_at().unwrap());
+        assert!(
+            quick_end < slow_end,
+            "the fixture did not end in the wrong order"
+        );
+        // One byte over the limit: exactly one eviction is needed, and it must be the earliest end.
+        tasks.log_bytes.store(tasks.log_limit - 1, Ordering::SeqCst);
+        assert!(tasks.reserve(2), "the reservation failed");
+        assert!(
+            lock(&quick.out).evicted,
+            "the log that ended earliest was not evicted first"
+        );
+        assert!(
+            !lock(&slow.out).evicted,
+            "the log that ended last was evicted first"
+        );
+        assert!(!tasks.dir.join(format!("{}.log", quick.id)).exists());
+        assert!(tasks.dir.join(format!("{}.log", slow.id)).exists());
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn a_read_of_an_evicted_log_is_an_outcome_not_an_error() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (_runtime, tasks) = tasks();
+        let task = tasks.start(start_args()).unwrap();
+        finish(&task);
+        let written = lock(&task.out).written;
+        assert!(written > 0, "the task wrote nothing");
+        tasks.evict_log(&task);
+        let mut state = ReadState::default();
+        // Every read path that opens the deleted file reports the eviction instead of an error.
+        let window = task
+            .read_window(
+                &mut state,
+                Truncate::None,
+                4096,
+                false,
+                encoding_rs::UTF_8,
+                None,
+            )
+            .expect("an evicted log is not an I/O error");
+        // Empty, with no invented line range: the snapshot reports the eviction.
+        assert_eq!(window.fit(usize::MAX).0, "");
+        assert_eq!(window.omitted, None);
+        assert_eq!(state.cursor, written, "the cursor moved past the output");
+        // A second read has nothing more to move past and stays empty.
+        let again = task
+            .read_window(
+                &mut state,
+                Truncate::None,
+                4096,
+                false,
+                encoding_rs::UTF_8,
+                None,
+            )
+            .unwrap();
+        assert_eq!(again.fit(usize::MAX).0, "");
+        assert_eq!(state.cursor, written);
+        // A legacy encoding takes its own path through the same read.
+        assert!(
+            task.read_window(
+                &mut ReadState::default(),
+                Truncate::Tail,
+                1024,
+                false,
+                encoding_rs::BIG5,
+                None,
+            )
+            .is_ok()
+        );
+        // So does the return_when scan.
+        let mut matcher =
+            Matcher::new(&["abc".to_string()], encoding_rs::UTF_8, Cleaner::default());
+        let mut from = 0;
+        assert_eq!(task.scan(&mut matcher, &mut from).unwrap(), None);
+        // A log that is gone while the task is not evicted stays an error.
+        let live = tasks.start(start_args()).unwrap();
+        finish(&live);
+        std::fs::remove_file(tasks.dir.join(format!("{}.log", live.id))).unwrap();
+        let mut matcher =
+            Matcher::new(&["abc".to_string()], encoding_rs::UTF_8, Cleaner::default());
+        let mut from = 0;
+        assert!(
+            live.scan(&mut matcher, &mut from).is_err(),
+            "a missing log of a task that was not evicted is a real error"
+        );
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn a_session_launch_context_supplies_the_environment_and_default_cwd() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (runtime, tasks) = tasks();
+        let dir = std::env::temp_dir().join(format!("fastexec-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A variable of this process that the context leaves out: a task must not inherit it.
+        let leaked = std::env::vars_os()
+            .find(|(name, _)| name.to_string_lossy().starts_with("CARGO_"))
+            .map(|(name, _)| name.to_string_lossy().into_owned());
+        let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+            .filter(|(name, _)| Some(name.to_string_lossy()) != leaked.as_deref().map(Into::into))
+            .collect();
+        env.push(("FASTEXEC_CTX_PROBE".into(), "xyz".into()));
+        let launch = Arc::new(LaunchContext::new(dir.clone(), env));
+        let probe = leaked
+            .as_ref()
+            .map(|name| format!("${{{name}-NONE}}"))
+            .unwrap_or_default();
+        let command =
+            format!("printf '%s|%s|%s' \"$FASTEXEC_CTX_PROBE\" \"$(pwd -P)\" \"{probe}\"");
+        let service = crate::service::Service::new(Arc::clone(&tasks), false);
+        let session = Session::new("ctx-1".into(), "ctx-1".into(), Arc::clone(&launch));
+        let call = || crate::service::Call {
+            session: &session,
+            render: crate::service::Render {
+                output_mode: crate::service::OutputMode::Text,
+                structured_content: true,
+            },
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: None,
+            call_id: None,
+        };
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        // A pipe task and a PTY task see the same environment and the same default directory.
+        for pty in [false, true] {
+            let result = runtime.block_on(service.call_json(
+                serde_json::json!({
+                    "action": "start",
+                    "command": command,
+                    "pty": pty,
+                    "waitMs": 30000,
+                }),
+                call(),
+            ));
+            let text = result_text(&result);
+            assert!(
+                text.contains("xyz|"),
+                "the context's environment reached the pty={pty} task: {text}"
+            );
+            assert!(
+                text.contains(&name),
+                "the default cwd came from the context in the pty={pty} task: {text}"
+            );
+            if leaked.is_some() {
+                assert!(
+                    text.contains("|NONE"),
+                    "the variable the context left out is unset in the pty={pty} task: {text}"
+                );
+            }
+        }
+        tasks.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_contexts_do_not_share_a_bash_result() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (_runtime, tasks) = tasks();
+        let bad = Arc::new(LaunchContext::new(
+            std::env::temp_dir(),
+            vec![("FASTEXEC_BASH".into(), "/nonexistent/bash".into())],
+        ));
+        let Err(refused) = tasks.start(StartArgs {
+            launch: Arc::clone(&bad),
+            ..start_args()
+        }) else {
+            panic!("a task started with an invalid bash override");
+        };
+        assert!(refused.contains("FASTEXEC_BASH"), "{refused}");
+        // A context that finds bash still starts a task, and its start got its place back.
+        let task = tasks.start(start_args()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while task.is_running() || !task.output_closed() {
+            assert!(Instant::now() < deadline, "the task never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn two_sessions_read_one_task_independently() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (_runtime, tasks) = tasks();
+        let task = tasks
+            .start(StartArgs {
+                command: "printf 'a\\nb\\n'".into(),
+                ..start_args()
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while task.is_running() || !task.output_closed() {
+            assert!(Instant::now() < deadline, "the task never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (first, second) = (session("a-1"), session("b-2"));
+        let read = |session: &Arc<Session>| -> String {
+            let view = session.view(&task);
+            let mut state = view.read.try_lock().expect("the read gate is free");
+            let window = task
+                .read_window(
+                    &mut state,
+                    Truncate::Tail,
+                    1024,
+                    false,
+                    encoding_rs::UTF_8,
+                    None,
+                )
+                .unwrap();
+            window.fit(1024).0
+        };
+        let (from_first, from_second) = (read(&first), read(&second));
+        assert!(
+            from_first.contains('a') && from_first.contains('b'),
+            "{from_first:?}"
+        );
+        assert_eq!(
+            from_second, from_first,
+            "each session reads the whole output"
+        );
+        assert_eq!(
+            read(&first),
+            "",
+            "a second read of one session sees nothing new"
+        );
         tasks.shutdown();
     }
 }

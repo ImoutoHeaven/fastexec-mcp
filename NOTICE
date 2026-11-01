@@ -5,6 +5,11 @@ This product includes software derived from FastCtx
 licensed under the Apache License, Version 2.0. The derived files are
 src/bash.rs, src/process.rs, and src/output.rs.
 
+src/conpty_spawn.rs follows the ConPTY export lookup and the command-line
+quoting of portable-pty (https://github.com/wez/wezterm), Copyright (c) 2018
+Wez Furlong, licensed under the MIT license, whose permission text is the one
+in vendor/conpty/LICENSE.
+
 src/keys.rs follows the key names and key encodings of tmux
 (https://github.com/tmux/tmux), Copyright (c) Nicholas Marriott and
 contributors, licensed under the ISC license. Its kitty keyboard protocol

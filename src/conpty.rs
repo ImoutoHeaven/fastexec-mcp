@@ -4,8 +4,8 @@
 //! the screen through scroll regions, history cleared by full redraws, and alternate-screen
 //! switches do not reach the task log. The bundled ConPTY passes the program's output through.
 //!
-//! portable-pty loads `conpty.dll` by name and prefers it to the system ConPTY. Loading the
-//! extracted copy by its full path first makes that name resolve to it.
+//! The launcher (`src/conpty_spawn.rs`) looks `conpty.dll` up by name and prefers it to the system
+//! ConPTY. Loading the extracted copy by its full path first makes that name resolve to it.
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod bundled {
@@ -32,7 +32,7 @@ mod bundled {
             .chain([0])
             .collect();
         // SAFETY: `wide` is a NUL-terminated path. The module stays loaded for the process
-        // lifetime, as portable-pty keeps using it.
+        // lifetime, as the launcher keeps resolving the console API through it.
         let module =
             unsafe { windows_sys::Win32::System::LibraryLoader::LoadLibraryW(wide.as_ptr()) };
         if module.is_null() {

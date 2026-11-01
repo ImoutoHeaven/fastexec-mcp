@@ -4,6 +4,7 @@
 //! Object are derived from FastCtx `src/shell/process.rs` and `src/process_policy.rs`
 //! (Apache-2.0, Copyright 2026 yc-duan), modified for fastexec.
 
+use crate::session::LaunchContext;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -19,6 +20,8 @@ pub struct Launch<'a> {
     /// Script file holding `command` when it exceeds [`SCRIPT_THRESHOLD_BYTES`].
     pub script: Option<&'a Path>,
     pub cwd: &'a Path,
+    /// The session's environment: a task inherits it, never the server's own.
+    pub env: &'a LaunchContext,
     pub login: bool,
     pub pty: bool,
 }
@@ -42,9 +45,9 @@ pub struct Member {
 pub enum Child {
     Pipe(std::process::Child),
     Pty {
-        child: Box<dyn portable_pty::Child + Send + Sync>,
+        process: std::os::windows::io::OwnedHandle,
         /// Held until the tree ends; dropping it closes the terminal so output reaches EOF.
-        _master: Box<dyn portable_pty::MasterPty + Send>,
+        _terminal: crate::conpty_spawn::Terminal,
     },
 }
 
@@ -54,7 +57,8 @@ impl Child {
     pub fn wait(&mut self, _tree: &Tree) -> i32 {
         let code = match self {
             Child::Pipe(child) => child.wait().map_or(1, |status| status.code().unwrap_or(1)),
-            Child::Pty { child, .. } => child.wait().map_or(1, |status| status.exit_code() as i32),
+            // The console's exit code carries the same signal convention the pipe's does.
+            Child::Pty { process, .. } => crate::conpty_spawn::wait(process),
         };
         msys_signal_exit(code)
     }
@@ -118,7 +122,7 @@ impl Child {
 // ponytail: a native Windows program that exits with exactly 256..=16384 in steps of 256 is
 // read as a signal exit too.
 #[cfg(windows)]
-fn msys_signal_exit(code: i32) -> i32 {
+pub(crate) fn msys_signal_exit(code: i32) -> i32 {
     if code & 0xff == 0 && (1..=64).contains(&(code >> 8)) {
         128 + (code >> 8)
     } else {
@@ -149,7 +153,7 @@ pub fn spawn(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     return spawn_host(launch);
 }
 
-fn bash_args(launch: &Launch<'_>) -> Vec<OsString> {
+pub(crate) fn bash_args(launch: &Launch<'_>) -> Vec<OsString> {
     let mut args: Vec<OsString> = if launch.login {
         vec!["-l".into()]
     } else {
@@ -166,7 +170,7 @@ fn bash_args(launch: &Launch<'_>) -> Vec<OsString> {
     args
 }
 
-fn environment(launch: &Launch<'_>) -> Vec<(&'static str, OsString)> {
+pub(crate) fn environment(launch: &Launch<'_>) -> Vec<(&'static str, OsString)> {
     let mut env: Vec<(&'static str, OsString)> = vec![
         ("LANG", LOCALE.into()),
         ("LC_ALL", LOCALE.into()),
@@ -202,7 +206,7 @@ fn environment(launch: &Launch<'_>) -> Vec<(&'static str, OsString)> {
 #[cfg(windows)]
 fn windows_path_environment(launch: &Launch<'_>, env: &mut Vec<(&'static str, OsString)>) {
     if launch.login {
-        if std::env::var_os("MSYS2_PATH_TYPE").is_none() {
+        if launch.env.var("MSYS2_PATH_TYPE").is_none() {
             env.push(("MSYS2_PATH_TYPE", "inherit".into()));
         }
         return;
@@ -220,8 +224,10 @@ fn windows_path_environment(launch: &Launch<'_>, env: &mut Vec<(&'static str, Os
         }
     }
     dirs.extend(
-        std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        launch
+            .env
+            .var("PATH")
+            .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
             .unwrap_or_default(),
     );
     if let Ok(path) = std::env::join_paths(dirs) {
@@ -238,6 +244,8 @@ fn spawn_pipe(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     let mut command = quiet_command(launch.bash);
     command
         .args(bash_args(launch))
+        .env_clear()
+        .envs(launch.env.env.iter().map(|(name, value)| (name, value)))
         .envs(environment(launch))
         .current_dir(launch.cwd)
         .stdin(Stdio::piped())
@@ -274,59 +282,7 @@ pub const PTY_COLS: u16 = 120;
 
 #[cfg(windows)]
 fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    fn other(error: impl std::fmt::Display) -> std::io::Error {
-        std::io::Error::other(error.to_string())
-    }
-    // Before portable-pty first opens ConPTY, so it picks the bundled one.
-    crate::conpty::load();
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: PTY_ROWS,
-            cols: PTY_COLS,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(other)?;
-    let mut builder = CommandBuilder::new(launch.bash);
-    // portable-pty seeds the environment from the registry, overriding the server's own values
-    // (PATH entries added at runtime, host-configured env); start from the process environment
-    // instead so PTY tasks see exactly what pipe tasks see.
-    builder.env_clear();
-    for (name, value) in std::env::vars_os() {
-        builder.env(name, value);
-    }
-    builder.args(bash_args(launch));
-    builder.cwd(launch.cwd);
-    for (name, value) in environment(launch) {
-        builder.env(name, value);
-    }
-    let mut child = pair.slave.spawn_command(builder).map_err(other)?;
-    drop(pair.slave);
-    // ponytail: the child runs before it joins the job, so a process it starts in that window
-    // escapes; spawning suspended needs a portable-pty patch.
-    let tree = match child.as_raw_handle().map(Tree::adopt) {
-        Some(Ok(tree)) => tree,
-        Some(Err(error)) => {
-            let _ = child.kill();
-            return Err(error);
-        }
-        None => {
-            let _ = child.kill();
-            return Err(std::io::Error::other("the PTY child has no process handle"));
-        }
-    };
-    let output = pair.master.try_clone_reader().map_err(other)?;
-    let input = pair.master.take_writer().map_err(other)?;
-    Ok(Spawned {
-        child: Child::Pty {
-            child,
-            _master: pair.master,
-        },
-        output,
-        input,
-        tree,
-    })
+    crate::conpty_spawn::spawn_pty(launch)
 }
 
 /// Starts the task host (`src/host.rs`) as the leader of a new session, with bash's command
@@ -336,7 +292,7 @@ fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
 fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
-    let (status, status_writer) = std::io::pipe()?;
+    let (mut status, status_writer) = std::io::pipe()?;
     let (lifeline_reader, lifeline) = std::io::pipe()?;
     let passed = [status_writer.as_raw_fd(), lifeline_reader.as_raw_fd()];
     // /proc/self/exe stays valid when the server's binary is replaced on disk.
@@ -351,6 +307,9 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         .args(passed.map(|fd| fd.to_string()))
         .arg(launch.bash)
         .args(bash_args(launch))
+        // The host needs no environment of its own: it execs bash with this one.
+        .env_clear()
+        .envs(launch.env.env.iter().map(|(name, value)| (name, value)))
         .envs(environment(launch))
         .current_dir(launch.cwd);
     let (master, output): (_, Box<dyn Read + Send>) = if launch.pty {
@@ -393,6 +352,25 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     // status pipe reach EOF when the tree ends.
     drop(command);
     drop((status_writer, lifeline_reader));
+    // The host reports whether it runs bash before the task is reported as started; this word is
+    // the first thing it writes to its status pipe, before it starts bash.
+    let mut startup = [0_u8; 4];
+    if let Err(error) = status.read_exact(&mut startup) {
+        let _ = host.kill();
+        let _ = host.wait();
+        return Err(std::io::Error::other(format!(
+            "The task host ended before it reported readiness: {error}"
+        )));
+    }
+    let startup = u32::from_le_bytes(startup);
+    if startup != crate::host::STARTUP_READY {
+        let _ = host.kill();
+        let _ = host.wait();
+        let problem = std::io::Error::from_raw_os_error(startup as i32);
+        return Err(std::io::Error::other(format!(
+            "Cannot become the subreaper of the task tree: {problem}"
+        )));
+    }
     // Past the spawn, an error drops the lifeline, and the host ends the tree.
     let input: Box<dyn Write + Send> = match &master {
         Some(master) => Box::new(master.try_clone()?),
@@ -527,7 +505,7 @@ impl Tree {
     }
 
     #[cfg(windows)]
-    fn adopt(process: std::os::windows::io::RawHandle) -> std::io::Result<Tree> {
+    pub(crate) fn adopt(process: std::os::windows::io::RawHandle) -> std::io::Result<Tree> {
         windows::kill_on_close_job(process).map(|job| Tree { job })
     }
 }

@@ -3,26 +3,28 @@
 //! task ends when they do, once a result has shown the root's exit.
 
 use crate::output::{Cleaner, Matcher};
+use crate::session::{ReadState, TaskView};
 use crate::tasks::Task;
 use encoding_rs::Encoding;
-use rmcp::RoleServer;
-use rmcp::model::ProgressNotificationParam;
-use rmcp::service::RequestContext;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 const PROGRESS_EVERY: Duration = Duration::from_secs(20);
+/// The latest progress message: elapsed seconds and its text.
+pub type Progress = (f64, String);
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_TEXTS: usize = 16;
 const QUIET_MS: std::ops::RangeInclusive<u64> = 10..=60_000;
 /// Characters of a matched text the status line quotes; structured content holds all of it.
 const NOTE_CHARS: usize = 60;
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReturnWhen {
     /// Unseen output, cleaned as results show it, has a line containing one of the texts; text a carriage return later rewrites counts. For line-oriented programs: a TUI's redraws repeat old text.
@@ -154,8 +156,13 @@ pub struct Mark {
     root_reported: bool,
 }
 
-pub fn mark(task: &Task, when: Option<&ReturnWhen>) -> Result<Mark, String> {
-    let (cursor, cleaner) = task.unseen();
+pub fn mark(
+    task: &Task,
+    view: &TaskView,
+    state: &ReadState,
+    when: Option<&ReturnWhen>,
+) -> Result<Mark, String> {
+    let (cursor, cleaner) = (state.cursor, state.cleaner.clone());
     let compares =
         when.is_some_and(|when| when.screen_appears.is_some() || when.screen_gone.is_some());
     let rows = if compares {
@@ -167,7 +174,7 @@ pub fn mark(task: &Task, when: Option<&ReturnWhen>) -> Result<Mark, String> {
         cursor,
         cleaner,
         rows,
-        root_reported: task.is_reported(),
+        root_reported: view.is_reported(),
     })
 }
 
@@ -279,13 +286,14 @@ pub async fn wait(
     when: Option<&ReturnWhen>,
     mark: Mark,
     encoding: &'static Encoding,
-    context: &RequestContext<RoleServer>,
+    cancel: &CancellationToken,
+    progress: Option<&watch::Sender<Option<Progress>>>,
 ) -> Result<WaitEnd, String> {
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
     // Quiet that begins past the deadline does not hold, however late the last check runs.
     let last_quiet = started + Duration::from_millis(wait_ms);
-    let token = context.meta.get_progress_token();
+    // The caller's forwarder sends the latest message; the loop only replaces it.
     let mut ticks =
         tokio::time::interval_at(tokio::time::Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
     let mut done = task.done();
@@ -359,17 +367,18 @@ pub async fn wait(
         }
         tokio::select! {
             biased;
-            _ = context.ct.cancelled() => return Err("Cancelled; the task keeps running.".into()),
+            _ = cancel.cancelled() => return Err("Cancelled; the task keeps running.".into()),
             _ = done.changed() => {}
             _ = tree_done.changed() => {}
             _ = tokio::time::sleep_until(deadline) => expired = true,
             _ = activity.changed() => {}
             _ = tokio::time::sleep_until(quiet_until.unwrap_or(deadline)), if quiet_until.is_some() => {}
-            _ = ticks.tick(), if token.is_some() => {
+            _ = ticks.tick(), if progress.is_some() => {
                 let seconds = started.elapsed().as_secs_f64();
                 let message = format!("{} running, waited {seconds:.0}s of {}s", task.id, wait_ms / 1000);
-                let progress = ProgressNotificationParam::new(token.clone().expect("guarded"), seconds).with_message(message);
-                let _ = context.peer.notify_progress(progress).await;
+                if let Some(progress) = progress {
+                    progress.send_replace(Some((seconds, message)));
+                }
             }
         }
     }

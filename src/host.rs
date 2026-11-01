@@ -18,6 +18,11 @@ use std::os::fd::{FromRawFd, RawFd};
 /// The first argument that makes the fastexec binary run as a task host.
 pub const FLAG: &str = "--fastexec-task-host";
 
+/// The host's first word on the status pipe: 0 when the host is ready to run bash, else a
+/// Linux errno saying why it cannot own the task's tree. The root bash's exit code follows as a
+/// second word.
+pub const STARTUP_READY: u32 = 0;
+
 extern "C" fn ignore(_: libc::c_int) {}
 
 /// Runs the host with `args`: the status pipe's descriptor, the lifeline's descriptor, then
@@ -36,11 +41,25 @@ pub fn main(args: &[OsString]) -> ! {
         libc::fcntl(lifeline, libc::F_SETFD, libc::FD_CLOEXEC);
         (File::from_raw_fd(status), File::from_raw_fd(lifeline))
     };
+    // The server waits for this word before it reports the task as started. A host that cannot
+    // become the subreaper would silently leave daemonizing processes outside the tree, so it
+    // fails the start instead of running bash.
     #[cfg(target_os = "linux")]
-    // SAFETY: plain prctl; an error leaves daemonizing processes outside the tree.
-    unsafe {
-        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
-    };
+    // SAFETY: plain prctl; its failure is reported below.
+    let startup = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    #[cfg(not(target_os = "linux"))]
+    let startup = 0;
+    if startup == -1 {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_default() as u32;
+        let _ = status.write_all(&errno.to_le_bytes());
+        std::process::exit(3);
+    }
+    if status.write_all(&STARTUP_READY.to_le_bytes()).is_err() {
+        // The server is gone; nothing to run for.
+        std::process::exit(3);
+    }
     // The host shares bash's process group, the PTY's foreground group, so Ctrl-C, Ctrl-Z, the
     // hangup of a closing terminal, and a command's `kill 0` reach it too: it outlives every
     // signal but SIGKILL that would end or stop it. A handler, unlike SIG_IGN, resets to the

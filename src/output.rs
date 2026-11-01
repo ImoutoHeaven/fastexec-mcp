@@ -4,7 +4,7 @@
 //! split follows FastCtx `src/shell/output.rs` (Apache-2.0, Copyright 2026 yc-duan), modified for fastexec.
 
 use encoding_rs::Encoding;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// Bytes kept per line in bounded windows; the rest of an oversized line is counted, then cut.
@@ -12,7 +12,9 @@ const LINE_BYTES_LIMIT: usize = 64 * 1024;
 /// Characters kept per cleaned line in bounded windows. `Truncate::None` keeps whole lines.
 const LINE_CHARS_LIMIT: usize = 2000;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Truncate {
     /// First lines and last lines with the middle omitted.
@@ -22,7 +24,7 @@ pub enum Truncate {
     Head,
     /// Last lines only.
     Tail,
-    /// Every line; the host's own output limit applies.
+    /// Every unseen line whole, up to 4 MiB; the rest is reported as an omitted range.
     None,
 }
 
@@ -357,9 +359,17 @@ impl<'a> WindowBuilder<'a> {
         }
     }
 
+    /// The bytes one line may keep: 64 KiB, or a `Truncate::None` window's whole cap.
+    fn line_limit(&self) -> usize {
+        match self.spec.truncate {
+            Truncate::None => self.spec.budget,
+            _ => LINE_BYTES_LIMIT,
+        }
+    }
+
     fn append(&mut self, byte: u8) {
         self.line_started = true;
-        if self.line.len() < LINE_BYTES_LIMIT || self.spec.truncate == Truncate::None {
+        if self.line.len() < self.line_limit() {
             self.line.push(byte);
         } else {
             self.line_overflow += 1;
@@ -371,18 +381,34 @@ impl<'a> WindowBuilder<'a> {
         if terminated {
             self.newlines += 1;
         }
-        let bytes = std::mem::take(&mut self.line);
+        let mut bytes = std::mem::take(&mut self.line);
         let overflow = std::mem::take(&mut self.line_overflow);
         self.line_started = false;
         if std::mem::take(&mut self.cleaner.continued) && bytes.is_empty() && overflow == 0 {
             return;
+        }
+        let mut dropped = overflow;
+        if overflow > 0 {
+            // A clipped prefix can end inside a character, and decoding it would report an
+            // error the output does not have; only that unfinished tail is dropped. Bytes
+            // that are genuinely invalid elsewhere stay, so their error still shows.
+            let suffix = if self.spec.encoding == encoding_rs::UTF_8 {
+                incomplete_utf8_suffix(&bytes)
+            } else {
+                incomplete_legacy_suffix(&bytes, self.spec.encoding)
+            };
+            if suffix > 0 {
+                bytes.truncate(bytes.len() - suffix);
+                dropped += suffix;
+            }
         }
         let (decoded, had_errors) = self.spec.encoding.decode_without_bom_handling(&bytes);
         if had_errors {
             self.bad_lines += 1;
         }
         let mut text = decoded.into_owned();
-        let mut cut = overflow > 0;
+        let limit = self.line_limit();
+        let mut cut = dropped > 0;
         if !self.spec.raw {
             // Terminals (ConPTY in particular) pad lines with spaces.
             text.truncate(text.trim_end_matches(' ').len());
@@ -401,15 +427,31 @@ impl<'a> WindowBuilder<'a> {
                 ));
             }
         }
-        if overflow > 0 {
-            text.push_str(&format!(" … [line cut at 64 KiB; {overflow} more bytes]"));
+        // Decoded text can be longer than its source bytes, so a `None` window's cap is
+        // enforced on the text too, on a character boundary.
+        if self.spec.truncate == Truncate::None && text.len() > limit {
+            let mut end = limit;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            dropped += text.len() - end;
+            text.truncate(end);
+            cut = true;
+        }
+        if dropped > 0 {
+            text.push_str(&format!(
+                " … [line cut at {}; {dropped} more bytes]",
+                brief_bytes(limit)
+            ));
         }
         self.place(Line { number, text, cut });
     }
 
     fn place(&mut self, mut line: Line) {
         let (head_budget, tail_budget) = match self.spec.truncate {
-            Truncate::None => (usize::MAX, usize::MAX),
+            // A `None` window stores whole lines up to its cap and reports the rest as omitted,
+            // so nothing is buffered past it.
+            Truncate::None => (self.line_limit(), 0),
             Truncate::Head => (self.spec.budget, 0),
             Truncate::Tail => (0, self.spec.budget),
             Truncate::HeadTail => (
@@ -425,8 +467,14 @@ impl<'a> WindowBuilder<'a> {
                 return;
             }
             self.head_open = false;
-            if self.head.is_empty() && self.spec.truncate == Truncate::Head {
-                line.cut |= cut_to(&mut line.text, head_budget);
+            // The first line of a bounded window is shown cut rather than left out, so a single
+            // line longer than the whole budget still shows its beginning.
+            if self.head.is_empty() && matches!(self.spec.truncate, Truncate::Head | Truncate::None)
+            {
+                // A `None` line is already bounded by the cap, with the note that says so.
+                if self.spec.truncate == Truncate::Head {
+                    line.cut |= cut_to(&mut line.text, head_budget);
+                }
                 self.head_bytes += line.text.len() + 1;
                 self.head.push(line);
                 return;
@@ -478,10 +526,18 @@ impl<'a> WindowBuilder<'a> {
     }
 }
 
+/// A byte count for a note: `64 KiB`, or `999 bytes` below a kibibyte.
+fn brief_bytes(bytes: usize) -> String {
+    if bytes >= 1024 && bytes.is_multiple_of(1024) {
+        format!("{} KiB", bytes >> 10)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 /// Shortens `text` to at most `budget - 1` bytes, with a cut marker when it fits, on a char
 /// boundary. Returns whether it cut anything.
 pub fn cut_to(text: &mut String, budget: usize) -> bool {
-    const MARK: &str = " … [cut]";
     if text.len() < budget {
         return false;
     }
@@ -504,6 +560,9 @@ pub fn cut_to(text: &mut String, budget: usize) -> bool {
     text.push_str(MARK);
     true
 }
+
+/// What a cut line ends with, so a reader knows the rest is elsewhere.
+pub const MARK: &str = " … [cut]";
 
 /// Length of an incomplete UTF-8 sequence at the end of `tail` (the last 1..=3 bytes).
 pub fn incomplete_utf8_suffix(tail: &[u8]) -> usize {
@@ -544,6 +603,9 @@ pub fn incomplete_legacy_suffix(line: &[u8], encoding: &'static encoding_rs::Enc
 mod tests {
     use super::*;
 
+    /// A budget the fixtures do not mean to bound a `Truncate::None` window with.
+    const UNBOUNDED: usize = usize::MAX;
+
     fn text(window: &Window) -> String {
         window.fit(usize::MAX).0
     }
@@ -574,7 +636,7 @@ mod tests {
                 b"\x1b]0;title\x07done",
             ],
             Truncate::None,
-            0,
+            UNBOUNDED,
             false,
         );
         assert_eq!(text(&out), "ok\n100%\ndone");
@@ -587,7 +649,7 @@ mod tests {
         let out = window(
             &[&input[..2], &input[2..5], &input[5..]],
             Truncate::None,
-            0,
+            UNBOUNDED,
             false,
         );
         assert_eq!(text(&out), "中文😀");
@@ -596,13 +658,13 @@ mod tests {
 
     #[test]
     fn raw_mode_keeps_escapes_and_carriage_returns() {
-        let out = window(&[b"\x1b[1mA\r\nB\rC\n"], Truncate::None, 0, true);
+        let out = window(&[b"\x1b[1mA\r\nB\rC\n"], Truncate::None, UNBOUNDED, true);
         assert_eq!(text(&out), "\x1b[1mA\r\nB\rC");
         // A raw window that ends inside a sequence leaves a cleaned window parsing it.
         let mut cleaner = Cleaner::default();
         let spec = |raw| WindowSpec {
             truncate: Truncate::None,
-            budget: 0,
+            budget: UNBOUNDED,
             raw,
             encoding: encoding_rs::UTF_8,
             source: "log",
@@ -646,7 +708,7 @@ mod tests {
         let mut cleaner = Cleaner::default();
         let spec = || WindowSpec {
             truncate: Truncate::None,
-            budget: 0,
+            budget: UNBOUNDED,
             raw: false,
             encoding: encoding_rs::UTF_8,
             source: "log",
@@ -726,6 +788,48 @@ mod tests {
         assert_eq!(incomplete_utf8_suffix(emoji), 0);
         assert_eq!(incomplete_utf8_suffix(b"ab"), 0);
         assert_eq!(incomplete_utf8_suffix(&"中".as_bytes()[..1]), 1);
+    }
+
+    #[test]
+    fn a_none_window_stops_at_its_cap_and_reports_the_rest() {
+        let lines: Vec<u8> = (0..40)
+            .flat_map(|line| format!("line {line:02}\n").into_bytes())
+            .collect();
+        let out = window(&[&lines], Truncate::None, 100, false);
+        let shown = text(&out);
+        assert!(shown.contains("lines omitted"), "{shown}");
+        assert!(!shown.contains("line 20"), "{shown}");
+        assert!(shown.len() <= 100 + 64, "{} bytes: {shown}", shown.len());
+
+        // A line longer than the whole cap shows its beginning, cut, and says how much is gone.
+        let long = format!("{}\n", "x".repeat(200));
+        let out = window(&[long.as_bytes()], Truncate::None, 100, false);
+        let shown = text(&out);
+        assert!(
+            shown.contains("line cut at 100 bytes; 100 more bytes"),
+            "{shown}"
+        );
+        assert!(out.omitted.is_none(), "{shown}");
+
+        // A valid multibyte line crossing the cap stays valid: the unfinished character at the
+        // cut is dropped rather than decoded into a false encoding error.
+        let mut multibyte = "中".repeat(400).into_bytes();
+        multibyte.push(0x0a);
+        let out = window(&[&multibyte], Truncate::None, 100, false);
+        assert_eq!(out.bad_lines, 0);
+        let shown = text(&out);
+        assert!(shown.contains("line cut at 100 bytes"), "{shown}");
+        assert!(shown.len() <= 100 + 64, "{} bytes: {shown}", shown.len());
+
+        // Bytes that are invalid on their own decode to 3-byte replacement characters: the cap
+        // holds on the text too, and the error is still reported.
+        let mut invalid = vec![0x80_u8; 100];
+        invalid.push(0x0a);
+        let out = window(&[&invalid], Truncate::None, 100, false);
+        let shown = text(&out);
+        assert!(shown.contains("line cut at 100 bytes"), "{shown}");
+        assert!(shown.len() <= 100 + 64, "{} bytes: {shown}", shown.len());
+        assert_eq!(out.bad_lines, 1);
     }
 
     #[test]

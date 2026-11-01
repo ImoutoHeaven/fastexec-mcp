@@ -2,6 +2,7 @@
 //!
 //! Derived from FastCtx `src/shell/bash.rs` (Apache-2.0, Copyright 2026 yc-duan), modified for fastexec.
 
+use crate::session::LaunchContext;
 use std::collections::HashSet;
 #[cfg(windows)]
 use std::ffi::OsStr;
@@ -9,15 +10,17 @@ use std::path::{Path, PathBuf};
 
 const OVERRIDE: &str = "FASTEXEC_BASH";
 
-pub fn find() -> Result<PathBuf, String> {
-    if let Some(value) = std::env::var_os(OVERRIDE) {
+/// GNU bash for `ctx`: its override, then its PATH and the usual install roots. Everything comes
+/// from the context, so two sessions can find different bashes.
+pub fn find(ctx: &LaunchContext) -> Result<PathBuf, String> {
+    if let Some(value) = ctx.var(OVERRIDE) {
         let path = PathBuf::from(&value);
         let problem = if !path.is_absolute() {
             Some("the path is not absolute".to_string())
-        } else if excluded(&path) {
+        } else if excluded(&path, ctx) {
             Some("the path is the WSL launcher or a WindowsApps shim".to_string())
         } else {
-            validate(&path).err()
+            validate(&path, ctx).err()
         };
         return match problem {
             None => Ok(path),
@@ -27,7 +30,7 @@ pub fn find() -> Result<PathBuf, String> {
         };
     }
     let mut seen = HashSet::new();
-    for candidate in candidates() {
+    for candidate in candidates(ctx) {
         // Windows paths compare case-insensitively; Unix paths that differ in case are distinct.
         let key = candidate.to_string_lossy();
         let key = if cfg!(windows) {
@@ -36,9 +39,9 @@ pub fn find() -> Result<PathBuf, String> {
             key.into_owned()
         };
         if candidate.is_absolute()
-            && !excluded(&candidate)
+            && !excluded(&candidate, ctx)
             && seen.insert(key)
-            && validate(&candidate).is_ok()
+            && validate(&candidate, ctx).is_ok()
         {
             return Ok(candidate);
         }
@@ -55,11 +58,18 @@ pub fn find() -> Result<PathBuf, String> {
 /// Longest `--version` output a candidate may print.
 const BANNER_LIMIT: u64 = 4096;
 
-fn validate(path: &Path) -> Result<(), String> {
+fn validate(path: &Path, ctx: &LaunchContext) -> Result<(), String> {
     if !path.is_file() {
         return Err("the file does not exist".to_string());
     }
-    let mut child = crate::process::quiet_command(path)
+    let mut command = crate::process::quiet_command(path);
+    // The candidate is checked in the environment its tasks would get, not the server's own. Its
+    // directory is not part of the check: a session's starting directory can be gone by the time
+    // its first task starts, and discovery still has to find bash.
+    command
+        .env_clear()
+        .envs(ctx.env.iter().map(|(name, value)| (name, value)));
+    let mut child = command
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -109,10 +119,10 @@ fn validate(path: &Path) -> Result<(), String> {
     }
 }
 
-fn path_candidates(name: &str) -> Vec<PathBuf> {
-    std::env::var_os("PATH")
+fn path_candidates(name: &str, ctx: &LaunchContext) -> Vec<PathBuf> {
+    ctx.var("PATH")
         .map(|path| {
-            std::env::split_paths(&path)
+            std::env::split_paths(path)
                 .map(|dir| dir.join(name))
                 .collect()
         })
@@ -120,10 +130,10 @@ fn path_candidates(name: &str) -> Vec<PathBuf> {
 }
 
 #[cfg(windows)]
-fn candidates() -> Vec<PathBuf> {
+fn candidates(ctx: &LaunchContext) -> Vec<PathBuf> {
     let mut out = Vec::new();
     // <git root>/usr/bin/bash.exe is the real bash; <git root>/bin/bash.exe is a launcher shim.
-    for git in path_candidates("git.exe")
+    for git in path_candidates("git.exe", ctx)
         .into_iter()
         .filter(|git| git.is_file())
     {
@@ -134,7 +144,7 @@ fn candidates() -> Vec<PathBuf> {
             ancestor = dir.parent();
         }
     }
-    let env = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    let env = |name: &str| ctx.var(name).map(PathBuf::from);
     for root in ["ProgramFiles", "ProgramFiles(x86)"]
         .into_iter()
         .filter_map(env)
@@ -150,19 +160,19 @@ fn candidates() -> Vec<PathBuf> {
     if let Some(profile) = env("USERPROFILE") {
         out.push(profile.join("scoop/apps/git/current/usr/bin/bash.exe"));
     }
-    out.extend(path_candidates("bash.exe"));
+    out.extend(path_candidates("bash.exe", ctx));
     out
 }
 
 #[cfg(not(windows))]
-fn candidates() -> Vec<PathBuf> {
+fn candidates(ctx: &LaunchContext) -> Vec<PathBuf> {
     let mut out = vec![PathBuf::from("/bin/bash"), PathBuf::from("/usr/bin/bash")];
-    out.extend(path_candidates("bash"));
+    out.extend(path_candidates("bash", ctx));
     out
 }
 
 #[cfg(windows)]
-fn excluded(path: &Path) -> bool {
+fn excluded(path: &Path, ctx: &LaunchContext) -> bool {
     fn normalized(path: &OsStr) -> String {
         let path = Path::new(path);
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -178,13 +188,13 @@ fn excluded(path: &Path) -> bool {
     if candidate.contains(r"\windowsapps\") {
         return true;
     }
-    std::env::var_os("SystemRoot").is_some_and(|root| {
-        let root = normalized(&root);
+    ctx.var("SystemRoot").is_some_and(|root| {
+        let root = normalized(root);
         candidate.starts_with(&format!("{}\\", root.trim_end_matches('\\')))
     })
 }
 
 #[cfg(not(windows))]
-fn excluded(_path: &Path) -> bool {
+fn excluded(_path: &Path, _ctx: &LaunchContext) -> bool {
     false
 }

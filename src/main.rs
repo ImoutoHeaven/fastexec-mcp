@@ -1,318 +1,115 @@
-//! fastexec: an MCP stdio server with one tool that runs bash commands as tasks.
+//! MCP stdio server: the rmcp adapter over the service, and the process lifecycle around it.
 
 mod bash;
 mod conpty;
+#[cfg(windows)]
+mod conpty_spawn;
+mod daemon;
+mod endpoint;
 mod frames;
 #[cfg(unix)]
 mod host;
+mod http;
+mod ipc;
 mod keys;
 mod output;
 mod process;
+mod runtime;
+mod service;
+mod session;
 mod tasks;
 mod terminal;
+mod transport;
 mod wait;
 
-use output::{Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
+use ipc::{ToDaemon, ToEndpoint};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
-use schemars::JsonSchema;
-use serde::Deserialize;
-use serde_json::{Value, json};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-use tasks::{Snapshot, StartArgs, Task, Tasks};
-use wait::WaitEnd;
-
-const MAX_WAIT_MS: u64 = 240_000;
-const KILL_WAIT: Duration = Duration::from_secs(5);
-const MAX_INPUT_BYTES: usize = 16 * 1024;
-const DEFAULT_KEY_DELAY_MS: u64 = 150;
-const MAX_KEY_DELAY_MS: u64 = 2_000;
-/// Longest pause the keys of one poll add up to before its wait begins.
-const MAX_KEY_PAUSE_MS: u64 = 30_000;
-/// Longest a key waits for the program's stdin to accept the input before it.
-const INPUT_ACCEPT_LIMIT: Duration = Duration::from_secs(5);
-const DEFAULT_MAX_BYTES: u64 = 16 * 1024;
-const MAX_BYTES_RANGE: std::ops::RangeInclusive<u64> = 100..=1024 * 1024;
-/// Room in `maxBytes` for the omission marker, the encoding note, and separators.
-const NOTES_RESERVE: usize = 260;
-/// Smallest window body, so a long status line still leaves room for some output.
-const MIN_BODY_BUDGET: usize = 256;
-/// Largest background footer; bounded results give it at most a quarter of `maxBytes`.
-const FOOTER_LIMIT: usize = 512;
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Action {
-    Start,
-    Poll,
-    Kill,
-    List,
-    Transcript,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct Request {
-    /// start: run a command. poll: send input and/or wait, then read unseen output. kill: terminate a task's process tree. list: this server's tasks. transcript: a PTY task's output as a terminal shows it, from the first line no earlier transcript returned, then the pending lines still on screen.
-    action: Action,
-    /// start: the bash command line.
-    command: Option<String>,
-    /// start: absolute working directory. Omit for the server's working directory.
-    cwd: Option<String>,
-    /// start: run inside a pseudo-terminal (default false).
-    pty: Option<bool>,
-    /// start: login shell, bash -lc, so profile-managed tools resolve (default true). false runs bash --noprofile --norc -c.
-    login_shell: Option<bool>,
-    /// start: kill the task's whole process tree this many ms after launch, whatever the waits and polls, kept processes included; 0 or omitted means no limit.
-    kill_after_ms: Option<u64>,
-    /// start: keep the processes the command leaves running when its bash exits, such as a server a CLI starts for itself (adb, Gradle daemon), until kill on this task or session end (default false: they end with bash).
-    keep_tree: Option<bool>,
-    /// poll, kill, transcript: the task to act on.
-    task_id: Option<String>,
-    /// poll: text written to the task exactly as given, before `keys` and before waiting, at most 16 KiB.
-    input: Option<String>,
-    /// poll, PTY only: keys pressed after `input` is written, in array order, e.g. ["Enter"] or ["Escape", ":", "q", "Enter"]. One key per item, named as in tmux send-keys: Enter, Tab, BTab, Escape, Space, BSpace, Up, Down, Left, Right, Home, End, PageUp/PgUp/PPage, PageDown/PgDn/NPage, Insert/IC, Delete/DC, F1-F12, KP0-KP9, KP/, KP*, KP-, KP+, KP., KPEnter, [NUL]-[US] for C0 controls, 0xHH for a code point, or one character; prefixes C- (Ctrl), M- (Meta/Alt), S- (Shift) combine, as in C-c, M-x, C-M-a, S-Up, and ^c means C-c. Names ignore case. Arrow and keypad keys follow the program's cursor and keypad modes. An unknown name, or a modifier the key cannot carry (C-Enter, S-a) in the program's mode when the poll starts, is an error before anything is sent.
-    keys: Option<Vec<String>>,
-    /// poll, with keys: pause before each key, the first one after input included, 0-2000 ms (default 150); 0 writes input and keys at once. Programs that time keystrokes to detect pastes, such as Codex, read a key sent right after text as part of the paste; programs with an escape timeout read Escape and the next key as one Alt key unless the pause exceeds it (often 500).
-    #[schemars(range(min = 0, max = 2000))]
-    key_delay_ms: Option<u64>,
-    /// poll: close stdin after input (pipe mode only).
-    eof: Option<bool>,
-    /// start, poll: how long to wait at most, 0-240000 ms; the cap returns each call within a 5-minute prompt-cache lifetime, so poll again to wait longer. kill ignores it.
-    #[schemars(range(min = 0, max = 240000))]
-    wait_ms: Option<u64>,
-    /// start, poll: end the wait early when any condition holds; the task keeps running. Texts are literal and case-sensitive, 1-16 per condition, each 1-4096 bytes without line breaks. waitMs stays the longest wait and defaults to 30000 with returnWhen.
-    return_when: Option<wait::ReturnWhen>,
-    /// start, poll, list, transcript: output window mode (default head_tail; transcript defaults to tail).
-    truncate: Option<Truncate>,
-    /// start, poll, kill, list, transcript: byte budget of the result, 100-1048576 (default 16384); error messages stay whole.
-    #[schemars(range(min = 100, max = 1048576))]
-    max_bytes: Option<u64>,
-    /// start, poll: return output without cleaning (default false).
-    raw: Option<bool>,
-    /// start, poll: WHATWG label of the output encoding, e.g. "big5" or "gbk". On start it becomes the task default.
-    encoding: Option<String>,
-    /// start, poll, PTY only: return the rendered terminal screen (120x30) and cursor position instead of the output stream; for full-screen and TUI programs. Marks the stream read. Not with truncate, raw, or encoding.
-    screen: Option<bool>,
-}
-
-/// Output options shared by start and poll.
-struct View {
-    truncate: Truncate,
-    max_bytes: usize,
-    raw: bool,
-    encoding: Option<&'static encoding_rs::Encoding>,
-    screen: bool,
-    /// The call set `returnWhen`.
-    conditions: bool,
-}
-
-fn validate(request: &Request) -> Result<View, String> {
-    let present = [
-        ("command", request.command.is_some()),
-        ("cwd", request.cwd.is_some()),
-        ("pty", request.pty.is_some()),
-        ("loginShell", request.login_shell.is_some()),
-        ("killAfterMs", request.kill_after_ms.is_some()),
-        ("keepTree", request.keep_tree.is_some()),
-        ("taskId", request.task_id.is_some()),
-        ("input", request.input.is_some()),
-        ("eof", request.eof.is_some()),
-        ("waitMs", request.wait_ms.is_some()),
-        ("truncate", request.truncate.is_some()),
-        ("maxBytes", request.max_bytes.is_some()),
-        ("raw", request.raw.is_some()),
-        ("encoding", request.encoding.is_some()),
-        ("keys", request.keys.is_some()),
-        ("keyDelayMs", request.key_delay_ms.is_some()),
-        ("screen", request.screen.is_some()),
-        ("returnWhen", request.return_when.is_some()),
-    ];
-    const VIEW: [&str; 7] = [
-        "waitMs",
-        "returnWhen",
-        "truncate",
-        "maxBytes",
-        "raw",
-        "encoding",
-        "screen",
-    ];
-    let allowed: Vec<&str> = match request.action {
-        Action::Start => [
-            "command",
-            "cwd",
-            "pty",
-            "loginShell",
-            "killAfterMs",
-            "keepTree",
-        ]
-        .into_iter()
-        .chain(VIEW)
-        .collect(),
-        Action::Poll => ["taskId", "input", "eof", "keys", "keyDelayMs"]
-            .into_iter()
-            .chain(VIEW)
-            .collect(),
-        Action::Kill => vec!["taskId", "waitMs", "maxBytes"],
-        Action::List => vec!["truncate", "maxBytes"],
-        Action::Transcript => vec!["taskId", "truncate", "maxBytes"],
-    };
-    for (name, set) in present {
-        if set && !allowed.contains(&name) {
-            return Err(format!(
-                "`{name}` does not apply to action {:?}; remove it.",
-                request.action
-            ));
-        }
-    }
-    match request.action {
-        Action::Start
-            if request
-                .command
-                .as_deref()
-                .is_none_or(|c| c.trim().is_empty()) =>
-        {
-            return Err("start needs a non-empty `command`.".into());
-        }
-        Action::Poll | Action::Kill | Action::Transcript if request.task_id.is_none() => {
-            return Err(format!(
-                "{:?} needs `taskId`; use action list to find it.",
-                request.action
-            ));
-        }
-        _ => {}
-    }
-    let screen = request.screen.unwrap_or(false);
-    if screen {
-        if let Some(name) = [
-            ("truncate", request.truncate.is_some()),
-            ("raw", request.raw.is_some()),
-            ("encoding", request.encoding.is_some()),
-        ]
-        .into_iter()
-        .find_map(|(name, set)| set.then_some(name))
-        {
-            return Err(format!(
-                "`{name}` does not apply with screen; remove one of them."
-            ));
-        }
-        if request.action == Action::Start && request.pty != Some(true) {
-            return Err("screen needs a PTY task; start with pty: true.".into());
-        }
-    }
-    if let Some(when) = &request.return_when {
-        when.validate()?;
-        if let Some(name) = when.screen_condition()
-            && request.action == Action::Start
-            && request.pty != Some(true)
-        {
-            return Err(format!("{name} needs a PTY task; start with pty: true."));
-        }
-    }
-    if let Some(delay) = request.key_delay_ms {
-        if request.keys.is_none() {
-            return Err("keyDelayMs applies only with keys; remove it.".into());
-        }
-        if delay > MAX_KEY_DELAY_MS {
-            return Err(format!(
-                "keyDelayMs {delay} is out of range 0-{MAX_KEY_DELAY_MS}."
-            ));
-        }
-    }
-    if let Some(keys) = &request.keys {
-        let delay = request.key_delay_ms.unwrap_or(DEFAULT_KEY_DELAY_MS);
-        let pause = keys.len() as u64 * delay;
-        if pause > MAX_KEY_PAUSE_MS {
-            return Err(format!(
-                "The keys would pause {pause} ms in all at keyDelayMs {delay}, over the {MAX_KEY_PAUSE_MS} ms limit; send fewer keys per poll or lower keyDelayMs."
-            ));
-        }
-    }
-    if let Some(wait) = request.wait_ms.filter(|&wait| wait > MAX_WAIT_MS) {
-        return Err(format!("waitMs {wait} is out of range 0-{MAX_WAIT_MS}."));
-    }
-    if let Some(bytes) = request.max_bytes {
-        if !MAX_BYTES_RANGE.contains(&bytes) {
-            return Err(format!("maxBytes {bytes} is out of range 100-1048576."));
-        }
-        if request.truncate == Some(Truncate::None) {
-            return Err(
-                "maxBytes does not apply with truncate \"none\"; remove one of them.".into(),
-            );
-        }
-    }
-    if request
-        .input
-        .as_ref()
-        .is_some_and(|input| input.len() > MAX_INPUT_BYTES)
-    {
-        return Err(
-            "input exceeds 16 KiB; send it in smaller pieces or write it to a file.".into(),
-        );
-    }
-    let encoding = match request.encoding.as_deref() {
-        None => None,
-        Some(label) => Some(encoding_rs::Encoding::for_label(label.trim().as_bytes())
-            .filter(|encoding| encoding.is_ascii_compatible())
-            .ok_or_else(|| {
-            format!("Unknown or unsupported encoding {label:?}; use an ASCII-compatible WHATWG label such as \"utf-8\", \"big5\", or \"gbk\" (UTF-16 output is not supported).")
-        })?),
-    };
-    if request.action == Action::Start
-        && let Some(name) = request
-            .return_when
-            .as_ref()
-            .and_then(|when| when.screen_condition())
-        && encoding.is_some_and(|encoding| encoding != encoding_rs::UTF_8)
-    {
-        return Err(format!("{name} needs UTF-8 output; remove encoding."));
-    }
-    Ok(View {
-        truncate: request
-            .truncate
-            .unwrap_or(if request.action == Action::Transcript {
-                Truncate::Tail
-            } else {
-                Truncate::HeadTail
-            }),
-        max_bytes: request.max_bytes.unwrap_or(DEFAULT_MAX_BYTES) as usize,
-        raw: request.raw.unwrap_or(false),
-        encoding,
-        screen,
-        conditions: request.return_when.is_some(),
-    })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OutputMode {
-    Text,
-    Both,
-    Structured,
-}
+use service::{Call, Render, Service};
+use session::{LaunchContext, Session};
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
+use tasks::{Limits, Tasks};
+use tokio::sync::watch;
 
 #[derive(Clone)]
 struct Server {
-    tasks: Arc<Tasks>,
-    output_mode: OutputMode,
-    structured_content: bool,
+    backend: Backend,
 }
 
-/// Server instructions say when to use the tool; hosts that show one line take the first.
-const INSTRUCTIONS: &str = "Runs bash commands as tasks: long-running builds and servers, stdin-driven programs, and terminal (PTY) programs such as password prompts, with bounded output and process-tree kill.
+/// Where this server's calls run: in this process, or on the namespace's daemon.
+#[derive(Clone)]
+enum Backend {
+    Local {
+        service: Arc<Service>,
+        render: Render,
+        /// Created on the first tool call, when the client's name is known.
+        session: Arc<OnceLock<Result<Arc<Session>, String>>>,
+        /// What this server's tasks inherit: the environment captured at startup, so a later
+        /// change to the server's own environment cannot reach them.
+        launch: Arc<LaunchContext>,
+        /// What this server tells a client about where its tasks live.
+        instructions: &'static str,
+    },
+    /// `on` mode: the daemon owns every task, and this process only carries calls to it.
+    Daemon(Arc<endpoint::Endpoint>),
+}
+
+impl Backend {
+    fn instructions(&self) -> &'static str {
+        match self {
+            Self::Local { instructions, .. } => instructions,
+            Self::Daemon(_) => INSTRUCTIONS_DAEMON,
+        }
+    }
+}
+
+impl Server {
+    /// This server's session: the client name and a short random ID, its tasks' owner.
+    fn session(&self, context: &RequestContext<RoleServer>) -> Result<Arc<Session>, String> {
+        let Backend::Local {
+            session, launch, ..
+        } = &self.backend
+        else {
+            return Err("this server has no tasks of its own".to_owned());
+        };
+        session
+            .get_or_init(|| {
+                let short = tasks::random_chars(6)
+                    .map_err(|error| format!("Cannot name the session: {error}"))?;
+                Ok(Session::new(
+                    short.clone(),
+                    format!("{}-{short}", client_name(context)),
+                    Arc::clone(launch),
+                ))
+            })
+            .clone()
+    }
+}
+
+/// The client's name from the MCP handshake, for the session label.
+fn client_name(context: &RequestContext<RoleServer>) -> String {
+    context.peer.peer_info().map_or_else(
+        || "client".to_string(),
+        |info| info.client_info.name.clone(),
+    )
+}
+
+/// Server instructions say when to use the tool; hosts that show one line take the first. The
+/// second line says where the tasks live, which is the one thing that differs between the modes.
+const INSTRUCTIONS_LOCAL: &str = "Runs bash commands as tasks: long-running builds and servers, stdin-driven programs, and terminal (PTY) programs such as password prompts, with bounded output and process-tree kill.
 Prefer it over one-shot shell tools when a command may outlive a single call or needs input; tasks end when the session ends.";
+const INSTRUCTIONS_DAEMON: &str = "Runs bash commands as tasks: long-running builds and servers, stdin-driven programs, and terminal (PTY) programs such as password prompts, with bounded output and process-tree kill.
+Prefer it over one-shot shell tools when a command may outlive a single call or needs input; tasks run in a shared background daemon, outlive this session, and are visible to every session using it.";
 
 #[tool_handler]
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fastexec", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(self.backend.instructions())
     }
 }
 
@@ -330,814 +127,585 @@ impl Server {
     )]
     async fn fastexec(
         &self,
-        Parameters(request): Parameters<Request>,
+        Parameters(request): Parameters<service::Request>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let action = request.action;
-        let mut result = match self.handle(request, &context).await {
-            Ok(result) => result,
-            Err(message) => error_result(action, &message),
-        };
-        if !self.structured_content {
-            result.structured_content = None;
-        }
-        result
-    }
-}
-
-impl Server {
-    async fn handle(
-        &self,
-        request: Request,
-        context: &RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, String> {
-        let view = validate(&request)?;
-        match request.action {
-            Action::List => Ok(self.list(&view)),
-            Action::Start => {
-                let cwd = match request.cwd {
-                    None => std::env::current_dir()
-                        .map_err(|error| format!("Cannot read the working directory: {error}."))?,
-                    Some(dir) => {
-                        let dir = PathBuf::from(dir);
-                        if !dir.is_absolute() || !dir.is_dir() {
-                            return Err(format!(
-                                "cwd {} is not an existing absolute directory.",
-                                dir.display()
-                            ));
-                        }
-                        dir
+        match &self.backend {
+            Backend::Daemon(endpoint) => {
+                let (progress, _forwarder) = progress(&context);
+                // The daemon validates the call again; this is only how it travels.
+                let arguments = match serde_json::to_value(&request) {
+                    Ok(arguments) => arguments,
+                    Err(problem) => {
+                        return CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                            format!("cannot serialize the call: {problem}"),
+                        )]);
                     }
                 };
-                let args = StartArgs {
-                    command: request.command.unwrap_or_default(),
-                    cwd,
-                    pty: request.pty.unwrap_or(false),
-                    login: request.login_shell.unwrap_or(true),
-                    keep: request.keep_tree.unwrap_or(false),
-                    encoding: view.encoding.unwrap_or(encoding_rs::UTF_8),
-                };
-                let tasks = Arc::clone(&self.tasks);
-                let task = tokio::task::spawn_blocking(move || tasks.start(args))
-                    .await
-                    .map_err(|error| format!("Internal failure while starting: {error}."))??;
-                if let Some(limit) = request.kill_after_ms.filter(|&limit| limit > 0) {
-                    // The deadline belongs to the task, not to this request: it survives the
-                    // request's cancellation and every later wait, and bounds kept processes.
-                    let (expiring, mut done) = (Arc::clone(&task), task.tree_done());
-                    tokio::spawn(async move {
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(limit)) => expiring.expire(),
-                            _ = done.wait_for(|done| *done) => {}
-                        }
-                    });
-                }
-                let when = request.return_when.as_ref();
-                let mark = wait::mark(&task, when)?;
-                let encoding = view.encoding.unwrap_or(task.encoding);
-                let wait = request.wait_ms.unwrap_or(30_000);
-                let ended = wait::wait(&task, wait, when, mark, encoding, context).await?;
-                self.window_result(Action::Start, task, view, ended).await
-            }
-            Action::Poll => {
-                let task = self.task(request.task_id.as_deref())?;
-                let when = request.return_when.as_ref();
-                let watches_screen = when.and_then(|when| when.screen_condition());
-                let needs_pty = [("screen", view.screen), ("keys", request.keys.is_some())]
-                    .into_iter()
-                    .find_map(|(name, set)| set.then_some(name))
-                    .or(watches_screen);
-                if let Some(name) = needs_pty.filter(|_| !task.pty) {
-                    return Err(format!(
-                        "{name} applies to PTY tasks only; in pipe mode, write text with input and end lines with a newline."
-                    ));
-                }
-                if let Some(name) = view.screen.then_some("screen").or(watches_screen)
-                    && task.encoding != encoding_rs::UTF_8
-                {
-                    return Err(format!(
-                        "{name} needs UTF-8 output; this task was started with an encoding."
-                    ));
-                }
-                let input = request.input.as_deref().unwrap_or_default().as_bytes();
-                let names = request.keys.as_deref().unwrap_or_default();
-                // Every key is checked against the current modes before anything is written.
-                let mut parsed = Vec::with_capacity(names.len());
-                let mut data = input.to_vec();
-                if !names.is_empty() {
-                    let modes = task.modes()?;
-                    for name in names {
-                        let key = keys::parse(name)?;
-                        data.extend(keys::encode(name, key, modes)?);
-                        parsed.push(key);
-                    }
-                }
-                if data.len() > MAX_INPUT_BYTES {
-                    return Err(
-                        "input and keys together exceed 16 KiB; send them in smaller pieces."
-                            .into(),
-                    );
-                }
-                let mark = wait::mark(&task, when)?;
-                let delay =
-                    Duration::from_millis(request.key_delay_ms.unwrap_or(DEFAULT_KEY_DELAY_MS));
-                if delay.is_zero() {
-                    // Without a pause, input and keys go out as one write, like a typed burst.
-                    task.send(Some(&data), request.eof.unwrap_or(false))?;
-                } else {
-                    task.send(Some(input), request.eof.unwrap_or(false))?;
-                    press(&task, input, names, parsed, delay, context).await?;
-                }
-                let default_wait =
-                    if (request.input.is_some() || request.keys.is_some()) && when.is_none() {
-                        2_000
-                    } else {
-                        30_000
-                    };
-                let wait = request.wait_ms.unwrap_or(default_wait);
-                let encoding = view.encoding.unwrap_or(task.encoding);
-                let ended = wait::wait(&task, wait, when, mark, encoding, context).await?;
-                self.window_result(Action::Poll, task, view, ended).await
-            }
-            Action::Kill => {
-                let task = self.task(request.task_id.as_deref())?;
-                task.kill().map_err(|error| {
-                    format!(
-                        "Cannot terminate the process tree of {}: {error}. Poll to see its state, or retry kill.",
-                        task.id
+                endpoint
+                    .call(
+                        arguments,
+                        context.id.to_string(),
+                        &client_name(&context),
+                        context.ct.clone(),
+                        progress,
                     )
-                })?;
-                let (mut done, mut tree_done) = (task.done(), task.tree_done());
-                let finished = async move {
-                    let _ = done.wait_for(|done| *done).await;
-                    let _ = tree_done.wait_for(|done| *done).await;
+                    .await
+            }
+            Backend::Local {
+                service,
+                render,
+                session: _,
+                launch: _,
+                instructions: _,
+            } => {
+                let result = match self.session(&context) {
+                    Ok(session) => {
+                        let (progress, _forwarder) = progress(&context);
+                        let call = Call {
+                            session: &session,
+                            render: *render,
+                            cancel: context.ct.clone(),
+                            progress,
+                            call_id: None,
+                        };
+                        service.call(request, call).await
+                    }
+                    Err(message) => service::error_result(request.action, &message),
                 };
-                let _ = tokio::time::timeout(KILL_WAIT, finished).await;
-                let snapshot = task.snapshot_held();
-                let mut text = status_line(&task, &snapshot);
-                if snapshot.state == "running" || snapshot.kept {
-                    text.push_str(" · the tree did not exit within 5 s; poll later to confirm");
-                }
-                output::cut_to(&mut text, view.max_bytes / 2 + 1);
-                let background = self
-                    .tasks
-                    .background(&task.id, FOOTER_LIMIT.min(view.max_bytes / 4));
-                if let Some((line, _)) = &background {
-                    text.push('\n');
-                    text.push_str(line);
-                }
-                let result = success(text, task_json(Action::Kill, &task, &snapshot));
-                report(&task, &snapshot, background);
-                Ok(result)
-            }
-            Action::Transcript => {
-                let task = self.task(request.task_id.as_deref())?;
-                if !task.pty {
-                    return Err("transcript applies to PTY tasks only; poll returns a pipe task's output, and its log holds every byte.".into());
-                }
-                if task.encoding != encoding_rs::UTF_8 {
-                    return Err(
-                        "transcript needs UTF-8 output; this task was started with an encoding."
-                            .into(),
-                    );
-                }
-                self.transcript_result(task, view).await
+                service::suppress(result, *render)
             }
         }
-    }
-
-    fn task(&self, id: Option<&str>) -> Result<Arc<Task>, String> {
-        let id = id.unwrap_or_default();
-        self.tasks
-            .find(id)
-            .ok_or_else(|| format!("Unknown taskId {id:?}. Tasks live as long as this server; use action list to see them."))
-    }
-
-    fn list(&self, view: &View) -> CallToolResult {
-        let tasks = self.tasks.all();
-        let mut lines = Vec::new();
-        let mut entries = Vec::new();
-        let mut shown = Vec::new();
-        for task in &tasks {
-            let snapshot = task.snapshot_held();
-            let command: String = task.command.chars().take(120).collect();
-            let code = snapshot
-                .exit_code
-                .map_or(String::new(), |code| format!(" {code}"));
-            lines.push(format!(
-                "{} [{}{code}] {:.1}s{}{} · {}",
-                task.id,
-                snapshot.state,
-                snapshot.elapsed.as_secs_f64(),
-                if task.pty { " pty" } else { "" },
-                if snapshot.kept {
-                    format!(" · keeps {}", members(&snapshot.held))
-                } else if snapshot.tree_ended {
-                    " · kept processes ended".to_string()
-                } else {
-                    String::new()
-                },
-                command.replace('\n', " ")
-            ));
-            entries.push(json!({
-                "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
-                "elapsedMs": snapshot.elapsed.as_millis() as u64, "command": command, "logPath": task.log_path,
-                "lifetimeExpired": snapshot.expired, "keepTree": task.keep, "keptRunning": snapshot.kept,
-                "held": members_json(&snapshot.held),
-            }));
-            shown.push((task, snapshot));
-        }
-        let (kept, text) = fit_lines(&lines, view.truncate, view.max_bytes);
-        // The list shows these states, which settles the background footer's notices; a task
-        // the window leaves out stays due.
-        for index in kept {
-            let (task, snapshot) = &shown[index];
-            task.mark_reported(snapshot);
-            task.mark_keeps_reported(snapshot);
-        }
-        let text = if lines.is_empty() {
-            "No tasks.".to_string()
-        } else {
-            text
-        };
-        success(
-            text,
-            json!({ "ok": true, "action": "list", "tasks": entries }),
-        )
     }
 }
 
-/// Joins the whole `lines` that fit `budget` bytes, picked from the ends `truncate` names, with
-/// one marker line where lines were left out. Returns the indexes of the lines shown and the
-/// text.
-fn fit_lines(lines: &[String], truncate: Truncate, budget: usize) -> (Vec<usize>, String) {
-    let all = || ((0..lines.len()).collect(), lines.join("\n"));
-    if truncate == Truncate::None
-        || lines.iter().map(|line| line.len() + 1).sum::<usize>() <= budget + 1
-    {
-        return all();
+/// Aborts the progress forwarder however the call returns, including through `?`.
+struct Forwarder(tokio::task::JoinHandle<()>);
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        self.0.abort();
     }
-    let marker =
-        |omitted: usize| format!("... [{omitted} tasks omitted; raise maxBytes to see them] ...");
-    let last = lines.len() - 1;
-    let order: Vec<usize> = match truncate {
-        Truncate::Head => (0..=last).collect(),
-        Truncate::Tail => (0..=last).rev().collect(),
-        _ => (0..=last / 2).flat_map(|i| [i, last - i]).collect(),
-    };
-    // Room for the marker at its longest, with the newlines around it.
-    let mut room = budget.saturating_sub(marker(lines.len()).len() + 2);
-    let mut kept = Vec::new();
-    for index in order {
-        if kept.contains(&index) {
+}
+
+/// Sends each latest progress message. A transport that stalls only delays these; the call keeps
+/// watching its own futures, so completion and cancellation never queue behind progress.
+async fn forward_progress(
+    peer: rmcp::service::Peer<RoleServer>,
+    token: rmcp::model::ProgressToken,
+    mut latest: watch::Receiver<Option<wait::Progress>>,
+) {
+    while latest.changed().await.is_ok() {
+        // The watch borrow ends before the send awaits, so this future stays `Send`.
+        let next = latest.borrow_and_update().clone();
+        let Some((seconds, message)) = next else {
             continue;
-        }
-        if lines[index].len() + 1 > room {
-            break;
-        }
-        room -= lines[index].len() + 1;
-        kept.push(index);
-    }
-    kept.sort_unstable();
-    let mut text: Vec<String> = Vec::new();
-    for index in 0..=last {
-        if kept.contains(&index) {
-            text.push(lines[index].clone());
-        } else if index == 0 || kept.contains(&(index - 1)) {
-            text.push(marker(lines.len() - kept.len()));
+        };
+        let progress = rmcp::model::ProgressNotificationParam::new(token.clone(), seconds)
+            .with_message(message);
+        if peer.notify_progress(progress).await.is_err() {
+            return;
         }
     }
-    (kept, text.join("\n"))
 }
 
-/// Writes each key on its own after `input`, pausing `delay` after the program's stdin has
-/// accepted what came before, and encodes it in the modes the program has set by then.
-async fn press(
-    task: &Task,
-    input: &[u8],
-    names: &[String],
-    parsed: Vec<keys::Key>,
-    delay: Duration,
+/// The sink the call replaces with its latest progress message, when the client asked for
+/// progress; the forwarder sends them.
+fn progress(
     context: &RequestContext<RoleServer>,
-) -> Result<(), String> {
-    let mut size = input.len();
-    for (index, (name, key)) in names.iter().zip(parsed).enumerate() {
-        let sent = |error: String| format!("{error} The first {index} keys were sent.");
-        // Input still queued, from this poll or an earlier one, goes first.
-        let mut follows = index > 0 || !input.is_empty();
-        let accepted = tokio::time::Instant::now() + INPUT_ACCEPT_LIMIT;
-        // ponytail: polls the input queue; a delivery signal from the writer if 5 ms
-        // granularity ever matters.
-        while task.input_pending() {
-            follows = true;
-            if tokio::time::Instant::now() >= accepted {
-                return Err(sent(
-                    "The program has not accepted earlier input for 5 s; the task keeps running."
-                        .into(),
-                ));
-            }
-            tokio::select! {
-                _ = context.ct.cancelled() => return Err(sent("Cancelled; the task keeps running.".into())),
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
-            }
-        }
-        if follows {
-            tokio::select! {
-                _ = context.ct.cancelled() => return Err(sent("Cancelled; the task keeps running.".into())),
-                _ = tokio::time::sleep(delay) => {}
-            }
-        }
-        let bytes = task
-            .modes()
-            .and_then(|modes| keys::encode(name, key, modes))
-            .map_err(sent)?;
-        size += bytes.len();
-        if size > MAX_INPUT_BYTES {
-            return Err(sent(format!(
-                "Key {name:?} in the program's current keyboard mode takes input and keys past 16 KiB; send fewer keys per poll."
-            )));
-        }
-        task.send(Some(&bytes), false).map_err(sent)?;
-    }
-    Ok(())
-}
-
-/// Marks what the result showed of the task and of the footer's tasks reported, once the
-/// result is built.
-fn report(task: &Task, shown: &Snapshot, background: Option<(String, Vec<tasks::Shown>)>) {
-    task.mark_reported(shown);
-    for (task, shown) in background.map(|(_, shown)| shown).unwrap_or_default() {
-        task.mark_reported(&shown);
-        task.mark_keeps_reported(&shown);
-    }
-}
-
-impl Server {
-    async fn window_result(
-        &self,
-        action: Action,
-        task: Arc<Task>,
-        view: View,
-        ended: WaitEnd,
-    ) -> Result<CallToolResult, String> {
-        if view.screen {
-            return self.screen_result(action, task, view, ended).await;
-        }
-        let reader = Arc::clone(&task);
-        let encoding = view.encoding.unwrap_or(task.encoding);
-        let footer_cap = match view.truncate {
-            Truncate::None => FOOTER_LIMIT,
-            _ => FOOTER_LIMIT.min(view.max_bytes / 4),
-        };
-        let background = self.tasks.background(&task.id, footer_cap);
-        let footer = background
-            .as_ref()
-            .map_or(String::new(), |(line, _)| format!("\n{line}"));
-        // The state is taken before the read: a finished state means output reached EOF (or
-        // stayed open, which the status line notes), so the window below holds all of it. The
-        // status line can only grow by its notes.
-        let before = task.snapshot_held();
-        let reserved = status_line(&task, &before).len()
-            + ended.note(view.conditions).len()
-            + NOTES_RESERVE
-            + footer.len();
-        let budget = match view.truncate {
-            Truncate::None => usize::MAX,
-            _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
-        };
-        let window = tokio::task::spawn_blocking(move || {
-            reader.read_window(view.truncate, budget, view.raw, encoding, None)
-        })
-        .await
-        .map_err(|error| format!("Internal failure while reading output: {error}."))?
-        .map_err(|error| format!("Cannot read the task log: {error}."))?;
-        // Log metadata, such as an eviction during the read, is taken after it.
-        let after = task.snapshot();
-        let snapshot = Snapshot {
-            lines: after.lines,
-            dropped: after.dropped,
-            evicted: after.evicted,
-            log_error: after.log_error,
-            ..before
-        };
-        let mut status = status_line(&task, &snapshot);
-        status.push_str(&ended.note(view.conditions));
-        if window.bad_lines > 0 {
-            status.push_str(&format!(
-                " · {} lines had bytes invalid in {}; pass encoding (e.g. big5, gbk)",
-                window.bad_lines,
-                encoding.name()
-            ));
-        }
-        let mut structured = task_json(action, &task, &snapshot);
-        structured["waitEndedBy"] = ended.json();
-        let text = self.layout(
-            &window,
-            status,
-            &footer,
-            &view,
-            "(no new output)",
-            &mut structured,
-        );
-        let result = success(text, structured);
-        report(&task, &snapshot, background);
-        Ok(result)
-    }
-
-    /// A PTY task's transcript from the first line no earlier read showed: its final lines,
-    /// then the pending ones, which the file also holds after the final lines until output
-    /// changes them. The result shows the last lines by default, where a program's newest
-    /// output is.
-    async fn transcript_result(
-        &self,
-        task: Arc<Task>,
-        view: View,
-    ) -> Result<CallToolResult, String> {
-        let snapshot = task.snapshot_held();
-        let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
-        let transcript = tokio::task::spawn_blocking(move || reader.transcript(&tasks))
-            .await
-            .map_err(|error| format!("Internal failure while reading: {error}."))??;
-        let pending_lines = transcript.pending.matches('\n').count() as u64;
-        let total = transcript.lines + pending_lines;
-        let footer_cap = match view.truncate {
-            Truncate::None => FOOTER_LIMIT,
-            _ => FOOTER_LIMIT.min(view.max_bytes / 4),
-        };
-        let background = self.tasks.background(&task.id, footer_cap);
-        let footer = background
-            .as_ref()
-            .map_or(String::new(), |(line, _)| format!("\n{line}"));
-        let mut status = status_line(&task, &snapshot);
-        status.push_str(&format!(
-            " · transcript {total} lines, final through {}; this read starts at line {} · {}",
-            transcript.lines,
-            transcript.first_line,
-            transcript.path.display()
-        ));
-        if transcript.cut {
-            status.push_str(" · pending lines past the transcript's 64 MiB limit are left out");
-        }
-        if let Some(reason) = &transcript.stopped {
-            status.push_str(&format!(
-                " · the transcript stops after line {}: {reason}",
-                transcript.lines
-            ));
-        }
-        if let Some(warning) = conpty::load() {
-            status.push_str(&format!(" · {warning}, so lines may be missing"));
-        }
-        let budget = match view.truncate {
-            Truncate::None => usize::MAX,
-            _ => view
-                .max_bytes
-                .saturating_sub(status.len() + NOTES_RESERVE + footer.len())
-                .max(MIN_BODY_BUDGET),
-        };
-        let spec = WindowSpec {
-            truncate: view.truncate,
-            budget,
-            raw: false,
-            encoding: encoding_rs::UTF_8,
-            source: "transcript",
-        };
-        let mut structured = task_json(Action::Transcript, &task, &snapshot);
-        structured["transcriptPath"] = json!(transcript.path);
-        structured["transcriptLines"] = json!(total);
-        structured["finalLines"] = json!(transcript.lines);
-        structured["firstLine"] = json!(transcript.first_line);
-        let window = tokio::task::spawn_blocking(move || {
-            let mut cleaner = Cleaner::default();
-            let mut builder = WindowBuilder::new(spec, &mut cleaner, transcript.first_line);
-            // Final lines only grow, so the range read stays as it was.
-            let mut file = File::open(&transcript.path)?;
-            file.seek(SeekFrom::Start(transcript.start))?;
-            let mut remaining = transcript.bytes - transcript.start;
-            let mut buffer = vec![0_u8; 64 * 1024];
-            while remaining > 0 {
-                let want = remaining.min(buffer.len() as u64) as usize;
-                let read = file.read(&mut buffer[..want])?;
-                if read == 0 {
-                    break;
-                }
-                builder.push(&buffer[..read]);
-                remaining -= read as u64;
-            }
-            builder.push(transcript.pending.as_bytes());
-            Ok::<_, std::io::Error>(builder.finish())
-        })
-        .await
-        .map_err(|error| format!("Internal failure while reading: {error}."))?
-        .map_err(|error| format!("Cannot read the transcript file: {error}."))?;
-        let text = self.layout(
-            &window,
-            status,
-            &footer,
-            &view,
-            "(no transcript lines since the last read)",
-            &mut structured,
-        );
-        let result = success(text, structured);
-        report(&task, &snapshot, background);
-        Ok(result)
-    }
-
-    /// Fits `window` with the status line and footer into `maxBytes`, adds the window metadata
-    /// to `structured`, and returns the text content; `empty` stands in for an empty window.
-    fn layout(
-        &self,
-        window: &Window,
-        mut status: String,
-        footer: &str,
-        view: &View,
-        empty: &str,
-        structured: &mut Value,
-    ) -> String {
-        let room = if view.truncate == Truncate::None {
-            usize::MAX
-        } else {
-            // Hard guarantee: the whole text fits maxBytes. A status line longer than half the
-            // budget is cut too; structuredContent.logPath, when enabled, keeps the full path.
-            output::cut_to(&mut status, view.max_bytes / 2 + 1);
-            view.max_bytes - status.len() - 2 - footer.len()
-        };
-        let (output, cut_lines) = window.fit(room);
-        // A small maxBytes may leave no room for the placeholder.
-        let body = if output.is_empty() {
-            if empty.len() <= room { empty } else { "" }
-        } else {
-            output.as_str()
-        };
-        let text = if self.output_mode == OutputMode::Structured {
-            format!("{status}{footer}")
-        } else {
-            format!("{body}\n\n{status}{footer}")
-        };
-        add_window(structured, window);
-        if self.output_mode != OutputMode::Text {
-            structured["output"] = json!(output);
-        }
-        structured["cutLines"] = json!(cut_lines);
-        text
-    }
-}
-
-impl Server {
-    /// The rendered screen of a PTY task, bottom rows first to stay within `maxBytes`.
-    async fn screen_result(
-        &self,
-        action: Action,
-        task: Arc<Task>,
-        view: View,
-        ended: WaitEnd,
-    ) -> Result<CallToolResult, String> {
-        let background = self
-            .tasks
-            .background(&task.id, FOOTER_LIMIT.min(view.max_bytes / 4));
-        let footer = background
-            .as_ref()
-            .map_or(String::new(), |(line, _)| format!("\n{line}"));
-        // A finished state, taken first, means the screen below holds all output.
-        let snapshot = task.snapshot_held();
-        let screen = task.screen()?;
-        // The stream counts as read up to the output the screen shows.
-        let (reader, until) = (Arc::clone(&task), screen.log_end);
-        tokio::task::spawn_blocking(move || {
-            let encoding = reader.encoding;
-            reader.read_window(
-                Truncate::Tail,
-                MIN_BODY_BUDGET,
-                false,
-                encoding,
-                Some(until),
-            )
-        })
-        .await
-        .map_err(|error| format!("Internal failure while reading output: {error}."))?
-        .map_err(|error| format!("Cannot read the task log: {error}."))?;
-        let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
-        let mut status = status_line(&task, &snapshot);
-        status.push_str(&ended.note(view.conditions));
-        status.push_str(&format!(" · screen, cursor row {row} col {col}"));
-        output::cut_to(&mut status, view.max_bytes / 2 + 1);
-        let room = view.max_bytes - status.len() - 2 - footer.len();
-        let mut omitted = 0;
-        let mut body = screen.rows.join("\n");
-        while body.len() > room && omitted < screen.rows.len() {
-            omitted += 1;
-            body = format!(
-                "... [{omitted} top rows omitted] ...\n{}",
-                screen.rows[omitted..].join("\n")
-            );
-        }
-        // cut_to keeps budget - 1 bytes; the separators are already outside `room`.
-        output::cut_to(&mut body, room + 1);
-        let shown = if body.is_empty() && room >= "(blank screen)".len() {
-            "(blank screen)"
-        } else {
-            &body
-        };
-        let text = if self.output_mode == OutputMode::Structured {
-            format!("{status}{footer}")
-        } else {
-            format!("{shown}\n\n{status}{footer}")
-        };
-        let mut structured = task_json(action, &task, &snapshot);
-        structured["waitEndedBy"] = ended.json();
-        structured["cursor"] = json!([row, col]);
-        structured["omittedRows"] = json!(omitted);
-        if self.output_mode != OutputMode::Text {
-            structured["output"] = json!(body);
-        }
-        let result = success(text, structured);
-        report(&task, &snapshot, background);
-        Ok(result)
-    }
-}
-
-fn status_line(task: &Task, snapshot: &Snapshot) -> String {
-    let state = match snapshot.exit_code {
-        Some(code) if snapshot.state == "exited" => format!("exited {code}"),
-        Some(code) => format!("{} (exit {code})", snapshot.state),
-        None => snapshot.state.to_string(),
+) -> (
+    Option<watch::Sender<Option<wait::Progress>>>,
+    Option<Forwarder>,
+) {
+    let Some(token) = context.meta.get_progress_token() else {
+        return (None, None);
     };
-    let mut line = format!(
-        "[{state}] {} · {:.1}s · {} lines · log {}",
-        task.id,
-        snapshot.elapsed.as_secs_f64(),
-        snapshot.lines,
-        task.log_path.display()
-    );
-    if snapshot.state == "running" {
-        line.push_str(" · poll to continue, kill to stop");
-    }
-    if snapshot.expired {
-        line.push_str(" · killed by killAfterMs");
-    }
-    if let Some(error) = &snapshot.log_error {
-        line.push_str(&format!(
-            " · log write failed ({error}); {} bytes were not stored",
-            snapshot.dropped
-        ));
-    } else if snapshot.dropped > 0 {
-        line.push_str(&format!(
-            " · {} bytes past the log limit were not stored",
-            snapshot.dropped
-        ));
-    }
-    if snapshot.evicted {
-        line.push_str(" · log evicted under the 1 GiB total limit");
-    }
-    if snapshot.kept {
-        let names = members(&snapshot.held);
-        line.push_str(&match &snapshot.kill_error {
-            Some(error) => format!(" · could not end {names}: {error}; kill retries"),
-            None => format!(" · keeps {names} running; kill ends them"),
-        });
-    } else if snapshot.tree_ended {
-        line.push_str(" · kept processes ended");
-    } else if !snapshot.leftovers.is_empty() && !task.keep {
-        line.push_str(&format!(
-            " · ended with bash: {}; start with keepTree: true to keep them",
-            members(&snapshot.leftovers)
-        ));
-    }
-    if snapshot.output_open {
-        line.push_str(if snapshot.kept {
-            " · processes it keeps hold the output open; later output may follow"
-        } else {
-            " · output stayed open after exit; later output may follow"
-        });
-    }
-    line
-}
-
-/// Names processes as `adb.exe (4120), sleep (77) and 3 more`.
-fn members(members: &[process::Member]) -> String {
-    if members.is_empty() {
-        return "processes".into();
-    }
-    let mut text = members
-        .iter()
-        .take(3)
-        .map(|member| format!("{} ({})", member.name, member.pid))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if members.len() > 3 {
-        text.push_str(&format!(" and {} more", members.len() - 3));
-    }
-    text
-}
-
-fn task_json(action: Action, task: &Task, snapshot: &Snapshot) -> Value {
-    json!({
-        "ok": true,
-        "action": action_name(action),
-        "taskId": task.id,
-        "state": snapshot.state,
-        "exitCode": snapshot.exit_code,
-        "pty": task.pty,
-        "elapsedMs": snapshot.elapsed.as_millis() as u64,
-        "logPath": task.log_path,
-        "lifetimeExpired": snapshot.expired,
-        "logError": snapshot.log_error,
-        "keepTree": task.keep,
-        "leftovers": members_json(&snapshot.leftovers),
-        "keptRunning": snapshot.kept,
-        "held": members_json(&snapshot.held),
-        "killError": snapshot.kill_error,
-    })
-}
-
-fn members_json(members: &[process::Member]) -> Value {
-    json!(
-        members
-            .iter()
-            .map(|member| json!({"pid": member.pid, "name": member.name}))
-            .collect::<Vec<_>>()
-    )
-}
-
-fn add_window(value: &mut Value, window: &Window) {
-    let omitted = window.omitted.map_or(0, |(first, last)| last - first + 1);
-    value["omittedLines"] = json!(omitted);
-    value["omittedRange"] = json!(window.omitted.map(|(first, last)| [first, last]));
-    value["encodingErrors"] = json!(window.bad_lines);
-}
-
-fn action_name(action: Action) -> &'static str {
-    match action {
-        Action::Start => "start",
-        Action::Poll => "poll",
-        Action::Kill => "kill",
-        Action::List => "list",
-        Action::Transcript => "transcript",
-    }
-}
-
-fn success(text: String, structured: Value) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-    result.structured_content = Some(structured);
-    result
-}
-
-fn error_result(action: Action, message: &str) -> CallToolResult {
-    let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
-    result.structured_content =
-        Some(json!({ "ok": false, "action": action_name(action), "error": message }));
-    result
+    let (sender, latest) = watch::channel(None);
+    let forwarder = Forwarder(tokio::spawn(forward_progress(
+        context.peer.clone(),
+        token,
+        latest,
+    )));
+    (Some(sender), Some(forwarder))
 }
 
 fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     #[cfg(unix)]
     {
-        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
         if args.first().is_some_and(|arg| arg == host::FLAG) {
             host::main(&args[1..]);
         }
     }
+    if args.first().is_some_and(|arg| arg == "daemon") {
+        std::process::exit(daemon_main(&args[1..]));
+    }
     serve();
+}
+
+/// The hidden `daemon` subcommand: the daemon process itself, and the CLI that starts, inspects,
+/// and stops one.
+fn daemon_main(args: &[std::ffi::OsString]) -> i32 {
+    let action = args
+        .first()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match action.as_str() {
+        "serve" => {
+            let (Some(namespace), Some(build)) = (args.get(1), args.get(2)) else {
+                eprintln!(
+                    "fastexec: usage: fastexec daemon serve <namespace> <build> [--http <addr>]"
+                );
+                return 2;
+            };
+            let http = match http_flag(&args[3..]) {
+                Ok(http) => http,
+                Err(message) => return fail(&message),
+            };
+            daemon::serve_process(
+                namespace.to_string_lossy().into_owned(),
+                build.to_string_lossy().into_owned(),
+                http,
+            )
+        }
+        "start" | "status" | "stop" => {
+            let http = match http_flag(&args[1..]) {
+                Ok(http) => http,
+                Err(message) => return fail(&message),
+            };
+            // Only a start serves HTTP; a status or stop that named an address meant something
+            // else.
+            if http.is_some() && action != "start" {
+                return fail("usage: fastexec daemon start|status|stop [--http <addr>]");
+            }
+            match tokio::runtime::Runtime::new() {
+                Ok(runtime) => {
+                    let code = runtime.block_on(cli(&action, http));
+                    // Exit here rather than through the runtime's drop, which would wait for a
+                    // start worker the deadline abandoned.
+                    std::process::exit(code);
+                }
+                Err(error) => fail(&format!("cannot start the runtime: {error}")),
+            }
+        }
+        _ => {
+            eprintln!("fastexec: usage: fastexec daemon start|status|stop [--http <addr>]");
+            2
+        }
+    }
+}
+
+/// The address a `--http` flag names, when the command carries one.
+fn http_flag(args: &[std::ffi::OsString]) -> Result<Option<String>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, addr] if flag == "--http" => Ok(Some(addr.to_string_lossy().into_owned())),
+        _ => Err("usage: fastexec daemon start|status|stop [--http <addr>]".to_owned()),
+    }
+}
+
+fn fail(message: &str) -> i32 {
+    eprintln!("fastexec: {message}");
+    1
+}
+
+/// The CLI: one exchange with the namespace's daemon, and what it prints.
+async fn cli(action: &str, http: Option<String>) -> i32 {
+    let launch = match LaunchContext::current() {
+        Ok(launch) => launch,
+        Err(error) => return fail(&format!("cannot read the launch context: {error}")),
+    };
+    let identity = match runtime::identity(&launch) {
+        Ok(identity) => identity,
+        Err(error) => return fail(&format!("cannot identify this image: {error}")),
+    };
+    let paths = match runtime::paths(&identity.namespace) {
+        Ok(paths) => paths,
+        Err(error) => return fail(&format!("cannot use the runtime directory: {error}")),
+    };
+    // One deadline for the whole command, so a daemon that stops answering cannot hold the CLI.
+    let deadline = std::time::Instant::now() + runtime::START_WAIT;
+    match action {
+        "start" => cli_start(&identity, &paths, &launch, deadline, http).await,
+        "status" => cli_status(&identity, &paths, &launch, deadline).await,
+        _ => cli_stop(&identity, &paths, &launch, deadline).await,
+    }
+}
+
+const NO_ANSWER: &str = "the daemon did not answer in time";
+
+/// Runs `work` under what is left of `deadline`.
+async fn within<T>(
+    deadline: std::time::Instant,
+    work: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let left = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| NO_ANSWER.to_owned())?;
+    match tokio::time::timeout(left, work).await {
+        Ok(result) => result,
+        Err(_) => Err(NO_ANSWER.to_owned()),
+    }
+}
+
+async fn cli_start(
+    identity: &runtime::Identity,
+    paths: &runtime::Paths,
+    launch: &LaunchContext,
+    deadline: std::time::Instant,
+    http: Option<String>,
+) -> i32 {
+    // A start that cannot serve HTTP is refused before anything runs, so it leaves no daemon
+    // behind that the caller did not ask for.
+    let mut extra: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(value) = &http {
+        if let Err(message) = http_addr(value) {
+            return fail(&message);
+        }
+        if let Err(message) = http_token() {
+            return fail(&message);
+        }
+        extra.push("--http".into());
+        extra.push(value.into());
+    }
+    let (mut client, lock) =
+        match runtime::connect_or_start(identity, paths, deadline, &extra).await {
+            Ok(pair) => pair,
+            Err(message) => return fail(&message),
+        };
+    let hello = match hello(identity, launch) {
+        Ok(hello) => hello,
+        Err(message) => return fail(&message),
+    };
+    let epoch = match within(deadline, endpoint::handshake(&mut client, hello, identity)).await {
+        Ok(epoch) => epoch,
+        Err(message) => return fail(&message),
+    };
+    // The Welcome arrived, so the start no longer needs to be exclusive.
+    drop(lock);
+    let status = match within(deadline, request_status(&mut client)).await {
+        Ok(status) => status,
+        Err(message) => return fail(&message),
+    };
+    // A daemon that was already running keeps the answer it had: one that serves HTTP is used as
+    // it is, and one that does not cannot be turned into one without a stop.
+    if http.is_some() && status.http.is_none() {
+        return fail(&format!(
+            "a daemon already runs for this namespace (epoch {epoch}, HTTP off); stop it first"
+        ));
+    }
+    if let Err(message) = within(deadline, bye(&mut client)).await {
+        return fail(&message);
+    }
+    match &status.http {
+        Some(addr) => println!(
+            "fastexec daemon {epoch} pid {} namespace {} http {addr}",
+            status.pid, identity.namespace
+        ),
+        None => println!(
+            "fastexec daemon {epoch} pid {} namespace {}",
+            status.pid, identity.namespace
+        ),
+    }
+    0
+}
+
+async fn cli_status(
+    identity: &runtime::Identity,
+    paths: &runtime::Paths,
+    launch: &LaunchContext,
+    deadline: std::time::Instant,
+) -> i32 {
+    let mut client = match connect_existing(paths).await {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            println!("No fastexec daemon for namespace {}.", identity.namespace);
+            return 0;
+        }
+        Err(message) => return fail(&message),
+    };
+    let status = match within(deadline, async {
+        let hello = hello(identity, launch)?;
+        endpoint::handshake(&mut client, hello, identity).await?;
+        request_status(&mut client).await
+    })
+    .await
+    {
+        Ok(status) => status,
+        Err(message) => return fail(&message),
+    };
+    if let Err(message) = within(deadline, bye(&mut client)).await {
+        return fail(&message);
+    }
+    println!("epoch {}", status.epoch);
+    println!("build {}", status.build);
+    println!("pid {}", status.pid);
+    println!("sessions {}", status.sessions);
+    println!("tasks {}", status.tasks);
+    match &status.http {
+        Some(addr) => println!("http {addr}"),
+        None => println!("http off"),
+    }
+    0
+}
+
+async fn cli_stop(
+    identity: &runtime::Identity,
+    paths: &runtime::Paths,
+    launch: &LaunchContext,
+    deadline: std::time::Instant,
+) -> i32 {
+    let mut client = match connect_existing(paths).await {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            println!("No fastexec daemon for namespace {}.", identity.namespace);
+            return 0;
+        }
+        Err(message) => return fail(&message),
+    };
+    let epoch = match within(deadline, async {
+        let hello = hello(identity, launch)?;
+        let epoch = endpoint::handshake(&mut client, hello, identity).await?;
+        ipc::write_frame(&mut client, &ToDaemon::Stop)
+            .await
+            .map_err(|error| format!("cannot send Stop: {error}"))?;
+        // The daemon ends every connection and exits, so this one ends too.
+        read_to_end(&mut client).await?;
+        Ok(epoch)
+    })
+    .await
+    {
+        Ok(epoch) => epoch,
+        Err(message) => return fail(&message),
+    };
+    if !wait_for_exit(paths, deadline).await {
+        return fail(&format!(
+            "the daemon did not exit; see {}",
+            paths.ns.join("daemon.log").display()
+        ));
+    }
+    println!("Stopped fastexec daemon {epoch}.");
+    0
+}
+
+/// Connects to the namespace's daemon without starting one. `Ok(None)` means none is there.
+async fn connect_existing(paths: &runtime::Paths) -> Result<Option<transport::Client>, String> {
+    match transport::connect(&paths.endpoint).await {
+        Ok(client) => Ok(Some(client)),
+        // Nothing listening is an answer, not a failure; anything else is reported as it is.
+        Err(error) if runtime::absent(&error) => Ok(None),
+        Err(error) => Err(format!(
+            "cannot connect to {}: {error}",
+            std::path::Path::new(&paths.endpoint).display()
+        )),
+    }
+}
+
+/// The Hello a CLI command sends: a session of its own, one connection, and the launch context.
+fn hello(identity: &runtime::Identity, launch: &LaunchContext) -> Result<ToDaemon, String> {
+    let session =
+        tasks::random_chars(26).map_err(|error| format!("cannot name the session: {error}"))?;
+    let (cwd, env) = launch.to_wire();
+    Ok(ToDaemon::Hello {
+        protocol: ipc::PROTOCOL,
+        namespace: identity.namespace.clone(),
+        build: identity.build.clone(),
+        session,
+        connection: 1,
+        client_name: "cli".to_owned(),
+        output_mode: "text".to_owned(),
+        structured_content: true,
+        cwd,
+        env,
+    })
+}
+
+/// Says Bye and reads until the daemon ends the connection, so the session is gone before the CLI
+/// exits.
+async fn bye(client: &mut transport::Client) -> Result<(), String> {
+    ipc::write_frame(client, &ToDaemon::Bye)
+        .await
+        .map_err(|error| format!("cannot send Bye: {error}"))?;
+    read_to_end(client).await
+}
+
+async fn read_to_end(client: &mut transport::Client) -> Result<(), String> {
+    loop {
+        match ipc::read_frame::<_, ToEndpoint>(client, ipc::RESPONSE_LIMIT).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(format!("cannot read the daemon's answer: {error}")),
+        }
+    }
+}
+
+/// The daemon's state, as `Status` reports it.
+struct DaemonStatus {
+    epoch: String,
+    build: String,
+    pid: u32,
+    sessions: usize,
+    tasks: usize,
+    /// The address it serves Streamable HTTP on, when it serves it.
+    http: Option<String>,
+}
+
+/// Asks the daemon for its state, after the Welcome.
+async fn request_status(client: &mut transport::Client) -> Result<DaemonStatus, String> {
+    ipc::write_frame(client, &ToDaemon::Status)
+        .await
+        .map_err(|error| format!("cannot send Status: {error}"))?;
+    match ipc::read_frame::<_, ToEndpoint>(client, ipc::RESPONSE_LIMIT).await {
+        Ok(Some(ToEndpoint::Status {
+            epoch,
+            build,
+            pid,
+            sessions,
+            tasks,
+            http,
+        })) => Ok(DaemonStatus {
+            epoch,
+            build,
+            pid,
+            sessions,
+            tasks,
+            http,
+        }),
+        Ok(other) => Err(format!("the daemon answered Status with {other:?}")),
+        Err(error) => Err(format!("cannot read Status: {error}")),
+    }
+}
+
+async fn wait_for_exit(paths: &runtime::Paths, deadline: std::time::Instant) -> bool {
+    let path = paths.ns.join(runtime::DAEMON_LOCK);
+    while std::time::Instant::now() < deadline {
+        if matches!(runtime::Lock::try_lock(&path), Ok(Some(_))) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// The output mode `FASTEXEC_OUTPUT_MODE` names, or the message saying what it held instead.
+pub fn output_mode() -> Result<service::OutputMode, String> {
+    match std::env::var("FASTEXEC_OUTPUT_MODE").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("text") => Ok(service::OutputMode::Text),
+        Ok("both") => Ok(service::OutputMode::Both),
+        Ok("structured") => Ok(service::OutputMode::Structured),
+        value => Err(format!(
+            "invalid FASTEXEC_OUTPUT_MODE {value:?}; expected text, both, or structured"
+        )),
+    }
+}
+
+/// What `FASTEXEC_STRUCTURED_CONTENT` asks for, or the message saying what it held instead.
+pub fn structured_content() -> Result<bool, String> {
+    match std::env::var("FASTEXEC_STRUCTURED_CONTENT").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("true") => Ok(true),
+        Ok("false") => Ok(false),
+        value => Err(format!(
+            "invalid FASTEXEC_STRUCTURED_CONTENT {value:?}; expected true or false"
+        )),
+    }
+}
+
+/// How this process renders results: both settings, or the message naming the one that is wrong.
+pub fn render() -> Result<Render, String> {
+    Ok(Render {
+        output_mode: output_mode()?,
+        structured_content: structured_content()?,
+    })
+}
+
+/// The token a `--http` daemon admits requests with: at least 16 visible ASCII characters, from
+/// the environment. A token an `Authorization` header cannot carry exactly is refused here rather
+/// than starting a daemon nobody can reach.
+pub fn http_token() -> Result<String, String> {
+    const MESSAGE: &str = "FASTEXEC_HTTP_TOKEN must be at least 16 visible ASCII characters";
+    match std::env::var("FASTEXEC_HTTP_TOKEN") {
+        Ok(token)
+            if token.len() >= 16 && token.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) =>
+        {
+            Ok(token)
+        }
+        Ok(_) | Err(_) => Err(MESSAGE.to_owned()),
+    }
+}
+
+/// The address a `--http` argument names, refused when it is outside loopback and serving there
+/// was not allowed.
+pub fn http_addr(value: &str) -> Result<std::net::SocketAddr, String> {
+    let addr: std::net::SocketAddr = value
+        .parse()
+        .map_err(|_| format!("--http {value} is not an address (host:port)"))?;
+    if !addr.ip().is_loopback() && !http::remote_allowed() {
+        return Err(format!(
+            "--http {value} is not a loopback address; set FASTEXEC_HTTP_ALLOW_REMOTE=1 only behind a TLS-terminating proxy"
+        ));
+    }
+    Ok(addr)
 }
 
 #[tokio::main]
 async fn serve() {
-    let output_mode = match std::env::var("FASTEXEC_OUTPUT_MODE").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("text") => OutputMode::Text,
-        Ok("both") => OutputMode::Both,
-        Ok("structured") => OutputMode::Structured,
-        value => {
-            eprintln!(
-                "fastexec: invalid FASTEXEC_OUTPUT_MODE {value:?}; expected text, both, or structured"
-            );
+    let render = match render() {
+        Ok(render) => render,
+        Err(message) => {
+            eprintln!("fastexec: {message}");
             std::process::exit(1);
         }
     };
-    let structured_content = match std::env::var("FASTEXEC_STRUCTURED_CONTENT").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("true") => true,
-        Ok("false") => false,
-        value => {
-            eprintln!(
-                "fastexec: invalid FASTEXEC_STRUCTURED_CONTENT {value:?}; expected true or false"
-            );
-            std::process::exit(1);
-        }
-    };
-    let tasks = match Tasks::new() {
-        Ok(tasks) => tasks,
+    // Captured once, at startup: the client's own environment is the server's own here.
+    let launch = match LaunchContext::current() {
+        Ok(launch) => Arc::new(launch),
         Err(error) => {
-            eprintln!("fastexec: cannot create the log directory: {error}");
+            eprintln!("fastexec: cannot read the launch context: {error}");
             std::process::exit(1);
         }
     };
-    let server = Server {
-        tasks: Arc::clone(&tasks),
-        output_mode: if structured_content {
-            output_mode
-        } else {
-            OutputMode::Text
-        },
-        structured_content,
+    // `on` forwards every call to the namespace's daemon and keeps no tasks of its own.
+    let daemon = match std::env::var("FASTEXEC_DAEMON") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "off" => false,
+        Ok(value) if value == "on" => true,
+        Ok(value) => {
+            eprintln!("fastexec: invalid FASTEXEC_DAEMON {value:?}; expected on or off");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("fastexec: invalid FASTEXEC_DAEMON {error}; expected on or off");
+            std::process::exit(1);
+        }
     };
+    let (backend, tasks) = if daemon {
+        let endpoint = match endpoint::Endpoint::new(Arc::clone(&launch), render) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                eprintln!("fastexec: cannot name this endpoint's session: {error}");
+                std::process::exit(1);
+            }
+        };
+        (Backend::Daemon(Arc::new(endpoint)), None)
+    } else {
+        let tasks = match Tasks::new(Limits::OFF) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                eprintln!("fastexec: cannot create the log directory: {error}");
+                std::process::exit(1);
+            }
+        };
+        let backend = Backend::Local {
+            service: Arc::new(Service::new(Arc::clone(&tasks), false)),
+            render,
+            session: Arc::new(OnceLock::new()),
+            launch,
+            instructions: INSTRUCTIONS_LOCAL,
+        };
+        (backend, Some(tasks))
+    };
+    let server = Server { backend };
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
         inner: tokio::io::stdin(),
@@ -1146,6 +714,8 @@ async fn serve() {
     // Signals are watched from the start, so an exit during initialization still cleans up.
     let signal = shutdown_signal();
     tokio::pin!(signal);
+    // The backend outlives the serve call, which consumes the handler.
+    let backend = server.backend.clone();
     let served = tokio::select! {
         served = server.serve((stdin, tokio::io::stdout())) => Some(served),
         _ = &mut signal => None,
@@ -1162,7 +732,16 @@ async fn serve() {
         Some(Err(error)) => eprintln!("fastexec: MCP initialization failed: {error}"),
         None => {}
     }
-    tasks.shutdown();
+    match &backend {
+        // The endpoint never kills tasks: they belong to the daemon, and other sessions may be
+        // using them.
+        Backend::Daemon(endpoint) => endpoint.bye().await,
+        Backend::Local { .. } => {
+            if let Some(tasks) = tasks {
+                tasks.shutdown();
+            }
+        }
+    }
     std::process::exit(0);
 }
 
