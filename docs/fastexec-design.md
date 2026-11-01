@@ -227,8 +227,11 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
   cursors, and a reconnect keeps them. A session with no live connection is
   dropped after `10` minutes, and the table holds at most `256` sessions. The
   endpoint says `Bye` when its stdin closes, which drops the session at once.
-- **Lifetimes**: The daemon exits after `10` minutes with no connections and no
-  tasks, and never exits idle while it serves HTTP. `fastexec daemon stop` kills
+- **Lifetimes**: The daemon does not exit idle by default. Starting it with
+  `--idle-exit on` enables exit after `10` minutes with no connections and an
+  empty task registry (finished tasks stay for up to `24` hours). `--idle-exit off`
+  explicitly disables it. HTTP daemons never exit idle, even with `--idle-exit on`.
+  `fastexec daemon stop` kills
   every task and exits. A daemon crash ends its tasks, through the Windows Job
   or the Linux task host, and a task ID from a dead daemon answers as coming
   from an earlier daemon.
@@ -237,11 +240,12 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
   fails naming `fastexec daemon start` from a terminal outside the host. A host
   that confines its children to a cgroup, such as a systemd scope or a
   container, ends the daemon with it.
-- **CLI**: `fastexec daemon start [--http <addr>]` starts the daemon detached
+- **CLI**: `fastexec daemon start [--http <addr>] [--idle-exit on|off]` starts the daemon detached
   from the calling terminal and prints its epoch, PID, namespace, and HTTP
   address. `status` prints epoch, build, PID, sessions, tasks, and the HTTP
   address or `off`; `stop` prints the stopped epoch. `status` and `stop` never
-  start a daemon, and `stop` without one exits `0`.
+  start a daemon, and `stop` without one exits `0`. Start flags only apply to a
+  new daemon; stop the existing one before changing its idle-exit policy.
 - **HTTP**: `--http <addr>` with `FASTEXEC_HTTP_TOKEN`, at least `16` visible
   ASCII characters, serves the same tool over Streamable HTTP. The address is
   loopback unless `FASTEXEC_HTTP_ALLOW_REMOTE=1`, which belongs behind a

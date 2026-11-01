@@ -97,6 +97,12 @@ one, and different builds never share one. `fastexec daemon start|status|stop`
 starts it, reports its epoch, build, PID, sessions, tasks, and HTTP address, and
 stops it; `status` and `stop` never start one.
 
+Daemons stay running when idle by default. `fastexec daemon start --idle-exit on`
+enables exit after 10 minutes with no connections and an empty task registry;
+`--idle-exit off` explicitly keeps the default. Finished tasks remain in the
+registry for up to 24 hours. These options apply only when starting a new daemon;
+stop an existing daemon before changing its policy. HTTP daemons never exit idle.
+
 A host that keeps its children in a Job without breakaway, such as a fastexec
 task, cannot start the daemon: run `fastexec daemon start` from a terminal.
 

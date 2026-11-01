@@ -64,7 +64,7 @@ impl Default for Config {
             write_stall: WRITE_STALL,
             tick: TICK,
             idle_after: IDLE_AFTER,
-            idle_exit: true,
+            idle_exit: false,
         }
     }
 }
@@ -1001,7 +1001,12 @@ const DAEMON_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// Runs the daemon for `namespace` in this process: the hidden `daemon serve` subcommand.
 /// Returns the exit code.
-pub fn serve_process(namespace: String, build: String, http: Option<String>) -> i32 {
+pub fn serve_process(
+    namespace: String,
+    build: String,
+    http: Option<String>,
+    idle_exit: bool,
+) -> i32 {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -1009,10 +1014,15 @@ pub fn serve_process(namespace: String, build: String, http: Option<String>) -> 
             return 1;
         }
     };
-    runtime.block_on(serve_daemon(namespace, build, http))
+    runtime.block_on(serve_daemon(namespace, build, http, idle_exit))
 }
 
-async fn serve_daemon(namespace: String, build: String, http: Option<String>) -> i32 {
+async fn serve_daemon(
+    namespace: String,
+    build: String,
+    http: Option<String>,
+    idle_exit: bool,
+) -> i32 {
     let actual = match runtime::build_id() {
         Ok(actual) => actual,
         Err(error) => {
@@ -1116,7 +1126,14 @@ async fn serve_daemon(namespace: String, build: String, http: Option<String>) ->
                 },
             )
         }
-        None => (None, None, Config::default()),
+        None => (
+            None,
+            None,
+            Config {
+                idle_exit,
+                ..Config::default()
+            },
+        ),
     };
     // The daemon leaves the directory it was started from: a Windows process holds that directory
     // open for its whole life, and a starter's checkout must stay removable.
@@ -2054,6 +2071,7 @@ mod tests {
         let fixture = fixture_with_config(Config {
             tick: Duration::from_millis(50),
             idle_after: Duration::from_millis(200),
+            idle_exit: true,
             ..Config::default()
         });
         let daemon = Arc::clone(&fixture.daemon);
@@ -2081,11 +2099,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_daemon_that_does_not_exit_on_idleness_runs_until_it_is_stopped() {
+    async fn a_default_daemon_runs_until_it_is_stopped() {
         let fixture = fixture_with_config(Config {
             tick: Duration::from_millis(50),
             idle_after: Duration::from_millis(100),
-            idle_exit: false,
             ..Config::default()
         });
         let daemon = Arc::clone(&fixture.daemon);
@@ -2147,6 +2164,7 @@ mod tests {
     async fn admitting_a_connection_restarts_the_idle_interval() {
         let fixture = fixture_with_config(Config {
             idle_after: Duration::from_millis(200),
+            idle_exit: true,
             ..Config::default()
         });
         let daemon = &fixture.daemon;

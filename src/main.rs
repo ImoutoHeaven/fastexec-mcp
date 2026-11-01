@@ -254,33 +254,32 @@ fn daemon_main(args: &[std::ffi::OsString]) -> i32 {
         "serve" => {
             let (Some(namespace), Some(build)) = (args.get(1), args.get(2)) else {
                 eprintln!(
-                    "fastexec: usage: fastexec daemon serve <namespace> <build> [--http <addr>]"
+                    "fastexec: usage: fastexec daemon serve <namespace> <build> [--http <addr>] [--idle-exit on|off]"
                 );
                 return 2;
             };
-            let http = match http_flag(&args[3..]) {
-                Ok(http) => http,
+            let flags = match daemon_flags(&args[3..]) {
+                Ok(flags) => flags,
                 Err(message) => return fail(&message),
             };
             daemon::serve_process(
                 namespace.to_string_lossy().into_owned(),
                 build.to_string_lossy().into_owned(),
-                http,
+                flags.http,
+                flags.idle_exit.unwrap_or_default(),
             )
         }
         "start" | "status" | "stop" => {
-            let http = match http_flag(&args[1..]) {
-                Ok(http) => http,
+            let flags = match daemon_flags(&args[1..]) {
+                Ok(flags) => flags,
                 Err(message) => return fail(&message),
             };
-            // Only a start serves HTTP; a status or stop that named an address meant something
-            // else.
-            if http.is_some() && action != "start" {
-                return fail("usage: fastexec daemon start|status|stop [--http <addr>]");
+            if (flags.http.is_some() || flags.idle_exit.is_some()) && action != "start" {
+                return fail(DAEMON_USAGE);
             }
             match tokio::runtime::Runtime::new() {
                 Ok(runtime) => {
-                    let code = runtime.block_on(cli(&action, http));
+                    let code = runtime.block_on(cli(&action, flags));
                     // Exit here rather than through the runtime's drop, which would wait for a
                     // start worker the deadline abandoned.
                     std::process::exit(code);
@@ -289,18 +288,85 @@ fn daemon_main(args: &[std::ffi::OsString]) -> i32 {
             }
         }
         _ => {
-            eprintln!("fastexec: usage: fastexec daemon start|status|stop [--http <addr>]");
+            eprintln!("fastexec: {DAEMON_USAGE}");
             2
         }
     }
 }
 
-/// The address a `--http` flag names, when the command carries one.
-fn http_flag(args: &[std::ffi::OsString]) -> Result<Option<String>, String> {
-    match args {
-        [] => Ok(None),
-        [flag, addr] if flag == "--http" => Ok(Some(addr.to_string_lossy().into_owned())),
-        _ => Err("usage: fastexec daemon start|status|stop [--http <addr>]".to_owned()),
+const DAEMON_USAGE: &str =
+    "usage: fastexec daemon start [--http <addr>] [--idle-exit on|off] | status | stop";
+
+#[derive(Default)]
+struct DaemonFlags {
+    http: Option<String>,
+    idle_exit: Option<bool>,
+}
+
+fn daemon_flags(args: &[std::ffi::OsString]) -> Result<DaemonFlags, String> {
+    let mut flags = DaemonFlags::default();
+    let mut pairs = args.chunks_exact(2);
+    for pair in &mut pairs {
+        if pair[0] == "--http" && flags.http.is_none() {
+            flags.http = Some(pair[1].to_string_lossy().into_owned());
+        } else if pair[0] == "--idle-exit" && flags.idle_exit.is_none() {
+            flags.idle_exit = Some(match pair[1].to_str() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => return Err("--idle-exit must be on or off".to_owned()),
+            });
+        } else {
+            return Err(DAEMON_USAGE.to_owned());
+        }
+    }
+    if !pairs.remainder().is_empty() {
+        return Err(DAEMON_USAGE.to_owned());
+    }
+    Ok(flags)
+}
+
+#[cfg(test)]
+mod daemon_flag_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<DaemonFlags, String> {
+        daemon_flags(
+            &args
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn idle_exit_is_opt_in_and_combines_with_http_in_either_order() {
+        assert!(!parse(&[]).unwrap().idle_exit.unwrap_or_default());
+        assert_eq!(
+            parse(&["--idle-exit", "off"]).unwrap().idle_exit,
+            Some(false)
+        );
+        assert_eq!(parse(&["--idle-exit", "on"]).unwrap().idle_exit, Some(true));
+        for args in [
+            ["--http", "127.0.0.1:0", "--idle-exit", "on"],
+            ["--idle-exit", "on", "--http", "127.0.0.1:0"],
+        ] {
+            let flags = parse(&args).unwrap();
+            assert_eq!(flags.http.as_deref(), Some("127.0.0.1:0"));
+            assert_eq!(flags.idle_exit, Some(true));
+        }
+    }
+
+    #[test]
+    fn malformed_or_repeated_daemon_flags_are_rejected() {
+        for args in [
+            vec!["--idle-exit"],
+            vec!["--idle-exit", "true"],
+            vec!["--idle-exit", "on", "--idle-exit", "off"],
+            vec!["--http", "127.0.0.1:0", "--http", "127.0.0.1:1"],
+            vec!["--unknown", "off"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
     }
 }
 
@@ -310,7 +376,7 @@ fn fail(message: &str) -> i32 {
 }
 
 /// The CLI: one exchange with the namespace's daemon, and what it prints.
-async fn cli(action: &str, http: Option<String>) -> i32 {
+async fn cli(action: &str, flags: DaemonFlags) -> i32 {
     let launch = match LaunchContext::current() {
         Ok(launch) => launch,
         Err(error) => return fail(&format!("cannot read the launch context: {error}")),
@@ -326,7 +392,7 @@ async fn cli(action: &str, http: Option<String>) -> i32 {
     // One deadline for the whole command, so a daemon that stops answering cannot hold the CLI.
     let deadline = std::time::Instant::now() + runtime::START_WAIT;
     match action {
-        "start" => cli_start(&identity, &paths, &launch, deadline, http).await,
+        "start" => cli_start(&identity, &paths, &launch, deadline, flags).await,
         "status" => cli_status(&identity, &paths, &launch, deadline).await,
         _ => cli_stop(&identity, &paths, &launch, deadline).await,
     }
@@ -354,12 +420,12 @@ async fn cli_start(
     paths: &runtime::Paths,
     launch: &LaunchContext,
     deadline: std::time::Instant,
-    http: Option<String>,
+    flags: DaemonFlags,
 ) -> i32 {
     // A start that cannot serve HTTP is refused before anything runs, so it leaves no daemon
     // behind that the caller did not ask for.
     let mut extra: Vec<std::ffi::OsString> = Vec::new();
-    if let Some(value) = &http {
+    if let Some(value) = &flags.http {
         if let Err(message) = http_addr(value) {
             return fail(&message);
         }
@@ -368,6 +434,10 @@ async fn cli_start(
         }
         extra.push("--http".into());
         extra.push(value.into());
+    }
+    if let Some(idle_exit) = flags.idle_exit {
+        extra.push("--idle-exit".into());
+        extra.push(if idle_exit { "on" } else { "off" }.into());
     }
     let (mut client, lock) =
         match runtime::connect_or_start(identity, paths, deadline, &extra).await {
@@ -390,7 +460,7 @@ async fn cli_start(
     };
     // A daemon that was already running keeps the answer it had: one that serves HTTP is used as
     // it is, and one that does not cannot be turned into one without a stop.
-    if http.is_some() && status.http.is_none() {
+    if flags.http.is_some() && status.http.is_none() {
         return fail(&format!(
             "a daemon already runs for this namespace (epoch {epoch}, HTTP off); stop it first"
         ));
