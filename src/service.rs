@@ -1106,7 +1106,7 @@ impl Service {
             output::cut_to(&mut status, budget);
             view.max_bytes - status.len() - 2 - footer.len()
         };
-        let (output, cut_lines) = window.fit(room);
+        let (output, cut_lines, omitted) = window.fit(room);
         // A small maxBytes may leave no room for the placeholder.
         let body = if output.is_empty() {
             if empty.len() <= room { empty } else { "" }
@@ -1118,7 +1118,7 @@ impl Service {
         } else {
             format!("{body}\n\n{status}{footer}")
         };
-        add_window(structured, window);
+        add_window(structured, window, omitted);
         if render.output_mode != OutputMode::Text {
             structured["output"] = json!(output);
         }
@@ -1327,10 +1327,9 @@ fn members_json(members: &[process::Member]) -> Value {
     )
 }
 
-fn add_window(value: &mut Value, window: &Window) {
-    let omitted = window.omitted.map_or(0, |(first, last)| last - first + 1);
-    value["omittedLines"] = json!(omitted);
-    value["omittedRange"] = json!(window.omitted.map(|(first, last)| [first, last]));
+fn add_window(value: &mut Value, window: &Window, omitted: Option<(u64, u64)>) {
+    value["omittedLines"] = json!(omitted.map_or(0, |(first, last)| last - first + 1));
+    value["omittedRange"] = json!(omitted.map(|(first, last)| [first, last]));
     value["encodingErrors"] = json!(window.bad_lines);
 }
 

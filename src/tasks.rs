@@ -588,13 +588,14 @@ impl Tasks {
             let ender = Arc::clone(&waiter_task);
             std::thread::spawn(move || {
                 child.wait_tree(&ender.tree);
+                // Kept children can still read after the root exits; close input at tree end.
+                *lock(&ender.input) = None;
                 drop(child);
                 let _ = std::fs::remove_file(&script_path);
                 let _ = ender.tree_ended_at.set(Instant::now());
                 ender.tree_done.send_replace(true);
             });
             let output_open = drain(&waiter_task, &eof_rx, kept);
-            *lock(&waiter_task.input) = None;
             *lock(&waiter_task.end) = Some(Final {
                 exit_code,
                 killed,

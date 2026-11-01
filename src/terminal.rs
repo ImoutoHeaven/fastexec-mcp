@@ -406,6 +406,8 @@ struct Recorder {
     /// A line whose first rows left the screen while its last one wraps onto it, and the mark
     /// of its first row.
     partial: Option<(String, Option<char>)>,
+    /// The screen row where the partial logical line continues.
+    partial_row: usize,
     /// The text of the lines written out while on screen, by the mark on their first row.
     marked: HashMap<char, String>,
     /// Marks issued.
@@ -429,6 +431,7 @@ impl Recorder {
             drawn: 0,
             frame: Vec::new(),
             partial: None,
+            partial_row: 0,
             marked: HashMap::new(),
             marks: 0,
             after_session: false,
@@ -530,11 +533,18 @@ impl Recorder {
             })
             .collect();
         self.term.grid_mut().clear_history();
+        self.write_rows(rows, 0);
+    }
+
+    /// Writes normal-screen rows using the same logical-line and reprint rules, whether they
+    /// entered emulator history or left a partial scroll region without entering it.
+    fn write_rows(&mut self, rows: Vec<(String, bool, Option<char>)>, continuation: usize) {
         for (text, wraps, mark) in rows {
             let (mut line, mark) = self.partial.take().unwrap_or((String::new(), mark));
             line.push_str(&text);
             if wraps && line.len() < LINE_LIMIT {
                 self.partial = Some((line, mark));
+                self.partial_row = continuation;
                 continue;
             }
             if !wraps {
@@ -552,24 +562,25 @@ impl Recorder {
         let grid = self.term.grid();
         let last_text = (0..grid.screen_lines())
             .rev()
-            .find(|&line| !blank(&row_text(&grid[Line(line as i32)])));
+            .find(|&line| !blank(&row_text(&grid[Line(line as i32)])))
+            .into_iter()
+            .chain(self.partial.as_ref().map(|_| self.partial_row))
+            .max();
         let mut lines = Vec::new();
         let Some(last_text) = last_text else {
-            if let Some((text, mark)) = &self.partial {
-                lines.push(ScreenLine {
-                    text: text.trim_end().to_string(),
-                    left: text.len(),
-                    mark: *mark,
-                    row: 0,
-                    row_mark: None,
-                });
-            }
             return lines;
         };
-        let (mut text, mut mark) = self.partial.clone().unwrap_or_default();
-        let mut left = text.len();
+        let (mut text, mut mark) = (String::new(), None);
+        let mut left = 0;
         let mut start = 0;
         for line in 0..=last_text {
+            if line == self.partial_row {
+                if let Some((prefix, prefix_mark)) = &self.partial {
+                    text.push_str(prefix);
+                    mark = *prefix_mark;
+                    left = prefix.len();
+                }
+            }
             let row = &grid[Line(line as i32)];
             if text.is_empty() && left == 0 {
                 mark = row_mark(row);
@@ -601,6 +612,18 @@ impl Recorder {
     fn write_screen(&mut self) {
         let lines = self.screen_lines();
         self.partial = None;
+        self.write_screen_lines(lines);
+    }
+
+    /// Settles the partial line before an unrelated scroll can move its continuation.
+    fn flush_partial(&mut self) {
+        if let Some(line) = self.screen_lines().into_iter().find(|line| line.left != 0) {
+            self.partial = None;
+            self.write_screen_lines(vec![line]);
+        }
+    }
+
+    fn write_screen_lines(&mut self, lines: Vec<ScreenLine>) {
         for line in lines {
             if !self.already_written(&line) {
                 self.write_checked(line.text.clone());
@@ -692,6 +715,20 @@ impl Recorder {
     /// Rows `top..end` scroll by `n` rows.
     fn shift(&mut self, top: usize, end: usize, n: usize, up: bool) {
         if !self.alternate() {
+            if self.partial.is_some() && (!up || self.partial_row != top) {
+                self.flush_partial();
+            }
+            // Only a region starting at row zero enters alacritty's scrollback.
+            if up && top != 0 {
+                let grid = self.term.grid();
+                let rows = (top..top + n.min(end.saturating_sub(top)))
+                    .map(|line| {
+                        let row = &grid[Line(line as i32)];
+                        (row_text(row), wraps(grid, row), row_mark(row))
+                    })
+                    .collect();
+                self.write_rows(rows, top);
+            }
             return;
         }
         // Rows written since the last frame show before they move: a frame of the screen, read
@@ -852,6 +889,9 @@ impl Handler for Recorder {
     // match a reprint against the lines written out.
     fn clear_screen(&mut self, mode: ClearMode) {
         self.present();
+        if !self.alternate() && self.partial.is_some() && self.partial_row != 0 {
+            self.flush_partial();
+        }
         if matches!(mode, ClearMode::Saved) && !self.alternate() {
             for line in self.reprint.release() {
                 self.write_normal(&line);
@@ -1018,12 +1058,12 @@ fn frame_rows(grid: &Grid<Cell>) -> Vec<FrameRow> {
 
 fn frame_row(grid: &Grid<Cell>, line: usize) -> FrameRow {
     let row = &grid[Line(line as i32)];
+    let wraps = wraps(grid, row);
     let mut text = row_text(row);
-    text.truncate(text.trim_end().len());
-    FrameRow {
-        text,
-        wraps: wraps(grid, row),
+    if !wraps {
+        text.truncate(text.trim_end().len());
     }
+    FrameRow { text, wraps }
 }
 
 /// The terminal wrapped the row onto the next one.
@@ -1107,6 +1147,62 @@ mod tests {
 
     fn render_text(log: &[u8]) -> String {
         record(log, &[], true)
+    }
+
+    #[test]
+    fn soft_wrapped_transcript_keeps_spaces_inside_logical_lines() {
+        for prefix in ["", "\x1b[?1049h"] {
+            for line in [format!("{} next", "a".repeat(119)), "token".repeat(30)] {
+                let text = render_text(format!("{prefix}{line}").as_bytes());
+                let lines: Vec<_> = text
+                    .lines()
+                    .filter(|line| *line != ALTERNATE_MARKER)
+                    .collect();
+                assert_eq!(lines, [line.as_str()]);
+            }
+        }
+    }
+
+    #[test]
+    fn normal_partial_scrolls_preserve_the_rows_that_leave_once() {
+        for log in [
+            "\x1b[2;4r\x1b[2;1Halpha\r\nbeta\r\ngamma\r\ndelta\r\nepsilon".to_string(),
+            "\x1b[1;3ralpha\r\nbeta\r\ngamma\r\ndelta\r\nepsilon".to_string(),
+            "\x1b[2;4r\x1b[2;1Halpha\r\nbeta\r\ngamma\x1b[2S\x1b[3;1Hdelta\r\nepsilon".to_string(),
+            "\x1b[2;4r\x1b[2;1Halpha\r\nbeta\r\ngamma\x1b[2;1H\x1b[2M\x1b[3;1Hdelta\r\nepsilon"
+                .to_string(),
+        ] {
+            let text = render_text(log.as_bytes());
+            let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
+            assert_eq!(lines, ["alpha", "beta", "gamma", "delta", "epsilon"]);
+        }
+        let line = format!("{} next", "a".repeat(119));
+        for (suffix, expected) in [
+            ("\r\n", vec![line.as_str()]),
+            ("\r\nlast", vec![line.as_str(), "last"]),
+            ("\r\nlast\r\nend", vec![line.as_str(), "last", "end"]),
+            ("\r\n\x1b[2J\x1b[Hafter", vec![line.as_str(), "after"]),
+            (
+                "\r\n\x1b[3;5r\x1b[3;1Hp\r\nq\r\nr\r\ns",
+                vec![line.as_str(), "p", "q", "r", "s"],
+            ),
+        ] {
+            let log = format!("\x1b[2;3r\x1b[2;1H{line}{suffix}");
+            let text = render_text(log.as_bytes());
+            let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
+            assert_eq!(lines, expected);
+        }
+
+        let log = b"\x1b[2;4r\x1b[2;1Halpha\r\nbeta\r\ngamma\x1b[?1049h\x1b[Hinside\x1b[?1049l\r\ndelta\r\nepsilon";
+        let text = render_text(log);
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|line| !matches!(*line, "" | ALTERNATE_MARKER | NORMAL_MARKER))
+            .collect();
+        assert_eq!(
+            lines,
+            ["alpha", "beta", "gamma", "inside", "delta", "epsilon"]
+        );
     }
 
     #[test]

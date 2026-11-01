@@ -696,6 +696,40 @@ fn a_hundred_byte_result_keeps_the_whole_task_id() {
 }
 
 #[test]
+fn tiny_stream_and_transcript_windows_keep_requested_ends_and_truthful_omissions() {
+    let mut server = Server::start_with(|command| {
+        command.env("FASTEXEC_OUTPUT_MODE", "both");
+    });
+    for mode in ["head", "tail", "head_tail"] {
+        let (started, text) = server.ok(json!({"action": "start",
+            "command": "for i in {1..50}; do printf 'line%03d\\n' \"$i\"; done",
+            "pty": true, "loginShell": false, "waitMs": 10000,
+            "truncate": mode, "maxBytes": 100}));
+        let (transcript, transcript_text) = server.ok(json!({"action": "transcript",
+            "taskId": started["taskId"], "truncate": mode, "maxBytes": 100}));
+        for (out, text) in [(&started, &text), (&transcript, &transcript_text)] {
+            assert!(text.len() <= 100, "{text}");
+            let body = out["output"].as_str().unwrap();
+            if mode != "tail" {
+                assert!(body.starts_with("line001"), "{mode}: {body}");
+            }
+            if mode != "head" {
+                assert!(body.ends_with("line050"), "{mode}: {body}");
+            }
+            let shown: Vec<u64> = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("line").and_then(|n| n.parse().ok()))
+                .collect();
+            let range = out["omittedRange"].as_array().unwrap();
+            let (first, last) = (range[0].as_u64().unwrap(), range[1].as_u64().unwrap());
+            assert_eq!(out["omittedLines"], 50 - shown.len() as u64, "{out}");
+            assert_eq!(last - first + 1, 50 - shown.len() as u64, "{out}");
+            assert!(shown.iter().all(|n| *n < first || *n > last), "{out}");
+        }
+    }
+}
+
+#[test]
 fn none_truncate_stops_at_its_cap_and_names_the_log() {
     let long = "y".repeat(2000);
     let mut server = Server::start_with(|command| {
@@ -1454,6 +1488,46 @@ fn kill_and_root_exit_end_the_whole_process_tree() {
         assert_eq!(out["keptRunning"], false);
         assert_stops_growing(leaked);
     }
+}
+
+#[test]
+fn kept_pipe_stdin_stays_open_after_root_exit() {
+    kept_stdin_stays_open_after_root_exit(false);
+}
+
+#[test]
+fn kept_pty_stdin_stays_open_after_root_exit() {
+    kept_stdin_stays_open_after_root_exit(true);
+}
+
+fn kept_stdin_stays_open_after_root_exit(pty: bool) {
+    let mut server = Server::start_with(|command| {
+        command.env_remove("FASTEXEC_BASH");
+    });
+    let source = if pty { "/dev/tty" } else { "&0" };
+    let command = format!(
+        "(while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done; echo input-ended) <{source} & echo ready"
+    );
+    let (out, text) = server.ok(json!({"action": "start", "command": command,
+        "pty": pty, "keepTree": true, "loginShell": false, "waitMs": 10000}));
+    assert_eq!(out["state"], "exited", "{text}");
+    assert_eq!(out["keptRunning"], true, "{text}");
+    let id = out["taskId"].clone();
+    let (_, text) = server.ok(json!({"action": "poll", "taskId": id,
+        "input": "after-root\n", "waitMs": 10000,
+        "returnWhen": {"outputContains": ["got:after-root"]}}));
+    assert!(text.contains("got:after-root"), "{text}");
+    let finish = if pty {
+        json!({"action": "poll", "taskId": id, "keys": ["C-d"], "waitMs": 10000})
+    } else {
+        json!({"action": "poll", "taskId": id, "eof": true, "waitMs": 10000})
+    };
+    let (out, text) = server.ok(finish);
+    assert!(text.contains("input-ended"), "{text}");
+    assert_eq!(out["keptRunning"], false, "{text}");
+    let (_, text, failed) = server.call(json!({"action": "poll", "taskId": id,
+        "input": "late\n", "waitMs": 0}));
+    assert!(failed && text.contains("exited"), "{text}");
 }
 
 #[test]

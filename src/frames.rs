@@ -46,8 +46,8 @@ const REFLOW_WORDS: usize = 3;
 /// continues the line or finds it an echo.
 const SETTLE_REACH: usize = CONTINUE_REACH + ECHO_REACH;
 
-/// One screen row: its text without trailing spaces, and whether the terminal wrapped it
-/// onto the next row.
+/// One screen row and whether the terminal wrapped it onto the next row. A wrapped row keeps
+/// its trailing spaces: they belong inside the logical line joined to the next row.
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Row {
     pub text: String,

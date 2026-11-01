@@ -84,8 +84,8 @@ impl Cleaner {
             return (false, Step::SwallowedLf);
         }
         let mut clear = false;
-        if byte == 0x1b && self.escape == EscState::Text && self.pending_cr {
-            // CR then an escape sequence (often ESC[K) starts rewriting the line.
+        if self.escape == EscState::Csi && matches!(byte, b'K' | b'J') && self.pending_cr {
+            // An erase rewrites the line; SGR, OSC and cursor visibility leave its text intact.
             self.pending_cr = false;
             clear = true;
         }
@@ -224,6 +224,7 @@ impl Matcher {
 }
 
 /// One line ready for the window, with its 1-based log line number.
+#[derive(Clone)]
 struct Line {
     number: u64,
     text: String,
@@ -242,8 +243,10 @@ pub struct WindowSpec {
 }
 
 pub struct Window {
-    /// Lines in display order, omission marker included, each with whether it lost text.
-    lines: Vec<(String, bool)>,
+    /// Candidate lines retain their source numbers so final fitting can account for omissions.
+    lines: Vec<Line>,
+    truncate: Truncate,
+    source: &'static str,
     /// Inclusive line range left out of the window.
     pub omitted: Option<(u64, u64)>,
     /// Lines that held byte sequences invalid in the selected encoding.
@@ -253,36 +256,103 @@ pub struct Window {
 }
 
 impl Window {
-    /// Joins the lines within `room` bytes. The line that crosses the limit is cut and later
-    /// lines are left out. Returns the text and how many shown lines lost part of their text.
-    pub fn fit(&self, room: usize) -> (String, u64) {
-        let mut text = String::new();
-        let mut cut_lines = 0;
-        for (index, (line, cut)) in self.lines.iter().enumerate() {
-            if index > 0 {
-                if text.len() >= room {
-                    break;
-                }
-                text.push('\n');
-            }
-            let available = room - text.len();
-            let trimmed = line.len() > available;
-            if trimmed {
-                let mut shown = line.clone();
-                cut_to(&mut shown, available + 1);
-                text.push_str(&shown);
-            } else {
-                text.push_str(line);
-            }
-            if *cut || trimmed {
-                cut_lines += 1;
-            }
-            if trimmed {
-                break;
+    fn marker(&self, omitted: Option<(u64, u64)>) -> String {
+        omitted.map_or(String::new(), |(first, last)| {
+            let count = last - first + 1;
+            format!(
+                "... [{count} lines omitted: {} lines {first}-{last}] ...",
+                self.source
+            )
+        })
+    }
+
+    fn render(&self, marker: &str) -> (String, u64, Option<(u64, u64)>) {
+        let mut lines: Vec<&str> = self.lines.iter().map(|line| line.text.as_str()).collect();
+        if let Some((first, _)) = self.omitted.filter(|_| !marker.is_empty()) {
+            let at = self.lines.partition_point(|line| line.number < first);
+            lines.insert(at, marker);
+        }
+        let cuts = self.lines.iter().filter(|line| line.cut).count() as u64;
+        (lines.join("\n"), cuts, self.omitted)
+    }
+
+    /// Fits the final body using the requested ends, returning its actual omitted range.
+    pub fn fit(&self, room: usize) -> (String, u64, Option<(u64, u64)>) {
+        let full = self.render(&self.marker(self.omitted));
+        if full.0.len() <= room {
+            return full;
+        }
+        let mut cleaner = Cleaner::default();
+        let mut builder = WindowBuilder::new(
+            WindowSpec {
+                truncate: if self.truncate == Truncate::None {
+                    Truncate::Head
+                } else {
+                    self.truncate
+                },
+                budget: 0,
+                raw: true,
+                encoding: encoding_rs::UTF_8,
+                source: self.source,
+            },
+            &mut cleaner,
+            1,
+        );
+        builder.omitted = self.omitted;
+        // Size the full marker conservatively from the entire range, then prefer actual
+        // endpoint text over a marker when the body is too small to carry both.
+        let mut all = self.omitted;
+        for line in &self.lines {
+            merge_omitted(&mut all, line.number, line.number);
+        }
+        let widest = self.marker(all);
+        let marker_limit = widest.len()
+            + all.map_or(0, |(first, last)| {
+                last.to_string().len() - first.to_string().len()
+            });
+        let first = self.lines.first().map_or(0, |line| line.text.len() + 1);
+        let last = self.lines.last().map_or(0, |line| line.text.len() + 1);
+        let content = match self.truncate {
+            Truncate::Head | Truncate::None => first,
+            Truncate::Tail => last,
+            Truncate::HeadTail if self.lines.len() > 1 => first + last,
+            Truncate::HeadTail => first,
+        };
+        let marker_room = if room >= marker_limit.saturating_add(content) {
+            marker_limit
+        } else if room >= 3_usize.saturating_add(content) {
+            3
+        } else {
+            0
+        };
+        builder.spec.budget = if marker_room == 0 {
+            room.saturating_add(1)
+        } else {
+            room - marker_room
+        };
+        if room == 0 {
+            builder.omitted = all;
+        } else {
+            for line in &self.lines {
+                builder.place(line.clone());
             }
         }
-        (text, cut_lines)
+        let fitted = builder.finish();
+        let marker = if marker_room == 0 {
+            String::new()
+        } else if marker_room == 3 {
+            "...".to_owned()
+        } else {
+            fitted.marker(fitted.omitted)
+        };
+        fitted.render(&marker)
     }
+}
+
+fn merge_omitted(range: &mut Option<(u64, u64)>, first: u64, last: u64) {
+    *range = Some(range.map_or((first, last), |(old_first, old_last)| {
+        (old_first.min(first), old_last.max(last))
+    }));
 }
 
 /// Turns a byte range of the log into a bounded window. Feed chunks, then call `finish`.
@@ -454,10 +524,13 @@ impl<'a> WindowBuilder<'a> {
             Truncate::None => (self.line_limit(), 0),
             Truncate::Head => (self.spec.budget, 0),
             Truncate::Tail => (0, self.spec.budget),
-            Truncate::HeadTail => (
-                self.spec.budget / 10,
-                self.spec.budget - self.spec.budget / 10,
-            ),
+            Truncate::HeadTail => {
+                // Keep both ends at small budgets, instead of spending less than one line on
+                // the head even when the first and last lines fit together.
+                let first = self.head.first().unwrap_or(&line).text.len() + 1;
+                let head = (self.spec.budget / 10).max(first.min(self.spec.budget / 2));
+                (head, self.spec.budget - head)
+            }
         };
         let cost = line.text.len() + 1;
         if self.head_open {
@@ -469,11 +542,14 @@ impl<'a> WindowBuilder<'a> {
             self.head_open = false;
             // The first line of a bounded window is shown cut rather than left out, so a single
             // line longer than the whole budget still shows its beginning.
-            if self.head.is_empty() && matches!(self.spec.truncate, Truncate::Head | Truncate::None)
-            {
+            if self.head.is_empty() && head_budget > 1 && self.spec.truncate != Truncate::Tail {
                 // A `None` line is already bounded by the cap, with the note that says so.
-                if self.spec.truncate == Truncate::Head {
+                if self.spec.truncate != Truncate::None {
                     line.cut |= cut_to(&mut line.text, head_budget);
+                }
+                if line.cut && line.text.is_empty() {
+                    merge_omitted(&mut self.omitted, line.number, line.number);
+                    return;
                 }
                 self.head_bytes += line.text.len() + 1;
                 self.head.push(line);
@@ -483,6 +559,10 @@ impl<'a> WindowBuilder<'a> {
         if line.text.len() + 1 > tail_budget && tail_budget > 0 {
             line.cut |= cut_to(&mut line.text, tail_budget);
         }
+        if line.cut && line.text.is_empty() {
+            merge_omitted(&mut self.omitted, line.number, line.number);
+            return;
+        }
         self.tail_bytes += line.text.len() + 1;
         self.tail.push_back(line);
         while self.tail_bytes > tail_budget {
@@ -490,8 +570,7 @@ impl<'a> WindowBuilder<'a> {
                 break;
             };
             self.tail_bytes -= dropped.text.len() + 1;
-            let first = self.omitted.map_or(dropped.number, |(first, _)| first);
-            self.omitted = Some((first, dropped.number));
+            merge_omitted(&mut self.omitted, dropped.number, dropped.number);
         }
     }
 
@@ -505,20 +584,12 @@ impl<'a> WindowBuilder<'a> {
             self.end_line(false);
             self.cleaner.continued = true;
         }
-        let mut lines: Vec<(String, bool)> = self
-            .head
-            .into_iter()
-            .map(|line| (line.text, line.cut))
-            .collect();
-        if let Some((first, last)) = self.omitted {
-            let count = last - first + 1;
-            let source = self.spec.source;
-            let marker = format!("... [{count} lines omitted: {source} lines {first}-{last}] ...");
-            lines.push((marker, false));
-        }
-        lines.extend(self.tail.into_iter().map(|line| (line.text, line.cut)));
+        let mut lines = self.head;
+        lines.extend(self.tail);
         Window {
             lines,
+            truncate: self.spec.truncate,
+            source: self.spec.source,
             omitted: self.omitted,
             bad_lines: self.bad_lines,
             newlines: self.newlines,
@@ -641,6 +712,22 @@ mod tests {
         );
         assert_eq!(text(&out), "ok\n100%\ndone");
         assert_eq!(out.newlines, 2);
+    }
+
+    #[test]
+    fn carriage_returns_survive_non_erasing_escapes() {
+        for (input, expected) in [
+            (&b"kept\r\x1b[0m\nNEXT\n"[..], "kept\nNEXT"),
+            (&b"kept\r\x1b[?25l\x1b[?25h\n"[..], "kept"),
+            (&b"kept\r\x1b]0;title\x07\n"[..], "kept"),
+            (&b"old\r\x1b[32mnew\n"[..], "new"),
+            (&b"old\r\x1b[2K\n"[..], ""),
+        ] {
+            for chunks in [vec![input], input.chunks(1).collect()] {
+                let out = window(&chunks, Truncate::None, UNBOUNDED, false);
+                assert_eq!(text(&out), expected, "{input:?}");
+            }
+        }
     }
 
     #[test]
@@ -833,6 +920,62 @@ mod tests {
     }
 
     #[test]
+    fn a_small_final_tail_window_keeps_the_actual_last_line() {
+        let lines: Vec<u8> = (1..=50)
+            .flat_map(|line| format!("line{line:03}\n").into_bytes())
+            .collect();
+        let out = window(&[&lines], Truncate::Tail, 256, false);
+        let fitted = out.fit(60);
+        assert!(fitted.0.ends_with("line050"), "{}", fitted.0);
+    }
+
+    #[test]
+    fn final_windows_report_the_lines_they_actually_omit() {
+        let lines: Vec<u8> = (1..=50)
+            .flat_map(|line| format!("line{line:03}\n").into_bytes())
+            .collect();
+        for (mode, expected, omitted) in [
+            (Truncate::Head, "line001\nline002\n...", (3, 50)),
+            (Truncate::Tail, "...\nline049\nline050", (1, 48)),
+            (Truncate::HeadTail, "line001\n...\nline050", (2, 49)),
+        ] {
+            let out = window(&[&lines], mode, 256, false);
+            let fitted = out.fit(21);
+            assert_eq!(fitted.0, expected);
+            assert_eq!(fitted.1, 0);
+            assert_eq!(fitted.2, Some(omitted));
+            for room in 0..=300 {
+                let fitted = out.fit(room);
+                assert!(fitted.0.len() <= room, "{mode:?}, {room}: {}", fitted.0);
+            }
+        }
+        // None's caller normally does not refit; a finite room still needs truthful omissions.
+        let out = window(&[&lines], Truncate::None, 256, false);
+        let fitted = out.fit(21);
+        assert_eq!(fitted.0, "line001\nline002\n...");
+        assert_eq!(fitted.2, Some((3, 50)));
+
+        for mode in [
+            Truncate::Head,
+            Truncate::Tail,
+            Truncate::HeadTail,
+            Truncate::None,
+        ] {
+            let long = format!("{}\n", "x".repeat(80));
+            let out = window(&[long.as_bytes()], mode, 256, false);
+            let fitted = out.fit(20);
+            assert!(!fitted.0.is_empty(), "{mode:?}");
+            assert!(fitted.0.len() <= 20);
+            assert_eq!(fitted.1, 1);
+            assert_eq!(fitted.2, None);
+        }
+        let out = window(&["中\n".as_bytes()], Truncate::Tail, 256, false);
+        let fitted = out.fit(1);
+        assert_eq!(fitted.0, "");
+        assert_eq!(fitted.2, Some((1, 1)));
+    }
+
+    #[test]
     fn fitting_a_window_counts_each_shown_cut_line_once() {
         let line = format!(
             "{}
@@ -850,8 +993,8 @@ mod tests {
             false,
         );
         assert_eq!(out.fit(usize::MAX).1, 1, "the 2000-char cap cut one line");
-        let (fitted, cut_lines) = out.fit(500);
-        assert!(fitted.len() <= 500 && !fitted.contains("tail"), "{fitted}");
+        let (fitted, cut_lines, _) = out.fit(500);
+        assert!(fitted.len() <= 500 && fitted.ends_with("tail"), "{fitted}");
         assert_eq!(cut_lines, 1, "a line cut twice still counts once");
     }
 }

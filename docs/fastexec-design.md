@@ -254,5 +254,7 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
   HTTP sessions launch tasks with; a body over `4` MiB is refused; `Origin` is
   limited to the bound address's own origin, the loopback names, and
   `FASTEXEC_HTTP_ALLOWED_ORIGINS`, where an entry without a port matches any
-  port. HTTP sessions run with the daemon's own environment, and the `10` minute
+  port. This is request Origin validation, not CORS support: browser cross-origin
+  preflights and CORS response headers are not provided. HTTP sessions run with
+  the daemon's own environment, and the `10` minute
   inactivity TTL expires idle ones without bounding their count or memory.
