@@ -78,10 +78,11 @@ ranges return an error before execution.
   and keeps the permissions of a file that exists.
 - **`edit`**: Each `edits[]` entry is `{oldText, newText}`, matched against the
   original file, not against the result of an earlier entry. Every `oldText`
-  must be unique in that file and must not overlap another. The file must be
-  UTF-8; a byte-order mark and the first line ending style are kept, and the
-  result names each replaced block's first line in the file it produced, marking
-  a block whose match needed normalizing.
+  must be unique in that file, counted over every start position including
+  overlapping ones, and must not overlap another. The file must be UTF-8; a
+  byte-order mark and the first line ending style are kept, only the matched
+  bytes are replaced, and the result names each replaced block's first line in
+  the file it produced, marking a block whose match needed normalizing.
 - **Paths**: A path resolves against the session's working directory, accepts
   `~` for the home directory, or is a native absolute path (`C:/...` or
   `C:\...` on Windows; a Git Bash `/c/...` path is not one).

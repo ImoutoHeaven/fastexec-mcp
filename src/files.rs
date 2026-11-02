@@ -15,6 +15,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::canonical_combining_class;
 
 /// The most lines a result shows.
 const MAX_LINES: u64 = 2000;
@@ -682,9 +683,11 @@ fn write_text(request: &WriteRequest, launch: &LaunchContext) -> Result<String, 
 struct Matched<'a> {
     /// The edit's position in the request, which names it in errors and in the result.
     index: usize,
-    /// Where it matched, and how long the matched text is.
+    /// Where it matched in the content, and how long the matched text there is.
     at: usize,
     len: usize,
+    /// Whether only the fuzzy form matched.
+    fuzzy: bool,
     new_text: &'a str,
 }
 
@@ -748,29 +751,22 @@ fn apply_edits(
             return Err(format!("edits[{index}].oldText must not be empty."));
         }
     }
-    // Every edit is first looked for in the content as it is; one that needs the fuzzy form makes
-    // the whole call work in that form, so no edit is matched against a half-changed file.
-    let first: Vec<Found> = edits.iter().map(|(old, _)| find(content, old)).collect();
-    let fuzzy = first.iter().any(|found| found.fuzzy);
-    let base = if fuzzy {
-        normalize_for_fuzzy_match(content)
-    } else {
-        content.to_owned()
-    };
+    // Each edit is looked for in the content as it is, and then through the fuzzy form, which
+    // names the bytes of the content a match in that form stands for.
     let mut matched: Vec<Matched<'_>> = Vec::new();
     for (index, (old, new)) in edits.iter().enumerate() {
-        let found = find(&base, old);
-        let Some(at) = found.at else {
+        let Some((at, len, fuzzy)) = find_span(content, old) else {
             return Err(not_found(path, index, total));
         };
-        let count = occurrences(&base, old);
+        let count = occurrences(content, old);
         if count > 1 {
             return Err(duplicate(path, index, total, count));
         }
         matched.push(Matched {
             index,
             at,
-            len: found.len,
+            len,
+            fuzzy,
             new_text: new,
         });
     }
@@ -783,62 +779,86 @@ fn apply_edits(
             ));
         }
     }
-    let (replaced, starts) = if fuzzy {
-        preserve_unchanged_lines(content, &base, &matched)?
-    } else {
-        replace(&base, &matched)
-    };
+    let (replaced, starts) = replace(content, &matched);
     if replaced == content {
         return Err(no_change(path, total));
     }
     let mut lines = vec![(0usize, false); total];
     for edit in &matched {
         let at = starts[edit.index];
-        lines[edit.index] = (
-            1 + replaced[..at].matches('\n').count(),
-            first[edit.index].fuzzy,
-        );
+        lines[edit.index] = (1 + replaced[..at].matches('\n').count(), edit.fuzzy);
     }
     Ok((replaced, lines))
 }
 
-/// One edit's place in the content it was looked for in.
-struct Found {
-    /// Where the text is, when it is there at all.
-    at: Option<usize>,
-    len: usize,
-    /// Whether only the fuzzy form matched.
-    fuzzy: bool,
-}
-
-/// Finds `old` in `content`: as it is first, then in the fuzzy form.
-fn find(content: &str, old: &str) -> Found {
+/// Finds `old` in `content`: as it is first, then through the fuzzy form, answering with the span
+/// of `content` the edit replaces and whether only the fuzzy form matched.
+fn find_span(content: &str, old: &str) -> Option<(usize, usize, bool)> {
     if let Some(at) = content.find(old) {
-        return Found {
-            at: Some(at),
-            len: old.len(),
-            fuzzy: false,
-        };
+        return Some((at, old.len(), false));
     }
-    let fuzzy_content = normalize_for_fuzzy_match(content);
-    let fuzzy_old = normalize_for_fuzzy_match(old);
-    Found {
-        at: fuzzy_content.find(&fuzzy_old),
-        len: fuzzy_old.len(),
-        fuzzy: true,
-    }
+    let (at, len) = fuzzy_span(content, old)?;
+    Some((at, len, true))
 }
 
-/// How often `old` occurs in `content`, counted in the fuzzy form so a near copy is ambiguous too.
-fn occurrences(content: &str, old: &str) -> usize {
-    let fuzzy_content = normalize_for_fuzzy_match(content);
-    let fuzzy_old = normalize_for_fuzzy_match(old);
-    if fuzzy_old.is_empty() {
-        // A needle that normalizes to nothing splits the content into its code units, so any
-        // content of two units or more is as ambiguous as a repeated needle.
-        return fuzzy_content.encode_utf16().count().saturating_sub(1);
+/// Maps the first match in the fuzzy form of `content` back to the bytes of `content` it stands for.
+fn fuzzy_span(content: &str, old: &str) -> Option<(usize, usize)> {
+    let needle = normalize_for_fuzzy_match(old);
+    if needle.is_empty() {
+        // A target without a character of its own is no target: it would match everywhere.
+        return None;
     }
-    fuzzy_content.match_indices(&fuzzy_old).count()
+    let haystack = normalize_for_fuzzy_match(content);
+    let at = haystack.find(&needle)?;
+    FuzzyMap::new(content)?.span(at, at + needle.len())
+}
+
+/// How often `old` occurs in `content`: counted in the fuzzy form, so a near copy is ambiguous
+/// too, and over every start, so overlapping occurrences are never mistaken for one.
+fn occurrences(content: &str, old: &str) -> usize {
+    let needle = normalize_for_fuzzy_match(old);
+    if needle.is_empty() {
+        // A target that normalizes to nothing is counted as the content spells it.
+        return starts_in(content, old);
+    }
+    starts_in(&normalize_for_fuzzy_match(content), &needle)
+}
+
+/// How many starts `needle` has in `haystack`, counting overlapping occurrences in one pass.
+///
+/// A match of a nonempty UTF-8 needle in UTF-8 text always starts on a character boundary, because
+/// a lead byte is never a continuation byte, so the bytes need no boundary check.
+fn starts_in(haystack: &str, needle: &str) -> usize {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut table = vec![0usize; needle.len()];
+    let mut matched = 0;
+    for at in 1..needle.len() {
+        while matched > 0 && needle[at] != needle[matched] {
+            matched = table[matched - 1];
+        }
+        if needle[at] == needle[matched] {
+            matched += 1;
+        }
+        table[at] = matched;
+    }
+    let mut count = 0;
+    matched = 0;
+    for byte in haystack {
+        while matched > 0 && *byte != needle[matched] {
+            matched = table[matched - 1];
+        }
+        if *byte == needle[matched] {
+            matched += 1;
+        }
+        if matched == needle.len() {
+            count += 1;
+            matched = table[matched - 1];
+        }
+    }
+    count
 }
 
 fn not_found(path: &str, index: usize, total: usize) -> String {
@@ -874,139 +894,19 @@ fn no_change(path: &str, total: usize) -> String {
     }
 }
 
-/// Applies matches to `base`, answering with the new content and each edit's start in it.
-fn replace(base: &str, matched: &[Matched<'_>]) -> (String, Vec<usize>) {
+/// Applies matches to `content`, answering with the new content and each edit's start in it.
+fn replace(content: &str, matched: &[Matched<'_>]) -> (String, Vec<usize>) {
     let mut starts = vec![0usize; matched.len()];
     let mut shift: i64 = 0;
     for edit in matched {
         starts[edit.index] = (edit.at as i64 + shift) as usize;
         shift += edit.new_text.len() as i64 - edit.len as i64;
     }
-    let mut result = base.to_owned();
+    let mut result = content.to_owned();
     for edit in matched.iter().rev() {
         result.replace_range(edit.at..edit.at + edit.len, edit.new_text);
     }
     (result, starts)
-}
-
-/// A run of lines one or more replacements touch, and those replacements.
-struct Group<'a> {
-    start: usize,
-    end: usize,
-    members: Vec<&'a Matched<'a>>,
-}
-
-/// Applies matches found in the fuzzy form of `original` while every line they do not touch is
-/// copied from `original` byte for byte.
-fn preserve_unchanged_lines(
-    original: &str,
-    base: &str,
-    matched: &[Matched<'_>],
-) -> Result<(String, Vec<usize>), String> {
-    let original_lines = split_lines_with_endings(original);
-    let spans = line_spans(base);
-    if original_lines.len() != spans.len() {
-        return Err(
-            "Cannot preserve unchanged lines because the base content has a different line count."
-                .to_owned(),
-        );
-    }
-    let mut groups: Vec<Group<'_>> = Vec::new();
-    for edit in matched {
-        let (start, end) = line_range(&spans, edit.at, edit.len)?;
-        if let Some(current) = groups.last_mut()
-            && start < current.end
-        {
-            current.end = current.end.max(end);
-            current.members.push(edit);
-            continue;
-        }
-        groups.push(Group {
-            start,
-            end,
-            members: vec![edit],
-        });
-    }
-    let mut starts = vec![0usize; matched.len()];
-    let mut result = String::new();
-    let mut line = 0;
-    for group in &groups {
-        for untouched in &original_lines[line..group.start] {
-            result.push_str(untouched);
-        }
-        let from = spans[group.start].0;
-        let to = spans[group.end - 1].1;
-        let group_start = result.len();
-        let mut shift: i64 = 0;
-        for edit in &group.members {
-            starts[edit.index] = (group_start as i64 + (edit.at - from) as i64 + shift) as usize;
-            shift += edit.new_text.len() as i64 - edit.len as i64;
-        }
-        let mut text = base[from..to].to_owned();
-        for edit in group.members.iter().rev() {
-            let at = edit.at - from;
-            text.replace_range(at..at + edit.len, edit.new_text);
-        }
-        result.push_str(&text);
-        line = group.end;
-    }
-    for untouched in &original_lines[line..] {
-        result.push_str(untouched);
-    }
-    Ok((result, starts))
-}
-
-/// The lines of `content` with their endings, and no line after a final `\n`.
-fn split_lines_with_endings(content: &str) -> Vec<&str> {
-    let mut lines = Vec::new();
-    let mut start = 0;
-    while start < content.len() {
-        match content[start..].find('\n') {
-            Some(at) => {
-                let end = start + at + 1;
-                lines.push(&content[start..end]);
-                start = end;
-            }
-            None => {
-                lines.push(&content[start..]);
-                start = content.len();
-            }
-        }
-    }
-    lines
-}
-
-/// Where each line of `content` starts and ends.
-fn line_spans(content: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut start = 0;
-    while start < content.len() {
-        let end = match content[start..].find('\n') {
-            Some(at) => start + at + 1,
-            None => content.len(),
-        };
-        spans.push((start, end));
-        start = end;
-    }
-    spans
-}
-
-/// The whole lines a replacement touches.
-fn line_range(spans: &[(usize, usize)], at: usize, len: usize) -> Result<(usize, usize), String> {
-    let end = at + len;
-    let outside = || "Replacement range is outside the base content.".to_owned();
-    let start = spans
-        .iter()
-        .position(|(from, to)| at >= *from && at < *to)
-        .ok_or_else(outside)?;
-    let mut last = start;
-    while last < spans.len() && spans[last].1 < end {
-        last += 1;
-    }
-    if last >= spans.len() {
-        return Err(outside());
-    }
-    Ok((start, last + 1))
 }
 
 /// The line ending the content uses: CRLF only when its first `\n` follows a `\r`.
@@ -1035,21 +935,185 @@ fn restore_line_endings(text: &str, ending: &str) -> String {
 /// The form matching falls back to: NFKC, no trailing whitespace, and ASCII quotes, dashes and
 /// spaces, so text pasted from a document still finds its source.
 fn normalize_for_fuzzy_match(text: &str) -> String {
-    let normalized: String = text.nfkc().collect();
-    normalized
-        .split('\n')
-        .map(|line| line.trim_end_matches(is_js_whitespace))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .chars()
-        .map(|character| match character {
-            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => '\'',
-            '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => '"',
-            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
-            '\u{00a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => ' ',
-            other => other,
-        })
-        .collect()
+    let normalized = nfkc(text);
+    mapped(
+        &normalized
+            .split('\n')
+            .map(|line| line.trim_end_matches(is_js_whitespace))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn nfkc(text: &str) -> String {
+    text.nfkc().collect()
+}
+
+/// The characters the fuzzy form rewrites, one for one.
+fn mapped(text: &str) -> String {
+    text.chars().map(mapped_character).collect()
+}
+
+fn mapped_character(character: char) -> char {
+    match character {
+        '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => '\'',
+        '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => '"',
+        '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+        '\u{00a0}' | '\u{2002}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => ' ',
+        other => other,
+    }
+}
+
+/// Where the fuzzy form of a text came from: a match found in that form names a span of the text
+/// itself, so only the matched bytes are ever replaced.
+struct FuzzyMap {
+    /// For every byte of the trimmed fuzzy form, the byte of the untrimmed form it comes from.
+    origin: Vec<usize>,
+    /// The untrimmed byte the trimmed fuzzy form ends at.
+    end: usize,
+    /// Every unit of the text: its start and end in the untrimmed fuzzy form, then in the text.
+    units: Vec<(usize, usize, usize, usize)>,
+}
+
+impl FuzzyMap {
+    /// Builds the map of `text`, or nothing when its units do not reproduce the fuzzy form.
+    fn new(text: &str) -> Option<Self> {
+        let mut form = String::with_capacity(text.len());
+        let mut units = Vec::new();
+        for (at, end) in units_of(text) {
+            let unit = mapped(&nfkc(&text[at..end]));
+            if unit.is_empty() {
+                return None;
+            }
+            units.push((form.len(), form.len() + unit.len(), at, end));
+            form.push_str(&unit);
+        }
+        let (trimmed, origin, end) = trimmed_form(&form);
+        if trimmed != normalize_for_fuzzy_match(text) {
+            return None;
+        }
+        Some(Self { origin, end, units })
+    }
+
+    /// The span of the text the fuzzy form's bytes `[from, to)` stand for, when both ends fall on a
+    /// unit boundary.
+    fn span(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+        let start = self.start_of(from)?;
+        let end = self.end_of(to)?;
+        (end > start).then_some((start, end - start))
+    }
+
+    /// The byte of the text the unit starting at the byte of the fuzzy form at `from` starts at.
+    fn start_of(&self, from: usize) -> Option<usize> {
+        let at = match self.origin.get(from) {
+            Some(at) => *at,
+            None if from == self.origin.len() => self.end,
+            None => return None,
+        };
+        self.units
+            .binary_search_by_key(&at, |unit| unit.0)
+            .ok()
+            .map(|found| self.units[found].2)
+    }
+
+    /// The byte of the text just after the unit ending at the byte of the fuzzy form after `to`, so
+    /// trailing whitespace the trim removed stays outside the span.
+    fn end_of(&self, to: usize) -> Option<usize> {
+        let at = match to.checked_sub(1).and_then(|last| self.origin.get(last)) {
+            Some(last) => last + 1,
+            None if to == 0 => 0,
+            None => return None,
+        };
+        self.units
+            .binary_search_by_key(&at, |unit| unit.1)
+            .ok()
+            .map(|found| self.units[found].3)
+    }
+}
+
+/// The most characters one unit may hold. UAX #15's stream-safe format bounds a run of
+/// non-starters at 30, so a longer run is split; if that splits a real composition the form check
+/// refuses the map instead of guessing a span.
+const MAX_UNIT: usize = 32;
+
+/// Splits `text` into the units normalization works on: one character each, extended while the
+/// next character can reorder with the marks already in the unit, or composes with them, up to
+/// `MAX_UNIT` characters.
+fn units_of(text: &str) -> Vec<(usize, usize)> {
+    let mut units = Vec::new();
+    let mut characters = text.char_indices();
+    while let Some((at, first)) = characters.next() {
+        let mut end = at + first.len_utf8();
+        let mut length = 1;
+        while length < MAX_UNIT {
+            let Some(next) = characters.as_str().chars().next() else {
+                break;
+            };
+            // A mark that starts a unit can reorder with every later mark, so it stays in the unit
+            // whether or not the two compose now. Whitespace keeps its own unit, because the trim
+            // removes it on its own.
+            let extends = (!is_js_whitespace(first) && starts_with_a_mark(next))
+                || composes(&text[at..end], next);
+            if !extends {
+                break;
+            }
+            end += next.len_utf8();
+            length += 1;
+            characters.next();
+        }
+        units.push((at, end));
+    }
+    units
+}
+
+/// Whether `character` decomposes to a leading non-starter, which reorders with the marks before
+/// it under NFKC.
+fn starts_with_a_mark(character: char) -> bool {
+    character
+        .nfkd()
+        .next()
+        .is_some_and(|first| canonical_combining_class(first) != 0)
+}
+
+/// Whether `next` composes with `unit` under NFKC, which keeps the two one unit.
+fn composes(unit: &str, next: char) -> bool {
+    let mut joined = String::with_capacity(unit.len() + next.len_utf8());
+    joined.push_str(unit);
+    joined.push(next);
+    let mut single = String::with_capacity(next.len_utf8());
+    single.push(next);
+    nfkc(&joined) != nfkc(unit) + &nfkc(&single)
+}
+
+/// The fuzzy form without the trailing whitespace of each line, where every byte comes from in the
+/// form it trims, and where the kept bytes end.
+fn trimmed_form(form: &str) -> (String, Vec<usize>, usize) {
+    let mut trimmed = String::with_capacity(form.len());
+    let mut origin = Vec::with_capacity(form.len());
+    let mut end = 0;
+    let mut line_start = 0;
+    for line in form.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, true),
+            None => (line, false),
+        };
+        let kept = body.trim_end_matches(is_js_whitespace);
+        for (offset, character) in kept.char_indices() {
+            for byte in 0..character.len_utf8() {
+                origin.push(line_start + offset + byte);
+            }
+            trimmed.push(character);
+        }
+        end = line_start + kept.len();
+        if newline {
+            // The kept newline is the physical one, past every byte the trim removed.
+            origin.push(line_start + body.len());
+            trimmed.push('\n');
+            end = line_start + line.len();
+        }
+        line_start += line.len();
+    }
+    (trimmed, origin, end)
 }
 
 /// The whitespace the reference implementation strips, which includes U+FEFF and not U+0085.
@@ -1070,6 +1134,7 @@ fn is_js_whitespace(character: char) -> bool {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     /// A directory of its own under the temp directory, removed when the test ends.
     struct Scratch(PathBuf);
@@ -1398,21 +1463,29 @@ mod tests {
     }
 
     #[test]
-    fn edit_counts_a_needle_that_normalizes_to_nothing() {
+    fn edit_counts_a_whitespace_needle_as_the_content_spells_it() {
         let scratch = Scratch::new("blank-needle");
         let launch = context(&scratch.0, &scratch.0);
+        // A unique blank is a real target, and it is counted where the content spells it.
         scratch.file("a.txt", b"a b");
         assert_eq!(
-            change("a.txt", &[(" ", "X")], &launch).unwrap_err(),
-            "Found 2 occurrences of the text in a.txt. The text must be unique. Please provide more context to make it unique."
+            change("a.txt", &[(" ", "X")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1"
         );
-        // A non-BMP character is two code units, so two of them are three units apart.
+        assert_eq!(scratch.read("a.txt"), b"aXb");
+        // Two blanks are two candidates.
+        scratch.file("c.txt", b"a b c");
+        assert_eq!(
+            change("c.txt", &[(" ", "X")], &launch).unwrap_err(),
+            "Found 2 occurrences of the text in c.txt. The text must be unique. Please provide more context to make it unique."
+        );
+        assert_eq!(scratch.read("c.txt"), b"a b c");
+        // A blank the content does not have is not a target at all.
         scratch.file("b.txt", "\u{1f600}\u{1f600}".as_bytes());
         assert_eq!(
             change("b.txt", &[("\u{3000}", "X")], &launch).unwrap_err(),
-            "Found 3 occurrences of the text in b.txt. The text must be unique. Please provide more context to make it unique."
+            "Could not find the exact text in b.txt. The old text must match exactly including all whitespace and newlines."
         );
-        assert_eq!(scratch.read("a.txt"), b"a b");
         assert_eq!(scratch.read("b.txt"), "\u{1f600}\u{1f600}".as_bytes());
     }
 
@@ -1542,16 +1615,309 @@ mod tests {
     }
 
     #[test]
-    fn edit_matches_a_typographic_copy_and_leaves_other_lines_alone() {
+    fn edit_matches_a_typographic_copy_and_keeps_the_bytes_around_it() {
         let scratch = Scratch::new("fuzzy");
         let launch = context(&scratch.0, &scratch.0);
-        scratch.file("a.txt", "it\u{2019}s here\nuntouched   \n".as_bytes());
+        scratch.file(
+            "a.txt",
+            "note: \u{201c}keep\u{201d} it\u{2019}s here   \nsecond line\n".as_bytes(),
+        );
         assert_eq!(
             change("a.txt", &[("it's here", "it's fine")], &launch).unwrap(),
             "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
         );
-        // The touched line is rewritten from the normalized form; the other keeps its bytes.
-        assert_eq!(scratch.read("a.txt"), b"it's fine\nuntouched   \n");
+        // Only the matched bytes change: the quotes before them and the trailing whitespace stay.
+        assert_eq!(
+            scratch.read("a.txt"),
+            "note: \u{201c}keep\u{201d} it's fine   \nsecond line\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn edit_changes_only_the_bytes_a_fuzzy_match_names() {
+        let scratch = Scratch::new("fuzzy-json");
+        let launch = context(&scratch.0, &scratch.0);
+        let original =
+            "{\"quote\":\"She said \u{201c}hello\u{201d}\",\"author\":\"O\u{2019}Reilly\"}";
+        scratch.file("case.json", original.as_bytes());
+        assert_eq!(
+            change("case.json", &[("O'Reilly", "Publisher")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in case.json.\nedits[0]: line 1 (fuzzy match)"
+        );
+        let edited = scratch.read("case.json");
+        assert_eq!(
+            edited,
+            "{\"quote\":\"She said \u{201c}hello\u{201d}\",\"author\":\"Publisher\"}".as_bytes()
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(edited).unwrap()).unwrap();
+        assert_eq!(parsed["author"], "Publisher");
+    }
+
+    #[test]
+    fn edit_keeps_an_exact_edits_line_while_another_edit_needs_normalizing() {
+        let scratch = Scratch::new("fuzzy-mixed");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file(
+            "a.txt",
+            "label = \"\u{2460}\"; enabled = false\nname = \u{201c}old\u{201d}   \n".as_bytes(),
+        );
+        assert_eq!(
+            change(
+                "a.txt",
+                &[("false", "true"), ("\"old\"", "\"new\"")],
+                &launch
+            )
+            .unwrap(),
+            "Successfully replaced 2 block(s) in a.txt.\nedits[0]: line 1\nedits[1]: line 2 (fuzzy match)"
+        );
+        assert_eq!(
+            scratch.read("a.txt"),
+            "label = \"\u{2460}\"; enabled = true\nname = \"new\"   \n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn edit_refuses_a_needle_with_two_overlapping_starts() {
+        let scratch = Scratch::new("overlap");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file("a.txt", b"banana\n");
+        assert_eq!(
+            change("a.txt", &[("ana", "X")], &launch).unwrap_err(),
+            "Found 2 occurrences of the text in a.txt. The text must be unique. Please provide more context to make it unique."
+        );
+        assert_eq!(scratch.read("a.txt"), b"banana\n");
+        scratch.file("b.txt", b"aaaa\n");
+        assert_eq!(
+            change("b.txt", &[("aaa", "X")], &launch).unwrap_err(),
+            "Found 2 occurrences of the text in b.txt. The text must be unique. Please provide more context to make it unique."
+        );
+        assert_eq!(scratch.read("b.txt"), b"aaaa\n");
+        scratch.file("c.txt", "\u{e9}\u{e9}\u{e9}\n".as_bytes());
+        assert_eq!(
+            change("c.txt", &[("\u{e9}\u{e9}", "X")], &launch).unwrap_err(),
+            "Found 2 occurrences of the text in c.txt. The text must be unique. Please provide more context to make it unique."
+        );
+        assert_eq!(scratch.read("c.txt"), "\u{e9}\u{e9}\u{e9}\n".as_bytes());
+    }
+
+    #[test]
+    fn edit_replaces_a_whitespace_only_target() {
+        let scratch = Scratch::new("whitespace");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file("tab.txt", b"if x:\n\tfoo()\n");
+        assert_eq!(
+            change("tab.txt", &[("\t", "    ")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in tab.txt.\nedits[0]: line 2"
+        );
+        assert_eq!(scratch.read("tab.txt"), b"if x:\n    foo()\n");
+        scratch.file("space.txt", b"foo bar\n");
+        assert_eq!(
+            change("space.txt", &[(" ", "_")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in space.txt.\nedits[0]: line 1"
+        );
+        assert_eq!(scratch.read("space.txt"), b"foo_bar\n");
+        scratch.file("indent.txt", b"if x:\n    foo()\n");
+        assert_eq!(
+            change("indent.txt", &[("    ", "\t")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in indent.txt.\nedits[0]: line 2"
+        );
+        assert_eq!(scratch.read("indent.txt"), b"if x:\n\tfoo()\n");
+        // A target the content does not hold writes nothing.
+        scratch.file("none.txt", b"ab\n");
+        assert_eq!(
+            change("none.txt", &[(" ", "X")], &launch).unwrap_err(),
+            "Could not find the exact text in none.txt. The old text must match exactly including all whitespace and newlines."
+        );
+        assert_eq!(scratch.read("none.txt"), b"ab\n");
+    }
+
+    #[test]
+    fn edit_refuses_a_fuzzy_match_that_ends_inside_a_unit() {
+        let scratch = Scratch::new("unit-end");
+        let launch = context(&scratch.0, &scratch.0);
+        // NFKC turns the ligature into two characters, so a match that ends between them names no
+        // bytes of the content.
+        scratch.file("a.txt", "\u{2019}\u{fb00}tail\n".as_bytes());
+        assert_eq!(
+            change("a.txt", &[("'f", "X")], &launch).unwrap_err(),
+            "Could not find the exact text in a.txt. The old text must match exactly including all whitespace and newlines."
+        );
+        assert_eq!(scratch.read("a.txt"), "\u{2019}\u{fb00}tail\n".as_bytes());
+        // A match that covers whole units names them all and replaces them.
+        assert_eq!(
+            change("a.txt", &[("'ff", "'ff")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
+        );
+        assert_eq!(scratch.read("a.txt"), b"'fftail\n");
+    }
+
+    #[test]
+    fn edit_matches_a_line_end_that_lost_trailing_whitespace() {
+        let scratch = Scratch::new("trimmed-line-end");
+        let launch = context(&scratch.0, &scratch.0);
+        // The match ends on the newline the trim kept, so the removed spaces stay outside it and
+        // the edit after it keeps its line.
+        scratch.file("a.txt", "it\u{2019}s   \nnext\nmore\n".as_bytes());
+        assert_eq!(
+            change("a.txt", &[("it's\n", "X"), ("more", "MORE")], &launch).unwrap(),
+            "Successfully replaced 2 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)\nedits[1]: line 2"
+        );
+        assert_eq!(scratch.read("a.txt"), b"Xnext\nMORE\n");
+    }
+
+    #[test]
+    fn edit_matches_from_a_line_end_that_lost_trailing_whitespace() {
+        let scratch = Scratch::new("trimmed-line-start");
+        let launch = context(&scratch.0, &scratch.0);
+        // The match starts on the newline the trim kept, so the removed spaces stay before it.
+        scratch.file("a.txt", "a   \n\u{201c}b\u{201d}".as_bytes());
+        assert_eq!(
+            change("a.txt", &[("\n\"b\"", "X")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
+        );
+        assert_eq!(scratch.read("a.txt"), b"a   X");
+        // A match that keeps the newline keeps it where it was.
+        scratch.file("b.txt", "a   \n\u{201c}b\u{201d}\n".as_bytes());
+        assert_eq!(
+            change("b.txt", &[("\n\"b\"", "\nB")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in b.txt.\nedits[0]: line 1 (fuzzy match)"
+        );
+        assert_eq!(scratch.read("b.txt"), b"a   \nB\n");
+    }
+
+    #[test]
+    fn edit_refuses_a_run_longer_than_a_unit_holds_promptly() {
+        let scratch = Scratch::new("long-run");
+        let launch = context(&scratch.0, &scratch.0);
+        // A run of reordering non-starters longer than one unit may hold: the units no longer
+        // reproduce the whole-file form, so the edit is refused instead of guessed.
+        let content = format!("{}\nit\u{2019}s\n", "\u{0f73}".repeat(8192));
+        scratch.file("a.txt", content.as_bytes());
+        let started = Instant::now();
+        assert_eq!(
+            change("a.txt", &[("it's", "X")], &launch).unwrap_err(),
+            "Could not find the exact text in a.txt. The old text must match exactly including all whitespace and newlines."
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(scratch.read("a.txt"), content.as_bytes());
+        // An exact edit of the same file still applies.
+        assert_eq!(
+            change("a.txt", &[("\nit\u{2019}s\n", "\nit's\n")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1"
+        );
+    }
+
+    #[test]
+    fn edit_matches_across_a_short_combining_run() {
+        let scratch = Scratch::new("short-run");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file("a.txt", "cafe\u{301} \u{201c}x\u{201d}\n".as_bytes());
+        assert_eq!(
+            change("a.txt", &[("caf\u{e9} \"x\"", "caf\u{e9} \"y\"")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
+        );
+        assert_eq!(scratch.read("a.txt"), "caf\u{e9} \"y\"\n".as_bytes());
+    }
+
+    /// The form the units reproduce, the way the map builds and checks it.
+    fn unit_form(text: &str) -> String {
+        let form: String = units_of(text)
+            .into_iter()
+            .map(|(at, end)| mapped(&nfkc(&text[at..end])))
+            .collect();
+        trimmed_form(&form).0
+    }
+
+    #[test]
+    fn units_reproduce_the_fuzzy_form_of_their_text() {
+        let samples = [
+            "author = O\u{2019}Reilly\nnote = a\u{327}\u{301}\n",
+            "title = \u{201c}hello\u{201d}\nword = \u{628}\u{650}\u{651}\u{64e}\n",
+            "cafe\u{301} \u{201c}x\u{201d}\n",
+            "e\u{301}\u{323}\u{327}\n",
+            "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}",
+            "\u{fb01} \u{2460} \u{216b} \u{ff76}\u{ff9e}",
+            "x\u{301}   \ny\t\n   \n",
+            "a\u{fe00}b\u{200d}c\u{1f600}",
+        ];
+        for sample in samples {
+            assert_eq!(
+                unit_form(sample),
+                normalize_for_fuzzy_match(sample),
+                "{sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_matches_a_mark_that_reorders_inside_its_unit() {
+        let scratch = Scratch::new("reorder");
+        let launch = context(&scratch.0, &scratch.0);
+        // A cedilla between a base and an acute is below the acute's combining class, so the whole
+        // run is one unit and an edit elsewhere in the file still matches.
+        scratch.file(
+            "a.txt",
+            "author = O\u{2019}Reilly\nnote = a\u{327}\u{301}\n".as_bytes(),
+        );
+        assert_eq!(
+            change("a.txt", &[("O'Reilly", "Publisher")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
+        );
+        assert_eq!(
+            scratch.read("a.txt"),
+            "author = Publisher\nnote = a\u{327}\u{301}\n".as_bytes()
+        );
+        // The run itself is one unit, so its own normalized form names it.
+        scratch.file("b.txt", "note = a\u{327}\u{301}\n".as_bytes());
+        assert_eq!(
+            change("b.txt", &[("\u{e1}\u{327}", "X")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in b.txt.\nedits[0]: line 1 (fuzzy match)"
+        );
+        assert_eq!(scratch.read("b.txt"), b"note = X\n");
+        // The same for marks that reorder without composing, as in vocalized Arabic.
+        scratch.file(
+            "c.txt",
+            "title = \u{201c}hello\u{201d}\nword = \u{628}\u{650}\u{651}\u{64e}\n".as_bytes(),
+        );
+        assert_eq!(
+            change("c.txt", &[("\"hello\"", "\"world\"")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in c.txt.\nedits[0]: line 1 (fuzzy match)"
+        );
+        assert_eq!(
+            scratch.read("c.txt"),
+            "title = \"world\"\nword = \u{628}\u{650}\u{651}\u{64e}\n".as_bytes()
+        );
+        scratch.file("d.txt", "word = \u{628}\u{650}\u{651}\u{64e}\n".as_bytes());
+        assert_eq!(
+            change("d.txt", &[("\u{628}\u{64e}\u{650}\u{651}", "X")], &launch).unwrap(),
+            "Successfully replaced 1 block(s) in d.txt.\nedits[0]: line 1 (fuzzy match)"
+        );
+        assert_eq!(scratch.read("d.txt"), b"word = X\n");
+    }
+
+    #[test]
+    fn edit_counts_overlapping_starts_in_one_pass() {
+        let scratch = Scratch::new("overlap-cost");
+        let launch = context(&scratch.0, &scratch.0);
+        let content = "a".repeat(131_072);
+        scratch.file("a.txt", content.as_bytes());
+        let needle = "a".repeat(65_536);
+        let started = Instant::now();
+        assert_eq!(
+            change("a.txt", &[(needle.as_str(), "X")], &launch).unwrap_err(),
+            "Found 65537 occurrences of the text in a.txt. The text must be unique. Please provide more context to make it unique."
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(scratch.read("a.txt"), content.as_bytes());
     }
 
     #[test]
