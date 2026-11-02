@@ -1,0 +1,1 @@
+Windows: Git Bash rewrites arguments that look like POSIX paths (/c, /F, /tmp/x) for native programs; prefix MSYS_NO_PATHCONV=1 or set MSYS2_ARG_CONV_EXCL. Run PowerShell from a script file (pwsh -NoProfile -NonInteractive -File x.ps1) or with -EncodedCommand. loginShell: false skips the profile and starts faster.

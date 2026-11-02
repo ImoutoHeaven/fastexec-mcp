@@ -13,6 +13,4 @@ PTY (pty: true): for programs that need a terminal, including password prompts s
 
 returnWhen: the first condition that holds ends the wait, and waitEndedBy names it with the matched text. outputContains suits plain output, such as a server's ready line. A TUI redraws old text, so watch its screen: screenAppears for a line it adds when done (Codex: "Worked for") and screenGone for a busy indicator (pi: "Working"), both compared with the screen before this call's input, or screenContains for a state that may already show. Add quietMs (about 3000) as a fallback: TUIs animate while busy and go quiet when idle. Send the prompt and Enter in the poll that waits.
 
-Windows: Git Bash rewrites arguments that look like POSIX paths (/c, /F, /tmp/x) for native programs; prefix MSYS_NO_PATHCONV=1 or set MSYS2_ARG_CONV_EXCL. Run PowerShell from a script file (pwsh -NoProfile -NonInteractive -File x.ps1) or with -EncodedCommand. loginShell: false skips the profile and starts faster.
-
 U+FFFD in output means another encoding: pass encoding ("big5", "gbk").

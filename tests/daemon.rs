@@ -307,8 +307,14 @@ impl Endpoint {
     fn call(&mut self, arguments: Value) -> (Value, String, bool) {
         let message = self.request(
             "tools/call",
-            json!({"name": "fastexec", "arguments": arguments}),
+            json!({"name": "exec", "arguments": arguments}),
         );
+        Endpoint::answer(&message)
+    }
+
+    /// Calls a file tool: (structured content, text, isError).
+    fn file(&mut self, tool: &str, arguments: Value) -> (Value, String, bool) {
+        let message = self.request("tools/call", json!({"name": tool, "arguments": arguments}));
         Endpoint::answer(&message)
     }
 
@@ -742,11 +748,11 @@ fn two_sessions_send_their_input_whole() {
     };
     let first_call = first.request_later(
         "tools/call",
-        json!({"name": "fastexec", "arguments": poll("aaaa-", "1")}),
+        json!({"name": "exec", "arguments": poll("aaaa-", "1")}),
     );
     let second_call = second.request_later(
         "tools/call",
-        json!({"name": "fastexec", "arguments": poll("bbbb-", "2")}),
+        json!({"name": "exec", "arguments": poll("bbbb-", "2")}),
     );
     for (endpoint, call) in [(&mut first, first_call), (&mut second, second_call)] {
         let message = endpoint.response(call);
@@ -918,7 +924,7 @@ fn a_lost_call_after_a_daemon_stop_is_reported_and_the_next_call_starts_a_daemon
     let waiting = endpoint.request_later(
         "tools/call",
         json!({
-            "name": "fastexec",
+            "name": "exec",
             "arguments": {"action": "poll", "taskId": old, "waitMs": 30000},
             "_meta": {"progressToken": "p1"}
         }),
@@ -1002,12 +1008,115 @@ fn initialize_and_tools_list_answer_with_no_daemon() {
     let mut endpoint = Endpoint::start(&fixture);
     let listed = endpoint.request("tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1, "{listed}");
-    assert_eq!(tools[0]["name"], json!("fastexec"), "{listed}");
+    let mut names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["edit", "exec", "read", "write"], "{listed}");
+    // A stdio endpoint has no route to serve a URL from, so `transfer` is not even a tool here.
+    let refused = endpoint.request(
+        "tools/call",
+        json!({"name": "transfer", "arguments": {"path": "notes/a.txt"}}),
+    );
+    assert_eq!(
+        refused["error"]["message"],
+        json!("tool not found"),
+        "{refused}"
+    );
     let (code, out, err) = fixture.run(&["daemon", "status"]);
     assert_eq!(code, 0, "status failed: {err}");
     assert!(out.starts_with("No fastexec daemon"), "{out}");
     endpoint.close();
+}
+
+#[test]
+fn file_tools_run_in_the_endpoints_directory_and_not_the_daemons() {
+    let fixture = Fixture::new("files");
+    let dir = std::env::temp_dir().join(format!("fastexec-daemon-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // The daemon runs first, with the launch context of the test's own directory. A file call
+    // must then resolve against the endpoint's directory, not against that captured one.
+    let (code, out, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let mut endpoint = Endpoint::start_with(&fixture, |command| {
+        command.current_dir(&dir);
+    });
+    let (_, written, error) = endpoint.file(
+        "write",
+        json!({"path": "notes/a.txt", "content": "one\ntwo\n"}),
+    );
+    assert!(!error, "{written}");
+    assert_eq!(written, "Successfully wrote to notes/a.txt");
+    assert_eq!(
+        std::fs::read(dir.join("notes/a.txt")).unwrap(),
+        b"one\ntwo\n"
+    );
+    let (_, read, error) = endpoint.file("read", json!({"path": "notes/a.txt"}));
+    assert!(!error, "{read}");
+    assert_eq!(read, "one\ntwo\n");
+    let (_, edited, error) = endpoint.file(
+        "edit",
+        json!({"path": "notes/a.txt", "edits": [{"oldText": "two", "newText": "TWO"}]}),
+    );
+    assert!(!error, "{edited}");
+    assert_eq!(
+        edited,
+        "Successfully replaced 1 block(s) in notes/a.txt.\nedits[0]: line 2"
+    );
+    let (_, read, _) = endpoint.file("read", json!({"path": "notes/a.txt"}));
+    assert_eq!(read, "one\nTWO\n");
+    // A missing file is an error result, not a lost call.
+    let (_, text, error) = endpoint.file("read", json!({"path": "notes/missing.txt"}));
+    assert!(error, "{text}");
+    assert!(
+        text.starts_with("Cannot read notes/missing.txt: "),
+        "{text}"
+    );
+    endpoint.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_image_read_crosses_the_daemon_link() {
+    let fixture = Fixture::new("image");
+    let dir = std::env::temp_dir().join(format!("fastexec-daemon-image-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let image =
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 6, image::Rgb([7, 8, 9])));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(dir.join("shot.png"), &png).unwrap();
+    let (code, out, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let mut endpoint = Endpoint::start_with(&fixture, |command| {
+        command.current_dir(&dir);
+    });
+    let message = endpoint.request(
+        "tools/call",
+        json!({"name": "read", "arguments": {"path": "shot.png"}}),
+    );
+    let result = &message["result"];
+    assert_eq!(result["isError"], json!(false), "{message}");
+    let content = result["content"].as_array().expect("content blocks");
+    assert_eq!(content.len(), 2, "{message}");
+    assert_eq!(content[0]["type"], json!("text"));
+    assert_eq!(content[0]["text"], json!("Read image file [image/png]"));
+    assert_eq!(content[1]["type"], json!("image"));
+    assert_eq!(content[1]["mimeType"], json!("image/png"));
+    assert_eq!(
+        content[1]["data"],
+        json!(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &png
+        ))
+    );
+    endpoint.close();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1026,7 +1135,7 @@ fn a_cancelled_call_does_not_disturb_another_call_on_the_same_endpoint() {
     let waiting = endpoint.request_later(
         "tools/call",
         json!({
-            "name": "fastexec",
+            "name": "exec",
             "arguments": {"action": "poll", "taskId": id, "waitMs": 30000},
             "_meta": {"progressToken": "p1"}
         }),
@@ -1044,7 +1153,7 @@ fn a_cancelled_call_does_not_disturb_another_call_on_the_same_endpoint() {
     // call at a time would have to answer the poll first, and that answer is what this fails on.
     let beside = endpoint.request_later(
         "tools/call",
-        json!({"name": "fastexec", "arguments": {"action": "list"}}),
+        json!({"name": "exec", "arguments": {"action": "list"}}),
     );
     let listed = endpoint.next_matching("the list answer beside the waiting poll", |message| {
         if message["id"] == json!(waiting) {
@@ -1064,7 +1173,7 @@ fn a_cancelled_call_does_not_disturb_another_call_on_the_same_endpoint() {
     }));
     let listing = endpoint.request_later(
         "tools/call",
-        json!({"name": "fastexec", "arguments": {"action": "list"}}),
+        json!({"name": "exec", "arguments": {"action": "list"}}),
     );
     let listed = endpoint.next_matching("the list answer beside the cancelled call", |message| {
         message["id"] == json!(listing)
@@ -1120,4 +1229,308 @@ fn each_endpoint_starts_its_tasks_with_its_own_environment() {
     assert!(!error, "{text}");
     second.close();
     first.close();
+}
+
+/// The token a foreground daemon needs before it will serve HTTP at all.
+const TOKEN: &str = "0123456789abcdef";
+
+/// A `daemon run` child: the daemon in its own process, with the stderr its readiness line
+/// arrives on. It is declared after the fixture in every test, so it ends its child before the
+/// fixture removes the runtime directory. Its own child handle is the only authority over it: the
+/// detached-process ownership check deliberately does not recognize this executable.
+struct Foreground {
+    child: Child,
+    /// The line that says the daemon is ready, already read.
+    ready: String,
+}
+
+impl Foreground {
+    fn start(fixture: &Fixture, args: &[&str]) -> Foreground {
+        let mut command = fixture.command(&["daemon", "run"]);
+        command
+            .args(args)
+            .env("FASTEXEC_HTTP_TOKEN", TOKEN)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn fastexec daemon run");
+        let stderr = child.stderr.take().unwrap();
+        // The guard owns the child from the moment it exists, so a startup that fails, or that
+        // never reaches its readiness line, still ends it.
+        let mut running = Foreground {
+            child,
+            ready: String::new(),
+        };
+        running.ready = readiness_line(stderr);
+        running
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The address the readiness line names, when the daemon serves HTTP.
+    fn http(&self) -> Option<String> {
+        let at = self.ready.find(" http ")?;
+        Some(self.ready[at + " http ".len()..].trim().to_string())
+    }
+
+    /// Waits for the daemon to end, for at most `within`.
+    fn wait_exit(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        // The child handle ends whatever the test left running, so the fixture's runtime
+        // directory is removable afterwards.
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+/// Reads a daemon's stderr until its readiness line. The readiness line is the barrier: nothing
+/// else is claimed about that daemon before it arrives, and a daemon that never gets there is a
+/// failure of the test that started it.
+fn readiness_line(stderr: std::process::ChildStderr) -> String {
+    let (sender, lines) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(line) if line.starts_with("fastexec daemon ") => return line,
+            Ok(_) => {}
+            Err(error) => panic!("no readiness line on stderr: {error:?}"),
+        }
+    }
+}
+
+/// Runs a `daemon run` that must be refused, and returns its exit code and stderr. The child is
+/// owned and waited for with a bound, so a `run` that serves instead of refusing cannot hang the
+/// test: it is ended and reported.
+fn run_refused(fixture: &Fixture, args: &[&str]) -> (i32, String) {
+    let mut command = fixture.command(&["daemon", "run"]);
+    command
+        .args(args)
+        .env("FASTEXEC_HTTP_TOKEN", TOKEN)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn fastexec daemon run");
+    let stderr = child.stderr.take().unwrap();
+    let reading = std::thread::spawn(move || {
+        BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+            .collect::<Vec<String>>()
+            .join("\n")
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon run {args:?} did not refuse: it was still running");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    (status.code().unwrap_or(-1), reading.join().unwrap())
+}
+
+/// Whether a process is still running. A zombie has ended, so only a live process counts.
+fn is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some(rest) = stat.rsplit(')').next()
+            && let Some(state) = rest.split_whitespace().next()
+        {
+            return state != "Z";
+        }
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        let script =
+            format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'alive' }}");
+        let Ok(output) = Command::new("pwsh")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&output.stdout).contains("alive")
+    }
+}
+
+/// A task that names its own process and then waits to be killed. Git Bash's `$$` is an MSYS
+/// number, not a native PID, so on Windows the number comes from pwsh's own `$PID`.
+#[cfg(unix)]
+const NAMED_TASK: &str = "printf 'PID %s READY\\n' $$; exec sleep 60";
+#[cfg(windows)]
+const NAMED_TASK: &str =
+    "pwsh -NoProfile -NonInteractive -Command 'Write-Output \"PID $PID READY\"; Start-Sleep 60'";
+
+/// The value of a `key value` word in a line.
+fn word_after(text: &str, key: &str) -> Option<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let at = words.iter().position(|word| *word == key)?;
+    words.get(at + 1).map(|word| (*word).to_string())
+}
+
+/// The number a task printed after `PID `.
+fn printed_pid(text: &str) -> u32 {
+    text.split_whitespace()
+        .skip_while(|word| *word != "PID")
+        .nth(1)
+        .and_then(|number| number.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no PID in {text:?}"))
+}
+
+#[test]
+fn a_foreground_daemon_announces_readiness_and_a_status_finds_it() {
+    let fixture = Fixture::new("fg-ready");
+    let mut running = Foreground::start(&fixture, &["--http", "127.0.0.1:0"]);
+    // The readiness line names this process, this namespace, and the address actually bound.
+    assert_eq!(
+        pid_of(&running.ready),
+        Some(running.pid()),
+        "{}",
+        running.ready
+    );
+    let namespace = word_after(&running.ready, "namespace").expect("a namespace");
+    assert!(!namespace.is_empty(), "{}", running.ready);
+    let http = running.http().expect("an http address");
+    assert!(http.starts_with("127.0.0.1:"), "{http}");
+    assert_ne!(http, "127.0.0.1:0", "the bound address, not the asked one");
+    let epoch = fixture.epoch_of(&running.ready);
+
+    let (code, status, err) = fixture.run(&["daemon", "status"]);
+    assert_eq!(code, 0, "{status:?}{err}");
+    assert_eq!(Fixture::field(&status, "epoch"), epoch);
+    assert_eq!(Fixture::field(&status, "pid"), running.pid().to_string());
+    assert_eq!(Fixture::field(&status, "http"), http);
+
+    // A task runs on that daemon, through an endpoint that would otherwise start one of its own.
+    let mut endpoint = Endpoint::start(&fixture);
+    let (started, text, error) = endpoint.call(json!({
+        "action": "start",
+        "command": "sleep 60",
+        "waitMs": 0
+    }));
+    assert!(!error, "{text}");
+    assert_eq!(started["state"], json!("running"), "{started}");
+    let id = Endpoint::task_id(&started, &text);
+    // The same daemon served it: no second one was started behind the endpoint.
+    let (_, after, err) = fixture.run(&["daemon", "status"]);
+    assert_eq!(
+        Fixture::field(&after, "pid"),
+        running.pid().to_string(),
+        "{err}"
+    );
+    assert_eq!(Fixture::field(&after, "tasks"), "1");
+    endpoint.call(json!({"action": "kill", "taskId": id}));
+    endpoint.close();
+
+    // A second daemon in the same namespace is refused, not waited for, and it names the
+    // namespace the ready line named: both were derived from this fixture's own environment.
+    let (code, err) = run_refused(&fixture, &[]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains(&format!("another daemon owns namespace {namespace}")),
+        "the running daemon is not reused and not replaced: {err}"
+    );
+    assert_eq!(running.wait_exit(Duration::from_secs(1)), None);
+}
+
+#[test]
+fn daemon_run_refuses_an_idle_exit() {
+    let fixture = Fixture::new("fg-idle");
+    for value in ["on", "off"] {
+        let (code, err) = run_refused(&fixture, &["--idle-exit", value]);
+        assert_eq!(code, 1, "--idle-exit {value}: {err}");
+        assert!(err.contains("usage: fastexec daemon"), "{err}");
+        assert!(err.contains("run [--http <addr>]"), "{err}");
+    }
+    // Nothing was started by a refused command.
+    let (_, status, _) = fixture.run(&["daemon", "status"]);
+    assert!(status.starts_with("No fastexec daemon"), "{status}");
+}
+
+#[test]
+fn a_stopped_foreground_daemon_ends_and_takes_its_task_with_it() {
+    let fixture = Fixture::new("fg-stop");
+    let mut running = Foreground::start(&fixture, &[]);
+    assert_eq!(
+        pid_of(&running.ready),
+        Some(running.pid()),
+        "{}",
+        running.ready
+    );
+    assert_eq!(running.http(), None, "{}", running.ready);
+
+    let mut endpoint = Endpoint::start(&fixture);
+    // The wait belongs to the start call itself: its own reply may already carry the output, and
+    // a later read would only see what this one had not shown. READY follows the whole number.
+    let (started, text, error) = endpoint.call(json!({
+        "action": "start",
+        "command": NAMED_TASK,
+        "waitMs": 30000,
+        "returnWhen": {"outputContains": ["READY"]}
+    }));
+    assert!(!error, "{text}");
+    assert_eq!(started["state"], json!("running"), "{started}");
+    let _id = Endpoint::task_id(&started, &text);
+    let task = printed_pid(&text);
+    assert!(
+        is_alive(task),
+        "the task runs before the daemon stops: {text}"
+    );
+    endpoint.close();
+
+    // A signal takes the same path as `daemon stop`. Sending a console control event to a child
+    // needs a console of its own, which this harness has not, so Windows stops it the CLI way.
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            unsafe { libc::kill(running.pid() as i32, libc::SIGTERM) },
+            0
+        );
+    }
+    #[cfg(windows)]
+    {
+        let (code, out, err) = fixture.run(&["daemon", "stop"]);
+        assert_eq!(code, 0, "{out}{err}");
+        assert!(out.contains("Stopped"), "{out}");
+    }
+    let status = running
+        .wait_exit(Duration::from_secs(60))
+        .expect("the daemon exits");
+    assert_eq!(status.code(), Some(0), "a signalled daemon exits cleanly");
+    // The task it was running went with it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while is_alive(task) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!is_alive(task), "the task outlived the daemon that ran it");
 }

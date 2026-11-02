@@ -6,10 +6,12 @@ mod conpty;
 mod conpty_spawn;
 mod daemon;
 mod endpoint;
+mod files;
 mod frames;
 #[cfg(unix)]
 mod host;
 mod http;
+mod images;
 mod ipc;
 mod keys;
 mod output;
@@ -19,12 +21,14 @@ mod service;
 mod session;
 mod tasks;
 mod terminal;
+mod transfer;
 mod transport;
 mod wait;
 
 use ipc::{ToDaemon, ToEndpoint};
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use service::{Call, Render, Service};
@@ -37,6 +41,12 @@ use tokio::sync::watch;
 #[derive(Clone)]
 struct Server {
     backend: Backend,
+    /// This server's own routes: the tool list and the description of `exec` are built per
+    /// server, because what they say about the host differs between servers.
+    router: ToolRouter<Server>,
+    /// The files this server publishes under `/t/`, for an HTTP session only. Its absence is what
+    /// removes the `transfer` route from a stdio session.
+    transfers: Option<Arc<transfer::Transfers>>,
 }
 
 /// Where this server's calls run: in this process, or on the namespace's daemon.
@@ -67,6 +77,29 @@ impl Backend {
 }
 
 impl Server {
+    /// A server over `backend`, whose `exec` tool says where its tasks run.
+    fn new(
+        backend: Backend,
+        launch: &LaunchContext,
+        transfers: Option<Arc<transfer::Transfers>>,
+    ) -> Self {
+        let mut router = Self::tool_router();
+        let exec = router
+            .map
+            .get_mut("exec")
+            .expect("the generated router has the exec route");
+        exec.attr.description = Some(exec_description(launch).into());
+        if transfers.is_none() {
+            // A stdio session has no route to serve a URL from, so it never sees the tool.
+            router.remove_route("transfer");
+        }
+        Self {
+            backend,
+            router,
+            transfers,
+        }
+    }
+
     /// This server's session: the client name and a short random ID, its tasks' owner.
     fn session(&self, context: &RequestContext<RoleServer>) -> Result<Arc<Session>, String> {
         let Backend::Local {
@@ -99,12 +132,72 @@ fn client_name(context: &RequestContext<RoleServer>) -> String {
 
 /// Server instructions say when to use the tool; hosts that show one line take the first. The
 /// second line says where the tasks live, which is the one thing that differs between the modes.
-const INSTRUCTIONS_LOCAL: &str = "Runs bash commands as tasks: long-running builds and servers, stdin-driven programs, and terminal (PTY) programs such as password prompts, with bounded output and process-tree kill.
+const INSTRUCTIONS_LOCAL: &str = "Run bash tasks with exec and read, write, and edit files on this host.
 Prefer it over one-shot shell tools when a command may outlive a single call or needs input; tasks end when the session ends.";
-const INSTRUCTIONS_DAEMON: &str = "Runs bash commands as tasks: long-running builds and servers, stdin-driven programs, and terminal (PTY) programs such as password prompts, with bounded output and process-tree kill.
+const INSTRUCTIONS_DAEMON: &str = "Run bash tasks with exec and read, write, and edit files on this host.
 Prefer it over one-shot shell tools when a command may outlive a single call or needs input; tasks run in a shared background daemon, outlive this session, and are visible to every session using it.";
 
-#[tool_handler]
+/// The `exec` tool's description: the static text, the Windows paragraph on Windows, and one
+/// line saying where this server's tasks run. Nothing in it changes while the server runs.
+fn exec_description(launch: &LaunchContext) -> String {
+    let mut description = include_str!("description.md").trim_end().to_owned();
+    if cfg!(windows) {
+        description.push_str("\n\n");
+        description.push_str(include_str!("description-windows.md").trim_end());
+    }
+    description.push_str("\n\nHost: ");
+    description.push_str(&host_line(launch));
+    description
+}
+
+/// `os arch · hostname · user <user> · home <home> · default cwd <cwd>`, with `unknown` for a
+/// value the launch environment does not hold.
+fn host_line(launch: &LaunchContext) -> String {
+    let value = |name: &str| {
+        launch
+            .var(name)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string_lossy().into_owned())
+    };
+    let hostname = hostname(launch).unwrap_or_else(|| "unknown".to_owned());
+    let user = value("USER")
+        .or_else(|| value("USERNAME"))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let home = launch
+        .home()
+        .map_or_else(|| "unknown".to_owned(), |home| home.display().to_string());
+    format!(
+        "{} {} · {hostname} · user {user} · home {home} · default cwd {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        launch.cwd.display()
+    )
+}
+
+/// This host's name: the launch environment's `COMPUTERNAME` on Windows, the kernel's answer on
+/// Unix.
+#[cfg(windows)]
+fn hostname(launch: &LaunchContext) -> Option<String> {
+    launch
+        .var("COMPUTERNAME")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+#[cfg(unix)]
+fn hostname(launch: &LaunchContext) -> Option<String> {
+    let _ = launch;
+    let mut name = [0u8; 256];
+    // SAFETY: `name` is writable for the length passed, as `gethostname` requires.
+    let answer = unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) };
+    if answer != 0 {
+        return None;
+    }
+    let end = name.iter().position(|byte| *byte == 0)?;
+    String::from_utf8(name[..end].to_vec()).ok()
+}
+
+#[tool_handler(router = self.router)]
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -117,7 +210,7 @@ impl ServerHandler for Server {
 impl Server {
     #[doc = include_str!("description.md")]
     #[tool(
-        name = "fastexec",
+        name = "exec",
         annotations(
             title = "Run bash command",
             read_only_hint = false,
@@ -125,7 +218,7 @@ impl Server {
             open_world_hint = true
         )
     )]
-    async fn fastexec(
+    async fn exec(
         &self,
         Parameters(request): Parameters<service::Request>,
         context: RequestContext<RoleServer>,
@@ -144,6 +237,7 @@ impl Server {
                 };
                 endpoint
                     .call(
+                        "exec",
                         arguments,
                         context.id.to_string(),
                         &client_name(&context),
@@ -177,6 +271,156 @@ impl Server {
             }
         }
     }
+
+    #[doc = "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."]
+    #[tool(name = "read", annotations(title = "Read file", read_only_hint = true))]
+    async fn read(
+        &self,
+        Parameters(request): Parameters<files::ReadRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        match &self.backend {
+            Backend::Local { launch, .. } => {
+                files::read(request, Arc::clone(launch), self.transfers.is_some()).await
+            }
+            Backend::Daemon(endpoint) => forward(endpoint, "read", &request, &context).await,
+        }
+    }
+
+    #[doc = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."]
+    #[tool(
+        name = "write",
+        annotations(title = "Write file", destructive_hint = true, idempotent_hint = false)
+    )]
+    async fn write(
+        &self,
+        Parameters(request): Parameters<files::WriteRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        match &self.backend {
+            Backend::Local { launch, .. } => files::write(request, Arc::clone(launch)).await,
+            Backend::Daemon(endpoint) => forward(endpoint, "write", &request, &context).await,
+        }
+    }
+
+    #[doc = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes."]
+    #[tool(
+        name = "edit",
+        annotations(title = "Edit file", destructive_hint = true, idempotent_hint = false)
+    )]
+    async fn edit(
+        &self,
+        Parameters(request): Parameters<files::EditRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        match &self.backend {
+            Backend::Local { launch, .. } => files::edit(request, Arc::clone(launch)).await,
+            Backend::Daemon(endpoint) => forward(endpoint, "edit", &request, &context).await,
+        }
+    }
+
+    #[doc = "Publish one file at a URL that serves it for GET (download), HEAD (current size) and PUT (upload). The URL stops working after 10 minutes unused. Pack a directory with tar through exec first. Start every new upload with `curl -fsS -X PUT --data-binary '' \"$url?offset=0\"`, then `curl -fsS -T file \"$url\"`; on HTTP 413 or a broken connection, read the uploaded size with `curl -fsSI \"$url\"` and send the rest of the same unchanged file in parts, one at a time: `tail -c +$((off+1)) file | head -c 1048576 | curl -fsS -T - \"$url?offset=$off\"`. Download with `curl -fsS -o file \"$url\"`, resume with `curl -fsS -C - -o file \"$url\"`, and verify with sha256sum on both ends."]
+    #[tool(
+        name = "transfer",
+        annotations(
+            title = "Transfer file",
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn transfer(
+        &self,
+        Parameters(request): Parameters<transfer::Request>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let Some(table) = &self.transfers else {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "transfer needs an HTTP session, and this one is stdio.",
+            )]);
+        };
+        let Backend::Local { launch, render, .. } = &self.backend else {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "transfer needs an HTTP session, and this one is stdio.",
+            )]);
+        };
+        let path = match files::resolve(&request.path, launch) {
+            Ok(path) => path,
+            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+        };
+        let url = match transfer_url(path, table, &context) {
+            Ok(url) => url,
+            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+        };
+        let mut result = CallToolResult::success(vec![ContentBlock::text(url.clone())]);
+        result.structured_content = Some(serde_json::json!({ "url": url }));
+        service::suppress(result, *render)
+    }
+}
+
+/// The URL a transfer publishes: this listener, as the client reached it, and a fresh id.
+///
+/// shortcut: no FASTEXEC_PUBLIC_URL; add it when a proxy rewrites Host.
+fn transfer_url(
+    path: std::path::PathBuf,
+    table: &Arc<transfer::Transfers>,
+    context: &RequestContext<RoleServer>,
+) -> Result<String, String> {
+    let Some(parts) = context.extensions.get::<::http::request::Parts>() else {
+        return Err("Cannot make a transfer URL outside an HTTP request.".to_owned());
+    };
+    let host = parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "Cannot make a transfer URL: the request names no Host.".to_owned())?;
+    let authority: ::http::uri::Authority = host
+        .parse()
+        .map_err(|_| format!("Cannot make a transfer URL: {host} is not a host."))?;
+    let scheme = forwarded_scheme(&parts.headers);
+    let id = table.create(path)?;
+    Ok(format!("{scheme}://{authority}/t/{id}"))
+}
+
+/// The scheme the client saw: the first `X-Forwarded-Proto` token when it names one of the two.
+fn forwarded_scheme(headers: &::http::HeaderMap) -> &'static str {
+    let token = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim);
+    match token {
+        Some(token) if token.eq_ignore_ascii_case("https") => "https",
+        Some(token) if token.eq_ignore_ascii_case("http") => "http",
+        _ => "http",
+    }
+}
+
+/// Sends a file tool's call to the daemon, which runs it with the session's launch context.
+async fn forward<T: serde::Serialize>(
+    endpoint: &endpoint::Endpoint,
+    tool: &str,
+    request: &T,
+    context: &RequestContext<RoleServer>,
+) -> CallToolResult {
+    let arguments = match serde_json::to_value(request) {
+        Ok(arguments) => arguments,
+        Err(problem) => {
+            return CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                "cannot serialize the call: {problem}"
+            ))]);
+        }
+    };
+    let (progress, _forwarder) = progress(context);
+    endpoint
+        .call(
+            tool,
+            arguments,
+            context.id.to_string(),
+            &client_name(context),
+            context.ct.clone(),
+            progress,
+        )
+        .await
 }
 
 /// Aborts the progress forwarder however the call returns, including through `?`.
@@ -267,7 +511,21 @@ fn daemon_main(args: &[std::ffi::OsString]) -> i32 {
                 build.to_string_lossy().into_owned(),
                 flags.http,
                 flags.idle_exit.unwrap_or_default(),
+                false,
             )
+        }
+        // The daemon in this process, in the foreground, until it is stopped: the supervisor that
+        // started it owns its lifetime, so it never detaches and never reuses a running daemon.
+        "run" => {
+            let flags = match daemon_flags(&args[1..]) {
+                Ok(flags) => flags,
+                Err(message) => return fail(&message),
+            };
+            // A foreground daemon serves until it is stopped, so there is no idleness to exit on.
+            if flags.idle_exit.is_some() {
+                return fail(DAEMON_USAGE);
+            }
+            cli_run(flags)
         }
         "start" | "status" | "stop" => {
             let flags = match daemon_flags(&args[1..]) {
@@ -294,8 +552,7 @@ fn daemon_main(args: &[std::ffi::OsString]) -> i32 {
     }
 }
 
-const DAEMON_USAGE: &str =
-    "usage: fastexec daemon start [--http <addr>] [--idle-exit on|off] | status | stop";
+const DAEMON_USAGE: &str = "usage: fastexec daemon start [--http <addr>] [--idle-exit on|off] | run [--http <addr>] | status | stop";
 
 #[derive(Default)]
 struct DaemonFlags {
@@ -305,8 +562,8 @@ struct DaemonFlags {
 
 fn daemon_flags(args: &[std::ffi::OsString]) -> Result<DaemonFlags, String> {
     let mut flags = DaemonFlags::default();
-    let mut pairs = args.chunks_exact(2);
-    for pair in &mut pairs {
+    let (pairs, rest) = args.as_chunks::<2>();
+    for pair in pairs {
         if pair[0] == "--http" && flags.http.is_none() {
             flags.http = Some(pair[1].to_string_lossy().into_owned());
         } else if pair[0] == "--idle-exit" && flags.idle_exit.is_none() {
@@ -319,60 +576,33 @@ fn daemon_flags(args: &[std::ffi::OsString]) -> Result<DaemonFlags, String> {
             return Err(DAEMON_USAGE.to_owned());
         }
     }
-    if !pairs.remainder().is_empty() {
+    if !rest.is_empty() {
         return Err(DAEMON_USAGE.to_owned());
     }
     Ok(flags)
 }
 
-#[cfg(test)]
-mod daemon_flag_tests {
-    use super::*;
-
-    fn parse(args: &[&str]) -> Result<DaemonFlags, String> {
-        daemon_flags(
-            &args
-                .iter()
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    #[test]
-    fn idle_exit_is_opt_in_and_combines_with_http_in_either_order() {
-        assert!(!parse(&[]).unwrap().idle_exit.unwrap_or_default());
-        assert_eq!(
-            parse(&["--idle-exit", "off"]).unwrap().idle_exit,
-            Some(false)
-        );
-        assert_eq!(parse(&["--idle-exit", "on"]).unwrap().idle_exit, Some(true));
-        for args in [
-            ["--http", "127.0.0.1:0", "--idle-exit", "on"],
-            ["--idle-exit", "on", "--http", "127.0.0.1:0"],
-        ] {
-            let flags = parse(&args).unwrap();
-            assert_eq!(flags.http.as_deref(), Some("127.0.0.1:0"));
-            assert_eq!(flags.idle_exit, Some(true));
-        }
-    }
-
-    #[test]
-    fn malformed_or_repeated_daemon_flags_are_rejected() {
-        for args in [
-            vec!["--idle-exit"],
-            vec!["--idle-exit", "true"],
-            vec!["--idle-exit", "on", "--idle-exit", "off"],
-            vec!["--http", "127.0.0.1:0", "--http", "127.0.0.1:1"],
-            vec!["--unknown", "off"],
-        ] {
-            assert!(parse(&args).is_err(), "accepted {args:?}");
-        }
-    }
-}
-
 fn fail(message: &str) -> i32 {
     eprintln!("fastexec: {message}");
     1
+}
+
+/// `daemon run`: the daemon in this process, in the foreground. It derives the namespace and the
+/// build exactly as `start` does, and it holds no runtime of its own here: the daemon's runtime
+/// starts once, inside the daemon.
+fn cli_run(flags: DaemonFlags) -> i32 {
+    let launch = match LaunchContext::current() {
+        Ok(launch) => launch,
+        Err(error) => return fail(&format!("cannot read the launch context: {error}")),
+    };
+    let identity = match runtime::identity(&launch) {
+        Ok(identity) => identity,
+        Err(error) => return fail(&format!("cannot identify this image: {error}")),
+    };
+    if let Err(error) = runtime::paths(&identity.namespace) {
+        return fail(&format!("cannot use the runtime directory: {error}"));
+    }
+    daemon::serve_process(identity.namespace, identity.build, flags.http, false, true)
 }
 
 /// The CLI: one exchange with the namespace's daemon, and what it prints.
@@ -770,12 +1000,12 @@ async fn serve() {
             service: Arc::new(Service::new(Arc::clone(&tasks), false)),
             render,
             session: Arc::new(OnceLock::new()),
-            launch,
+            launch: Arc::clone(&launch),
             instructions: INSTRUCTIONS_LOCAL,
         };
         (backend, Some(tasks))
     };
-    let server = Server { backend };
+    let server = Server::new(backend, &launch, None);
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
         inner: tokio::io::stdin(),
@@ -850,4 +1080,49 @@ async fn shutdown_signal() {
     }
     #[cfg(windows)]
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod daemon_flag_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<DaemonFlags, String> {
+        daemon_flags(
+            &args
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn idle_exit_is_opt_in_and_combines_with_http_in_either_order() {
+        assert!(!parse(&[]).unwrap().idle_exit.unwrap_or_default());
+        assert_eq!(
+            parse(&["--idle-exit", "off"]).unwrap().idle_exit,
+            Some(false)
+        );
+        assert_eq!(parse(&["--idle-exit", "on"]).unwrap().idle_exit, Some(true));
+        for args in [
+            ["--http", "127.0.0.1:0", "--idle-exit", "on"],
+            ["--idle-exit", "on", "--http", "127.0.0.1:0"],
+        ] {
+            let flags = parse(&args).unwrap();
+            assert_eq!(flags.http.as_deref(), Some("127.0.0.1:0"));
+            assert_eq!(flags.idle_exit, Some(true));
+        }
+    }
+
+    #[test]
+    fn malformed_or_repeated_daemon_flags_are_rejected() {
+        for args in [
+            vec!["--idle-exit"],
+            vec!["--idle-exit", "true"],
+            vec!["--idle-exit", "on", "--idle-exit", "off"],
+            vec!["--http", "127.0.0.1:0", "--http", "127.0.0.1:1"],
+            vec!["--unknown", "off"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
 }

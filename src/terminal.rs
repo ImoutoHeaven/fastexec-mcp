@@ -574,12 +574,12 @@ impl Recorder {
         let mut left = 0;
         let mut start = 0;
         for line in 0..=last_text {
-            if line == self.partial_row {
-                if let Some((prefix, prefix_mark)) = &self.partial {
-                    text.push_str(prefix);
-                    mark = *prefix_mark;
-                    left = prefix.len();
-                }
+            if line == self.partial_row
+                && let Some((prefix, prefix_mark)) = &self.partial
+            {
+                text.push_str(prefix);
+                mark = *prefix_mark;
+                left = prefix.len();
             }
             let row = &grid[Line(line as i32)];
             if text.is_empty() && left == 0 {

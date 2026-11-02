@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// What a Hello and a Welcome must agree on.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// The largest frame the daemon accepts. A Hello carries the endpoint's whole environment, which
 /// is the reason this is larger than a call.
@@ -217,10 +217,12 @@ pub enum ToDaemon {
         cwd: OsText,
         env: Vec<(OsText, OsText)>,
     },
-    /// One call. `id` comes from an endpoint-wide counter, so it keeps naming this call across a
-    /// reconnect; `request_id` is the MCP JSON-RPC ID, kept as a label because clients reuse it.
+    /// One call, of one tool. `id` comes from an endpoint-wide counter, so it keeps naming this
+    /// call across a reconnect; `request_id` is the MCP JSON-RPC ID, kept as a label because
+    /// clients reuse it.
     Call {
         id: u64,
+        tool: String,
         request_id: String,
         arguments: serde_json::Value,
     },
@@ -381,6 +383,7 @@ mod tests {
             hello(),
             ToDaemon::Call {
                 id: 7,
+                tool: "exec".to_owned(),
                 request_id: "3".to_owned(),
                 arguments: json!({"action": "start", "command": "echo hi"}),
             },
@@ -423,6 +426,7 @@ mod tests {
         assert_eq!(serde_json::to_vec(&arguments).unwrap().len(), CALL_LIMIT);
         let message = ToDaemon::Call {
             id: 5,
+            tool: "exec".to_owned(),
             request_id: "5".to_owned(),
             arguments,
         };
@@ -471,6 +475,7 @@ mod tests {
     async fn frames_one_after_another_read_one_after_another() {
         let first = ToDaemon::Call {
             id: 1,
+            tool: "exec".to_owned(),
             request_id: "1".to_owned(),
             arguments: json!({"action": "list"}),
         };
@@ -510,6 +515,7 @@ mod tests {
     async fn a_body_exactly_at_the_limit_reads() {
         let message = ToDaemon::Call {
             id: 4,
+            tool: "exec".to_owned(),
             request_id: "4".to_owned(),
             arguments: json!({"action": "list"}),
         };

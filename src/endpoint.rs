@@ -115,6 +115,7 @@ impl Endpoint {
     /// Runs one call on the daemon and answers with its result.
     pub async fn call(
         &self,
+        tool: &str,
         arguments: serde_json::Value,
         request_id: String,
         client_name: &str,
@@ -164,6 +165,7 @@ impl Endpoint {
         }
         let frame = ToDaemon::Call {
             id,
+            tool: tool.to_owned(),
             request_id: request_id.clone(),
             arguments,
         };
@@ -182,13 +184,13 @@ impl Endpoint {
         if !matches!(written, Some(Ok(Ok(())))) {
             lock(&link.pending).remove(&id);
             self.close(&link);
-            return self.lost(&link, &action, id, &request_id);
+            return self.lost(&link, tool, &action, id, &request_id);
         }
         tokio::select! {
             answer = answer => match answer {
                 Ok(result) => result,
                 // The reader dropped the entry, so the link is gone.
-                Err(_) => self.lost(&link, &action, id, &request_id),
+                Err(_) => self.lost(&link, tool, &action, id, &request_id),
             },
             _ = cancel.cancelled() => {
                 // The wait ends here; the task keeps running on the daemon.
@@ -205,7 +207,7 @@ impl Endpoint {
                 }
                 error("Cancelled; the task keeps running.")
             }
-            _ = link.closed.cancelled() => self.lost(&link, &action, id, &request_id),
+            _ = link.closed.cancelled() => self.lost(&link, tool, &action, id, &request_id),
         }
     }
 
@@ -293,9 +295,22 @@ impl Endpoint {
     }
 
     /// The call may have run, so it is reported, never replayed.
-    fn lost(&self, link: &Link, action: &str, id: u64, request_id: &str) -> CallToolResult {
+    fn lost(
+        &self,
+        link: &Link,
+        tool: &str,
+        action: &str,
+        id: u64,
+        request_id: &str,
+    ) -> CallToolResult {
+        if tool == "exec" {
+            return error(format!(
+                "The connection to the fastexec daemon (epoch {}) closed during {action} call {id} (request {request_id}, session {}); the operation may have run. Use action list to check.",
+                link.epoch, self.session
+            ));
+        }
         error(format!(
-            "The connection to the fastexec daemon (epoch {}) closed during {action} call {id} (request {request_id}, session {}); the operation may have run. Use action list to check.",
+            "The connection to the fastexec daemon (epoch {}) closed during {tool} call {id} (request {request_id}, session {}); the call may or may not have run.",
             link.epoch, self.session
         ))
     }
@@ -610,6 +625,7 @@ mod tests {
             tokio::spawn(async move {
                 endpoint
                     .call(
+                        "exec",
                         serde_json::json!({"action": "list"}),
                         "1".to_owned(),
                         "test",
@@ -725,6 +741,7 @@ mod tests {
         let result = timeout(
             Duration::from_secs(30),
             endpoint.call(
+                "exec",
                 serde_json::json!({"action": "list"}),
                 "1".to_owned(),
                 "test",
@@ -804,6 +821,7 @@ mod tests {
             tokio::spawn(async move {
                 endpoint
                     .call(
+                        "exec",
                         serde_json::json!({"action": "list"}),
                         "1".to_owned(),
                         "test",
@@ -845,6 +863,96 @@ mod tests {
             seen.lock().unwrap()
         );
         assert!(lock(&link.pending).is_empty(), "the call is still pending");
+
+        // Dropping the last reference closes the connection, which ends the peer.
+        drop(link);
+        drop(endpoint);
+        finish(peer).await;
+    }
+
+    /// A file tool's lost call names the tool and says only that it may or may not have run.
+    #[tokio::test]
+    async fn a_lost_file_tool_call_names_its_tool_and_no_action_list() {
+        let (identity, paths, mut listener, _target) = test_daemon("lost-files");
+        let answering = identity.clone();
+        let peer = tokio::spawn(async move {
+            let Ok(mut conn) = listener.accept().await else {
+                return;
+            };
+            let Ok(Some(ToDaemon::Hello { .. })) =
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await
+            else {
+                return;
+            };
+            let welcome = ToEndpoint::Welcome {
+                protocol: ipc::PROTOCOL,
+                namespace: answering.namespace.clone(),
+                build: answering.build.clone(),
+                epoch: "e".repeat(26),
+            };
+            if ipc::write_frame(&mut conn, &welcome).await.is_err() {
+                return;
+            }
+            // The daemon reads the call and never answers it, so the link is lost under it.
+            while let Ok(Some(frame)) =
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await
+            {
+                if matches!(frame, ToDaemon::Bye) {
+                    break;
+                }
+            }
+        });
+
+        let endpoint = Arc::new(Endpoint::for_test(identity, paths));
+        let link = endpoint
+            .link("test", std::time::Instant::now() + runtime::START_WAIT)
+            .await
+            .expect("a link");
+        let busy = link.writer.lock().await;
+        let calling = {
+            let endpoint = Arc::clone(&endpoint);
+            tokio::spawn(async move {
+                endpoint
+                    .call(
+                        "read",
+                        serde_json::json!({"path": "notes.txt"}),
+                        "1".to_owned(),
+                        "test",
+                        CancellationToken::new(),
+                        None,
+                    )
+                    .await
+            })
+        };
+        let mut waited = 0;
+        while lock(&link.pending).is_empty() && waited < 500 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert_eq!(
+            lock(&link.pending).keys().copied().collect::<Vec<u64>>(),
+            vec![1],
+            "the call is not queued on this link"
+        );
+        endpoint.close(&link);
+        let result = timeout(Duration::from_secs(5), calling)
+            .await
+            .expect("the queued call ended")
+            .unwrap();
+        let text = result.content[0]
+            .as_text()
+            .map(|text| text.text.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            text,
+            format!(
+                "The connection to the fastexec daemon (epoch {}) closed during read call 1 (request 1, session {}); the call may or may not have run.",
+                "e".repeat(26),
+                endpoint.session
+            )
+        );
+        assert!(!text.contains("action list"), "{text}");
+        drop(busy);
 
         // Dropping the last reference closes the connection, which ends the peer.
         drop(link);

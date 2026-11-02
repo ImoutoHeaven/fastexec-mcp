@@ -118,7 +118,7 @@ impl Drop for Pending<'_> {
 }
 
 /// Crockford's base32 alphabet in lowercase.
-const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+pub(crate) const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// `value` in Crockford's base32, most significant digit first, no padding beyond `digits`.
 fn base32(mut value: u128, digits: usize) -> String {

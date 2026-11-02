@@ -138,7 +138,7 @@ impl Server {
         let start = arguments["action"] == "start";
         let message = self.request(
             "tools/call",
-            json!({"name": "fastexec", "arguments": arguments}),
+            json!({"name": "exec", "arguments": arguments}),
         );
         let result = &message["result"];
         assert!(result.is_object(), "protocol error: {message}");
@@ -183,6 +183,18 @@ impl Server {
         let (structured, text, is_error) = self.call(arguments);
         assert!(!is_error, "unexpected error: {text}");
         (structured, text)
+    }
+
+    /// Calls one of the file tools: (text, isError).
+    fn file(&mut self, name: &str, arguments: Value) -> (String, bool) {
+        let message = self.request("tools/call", json!({"name": name, "arguments": arguments}));
+        let result = &message["result"];
+        assert!(result.is_object(), "protocol error: {message}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (text, result["isError"] == json!(true))
     }
 }
 
@@ -816,6 +828,163 @@ fn tasks_inherit_the_launch_context_the_server_captured_at_startup() {
     assert!(
         text.contains(&name),
         "a start without cwd ran in the context's directory: {text}"
+    );
+}
+
+#[test]
+fn the_listed_tool_says_which_host_it_runs_on() {
+    let dir = Scratch::new("exec-description");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let mut server = Server::start_with(|command| {
+        command.current_dir(&*dir);
+    });
+    let listed = server.request("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let mut names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["edit", "exec", "read", "write"], "{listed}");
+    // A stdio session has no route to serve a URL from, so `transfer` is not even a tool here.
+    let refused = server.request(
+        "tools/call",
+        json!({"name": "transfer", "arguments": {"path": "notes/a.txt"}}),
+    );
+    assert_eq!(
+        refused["error"]["message"],
+        json!("tool not found"),
+        "{refused}"
+    );
+    let exec = tools
+        .iter()
+        .find(|tool| tool["name"] == json!("exec"))
+        .unwrap_or_else(|| panic!("no exec in {listed}"));
+    let description = exec["description"].as_str().unwrap();
+    // The host line is the last one, so a client that shows the tail still says where it runs.
+    let last = description.lines().last().unwrap();
+    assert!(last.starts_with("Host: "), "{last:?}");
+    let cwd = last
+        .split_once("default cwd ")
+        .unwrap_or_else(|| panic!("no default cwd in {last:?}"))
+        .1;
+    let expected = dir.display().to_string();
+    let same = if cfg!(windows) {
+        cwd.eq_ignore_ascii_case(&expected)
+    } else {
+        cwd == expected
+    };
+    assert!(same, "cwd {cwd:?}, expected {expected:?} in {last:?}");
+    // The Windows paragraph is there exactly where it applies.
+    assert_eq!(
+        description.contains("MSYS_NO_PATHCONV"),
+        cfg!(windows),
+        "{description}"
+    );
+}
+
+#[test]
+fn file_tools_round_trip_through_the_servers_directory() {
+    let dir = Scratch::new("files");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let mut server = Server::start_with(|command| {
+        command.current_dir(&*dir);
+    });
+    let (text, error) = server.file(
+        "write",
+        json!({"path": "notes/a.txt", "content": "one\ntwo\n"}),
+    );
+    assert!(!error, "{text}");
+    assert_eq!(text, "Successfully wrote to notes/a.txt");
+    let (text, error) = server.file("read", json!({"path": "notes/a.txt"}));
+    assert!(!error, "{text}");
+    assert_eq!(text, "one\ntwo\n");
+    let (text, error) = server.file(
+        "edit",
+        json!({"path": "notes/a.txt", "edits": [{"oldText": "two", "newText": "TWO"}]}),
+    );
+    assert!(!error, "{text}");
+    assert_eq!(
+        text,
+        "Successfully replaced 1 block(s) in notes/a.txt.\nedits[0]: line 2"
+    );
+    let (text, _) = server.file("read", json!({"path": "notes/a.txt"}));
+    assert_eq!(text, "one\nTWO\n");
+    // The path resolved against the server's own directory, which is where the file now is.
+    assert_eq!(
+        std::fs::read(dir.join("notes/a.txt")).unwrap(),
+        b"one\nTWO\n"
+    );
+    // A missing file is an error result, not a protocol failure.
+    let (text, error) = server.file("read", json!({"path": "notes/missing.txt"}));
+    assert!(error, "{text}");
+    assert!(
+        text.starts_with("Cannot read notes/missing.txt: "),
+        "{text}"
+    );
+}
+
+#[test]
+fn read_answers_a_png_with_a_text_block_and_an_image_block() {
+    let dir = Scratch::new("image");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let image =
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 6, image::Rgb([7, 8, 9])));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(dir.join("shot.png"), &png).unwrap();
+    let mut server = Server::start_with(|command| {
+        command.current_dir(&*dir);
+    });
+    let message = server.request(
+        "tools/call",
+        json!({"name": "read", "arguments": {"path": "shot.png"}}),
+    );
+    let result = &message["result"];
+    assert_eq!(result["isError"], json!(false), "{message}");
+    let content = result["content"].as_array().expect("content blocks");
+    assert_eq!(content.len(), 2, "{message}");
+    assert_eq!(content[0]["type"], json!("text"));
+    assert_eq!(content[0]["text"], json!("Read image file [image/png]"));
+    assert_eq!(content[1]["type"], json!("image"));
+    assert_eq!(content[1]["mimeType"], json!("image/png"));
+    assert_eq!(
+        content[1]["data"],
+        json!(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &png
+        ))
+    );
+}
+
+#[test]
+fn read_omits_an_image_past_the_encoded_ceiling_without_loading_it() {
+    let dir = Scratch::new("image-oversized");
+    std::fs::create_dir_all(&*dir).unwrap();
+    // Sparse: a PNG signature and the IHDR chunk it is recognized by at the front, and a length
+    // past the ceiling a read loads, so creating it costs nothing and reading it whole would
+    // cost the ceiling.
+    let path = dir.join("huge.png");
+    let mut file = std::fs::File::create(&path).unwrap();
+    std::io::Write::write_all(&mut file, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
+    file.set_len((512 << 20) + 1).unwrap();
+    drop(file);
+    let mut server = Server::start_with(|command| {
+        command.current_dir(&*dir);
+    });
+    let message = server.request(
+        "tools/call",
+        json!({"name": "read", "arguments": {"path": "huge.png"}}),
+    );
+    let result = &message["result"];
+    assert_eq!(result["isError"], json!(false), "{message}");
+    let content = result["content"].as_array().expect("content blocks");
+    assert_eq!(content.len(), 1, "no image is attached: {message}");
+    assert_eq!(
+        content[0]["text"],
+        json!("Read image file [image/png]\n[Image omitted: the file is larger than 512 MiB.]")
     );
 }
 
@@ -2028,7 +2197,7 @@ fn closing_the_server_ends_running_tasks_and_removes_logs() {
     let log = PathBuf::from(out["logPath"].as_str().unwrap());
     assert!(log.exists());
     // An in-flight wait must not delay shutdown: hosts escalate to SIGKILL within ~2.5 s.
-    let poll = json!({"name": "fastexec", "arguments": {"action": "poll", "taskId": server.id(1), "waitMs": 60000}});
+    let poll = json!({"name": "exec", "arguments": {"action": "poll", "taskId": server.id(1), "waitMs": 60000}});
     server.send(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/call", "params": poll}));
     std::thread::sleep(Duration::from_millis(300));
     drop(server.stdin.take());
@@ -2353,7 +2522,7 @@ fn invalid_parameters_are_rejected_and_null_means_omitted() {
     }
     let message = server.request(
         "tools/call",
-        json!({"name": "fastexec", "arguments": {"action": "list", "bogus": 1}}),
+        json!({"name": "exec", "arguments": {"action": "list", "bogus": 1}}),
     );
     assert!(
         message.get("error").is_some() || message["result"]["isError"] == json!(true),
@@ -2371,7 +2540,7 @@ fn long_wait_sends_progress_and_cancellation_leaves_the_task_running() {
     server.ok(json!({"action": "start", "command": "sleep 120", "waitMs": 0}));
     server.next_id += 1;
     let id = server.next_id;
-    let call = json!({"name": "fastexec", "arguments": {"action": "poll", "taskId": server.id(1), "waitMs": 60000}, "_meta": {"progressToken": "p1"}});
+    let call = json!({"name": "exec", "arguments": {"action": "poll", "taskId": server.id(1), "waitMs": 60000}, "_meta": {"progressToken": "p1"}});
     server.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": call}));
     let progress = server
         .lines

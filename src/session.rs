@@ -60,6 +60,25 @@ impl LaunchContext {
             .map(|(_, value)| value.as_os_str())
     }
 
+    /// The home directory this context's environment names: `USERPROFILE`, else `HOMEDRIVE` with
+    /// `HOMEPATH`, else `HOME` on Windows, and `HOME` on Unix. An empty value is a missing one.
+    pub fn home(&self) -> Option<PathBuf> {
+        let value = |name: &str| self.var(name).filter(|value| !value.is_empty());
+        if cfg!(windows) {
+            if let Some(profile) = value("USERPROFILE") {
+                return Some(PathBuf::from(profile.to_os_string()));
+            }
+            if let (Some(drive), Some(path)) = (value("HOMEDRIVE"), value("HOMEPATH")) {
+                // `HOMEPATH` starts at the root of the drive, so the two join as text: joining
+                // them as paths would drop the drive.
+                let mut home = drive.to_os_string();
+                home.push(path);
+                return Some(PathBuf::from(home));
+            }
+        }
+        value("HOME").map(|home| PathBuf::from(home.to_os_string()))
+    }
+
     /// The bash these tasks run, found in this context's environment.
     pub fn bash(&self) -> Result<&Path, String> {
         if let Some(found) = self.bash.get() {
@@ -240,6 +259,39 @@ mod tests {
             assert_eq!(ctx.var("path"), None);
         }
         assert_eq!(ctx.var("MISSING"), None);
+    }
+
+    #[test]
+    fn home_follows_the_platforms_variable_order() {
+        if cfg!(windows) {
+            let all = context(&[
+                ("USERPROFILE", r"C:\Users\profile"),
+                ("HOMEDRIVE", "D:"),
+                ("HOMEPATH", r"\Users\pair"),
+                ("HOME", "/home/third"),
+            ]);
+            assert_eq!(all.home().unwrap(), PathBuf::from(r"C:\Users\profile"));
+            // An empty value is a missing one, so the next name in the order answers.
+            let pair = context(&[
+                ("USERPROFILE", ""),
+                ("HOMEDRIVE", "D:"),
+                ("HOMEPATH", r"\Users\pair"),
+                ("HOME", "/home/third"),
+            ]);
+            assert_eq!(pair.home().unwrap(), PathBuf::from(r"D:\Users\pair"));
+            let half = context(&[("HOMEDRIVE", "D:"), ("HOME", "/home/third")]);
+            assert_eq!(half.home().unwrap(), PathBuf::from("/home/third"));
+        } else {
+            assert_eq!(
+                context(&[("HOME", "/home/me"), ("USERPROFILE", "/ignored")]).home(),
+                Some(PathBuf::from("/home/me"))
+            );
+            assert_eq!(
+                context(&[("HOME", ""), ("USERPROFILE", "/ignored")]).home(),
+                None
+            );
+        }
+        assert_eq!(context(&[]).home(), None);
     }
 
     #[cfg(unix)]

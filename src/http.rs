@@ -4,9 +4,11 @@
 use crate::daemon::Daemon;
 use crate::service::Render;
 use crate::session::LaunchContext;
+use crate::transfer::{self, Admitted, Transfers};
 use crate::{Backend, INSTRUCTIONS_DAEMON, Server};
 use bytes::Bytes;
-use http::{HeaderMap, Request, Response, StatusCode, header};
+use http::header::HeaderName;
+use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -19,10 +21,12 @@ use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 /// The largest request body the daemon reads: a call carries its arguments, not a file.
@@ -42,7 +46,8 @@ pub struct Http {
 }
 
 /// What a reply carries: rmcp's own response type, so a refusal and a served call have one shape.
-type Reply = Response<BoxBody<Bytes, Infallible>>;
+/// A body can fail while it streams, which a transfer of a large file must be able to say.
+type Reply = Response<BoxBody<Bytes, std::io::Error>>;
 
 /// Serves MCP over Streamable HTTP on `listener` until the daemon stops.
 pub async fn serve(
@@ -56,16 +61,21 @@ pub async fn serve(
     // Every session gets a server of its own over the daemon's service, so two HTTP clients share
     // the daemon's tasks and keep their own cursors, exactly as two endpoints do.
     let service = Arc::clone(&daemon.service());
-    let factory = move || {
-        Ok(Server {
-            backend: Backend::Local {
+    // One table for this listener: the factory hands it to every session, so a URL a session
+    // makes is served by the same route that carries the requests.
+    let table = Arc::new(Transfers::new());
+    let factory = {
+        let table = Arc::clone(&table);
+        move || {
+            let backend = Backend::Local {
                 service: Arc::clone(&service),
                 render,
                 session: Arc::new(OnceLock::new()),
                 launch: Arc::clone(&launch),
                 instructions: INSTRUCTIONS_DAEMON,
-            },
-        })
+            };
+            Ok(Server::new(backend, &launch, Some(Arc::clone(&table))))
+        }
     };
     let bound = listener
         .local_addr()
@@ -96,6 +106,7 @@ pub async fn serve(
     let inner = StreamableHttpService::new(factory, Arc::new(sessions), config);
     let layer = Bearer {
         digest: Sha256::digest(token.as_bytes()).into(),
+        table,
         inner,
     };
     loop {
@@ -206,6 +217,8 @@ fn disconnect(error: &hyper::Error) -> bool {
 struct Bearer {
     /// The SHA-256 of the token, so the comparison is over two fixed-size values.
     digest: [u8; 32],
+    /// The files this listener publishes under `/t/`.
+    table: Arc<Transfers>,
     inner: StreamableHttpService<Server, LocalSessionManager>,
 }
 
@@ -221,7 +234,12 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
     fn call(&mut self, request: Request<Incoming>) -> Self::Future {
         let mut inner = self.inner.clone();
         let digest = self.digest;
+        let table = Arc::clone(&self.table);
         Box::pin(async move {
+            // A transfer is its own front door: no token, no body cap, and never a session.
+            if request.uri().path().starts_with("/t/") {
+                return Ok(serve_transfer(request, table).await);
+            }
             if !authorized(request.headers(), &digest) {
                 return Ok(refusal(StatusCode::UNAUTHORIZED, "Bearer"));
             }
@@ -232,10 +250,20 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
             }
             let (parts, body) = request.into_parts();
             let request = Request::from_parts(parts, Limited::new(body, LIMIT));
-            Ok(inner
+            let answer = inner
                 .call(request)
                 .await
-                .unwrap_or_else(|never| match never {}))
+                .unwrap_or_else(|never| match never {});
+            let (mut parts, body) = answer.into_parts();
+            // A proxy that buffers would hold every event of a stream until the call ended.
+            parts.headers.insert(
+                HeaderName::from_static("x-accel-buffering"),
+                "no".parse().expect("a header value"),
+            );
+            Ok(Response::from_parts(
+                parts,
+                body.map_err(|never: Infallible| match never {}).boxed(),
+            ))
         })
     }
 }
@@ -247,7 +275,11 @@ fn refusal(status: StatusCode, challenge: &str) -> Reply {
         builder = builder.header(header::WWW_AUTHENTICATE, challenge);
     }
     builder
-        .body(Full::new(Bytes::new()).boxed())
+        .body(
+            Full::new(Bytes::new())
+                .map_err(|never: Infallible| match never {})
+                .boxed(),
+        )
         .expect("a response with no body")
 }
 
@@ -285,6 +317,328 @@ fn authorized(headers: &HeaderMap, digest: &[u8; 32]) -> bool {
         .zip(digest)
         .fold(0u8, |difference, (a, b)| difference | (a ^ b))
         == 0
+}
+
+/// The bytes a streamed file is read in.
+const CHUNK: usize = 32 * 1024;
+
+/// Answers one `/t/` request: a download, the size of a file, or an upload.
+async fn serve_transfer(request: Request<Incoming>, table: Arc<Transfers>) -> Reply {
+    let id = request
+        .uri()
+        .path()
+        .strip_prefix("/t/")
+        .unwrap_or_default()
+        .to_owned();
+    if !transfer::valid_id(&id) {
+        return transfer_empty(StatusCode::NOT_FOUND, &[]);
+    }
+    // An unknown or expired id is absent whatever the method is, and a request refreshes a live
+    // one, so admission comes before the method is looked at. The guard then travels with the
+    // request: a download holds it inside its body, an upload inside its writer task.
+    let Some(admitted) = table.admit(&id) else {
+        return transfer_empty(StatusCode::NOT_FOUND, &[]);
+    };
+    match *request.method() {
+        Method::GET => transfer_get(request, admitted).await,
+        Method::HEAD => transfer_head(admitted).await,
+        Method::PUT => transfer_put(request, admitted).await,
+        _ => transfer_empty(
+            StatusCode::METHOD_NOT_ALLOWED,
+            &[(header::ALLOW.as_str(), "GET, HEAD, PUT")],
+        ),
+    }
+}
+
+/// What the table's entry has on disk.
+enum Presence {
+    File(u64),
+    Missing,
+    NotAFile,
+    Failed,
+}
+
+async fn presence(path: &Path) -> Presence {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() => Presence::File(metadata.len()),
+        Ok(_) => Presence::NotAFile,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Missing,
+        Err(_) => Presence::Failed,
+    }
+}
+
+/// Downloads a file, or the one range of it that was asked for.
+async fn transfer_get(request: Request<Incoming>, admitted: Admitted) -> Reply {
+    let size = match presence(admitted.path()).await {
+        Presence::File(size) => size,
+        Presence::Failed => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+        Presence::Missing | Presence::NotAFile => {
+            return transfer_empty(StatusCode::NOT_FOUND, &[]);
+        }
+    };
+    let range = match ranges(request.headers()) {
+        Some(value) => transfer::parse_range(&value, size),
+        None => transfer::Range::Whole,
+    };
+    let (start, length, status, content_range) = match range {
+        transfer::Range::Unsatisfiable => {
+            let header = format!("bytes */{size}");
+            return transfer_empty(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                &[(header::CONTENT_RANGE.as_str(), &header)],
+            );
+        }
+        transfer::Range::Part { start, end } => (
+            start,
+            end - start + 1,
+            StatusCode::PARTIAL_CONTENT,
+            Some(format!("bytes {start}-{end}/{size}")),
+        ),
+        transfer::Range::Whole => (0, size, StatusCode::OK, None),
+    };
+    let mut file = match tokio::fs::File::open(admitted.path()).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return transfer_empty(StatusCode::NOT_FOUND, &[]);
+        }
+        Err(_) => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+    };
+    if start > 0 && file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]);
+    }
+    let mut builder =
+        transfer_response(status, Some(length)).header(header::ACCEPT_RANGES, "bytes");
+    if let Some(content_range) = content_range {
+        builder = builder.header(header::CONTENT_RANGE, content_range);
+    }
+    builder
+        .body(
+            FileBody {
+                // The length is fixed, so a file that grows while it is sent cannot overrun it.
+                file: Some(file.take(length)),
+                _admitted: admitted,
+            }
+            .boxed(),
+        )
+        .expect("a response with a body")
+}
+
+/// Reports the current size of a file, which an upload can resume from.
+async fn transfer_head(admitted: Admitted) -> Reply {
+    let length = match presence(admitted.path()).await {
+        Presence::File(size) => size,
+        Presence::Missing => 0,
+        Presence::NotAFile => return transfer_empty(StatusCode::NOT_FOUND, &[]),
+        Presence::Failed => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+    };
+    transfer_response(StatusCode::OK, Some(length))
+        .header(header::ACCEPT_RANGES, "bytes")
+        .body(
+            Full::new(Bytes::new())
+                .map_err(|never: Infallible| match never {})
+                .boxed(),
+        )
+        .expect("a response with no body")
+}
+
+/// Uploads one part of a file at `offset`.
+async fn transfer_put(request: Request<Incoming>, admitted: Admitted) -> Reply {
+    let offset = match offset_of(request.uri().query()) {
+        Ok(offset) => offset,
+        Err(()) => return transfer_empty(StatusCode::BAD_REQUEST, &[]),
+    };
+    let body = request.into_body();
+    // The writer runs as a task of its own. A client that hangs up drops this handler before the
+    // bytes it already sent are flushed, and the lock must be released only after they are.
+    let task = tokio::spawn(async move { write_upload(admitted, offset, body).await });
+    match task.await {
+        Ok(reply) => reply,
+        Err(_) => transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+    }
+}
+
+/// Writes one part into the entry's file, from `offset` on, and answers its new size.
+async fn write_upload(admitted: Admitted, offset: u64, mut body: Incoming) -> Reply {
+    let _turn = admitted.upload().await;
+    let path = admitted.path().to_path_buf();
+    match presence(&path).await {
+        Presence::File(size) if offset > size => return transfer_empty(StatusCode::CONFLICT, &[]),
+        Presence::NotAFile => return transfer_empty(StatusCode::CONFLICT, &[]),
+        Presence::Failed => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+        Presence::Missing if offset > 0 => return transfer_empty(StatusCode::CONFLICT, &[]),
+        Presence::Missing => {
+            let parent = path.parent().map(Path::to_path_buf);
+            if let Some(parent) = parent
+                && !parent.as_os_str().is_empty()
+                && tokio::fs::create_dir_all(&parent).await.is_err()
+            {
+                return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]);
+            }
+        }
+        Presence::File(_) => {}
+    }
+    let opened = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .await;
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(_) => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+    };
+    // The part replaces whatever followed `offset`, and nothing of the body is read before that.
+    if file.set_len(offset).await.is_err()
+        || file.seek(std::io::SeekFrom::Start(offset)).await.is_err()
+    {
+        return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]);
+    }
+    // A write that fails is remembered to the end: a later flush can succeed on its own and must
+    // not turn a rejected part into a success.
+    let mut refused = false;
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            // A body that ends early keeps the bytes it did send: HEAD reports them.
+            Err(_) => break,
+        };
+        if let Some(data) = frame.data_ref() {
+            // Each accepted part is flushed before the next frame is waited for, so a body that
+            // fails later never leaves an earlier write in flight.
+            if file.write_all(data).await.is_err() || file.flush().await.is_err() {
+                refused = true;
+                break;
+            }
+        }
+    }
+    // Flushed before the answer and before the upload lock is released with this task.
+    let flushed = file.flush().await;
+    let size = file.metadata().await.map(|metadata| metadata.len());
+    drop(file);
+    match size {
+        Ok(size) if !refused && flushed.is_ok() => transfer_text(StatusCode::OK, size.to_string()),
+        // The disk refused part of the upload, or its size cannot be read: nothing to report.
+        _ => transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+    }
+}
+
+/// The offset an upload resumes at: at most one `offset=` with a nonempty decimal value.
+fn offset_of(query: Option<&str>) -> Result<u64, ()> {
+    let mut offset = 0;
+    let mut seen = false;
+    for pair in query.unwrap_or_default().split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if name != "offset" {
+            continue;
+        }
+        if seen {
+            return Err(());
+        }
+        seen = true;
+        offset = transfer::decimal(value)?;
+    }
+    Ok(offset)
+}
+
+/// The one `Range` a request asks for, or `None` when several were sent.
+fn ranges(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    first.to_str().ok().map(str::to_owned)
+}
+
+/// A `/t/` response's headers: never cached, never buffered by a proxy, and the type and length
+/// of a body when there is one.
+fn transfer_response(status: StatusCode, length: Option<u64>) -> http::response::Builder {
+    let builder = Response::builder()
+        .status(status)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-accel-buffering", "no")
+        // Hyper sends `Content-Length: 0` on a reply with no body, so every reply has a length
+        // and therefore says what its bytes would be.
+        .header(header::CONTENT_TYPE, "application/octet-stream");
+    match length {
+        Some(length) => builder.header(header::CONTENT_LENGTH, length),
+        None => builder,
+    }
+}
+
+fn transfer_empty(status: StatusCode, extra: &[(&str, &str)]) -> Reply {
+    let mut builder = transfer_response(status, None);
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    builder
+        .body(
+            Full::new(Bytes::new())
+                .map_err(|never: Infallible| match never {})
+                .boxed(),
+        )
+        .expect("a response with no body")
+}
+
+fn transfer_text(status: StatusCode, text: String) -> Reply {
+    let length = text.len() as u64;
+    transfer_response(status, Some(length))
+        .body(
+            Full::new(Bytes::from(text))
+                .map_err(|never: Infallible| match never {})
+                .boxed(),
+        )
+        .expect("a response with a body")
+}
+
+/// A file's bytes, read as the response is written, holding its entry open to the last byte.
+struct FileBody {
+    /// The bytes left to send, or `None` once the body has ended, so its end stays an end.
+    file: Option<tokio::io::Take<tokio::fs::File>>,
+    _admitted: Admitted,
+}
+
+impl hyper::body::Body for FileBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        let Some(file) = this.file.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let mut buffer = [0u8; CHUNK];
+        let mut read = ReadBuf::new(&mut buffer);
+        match Pin::new(file).poll_read(context, &mut read) {
+            Poll::Pending => Poll::Pending,
+            // A read that fails ends the body with that failure rather than a quiet end of file.
+            Poll::Ready(Err(error)) => {
+                this.file = None;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Ok(())) if read.filled().is_empty() => {
+                this.file = None;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Ok(())) => Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                Bytes::copy_from_slice(read.filled()),
+            )))),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.file.as_ref().is_none_or(|file| file.limit() == 0)
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.file.as_ref().map_or(0, |file| file.limit()))
+    }
 }
 
 #[cfg(test)]

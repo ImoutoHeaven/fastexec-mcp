@@ -6,7 +6,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A token of this run's own: 32 hexadecimal characters, so no two cases share one, and a daemon
 /// left listening by mistake admits nothing anyone else knows.
@@ -178,6 +178,8 @@ struct Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: String,
+    /// The body as it arrived, for the bytes of a file.
+    bytes: Vec<u8>,
 }
 
 impl Response {
@@ -208,6 +210,12 @@ impl Response {
 
 /// Sends `request` and reads the whole answer, which `Connection: close` ends.
 fn exchange(addr: SocketAddr, request: &[u8]) -> Response {
+    exchange_body(addr, request, true)
+}
+
+/// Sends `request` and reads the answer, which carries no body when `body` is false: a HEAD
+/// answer declares the length of the body it would have sent and sends none of it.
+fn exchange_body(addr: SocketAddr, request: &[u8], body: bool) -> Response {
     let mut stream = TcpStream::connect(addr).expect("the daemon accepts a connection");
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))
@@ -218,10 +226,14 @@ fn exchange(addr: SocketAddr, request: &[u8]) -> Response {
     stream
         .read_to_end(&mut bytes)
         .unwrap_or_else(|error| panic!("the answer ended early: {error}"));
-    parse(&bytes)
+    parse_body(&bytes, body)
 }
 
 fn parse(bytes: &[u8]) -> Response {
+    parse_body(bytes, true)
+}
+
+fn parse_body(bytes: &[u8], expect_body: bool) -> Response {
     let split = find(bytes, b"\r\n\r\n").unwrap_or_else(|| {
         panic!(
             "no header block in {:?}",
@@ -247,10 +259,11 @@ fn parse(bytes: &[u8]) -> Response {
         dechunk(body)
     } else {
         // A body that declares its length is that length, or the answer is incomplete.
-        if let Some(length) = headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, value)| value.parse::<usize>().ok())
+        if expect_body
+            && let Some(length) = headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.parse::<usize>().ok())
         {
             assert_eq!(
                 body.len(),
@@ -264,6 +277,7 @@ fn parse(bytes: &[u8]) -> Response {
         status,
         headers,
         body: String::from_utf8_lossy(&body).into_owned(),
+        bytes: body,
     }
 }
 
@@ -341,6 +355,11 @@ impl Client {
 
     /// Sends `body` as one POST to `/mcp` and returns the whole answer.
     fn post(&mut self, body: &str) -> Response {
+        self.post_with(body, "")
+    }
+
+    /// Sends `body` as one POST to `/mcp` with headers of the test's own choosing.
+    fn post_with(&mut self, body: &str, headers: &str) -> Response {
         let mut request = String::new();
         request.push_str("POST /mcp HTTP/1.1\r\n");
         request.push_str(&format!("Host: {}\r\n", self.addr));
@@ -352,6 +371,7 @@ impl Client {
         if let Some(session) = &self.session {
             request.push_str(&format!("Mcp-Session-Id: {session}\r\n"));
         }
+        request.push_str(headers);
         request.push_str("\r\n");
         request.push_str(body);
         exchange(self.addr, request.as_bytes())
@@ -407,13 +427,34 @@ impl Client {
             .collect()
     }
 
+    /// One `tools/call` of any tool, and its own result.
+    fn call_tool(&mut self, tool: &str, arguments: Value) -> Value {
+        self.call_tool_with(tool, arguments, "")
+    }
+
+    /// One `tools/call` with headers of the test's own choosing.
+    fn call_tool_with(&mut self, tool: &str, arguments: Value, headers: &str) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        let body = json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        })
+        .to_string();
+        let response = self.post_with(&body, headers);
+        assert_eq!(response.status, 200, "{:?}", response.body);
+        let answer = response.answer(id);
+        assert!(answer["result"].is_object(), "protocol error: {answer}");
+        answer["result"].clone()
+    }
+
     /// One `tools/call`, and the tool's own result.
     fn call(&mut self, arguments: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         let response = self.send(json!({
             "jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": {"name": "fastexec", "arguments": arguments},
+            "params": {"name": "exec", "arguments": arguments},
         }));
         assert_eq!(response.status, 200, "{:?}", response.body);
         response.answer(id)
@@ -436,6 +477,19 @@ impl Client {
     }
 }
 
+/// Sends one request with a method, a target and headers of the test's own choosing.
+/// Sends one request with a method, a target and headers of the test's own choosing.
+fn send(addr: SocketAddr, method: &str, target: &str, headers: &str, body: &[u8]) -> Response {
+    let mut request = Vec::new();
+    request.extend_from_slice(format!("{method} {target} HTTP/1.1\r\n").as_bytes());
+    request.extend_from_slice(format!("Host: {addr}\r\n").as_bytes());
+    request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    request.extend_from_slice(b"Connection: close\r\n");
+    request.extend_from_slice(headers.as_bytes());
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(body);
+    exchange_body(addr, &request, method != "HEAD")
+}
 /// Sends one request with headers of the test's own choosing.
 fn raw(addr: SocketAddr, token: &str, headers: &str, body: &str) -> Response {
     let mut request = String::new();
@@ -535,7 +589,7 @@ impl Stdio {
     fn list(&mut self) -> (String, Value) {
         let answer = self.request(
             "tools/call",
-            json!({"name": "fastexec", "arguments": {"action": "list"}}),
+            json!({"name": "exec", "arguments": {"action": "list"}}),
         );
         let result = &answer["result"];
         assert_ne!(result["isError"], json!(true), "{answer}");
@@ -561,8 +615,9 @@ fn a_session_runs_a_task_over_http() {
     let fixture = Fixture::new("run");
     let mut client = Client::new(fixture.addr, fixture.token.clone());
     client.initialize();
-    let tools = client.tools();
-    assert!(tools.iter().any(|name| name == "fastexec"), "{tools:?}");
+    let mut tools = client.tools();
+    tools.sort_unstable();
+    assert_eq!(tools, ["edit", "exec", "read", "transfer", "write"]);
     // The program reads a line and prints a marker, so the marker can only appear once this poll
     // delivered the input: a start that had already finished could not produce it. It also says
     // whether the token reached it, which it must not have.
@@ -796,6 +851,40 @@ fn a_start_outside_loopback_or_without_a_long_enough_token_is_refused() {
 }
 
 #[test]
+fn file_tools_round_trip_over_http_and_name_transfer_for_a_binary() {
+    let fixture = Fixture::new("files");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let dir = std::env::temp_dir().join(format!("fastexec-http-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("notes.txt");
+    let written = client.call_tool(
+        "write",
+        json!({"path": path.display().to_string(), "content": "one\ntwo\n"}),
+    );
+    assert_eq!(written["isError"], json!(false), "{written}");
+    assert_eq!(
+        written["content"][0]["text"],
+        json!(format!("Successfully wrote to {}", path.display()))
+    );
+    let read = client.call_tool("read", json!({"path": path.display().to_string()}));
+    assert_eq!(read["isError"], json!(false), "{read}");
+    assert_eq!(read["content"][0]["text"], json!("one\ntwo\n"));
+    // An HTTP session has a way to download a file, so a binary names it.
+    let blob = dir.join("blob.bin");
+    std::fs::write(&blob, [0u8, 1]).unwrap();
+    let binary = client.call_tool("read", json!({"path": blob.display().to_string()}));
+    assert_eq!(binary["isError"], json!(true), "{binary}");
+    let text = binary["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("Inspect it with exec or download it with transfer."),
+        "{binary}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn status_reports_the_address_the_daemon_serves_on() {
     let fixture = Fixture::new("status");
     let (code, out, err) = fixture.run(&["daemon", "status"]);
@@ -805,4 +894,365 @@ fn status_reports_the_address_the_daemon_serves_on() {
         "{out}"
     );
     assert!(Path::new(&fixture.runtime).exists());
+}
+
+/// A path under this fixture's own directory, which the daemon can serve.
+fn published(fixture: &Fixture, name: &str) -> PathBuf {
+    let dir = fixture.runtime.join("published");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(name)
+}
+
+/// Publishes `path` through the tool and answers the URL it got.
+fn publish(client: &mut Client, path: &Path) -> String {
+    let result = client.call_tool("transfer", json!({"path": path.display().to_string()}));
+    assert_ne!(result["isError"], json!(true), "{result}");
+    let url = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no url in {result}"))
+        .to_owned();
+    assert_eq!(result["structuredContent"]["url"], json!(url), "{result}");
+    url
+}
+
+/// The target a transfer URL names.
+fn target_of(url: &str) -> String {
+    let id = url.rsplit('/').next().expect("an id");
+    assert_eq!(id.len(), 26, "{url}");
+    assert!(
+        id.bytes()
+            .all(|byte| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&byte)),
+        "{url}"
+    );
+    format!("/t/{id}")
+}
+
+/// Waits for the daemon to report `expected` bytes, and answers what it reports last.
+fn wait_for_size(addr: SocketAddr, target: &str, expected: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let head = send(addr, "HEAD", target, "", b"");
+        let size: u64 = head
+            .header("content-length")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no length in {:?}", head.headers));
+        if size == expected || Instant::now() > deadline {
+            return size;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn transfer_is_listed_over_http_and_names_the_scheme_the_client_saw() {
+    let fixture = Fixture::new("transfer-url");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let tools = client.tools();
+    assert!(tools.contains(&"transfer".to_owned()), "{tools:?}");
+    let path = published(&fixture, "shot.bin");
+    let url = publish(&mut client, &path);
+    assert_eq!(url, format!("http://{}{}", fixture.addr, target_of(&url)));
+    // A proxy that terminated TLS says so, and the first token of the list is the one it means.
+    let result = client.call_tool_with(
+        "transfer",
+        json!({"path": path.display().to_string()}),
+        "X-Forwarded-Proto: https, http\r\n",
+    );
+    let forwarded = result["content"][0]["text"].as_str().expect("a url");
+    assert!(
+        forwarded.starts_with(&format!("https://{}/t/", fixture.addr)),
+        "{forwarded}"
+    );
+    // A scheme that is neither of the two is not believed.
+    let result = client.call_tool_with(
+        "transfer",
+        json!({"path": path.display().to_string()}),
+        "X-Forwarded-Proto: ftp\r\n",
+    );
+    let other = result["content"][0]["text"].as_str().expect("a url");
+    assert!(
+        other.starts_with(&format!("http://{}/t/", fixture.addr)),
+        "{other}"
+    );
+    // Every response of an MCP call tells a proxy not to buffer it.
+    let response = client.send(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list"}));
+    assert_eq!(response.header("x-accel-buffering"), Some("no"));
+}
+
+#[test]
+fn an_upload_and_a_download_over_t_need_no_token() {
+    let fixture = Fixture::new("transfer-io");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let file = published(&fixture, "up.bin");
+    let target = target_of(&publish(&mut client, &file));
+    let addr = fixture.addr;
+    // A file that does not exist yet reports no bytes, and the entry is ready for an upload.
+    let head = send(addr, "HEAD", &target, "", b"");
+    assert_eq!(head.status, 200, "{}", head.body);
+    assert_eq!(head.header("content-length"), Some("0"));
+    assert_eq!(head.header("cache-control"), Some("no-store"));
+    assert_eq!(head.header("x-accel-buffering"), Some("no"));
+    assert_eq!(head.header("accept-ranges"), Some("bytes"));
+    // An empty upload creates the file and answers its size.
+    let put = send(addr, "PUT", &format!("{target}?offset=0"), "", b"");
+    assert_eq!(put.status, 200, "{}", put.body);
+    assert_eq!(put.body, "0");
+    // Two parts, the second from the size the first one left.
+    let put = send(addr, "PUT", &target, "", b"hello ");
+    assert_eq!(put.status, 200, "{}", put.body);
+    assert_eq!(put.body, "6");
+    let size = wait_for_size(addr, &target, 6);
+    assert_eq!(size, 6);
+    let put = send(
+        addr,
+        "PUT",
+        &format!("{target}?offset={size}"),
+        "",
+        b"world",
+    );
+    assert_eq!(put.status, 200, "{}", put.body);
+    assert_eq!(put.body, "11");
+    // The download is the same bytes, and says what it is.
+    let get = send(addr, "GET", &target, "", b"");
+    assert_eq!(get.status, 200, "{}", get.body);
+    assert_eq!(get.bytes, b"hello world");
+    assert_eq!(get.header("content-type"), Some("application/octet-stream"));
+    assert_eq!(get.header("accept-ranges"), Some("bytes"));
+    assert_eq!(get.header("content-length"), Some("11"));
+    // An empty upload resets a target that was larger.
+    let put = send(addr, "PUT", &format!("{target}?offset=0"), "", b"");
+    assert_eq!(put.body, "0");
+    let head = send(addr, "HEAD", &target, "", b"");
+    assert_eq!(head.header("content-length"), Some("0"));
+    assert_eq!(std::fs::read(&file).unwrap(), b"");
+}
+
+#[test]
+fn ranges_offsets_and_unknown_ids_answer_as_specified() {
+    let fixture = Fixture::new("transfer-edges");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let file = published(&fixture, "edges.bin");
+    std::fs::write(&file, b"hello world").unwrap();
+    let target = target_of(&publish(&mut client, &file));
+    let addr = fixture.addr;
+    let get = send(addr, "GET", &target, "Range: bytes=2-5\r\n", b"");
+    assert_eq!(get.status, 206, "{}", get.body);
+    assert_eq!(get.header("content-range"), Some("bytes 2-5/11"));
+    assert_eq!(get.header("content-length"), Some("4"));
+    assert_eq!(get.bytes, b"llo ");
+    let get = send(addr, "GET", &target, "Range: bytes=11-\r\n", b"");
+    assert_eq!(get.status, 416);
+    assert_eq!(get.header("content-range"), Some("bytes */11"));
+    assert_eq!(get.header("content-type"), Some("application/octet-stream"));
+    assert!(get.bytes.is_empty());
+    // Everything the two forms do not describe is ignored, and the whole file is sent.
+    for header in [
+        "Range: bytes=5-2\r\n",
+        "Range: bytes=-3\r\n",
+        "Range: bytes=0-1,3-4\r\n",
+        "Range: bytes=0-1\r\nRange: bytes=3-4\r\n",
+        "Range: nonsense\r\n",
+        "Range: bytes=0-18446744073709551616\r\n",
+    ] {
+        let get = send(addr, "GET", &target, header, b"");
+        assert_eq!(get.status, 200, "{header}");
+        assert_eq!(get.bytes, b"hello world", "{header}");
+    }
+    // An unknown id and a path that is not an id are both absent, whatever the method is: an
+    // entry that is not there is absent before the method is even looked at.
+    for path in ["/t/0123456789abcdefghjkmnpqrs", "/t/../mcp", "/t/"] {
+        for method in ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "POST", "PATCH"] {
+            let answer = send(addr, method, path, "", b"");
+            assert_eq!(answer.status, 404, "{method} {path}");
+            assert_eq!(answer.header("cache-control"), Some("no-store"));
+            assert_eq!(
+                answer.header("content-type"),
+                Some("application/octet-stream"),
+                "{method} {path}"
+            );
+        }
+    }
+    // A method the route does not serve says which ones it does.
+    let delete = send(addr, "DELETE", &target, "", b"");
+    assert_eq!(delete.status, 405);
+    assert_eq!(delete.header("allow"), Some("GET, HEAD, PUT"));
+    assert_eq!(
+        delete.header("content-type"),
+        Some("application/octet-stream")
+    );
+    // An offset past the end is refused, and the file is left as it was.
+    let put = send(addr, "PUT", &format!("{target}?offset=99"), "", b"x");
+    assert_eq!(put.status, 409);
+    assert_eq!(std::fs::read(&file).unwrap(), b"hello world");
+    // An offset that is not one decimal number is refused before anything is opened.
+    for query in [
+        "offset=",
+        "offset",
+        "offset=+1",
+        "offset=1.5",
+        "offset=1&offset=2",
+        "offset=18446744073709551616",
+    ] {
+        let put = send(addr, "PUT", &format!("{target}?{query}"), "", b"x");
+        assert_eq!(put.status, 400, "{query}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"hello world", "{query}");
+    }
+    // An unrelated query key is not an offset.
+    let put = send(addr, "PUT", &format!("{target}?other=1"), "", b"!");
+    assert_eq!(put.status, 200, "{}", put.body);
+    // A file that does not exist cannot be uploaded into past its start.
+    let absent = published(&fixture, "absent.bin");
+    let absent_target = target_of(&publish(&mut client, &absent));
+    let put = send(addr, "PUT", &format!("{absent_target}?offset=3"), "", b"x");
+    assert_eq!(put.status, 409);
+    assert!(!absent.exists());
+}
+
+#[test]
+fn an_interrupted_upload_leaves_a_prefix_that_resumes() {
+    let fixture = Fixture::new("transfer-resume");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let file = published(&fixture, "resume.bin");
+    let target = target_of(&publish(&mut client, &file));
+    let addr = fixture.addr;
+    let source: Vec<u8> = (0..1000u32).map(|number| (number % 251) as u8).collect();
+    // A part the client never finishes: it declares a thousand bytes and sends three hundred.
+    let mut stream = TcpStream::connect(addr).expect("the daemon accepts a connection");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let head = format!(
+        "PUT {target} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(&source[..300]).unwrap();
+    stream.flush().unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer);
+    // The bytes the daemon accepted are the file's size, and the rest resumes from there.
+    let size = wait_for_size(addr, &target, 300);
+    assert_eq!(size, 300, "the accepted prefix is kept");
+    let rest = send(
+        addr,
+        "PUT",
+        &format!("{target}?offset={size}"),
+        "",
+        &source[size as usize..],
+    );
+    assert_eq!(rest.status, 200, "{}", rest.body);
+    assert_eq!(rest.body, "1000");
+    let get = send(addr, "GET", &target, "", b"");
+    assert_eq!(get.status, 200);
+    assert_eq!(get.bytes, source);
+}
+
+/// Sends one PUT whose body is chunked, so the route is exercised without a declared length.
+fn send_chunked(addr: SocketAddr, target: &str, body: &[u8]) -> Response {
+    let mut request = Vec::new();
+    request.extend_from_slice(format!("PUT {target} HTTP/1.1\r\n").as_bytes());
+    request.extend_from_slice(format!("Host: {addr}\r\n").as_bytes());
+    request.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    request.extend_from_slice(b"Connection: close\r\n");
+    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+    request.extend_from_slice(body);
+    request.extend_from_slice(b"\r\n0\r\n\r\n");
+    exchange(addr, &request)
+}
+
+#[test]
+fn an_upload_larger_than_the_call_cap_arrives_whole() {
+    let fixture = Fixture::new("transfer-large");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let file = published(&fixture, "large.bin");
+    let target = target_of(&publish(&mut client, &file));
+    let addr = fixture.addr;
+    // Larger than the 4 MiB a call may carry, so the route's own limit is what admits it.
+    let payload: Vec<u8> = (0..5 * 1024 * 1024 + 12_345u32)
+        .map(|number| (number % 253) as u8)
+        .collect();
+    assert!(payload.len() > 4 << 20);
+    let put = send(addr, "PUT", &format!("{target}?offset=0"), "", &payload);
+    assert_eq!(put.status, 200, "{}", put.body);
+    assert_eq!(put.body, payload.len().to_string());
+    let get = send(addr, "GET", &target, "", b"");
+    assert_eq!(get.status, 200);
+    assert_eq!(get.bytes.len(), payload.len());
+    assert!(get.bytes == payload, "the download is the upload");
+    // The same size again through chunked framing, after the empty upload resets the file.
+    let put = send(addr, "PUT", &format!("{target}?offset=0"), "", b"");
+    assert_eq!(put.body, "0");
+    let put = send_chunked(addr, &target, &payload);
+    assert_eq!(put.status, 200, "{}", put.body);
+    assert_eq!(put.body, payload.len().to_string());
+    let get = send(addr, "GET", &target, "", b"");
+    assert!(get.bytes == payload, "the chunked download is the upload");
+}
+
+/// A descriptor the daemon can open as a regular file, for a write the disk refuses.
+#[cfg(target_os = "linux")]
+struct MemoryFile(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl MemoryFile {
+    /// A memory file, sealed against writes when `sealed`: metadata, opening, `set_len` and
+    /// `seek` still work, and every write fails with `EPERM`.
+    fn new(sealed: bool) -> MemoryFile {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let name = std::ffi::CString::new("fastexec-transfer").unwrap();
+        let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
+        assert!(raw >= 0, "memfd_create failed");
+        let file = MemoryFile(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) });
+        if sealed {
+            let added =
+                unsafe { libc::fcntl(file.0.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_WRITE) };
+            assert_eq!(added, 0, "the seal was added");
+        }
+        file
+    }
+
+    /// The path the daemon opens, which names this descriptor of this process.
+    fn path(&self) -> String {
+        use std::os::fd::AsRawFd;
+        format!("/proc/{}/fd/{}", std::process::id(), self.0.as_raw_fd())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_disk_write_is_not_acknowledged_as_success() {
+    let fixture = Fixture::new("transfer-sealed");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let addr = fixture.addr;
+    // The control: an unsealed memory file accepts the same upload and answers its size.
+    let open = MemoryFile::new(false);
+    let target = target_of(&publish(&mut client, std::path::Path::new(&open.path())));
+    let put = send(
+        addr,
+        "PUT",
+        &format!("{target}?offset=0"),
+        "",
+        b"fifteen bytes!!",
+    );
+    assert_eq!(put.status, 200, "{}", put.body);
+    assert_eq!(put.body, "15");
+    // The sealed one lets every step but the write through, and the write is what must be said.
+    let sealed = MemoryFile::new(true);
+    let target = target_of(&publish(&mut client, std::path::Path::new(&sealed.path())));
+    let put = send(
+        addr,
+        "PUT",
+        &format!("{target}?offset=0"),
+        "",
+        b"fifteen bytes!!",
+    );
+    assert_eq!(put.status, 500, "{}", put.body);
+    assert!(put.bytes.is_empty());
 }

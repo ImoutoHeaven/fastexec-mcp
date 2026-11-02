@@ -1,9 +1,9 @@
 # fastexec
 
-`fastexec` is a stdio MCP server that runs bash commands as background tasks,
-with stdin pipes, interactive PTYs, bounded output, and process-tree termination.
-It also runs a background daemon shared by every session in a namespace, opt-in
-with `FASTEXEC_DAEMON=on`.
+`fastexec` is an MCP server that runs bash commands as background tasks, with
+stdin pipes, interactive PTYs, bounded output, and process-tree termination, and
+reads, writes, and edits files on the host. It also runs a background daemon
+shared by every session in a namespace, opt-in with `FASTEXEC_DAEMON=on`.
 
 ## Requirements and Quickstart
 
@@ -21,10 +21,9 @@ cargo build --release
 ```json
 {
   "mcpServers": {
-    "fastexec": {
+    "fastexec_local": {
       "command": "/absolute/path/to/fastexec",
-      "exposure": "direct",
-      "description": "Run long-running, stdin-driven, and terminal (PTY) bash commands as tasks"
+      "exposure": "direct"
     }
   }
 }
@@ -34,10 +33,15 @@ Hosts without progress-aware timeouts need at least 300 seconds per tool call.
 
 ## Tool Usage and Example
 
-The server exposes one MCP tool, `fastexec` (`mcp__fastexec__fastexec` in Pi).
-Operations are selected via the tool's `action` field (`start`, `poll`, `kill`,
+The server exposes `exec` for bash tasks and `read`, `write`, and `edit` for
+files; an HTTP session also gets `transfer`. Pi names each tool
+`mcp__<server>__<tool>`, where `<server>` is the key in the configuration, so
+the entry above gives `mcp__fastexec_local__exec`.
+
+`exec` selects an operation with its `action` field (`start`, `poll`, `kill`,
 `list`, `transcript`)—these are MCP tool arguments, not CLI subcommands. See
-[`src/description.md`](src/description.md) for the runtime parameter contract.
+[`src/description.md`](src/description.md) for the runtime parameter contract,
+and [the design document](docs/fastexec-design.md) for the file tools.
 
 Start a command through the tool:
 
@@ -50,6 +54,33 @@ If it is still running, poll with the returned `taskId` (replace the placeholder
 ```json
 {"action": "poll", "taskId": "<returned taskId>", "waitMs": 10000}
 ```
+
+### Several servers
+
+One config can hold a local stdio server and a remote HTTP one under different
+keys. Pi treats `-` and `_` in server names as the same character, so names that
+differ only in those collide.
+
+```json
+{
+  "mcpServers": {
+    "fastexec_local": {
+      "command": "/absolute/path/to/fastexec",
+      "exposure": "direct"
+    },
+    "remote_linux": {
+      "url": "https://build.example.com/mcp",
+      "headers": {"Authorization": "Bearer ${FASTEXEC_TOKEN}"},
+      "exposure": "deferred"
+    }
+  }
+}
+```
+
+`${NAME}` reads the variable from the environment Pi runs in. Prefer `codemode`
+or `deferred` exposure for a remote server: a `direct` server that has not
+connected within the first prompt's 10 second wait changes the declared tools
+mid-session.
 
 ## Key Constraints
 
@@ -84,7 +115,7 @@ namespace:
 ```json
 {
   "mcpServers": {
-    "fastexec": {
+    "fastexec_local": {
       "command": "/absolute/path/to/fastexec",
       "env": {"FASTEXEC_DAEMON": "on"}
     }
@@ -104,14 +135,104 @@ registry for up to 24 hours. These options apply only when starting a new daemon
 stop an existing daemon before changing its policy. HTTP daemons never exit idle.
 
 A host that keeps its children in a Job without breakaway, such as a fastexec
-task, cannot start the daemon: run `fastexec daemon start` from a terminal.
-
-`fastexec daemon start --http 127.0.0.1:<port>` also serves the tool over
-Streamable HTTP, with `FASTEXEC_HTTP_TOKEN` as the bearer token every request
-carries.
+task, cannot start a detached daemon: run `fastexec daemon start` from a
+terminal outside the host, or `fastexec daemon run` in the foreground.
 
 See [`docs/fastexec-design.md`](docs/fastexec-design.md) §6 for the directory
 layout, limits, and lifetimes.
+
+## Remote host
+
+`fastexec daemon run --http 127.0.0.1:<port>` serves the same toolset over
+Streamable HTTP in the foreground, in the process the supervisor started. Once
+both listeners are bound it prints one line to stderr — `fastexec daemon <epoch>
+pid <pid> namespace <namespace> http <addr>` — and keeps its logs on stderr.
+`SIGTERM` and `SIGINT`, and on Windows `Ctrl+C`, `Ctrl+Break`, console close and
+shutdown, stop it the way `fastexec daemon stop` does: every task is killed and
+the process exits `0`. That cleanup is best effort where the operating system
+ends the process first, by a close deadline it enforces or a forced termination.
+It runs with idle exit off, refuses `--idle-exit`, and exits `1` when the
+namespace already has a daemon.
+
+`FASTEXEC_HTTP_TOKEN`, at least 16 visible ASCII characters, is the bearer token
+every `/mcp` request carries.
+
+A systemd **user** unit shares `XDG_RUNTIME_DIR` with the user's shells, so
+`fastexec daemon status` and `stop` reach the daemon it started:
+
+```ini
+# ~/.config/systemd/user/fastexec.service
+[Unit]
+Description=fastexec daemon
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/fastexec daemon run --http 127.0.0.1:8765
+EnvironmentFile=%h/.config/fastexec.env
+WorkingDirectory=%h
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+`~/.config/fastexec.env` holds `FASTEXEC_HTTP_TOKEN=<token>` and
+`FASTEXEC_HTTP_ALLOW_REMOTE=1`. Then:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now fastexec
+loginctl enable-linger <user>
+```
+
+`loginctl enable-linger` starts the unit without a login session.
+
+On Windows, [nssm](https://nssm.cc/usage) runs it under the user's own account
+rather than LocalSystem:
+
+```powershell
+nssm install fastexec "C:\path\to\fastexec.exe" "daemon run --http 127.0.0.1:8765"
+nssm set fastexec AppDirectory "C:\Users\<user>"
+nssm set fastexec AppEnvironmentExtra "FASTEXEC_HTTP_TOKEN=<token>" "FASTEXEC_HTTP_ALLOW_REMOTE=1" "LOCALAPPDATA=C:\Users\<user>\AppData\Local"
+nssm edit fastexec
+nssm start fastexec
+```
+
+`nssm edit` sets the Log on account without putting a password on the command
+line. Every environment entry goes in one `AppEnvironmentExtra` command, because
+a later one replaces the block. The runtime root comes from `LOCALAPPDATA`, so
+the service and the user's shell must see the same value: set it explicitly
+rather than inherit an administrator's profile. A service runs in Session 0
+without a desktop, so an app that needs a visible window belongs in Task
+Scheduler "at logon" instead.
+
+### Behind a proxy
+
+`FASTEXEC_HTTP_ALLOW_REMOTE=1` is required even on a loopback bind, because a
+proxy forwards the public `Host`. Route `/`, or both `/mcp` and `/t/`, to the
+daemon: a `/mcp`-only route leaves `transfer` URLs unreachable.
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8765;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 4m;
+}
+```
+
+`transfer` builds its URLs from the `Host` it receives, so without that line
+they name the loopback address. The server sends `X-Accel-Buffering: no` on the
+responses a proxy would otherwise buffer.
+
+Cloudflare reaches the daemon through a named tunnel; Quick Tunnels do not
+support server-sent events. Plan limits are in
+[Cloudflare's connection limits](https://developers.cloudflare.com/fundamentals/reference/connection-limits/).
+
+`transfer` publishes one file at a URL that serves it to `curl`, valid until 10
+minutes pass unused. A proxy that limits request size still carries a large file
+in parts, one at a time; the tool description has the recipe.
 
 ## Testing, Reference, and License
 

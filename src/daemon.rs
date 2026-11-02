@@ -605,7 +605,12 @@ impl Daemon {
                 },
             };
             match message {
-                ToDaemon::Call { id, arguments, .. } => {
+                ToDaemon::Call {
+                    id,
+                    tool,
+                    arguments,
+                    ..
+                } => {
                     let token = {
                         let mut calls = lock(in_flight);
                         if calls.contains_key(&id) || calls.len() >= MAX_IN_FLIGHT {
@@ -625,6 +630,7 @@ impl Daemon {
                                 attached.token.clone(),
                                 token,
                                 id,
+                                tool,
                                 arguments,
                                 Arc::clone(in_flight),
                                 outgoing.clone(),
@@ -727,16 +733,18 @@ async fn run_call(
     connection: CancellationToken,
     token: CancellationToken,
     id: u64,
+    tool: String,
     arguments: serde_json::Value,
     in_flight: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     outgoing: mpsc::UnboundedSender<Outgoing>,
     budget: Arc<Semaphore>,
     reserved: Arc<Semaphore>,
 ) {
-    let management = matches!(
-        arguments.get("action").and_then(|action| action.as_str()),
-        Some("kill" | "list")
-    );
+    let management = tool == "exec"
+        && matches!(
+            arguments.get("action").and_then(|action| action.as_str()),
+            Some("kill" | "list")
+        );
     let (progress, latest) = watch::channel(None);
     let forwarder = Forwarder(tokio::spawn(forward_progress(id, latest, outgoing.clone())));
     let call = Call {
@@ -746,7 +754,14 @@ async fn run_call(
         progress: Some(progress),
         call_id: Some(id),
     };
-    let result = service.call_json(arguments, call).await;
+    let result = if tool == "exec" {
+        service.call_json(arguments, call).await
+    } else {
+        // A file tool runs in the daemon's own process, with the session's launch context and no
+        // HTTP session behind it.
+        let launch = Arc::clone(&session.launch);
+        crate::files::call(&tool, arguments, launch, false).await
+    };
     // The result goes out last. Aborting the forwarder is not enough on its own: one already
     // inside an encode or a send could still queue a frame after the result, so this waits for
     // it to be gone.
@@ -1006,6 +1021,7 @@ pub fn serve_process(
     build: String,
     http: Option<String>,
     idle_exit: bool,
+    foreground: bool,
 ) -> i32 {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -1014,7 +1030,7 @@ pub fn serve_process(
             return 1;
         }
     };
-    runtime.block_on(serve_daemon(namespace, build, http, idle_exit))
+    runtime.block_on(serve_daemon(namespace, build, http, idle_exit, foreground))
 }
 
 async fn serve_daemon(
@@ -1022,6 +1038,7 @@ async fn serve_daemon(
     build: String,
     http: Option<String>,
     idle_exit: bool,
+    foreground: bool,
 ) -> i32 {
     let actual = match runtime::build_id() {
         Ok(actual) => actual,
@@ -1035,8 +1052,9 @@ async fn serve_daemon(
         return 1;
     }
     // A question that cannot be answered is answered the safe way: the daemon is treated as
-    // inside a Job rather than left to die with its starter.
-    if !matches!(runtime::in_job(), Ok(false)) {
+    // inside a Job rather than left to die with its starter. A foreground daemon is the
+    // supervisor's own process, and the supervisor owning its lifetime is the point.
+    if !foreground && !matches!(runtime::in_job(), Ok(false)) {
         eprintln!("fastexec: the daemon is inside a Job and would die with its starter");
         return 1;
     }
@@ -1054,8 +1072,9 @@ async fn serve_daemon(
         eprintln!("fastexec: another daemon owns namespace {namespace}");
         return 1;
     };
+    // A foreground daemon keeps its logs where its supervisor put them: its own stderr.
     let log = paths.ns.join("daemon.log");
-    if let Err(error) = runtime::redirect_stderr(&log) {
+    if !foreground && let Err(error) = runtime::redirect_stderr(&log) {
         eprintln!("fastexec: cannot write {}: {error}", log.display());
         return 1;
     }
@@ -1130,7 +1149,7 @@ async fn serve_daemon(
             None,
             None,
             Config {
-                idle_exit,
+                idle_exit: idle_exit && !foreground,
                 ..Config::default()
             },
         ),
@@ -1161,12 +1180,98 @@ async fn serve_daemon(
             return 1;
         }
     };
-    Daemon::with_config(tasks, namespace, build, http_addr, config)
-        .run(listener, http)
-        .await;
+    // A foreground daemon's shutdown handlers are registered before it says it is ready, so a
+    // signal that arrives after the ready line is never missed.
+    let signal = if foreground {
+        match foreground_signal() {
+            Ok(signal) => Some(signal),
+            Err(error) => {
+                eprintln!("fastexec: cannot watch shutdown signals: {error}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let shutdown = async move {
+        match signal {
+            Some(signal) => signal.await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let daemon = Daemon::with_config(tasks, namespace, build, http_addr, config);
+    let mut run = std::pin::pin!(Arc::clone(&daemon).run(listener, http));
+    let mut shutdown = std::pin::pin!(shutdown);
+    if foreground {
+        // Both listeners are bound and the handlers are in place, so this line is what a
+        // supervisor waits for: the epoch, this process, the namespace, and the address actually
+        // bound when the port was asked for as 0.
+        match &daemon.http {
+            Some(addr) => eprintln!(
+                "fastexec daemon {} pid {} namespace {} http {addr}",
+                daemon.tasks.epoch(),
+                std::process::id(),
+                daemon.namespace
+            ),
+            None => eprintln!(
+                "fastexec daemon {} pid {} namespace {}",
+                daemon.tasks.epoch(),
+                std::process::id(),
+                daemon.namespace
+            ),
+        }
+        tokio::select! {
+            () = &mut run => {}
+            () = &mut shutdown => {
+                // A signal takes the same path as `daemon stop`, and the run future is awaited
+                // through its tail so the listener is dropped and the tasks are waited for.
+                daemon.stop();
+                run.await;
+            }
+        }
+    } else {
+        run.await;
+    }
     // Exit here, with the namespace's lock still held: returning would drop it before the
     // process ends, and another daemon could take the namespace while this one is still alive.
     std::process::exit(0);
+}
+
+/// Watches the signals that end a foreground daemon. Registration happens here, synchronously,
+/// so a signal that arrives after the caller prints its readiness is never missed: a future
+/// whose body has not been polled has registered nothing.
+#[cfg(unix)]
+fn foreground_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
+}
+
+/// The Windows console events that end a foreground daemon. A logoff is not one of them: a
+/// service receives it whenever any user logs off.
+#[cfg(windows)]
+fn foreground_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::windows;
+
+    let mut ctrl_c = windows::ctrl_c()?;
+    let mut ctrl_break = windows::ctrl_break()?;
+    let mut ctrl_close = windows::ctrl_close()?;
+    let mut ctrl_shutdown = windows::ctrl_shutdown()?;
+    Ok(async move {
+        tokio::select! {
+            _ = ctrl_c.recv() => {}
+            _ = ctrl_break.recv() => {}
+            _ = ctrl_close.recv() => {}
+            _ = ctrl_shutdown.recv() => {}
+        }
+    })
 }
 
 /// Waits for the namespace's daemon lock, or returns `None` when another daemon holds it.
@@ -1288,6 +1393,7 @@ mod tests {
     fn call(id: u64, arguments: Value) -> ToDaemon {
         ToDaemon::Call {
             id,
+            tool: "exec".to_owned(),
             request_id: id.to_string(),
             arguments,
         }
@@ -1631,6 +1737,7 @@ mod tests {
                 connection,
                 CancellationToken::new(),
                 id,
+                "exec".to_owned(),
                 json!({"action": "list"}),
                 Arc::clone(&in_flight),
                 outgoing.clone(),

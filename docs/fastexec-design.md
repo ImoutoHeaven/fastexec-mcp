@@ -6,9 +6,19 @@ Authoritative runtime usage rules live in
 
 ## 1. Tool Actions and Parameter Limits
 
-The `fastexec` tool accepts a single JSON object (`deny_unknown_fields`,
-`camelCase`). Parameters that do not apply to the chosen `action` or fall
-outside declared ranges return an error before execution.
+Each tool accepts a single JSON object (`deny_unknown_fields`, `camelCase`).
+Parameters that do not apply to the chosen `action` or fall outside declared
+ranges return an error before execution.
+
+| Tool | Parameters | Summary |
+| --- | --- | --- |
+| `exec` | the action table below | Runs bash commands as tasks. |
+| `read` | `path`, `offset`, `limit` | Shows a text file, or an image inline. |
+| `write` | `path`, `content` | Writes a file in place. |
+| `edit` | `path`, `edits` | Applies exact text replacements to a UTF-8 file. |
+| `transfer` | `path` | Publishes one file at a URL, on an HTTP session. |
+
+### `exec` Actions
 
 | Action | Allowed Parameters | Summary |
 | --- | --- | --- |
@@ -52,6 +62,33 @@ outside declared ranges return an error before execution.
     120×30 screen and 1-based cursor `[row, col]`, marking the output stream
     read up to that point. Cannot combine with `truncate`, `raw`, or `encoding`.
 
+### File Tools
+
+- **`read`**: Shows up to `2000` lines and `50` KiB of a text file, with
+  `offset` (1-indexed line) and `limit` (lines) selecting a window. A
+  recognized image (JPEG, PNG, GIF, WebP) comes back inline, up to
+  `2000`×`2000` pixels and `4718592` bytes of base64; a BMP is re-encoded as
+  PNG, or as JPEG when the resize needs it, and a file over `512` MiB, or an
+  image whose conversion or resize cannot fit, returns the note as text instead
+  of an image. Images ignore `offset` and `limit`. A non-regular file, and one
+  that is not a recognized image and has a NUL byte in its first `8` KiB, are
+  refused; any other file decodes as text, lossily, with a note naming the
+  replacements.
+- **`write`**: Writes `content` in place, creating missing parent directories,
+  and keeps the permissions of a file that exists.
+- **`edit`**: Each `edits[]` entry is `{oldText, newText}`, matched against the
+  original file, not against the result of an earlier entry. Every `oldText`
+  must be unique in that file and must not overlap another. The file must be
+  UTF-8; a byte-order mark and the first line ending style are kept, and the
+  result names each replaced block's first line in the file it produced, marking
+  a block whose match needed normalizing.
+- **Paths**: A path resolves against the session's working directory, accepts
+  `~` for the home directory, or is a native absolute path (`C:/...` or
+  `C:\...` on Windows; a Git Bash `/c/...` path is not one).
+- **Mutation**: `write` and `edit` serialize with each other inside one server
+  process. They do not coordinate with `exec`, with a `transfer` upload, or with
+  another process.
+
 ## 2. Host Configuration and Output Modes
 
 ### Progress Notifications and Timeouts
@@ -68,7 +105,9 @@ its tasks. In `on` mode a disconnect ends nothing; the daemon keeps the tasks
 ### `FASTEXEC_STRUCTURED_CONTENT` and `FASTEXEC_OUTPUT_MODE`
 
 Set these strings in the MCP server's `env` configuration. Both are read at
-startup; invalid values exit with status `1`:
+startup; invalid values exit with status `1`. They shape `exec` results:
+`read`, `write`, and `edit` answer with their own text or image content, and
+`transfer` adds `structuredContent.url` when structured content is enabled.
 
 - **`FASTEXEC_STRUCTURED_CONTENT`**: `"true"` (default) attaches
   `structuredContent` JSON metadata; `"false"` omits `structuredContent` on all
@@ -93,6 +132,8 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
 `structuredContent`.
 
 ### `structuredContent` Fields
+
+These fields describe `exec` results.
 
 - **`start`, `poll`, `kill`**: `ok`, `action`, `taskId`, `state` (`"running"`,
   `"exited"`, `"killed"`), `exitCode`, `pty`, `elapsedMs`, `logPath`,
@@ -201,10 +242,11 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
   deadline that covers connecting, starting a daemon, and its `Hello`; only an
   absent daemon is started, and one that is there but does not answer in time is
   reported instead. A call whose connection fails after it was sent returns an
-  error naming the action, call ID, request ID, session, and daemon epoch, and is
-  not replayed. `list` shows each task's owner and, for a call through this
-  endpoint, the session and call ID that started it; both are null for a task
-  started in the default mode or over HTTP.
+  error naming the call, request ID, session, and daemon epoch — the action for
+  `exec`, the tool for `read`, `write`, and `edit` — and is not replayed.
+  `list` shows each task's owner and, for a call through this endpoint, the
+  session and call ID that started it; both are null for a task started in the
+  default mode or over HTTP.
 - **Identity**: The build ID is the SHA-256 of the running image. The namespace
   is the first `16` hex characters of `SHA-256(build ID, scope)`, where the
   scope is a non-empty `FASTEXEC_NAMESPACE`, else the canonical path of the
@@ -218,11 +260,12 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
 - **IPC**: A named pipe `\\.\pipe\fastexec-<user hash>-<namespace>` with an
   owner-only DACL that rejects remote clients, or a Unix socket at
   `ns/<namespace>/sock` when that path fits in `100` bytes, else at
-  `/tmp/fastexec-<uid>/<namespace>.sock`. Frames are length-prefixed JSON: the
-  endpoint refuses a call whose serialized arguments pass `1` MiB before writing
-  it, a request frame is at most `4` MiB (a `Hello` carries the endpoint's
-  environment), a response frame at most `64` MiB, one connection carries at most
-  `32` concurrent calls, and the daemon serves at most `128` connections.
+  `/tmp/fastexec-<uid>/<namespace>.sock`. Frames are length-prefixed JSON, and a
+  call names its tool (`exec`, `read`, `write`, `edit`). The endpoint refuses a
+  call whose serialized arguments pass `1` MiB before writing it, a request frame
+  is at most `4` MiB (a `Hello` carries the endpoint's environment), a response
+  frame at most `64` MiB, one connection carries at most `32` concurrent calls,
+  and the daemon serves at most `128` connections.
 - **Sessions**: Each endpoint process holds one random session ID with its own
   cursors, and a reconnect keeps them. A session with no live connection is
   dropped after `10` minutes, and the table holds at most `256` sessions. The
@@ -236,25 +279,52 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
   or the Linux task host, and a task ID from a dead daemon answers as coming
   from an earlier daemon.
 - **Host confinement**: A host that keeps its children in a Job without
-  breakaway, such as a fastexec task, cannot start the daemon, and the call
-  fails naming `fastexec daemon start` from a terminal outside the host. A host
-  that confines its children to a cgroup, such as a systemd scope or a
-  container, ends the daemon with it.
+  breakaway, such as a fastexec task, cannot start a detached daemon, and the
+  call fails naming `fastexec daemon start` from a terminal outside the host.
+  `fastexec daemon run` is the supervisor's own process and serves inside such a
+  host. A host that confines its children to a cgroup, such as a systemd scope or
+  a container, ends the daemon with it.
 - **CLI**: `fastexec daemon start [--http <addr>] [--idle-exit on|off]` starts the daemon detached
   from the calling terminal and prints its epoch, PID, namespace, and HTTP
-  address. `status` prints epoch, build, PID, sessions, tasks, and the HTTP
-  address or `off`; `stop` prints the stopped epoch. `status` and `stop` never
-  start a daemon, and `stop` without one exits `0`. Start flags only apply to a
-  new daemon; stop the existing one before changing its idle-exit policy.
+  address. `fastexec daemon run [--http <addr>]` serves the same daemon in the
+  foreground, in the process a supervisor started: it takes the namespace lock
+  like any daemon and refuses a namespace that already has one, prints the same
+  line to stderr once both listeners are bound, keeps its logs on stderr, runs
+  with idle exit off, and refuses `--idle-exit`. `SIGTERM` and `SIGINT`, and on
+  Windows `Ctrl+C`, `Ctrl+Break`, console close and shutdown, stop it as
+  `daemon stop` does, with exit `0`. That cleanup is best effort where the
+  operating system ends the process first, by a close deadline it enforces or a
+  forced termination. `status` prints epoch, build, PID, sessions,
+  tasks, and the HTTP address or `off`; `stop` prints the stopped epoch. `status`
+  and `stop` never start a daemon, and `stop` without one exits `0`. Start flags
+  only apply to a new daemon; stop the existing one before changing its
+  idle-exit policy.
 - **HTTP**: `--http <addr>` with `FASTEXEC_HTTP_TOKEN`, at least `16` visible
-  ASCII characters, serves the same tool over Streamable HTTP. The address is
+  ASCII characters, serves the same toolset over Streamable HTTP. The address is
   loopback unless `FASTEXEC_HTTP_ALLOW_REMOTE=1`, which belongs behind a
-  TLS-terminating proxy. Every request carries the bearer token, checked before a
-  session is created or resumed, and the token is dropped from the environment
-  HTTP sessions launch tasks with; a body over `4` MiB is refused; `Origin` is
+  TLS-terminating proxy. Every `/mcp` request carries the bearer token, checked
+  before a session is created or resumed, and the token is dropped from the
+  environment HTTP sessions launch tasks with; a `/mcp` body over `4` MiB is
+  refused; `Origin` is
   limited to the bound address's own origin, the loopback names, and
   `FASTEXEC_HTTP_ALLOWED_ORIGINS`, where an entry without a port matches any
   port. This is request Origin validation, not CORS support: browser cross-origin
   preflights and CORS response headers are not provided. HTTP sessions run with
   the daemon's own environment, and the `10` minute
   inactivity TTL expires idle ones without bounding their count or memory.
+  Streamed responses carry `X-Accel-Buffering: no`, which a proxy reads as the
+  instruction not to buffer them.
+- **Transfer route**: `/t/<capability id>` serves one file without the bearer
+  token, which is what makes a URL usable by `curl`; the `transfer` tool mints
+  the id and builds the URL from the request's own `Host` and scheme. An id
+  expires after `10` minutes unused, and an unknown or expired one answers
+  `404`. `GET` returns the file, honouring one `bytes=` range with `206` and
+  `416` and ignoring any other form, so the whole file comes back with `200`.
+  `HEAD` answers the current size. `PUT` writes the body at `?offset=` (default
+  `0`), truncating the file to that offset before reading the body, refusing an
+  offset past the end with `409`, keeping the bytes of a body that disconnects,
+  and answering the new size. Any other method answers `405` with `Allow`.
+  Replies carry `Cache-Control: no-store`, `Content-Type:
+  application/octet-stream`, and `X-Accel-Buffering: no`. `/t/` is answered
+  before the bearer check and before the `4` MiB body cap that applies to
+  `/mcp`.
