@@ -79,7 +79,10 @@ ranges return an error before execution.
 - **`edit`**: Each `edits[]` entry is `{oldText, newText}`, matched against the
   original file, not against the result of an earlier entry. Every `oldText`
   must be unique in that file, counted over every start position including
-  overlapping ones, and must not overlap another. The file must be UTF-8; a
+  overlapping ones, and must not overlap another. Exact duplicates are rejected
+  before fuzzy normalization can hide them; near copies are also ambiguous.
+  A sole exact and a sole fuzzy match must map to the same original target,
+  allowing for the whitespace fuzzy matching trims. The file must be UTF-8; a
   byte-order mark and the first line ending style are kept, only the matched
   bytes are replaced, and the result names each replaced block's first line in
   the file it produced, marking a block whose match needed normalizing.

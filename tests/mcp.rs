@@ -884,6 +884,92 @@ fn the_listed_tool_says_which_host_it_runs_on() {
 }
 
 #[test]
+fn edit_refuses_ambiguity_hidden_by_normalization() {
+    let dir = Scratch::new("edit-ambiguity");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let mut server = Server::start_with(|command| {
+        command.current_dir(&*dir);
+    });
+    for (content, old, new, batch) in [
+        ("cafe\u{301} cafe", "cafe", "coffee", false),
+        ("cafe\u{301} cafe\u{301}", "cafe", "coffee", false),
+        ("a\u{301} e\u{301}", "\u{301}", "", false),
+        (
+            "header\nJose\u{301} Martin\nJose\u{301} Perez\n",
+            "Jose",
+            "Joe",
+            true,
+        ),
+        ("cafe cafe", "cafe", "coffee", false),
+        ("e\u{301}e\u{301}e\u{301}", "e\u{301}e", "X", false),
+        ("\u{ff41}aa\u{301}", "aa", "X", false),
+        ("it's it\u{2019}s", "it's", "it is", false),
+        (
+            "cafe\u{301} \u{ff43}\u{ff41}\u{ff46}\u{ff45}",
+            "cafe",
+            "coffee",
+            false,
+        ),
+        (
+            "\u{ff43}\u{ff41}\u{ff46}\u{ff45} cafe\u{301}",
+            "cafe",
+            "coffee",
+            false,
+        ),
+    ] {
+        let path = dir.join("case.txt");
+        std::fs::write(&path, content).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut edits = Vec::new();
+        if batch {
+            edits.push(json!({"oldText": "header", "newText": "HEADER"}));
+        }
+        edits.push(json!({"oldText": old, "newText": new}));
+        let (text, error) = server.file("edit", json!({"path": "case.txt", "edits": edits}));
+        assert!(error, "{content:?} / {old:?}: {text}");
+        let target = if batch { "edits[1]" } else { "the text" };
+        assert!(
+            text.starts_with(&format!("Found 2 occurrences of {target} in case.txt.")),
+            "{text}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+}
+
+#[test]
+fn edit_allows_a_unique_exact_match_changed_by_normalization() {
+    let dir = Scratch::new("edit-unique");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let mut server = Server::start_with(|command| {
+        command.current_dir(&*dir);
+    });
+    for (content, old, new, expected) in [
+        ("cafe\u{301}", "cafe", "coffee", "coffee\u{301}"),
+        ("a\u{301}", "\u{301}", "", "a"),
+        ("a ", "a ", "X", "X"),
+        ("a \n", "a \n", "X\n", "X\n"),
+        (" \na \n", " \na \n", "X\n", "X\n"),
+    ] {
+        let path = dir.join("case.txt");
+        std::fs::write(&path, content).unwrap();
+        let (text, error) = server.file(
+            "edit",
+            json!({"path": "case.txt", "edits": [{"oldText": old, "newText": new}]}),
+        );
+        assert!(!error, "{content:?} / {old:?}: {text}");
+        assert_eq!(
+            text,
+            "Successfully replaced 1 block(s) in case.txt.\nedits[0]: line 1"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+    }
+}
+
+#[test]
 fn file_tools_round_trip_through_the_servers_directory() {
     let dir = Scratch::new("files");
     std::fs::create_dir_all(&*dir).unwrap();

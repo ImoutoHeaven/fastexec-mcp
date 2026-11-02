@@ -813,15 +813,36 @@ fn fuzzy_span(content: &str, old: &str) -> Option<(usize, usize)> {
     FuzzyMap::new(content)?.span(at, at + needle.len())
 }
 
-/// How often `old` occurs in `content`: counted in the fuzzy form, so a near copy is ambiguous
-/// too, and over every start, so overlapping occurrences are never mistaken for one.
+/// Counts exact duplicates first, then fuzzy copies; both counts include overlapping starts.
 fn occurrences(content: &str, old: &str) -> usize {
+    let exact = starts_in(content, old);
+    // Normalization can compose across the target's boundary and erase exact candidates.
+    if exact > 1 {
+        return exact;
+    }
     let needle = normalize_for_fuzzy_match(old);
     if needle.is_empty() {
         // A target that normalizes to nothing is counted as the content spells it.
-        return starts_in(content, old);
+        return exact;
     }
-    starts_in(&normalize_for_fuzzy_match(content), &needle)
+    let haystack = normalize_for_fuzzy_match(content);
+    if haystack == content && needle == old {
+        return exact;
+    }
+    let count = starts_in(&haystack, &needle);
+    // Trim can shorten the exact target's fuzzy span; compare its mapped form.
+    if exact == 1
+        && count == 1
+        && let Some(exact_at) = content.find(old)
+        && let Some(fuzzy_at) = haystack.find(&needle)
+        && let Some(fuzzy_span) =
+            FuzzyMap::new(content).and_then(|map| map.span(fuzzy_at, fuzzy_at + needle.len()))
+        && let Some((offset, len)) = FuzzyMap::new(old).and_then(|map| map.span(0, needle.len()))
+        && fuzzy_span != (exact_at + offset, len)
+    {
+        return 2;
+    }
+    exact.max(count)
 }
 
 /// How many starts `needle` has in `haystack`, counting overlapping occurrences in one pass.
