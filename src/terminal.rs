@@ -36,8 +36,10 @@ const SESSION_LINES: usize = 10_000;
 /// Normal-screen lines written out that a reprint after a cleared history is matched against.
 const REPRINT_REACH: usize = 100_000;
 /// Lines with text that must repeat written lines in a row before a reprint is taken for one:
-/// a screen of them, more than a command run again after `clear` usually prints.
-const REPRINT_CONFIRM: usize = PTY_ROWS as usize;
+/// a screen of them, more than a command run again after `clear` usually prints, and never
+/// more than the screen holds.
+const REPRINT_CONFIRM_LIMIT: usize = 30;
+
 /// A line whose rows wrap for longer is written out in pieces this long, so a program that
 /// prints without line breaks holds no more than this in memory.
 const LINE_LIMIT: usize = 1 << 20;
@@ -81,7 +83,12 @@ const KITTY_FLAGS: [TermMode; 5] = [
     TermMode::REPORT_ASSOCIATED_TEXT,
 ];
 
-struct Size;
+/// The size of a task's terminal: its columns and screen rows.
+#[derive(Clone, Copy)]
+struct Size {
+    columns: u16,
+    lines: u16,
+}
 
 impl Dimensions for Size {
     fn total_lines(&self) -> usize {
@@ -89,11 +96,47 @@ impl Dimensions for Size {
     }
 
     fn screen_lines(&self) -> usize {
-        usize::from(PTY_ROWS)
+        usize::from(self.lines)
     }
 
     fn columns(&self) -> usize {
-        usize::from(PTY_COLS)
+        usize::from(self.columns)
+    }
+}
+
+/// Rows drawn since the session's history last read the screen: none, one row, or more than one,
+/// which is all any reader needs to know.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+enum Drawn {
+    #[default]
+    None,
+    One(usize),
+    /// More than one row, which is all any reader needs to know.
+    Many,
+}
+
+impl Drawn {
+    /// Records that row `row` was written.
+    fn add(&mut self, row: usize) {
+        match self {
+            Drawn::None => *self = Drawn::One(row),
+            Drawn::One(first) if *first == row => {}
+            Drawn::One(_) => *self = Drawn::Many,
+            Drawn::Many => {}
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        matches!(self, Drawn::None)
+    }
+
+    /// Only row `row` was written.
+    fn only(&self, row: usize) -> bool {
+        matches!(self, Drawn::One(only) if *only == row)
+    }
+
+    fn clear(&mut self) {
+        *self = Drawn::None;
     }
 }
 
@@ -123,22 +166,58 @@ impl EventListener for Replies {
 }
 
 impl Live {
+    /// An emulator at the default size, which is what a task that names no size gets.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Live {
+        Live::at(PTY_COLS, PTY_ROWS)
+    }
+
+    /// An emulator for a terminal of `cols` by `rows`.
+    pub fn at(cols: u16, rows: u16) -> Live {
         let replies = Replies::default();
         let config = Config {
             // One operation pushes at most a screen of rows, and the recorder takes the history
             // after each.
-            scrolling_history: usize::from(PTY_ROWS),
+            scrolling_history: usize::from(rows),
             kitty_keyboard: true,
             ..Config::default()
         };
+        let size = Size {
+            columns: cols,
+            lines: rows,
+        };
         Live {
-            recorder: Recorder::new(Term::new(config, &Size, replies.clone())),
+            recorder: Recorder::new(Term::new(config.clone(), &size, replies.clone()), config),
             parser: Processor::new(),
             replies,
             read: 0,
             stopped: false,
         }
+    }
+
+    /// The terminal's size in columns and rows, as the emulator has it.
+    pub fn size(&self) -> (u16, u16) {
+        let (cols, rows) = self.recorder.size();
+        (cols as u16, rows as u16)
+    }
+
+    /// The terminal is `cols` by `rows` from now on. The emulator is at the new size when this
+    /// returns: the transcript settles at the old size, the reflow happens, and the rows it
+    /// pushed off are written out. A stopped emulator keeps the size it had. The replies the
+    /// output applied at the old size asked for are returned, for the caller to send to the
+    /// program as it sends the replies of any other read.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Vec<u8> {
+        if self.stopped {
+            return Vec::new();
+        }
+        let (cols, rows) = (usize::from(cols), usize::from(rows));
+        // Output a synchronized update holds is old-size output: it is applied, and settled, at
+        // the size the screen had when it arrived, before the emulator resizes.
+        self.run(|recorder, parser| {
+            recorder.stop_sync(parser);
+            recorder.commit();
+            recorder.resize(cols, rows);
+        })
     }
 
     /// Reads one piece of output, read from the program at `arrived` after the output paused
@@ -152,7 +231,7 @@ impl Live {
             .is_some_and(|deadline| deadline <= arrived);
         self.run(|recorder, parser| {
             if expired {
-                parser.stop_sync(recorder);
+                recorder.stop_sync(parser);
             }
             if let Some(long) = pause {
                 recorder.pause(long);
@@ -174,7 +253,7 @@ impl Live {
     /// replies that output asked for.
     pub fn end_sync(&mut self) -> Vec<u8> {
         self.run(|recorder, parser| {
-            parser.stop_sync(recorder);
+            recorder.stop_sync(parser);
             recorder.commit();
         })
     }
@@ -326,7 +405,7 @@ impl Reprint {
     }
 
     /// The lines `line` lets through to be written out: none while it repeats written lines.
-    fn step(&mut self, written: &Written, line: String) -> Vec<String> {
+    fn step(&mut self, written: &Written, line: String, confirm: usize) -> Vec<String> {
         let line_digest = digest(&line);
         match self {
             Reprint::Off => vec![line],
@@ -358,7 +437,7 @@ impl Reprint {
                 }
                 *texts += usize::from(!blank(&line));
                 held.push(line);
-                if *texts >= REPRINT_CONFIRM {
+                if *texts >= confirm.max(1) {
                     *self = Reprint::Following(starts[0] + held.len());
                 }
                 Vec::new()
@@ -399,8 +478,8 @@ struct Recorder {
     held: bool,
     /// Times the program showed the cursor again after hiding it.
     redraws: usize,
-    /// Rows written since the session's history last read the screen, one bit per row.
-    drawn: u64,
+    /// Rows written since the session's history last read the screen.
+    drawn: Drawn,
     /// The frame read from the rows written alone, kept to reuse its memory.
     frame: Vec<FrameRow>,
     /// A line whose first rows left the screen while its last one wraps onto it, and the mark
@@ -416,19 +495,24 @@ struct Recorder {
     after_session: bool,
     written: Written,
     reprint: Reprint,
+    /// Lines with text that must repeat written ones before a reprint is taken for one.
+    confirm: usize,
+    /// The emulator's options, kept so the history limit follows the screen's height.
+    config: Config,
     /// Lines written out and not taken yet, each ending in a newline.
     out: String,
 }
 
 impl Recorder {
-    fn new(term: Term<Replies>) -> Recorder {
+    fn new(term: Term<Replies>, config: Config) -> Recorder {
+        let rows = term.grid().screen_lines();
         Recorder {
             term,
             session: None,
-            region: (0, usize::from(PTY_ROWS) - 1),
+            region: (0, rows.saturating_sub(1)),
             held: false,
             redraws: 0,
-            drawn: 0,
+            drawn: Drawn::None,
             frame: Vec::new(),
             partial: None,
             partial_row: 0,
@@ -437,8 +521,78 @@ impl Recorder {
             after_session: false,
             written: Written::default(),
             reprint: Reprint::Off,
+            confirm: rows.min(REPRINT_CONFIRM_LIMIT),
+            config,
             out: String::new(),
         }
+    }
+
+    /// The terminal is `cols` by `rows` from now on. The transcript never loses text: the screen
+    /// as it stands is written out at the old size, the scrollback that remains is cleared, and
+    /// the recorder starts fresh at the new size. A row still on the screen after the resize can
+    /// therefore reach the transcript a second time, which is what the contract allows.
+    fn resize(&mut self, cols: usize, rows: usize) {
+        let (old_cols, old_rows) = (self.term.grid().columns(), self.term.grid().screen_lines());
+        if (cols, rows) == (old_cols, old_rows) || rows == 0 || cols == 0 {
+            return;
+        }
+        let size = Size {
+            columns: cols as u16,
+            lines: rows as u16,
+        };
+        // Lines held as a possible reprint were not a reprint after all: the rows around them
+        // moved.
+        for line in self.reprint.release() {
+            self.write_normal(&line);
+        }
+        if self.alternate() {
+            // The alternate screen as it stands is one frame, written whole; its session ends
+            // here and a new one starts at the new size.
+            self.present();
+            self.end_session(true);
+            // Rows the inactive normal grid's history holds came from rows the session start
+            // already wrote, so they are cleared rather than written twice.
+            self.term.grid_mut().clear_history();
+            self.term.resize(size);
+            self.term.grid_mut().clear_history();
+            self.session();
+        } else {
+            // Every row the screen pushed off, then the screen itself: the logical lines joined
+            // over WRAPLINE, the partial line included.
+            self.spill();
+            self.write_screen();
+            self.term.grid_mut().clear_history();
+            self.term.resize(size);
+            // The reflow's rows are rows already written.
+            self.term.grid_mut().clear_history();
+        }
+        // The limit the terminal keeps rows under is the screen's height: one operation pushes at
+        // most a screen of rows and the recorder takes them after each, so a pass through a
+        // taller screen must not be truncated by the height it had before.
+        self.set_history(rows);
+        // Fresh means fresh: the marks written at the old size stay on those cells, so the map
+        // starts empty and the counter at zero rather than carrying the old associations.
+        self.marked.clear();
+        self.marks = 0;
+        self.partial = None;
+        self.partial_row = 0;
+        self.region = (0, rows - 1);
+        self.drawn.clear();
+        self.confirm = rows.min(REPRINT_CONFIRM_LIMIT);
+    }
+
+    /// The emulator's history limit changes; the rows it already holds stay.
+    fn set_history(&mut self, lines: usize) {
+        if self.config.scrolling_history == lines {
+            return;
+        }
+        self.config.scrolling_history = lines;
+        self.term.set_options(self.config.clone());
+    }
+
+    /// The terminal's size in columns and rows.
+    fn size(&self) -> (usize, usize) {
+        (self.term.grid().columns(), self.term.grid().screen_lines())
     }
 
     fn alternate(&self) -> bool {
@@ -486,9 +640,10 @@ impl Recorder {
         } else {
             let mut reprint = self.reprint.clone();
             let mut lines = Vec::new();
+            let confirm = self.confirm;
             for line in self.screen_lines() {
                 if !self.already_written(&line) {
-                    lines.extend(reprint.step(&self.written, line.text));
+                    lines.extend(reprint.step(&self.written, line.text, confirm));
                 }
             }
             lines.extend(reprint.release());
@@ -511,7 +666,8 @@ impl Recorder {
 
     /// Writes out a normal-screen line unless it repeats written lines.
     fn write_checked(&mut self, line: String) {
-        for line in self.reprint.step(&self.written, line) {
+        let confirm = self.confirm;
+        for line in self.reprint.step(&self.written, line, confirm) {
             self.write_normal(&line);
         }
     }
@@ -682,7 +838,7 @@ impl Recorder {
 
     /// The cursor's row is being written.
     fn draw(&mut self) {
-        self.drawn |= 1 << self.cursor_line().min(63);
+        self.drawn.add(self.cursor_line());
     }
 
     /// The screen is a finished frame, unless a synchronized update holds its drawing.
@@ -694,7 +850,7 @@ impl Recorder {
         if let Some(session) = self.session() {
             session.present(&rows);
         }
-        self.drawn = 0;
+        self.drawn.clear();
     }
 
     /// Where the output paused the screen shows a finished frame, unless the program hides the
@@ -734,9 +890,9 @@ impl Recorder {
         // Rows written since the last frame show before they move: a frame of the screen, read
         // from the rows written alone when that is the cursor's row, as a program printing
         // lines writes it.
-        if !self.held && self.drawn != 0 {
+        if !self.held && !self.drawn.is_none() {
             let cursor = self.cursor_line();
-            if self.drawn == 1 << cursor.min(63) {
+            if self.drawn.only(cursor) {
                 let row = frame_row(self.term.grid(), cursor);
                 let mut frame = std::mem::take(&mut self.frame);
                 if let Some(session) = self.session() {
@@ -750,7 +906,7 @@ impl Recorder {
                     session.present(&frame);
                 }
                 self.frame = frame;
-                self.drawn = 0;
+                self.drawn.clear();
             } else {
                 self.present();
             }
@@ -915,7 +1071,8 @@ impl Handler for Recorder {
             self.write_screen();
         }
         Handler::reset_state(&mut self.term);
-        self.region = (0, usize::from(PTY_ROWS) - 1);
+        let (_, rows) = self.size();
+        self.region = (0, rows.saturating_sub(1));
         self.held = false;
         self.end_session(false);
     }
@@ -941,13 +1098,18 @@ impl Handler for Recorder {
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         self.mode_change(mode, false);
         Handler::unset_private_mode(&mut self.term, mode);
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) {
+            // Rows the inactive grid's history holds came from rows the session start already
+            // wrote, so they are dropped rather than written twice.
+            self.term.grid_mut().clear_history();
+        }
         self.end_session(false);
     }
 
     fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
         Handler::set_scrolling_region(&mut self.term, top, bottom);
         // As the terminal does: 1-based rows, ignored unless the top is above the bottom.
-        let rows = usize::from(PTY_ROWS);
+        let (_, rows) = self.size();
         let bottom = bottom.unwrap_or(rows);
         if top < bottom {
             self.region = (top.saturating_sub(1).min(rows), bottom.min(rows) - 1);
@@ -1011,6 +1173,19 @@ impl Handler for Recorder {
 }
 
 impl Recorder {
+    /// Ends a synchronized update the program no longer holds, after writing out the lines the
+    /// update already applied. A timeout can split one redraw into two numeric-only regions, and
+    /// the drawing that ends it would condense rows the transcript never received.
+    fn stop_sync(&mut self, parser: &mut Processor) {
+        if self.held {
+            let lines = self.session.as_mut().map(History::flush);
+            for line in lines.into_iter().flatten() {
+                self.push(&line);
+            }
+        }
+        parser.stop_sync(self);
+    }
+
     /// Before private mode `mode` is set or reset: the frame it ends, if it ends one.
     fn mode_change(&mut self, mode: PrivateMode, set: bool) {
         let PrivateMode::Named(named) = mode else {
@@ -1032,7 +1207,11 @@ impl Recorder {
             NamedPrivateMode::SwapScreenAndSetRestoreCursor => self.present(),
             NamedPrivateMode::ColumnMode => {
                 self.present();
-                self.region = (0, usize::from(PTY_ROWS) - 1);
+                // The frame is cleared at the height this terminal has, not the default one: a
+                // region past the last row indexes a row the emulator does not have, and a region
+                // short of it leaves the rows below scrolling in place.
+                let (_, rows) = self.size();
+                self.region = (0, rows.saturating_sub(1));
             }
             _ => {}
         }
@@ -1395,6 +1574,74 @@ mod tests {
         );
     }
 
+    /// A synchronized update that times out must not cost the rows it already applied: the timeout
+    /// splits one redraw into two numeric-only regions, and each would condense rows the transcript
+    /// never received. An empty piece arriving past the deadline is what forces the end.
+    #[test]
+    fn a_synchronized_update_that_times_out_keeps_the_rows_it_applied() {
+        fn rows(first: usize, last: usize) -> String {
+            (first..last)
+                .map(|k| format!("[{};1H[2Kframed {k:05}", k % 5 + 2))
+                .collect()
+        }
+        let mut live = Live::new();
+        let mut text = String::new();
+        let arrived = Instant::now();
+        // A whole frame of five rows on the alternate screen.
+        let first = format!("[?1049h[?2026h[H[2Kheader{}[?2026l", rows(0, 5));
+        live.process(first.as_bytes(), arrived, None);
+        text += &live.take_written();
+        // The next frame begins and stays held, then the update times out.
+        let prefix = format!("[?2026h[H[2Kheader{}", rows(5, 7));
+        live.process(prefix.as_bytes(), arrived, None);
+        let deadline = live.sync_deadline().expect("the second frame is held");
+        let after = deadline + std::time::Duration::from_nanos(1);
+        live.process(b"", after, None);
+        text += &live.take_written();
+        let rest = format!("{}[?2026l", rows(7, 10));
+        live.process(rest.as_bytes(), after, None);
+        text += &live.take_written();
+        live.finish();
+        text += &live.take_written();
+        let framed: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("framed "))
+            .collect();
+        let expected: Vec<String> = (0..10).map(|k| format!("framed {k:05}")).collect();
+        assert_eq!(
+            framed,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "{text}"
+        );
+    }
+
+    /// Column mode clears the frame at the height the terminal has: a short screen must not index
+    /// a row it does not have. The tall half only shows that a screen taller than the default
+    /// survives the same sequence; it reads the emulator's grid, so it says nothing about how the
+    /// recorder attributes rows.
+    #[test]
+    fn column_mode_keeps_the_screens_own_height() {
+        let mut short = Live::at(20, 5);
+        short.process(b"[?1049h[?3h[T", Instant::now(), None);
+        let (rows, _) = short
+            .screen()
+            .expect("a five-row screen survives column mode");
+        assert_eq!(short.size(), (20, 5));
+        assert!(rows.is_empty(), "{rows:?}");
+
+        let mut tall = Live::at(20, 40);
+        let frame = "[?1049h[?3h[1;1Htop[40;1Hbottom";
+        tall.process(frame.as_bytes(), Instant::now(), None);
+        tall.process(b"[T", Instant::now(), None);
+        let (rows, _) = tall.screen().expect("a forty-row screen survives");
+        assert_eq!(tall.size(), (20, 40));
+        assert_eq!(rows.get(1).map(String::as_str), Some("top"), "{rows:?}");
+        assert!(
+            !rows.iter().any(|row| row == "bottom"),
+            "the bottom row scrolled out: {rows:?}"
+        );
+    }
+
     #[test]
     fn long_output_is_written_out_whole() {
         // Lines scrolling the normal screen, then the alternate screen, then pages a program
@@ -1415,8 +1662,12 @@ mod tests {
         // Read in pieces, as a program's output arrives.
         let mut live = Live::new();
         let mut text = String::new();
+        // One arrival for every piece: the chunks are one program's output, and a fresh instant
+        // per chunk would let a scheduling gap expire a synchronized update the fixture means to
+        // keep whole.
+        let arrived = Instant::now();
         for piece in log.as_bytes().chunks(4096) {
-            live.process(piece, Instant::now(), None);
+            live.process(piece, arrived, None);
             text += &live.take_written();
         }
         live.finish();
@@ -1916,6 +2167,473 @@ mod tests {
             live.finish();
             live.take_written();
             assert!(!live.stopped(), "{:?}", String::from_utf8_lossy(log));
+        }
+    }
+}
+
+/// The resize contract: a resize never loses transcript text. The screen as it stands is written
+/// out at the old size, the recorder starts fresh at the new size, and a row still visible after
+/// the resize may therefore reach the transcript twice.
+#[cfg(test)]
+mod resize {
+    use super::*;
+
+    /// One task's emulator and the transcript it has written out so far.
+    struct Written {
+        live: Live,
+        text: String,
+    }
+
+    impl Written {
+        fn new(cols: u16, rows: u16) -> Written {
+            Written {
+                live: Live::at(cols, rows),
+                text: String::new(),
+            }
+        }
+
+        fn drain(&mut self) {
+            self.text.push_str(&self.live.take_written());
+        }
+
+        fn feed(&mut self, bytes: &str) {
+            self.live.process(bytes.as_bytes(), Instant::now(), None);
+            self.drain();
+        }
+
+        fn resize(&mut self, cols: u16, rows: u16) {
+            let replies = self.live.resize(cols, rows);
+            assert!(replies.is_empty(), "no query was asked at the resize");
+            self.drain();
+        }
+
+        fn finish(&mut self) -> String {
+            self.live.finish();
+            self.drain();
+            let pending = self.live.pending();
+            self.text.clone() + &pending
+        }
+    }
+
+    /// Every non-blank line of a transcript.
+    fn lines(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The contract: no text is lost, and what a resize writes is written whole. Every expected
+    /// line appears, as one line, in this order; it may appear more than once only because a row
+    /// still on the screen after the resize can be written again, which is why appearance is
+    /// checked in order rather than counted.
+    fn assert_no_loss(text: &str, expected: &[&str]) {
+        let written = lines(text);
+        let mut at = 0;
+        for want in expected {
+            let found = written[at..]
+                .iter()
+                .position(|line| line == want)
+                .unwrap_or_else(|| {
+                    panic!("{want:?} is written whole, after {at} lines: {written:?}")
+                });
+            at += found + 1;
+        }
+    }
+
+    #[test]
+    fn normal_text_reflows_without_splitting_the_line() {
+        let mut task = Written::new(20, 6);
+        task.feed("abcdefghijklmnopqrs\r\n");
+        task.resize(10, 6);
+        task.feed("X\r\n");
+        assert_no_loss(&task.finish(), &["abcdefghijklmnopqrs", "X"]);
+    }
+
+    #[test]
+    fn a_row_shrink_writes_every_line_once_in_order() {
+        let mut task = Written::new(40, 10);
+        task.feed("l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\nl7\r\nl8\r\n");
+        task.resize(20, 5);
+        assert_no_loss(
+            &task.finish(),
+            &["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"],
+        );
+    }
+
+    /// Exact multiplicity: two rows are not one. With one bit per row and rows above 63 sharing
+    /// the last bit, a write on each of two such rows read as the cursor's row alone.
+    #[test]
+    fn rows_above_sixty_three_are_not_one_row() {
+        let mut drawn = Drawn::default();
+        drawn.add(65);
+        drawn.add(70);
+        assert!(!drawn.only(70), "two rows are not one row");
+        assert!(!drawn.only(65), "nor the other of the two");
+        let mut single = Drawn::default();
+        single.add(70);
+        assert!(single.only(70), "one row is that row");
+        assert!(!single.only(65), "and not another");
+    }
+
+    /// Two distinct rows above 63 are two rows. With one bit per row aliased to the last one,
+    /// both writes look like the cursor's row, and the frame a following scroll writes for them
+    /// holds only that row.
+    #[test]
+    fn writes_on_two_rows_above_sixty_three_are_two_rows() {
+        let mut task = Written::new(40, 100);
+        task.feed("\x1b[?1049h");
+        task.feed("\x1b[65;1Hrow sixty five");
+        task.feed("\x1b[70;1Hrow seventy");
+        // A scroll of the alternate screen is where the rows written since the last frame show.
+        task.feed("\x1b[1S");
+        let text = task.finish();
+        assert!(!task.live.stopped(), "the emulator never stops");
+        for row in ["row sixty five", "row seventy"] {
+            assert!(
+                lines(&text).iter().any(|line| line == row),
+                "{row} reaches the transcript: {:?}",
+                lines(&text)
+            );
+        }
+    }
+
+    /// Combining marks survive a width change: the logical line is written whole, so no mark is
+    /// left behind on a row border.
+    #[test]
+    fn combining_characters_survive_a_width_change() {
+        let line = "e\u{301}".repeat(12);
+        let mut task = Written::new(20, 6);
+        task.feed(&line);
+        task.resize(12, 6);
+        task.feed("\r\nX\r\n");
+        assert_no_loss(&task.finish(), &[line.as_str(), "X"]);
+    }
+
+    /// A line whose rows straddle the history and the screen is written as one line.
+    #[test]
+    fn a_normal_line_straddling_history_and_screen_is_written_whole() {
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(6);
+        assert_eq!(line.len(), 216);
+        let mut task = Written::new(40, 10);
+        task.feed(&format!("{line}\r\n\x1b[?1049hALT"));
+        task.resize(20, 5);
+        task.feed("\x1b[?1049l");
+        let text = task.finish();
+        assert!(!task.live.stopped(), "the emulator never stops");
+        assert_no_loss(&text, &[line.as_str(), "ALT"]);
+    }
+
+    /// A partial line spilled from a scroll region that does not start at row zero is written
+    /// whole, beside the header above it.
+    #[test]
+    fn a_partial_line_from_a_scroll_region_is_written_whole_beside_the_header() {
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxy";
+        assert_eq!(line.len(), 61);
+        let mut task = Written::new(40, 6);
+        task.feed("HEADER\r\n");
+        // Scroll region rows 2..3, so the rows leaving it never enter history.
+        task.feed("\x1b[2;3r\x1b[2;1H");
+        task.feed(&format!("\r\n{line}"));
+        task.resize(20, 6);
+        let text = task.finish();
+        assert_no_loss(&text, &["HEADER", line]);
+        for written in lines(&text) {
+            assert!(
+                !written.starts_with("HEADERab"),
+                "the header does not take the line's prefix: {written:?}"
+            );
+        }
+    }
+
+    /// 199 independent long lines on a full 500-column screen keep every line across the
+    /// narrowest reflow.
+    #[test]
+    fn hard_lines_keep_every_byte_across_the_narrowest_reflow() {
+        let line = format!("{}bbbbbb", format!("a{}", "界".repeat(9)).repeat(26));
+        let mut task = Written::new(500, 200);
+        task.feed(&format!("{line}\r\n").repeat(199));
+        task.resize(20, 5);
+        let text = task.finish();
+        let written = lines(&text);
+        assert_eq!(
+            written.iter().filter(|written| *written == &line).count(),
+            199,
+            "all 199 lines are written whole"
+        );
+    }
+
+    #[test]
+    fn wide_text_survives_the_narrowest_reflow() {
+        let line = ("a".to_string() + &"界".repeat(9)).repeat(5250);
+        assert_eq!(line.len() + 1, 147_001);
+        let mut task = Written::new(500, 200);
+        task.feed(&format!("{line}\r\n"));
+        task.resize(20, 5);
+        assert_no_loss(&task.finish(), &[line.as_str()]);
+    }
+
+    /// The normal screen's rows survive a resize taken while the alternate screen is active:
+    /// `Term::resize` reflows the inactive grid too, and its history is the rows a session start
+    /// already wrote.
+    #[test]
+    fn a_shrink_while_the_alternate_screen_is_active_keeps_the_normal_text() {
+        let mut task = Written::new(40, 10);
+        task.feed(
+            "n1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+             n2 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\n\
+             n3\r\nn4\r\nn5\r\nn6\r\nn7\r\nn8\r\n",
+        );
+        task.feed("\x1b[?1049h");
+        task.feed("a1\r\na2");
+        task.resize(20, 5);
+        task.feed("\r\na3");
+        task.feed("\x1b[?1049l");
+        let text = task.finish();
+        assert!(!task.live.stopped(), "the emulator never stops");
+        assert_no_loss(
+            &text,
+            &[
+                "n1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "n2 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "n3",
+                "n4",
+                "n5",
+                "n6",
+                "n7",
+                "n8",
+                "a1",
+                "a2",
+                "a3",
+            ],
+        );
+    }
+
+    #[test]
+    fn the_alternate_screen_keeps_every_row_across_a_resize() {
+        let mut task = Written::new(40, 6);
+        task.feed("n1\r\nn2\r\n");
+        task.feed("\x1b[?1049h");
+        task.feed("a1\r\na2\r\na3");
+        task.resize(20, 6);
+        task.feed("\r\na4");
+        task.feed("\x1b[?1049l");
+        let text = task.finish();
+        assert!(!task.live.stopped(), "the emulator never stops");
+        assert_no_loss(&text, &["n1", "n2", "a1", "a2", "a3", "a4"]);
+    }
+
+    /// Ten rows, the cursor on the last, a shrink to five rows, then a character appended to the
+    /// row that survives.
+    #[test]
+    fn alt_shrink_keeps_every_row_and_the_edit() {
+        let rows = "alpha\r\nbravo\r\ncharlie\r\ndelta\r\necho\r\nfoxtrot\r\ngolf\r\nhotel\r\nindia\r\njuliet";
+        // The cursor's position drives which side alacritty retains when the shrink drops rows,
+        // so both sides are covered: it arrived on the last row, or it was moved to the first.
+        for (side, move_cursor) in [("bottom", ""), ("top", "\x1b[1;1H")] {
+            let mut task = Written::new(40, 10);
+            task.feed("\x1b[?1049h");
+            task.feed(rows);
+            task.feed(move_cursor);
+            task.resize(40, 5);
+            task.feed("\x1b[5;7HX");
+            task.feed("\x1b[?1049l");
+            let text = task.finish();
+            assert!(!task.live.stopped(), "the emulator never stops: {side}");
+            assert_no_loss(
+                &text,
+                &[
+                    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+                    "india", "juliet",
+                ],
+            );
+            assert!(
+                lines(&text).iter().any(|line| line.ends_with('X')),
+                "the row that survives the shrink keeps the edit, cursor at the {side}: {:?}",
+                lines(&text)
+            );
+        }
+    }
+
+    /// Ten rows that read the same are ten rows, not one repeated.
+    /// A synchronized update holds the bytes that follow it, declarations included: nothing in
+    /// them is the terminal's until the update ends. The resize is what ends a held one, so a
+    /// keyboard mode declared inside it takes effect during the resize, and a reader after the
+    /// resize sees it. Nothing else here waits on a clock.
+    #[test]
+    fn a_resize_applies_a_keyboard_mode_a_synchronized_update_holds() {
+        let mut task = Written::new(100, 40);
+        task.feed("\x1b[?2026h\x1b[?1h");
+        assert!(
+            task.live.sync_deadline().is_some(),
+            "the update is held, not ended"
+        );
+        assert!(
+            !task.live.modes().expect("a live terminal has modes").cursor,
+            "application cursor keys are not the terminal's while the update holds them"
+        );
+        task.resize(80, 30);
+        assert!(
+            task.live.sync_deadline().is_none(),
+            "the resize ended the held update"
+        );
+        assert!(
+            task.live.modes().expect("a live terminal has modes").cursor,
+            "application cursor keys are the terminal's after the resize settled them"
+        );
+    }
+
+    #[test]
+    fn alt_repeated_and_wrapped_rows_keep_every_row() {
+        let same = "same\r\n".repeat(9) + "same";
+        let mut task = Written::new(40, 10);
+        task.feed("\x1b[?1049h");
+        task.feed(&same);
+        task.resize(40, 5);
+        task.feed("X");
+        task.feed("\x1b[?1049l");
+        let text = task.finish();
+        assert!(!task.live.stopped(), "the emulator never stops");
+        let written = lines(&text);
+        let same_rows = written
+            .iter()
+            .filter(|line| line.as_str() == "same" || line.as_str() == "sameX")
+            .count();
+        assert!(
+            same_rows >= 10,
+            "all ten rows reach the transcript: {written:?}"
+        );
+        assert_eq!(
+            written
+                .iter()
+                .filter(|line| line.as_str() == "sameX")
+                .count(),
+            1,
+            "the edited row is written once: {written:?}"
+        );
+        for line in &written {
+            assert!(
+                line.as_str() == "same" || line.as_str() == "sameX" || line.starts_with("---"),
+                "an extra row is a copy of a row visible at the resize: {line:?}"
+            );
+        }
+
+        let mut wrapped = Written::new(20, 6);
+        wrapped.feed("\x1b[?1049h0123456789abcdefghijklmnop");
+        wrapped.resize(40, 6);
+        wrapped.feed("\x1b[?1049l");
+        let text = wrapped.finish();
+        assert_no_loss(&text, &["0123456789abcdefghijklmnop"]);
+    }
+
+    /// A query the output asks while a synchronized update holds the frame is answered by the
+    /// resize that settles it: the reply is returned, not dropped, for the caller to send.
+    #[test]
+    fn a_query_held_across_a_resize_is_answered_by_the_resize() {
+        let mut live = Live::at(40, 10);
+        live.process(b"\x1b[?2026h\x1b[6n", Instant::now(), None);
+        let held = live.take_written();
+        let replies = live.resize(20, 5);
+        assert_eq!(
+            replies, b"\x1b[1;1R",
+            "the held query is answered at the resize, as end_sync answers it: {held:?}"
+        );
+        // Nothing is left for a later read to hand over.
+        assert!(live.end_sync().is_empty(), "the reply is not queued twice");
+        assert!(
+            live.process(b"", Instant::now(), None).is_empty(),
+            "the next read has no reply left"
+        );
+        assert!(!live.stopped(), "the emulator never stops");
+    }
+
+    /// A small held frame: the rows a synchronized update holds arrive, across a resize.
+    #[test]
+    fn a_held_row_reaches_the_transcript_across_a_resize() {
+        let mut task = Written::new(40, 6);
+        task.feed("\x1b[?1049h\x1b[?2026hsync text");
+        task.resize(20, 6);
+        task.feed("\x1b[?2026l\x1b[?1049l");
+        let text = task.finish();
+        assert!(!task.live.stopped(), "the emulator never stops");
+        assert_no_loss(&text, &["sync text"]);
+    }
+
+    /// The contract allows a row still on the screen after the resize to reach the transcript
+    /// twice. That is what it looks like: the row's text as it stood at the resize, then the same
+    /// row as it stands when it finally leaves.
+    #[test]
+    fn a_row_visible_at_the_resize_that_changes_is_written_twice() {
+        let mut task = Written::new(20, 6);
+        task.feed("one\r\ntwo\r\n");
+        task.resize(10, 6);
+        // The row is still on the screen and the program writes over it.
+        task.feed("\x1b[1;1Honetwo");
+        // Enough lines to push it off the screen.
+        task.feed("\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven");
+        assert_eq!(
+            task.finish(),
+            "one\ntwo\nonetwo\nthree\nfour\nfive\nsix\nseven\n"
+        );
+    }
+
+    /// Output a synchronized update holds when the resize arrives is applied at the old size, so
+    /// the rows it prints are not lost at the new height.
+    #[test]
+    fn a_held_frame_before_a_resize_is_written_at_the_old_size() {
+        let rows = "alpha\r\nbravo\r\ncharlie\r\ndelta\r\necho\r\nfoxtrot\r\ngolf\r\nhotel\r\nindia\r\njuliet";
+        let want = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet",
+        ];
+        for shrunk in [false, true] {
+            let mut task = Written::new(40, 10);
+            task.feed("\x1b[?1049h\x1b[?2026h");
+            task.feed(rows);
+            if shrunk {
+                task.resize(40, 5);
+            }
+            task.feed("\x1b[?2026l\x1b[?1049l");
+            let text = task.finish();
+            assert!(!task.live.stopped(), "the emulator never stops");
+            let written = lines(&text);
+            for row in want {
+                assert!(
+                    written.iter().any(|line| line == row),
+                    "{row} is written{}: {written:?}",
+                    if shrunk { " across the resize" } else { "" }
+                );
+            }
+        }
+    }
+
+    /// A screen that grew from five rows to ten must not truncate a ten-row scroll against the
+    /// height it had before.
+    #[test]
+    fn a_full_screen_scroll_after_a_growth_writes_every_row() {
+        let rows: String = (1..=10).map(|k| format!("row{k:02}\r\n")).collect();
+        for grown in [false, true] {
+            let mut task = if grown {
+                let mut task = Written::new(40, 5);
+                task.resize(40, 10);
+                task
+            } else {
+                Written::new(40, 10)
+            };
+            task.feed(&rows);
+            // One native scroll of a full screen: the rows leave without the recorder seeing
+            // each one.
+            task.feed("\x1b[10S");
+            let text = task.finish();
+            let written = lines(&text);
+            for k in 1..=10 {
+                let row = format!("row{k:02}");
+                assert!(
+                    written.contains(&row),
+                    "{row} survives the scroll{}: {written:?}",
+                    if grown { " after the growth" } else { "" }
+                );
+            }
         }
     }
 }

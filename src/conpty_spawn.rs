@@ -10,13 +10,16 @@
 //! implementation (https://github.com/wez/wezterm, `src/cmdbuilder.rs`), Copyright 2018 Wez
 //! Furlong, licensed under the MIT license in `vendor/conpty/LICENSE`; see NOTICE.
 
-use crate::process::{Child, Launch, PTY_COLS, PTY_ROWS, Spawned, Tree, bash_args, environment};
+use crate::process::{Child, Launch, Spawned, Tree, bash_args, environment};
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, S_OK};
+use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{
+    HANDLE, INVALID_HANDLE_VALUE, S_OK, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Globalization::{
     CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal,
 };
@@ -38,11 +41,14 @@ const CONPTY_FLAGS: u32 = 0x1 | 0x2 | 0x4;
 type CreatePseudoConsoleFn =
     unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> windows_sys::core::HRESULT;
 type ClosePseudoConsoleFn = unsafe extern "system" fn(HPCON);
+type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> windows_sys::core::HRESULT;
 
 /// The ConPTY entry points: from the `conpty.dll` this process already loaded when it answers to
-/// that name, else from `kernel32.dll`.
+/// that name, else from `kernel32.dll`. Create, resize, and close come from one module: a
+/// console made by one module is resized and closed only through that module.
 struct ConPty {
     create: CreatePseudoConsoleFn,
+    resize: ResizePseudoConsoleFn,
     close: ClosePseudoConsoleFn,
 }
 
@@ -58,8 +64,8 @@ impl ConPty {
         // to it. A bundled module is used only when it exports the whole API; a partial one would
         // pair its create with another module's close.
         let bundled = module("conpty.dll").ok().and_then(resolve);
-        let (create, close) = match bundled.or_else(|| resolve(kernel)) {
-            Some(pair) => pair,
+        let (create, resize, close) = match bundled.or_else(|| resolve(kernel)) {
+            Some(triple) => triple,
             None => {
                 return Err(std::io::Error::other(
                     "the ConPTY exports cannot be resolved",
@@ -67,10 +73,16 @@ impl ConPty {
             }
         };
         Ok(Self {
-            // SAFETY: both come from one module and have the signatures the console API declares.
+            // SAFETY: the three come from one module and have the signatures the console API
+            // declares.
             create: unsafe {
                 std::mem::transmute::<unsafe extern "system" fn() -> isize, CreatePseudoConsoleFn>(
                     create,
+                )
+            },
+            resize: unsafe {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, ResizePseudoConsoleFn>(
+                    resize,
                 )
             },
             close: unsafe {
@@ -104,6 +116,7 @@ impl ConPty {
         }
         Ok(Terminal {
             con,
+            resize: self.resize,
             close: self.close,
         })
     }
@@ -126,12 +139,13 @@ fn module(name: &str) -> std::io::Result<HANDLE> {
     Ok(loaded)
 }
 
-/// The console's create and close, taken from one module or not at all.
+/// The console's create, resize, and close, taken from one module or not at all.
 type Export = unsafe extern "system" fn() -> isize;
 
-fn resolve(from: HANDLE) -> Option<(Export, Export)> {
+fn resolve(from: HANDLE) -> Option<(Export, Export, Export)> {
     Some((
         export(from, c"CreatePseudoConsole")?,
+        export(from, c"ResizePseudoConsole")?,
         export(from, c"ClosePseudoConsole")?,
     ))
 }
@@ -145,7 +159,29 @@ fn export(module: HANDLE, name: &std::ffi::CStr) -> Option<Export> {
 /// task's child is what drops this, as the portable-pty master handle was dropped before.
 pub struct Terminal {
     con: HPCON,
+    resize: ResizePseudoConsoleFn,
     close: ClosePseudoConsoleFn,
+}
+
+impl Terminal {
+    /// The console is `columns` by `rows` from now on. ConPTY repaints the whole screen into the
+    /// output pipe, which keeps draining on the reading thread while this call runs, so it is
+    /// called with no lock capture needs held.
+    pub(crate) fn resize(&self, columns: u16, rows: u16) -> std::io::Result<()> {
+        let size = COORD {
+            X: columns as i16,
+            Y: rows as i16,
+        };
+        // SAFETY: the console was made by the module this function came from, and `size` is a
+        // plain value.
+        let result = unsafe { (self.resize)(self.con, size) };
+        if result != S_OK {
+            return Err(std::io::Error::other(format!(
+                "ResizePseudoConsole failed: HRESULT {result:#x}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Terminal {
@@ -172,14 +208,17 @@ pub fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         end(&suspended.process);
         return Err(error);
     }
+    let terminal = std::sync::Arc::new(suspended.terminal);
     Ok(Spawned {
         child: Child::Pty {
             process: suspended.process,
-            _terminal: suspended.terminal,
+            terminal: std::sync::Arc::clone(&terminal),
+            exit_status: launch.exit_status.map(std::path::Path::to_path_buf),
         },
         output: suspended.output,
         input: suspended.input,
         tree: suspended.tree,
+        pty: Some(crate::process::PtyControl::new(terminal)),
     })
 }
 
@@ -194,8 +233,8 @@ fn create_in_job(launch: &Launch<'_>) -> std::io::Result<Suspended> {
     let terminal = api.create(
         input_reader.as_raw_handle(),
         output_writer.as_raw_handle(),
-        PTY_COLS,
-        PTY_ROWS,
+        launch.cols,
+        launch.rows,
     )?;
     // The console keeps its own copies of the two ends it was handed.
     drop((input_reader, output_writer));
@@ -277,17 +316,113 @@ fn resume(thread: &OwnedHandle) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Blocks until the root bash exits and returns the code it reports.
-pub(crate) fn wait(process: &OwnedHandle) -> i32 {
-    // SAFETY: the handle is owned by the child and alive for the call; the exit code outlives it.
+/// How often the wait looks at the script's status file and at the root.
+const STATUS_SLICE: Duration = Duration::from_millis(100);
+/// How long a root may stay alive after its script finished before it is ended for the task.
+const END_GRACE: Duration = Duration::from_secs(5);
+
+/// Blocks until the root bash exits and returns the code it reports, and whether the end was
+/// forced because its script had finished while the root itself never terminated.
+///
+/// A root can deadlock inside its own exit (msys-2.0.dll blocks in a handle close under a
+/// pseudoconsole), and then the process never terminates and its task would never end. The
+/// script's EXIT trap writes its status to `status`, so the file appearing means the script
+/// finished: from there the root gets [`END_GRACE`] to exit on its own before it is terminated.
+/// A native call that fails asks for no verdict at all: the plain wait then reports whatever the
+/// root itself does.
+pub(crate) fn wait(process: &OwnedHandle, status: Option<&std::path::Path>) -> (i32, bool) {
+    let Some(status) = status else {
+        return (wait_forever(process), false);
+    };
+    let mut seen: Option<Instant> = None;
+    loop {
+        // SAFETY: the handle is owned by the child and alive for the call.
+        let waited = unsafe {
+            WaitForSingleObject(process.as_raw_handle(), STATUS_SLICE.as_millis() as u32)
+        };
+        match waited {
+            WAIT_OBJECT_0 => return (exit_code(process), false),
+            WAIT_TIMEOUT => {}
+            // A failing wait proves nothing, so the plain wait reports the root's own outcome.
+            _ => return (wait_forever(process), false),
+        }
+        if seen.is_none() && status.exists() {
+            seen = Some(Instant::now());
+        }
+        let Some(since) = seen else {
+            continue;
+        };
+        if since.elapsed() < END_GRACE {
+            continue;
+        }
+        // A file that never holds a complete record still ends the task, with status 1.
+        let code = script_status(status).unwrap_or(1);
+        // SAFETY: the handle is a live process of this call.
+        if unsafe { TerminateProcess(process.as_raw_handle(), code as u32) } == 0 {
+            // The force did not land, so nothing is claimed about the end.
+            return (wait_forever(process), false);
+        }
+        // SAFETY: as above; the root is now ending with the code the call asked for.
+        if unsafe { WaitForSingleObject(process.as_raw_handle(), END_GRACE.as_millis() as u32) }
+            != WAIT_OBJECT_0
+        {
+            return (wait_forever(process), false);
+        }
+        return match exit_code_status(process) {
+            // Only a force that landed and reported the script's own status is a forced end.
+            Some(actual) if actual == code => (code, true),
+            Some(actual) => (actual, false),
+            None => (wait_forever(process), false),
+        };
+    }
+}
+
+/// The script's exit status, once its trap has written a complete record: a newline-terminated
+/// decimal in 0..=255. A file caught mid-write, or holding anything else, is not a record yet.
+fn script_status(path: &std::path::Path) -> Option<i32> {
+    let mut bytes = [0_u8; 8];
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut read = 0;
+    while read < bytes.len() {
+        match file.read(&mut bytes[read..]) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(_) => return None,
+        }
+    }
+    // A record is at most four bytes; a full buffer holds trailing junk, not a status.
+    if read == bytes.len() {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes[..read]).ok()?;
+    text.strip_suffix('\n')?.parse::<u8>().ok().map(i32::from)
+}
+
+/// Blocks until the root bash exits, whatever it takes.
+fn wait_forever(process: &OwnedHandle) -> i32 {
+    // SAFETY: the handle is owned by the child and alive for the call.
+    let waited = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+    if waited != WAIT_OBJECT_0 {
+        return 1;
+    }
+    exit_code(process)
+}
+
+/// The root's exit code, or `1` when the OS would not report one.
+fn exit_code(process: &OwnedHandle) -> i32 {
+    exit_code_status(process).unwrap_or(1)
+}
+
+/// The root's exit code, or `None` when the OS would not report one.
+fn exit_code_status(process: &OwnedHandle) -> Option<i32> {
+    // SAFETY: the handle is owned by the child and alive for the call.
     unsafe {
-        let waited = WaitForSingleObject(process.as_raw_handle(), INFINITE);
         let mut code = 0;
-        if waited != 0 || GetExitCodeProcess(process.as_raw_handle(), &mut code) == 0 {
-            return 1;
+        if GetExitCodeProcess(process.as_raw_handle(), &mut code) == 0 {
+            return None;
         }
         // `Child::wait` reads the msys signal convention into this code; it is not applied twice.
-        code as i32
+        Some(code as i32)
     }
 }
 
@@ -530,6 +665,35 @@ fn nul_terminated(value: &OsStr) -> std::io::Result<Vec<u16>> {
 mod tests {
     use super::*;
     use crate::session::LaunchContext;
+
+    /// What the trap's file can hold at the moment the wait looks at it.
+    #[test]
+    fn script_status_reads_only_a_complete_record() {
+        let dir =
+            std::env::temp_dir().join(format!("fastexec-script-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let cases = [
+            ("0\n", Some(0)),
+            ("7\n", Some(7)),
+            ("255\n", Some(255)),
+            ("256\n", None),
+            ("-1\n", None),
+            ("\n", None),
+            ("7", None),
+            ("7\n8\n", None),
+            ("0000000\n7\n", None),
+            ("x\n", None),
+            ("", None),
+        ];
+        for (index, (contents, expected)) in cases.iter().enumerate() {
+            let path = dir.join(format!("{index}.exit"));
+            std::fs::write(&path, contents).expect("the case file");
+            assert_eq!(script_status(&path), *expected, "{contents:?}");
+        }
+        assert_eq!(script_status(&dir.join("absent.exit")), None);
+        std::fs::remove_dir_all(&dir).expect("the scratch directory to go");
+    }
+
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Threading::{ResumeThread, SuspendThread};
     use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
@@ -759,6 +923,9 @@ mod tests {
             env: &context,
             login: false,
             pty: true,
+            cols: crate::process::PTY_COLS,
+            rows: crate::process::PTY_ROWS,
+            exit_status: None,
         };
         let suspended = create_in_job(&launch).expect("a suspended PTY root");
         let pid = pid_of(&suspended.process);
@@ -766,6 +933,7 @@ mod tests {
             suspended
                 .tree
                 .members()
+                .unwrap_or_default()
                 .iter()
                 .any(|member| member.pid == pid),
             "the root is in the job before it runs"

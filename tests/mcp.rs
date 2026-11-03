@@ -868,9 +868,13 @@ fn the_listed_tool_says_which_host_it_runs_on() {
         .split_once("default cwd ")
         .unwrap_or_else(|| panic!("no default cwd in {last:?}"))
         .1;
-    let expected = dir.display().to_string();
+    // macOS reports `/private/var` for a $TMPDIR under `/var`, so both sides are compared as the
+    // filesystem resolves them.
+    let expected = std::fs::canonicalize(&*dir).unwrap_or_else(|_| PathBuf::from(&*dir));
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
     let same = if cfg!(windows) {
-        cwd.eq_ignore_ascii_case(&expected)
+        cwd.to_string_lossy()
+            .eq_ignore_ascii_case(&expected.to_string_lossy())
     } else {
         cwd == expected
     };
@@ -1138,6 +1142,29 @@ fn pty_task_sees_a_terminal_and_accepts_a_hidden_password() {
     );
 }
 
+/// The bytes `od -An -tx1` printed, one space between them: BSD `od` pads its columns to the
+/// width of a full line and GNU `od` does not.
+fn od(text: &str) -> String {
+    let mut normalized = String::new();
+    for line in text.split_inclusive('\n') {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let bytes = !words.is_empty()
+            && words
+                .iter()
+                .all(|word| word.len() == 2 && word.bytes().all(|b| b.is_ascii_hexdigit()));
+        if bytes {
+            normalized.push(' ');
+            normalized.push_str(&words.join(" "));
+            if line.ends_with('\n') {
+                normalized.push('\n');
+            }
+        } else {
+            normalized.push_str(line);
+        }
+    }
+    normalized
+}
+
 #[test]
 fn pty_keys_follow_input_and_the_programs_cursor_mode() {
     let mut server = Server::start();
@@ -1152,6 +1179,7 @@ fn pty_keys_follow_input_and_the_programs_cursor_mode() {
         "action": "poll", "taskId": server.id(1), "input": "ab", "keys": ["Enter", "Up", "C-c", "M-x"], "waitMs": 10000
     }));
     assert_eq!(out["state"], "exited", "{text}");
+    let text = od(&text);
     assert!(
         text.contains("61 62 0d 1b 4f 41 03 1b 78"),
         "input, then keys in order, with Up in application cursor mode: {text}"
@@ -1225,6 +1253,7 @@ fn keys_pause_after_input_and_follow_the_modes_set_meanwhile() {
         }
         let begun = Instant::now();
         let (_, text) = server.ok(poll);
+        let text = od(&text);
         if delay.is_none() {
             // 150 ms before each of the two keys.
             assert!(begun.elapsed() >= Duration::from_millis(300), "{text}");
@@ -1253,6 +1282,7 @@ fn pty_keys_follow_the_kitty_keyboard_protocol_the_program_pushes() {
         "action": "poll", "taskId": server.id(1), "keys": ["Escape", "C-i", "Tab"], "waitMs": 30000,
         "returnWhen": {"outputContains": ["popped"]}
     }));
+    let text = od(&text);
     assert!(
         text.contains("1b 5b 32 37 75 1b 5b 31 30 35 3b 35 75 09") && text.contains("popped"),
         "Escape and C-i as CSI u, Tab as itself: {text}"
@@ -1261,6 +1291,7 @@ fn pty_keys_follow_the_kitty_keyboard_protocol_the_program_pushes() {
         "action": "poll", "taskId": server.id(1), "keys": ["Escape", "Tab"], "waitMs": 10000
     }));
     assert_eq!(out["state"], "exited", "{text}");
+    let text = od(&text);
     assert!(text.contains("1b 09"), "legacy bytes once popped: {text}");
 }
 
@@ -1520,10 +1551,14 @@ fn screen_and_transcript_render_the_same_terminal() {
         "dch  a".to_string(),
     ]
     .join("\n");
-    let (out, text) = server.ok(json!({
-        "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 30000,
-        "returnWhen": {"screenContains": ["dch  a"]}
+    // The wait targets the full final state, cursor included. A screen condition can match before
+    // the trailing CRLF moves the cursor to [7, 1], and output that paused just before it looks
+    // quiet while the cursor is still elsewhere, so the wait observes the whole state.
+    server.ok(json!({
+        "action": "start", "command": command, "pty": true, "waitMs": 0
     }));
+    let task = server.id(1);
+    let (out, text) = wait_for_screen(&mut server, &task, &expected, json!([7, 1]));
     assert_eq!(out["state"], "running", "{text}");
     assert_eq!(
         text.split("\n\n[").next().unwrap(),
@@ -1750,6 +1785,126 @@ fn kept_pipe_stdin_stays_open_after_root_exit() {
     kept_stdin_stays_open_after_root_exit(false);
 }
 
+#[cfg(windows)]
+#[test]
+fn a_finished_script_ends_a_root_that_does_not_exit() {
+    // The script's status is read as the script ends, so a complete record and an empty file
+    // both end the task within the grace, with the recorded status or 1.
+    finished_script_case("printf '%s\n' 7 > \"$FASTEXEC_EXIT_STATUS\"", 7);
+    finished_script_case(": > \"$FASTEXEC_EXIT_STATUS\"", 1);
+}
+
+/// Starts a task whose script records its status, leaves a heartbeat in an independent
+/// subshell and then blocks, so only the grace after the script's end can end it, and only the
+/// tree kill can end the heartbeat.
+#[cfg(windows)]
+fn finished_script_case(write_status: &str, expected: i32) {
+    let beats = std::env::temp_dir().join(format!(
+        "fastexec-heartbeat-{}-{expected}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&beats);
+    let mut server = Server::start_with(|command| {
+        command.env("FASTEXEC_TEST_HEARTBEAT", &beats);
+    });
+    let command = format!(
+        "( while :; do printf x >> \"$FASTEXEC_TEST_HEARTBEAT\"; sleep 0.1; done ) & {}; sleep 120",
+        write_status
+    );
+    let started = Instant::now();
+    let (out, text) =
+        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000}));
+    let elapsed = started.elapsed();
+    assert_eq!(out["state"], "exited", "{text}");
+    assert_eq!(out["exitCode"], expected, "{text}");
+    assert_eq!(out["forcedEnd"], true, "{text}");
+    assert!(
+        elapsed < Duration::from_secs(12),
+        "the grace ended the root within its bound: {elapsed:?}"
+    );
+    assert!(
+        text.contains("root forced after 5 s exit grace"),
+        "the result names the forced end: {text}"
+    );
+    assert!(
+        !out["leftovers"].as_array().unwrap().is_empty(),
+        "the leftover heartbeat is named: {text}"
+    );
+    let written = std::fs::read(&beats).expect("the heartbeat file").len();
+    assert!(written > 0, "the heartbeat ran: {beats:?}");
+    std::thread::sleep(Duration::from_millis(700));
+    let after = std::fs::read(&beats).map(|bytes| bytes.len()).unwrap_or(0);
+    assert_eq!(after, written, "the forced end ended the heartbeat too");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_child_process_does_not_record_the_roots_status() {
+    root_only_case("bash \"$0\" child");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_child_subshell_does_not_record_the_roots_status() {
+    root_only_case("( trap - EXIT; . \"$0\" child )");
+}
+
+/// Runs a command over the script threshold from its file, with a child that runs that file
+/// again, and requires the root to finish its own work with its own status.
+#[cfg(windows)]
+fn root_only_case(invoker: &str) {
+    let mut server = Server::start();
+    let padding = "echo padding-line\n".repeat(700);
+    let command = format!(
+        "if [ \"${{1-}}\" = child ]; then sleep 1; exit 7; fi\n{padding}{invoker}\nsleep 12\necho root-done"
+    );
+    let started = Instant::now();
+    let (out, text) =
+        server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000}));
+    let elapsed = started.elapsed();
+    assert_eq!(out["state"], "exited", "{text}");
+    assert_eq!(out["exitCode"], 0, "{text}");
+    assert_eq!(out["forcedEnd"], false, "{text}");
+    assert!(
+        elapsed >= Duration::from_secs(12),
+        "the root was not ended early: {elapsed:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_startup_exit_trap_keeps_its_own_cleanup() {
+    // A profile-like startup file sets its own EXIT cleanup before the command runs; the status
+    // marker rides on the command line and never replaces that cleanup.
+    let dir = std::env::temp_dir().join(format!("fastexec-startup-trap-{}", std::process::id()));
+    // A stale directory from an earlier run must not answer for this one.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let marker = dir.join("startup-cleanup");
+    let startup = dir.join("bash_env.sh");
+    std::fs::write(
+        &startup,
+        format!(
+            "trap 'printf ran > \"{}\"' EXIT\n",
+            marker.to_string_lossy().replace('\\', "/")
+        ),
+    )
+    .expect("the startup file");
+    let mut server = Server::start_with(|command| {
+        command.env("BASH_ENV", &startup);
+    });
+    let (out, text) = server.ok(json!({"action": "start", "command": "true", "pty": true,
+        "loginShell": false, "waitMs": 10000}));
+    assert_eq!(out["state"], "exited", "{text}");
+    assert_eq!(out["exitCode"], 0, "{text}");
+    assert_eq!(out["forcedEnd"], false, "{text}");
+    assert!(
+        marker.exists(),
+        "the startup file's own EXIT cleanup ran: {marker:?} {text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn kept_pty_stdin_stays_open_after_root_exit() {
     kept_stdin_stays_open_after_root_exit(true);
@@ -1961,6 +2116,20 @@ fn retirement_counts_kept_processes_ending_as_finishing() {
         server.ok(json!({"action": "start", "command": "true"}));
     }
     server.ok(json!({"action": "kill", "taskId": kept}));
+    // The kill ends the tree, so the task is finished now and the cap applies to it: it stays,
+    // and the earliest finisher goes.
+    let (out, _) = server.ok(json!({"action": "list"}));
+    let tasks = out["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 64, "{out}");
+    let listed = |id: &str| tasks.iter().any(|task| task["taskId"] == id);
+    assert!(
+        listed(&kept),
+        "the task that just became finished stays: {out}"
+    );
+    assert!(
+        !listed(&server.id(2)),
+        "the earliest finisher goes first: {out}"
+    );
     server.ok(json!({"action": "start", "command": "true"}));
     // Retirement follows the result that shows the completion.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2106,15 +2275,20 @@ fn waits_on_kept_processes_last_until_they_end_or_a_condition_holds() {
 }
 
 /// A heartbeat in a new session through a double fork, as daemonizing servers (adb) start;
-/// `program` runs bash's loop under another name.
-#[cfg(unix)]
+/// `program` runs bash's loop under another name. Perl's fork and `setsid` stand in for util-linux
+/// `setsid -f`, which macOS does not carry; a failed detach says so instead of running the
+/// heartbeat in the task's own session.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn daemon(program: &str, bash_path: &str) -> String {
     format!(
-        "setsid -f {program} -c 'while :; do echo x >> {bash_path}; sleep 0.1; done'; sleep 0.5;"
+        "perl -MPOSIX -e 'exit if fork; POSIX::setsid() or die \"setsid: $!\"; exec @ARGV' {program} -c 'while :; do echo x >> {bash_path}; sleep 0.1; done'; sleep 0.5;"
     )
 }
 
-#[cfg(unix)]
+/// Linux keeps the stronger assertion: its subreaper follows a process that detaches at once. On
+/// macOS the host can only own what it observed first, and `a_detached_descendant_stays_owned_once_observed`
+/// proves that half.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn processes_that_start_their_own_session_stay_in_the_tree() {
     let files = ["daemon", "group-term", "odd-name", "odd-name-bin"].map(scratch);
@@ -2150,7 +2324,478 @@ fn processes_that_start_their_own_session_stay_in_the_tree() {
     assert_stops_growing(odd);
 }
 
-#[cfg(unix)]
+/// The daemon writes its pid, then waits for a release file before it detaches, so the host
+/// reports it — by that pid — while it is still in the task's session: the acknowledgement the
+/// macOS guarantee rests on.
+#[cfg(target_os = "macos")]
+fn daemon_until_released(
+    program: &str,
+    bash_path: &str,
+    mark: &std::path::Path,
+    go: &std::path::Path,
+) -> String {
+    let (mark, go) = (mark.display(), go.display());
+    // Both phases are bounded, so a failing run leaves nothing behind: the wait for the go file
+    // gives up after a minute, and the heartbeat after a minute of its own.
+    format!(
+        "perl -MPOSIX -e 'exit if fork; open my $m, \">\", \"{mark}\"; print $m $$; close $m; my $n = 0; while (!-e \"{go}\") {{ exit 3 if ++$n > 6000; select undef, undef, undef, 0.01 }} POSIX::setsid() or die \"setsid: $!\"; exec @ARGV' {program} -c 'for i in $(seq 600); do echo x >> {bash_path}; sleep 0.1; done'; sleep 0.5;"
+    )
+}
+
+/// The pid the daemon wrote before it blocked.
+#[cfg(target_os = "macos")]
+fn wait_for_mark(path: &std::path::Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse()
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "the daemon never wrote its pid");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Waits until the named task itself reports that pid among the processes it holds: the host's
+/// membership acknowledgement for that exact process, not a sleep and not another task's report.
+#[cfg(target_os = "macos")]
+fn wait_for_held_pid(server: &mut Server, task: &str, pid: u32) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (list, text) = server.ok(json!({"action": "list"}));
+        for entry in list["tasks"].as_array().into_iter().flatten() {
+            if entry["taskId"] != json!(task) {
+                continue;
+            }
+            for member in entry["held"].as_array().into_iter().flatten() {
+                if member["pid"] == json!(pid) {
+                    return pid;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the task never reported the process {pid} as held: {list} {text}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The kernel's own identity for a live pid: the start time libproc reports, in microseconds, the
+/// same pair the product compares.
+#[cfg(target_os = "macos")]
+fn birth_of(pid: u32) -> Option<u64> {
+    let info = bsd_info(pid)?;
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+/// What libproc reports about a live process: its parent, its group, and its start time.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is exactly the size given, and libproc writes at most that many bytes.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
+            size,
+        )
+    };
+    (read >= size).then_some(info)
+}
+
+/// The session a live process leads, from `getsid`.
+#[cfg(target_os = "macos")]
+fn session_of(pid: u32) -> Option<i32> {
+    // SAFETY: plain syscall; a process that ended reports none.
+    let session = unsafe { libc::getsid(pid as i32) };
+    (session != -1).then_some(session)
+}
+
+/// The state character `ps` reports, where `T` means stopped.
+#[cfg(target_os = "macos")]
+fn state_of(pid: u32) -> String {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output();
+    output
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Waits, bounded, for a probe to answer.
+#[cfg(target_os = "macos")]
+fn wait_until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A process a test started outside the tree, killed when the test ends whatever path it takes.
+/// The signal goes out only while the birth time that names it is unchanged, so a reused pid is
+/// never the target; the helper itself is bounded, so a leaked one ends on its own.
+#[cfg(target_os = "macos")]
+struct Escaped {
+    pid: i32,
+    birth: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl Escaped {
+    /// Takes the pid the helper wrote, once the file holds a whole number.
+    fn new(pid_file: &std::path::Path) -> Escaped {
+        let pid = wait_until("the escape wrote its pid", || {
+            std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+        });
+        let birth = birth_of(pid as u32).expect("the escape is a live process");
+        Escaped { pid, birth }
+    }
+
+    /// Whether the pid still names the process this guard took.
+    fn is_mine(&self) -> bool {
+        birth_of(self.pid as u32).is_some_and(|birth| birth == self.birth)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Escaped {
+    fn drop(&mut self) {
+        if self.is_mine() {
+            // SAFETY: plain syscall on a pid this guard just re-identified by birth time.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// The files one escape test needs, removed with it.
+#[cfg(target_os = "macos")]
+struct Files {
+    dir: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl Files {
+    fn new(beat: &std::path::Path) -> Files {
+        let dir = beat.with_extension("files");
+        std::fs::create_dir_all(&dir).expect("a directory for the escape's files");
+        Files { dir }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Files {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Keeps a stopped host stopped no longer than the test needs: the signal is resumed on every path
+/// out, and only while the pid is still the host this test stopped.
+#[cfg(target_os = "macos")]
+struct Stopped {
+    pid: i32,
+    birth: u64,
+    resumed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Stopped {
+    /// Stops the host and waits until the kernel says it is stopped, before anything relies on it.
+    fn new(pid: i32) -> Stopped {
+        let birth = birth_of(pid as u32).expect("the host is a live process");
+        // The guard exists before the signal goes out, so a panic on any step below still resumes
+        // the host on the way out.
+        let stopped = Stopped {
+            pid,
+            birth,
+            resumed: false,
+        };
+        // SAFETY: plain syscall on the pid the root named as its parent.
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGSTOP) },
+            0,
+            "the host stopped"
+        );
+        wait_until("the host is stopped", || {
+            state_of(pid as u32).starts_with('T').then_some(())
+        });
+        stopped
+    }
+
+    fn resume(&mut self) {
+        if self.resumed {
+            return;
+        }
+        self.resumed = true;
+        if birth_of(self.pid as u32).is_some_and(|birth| birth == self.birth) {
+            // SAFETY: plain syscall on the pid this guard re-identified by birth time.
+            unsafe { libc::kill(self.pid, libc::SIGCONT) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        self.resume();
+    }
+}
+
+/// The documented limit, proven without racing a scan: the root names its parent — the task host —
+/// and the test stops that host, waits until the kernel reports it stopped, and only then lets the
+/// root create the escapee. The escapee detaches, orphans itself, and the host is resumed into a
+/// tree that never held it. The root ends there, so the task reports what it left behind.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unobserved_escape_is_never_claimed() {
+    let (beat, beat_bash) = scratch("escaped-daemon");
+    let files = Files::new(&beat);
+    let (pid_file, go) = (files.path("pid"), files.path("go"));
+    let mut server = Server::start();
+    // The helper is bounded: it ends by itself after twenty seconds, whatever a failing run does.
+    let command = format!(
+        "printf 'host %s\n' \"$PPID\"; while [ ! -e \"{go}\" ]; do sleep 0.02; done; perl -MPOSIX -e 'exit if fork; POSIX::setsid() or die \"setsid: $!\"; exit if fork; open my $p, \">\", \"{pid}\"; print $p $$; close $p; exec @ARGV' bash -c 'for i in $(seq 200); do echo x >> {beat}; sleep 0.1; done'",
+        go = go.display(),
+        pid = pid_file.display(),
+        beat = beat_bash
+    );
+    let (_, started) = server.ok(json!({
+        "action": "start", "command": command, "keepTree": true, "waitMs": 1000
+    }));
+    let host: i32 = started
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("host "))
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the root named its parent: {started}"));
+    let task = server.id(1);
+    // The host cannot scan while it is stopped, so the escapee is created unobserved.
+    let mut stopped = Stopped::new(host);
+    std::fs::write(&go, b"go").unwrap();
+    let escaped = Escaped::new(&pid_file);
+    // Detached and orphaned, as the contract describes: its own session and group, and a parent
+    // that is neither the root nor the host.
+    let info = bsd_info(escaped.pid as u32).expect("the escape runs");
+    let host_session = session_of(host as u32).expect("the host is a live process");
+    assert_ne!(
+        session_of(escaped.pid as u32),
+        Some(host_session),
+        "the escape left the task's session"
+    );
+    assert_ne!(info.pbi_pgid as i32, host, "and the task's group");
+    assert_ne!(
+        info.pbi_ppid as i32, host,
+        "its parent is not the task host"
+    );
+    // Orphaned for real, not merely parented elsewhere: the intermediate setsid parent can still
+    // be alive, and a live ancestry trace would be scanned once the host resumes.
+    wait_until("the escape is orphaned", || {
+        let info = bsd_info(escaped.pid as u32)?;
+        let parent = info.pbi_ppid as i32;
+        (parent == 1 || birth_of(parent as u32).is_none()).then_some(())
+    });
+    stopped.resume();
+    // The root ends, so the task reports what it left behind.
+    wait_until("the root ended", || {
+        let (list, _) = server.ok(json!({"action": "list"}));
+        let state = list["tasks"][0]["state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (state == "exited").then_some(())
+    });
+    let (list, listing) = server.ok(json!({"action": "list"}));
+    let mut claimed = false;
+    for entry in list["tasks"].as_array().into_iter().flatten() {
+        if entry["taskId"] != json!(task) {
+            continue;
+        }
+        for field in ["held", "leftovers"] {
+            for member in entry[field].as_array().into_iter().flatten() {
+                claimed |= member["pid"] == json!(escaped.pid);
+            }
+        }
+    }
+    assert!(
+        !claimed,
+        "a descendant created while the host could not scan is never claimed: {listing}"
+    );
+    // An explicit kill reaches the tree the task owns, and not the process that left it.
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+    let before = file_len(&beat);
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        file_len(&beat) > before,
+        "the escaped descendant outlives the task's kill, which is the documented limit"
+    );
+}
+
+/// A host stopped by its own tree runs nothing: it cannot answer a list or run a kill. The server
+/// still owns it and its number is reserved, so a request wakes it with a signal, and both calls
+/// finish instead of waiting on a process that will never run on its own.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stopped_host_is_woken_for_a_list_and_a_kill() {
+    // The list half: a kept tree whose root has exited. Only a kept tree asks the host for its
+    // members, so this is the case where a stopped host would block a list.
+    let (beat, beat_bash) = scratch("stopped-list");
+    let files = Files::new(&beat);
+    let (mark, go) = (files.path("mark"), files.path("go"));
+    let mut server = Server::start();
+    let command = format!(
+        "printf 'host %s\n' \"$PPID\"; {} echo started",
+        daemon_until_released("bash", &beat_bash, &mark, &go)
+    );
+    let (out, text) = server.ok(json!({
+        "action": "start", "command": command, "keepTree": true, "waitMs": 10000
+    }));
+    assert_eq!(out["state"], "exited", "{text}");
+    let host: i32 = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("host "))
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the root named its parent: {text}"));
+    let daemon = wait_for_mark(&mark);
+    let task = server.id(1);
+    // The daemon is the task's own member, observed before the host is stopped.
+    wait_for_held_pid(&mut server, &task, daemon);
+    std::fs::write(&go, b"go").unwrap();
+    wait_for_heartbeat(&beat);
+    // The host is stopped from outside: the reserved, unreaped process the server still owns.
+    let mut stopped = Stopped::new(host);
+    // A list asks the stopped host which processes the task holds: it answers because the request
+    // woke it, and the answer names the daemon rather than blocking on a host that never runs.
+    let begun = Instant::now();
+    let (list, listing) = server.ok(json!({"action": "list"}));
+    assert!(
+        begun.elapsed() < Duration::from_secs(10),
+        "the list waited on a stopped host: {listing}"
+    );
+    let held = list["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|entry| entry["held"].as_array().into_iter().flatten())
+        .filter_map(|member| member["pid"].as_i64())
+        .collect::<Vec<_>>();
+    assert!(
+        held.contains(&(daemon as i64)),
+        "the list names the held daemon {daemon}: {listing}"
+    );
+    stopped.resume();
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 10000}));
+
+    // The kill half: a root that stops its own group, so nothing in the tree runs until the server
+    // wakes the host for the kill.
+    let mut server = Server::start();
+    server.ok(json!({
+        "action": "start", "command": "kill -STOP 0; sleep 60", "keepTree": true, "waitMs": 500
+    }));
+    let task = server.id(1);
+    let begun = Instant::now();
+    let (_, text) = server.ok(json!({"action": "kill", "taskId": task, "waitMs": 20000}));
+    assert!(
+        begun.elapsed() < Duration::from_secs(15),
+        "the kill waited on a stopped host: {text}"
+    );
+    let (list, listing) = server.ok(json!({"action": "list"}));
+    assert_eq!(
+        list["tasks"][0]["held"],
+        json!([]),
+        "the stopped tree ended: {listing}"
+    );
+}
+
+/// A descendant the host observed stays in the tree after it leaves the session, the group, and
+/// its parent chain, and a kill reaches it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_detached_descendant_stays_owned_once_observed() {
+    let (beat, beat_bash) = scratch("observed-daemon");
+    let files = Files::new(&beat);
+    let (mark, go) = (files.path("mark"), files.path("go"));
+    let mut server = Server::start();
+    let command = format!(
+        "{} echo started",
+        daemon_until_released("bash", &beat_bash, &mark, &go)
+    );
+    let (out, text) = server.ok(json!({
+        "action": "start", "command": command, "keepTree": true, "waitMs": 10000
+    }));
+    assert_eq!(out["state"], "exited", "{text}");
+    let pid = wait_for_mark(&mark);
+    let task = server.id(1);
+    // The acknowledgement names this process, under this task, before it detaches.
+    wait_for_held_pid(&mut server, &task, pid);
+    std::fs::write(&go, b"go").unwrap();
+    wait_for_heartbeat(&beat);
+    // It has detached by now, and is still the task's: the explicit kill reaches it.
+    std::thread::sleep(Duration::from_millis(300));
+    let (list, listing) = server.ok(json!({"action": "list"}));
+    let held = list["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["taskId"] == json!(task))
+        .flat_map(|entry| entry["held"].as_array().into_iter().flatten())
+        .filter_map(|member| member["pid"].as_i64())
+        .collect::<Vec<_>>();
+    assert!(
+        held.contains(&(pid as i64)),
+        "the detached descendant is still held: {listing}"
+    );
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+    assert_stops_growing(&beat);
+}
+
+/// Server death ends the trees the host holds, a detached descendant included once it was seen.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_killed_server_takes_its_task_trees_with_it() {
+    let files = ["orphaned", "orphaned-daemon"].map(scratch);
+    let [(beat, beat_bash), (daemon_beat, daemon_bash)] = &files;
+    let daemon_files = Files::new(daemon_beat);
+    let (mark, go) = (daemon_files.path("mark"), daemon_files.path("go"));
+    let mut server = Server::start();
+    let command = format!("{} sleep 300", heartbeat(beat_bash));
+    server.ok(json!({"action": "start", "command": command, "keepTree": true, "waitMs": 1000}));
+    let command = format!(
+        "{} echo started",
+        daemon_until_released("bash", daemon_bash, &mark, &go)
+    );
+    let (out, text) = server.ok(json!({
+        "action": "start", "command": command, "keepTree": true, "pty": true, "waitMs": 10000
+    }));
+    assert_eq!(out["keptRunning"], true, "{text}");
+    let daemon = wait_for_mark(&mark);
+    let second = server.id(2);
+    wait_for_held_pid(&mut server, &second, daemon);
+    std::fs::write(&go, b"go").unwrap();
+    wait_for_heartbeat(daemon_beat);
+    // SIGKILL: no shutdown code runs, so only the hosts' lifelines can end the trees.
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    for beat in [beat, daemon_beat] {
+        assert!(file_len(beat) > 0, "a heartbeat never started");
+        assert_stops_growing(beat);
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn a_killed_server_takes_its_task_trees_with_it() {
     let files = ["orphaned", "orphaned-daemon"].map(scratch);
@@ -2170,6 +2815,154 @@ fn a_killed_server_takes_its_task_trees_with_it() {
     }
 }
 
+/// A process the server may not signal — one sudo runs as root — is a member the host can see and
+/// must not end: the kill fails, the task says so, and the tree stays held, as on Linux. The host
+/// reads it from the kernel's own table, because libproc answers EPERM for another user's process.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sudo_child_the_server_may_not_kill_is_held_and_reported() {
+    let required = std::env::var("FASTEXEC_REQUIRE_ROOT_TEST").is_ok_and(|value| value == "1");
+    let sudo = Command::new("sudo").args(["-n", "true"]).status();
+    if !matches!(sudo, Ok(status) if status.success()) {
+        assert!(
+            !required,
+            "FASTEXEC_REQUIRE_ROOT_TEST=1, and a sudo child needs passwordless sudo"
+        );
+        eprintln!("skipped: a sudo child needs passwordless sudo");
+        return;
+    }
+    let (beat, beat_bash) = scratch("sudo-daemon");
+    let files = Files::new(&beat);
+    let pid_file = files.path("pid");
+    let mut server = Server::start();
+    // The daemon runs as root, so this user cannot signal it; it writes its own pid first, and it
+    // is bounded, so a failing run leaves nothing behind for long.
+    let command = format!(
+        "sudo -n bash -c 'echo $$ > {pid}; for i in $(seq 600); do echo x >> {beat_bash}; sleep 0.1; done' & echo started",
+        pid = pid_file.display()
+    );
+    server.ok(json!({
+        "action": "start", "command": command, "keepTree": true, "waitMs": 2000
+    }));
+    wait_for_heartbeat(&beat);
+    let rooted = Rooted::new(&pid_file);
+    let task = server.id(1);
+    // The kill fails and the tree stays held, as on Linux.
+    let (_, text, is_error) =
+        server.call(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+    assert!(
+        is_error && text.contains("Cannot terminate"),
+        "a member this user may not signal fails the kill: {text}"
+    );
+    // The refusal is reported, and the task still holds that exact root process.
+    let (list, listing) = server.ok(json!({"action": "list"}));
+    let entry = list["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["taskId"] == json!(task))
+        .unwrap_or_else(|| panic!("the task is listed: {listing}"));
+    assert_eq!(
+        entry["keptRunning"],
+        json!(true),
+        "the task keeps the tree it could not end: {listing}"
+    );
+    assert!(
+        entry["killError"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "the refusal is reported: {listing}"
+    );
+    // Held only: `leftovers` is cached from the root's exit, so an old pid there would satisfy the
+    // assertion even after membership lost it.
+    let held = entry["held"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|member| member["pid"].as_i64())
+        .collect::<Vec<_>>();
+    assert!(
+        held.contains(&(rooted.pid as i64)),
+        "the held tree names the root process {}: {listing}",
+        rooted.pid
+    );
+    let before = file_len(&beat);
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        file_len(&beat) > before,
+        "the daemon the server may not signal keeps running"
+    );
+}
+
+/// A root process a test started, ended when the test ends: the pid it wrote itself and the birth
+/// time the kernel reports for it, read through `sysctl`, which answers for every uid. The signal
+/// goes out only while that birth time is unchanged, so a reused root pid is never the target; the
+/// helper is bounded as well, so a skipped guard still ends.
+#[cfg(target_os = "macos")]
+struct Rooted {
+    pid: i32,
+    birth: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl Rooted {
+    fn new(pid_file: &std::path::Path) -> Rooted {
+        let pid = wait_until("the root daemon wrote its pid", || {
+            std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+        });
+        let birth = native_birth(pid).expect("the kernel describes a root process");
+        Rooted { pid, birth }
+    }
+
+    fn is_mine(&self) -> bool {
+        native_birth(self.pid).is_some_and(|birth| birth == self.birth)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Rooted {
+    fn drop(&mut self) {
+        if self.is_mine() {
+            let _ = Command::new("sudo")
+                .args(["-n", "kill", "-9", &self.pid.to_string()])
+                .status();
+        }
+    }
+}
+
+/// The start time the kernel reports for a pid, in microseconds, read from the `KERN_PROC_PID` row
+/// — the one source that answers for another uid's process.
+#[cfg(target_os = "macos")]
+fn native_birth(pid: i32) -> Option<u64> {
+    let mut buffer = [0_u8; 648];
+    let mut size = buffer.len();
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid as libc::c_int,
+    ];
+    // SAFETY: the mib is four integers and the buffer is as long as the size passed.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size != buffer.len() {
+        return None;
+    }
+    let seconds = u64::from_le_bytes(buffer[0..8].try_into().ok()?);
+    let micros = u32::from_le_bytes(buffer[8..12].try_into().ok()?) as u64;
+    Some(seconds * 1_000_000 + micros)
+}
+
 /// A process the server may not signal, as one sudo runs as root, stays held and reported. The
 /// fixture needs root and a C compiler, as in the Linux test container; elsewhere it is skipped.
 #[cfg(target_os = "linux")]
@@ -2177,8 +2970,14 @@ fn a_killed_server_takes_its_task_trees_with_it() {
 fn processes_the_server_may_not_kill_stay_held_and_reported() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
+    // CI and fx-test set this, so the case cannot pass by skipping when a prerequisite is missing.
+    let required = std::env::var("FASTEXEC_REQUIRE_ROOT_TEST").is_ok_and(|value| value == "1");
     // SAFETY: plain syscall.
     if unsafe { libc::geteuid() } != 0 {
+        assert!(
+            !required,
+            "FASTEXEC_REQUIRE_ROOT_TEST=1, and a setuid-root fixture needs root"
+        );
         eprintln!("skipped: a setuid-root fixture needs root");
         return;
     }
@@ -2199,6 +2998,10 @@ fn processes_the_server_may_not_kill_stay_held_and_reported() {
         .status()
     {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                !required,
+                "FASTEXEC_REQUIRE_ROOT_TEST=1, and the fixture needs a C compiler"
+            );
             eprintln!("skipped: no C compiler");
             return;
         }
@@ -2312,7 +3115,7 @@ fn finishing_after_many_short_tasks_keeps_its_own_output() {
     assert!(text.starts_with("final-ok\n"), "{text}");
     let (out, _) = server.ok(json!({"action": "list"}));
     let tasks = out["tasks"].as_array().unwrap();
-    assert_eq!(tasks.len(), 64);
+    assert_eq!(tasks.len(), 64, "{out}");
     let kept = |id: &str| tasks.iter().any(|task| task["taskId"] == id);
     assert!(
         kept(&server.id(1)) && !kept(&server.id(2)) && !kept(&server.id(3)),
@@ -2704,4 +3507,451 @@ impl Drop for StopOnDrop {
     fn drop(&mut self) {
         let _ = self.0.output();
     }
+}
+
+/// Polls a task's screen until it and the cursor are exactly `rows` and `cursor`, with a bounded
+/// wait: the state the test means, not merely text that appears on the way there.
+fn wait_for_screen(server: &mut Server, task: &str, rows: &str, cursor: Value) -> (Value, String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (out, text) = server.ok(json!({
+            "action": "poll", "taskId": task, "screen": true, "waitMs": 100
+        }));
+        if text.split("\n\n[").next().unwrap_or_default() == rows && out["cursor"] == cursor {
+            return (out, text);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the screen never reached {rows:?} at {cursor}: {text}"
+        );
+    }
+}
+
+/// The transcript of a PTY task, read in windows until a call adds nothing: a task that ended
+/// hands out its last window, then an empty one.
+fn transcript_body(server: &mut Server, id: &str) -> String {
+    let mut body = String::new();
+    for _ in 0..20 {
+        let (out, text) = server.ok(json!({
+            "action": "transcript", "taskId": id, "truncate": "none"
+        }));
+        let part = text
+            .split(
+                "
+
+[",
+            )
+            .next()
+            .unwrap_or_default();
+        // The window's own note for an empty one is not transcript text.
+        let part = match part.trim() {
+            "(no transcript lines since the last read)" => "",
+            other if other.starts_with("... [") && other.ends_with("] ...") => "",
+            _ => part,
+        };
+        let ended = ["exited", "killed"].contains(&out["state"].as_str().unwrap_or_default());
+        if part.is_empty() {
+            if ended {
+                break;
+            }
+            continue;
+        }
+        body.push_str(part);
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    body
+}
+
+/// The size a PTY task starts at, as the program itself sees it: `stty size` prints rows then
+/// columns.
+#[test]
+fn a_pty_task_starts_at_the_default_size_and_the_program_sees_it() {
+    let mut server = Server::start();
+    let (_, text) = server.ok(json!({
+        "action": "start", "pty": true, "waitMs": 2000,
+        "command": "stty size; sleep 30"
+    }));
+    assert!(
+        text.contains("30 120"),
+        "the program's terminal is 120x30: {text}"
+    );
+    let task = server.id(1);
+    let (list, text) = server.ok(json!({"action": "list"}));
+    assert!(text.contains(" pty 120x30"), "{text}");
+    assert_eq!(list["tasks"][0]["cols"], json!(120), "{list}");
+    assert_eq!(list["tasks"][0]["rows"], json!(30), "{list}");
+    // The screen is read as it stands: the command sleeps, so a poll that waited would wait out
+    // its own timeout for output that cannot arrive.
+    let (_, text) = server.ok(json!(
+        {"action": "poll", "taskId": task, "screen": true, "waitMs": 0}
+    ));
+    assert!(
+        text.contains("screen 120x30, cursor row 2 col 1"),
+        "the screen names its size: {text}"
+    );
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+}
+
+/// `start` takes the size, and a poll resizes: the resize goes out before the poll's input, so the
+/// program sees the new size when it reads the input that follows it.
+/// A zero-delay burst travels as one write, and the keys in it carry the keyboard mode the
+/// program declared, application-cursor included. A synchronized update the program holds
+/// withholds its printing, not its mode: the declaration applies as it arrives, so the burst
+/// after a resize in the same call is the same burst it would be without one.
+#[test]
+fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
+    let mut server = Server::start();
+    let (out, text) = server.ok(json!({
+        "action": "start", "pty": true, "cols": 100, "rows": 40, "waitMs": 1000,
+        "command": "printf '\\033[?2026h\\033[?1h\\r\\n'; stty raw -echo; head -c 3 | od -An -tx1"
+    }));
+    assert!(!text.contains("Cannot"), "{text}");
+    let task = server.id(1);
+    let log = PathBuf::from(out["logPath"].as_str().unwrap());
+    // The resize arrives with the key: the sustained update is settled, the held DECCKM applies,
+    // and Up is the application-cursor form from here on.
+    server.ok(json!({
+        "action": "poll", "taskId": task, "cols": 80, "rows": 20,
+        "keys": ["Up"], "keyDelayMs": 0, "waitMs": 1000
+    }));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let bytes = loop {
+        let read = std::fs::read_to_string(&log).unwrap_or_default();
+        if od(&read).contains("1b 4f 41") {
+            break read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the program never read the application-cursor key: {read:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        !od(&bytes).contains("1b 5b 41"),
+        "the burst used the modes the validation pass saw: {bytes:?}"
+    );
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+}
+
+#[test]
+fn a_poll_resizes_the_terminal_before_its_input() {
+    let mut server = Server::start();
+    let (_, text) = server.ok(json!({
+        "action": "start", "pty": true, "cols": 100, "rows": 40, "waitMs": 5000,
+        "command": "stty size; while read -r line; do stty size; done"
+    }));
+    // The size `start` was given, read by the program itself before any poll runs.
+    assert!(
+        text.contains("40 100"),
+        "the program's terminal is 100x40: {text}"
+    );
+    let task = server.id(1);
+    let (_, text) = server.ok(json!({
+        "action": "poll", "taskId": task, "cols": 60, "rows": 20, "input": "x
+    ", "waitMs": 500
+    }));
+    assert!(
+        text.contains("20 60"),
+        "the program read the new size, after the resize: {text}"
+    );
+    // One axis alone keeps the other.
+    let (_, text) = server.ok(json!({
+        "action": "poll", "taskId": task, "rows": 25, "input": "y
+    ", "waitMs": 500
+    }));
+    assert!(
+        text.contains("25 60"),
+        "rows changed and cols stayed: {text}"
+    );
+    let (out, text) = server.ok(json!({
+        "action": "poll", "taskId": task, "screen": true, "waitMs": 100
+    }));
+    assert_eq!(out["cols"], json!(60), "{text}");
+    assert_eq!(out["rows"], json!(25), "{text}");
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+}
+
+/// The program is told the terminal changed size: on Unix it gets SIGWINCH and reads the new size
+/// in its handler. The program says `ready` after the trap is armed, and that is asserted before
+/// the one resize is sent: a resize to the size the terminal already has is a no-op, so a
+/// notification lost before the trap existed could never be recovered by sending it again.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn a_resize_sends_sigwinch_and_the_program_reads_the_new_size() {
+    let mut server = Server::start();
+    let (_, started) = server.ok(json!({
+        "action": "start", "pty": true, "waitMs": 5000,
+        "command": "trap 'printf \"winch %s\n\" \"$(stty size)\"' WINCH; printf 'ready\n'; while :; do sleep 0.02; done"
+    }));
+    assert!(
+        started.contains("ready"),
+        "the program armed its trap before the resize: {started}"
+    );
+    let task = server.id(1);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut text = String::new();
+    while !text.contains("winch 22 70") {
+        let (_, polled) = server.ok(json!({
+            "action": "poll", "taskId": task, "cols": 70, "rows": 22, "waitMs": 2000,
+            "returnWhen": {"outputContains": ["winch 22 70"]}
+        }));
+        text.push_str(&polled);
+        assert!(
+            Instant::now() < deadline,
+            "the program saw the new size on SIGWINCH: {text}"
+        );
+    }
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+}
+
+/// On Windows the promise is the native console resize, which the program reads as its own size.
+/// SIGWINCH delivery to bash is the emulation layer's business and is not asserted: the reader runs
+/// `stty size` after the input that wakes it, and that answer must be the new size.
+#[cfg(target_os = "windows")]
+#[test]
+fn a_resize_is_seen_by_the_program_as_its_new_size() {
+    let mut server = Server::start();
+    let (_, started) = server.ok(json!({
+        "action": "start", "pty": true, "waitMs": 5000,
+        "command": "printf 'ready\n'; while IFS= read -r line; do printf 'native %s\n' \"$(stty size)\"; done"
+    }));
+    assert!(started.contains("ready"), "the reader is ready: {started}");
+    let task = server.id(1);
+    // One resize, and nothing that resizes again.
+    server.ok(json!({
+        "action": "poll", "taskId": task, "cols": 70, "rows": 22, "waitMs": 2000
+    }));
+    let (_, text) = server.ok(json!({
+        "action": "poll", "taskId": task, "input": "measure
+    ", "waitMs": 5000,
+        "returnWhen": {"outputContains": ["native 22 70"]}
+    }));
+    assert!(
+        text.contains("native 22 70"),
+        "the program reads the new size as its own: {text}"
+    );
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+}
+
+/// Bounds are checked before anything happens, and a pipe task has no size to change.
+#[test]
+fn sizes_out_of_range_or_on_a_pipe_task_are_refused() {
+    let mut server = Server::start();
+    let (_, text, is_error) = server.call(json!({
+        "action": "start", "pty": true, "cols": 19, "command": "printf hi"
+    }));
+    assert!(
+        is_error && text.contains("cols 19 is out of range 20-500"),
+        "{text}"
+    );
+    let (_, text, is_error) = server.call(json!({
+        "action": "start", "pty": true, "rows": 201, "command": "printf hi"
+    }));
+    assert!(
+        is_error && text.contains("rows 201 is out of range 5-200"),
+        "{text}"
+    );
+    let (_, text, is_error) = server.call(json!({
+        "action": "start", "pty": false, "cols": 100, "command": "printf hi"
+    }));
+    assert!(
+        is_error && text.contains("`cols` applies to PTY tasks only"),
+        "{text}"
+    );
+    server.ok(json!({"action": "start", "pty": false, "waitMs": 5000, "command": "printf hi"}));
+    let pipe = server.id(1);
+    let (_, text, is_error) = server.call(json!({"action": "poll", "taskId": pipe, "rows": 10}));
+    assert!(
+        is_error && text.contains("applies to PTY tasks only"),
+        "{text}"
+    );
+}
+
+/// A poll that fails validation changes nothing: no resize, and no input delivered.
+#[test]
+fn an_invalid_combined_poll_neither_resizes_nor_delivers_input() {
+    let mut server = Server::start();
+    server.ok(json!({
+        "action": "start", "pty": true, "waitMs": 5000,
+        "command": "stty size; while read -r line; do printf 'got %s\\n' \"$line\"; done"
+    }));
+    let task = server.id(1);
+    let (_, text, is_error) = server.call(json!({
+        "action": "poll", "taskId": task, "cols": 100, "rows": 40, "input": "hello\n",
+        "keys": ["NotAKey"], "waitMs": 200
+    }));
+    assert!(
+        is_error && text.contains("NotAKey"),
+        "the key name is refused: {text}"
+    );
+    let (_, text) = server.ok(json!({
+        "action": "poll", "taskId": task, "input": "second\n", "waitMs": 500
+    }));
+    assert!(
+        !text.contains("got hello"),
+        "the refused poll's input was not delivered: {text}"
+    );
+    assert!(
+        text.contains("got second"),
+        "the next poll's input was: {text}"
+    );
+    let (out, text) =
+        server.ok(json!({"action": "poll", "taskId": task, "screen": true, "waitMs": 200}));
+    assert!(
+        text.contains("screen 120x30"),
+        "the refused poll's size was not applied: {text}"
+    );
+    assert_eq!(out["cols"], json!(120), "{text}");
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+}
+
+/// A poll that names the size the task already has changes nothing: no SIGWINCH, no repaint.
+#[test]
+fn an_unchanged_size_sends_nothing() {
+    let mut server = Server::start();
+    server.ok(json!({
+        "action": "start", "pty": true, "waitMs": 5000,
+        "command": "n=0; trap 'n=$((n+1)); printf \"winch %s\\n\" \"$n\"' WINCH; printf 'ready\\n'; while :; do sleep 0.02; done"
+    }));
+    let task = server.id(1);
+    // A loaded machine runs the trap late, so the size keeps changing until the program answers:
+    // each change is another SIGWINCH, and the first answer is the one the test wants.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut text = String::new();
+    let (mut cols, mut sent) = (121u16, 0u16);
+    while !text.contains("winch 1") {
+        sent = cols;
+        let (_, polled) = server.ok(json!({
+            "action": "poll", "taskId": task, "cols": cols, "waitMs": 2000,
+            "returnWhen": {"outputContains": ["winch 1"]}
+        }));
+        text.push_str(&polled);
+        cols = if cols == 121 { 122 } else { 121 };
+        assert!(Instant::now() < deadline, "a changed size does: {text}");
+    }
+    // The size it now has, named again: the program has already answered one change, so a second
+    // answer could only come from a resize that should not have been sent.
+    let (_, unchanged) = server.ok(json!({
+        "action": "poll", "taskId": task, "cols": sent, "waitMs": 1500
+    }));
+    assert!(
+        !unchanged.contains("winch 2"),
+        "an unchanged size sends no SIGWINCH: {unchanged}"
+    );
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+}
+
+/// A resize after the task's tree ended is refused before anything changes.
+#[test]
+fn a_resize_after_exit_is_refused() {
+    let mut server = Server::start();
+    server.ok(json!({"action": "start", "pty": true, "waitMs": 30000, "command": "printf hi"}));
+    let task = server.id(1);
+    let (_, text, is_error) = server.call(json!({"action": "poll", "taskId": task, "cols": 100}));
+    assert!(
+        is_error && (text.contains("terminal is closed") || text.contains("tree has ended")),
+        "the resize is refused: {text}"
+    );
+    // The task's own record is unchanged, and it still renders its screen.
+    let (out, text) =
+        server.ok(json!({"action": "poll", "taskId": task, "screen": true, "waitMs": 100}));
+    assert_eq!(out["cols"], json!(120), "{text}");
+    assert!(text.contains("screen 120x30"), "{text}");
+}
+
+/// Sustained output through fifty resizes: the settled contract, on the product's own path. The
+/// producer prints a fixed payload of 20 000 lines, is still printing for every resize, and its
+/// transcript then holds every one of those lines, whole and in order, in over a megabyte.
+#[test]
+#[ignore = "heavy: opt in with --ignored"]
+fn sustained_output_through_resizes_keeps_every_line() {
+    const LINES: usize = 20_000;
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(180);
+    let mut server = Server::start();
+    let temp = std::env::temp_dir();
+    let tag = std::process::id();
+    let done = temp.join(format!("fastexec-b3-done-{tag}"));
+    let _ = std::fs::remove_file(&done);
+    // Every fifty lines the producer waits, so its output spans the whole resize loop instead of
+    // landing in one burst, and the payload is fixed whether or not the loop keeps up.
+    let command = format!(
+        "i=0; while [ $i -lt {LINES} ]; do i=$((i+1)); \
+         printf 'line %05d %s\\n' $i '------------------------------------------------------------'; \
+         if [ $((i % 50)) -eq 0 ]; then sleep 0.02; fi; done; : > '{done}'; sleep 60",
+        done = done.display().to_string().replace('\\', "/")
+    );
+    server.ok(json!({
+        "action": "start", "pty": true, "cols": 68, "rows": 30, "waitMs": 500, "command": command
+    }));
+    let task = server.id(1);
+    let sizes = [(100u16, 30u16), (40, 12), (20, 5), (500, 200), (68, 30)];
+    for k in 0..50 {
+        assert!(
+            !done.exists(),
+            "the producer finished before resize {k} of 50"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the resizes passed their bound at {k}"
+        );
+        let (cols, rows) = sizes[k % sizes.len()];
+        let (_, text) = server.ok(json!({
+            "action": "poll", "taskId": task, "cols": cols, "rows": rows, "waitMs": 50
+        }));
+        assert!(!text.contains("Cannot resize"), "a resize failed: {text}");
+    }
+    assert!(!done.exists(), "the producer printed through every resize");
+    // The payload's own end, within the run's bound: the producer's 20 000 lines take as long as
+    // they take on this platform.
+    while !done.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the producer never finished its payload"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    server.ok(json!({"action": "kill", "taskId": task, "waitMs": 10000}));
+    let body = transcript_body(&mut server, &task);
+    let written: Vec<&str> = body.lines().collect();
+    let payload: Vec<String> = (1..=LINES)
+        .map(|k| format!("line {k:05} {}", "-".repeat(60)))
+        .collect();
+    // The fixed payload, independently written: every line is there, whole, in order.
+    let mut at = 0;
+    for want in &payload {
+        match written[at..].iter().position(|line| line == want) {
+            Some(found) => at += found + 1,
+            None => panic!(
+                "payload line {want:?} is not in the transcript in order after {at} lines of {}",
+                written.len()
+            ),
+        }
+    }
+    assert!(
+        body.len() > 1_048_576,
+        "the transcript holds over a megabyte of sustained output: {} bytes",
+        body.len()
+    );
+    // Every other line is a payload line or a row visible at a resize, which a width change can
+    // cut: it is a part of a payload line. A blank extra line counts, and fails this check.
+    for line in &written {
+        assert!(
+            !line.is_empty() && payload.iter().any(|want| want.contains(line)),
+            "a transcript line is neither a payload line nor part of one: {line:?}"
+        );
+    }
+    let extras = written.len().saturating_sub(payload.len());
+    assert!(
+        extras <= 50 * 200,
+        "{extras} extra lines, more than fifty resizes of the largest screen"
+    );
+    assert!(
+        std::time::Instant::now() < deadline,
+        "the whole run took {:?}",
+        started.elapsed()
+    );
+    let _ = std::fs::remove_file(&done);
 }

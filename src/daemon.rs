@@ -286,6 +286,7 @@ impl Daemon {
                     daemon,
                     http.render,
                     http.launch,
+                    http.public_root,
                     stopped,
                 )
                 .await;
@@ -1114,6 +1115,15 @@ async fn serve_daemon(
                     return 1;
                 }
             };
+            // The root is parsed once here, before anything is bound: from now on the daemon mints
+            // every transfer URL from this value and the environment is never read again.
+            let public_root = match http::public_root() {
+                Ok(root) => root.map(Arc::from),
+                Err(message) => {
+                    eprintln!("fastexec: {message}");
+                    return 1;
+                }
+            };
             let launch = match LaunchContext::current() {
                 Ok(launch) => Arc::new(launch.without("FASTEXEC_HTTP_TOKEN")),
                 Err(error) => {
@@ -1138,6 +1148,7 @@ async fn serve_daemon(
                     token,
                     render,
                     launch,
+                    public_root,
                 }),
                 Config {
                     idle_exit: false,

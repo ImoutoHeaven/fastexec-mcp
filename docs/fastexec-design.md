@@ -22,8 +22,8 @@ ranges return an error before execution.
 
 | Action | Allowed Parameters | Summary |
 | --- | --- | --- |
-| `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `keepTree`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Spawns `command` in GNU bash and waits up to `waitMs` (default `30000`, range `0–240000`). |
-| `poll` | `taskId`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only), waits (`2000` ms with `input`/`keys` and no `returnWhen`, `30000` ms otherwise), and returns unseen output. |
+| `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Spawns `command` in GNU bash and waits up to `waitMs` (default `30000`, range `0–240000`). `cols`/`rows` set a PTY terminal's size (default `120×30`). |
+| `poll` | `taskId`, `cols`, `rows`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Resizes the terminal (PTY only), writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only), waits (`2000` ms with a resize, `input`, or `keys` and no `returnWhen`, `30000` ms otherwise), and returns unseen output. |
 | `kill` | `taskId`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns its final state. On a finished `keepTree` task, ends held processes while keeping the root exit result. |
 | `list` | `truncate`, `maxBytes` | Lists tasks in this server (the namespace's daemon in `on` mode, newest first) with their state, owner, session, call ID, and held processes; text fits `maxBytes` while `structuredContent.tasks` stays complete. |
 | `transcript` | `taskId`, `truncate` (default `"tail"`), `maxBytes` | Reads a UTF-8 PTY task's terminal transcript from the first unseen final line, followed by pending lines. Does not wait or advance the `poll` cursor. |
@@ -43,8 +43,8 @@ ranges return an error before execution.
     each, no line breaks) matched against cleaned unseen output lines (including
     text before a carriage return overwrites it).
   - `screenContains`, `screenAppears`, `screenGone` (UTF-8 PTY only): match
-    against the live 120×30 screen (`screenAppears` and `screenGone` compare
-    against the screen captured before the call's `input`).
+    against the live screen at the task's size (`screenAppears` and `screenGone`
+    compare against the screen captured before the call's resize and `input`).
   - `quietMs`: `10–60000` ms without output after `input` and `keys` finish.
 - **Window and encoding options**:
   - `maxBytes`: `100–1048576` (default `16384`). Rejected when
@@ -59,8 +59,15 @@ ranges return an error before execution.
     `"gbk"`; UTF-16 is rejected). On `start`, sets the task default; on `poll`,
     overrides for that call.
   - `screen`: Boolean (`false` default, UTF-8 PTY only). Returns the rendered
-    120×30 screen and 1-based cursor `[row, col]`, marking the output stream
-    read up to that point. Cannot combine with `truncate`, `raw`, or `encoding`.
+    screen at the task's size and 1-based cursor `[row, col]`, marking the output
+    stream read up to that point. Cannot combine with `truncate`, `raw`, or
+    `encoding`.
+  - `cols`, `rows` (PTY only): the terminal's size. `start` takes them,
+    defaulting `120×30`; `poll` takes them too, because a resize is
+    terminal-side input: a poll applies the resize, then `input`, then `keys`,
+    then waits. Either axis may come alone and an omitted axis keeps its value;
+    bounds are `cols` `20–500` and `rows` `5–200`; an unchanged size is a no-op.
+    A pipe task refuses both.
 
 ### File Tools
 
@@ -140,19 +147,20 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
 These fields describe `exec` results.
 
 - **`start`, `poll`, `kill`**: `ok`, `action`, `taskId`, `state` (`"running"`,
-  `"exited"`, `"killed"`), `exitCode`, `pty`, `elapsedMs`, `logPath`,
-  `lifetimeExpired`, `logError`, `keepTree`, `leftovers` (`[{ pid, name }]`),
-  `keptRunning`, `held` (`[{ pid, name }]`), `killError`.
+  `"exited"`, `"killed"`), `exitCode`, `forcedEnd`, `pty`, `elapsedMs`,
+  `logPath`, `lifetimeExpired`, `logError`, `keepTree`, `leftovers`
+  (`[{ pid, name }]`), `keptRunning`, `held` (`[{ pid, name }]`), `killError`.
 - **`start`, `poll` (additional)**: `waitEndedBy` (`{ condition, text? }`). With
-  `screen: true`, adds `cursor` (`[row, col]`) and `omittedRows`. Otherwise adds
+  `screen: true`, adds `cols`, `rows`, `cursor` (`[row, col]`), and `omittedRows`. Otherwise adds
   `omittedLines`, `omittedRange` (`[first, last]` or `null`), `cutLines`, and
   `encodingErrors`.
 - **`transcript` (additional)**: `transcriptPath`, `transcriptLines`,
   `finalLines`, `firstLine`, `omittedLines`, `omittedRange`, `cutLines`, and
   `encodingErrors`.
 - **`list`**: `ok`, `action`, and `tasks` (`taskId`, `state`, `exitCode`, `pty`,
-  `elapsedMs`, `command` up to 120 chars, `logPath`, `lifetimeExpired`,
-  `keepTree`, `keptRunning`, `held`, `owner`, `session`, `callId`).
+  `cols`, `rows`, `elapsedMs`, `command` up to 120 chars, `logPath`,
+  `lifetimeExpired`, `keepTree`, `keptRunning`, `held`, `leftovers`, `killError`,
+  `owner`, `session`, `callId`). `cols` and `rows` are `null` for a pipe task.
 - **Background footer**: Appended to `start`, `poll`, `kill`, and `transcript`
   results (up to `512` bytes and `maxBytes / 4`) naming up to three other tasks
   that finished unseen, had held processes end, are still running, or have a
@@ -176,11 +184,14 @@ These fields describe `exec` results.
   is gone; `on` mode empties the namespace's `logs/` directory at daemon start
   while it holds that namespace's `daemon.lock`.
 - **Live PTY emulator and continuous transcript spool**: Each UTF-8 PTY task
-  feeds output bytes into a 120×30 `alacritty_terminal` (`0.26.0`) instance
-  (`src/terminal.rs`, `src/frames.rs`) that answers terminal queries (`ESC[6n`,
-  `ESC[c`), tracks keyboard modes, serves `screen: true`, and continuously
-  spools `<taskId>.transcript.txt` (up to `64` MiB, counted under the `1` GiB
-  total limit). Lines scrolled off the normal screen and merged frames from
+  feeds output bytes into an `alacritty_terminal` (`0.26.0`) instance at the
+  task's size (`src/terminal.rs`, `src/frames.rs`) that answers terminal queries
+  (`ESC[6n`, `ESC[c`), tracks keyboard modes, serves `screen: true`, and
+  continuously spools `<taskId>.transcript.txt` (up to `64` MiB, counted under
+  the `1` GiB total limit). A resize settles the transcript at the old size,
+  reflows at the new one, and starts the recorder fresh, so transcript text is
+  never lost on either screen, and rows still visible after the resize may appear
+  twice; arbitrary application redraws keep today's best effort. Lines scrolled off the normal screen and merged frames from
   alternate-screen sessions (`--- alternate screen ---` /
   `--- normal screen ---`) are written as final lines once settled. A
   `transcript` call returns unseen final lines followed by current pending
@@ -226,14 +237,38 @@ These fields describe `exec` results.
   - **Linux**: A separate task host leads the session and adopts daemonized
     descendants as a subreaper. Tree termination sends `SIGKILL` to discovered
     descendants and the host's group. A lifeline pipe triggers cleanup if the
-    server dies. Other Unix builds lack Linux's descendant tracking and cannot
-    provide the same `keepTree` guarantees.
+    server dies.
+  - **macOS**: The same task host owns membership, because nothing adopts an
+    orphan there: it scans the process table every 100 ms and tracks the
+    processes it started by pid and start time, so a descendant seen once stays
+    a member after it leaves the session, group, and parent chain. The host
+    stays alive while it holds a member, which is what a `keepTree` wait, a
+    deadline, and the server's end-of-tree wait read. The server keeps no
+    membership set: it asks the host for members and for a kill over a control
+    socket, so no signal ever names a group by a number the server read
+    elsewhere. Identity comes from libproc, or from the kernel's `KERN_PROC_PID`
+    row for another user's process, which libproc refuses. `SIGKILL` goes to
+    each member by identity, then to the host's own group. A member this user
+    may not signal fails the kill and keeps the host holding the tree, as on
+    Linux. A descendant that leaves the session and group and loses its
+    traceable parent before a scan sees it escapes, whichever order `setsid`
+    and the parent's exit happen in: the tree is best-effort tracking of
+    detached descendants, and fastexec is not a sandbox.
   - **`keepTree: true`**: Keeps leftover processes running after root bash exits
     until `kill`, `killAfterMs`, or the end of the tasks' owner: the server's
     session in the default mode, the daemon's stop or exit in `on` mode. Once the root exit has been
     reported, subsequent `poll` calls wait on the held tree
     (`waitEndedBy.condition: "tree_ended"`), and a `start`/`poll` with
     `returnWhen` waits past a root exit `0` for output from held processes.
+  - **A root that does not terminate (Windows)**: A ConPTY root records its
+    script's exit status as that script ends, in a file the task's directory
+    holds. A root that has not terminated five seconds after its script finished
+    is ended with that status, so the task publishes `exited` with `forcedEnd:
+    true` and ` · root forced after 5 s exit grace` in the result line; its tree
+    is then handled as on any root exit. The marker is installed only when the
+    shell has no `EXIT` trap yet, so a startup file (`BASH_ENV`, a profile) that
+    sets one keeps its cleanup; such a task, a command that sets its own trap,
+    and a command that `exec`s all keep the plain wait.
   - **Limits**: Native permission failures appear in `killError`; unkillable
     processes remain held. Processes launched outside the owned tree, such as
     through a system service manager, are outside its cleanup scope.
@@ -320,8 +355,9 @@ These fields describe `exec` results.
   instruction not to buffer them.
 - **Transfer route**: `/t/<capability id>` serves one file without the bearer
   token, which is what makes a URL usable by `curl`; the `transfer` tool mints
-  the id and builds the URL from the request's own `Host` and scheme. An id
-  expires after `10` minutes unused, and an unknown or expired one answers
+  the id and builds the URL from `FASTEXEC_PUBLIC_URL` when the daemon was
+  started with it, and from the request's own `Host` and scheme when it was not.
+  An id expires after `10` minutes unused, and an unknown or expired one answers
   `404`. `GET` returns the file, honouring one `bytes=` range with `206` and
   `416` and ignoring any other form, so the whole file comes back with `200`.
   `HEAD` answers the current size. `PUT` writes the body at `?offset=` (default
@@ -331,4 +367,6 @@ These fields describe `exec` results.
   Replies carry `Cache-Control: no-store`, `Content-Type:
   application/octet-stream`, and `X-Accel-Buffering: no`. `/t/` is answered
   before the bearer check and before the `4` MiB body cap that applies to
-  `/mcp`.
+  `/mcp`. `/mcp` is the only other route: a path behind the bearer check that
+  is not `/mcp` answers `404`, so a proxy that forwards its prefix unstripped
+  fails at `initialize` rather than at a later download.

@@ -209,12 +209,23 @@ Scheduler "at logon" instead.
 ### Behind a proxy
 
 `FASTEXEC_HTTP_ALLOW_REMOTE=1` is required even on a loopback bind, because a
-proxy forwards the public `Host`. Route `/`, or both `/mcp` and `/t/`, to the
-daemon: a `/mcp`-only route leaves `transfer` URLs unreachable.
+proxy forwards the public `Host`. The daemon serves `/mcp` and `/t/<id>`, and an
+authenticated request for any other path answers 404, so a proxy that forwards
+its prefix unstripped fails at `initialize` instead of at a download.
+
+One domain carries every machine, each on a prefix of its own that the proxy
+strips. Each daemon is started with the address clients reach, which is the root
+`transfer` mints its URLs from:
+
+```bash
+FASTEXEC_PUBLIC_URL=https://example.com/mac/ \
+FASTEXEC_HTTP_ALLOW_REMOTE=1 \
+fastexec daemon start --http 127.0.0.1:8765
+```
 
 ```nginx
-location / {
-    proxy_pass http://127.0.0.1:8765;
+location /mac/ {
+    proxy_pass http://127.0.0.1:8765/;
     proxy_http_version 1.1;
     proxy_set_header Host $http_host;
     proxy_set_header X-Forwarded-Proto $scheme;
@@ -222,9 +233,20 @@ location / {
 }
 ```
 
-`transfer` builds its URLs from the `Host` it receives, so without that line
-they name the loopback address. The server sends `X-Accel-Buffering: no` on the
-responses a proxy would otherwise buffer.
+The same block with `/linux/`, `/windows/` and one port per machine. MCP clients
+use `<root>mcp`: `https://example.com/mac/mcp` for the block above.
+
+When `FASTEXEC_PUBLIC_URL` is unset, `transfer` uses the `Host` and
+`X-Forwarded-Proto` of the request it answers. The daemon reads the variable
+once when it starts and keeps that root until it stops; a `daemon start` that
+finds a running HTTP daemon keeps the root that daemon already has, and a daemon
+started over stdio has no HTTP front door and no root. A value that is not
+`http` or `https`, names no host, has a port outside 1-65535, or carries
+userinfo, a query, a fragment, a dot segment or an empty path segment is refused
+with its reason and exit 1, before anything binds.
+
+The server sends `X-Accel-Buffering: no` on the responses a proxy would
+otherwise buffer.
 
 Cloudflare reaches the daemon through a named tunnel; Quick Tunnels do not
 support server-sent events. Plan limits are in

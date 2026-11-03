@@ -24,6 +24,9 @@ struct Fixture {
     token: String,
     /// The daemon this fixture saw running, so cleanup can end that one process by PID.
     pid: std::cell::Cell<Option<u32>>,
+    /// The public root this fixture's daemon is started with, when a case names one. It is set on
+    /// this fixture's own commands only: no case changes the environment of the test process.
+    public_url: Option<String>,
     /// The turn this fixture holds until it ends: held, never read.
     #[allow(dead_code)]
     starting: std::sync::MutexGuard<'static, ()>,
@@ -38,6 +41,21 @@ static STARTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 impl Fixture {
     /// Starts a daemon that serves HTTP on a port of the system's choosing.
     fn new(tag: &str) -> Fixture {
+        let mut fixture = Fixture::bare(tag);
+        fixture.start();
+        fixture
+    }
+
+    /// Starts a daemon whose transfer URLs are minted from `root`, the way a proxy in front of the
+    /// listener has it.
+    fn with_public_url(mut self, root: &str) -> Fixture {
+        self.public_url = Some(root.to_owned());
+        self
+    }
+
+    /// A fixture with its runtime directory, and no daemon yet: the shape of a start that is
+    /// expected to be refused.
+    fn bare(tag: &str) -> Fixture {
         let runtime =
             std::env::temp_dir().join(format!("fastexec-http-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&runtime);
@@ -49,23 +67,27 @@ impl Fixture {
         // The turn is taken before the fixture exists, so a start that panics still cleans up with
         // it held.
         let starting = STARTING.lock().unwrap_or_else(|error| error.into_inner());
-        let mut fixture = Fixture {
+        Fixture {
             runtime,
             namespace: format!("http{tag}-{}", std::process::id()),
             addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: random_token(),
             pid: std::cell::Cell::new(None),
+            public_url: None,
             starting,
-        };
-        let (code, out, err) = fixture.run(&["daemon", "start", "--http", "127.0.0.1:0"]);
+        }
+    }
+
+    /// Starts the daemon, and reads back the address it bound.
+    fn start(&mut self) {
+        let (code, out, err) = self.run(&["daemon", "start", "--http", "127.0.0.1:0"]);
         assert_eq!(code, 0, "the daemon started: {out}{err}");
         let addr = out
             .split_whitespace()
             .skip_while(|word| *word != "http")
             .nth(1)
             .unwrap_or_else(|| panic!("no http address in {out:?}"));
-        fixture.addr = addr.parse().expect("the daemon printed an address");
-        fixture
+        self.addr = addr.parse().expect("the daemon printed an address");
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -84,6 +106,10 @@ impl Fixture {
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
             .env_remove("FASTEXEC_TEST_NONE_LIMIT")
             .stdin(std::process::Stdio::null());
+        match &self.public_url {
+            Some(root) => command.env("FASTEXEC_PUBLIC_URL", root),
+            None => command.env_remove("FASTEXEC_PUBLIC_URL"),
+        };
         command
     }
 
@@ -120,7 +146,26 @@ impl Fixture {
                 .to_lowercase();
             !path.is_empty() && path.starts_with(&expected.display().to_string().to_lowercase())
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        {
+            // macOS has no /proc: libproc names the image, and $TMPDIR sits under /var, which the
+            // kernel reports as /private/var.
+            let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            // SAFETY: the buffer is as large as proc_pidpath writes, for this pid.
+            let len = unsafe {
+                libc::proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32)
+            };
+            if len <= 0 {
+                return false;
+            }
+            buffer.truncate(len as usize);
+            let path = std::path::PathBuf::from(String::from_utf8_lossy(&buffer).into_owned());
+            let resolved = |path: &std::path::Path| {
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+            };
+            resolved(&path).starts_with(resolved(&expected))
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             std::fs::read_link(format!("/proc/{pid}/exe"))
                 .map(|path| path.starts_with(&expected))
@@ -492,8 +537,13 @@ fn send(addr: SocketAddr, method: &str, target: &str, headers: &str, body: &[u8]
 }
 /// Sends one request with headers of the test's own choosing.
 fn raw(addr: SocketAddr, token: &str, headers: &str, body: &str) -> Response {
+    post_to(addr, token, "/mcp", headers, body)
+}
+
+/// Sends one authenticated POST to `target`, for the routes a client may and may not use.
+fn post_to(addr: SocketAddr, token: &str, target: &str, headers: &str, body: &str) -> Response {
     let mut request = String::new();
-    request.push_str("POST /mcp HTTP/1.1\r\n");
+    request.push_str(&format!("POST {target} HTTP/1.1\r\n"));
     request.push_str(&format!("Host: {addr}\r\n"));
     request.push_str("Accept: application/json, text/event-stream\r\n");
     request.push_str("Content-Type: application/json\r\n");
@@ -978,6 +1028,130 @@ fn transfer_is_listed_over_http_and_names_the_scheme_the_client_saw() {
     // Every response of an MCP call tells a proxy not to buffer it.
     let response = client.send(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list"}));
     assert_eq!(response.header("x-accel-buffering"), Some("no"));
+}
+
+#[test]
+fn a_named_root_wins_over_the_host_and_keeps_its_prefix() {
+    let root = "https://files.example/mac/";
+    let mut fixture = Fixture::bare("public-root").with_public_url(root);
+    fixture.start();
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let path = published(&fixture, "rooted.bin");
+    let url = publish(&mut client, &path);
+    // The whole URL, not only its prefix: the root, then the id the listener checks itself.
+    let target = target_of(&url);
+    assert_eq!(url, format!("{root}{}", target.trim_start_matches('/')));
+    // Neither the Host the request carries nor a forwarded scheme moves a named root.
+    for forwarded in [
+        "X-Forwarded-Proto: https\r\n",
+        "X-Forwarded-Proto: http\r\n",
+    ] {
+        let result = client.call_tool_with(
+            "transfer",
+            json!({"path": path.display().to_string()}),
+            forwarded,
+        );
+        let again = result["content"][0]["text"].as_str().expect("a url");
+        let again_target = target_of(again);
+        assert_eq!(
+            again,
+            format!("{root}{}", again_target.trim_start_matches('/')),
+            "{again}"
+        );
+    }
+    // The id is served by this listener: the prefix belongs to the proxy that strips it.
+    let target = target_of(&url);
+    let put = send(fixture.addr, "PUT", &format!("{target}?offset=0"), "", b"");
+    assert_eq!(put.status, 200, "{}", put.body);
+    let put = send(fixture.addr, "PUT", &target, "", b"rooted bytes");
+    assert_eq!(put.body, "12");
+    let get = send(fixture.addr, "GET", &target, "", b"");
+    assert_eq!(get.status, 200, "{}", get.body);
+    assert_eq!(get.bytes, b"rooted bytes");
+}
+
+#[test]
+fn a_second_start_with_another_root_keeps_the_root_the_daemon_has() {
+    let first = "https://first.example/mac/";
+    let mut fixture = Fixture::bare("root-kept").with_public_url(first);
+    fixture.start();
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    // A start that finds a running HTTP daemon keeps that daemon, and with it the root it minted
+    // from when it started.
+    fixture.public_url = Some("https://second.example/linux/".to_owned());
+    let (code, out, err) = fixture.run(&["daemon", "start", "--http", "127.0.0.1:0"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let path = published(&fixture, "kept.bin");
+    let url = publish(&mut client, &path);
+    assert!(url.starts_with(first), "{url}");
+}
+
+#[test]
+fn a_path_that_is_not_mcp_is_not_found() {
+    let fixture = Fixture::new("routes");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "prefix", "version": "1"}
+        }
+    })
+    .to_string();
+    // `initialize` answers on the one route a session uses, and on nothing that only looks like it:
+    // a proxy that forwards its prefix unstripped fails here, at initialize, rather than later at a
+    // download.
+    for (target, status) in [
+        ("/mcp", 200),
+        ("/mcp/", 404),
+        ("/mac/mcp", 404),
+        ("/MCP", 404),
+        ("/t/mcp", 404),
+    ] {
+        let answer = post_to(fixture.addr, &fixture.token, target, "", &body);
+        assert_eq!(answer.status, status, "{target}: {:?}", answer.body);
+    }
+    // A path nobody may use is refused as unauthenticated before it is reported missing.
+    let anonymous = post_to(fixture.addr, "", "/mac/mcp", "", &body);
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.header("www-authenticate"), Some("Bearer"));
+}
+
+#[test]
+fn a_daemon_refuses_a_public_root_it_cannot_use() {
+    for (value, reason) in [
+        ("", "must start with http:// or https://"),
+        ("http://h:0/", "port outside 1-65535"),
+        ("https://user@h/mac/", "userinfo"),
+    ] {
+        let fixture = Fixture::bare("bad-root").with_public_url(value);
+        // Both entry paths: the CLI refuses before it spawns, and `run` is the daemon itself, which
+        // refuses before it binds.
+        for action in [
+            ["daemon", "start", "--http", "127.0.0.1:0"],
+            ["daemon", "run", "--http", "127.0.0.1:0"],
+        ] {
+            let (code, out, err) = fixture.run(&action);
+            assert_eq!(code, 1, "{value:?} ran {action:?}: {out}{err}");
+            assert!(
+                err.contains("FASTEXEC_PUBLIC_URL") && err.contains(reason),
+                "{value:?} through {action:?} gave {err:?}"
+            );
+        }
+        // Nothing was left running for a start that never happened.
+        let (code, out, _) = fixture.run(&["daemon", "status"]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.starts_with("No fastexec daemon"),
+            "{value:?} left a daemon: {out}"
+        );
+    }
 }
 
 #[test]

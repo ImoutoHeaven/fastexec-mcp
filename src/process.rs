@@ -24,6 +24,12 @@ pub struct Launch<'a> {
     pub env: &'a LaunchContext,
     pub login: bool,
     pub pty: bool,
+    /// The terminal's size: columns, then screen rows.
+    pub cols: u16,
+    pub rows: u16,
+    /// Where a Windows ConPTY root's script writes its exit status, so a root that never
+    /// terminates still ends its task. `None` for pipe roots and other platforms.
+    pub exit_status: Option<&'a Path>,
 }
 
 pub struct Spawned {
@@ -31,6 +37,61 @@ pub struct Spawned {
     pub output: Box<dyn Read + Send>,
     pub input: Box<dyn Write + Send>,
     pub tree: Tree,
+    /// A PTY task's size control, which resizes the terminal the program is on.
+    pub pty: Option<PtyControl>,
+}
+
+/// A task's PTY size control: the terminal handle the program sees, shared with capture, the
+/// ender, and resize, so resizing tells the program its terminal changed size. It stays open
+/// while the task's tree runs and is dropped with the terminal, so a resize that arrives after
+/// the tree ended finds it taken.
+pub struct PtyControl {
+    #[cfg(windows)]
+    terminal: std::sync::Arc<crate::conpty_spawn::Terminal>,
+    #[cfg(unix)]
+    master: std::os::fd::OwnedFd,
+}
+
+impl PtyControl {
+    #[cfg(windows)]
+    pub(crate) fn new(terminal: std::sync::Arc<crate::conpty_spawn::Terminal>) -> PtyControl {
+        PtyControl { terminal }
+    }
+
+    /// Shares the terminal master of `master` without taking its lifetime: the copy closes with
+    /// the control, so the output still reaches EOF when the tree ends.
+    #[cfg(unix)]
+    pub(crate) fn new(master: &std::fs::File) -> std::io::Result<PtyControl> {
+        use std::os::fd::AsFd;
+        Ok(PtyControl {
+            master: master.as_fd().try_clone_to_owned()?,
+        })
+    }
+
+    /// The terminal is `cols` by `rows` from now on, and the program is told: Unix sends
+    /// SIGWINCH to its process group, and ConPTY repaints the whole screen.
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            self.terminal.resize(cols, rows)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let size = libc::winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            // SAFETY: the descriptor is the task's own terminal master, and `size` is a winsize.
+            let set = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+            if set == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
 }
 
 /// A process of a task's tree other than its root bash.
@@ -46,27 +107,40 @@ pub enum Child {
     Pipe(std::process::Child),
     Pty {
         process: std::os::windows::io::OwnedHandle,
-        /// Held until the tree ends; dropping it closes the terminal so output reaches EOF.
-        _terminal: crate::conpty_spawn::Terminal,
+        /// Held until the tree ends; dropping it closes the terminal so output reaches EOF. The
+        /// task's size control holds another reference while the tree runs.
+        #[allow(dead_code)] // held for the console's lifetime, never read here
+        terminal: std::sync::Arc<crate::conpty_spawn::Terminal>,
+        /// Where the script records its exit status, so a root that never terminates can still
+        /// end its task.
+        exit_status: Option<std::path::PathBuf>,
     },
 }
 
 #[cfg(windows)]
 impl Child {
-    /// Blocks until the root bash exits and returns its bash-convention exit code.
-    pub fn wait(&mut self, _tree: &Tree) -> i32 {
-        let code = match self {
-            Child::Pipe(child) => child.wait().map_or(1, |status| status.code().unwrap_or(1)),
+    /// Blocks until the root bash exits and returns its bash-convention exit code, and whether the
+    /// end was forced because the script had finished while the root did not terminate.
+    pub fn wait(&mut self, _tree: &Tree) -> (i32, bool) {
+        let (code, forced) = match self {
+            Child::Pipe(child) => (
+                child.wait().map_or(1, |status| status.code().unwrap_or(1)),
+                false,
+            ),
             // The console's exit code carries the same signal convention the pipe's does.
-            Child::Pty { process, .. } => crate::conpty_spawn::wait(process),
+            Child::Pty {
+                process,
+                exit_status,
+                ..
+            } => crate::conpty_spawn::wait(process, exit_status.as_deref()),
         };
-        msys_signal_exit(code)
+        (msys_signal_exit(code), forced)
     }
 
     /// Blocks until no process of the tree runs.
     pub fn wait_tree(&mut self, tree: &Tree) {
         let mut pause = std::time::Duration::from_millis(10);
-        while !tree.members().is_empty() {
+        while tree.members().is_none_or(|members| !members.is_empty()) {
             std::thread::sleep(pause);
             pause = (pause * 2).min(std::time::Duration::from_millis(500));
         }
@@ -80,22 +154,24 @@ pub struct Child {
     /// The host writes the root bash's exit code here and holds it open until it exits.
     status: std::io::PipeReader,
     /// A PTY task's terminal, held until the tree ends.
-    _master: Option<std::fs::File>,
+    #[allow(dead_code)] // held for the terminal's lifetime, never read here
+    master: Option<std::fs::File>,
 }
 
 #[cfg(unix)]
 impl Child {
-    /// Blocks until the root bash exits and returns its bash-convention exit code.
-    pub fn wait(&mut self, tree: &Tree) -> i32 {
+    /// Blocks until the root bash exits and returns its bash-convention exit code. A root that
+    /// never terminates is not this platform's failure mode, so the end is never forced.
+    pub fn wait(&mut self, tree: &Tree) -> (i32, bool) {
         let mut code = [0; 4];
         if self.status.read_exact(&mut code).is_ok() {
-            return i32::from_le_bytes(code);
+            return (i32::from_le_bytes(code), false);
         }
         // The host ended before bash did: the tree was killed, or a signal only SIGKILL is, such
         // as `kill -9 0`, ended the host. What still holds its session or group goes too;
         // processes that left both are out of reach.
         let _ = tree.kill();
-        self.reap(tree)
+        (self.reap(tree), false)
     }
 
     /// Blocks until no process of the tree runs: the host leaves once it has no child left.
@@ -197,6 +273,13 @@ pub(crate) fn environment(launch: &Launch<'_>) -> Vec<(&'static str, OsString)> 
     }
     #[cfg(windows)]
     windows_path_environment(launch, &mut env);
+    if let Some(status) = launch.exit_status {
+        // msys reads a native path only with forward slashes.
+        env.push((
+            "FASTEXEC_EXIT_STATUS",
+            status.to_string_lossy().replace('\\', "/").into(),
+        ));
+    }
     env
 }
 
@@ -273,12 +356,18 @@ fn spawn_pipe(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         output: Box::new(reader),
         input,
         tree,
+        pty: None,
     })
 }
 
 /// PTY size; the terminal emulator behind `screen` uses the same.
 pub const PTY_ROWS: u16 = 30;
 pub const PTY_COLS: u16 = 120;
+/// The size bounds a task's terminal may be resized to, columns first.
+pub const PTY_COLS_MIN: u16 = 20;
+pub const PTY_COLS_MAX: u16 = 500;
+pub const PTY_ROWS_MIN: u16 = 5;
+pub const PTY_ROWS_MAX: u16 = 200;
 
 #[cfg(windows)]
 fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
@@ -294,7 +383,19 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     use std::os::unix::process::CommandExt;
     let (mut status, status_writer) = std::io::pipe()?;
     let (lifeline_reader, lifeline) = std::io::pipe()?;
-    let passed = [status_writer.as_raw_fd(), lifeline_reader.as_raw_fd()];
+    // macOS: the host answers member and kill requests on a control socket, because the server
+    // must not signal a group by a number the kernel may have reused. Other platforms answer from
+    // /proc or their job, and pass no such descriptor.
+    #[cfg(target_os = "macos")]
+    let (control, control_host) = crate::tree_macos::socket_pair()?;
+    #[cfg(target_os = "macos")]
+    let passed = vec![
+        status_writer.as_raw_fd(),
+        lifeline_reader.as_raw_fd(),
+        std::os::fd::AsRawFd::as_raw_fd(&control_host),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let passed = vec![status_writer.as_raw_fd(), lifeline_reader.as_raw_fd()];
     // /proc/self/exe stays valid when the server's binary is replaced on disk.
     let host = if cfg!(target_os = "linux") {
         "/proc/self/exe".into()
@@ -304,7 +405,7 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     let mut command = Command::new(host);
     command
         .arg(crate::host::FLAG)
-        .args(passed.map(|fd| fd.to_string()))
+        .args(passed.iter().map(|fd| fd.to_string()))
         .arg(launch.bash)
         .args(bash_args(launch))
         // The host needs no environment of its own: it execs bash with this one.
@@ -313,7 +414,7 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         .envs(environment(launch))
         .current_dir(launch.cwd);
     let (master, output): (_, Box<dyn Read + Send>) = if launch.pty {
-        let (master, slave) = open_pty()?;
+        let (master, slave) = open_pty(launch.cols, launch.rows)?;
         command
             .stdin(slave.try_clone()?)
             .stdout(slave.try_clone()?)
@@ -339,7 +440,7 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
             if pty && libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            for fd in passed {
+            for &fd in &passed {
                 if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -352,6 +453,8 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     // status pipe reach EOF when the tree ends.
     drop(command);
     drop((status_writer, lifeline_reader));
+    #[cfg(target_os = "macos")]
+    drop(control_host);
     // The host reports whether it runs bash before the task is reported as started; this word is
     // the first thing it writes to its status pipe, before it starts bash.
     let mut startup = [0_u8; 4];
@@ -376,31 +479,39 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         Some(master) => Box::new(master.try_clone()?),
         None => Box::new(host.stdin.take().expect("stdin is piped")),
     };
+    let pty = match &master {
+        Some(master) => Some(PtyControl::new(master)?),
+        None => None,
+    };
     let tree = Tree {
+        #[cfg(not(target_os = "macos"))]
         host: host.id() as i32,
         _lifeline: lifeline,
         ended: std::sync::Mutex::new(false),
+        #[cfg(target_os = "macos")]
+        control: crate::tree_macos::Client::new(control, host.id() as i32),
     };
     Ok(Spawned {
         child: Child {
             host,
             status,
-            _master: master,
+            master,
         },
         output,
         input,
         tree,
+        pty,
     })
 }
 
-/// A 120x30 pseudo-terminal: (master, slave), neither inherited across exec.
+/// A pseudo-terminal of `cols` by `rows`: (master, slave), neither inherited across exec.
 #[cfg(unix)]
-fn open_pty() -> std::io::Result<(std::fs::File, std::fs::File)> {
+fn open_pty(cols: u16, rows: u16) -> std::io::Result<(std::fs::File, std::fs::File)> {
     use std::os::fd::FromRawFd;
     let (mut master, mut slave) = (0, 0);
     let mut size = libc::winsize {
-        ws_row: PTY_ROWS,
-        ws_col: PTY_COLS,
+        ws_row: rows,
+        ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
@@ -440,13 +551,37 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(all(test, unix))]
+mod refusing_control_tests {
+    use super::*;
+
+    /// The native resize error reaches the caller as an error, not as a silent no-op. A plain
+    /// file takes no terminal size: Linux answers ENOTTY and macOS ENODEV, as a terminal that is
+    /// gone does.
+    #[test]
+    fn a_control_that_cannot_resize_reports_the_error() {
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let control = PtyControl::new(&file).expect("a shared descriptor");
+        let error = control
+            .resize(100, 40)
+            .expect_err("a resize on a plain file fails");
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ENOTTY) | Some(libc::ENODEV)
+            ),
+            "the ioctl answers ENOTTY or ENODEV: {error}"
+        );
+    }
+}
+
 /// The process tree of one task.
 pub struct Tree {
     #[cfg(windows)]
     job: std::os::windows::io::OwnedHandle,
     /// The task host: session leader, process group leader, and on Linux the subreaper that
-    /// adopts every orphan of the tree.
-    #[cfg(unix)]
+    /// adopts every orphan of the tree. macOS never names it: the host answers instead.
+    #[cfg(all(unix, not(target_os = "macos")))]
     host: i32,
     /// The write end of the host's lifeline. Closing it, when the tree is dropped or the server
     /// dies, makes the host end the tree, as closing a kill-on-close job does on Windows.
@@ -455,6 +590,10 @@ pub struct Tree {
     /// Set once the host is about to be reaped; `kill` and `members` then do nothing.
     #[cfg(unix)]
     ended: std::sync::Mutex<bool>,
+    /// The host's control socket: macOS asks the host which processes the tree holds, so no
+    /// membership list or signal target lives here.
+    #[cfg(target_os = "macos")]
+    control: crate::tree_macos::Client,
 }
 
 impl Tree {
@@ -475,7 +614,15 @@ impl Tree {
             }
             Ok(())
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        {
+            let ended = lock(&self.ended);
+            if *ended {
+                return Ok(());
+            }
+            self.control.kill()
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             let ended = lock(&self.ended);
             if *ended {
@@ -488,19 +635,29 @@ impl Tree {
     /// The processes of the tree other than its root: on Windows those in its job, apart from
     /// console hosts; on Linux the host's descendants and the members of its session and
     /// group. Other Unix systems list none.
-    pub fn members(&self) -> Vec<Member> {
+    pub fn members(&self) -> Option<Vec<Member>> {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            windows::job_members(self.job.as_raw_handle())
+            Some(windows::job_members(self.job.as_raw_handle()))
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
         {
             let ended = lock(&self.ended);
             if *ended {
-                return Vec::new();
+                return Some(Vec::new());
             }
-            unix_members(self.host)
+            // The host is still unreaped, so its number is reserved: a request that waits wakes
+            // it, and one it never answers is `None`, which says nothing about the tree.
+            self.control.members()
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let ended = lock(&self.ended);
+            if *ended {
+                return Some(Vec::new());
+            }
+            Some(unix_members(self.host))
         }
     }
 
@@ -514,7 +671,7 @@ impl Tree {
 /// the orphans of each pass, then the host's group, the host included. A member the server may
 /// not signal, such as a process sudo runs as root, fails the kill and leaves the host alive to
 /// hold the tree.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn kill_tree(host: i32) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -610,7 +767,7 @@ fn unix_members(host: i32) -> Vec<Member> {
         .collect()
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
 fn unix_members(_host: i32) -> Vec<Member> {
     Vec::new()
 }

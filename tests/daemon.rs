@@ -152,7 +152,26 @@ impl Fixture {
             let expected = expected.display().to_string().to_lowercase();
             !path.is_empty() && path.starts_with(&expected)
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        {
+            // macOS has no /proc: libproc names the image, and $TMPDIR sits under /var, which the
+            // kernel reports as /private/var.
+            let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            // SAFETY: the buffer is as large as proc_pidpath writes, for this pid.
+            let len = unsafe {
+                libc::proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32)
+            };
+            if len <= 0 {
+                return false;
+            }
+            buffer.truncate(len as usize);
+            let path = std::path::PathBuf::from(String::from_utf8_lossy(&buffer).into_owned());
+            let resolved = |path: &std::path::Path| {
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+            };
+            resolved(&path).starts_with(resolved(&expected))
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             std::fs::read_link(format!("/proc/{pid}/exe"))
                 .map(|path| path.starts_with(&expected))
@@ -769,6 +788,85 @@ fn two_sessions_send_their_input_whole() {
 }
 
 #[test]
+fn a_pending_watch_sees_another_sessions_resize() {
+    let fixture = Fixture::new("e2e-watch-resize");
+    let mut first = Endpoint::start(&fixture);
+    // At 20 columns the row wraps, so the token is split across rows and the program's "filler"
+    // text is what the screen shows. Widening the terminal rewraps the row and puts the token back
+    // together on one row, which is the change the pending watch is waiting for. Nothing else about
+    // the program changes: it prints once and then blocks.
+    let command = "stty -echo; printf 'prefix-padding-18SPLITTOKENfiller-filler-filler\r\n'; while IFS= read -r line; do :; done";
+    let (started, text, error) = first.call(json!({
+        "action": "start",
+        "command": command,
+        "pty": true,
+        "cols": 20,
+        "rows": 30,
+        "loginShell": false,
+        "waitMs": 0
+    }));
+    assert!(!error, "{text}");
+    let id = Endpoint::task_id(&started, &text);
+    // The filler text is on the screen before the watch starts: read as a screen, not as a wait a
+    // timeout would also satisfy, and with no row holding the whole token at this width.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, screen, error) = first.call(json!({
+            "action": "poll", "taskId": id, "screen": true, "waitMs": 100
+        }));
+        assert!(!error, "the screen never arrived: {screen}");
+        if screen.lines().any(|line| line.contains("filler")) {
+            assert!(
+                !screen.lines().any(|line| line.contains("SPLITTOKEN")),
+                "the narrow screen splits the token: {screen}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the filler text never reached the screen: {screen}"
+        );
+    }
+    // The watch is pending when the other session resizes: the request is sent, then the endpoint
+    // is left parked in its wait while a second connection widens the same task.
+    let watch = first.request_later(
+        "tools/call",
+        json!({"name": "exec", "arguments": {
+            "action": "poll", "taskId": id, "screen": true, "waitMs": 30000,
+            "returnWhen": {"screenContains": ["SPLITTOKEN"]}
+        }}),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let mut second = Endpoint::start(&fixture);
+    let (_, listed, error) = second.call(json!({"action": "list"}));
+    assert!(!error, "{listed}");
+    assert!(listed.contains(" pty 20x30"), "{listed}");
+    let (_, text, error) = second.call(json!({
+        "action": "poll", "taskId": id, "cols": 60, "rows": 30, "waitMs": 0
+    }));
+    assert!(!error, "the resize failed: {text}");
+    // The pending watch ends on the condition, not on its timeout, and the screen it reads holds the
+    // token on one row again: the resize woke the wait and rewrapped the terminal.
+    let message = first.response(watch);
+    let (out, text, error) = Endpoint::answer(&message);
+    assert!(!error, "{text}");
+    assert_eq!(
+        out["waitEndedBy"],
+        json!({"condition": "screen_contains", "text": "SPLITTOKEN"}),
+        "{text}"
+    );
+    assert!(
+        text.lines().any(|line| line.contains("SPLITTOKEN")),
+        "the wider terminal holds the token on one row: {text}"
+    );
+    let (_, listed, error) = second.call(json!({"action": "list"}));
+    assert!(!error, "{listed}");
+    assert!(listed.contains(" pty 60x30"), "the task is 60x30: {listed}");
+    first.close();
+    second.close();
+}
+
+#[test]
 fn a_closed_endpoint_leaves_no_session_behind() {
     let fixture = Fixture::new("bye");
     let mut endpoint = Endpoint::start(&fixture);
@@ -1359,7 +1457,27 @@ fn run_refused(fixture: &Fixture, args: &[&str]) -> (i32, String) {
 
 /// Whether a process is still running. A zombie has ended, so only a live process counts.
 fn is_alive(pid: u32) -> bool {
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        // A zombie has ended. libproc reports its state; /proc does not exist here.
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        // SAFETY: proc_pidinfo fills the struct for this pid; the size is the struct's.
+        let size = unsafe {
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<libc::proc_bsdinfo>() as i32,
+            )
+        };
+        if size as usize == std::mem::size_of::<libc::proc_bsdinfo>() {
+            // SAFETY: proc_pidinfo filled the whole struct.
+            return unsafe { info.assume_init() }.pbi_status != libc::SZOMB;
+        }
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             && let Some(rest) = stat.rsplit(')').next()

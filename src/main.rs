@@ -23,6 +23,8 @@ mod tasks;
 mod terminal;
 mod transfer;
 mod transport;
+#[cfg(target_os = "macos")]
+mod tree_macos;
 mod wait;
 
 use ipc::{ToDaemon, ToEndpoint};
@@ -47,6 +49,9 @@ struct Server {
     /// The files this server publishes under `/t/`, for an HTTP session only. Its absence is what
     /// removes the `transfer` route from a stdio session.
     transfers: Option<Arc<transfer::Transfers>>,
+    /// The base a `transfer` URL is minted from when a proxy names it at daemon start. `None` means
+    /// each request's Host and `X-Forwarded-Proto` are the address the client saw.
+    public_root: Option<Arc<str>>,
 }
 
 /// Where this server's calls run: in this process, or on the namespace's daemon.
@@ -82,6 +87,7 @@ impl Server {
         backend: Backend,
         launch: &LaunchContext,
         transfers: Option<Arc<transfer::Transfers>>,
+        public_root: Option<Arc<str>>,
     ) -> Self {
         let mut router = Self::tool_router();
         let exec = router
@@ -97,6 +103,7 @@ impl Server {
             backend,
             router,
             transfers,
+            public_root,
         }
     }
 
@@ -144,6 +151,10 @@ fn exec_description(launch: &LaunchContext) -> String {
     if cfg!(windows) {
         description.push_str("\n\n");
         description.push_str(include_str!("description-windows.md").trim_end());
+    }
+    if cfg!(target_os = "macos") {
+        description.push_str("\n\n");
+        description.push_str(include_str!("description-macos.md").trim_end());
     }
     description.push_str("\n\nHost: ");
     description.push_str(&host_line(launch));
@@ -347,7 +358,7 @@ impl Server {
             Ok(path) => path,
             Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
         };
-        let url = match transfer_url(path, table, &context) {
+        let url = match transfer_url(path, table, &context, self.public_root.as_deref()) {
             Ok(url) => url,
             Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
         };
@@ -357,28 +368,38 @@ impl Server {
     }
 }
 
-/// The URL a transfer publishes: this listener, as the client reached it, and a fresh id.
-///
-/// shortcut: no FASTEXEC_PUBLIC_URL; add it when a proxy rewrites Host.
+/// The URL a transfer publishes: the public root the daemon was started with, or else this
+/// listener as the client reached it, and a fresh id.
 fn transfer_url(
     path: std::path::PathBuf,
     table: &Arc<transfer::Transfers>,
     context: &RequestContext<RoleServer>,
+    public_root: Option<&str>,
 ) -> Result<String, String> {
     let Some(parts) = context.extensions.get::<::http::request::Parts>() else {
         return Err("Cannot make a transfer URL outside an HTTP request.".to_owned());
     };
-    let host = parts
-        .headers
+    // A named root is the whole address a proxy publishes, so the request's own Host says nothing;
+    // without one, the request's Host over the scheme it was forwarded as is the client's address.
+    let base = match public_root {
+        Some(root) => root.to_owned(),
+        None => inferred_base(&parts.headers)?,
+    };
+    let id = table.create(path)?;
+    Ok(format!("{base}t/{id}"))
+}
+
+/// The base inferred from a request: its Host, over the scheme the client saw.
+fn inferred_base(headers: &::http::HeaderMap) -> Result<String, String> {
+    let host = headers
         .get(::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| "Cannot make a transfer URL: the request names no Host.".to_owned())?;
     let authority: ::http::uri::Authority = host
         .parse()
         .map_err(|_| format!("Cannot make a transfer URL: {host} is not a host."))?;
-    let scheme = forwarded_scheme(&parts.headers);
-    let id = table.create(path)?;
-    Ok(format!("{scheme}://{authority}/t/{id}"))
+    let scheme = forwarded_scheme(headers);
+    Ok(format!("{scheme}://{authority}/"))
 }
 
 /// The scheme the client saw: the first `X-Forwarded-Proto` token when it names one of the two.
@@ -660,6 +681,11 @@ async fn cli_start(
             return fail(&message);
         }
         if let Err(message) = http_token() {
+            return fail(&message);
+        }
+        // A root that cannot be used is refused here too, so the terminal gets the reason and no
+        // daemon is left behind to fail binding for it.
+        if let Err(message) = http::public_root() {
             return fail(&message);
         }
         extra.push("--http".into());
@@ -1005,7 +1031,7 @@ async fn serve() {
         };
         (backend, Some(tasks))
     };
-    let server = Server::new(backend, &launch, None);
+    let server = Server::new(backend, &launch, None, None);
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
         inner: tokio::io::stdin(),

@@ -1,0 +1,1 @@
+macOS: a task's tree is found by scanning the processes the host started, by pid and start time, while the host runs. A descendant that leaves the session and group and loses its traceable parent before a scan sees it escapes; one seen first stays in the tree. A process another user owns is reported and not signalled, so a kill of it fails and the tree stays held.

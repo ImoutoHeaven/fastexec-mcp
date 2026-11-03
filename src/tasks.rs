@@ -59,6 +59,12 @@ pub const DRAIN_CAP: Duration = Duration::from_secs(2);
 /// output pauses this long.
 const KEPT_PAUSE: Duration = Duration::from_millis(100);
 
+/// Runs before a Windows ConPTY root's command, on its first line, so the script's exit status is
+/// on disk as the script ends. The root can deadlock inside its own exit; this file is what lets
+/// its task end anyway. A user's own EXIT cleanup is never overwritten, and a command that
+/// replaces the trap or execs keeps the plain wait.
+const EXIT_TRAP: &str = r#"[ -n "${FASTEXEC_EXIT_STATUS-}" ] && [ "${BASH_SUBSHELL-0}" -eq 0 ] && builtin export -n FASTEXEC_EXIT_STATUS && [ -z "$(builtin trap -p EXIT)" ] && builtin trap 'builtin printf "%s\n" "$?" 2>/dev/null > "$FASTEXEC_EXIT_STATUS" || :' EXIT || :; "#;
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -198,6 +204,16 @@ pub struct Task {
     /// records. Its replies to terminal queries, such as the cursor-position report and device
     /// attributes ConPTY waits for at startup, go to the program as input.
     terminal: Option<Mutex<Pty>>,
+    /// The terminal's size, columns first, as the program's terminal has it.
+    size: Mutex<(u16, u16)>,
+    /// A PTY task's size control, taken when the tree ends so a resize that arrives then fails
+    /// before the terminal closes. A resize holds it while it runs, so the ender's close waits
+    /// for it and the console's last reference stays on the ender.
+    pty_control: Mutex<Option<process::PtyControl>>,
+    /// Why the terminal's state is no longer trustworthy: a native resize failed, so the
+    /// emulator and the program's terminal disagree. Screen and keys report it; raw output
+    /// capture continues.
+    size_error: Mutex<Option<String>>,
 }
 
 struct Pty {
@@ -239,6 +255,9 @@ pub struct Transcript {
 
 /// The rendered terminal of a PTY task.
 pub struct Screen {
+    /// The terminal's size, columns first.
+    pub cols: u16,
+    pub rows_count: u16,
     /// Visible rows without trailing spaces; blank rows at the bottom are dropped.
     pub rows: Vec<String>,
     /// Zero-based row and column.
@@ -271,6 +290,8 @@ struct Final {
     exit_code: i32,
     killed: bool,
     expired: bool,
+    /// The script had finished but the root did not terminate, so the root was ended for it.
+    forced_end: bool,
     elapsed: Duration,
     output_open: bool,
     /// Processes the root left running when it exited.
@@ -290,6 +311,8 @@ enum Input {
 pub struct Snapshot {
     pub state: &'static str,
     pub exit_code: Option<i32>,
+    /// The script had finished but the root did not terminate, so the root was ended for it.
+    pub forced_end: bool,
     pub elapsed: Duration,
     pub lines: u64,
     pub dropped: u64,
@@ -313,6 +336,9 @@ pub struct StartArgs {
     pub command: String,
     pub cwd: PathBuf,
     pub pty: bool,
+    /// The terminal's size: columns, then screen rows. A pipe task ignores them.
+    pub cols: u16,
+    pub rows: u16,
     pub login: bool,
     pub keep: bool,
     pub encoding: &'static Encoding,
@@ -394,6 +420,30 @@ impl Tasks {
         lock(&self.registry).tasks.iter().rev().cloned().collect()
     }
 
+    /// Every task with the state a client sees. Both are read under the registry guard, so a
+    /// list either runs before a completion's end is visible or after its retirement: nothing
+    /// can show an end that the cap has not accounted for.
+    pub fn listed(&self) -> Vec<(Arc<Task>, Snapshot)> {
+        // The registry guard covers the state a list reads together with membership in it. The
+        // processes a task holds are asked for after the guard is dropped, so a host that cannot
+        // answer at once never blocks an admission, a list, or a retirement.
+        let mut entries: Vec<(Arc<Task>, Snapshot)> = {
+            let registry = lock(&self.registry);
+            registry
+                .tasks
+                .iter()
+                .rev()
+                .map(|task| (Arc::clone(task), task.snapshot()))
+                .collect()
+        };
+        for (task, snapshot) in &mut entries {
+            if snapshot.kept {
+                snapshot.held = task.tree.members().unwrap_or_default();
+            }
+        }
+        entries
+    }
+
     /// Takes a place against [`Limits::max_running`] and the next task ID. The guard gives the
     /// place back on drop, so every failed start releases it.
     fn admit(&self) -> Result<(String, Pending<'_>), String> {
@@ -448,8 +498,16 @@ impl Tasks {
         let log = private_file(&log_path)
             .map_err(|error| format!("Cannot create the task log: {error}."))?;
         let script_path = self.dir.join(format!("{id}.sh"));
-        let script = if args.command.len() > process::SCRIPT_THRESHOLD_BYTES {
-            std::fs::write(&script_path, &args.command)
+        // A Windows ConPTY root can deadlock inside its own exit and never terminate. Its script
+        // records its status as it ends, so the task can end anyway; a command that replaces the
+        // trap or execs keeps the plain wait.
+        let exit_status = (args.pty && cfg!(windows)).then(|| self.dir.join(format!("{id}.exit")));
+        let command = match exit_status {
+            Some(_) => format!("{EXIT_TRAP}{}", args.command),
+            None => args.command.clone(),
+        };
+        let script = if command.len() > process::SCRIPT_THRESHOLD_BYTES {
+            std::fs::write(&script_path, &command)
                 .map_err(|error| format!("Cannot write the command script: {error}."))?;
             Some(script_path.as_path())
         } else {
@@ -457,12 +515,15 @@ impl Tasks {
         };
         let launch = Launch {
             bash: &bash,
-            command: &args.command,
+            command: &command,
             script,
             cwd: &args.cwd,
             env: &args.launch,
             login: args.login,
             pty: args.pty,
+            cols: args.cols,
+            rows: args.rows,
+            exit_status: exit_status.as_deref(),
         };
         let spawned = match process::spawn(&launch) {
             Ok(spawned) => spawned,
@@ -488,7 +549,7 @@ impl Tasks {
                 }
             }
             Mutex::new(Pty {
-                live: Live::new(),
+                live: Live::at(args.cols, args.rows),
                 spool,
             })
         });
@@ -516,6 +577,9 @@ impl Tasks {
             queued: AtomicUsize::new(0),
             input_gate: tokio::sync::Mutex::new(()),
             terminal,
+            size: Mutex::new((args.cols, args.rows)),
+            pty_control: Mutex::new(spawned.pty),
+            size_error: Mutex::new(None),
         });
         let mut registry = lock(&self.registry);
         registry.tasks.push(Arc::clone(&task));
@@ -558,18 +622,20 @@ impl Tasks {
         let (waiter_shared, waiter_task, mut child) =
             (Arc::clone(self), Arc::clone(&task), spawned.child);
         std::thread::spawn(move || {
-            let exit_code = child.wait(&waiter_task.tree);
+            let (exit_code, forced_end) = child.wait(&waiter_task.tree);
             // Read at the root's exit, so a kill or deadline during the drain below leaves a
             // natural exit labeled as such.
             let killed = waiter_task.kill_requested.load(Ordering::SeqCst);
             let expired = waiter_task.expired.load(Ordering::SeqCst);
             // A task is its whole tree: whatever the root leaves behind ends with it, unless
             // the task keeps it.
-            let mut leftovers = if killed {
-                Vec::new()
+            // A tree whose members could not be listed is not an empty tree: it stays held.
+            let listed = if killed {
+                Some(Vec::new())
             } else {
                 waiter_task.tree.members()
             };
+            let mut leftovers = listed.clone().unwrap_or_default();
             let mut kept = waiter_task.keep && !leftovers.is_empty();
             let kill_error = if kept {
                 None
@@ -578,41 +644,62 @@ impl Tasks {
             };
             // A tree that could not be killed stays held, so kill and shutdown retry, and the
             // leftovers are what survived, also after a kill of the root.
-            if kill_error.is_some() {
+            if kill_error.is_some() || listed.is_none() {
                 kept = true;
-                leftovers = waiter_task.tree.members();
+                leftovers = waiter_task.tree.members().unwrap_or(leftovers);
                 *lock(&waiter_task.kill_error) = kill_error;
             }
             // The end of the tree closes a PTY, so its output reaches EOF; ConPTY's close can
             // block, so it runs apart. The script stays until then: kept processes may run `$0`.
             let ender = Arc::clone(&waiter_task);
+            let ender_shared = Arc::clone(&waiter_shared);
             std::thread::spawn(move || {
                 child.wait_tree(&ender.tree);
                 // Kept children can still read after the root exits; close input at tree end.
                 *lock(&ender.input) = None;
+                // A resize that arrives from here on finds the control taken and fails, so
+                // nothing reaches a terminal that is about to close.
+                *lock(&ender.pty_control) = None;
                 drop(child);
                 let _ = std::fs::remove_file(&script_path);
+                // The script's status marker is no larger a leak than the script: it goes too.
+                if let Some(status) = &exit_status {
+                    let _ = std::fs::remove_file(status);
+                }
+                // A task held at its root's exit is finished only here, so the cap is applied
+                // again under the guard that publishes the tree's end: retirement counts a task
+                // once its tree ended, and this is when that becomes true.
+                let mut registry = lock(&ender_shared.registry);
                 let _ = ender.tree_ended_at.set(Instant::now());
                 ender.tree_done.send_replace(true);
+                ender_shared.retire_finished(&mut registry);
+                drop(registry);
             });
             let output_open = drain(&waiter_task, &eof_rx, kept);
+            // The registry guard spans the end and the retirement that follows it: a client that
+            // reads the end, through a result or a list, then sees a registry within the cap.
+            // Readers take the registry first, so they cannot look between the two steps.
+            let mut registry = lock(&waiter_shared.registry);
             *lock(&waiter_task.end) = Some(Final {
                 exit_code,
                 killed,
                 expired,
+                forced_end,
                 elapsed: waiter_task.started.elapsed(),
                 output_open,
                 leftovers,
                 kept,
             });
+            waiter_shared.retire_finished(&mut registry);
+            drop(registry);
             waiter_task.done.send_replace(true);
-            waiter_shared.retire_finished(&mut lock(&waiter_shared.registry));
         });
         Ok(task)
     }
 
     /// Keeps the [`Limits::max_finished`] most recently finished tasks and deletes the logs of
-    /// older ones. Runs right after each completion, so the task that just finished always stays.
+    /// older ones. Runs at each completion under the registry guard that shows its end, so the
+    /// task that just finished always stays and no client sees the cap exceeded.
     fn retire_finished(&self, registry: &mut Registry) {
         // A task that keeps processes stays, so kill can still reach them.
         let mut finished: Vec<(Instant, String)> = registry
@@ -801,7 +888,7 @@ impl Tasks {
                     }
                     _ if snapshot.tree_ended && !view.tree_end_reported() => (1, Notice::TreeEnded),
                     _ if snapshot.kept => {
-                        snapshot.held = task.tree.members();
+                        snapshot.held = task.tree.members().unwrap_or_default();
                         if snapshot.kill_error.is_none()
                             && view.keeps_reported().as_ref() == Some(&pids(&snapshot.held))
                         {
@@ -1301,7 +1388,7 @@ impl Task {
     pub fn snapshot_held(&self) -> Snapshot {
         let mut snapshot = self.snapshot();
         if snapshot.kept {
-            snapshot.held = self.tree.members();
+            snapshot.held = self.tree.members().unwrap_or_default();
         }
         snapshot
     }
@@ -1318,6 +1405,7 @@ impl Task {
                 Some(_) => "exited",
             },
             exit_code: end.as_ref().map(|end| end.exit_code),
+            forced_end: end.as_ref().is_some_and(|end| end.forced_end),
             elapsed: end
                 .as_ref()
                 .map_or_else(|| self.started.elapsed(), |end| end.elapsed),
@@ -1351,6 +1439,7 @@ impl Task {
 
     /// The keyboard modes of a PTY task's program.
     pub fn modes(&self) -> Result<crate::keys::Modes, String> {
+        self.check_size()?;
         let terminal = self
             .terminal
             .as_ref()
@@ -1358,8 +1447,115 @@ impl Task {
         lock(terminal).live.modes()
     }
 
+    /// A terminal whose size the program never took has no screen or keyboard state to read.
+    fn check_size(&self) -> Result<(), String> {
+        match &*lock(&self.size_error) {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// The terminal's size, columns first.
+    pub fn size(&self) -> (u16, u16) {
+        *lock(&self.size)
+    }
+
+    /// Sends the terminal's replies to the program, as capture sends the replies of the output
+    /// it reads. The input slot says when that is possible: it is cleared at EOF, at a write
+    /// failure, and when the tree ends, and it is the only sender the writer thread's receiver
+    /// outlives.
+    pub fn answer(&self, replies: Vec<u8>) {
+        let sender = lock(&self.input).clone();
+        if let Some(sender) = sender {
+            answer_program(self, &sender, replies);
+        }
+    }
+
+    /// The terminal is `cols` by `rows` from now on. The emulator settles the transcript at the
+    /// old size and reflows at the new one, the output's own replies go to the program, and then
+    /// the program is told through the terminal's own handle, outside the lock capture needs. On
+    /// failure the terminal's state is reported unusable while capture continues.
+    pub fn resize(&self, shared: &Tasks, cols: u16, rows: u16) -> Result<(), String> {
+        self.check_size()?;
+        let terminal = self.terminal.as_ref().ok_or(
+            "A pipe task has no terminal size; its output is a byte stream with no screen.",
+        )?;
+        // The control slot stays held from here to the end of the native resize, so the ender's
+        // close waits for it and the console's last reference never moves into this thread. A
+        // control the ender already took means the terminal is closed: nothing changes.
+        let control = lock(&self.pty_control);
+        let Some(control) = control.as_ref() else {
+            return Err(
+                "The task's tree has ended and its terminal is closed, so the size did not change."
+                    .into(),
+            );
+        };
+        let (old_cols, old_rows) = self.size();
+        if (cols, rows) == (old_cols, old_rows) {
+            // The size a task already has changes nothing: no SIGWINCH, no repaint.
+            return Ok(());
+        }
+        let replies = {
+            let mut pty = lock(terminal);
+            // A synchronized update the resize ends shows its frame now, so quiet counts from
+            // now, exactly as capture's own end of one does. An ordinary resize shows nothing.
+            let ended_frame = pty.live.sync_deadline().is_some();
+            if pty.live.stopped() {
+                return Err(
+                    "The terminal emulator stopped after an internal failure, so the size did not change; raw output capture continues."
+                        .into(),
+                );
+            }
+            let replies = pty.live.resize(cols, rows);
+            let written = pty.live.take_written();
+            pty.spool.append(&written, self, shared);
+            if ended_frame {
+                lock(&self.out).last_output = Some(Instant::now());
+            }
+            // The resize runs the emulator, which stops on an internal failure rather than
+            // unwinding: a stopped one never took the new size.
+            if pty.live.stopped() {
+                *lock(&self.size_error) = Some(
+                    "The terminal emulator stopped after an internal failure during a resize, so its size is unknown. Raw output capture continues; start a new task for a terminal of a known size."
+                        .into(),
+                );
+                self.activity.send_replace(());
+                return Err(
+                    "The terminal emulator stopped after an internal failure, so the size did not change; raw output capture continues."
+                        .into(),
+                );
+            }
+            replies
+        };
+        // The replies answer the output applied at the old size: they go to the program whatever
+        // happens to the native call below.
+        self.answer(replies);
+        // The screen changed under every reader: a wait in another call, on screenAppears or
+        // screenGone, wakes now rather than at its deadline. A failure wakes it for the state it
+        // has to report.
+        self.activity.send_replace(());
+        if let Err(error) = control.resize(cols, rows) {
+            // The program's terminal kept the size it had, so the task still reports that one.
+            // The program's terminal kept the size it had, and a reflow cannot be reversed, so
+            // the emulator's size and the program's disagree from here on. Screen and keys say
+            // so; raw output capture continues, as it does after an internal emulator failure.
+            *lock(&self.size_error) = Some(format!(
+                "The terminal's size is unknown: a resize to {cols}x{rows} failed ({error}), so the screen may not match the program. Raw output capture continues; start a new task for a terminal of a known size."
+            ));
+            // A waiter may have taken the wake above before the failure landed; this one wakes
+            // the state it has to report.
+            self.activity.send_replace(());
+            return Err(format!(
+                "Cannot resize the terminal to {cols}x{rows}: {error}. The task keeps running and its output is captured; start a new task for a terminal of a known size."
+            ));
+        }
+        *lock(&self.size) = (cols, rows);
+        Ok(())
+    }
+
     /// The rendered terminal of a PTY task.
     pub fn screen(&self) -> Result<Screen, String> {
+        self.check_size()?;
         let terminal = lock(
             self.terminal
                 .as_ref()
@@ -1367,7 +1563,12 @@ impl Task {
         );
         let (rows, cursor) = terminal.live.screen()?;
         let log_end = lock(&self.out).readable.min(terminal.live.shown());
+        // The screen and its dimensions are one snapshot of the emulator's grid: another call's
+        // resize may already have moved it past what the program's terminal has taken.
+        let (cols, rows_count) = terminal.live.size();
         Ok(Screen {
+            cols,
+            rows_count,
             rows,
             cursor,
             log_end,
@@ -1741,6 +1942,8 @@ mod tests {
             command: "printf abc".into(),
             cwd: std::env::temp_dir(),
             pty: false,
+            cols: process::PTY_COLS,
+            rows: process::PTY_ROWS,
             login: false,
             keep: false,
             encoding: encoding_rs::UTF_8,
@@ -2133,6 +2336,203 @@ mod tests {
         }
         tasks.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A native resize that fails leaves the terminal's state unusable while raw output capture
+    /// continues, and the size the program's terminal kept is the one the task reports. A console
+    /// A finished PTY task is released: no sender, thread, or registry entry holds it once it
+    /// ended, was retired, and every owner dropped. A stored answer sender kept the writer
+    /// thread's receiver connected, and the writer thread held the task: the weak reference
+    /// never expired.
+    #[test]
+    fn a_finished_pty_task_is_released() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (runtime, tasks) = tasks_with(Limits {
+            max_finished: 0,
+            ..Limits::OFF
+        });
+        let mut args = start_args();
+        args.command = "read -r line".into();
+        args.pty = true;
+        let task = tasks.start(args).unwrap();
+        let weak = Arc::downgrade(&task);
+        task.kill().unwrap();
+        runtime.block_on(async {
+            let mut tree_done = task.tree_done();
+            let _ = tree_done.wait_for(|done| *done).await;
+        });
+        // The ender retires the task just after it publishes the end: the registry lets go.
+        let id = task.id.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while tasks.listed().iter().any(|(task, _)| task.id == id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the finished task stays in the registry"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(task);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while weak.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the finished task is still held"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        tasks.shutdown();
+    }
+
+    /// The permanent state a failed native resize leaves: the size is unknown from then on.
+    fn size_unknown(error: &str) -> bool {
+        error.contains("size is unknown")
+    }
+
+    /// A resize racing a kill: the two run concurrently, every resize either applies or is
+    /// refused with the reason the terminal gives, and a resize after the end always refuses.
+    #[test]
+    fn a_resize_racing_a_kill_applies_or_refuses_and_never_breaks_the_task() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (runtime, tasks) = tasks();
+        let mut args = start_args();
+        args.command = "read -r line".into();
+        args.pty = true;
+        let task = tasks.start(args).unwrap();
+        let racer = Arc::clone(&task);
+        let shared = Arc::clone(&tasks);
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = Arc::clone(&ended);
+        let ran = Arc::clone(&first);
+        let resizes = std::thread::spawn(move || {
+            let (mut applied, mut refused) = (0, 0);
+            let mut step = 0u16;
+            while !stop.load(Ordering::SeqCst) {
+                step = step.wrapping_add(1);
+                match racer.resize(&shared, 100 + step % 100, 30) {
+                    Ok(()) => applied += 1,
+                    Err(error) => {
+                        assert!(
+                            error.contains("tree has ended")
+                                || error.contains("terminal is closed")
+                                || error.contains("Cannot resize the terminal")
+                                || size_unknown(&error),
+                            "a resize before the end applies, fails natively, or reports the state \
+                             that failure left: {error}"
+                        );
+                        refused += 1;
+                    }
+                }
+                ran.store(true, Ordering::SeqCst);
+            }
+            // The ender clears the control before it publishes the tree's end, so the first
+            // resize after that end refuses at once. A native failure earlier in the race left a
+            // permanent state error, which also refuses: a refusal either way, never a success.
+            let error = racer
+                .resize(&shared, 90, 20)
+                .expect_err("a resize after the end refuses at once");
+            assert!(
+                error.contains("tree has ended") || size_unknown(&error),
+                "{error}"
+            );
+            (applied, refused)
+        });
+        // The kill goes out once the worker has made a resize, so its first outcome is real.
+        let ack = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !first.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < ack,
+                "the resize worker never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        task.kill().unwrap();
+        runtime.block_on(async {
+            let mut tree_done = task.tree_done();
+            let _ = tree_done.wait_for(|done| *done).await;
+        });
+        ended.store(true, Ordering::SeqCst);
+        let (applied, refused) = resizes.join().unwrap();
+        assert!(applied + refused > 0, "the race has outcomes");
+        // The size it already has is refused too: the closed terminal is checked before the no-op.
+        let (cols, rows) = task.size();
+        let error = task
+            .resize(&tasks, cols, rows)
+            .expect_err("a closed terminal refuses its own size");
+        assert!(
+            error.contains("tree has ended") || size_unknown(&error),
+            "{error}"
+        );
+        let error = task
+            .resize(&tasks, 90, 20)
+            .expect_err("a closed terminal refuses a resize");
+        assert!(
+            error.contains("tree has ended") || size_unknown(&error),
+            "{error}"
+        );
+        tasks.shutdown();
+    }
+
+    /// A resize is a change a pending wait can see. The task prints rows and then is silent, so
+    /// only the resize can wake it: the wake carries the reflowed screen, where a shrunk terminal
+    /// no longer shows the rows that scrolled out. Dropping the resize's own wake leaves the wait
+    /// asleep and this fails on the deadline.
+    #[test]
+    fn a_resize_wakes_a_wait_with_the_reflowed_screen() {
+        let _one_at_a_time = lock(&ONE_TASKS);
+        let (runtime, tasks) = tasks();
+        let mut args = start_args();
+        args.pty = true;
+        args.cols = 60;
+        args.rows = 30;
+        args.command = "for i in $(seq 1 20); do printf 'row %02d\\n' $i; done; \
+                        printf 'tail-marker\\n'; read -r line"
+            .into();
+        let task = tasks.start(args).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !task
+            .screen()
+            .map(|screen| screen.rows.iter().any(|row| row.contains("tail-marker")))
+            .unwrap_or(false)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the program never printed its rows"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Nothing else changes from here: the program is waiting for input.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let before = task.screen().unwrap();
+        let mut activity = task.activity();
+        while activity.has_changed().unwrap_or(false) {
+            activity.borrow_and_update();
+        }
+        let racer = Arc::clone(&task);
+        let shared = Arc::clone(&tasks);
+        let resizer = std::thread::spawn(move || racer.resize(&shared, 60, 10));
+        let woke = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), activity.changed()).await
+        });
+        assert!(woke.is_ok(), "the resize woke the pending wait");
+        resizer.join().unwrap().expect("the resize applies");
+        let screen = task.screen().unwrap();
+        assert_eq!(
+            (screen.cols, screen.rows_count),
+            (60, 10),
+            "the screen is the new size"
+        );
+        // Reflow keeps the side the cursor is on, so which rows survive is the emulator's call;
+        // that the screen the wait woke with is no longer the old one is the contract here.
+        assert!(
+            screen.rows != before.rows && screen.rows.len() <= 10,
+            "the woken screen is the reflowed one: {:?} then {:?}",
+            before.rows,
+            screen.rows
+        );
+        assert_eq!(task.size(), (60, 10), "the task reports the new size");
+        task.kill().unwrap();
+        tasks.shutdown();
     }
 
     #[test]

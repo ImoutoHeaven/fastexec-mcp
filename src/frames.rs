@@ -1017,8 +1017,14 @@ impl History {
     /// Writes out every line not written yet, as when the session ends, and returns every line
     /// written out since the last `commit`.
     pub fn finish(mut self) -> Vec<String> {
+        self.flush()
+    }
+
+    /// Writes out every line not written yet and returns it, leaving the session to carry on: each
+    /// line keeps the digest it was written with, so nothing is written twice.
+    pub fn flush(&mut self) -> Vec<String> {
         self.write(true);
-        self.out
+        std::mem::take(&mut self.out)
     }
 
     /// Writes out, in document order, each line not written yet or changed since: every one

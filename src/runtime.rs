@@ -385,7 +385,8 @@ fn build_id_of(path: &Path) -> io::Result<String> {
 }
 
 /// Deletes images in `dir` that are not `keep` and are old enough that no starter can still be
-/// reading them.
+/// reading them. macOS keeps every image: there a daemon execs its task host by pathname
+/// (`current_exe`), so unlinking a running old image breaks its later task starts.
 #[cfg(any(windows, target_os = "linux"))]
 fn sweep_cache(dir: &Path, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {

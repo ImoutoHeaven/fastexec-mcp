@@ -110,9 +110,17 @@ pub struct Request {
     /// start, poll: WHATWG label of the output encoding, e.g. "big5" or "gbk". On start it becomes the task default.
     #[serde(skip_serializing_if = "Option::is_none")]
     encoding: Option<String>,
-    /// start, poll, PTY only: return the rendered terminal screen (120x30) and cursor position instead of the output stream; for full-screen and TUI programs. Marks the stream read. Not with truncate, raw, or encoding.
+    /// start, poll, PTY only: return the rendered terminal screen and cursor position instead of the output stream; for full-screen and TUI programs. Marks the stream read. Not with truncate, raw, or encoding.
     #[serde(skip_serializing_if = "Option::is_none")]
     screen: Option<bool>,
+    /// start, poll, PTY only: terminal columns, 20-500. start defaults 120; poll keeps the current value when omitted.
+    #[schemars(range(min = 20, max = 500))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cols: Option<u16>,
+    /// start, poll, PTY only: terminal screen rows, 5-200. start defaults 30; poll keeps the current value when omitted.
+    #[schemars(range(min = 5, max = 200))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rows: Option<u16>,
 }
 
 /// Output options shared by start and poll.
@@ -155,6 +163,8 @@ fn validate(request: &Request) -> Result<View, String> {
         ("keys", request.keys.is_some()),
         ("keyDelayMs", request.key_delay_ms.is_some()),
         ("screen", request.screen.is_some()),
+        ("cols", request.cols.is_some()),
+        ("rows", request.rows.is_some()),
         ("returnWhen", request.return_when.is_some()),
     ];
     const VIEW: [&str; 7] = [
@@ -174,14 +184,24 @@ fn validate(request: &Request) -> Result<View, String> {
             "loginShell",
             "killAfterMs",
             "keepTree",
+            "cols",
+            "rows",
         ]
         .into_iter()
         .chain(VIEW)
         .collect(),
-        Action::Poll => ["taskId", "input", "eof", "keys", "keyDelayMs"]
-            .into_iter()
-            .chain(VIEW)
-            .collect(),
+        Action::Poll => [
+            "taskId",
+            "input",
+            "eof",
+            "keys",
+            "keyDelayMs",
+            "cols",
+            "rows",
+        ]
+        .into_iter()
+        .chain(VIEW)
+        .collect(),
         Action::Kill => vec!["taskId", "waitMs", "maxBytes"],
         Action::List => vec!["truncate", "maxBytes"],
         Action::Transcript => vec!["taskId", "truncate", "maxBytes"],
@@ -259,6 +279,45 @@ fn validate(request: &Request) -> Result<View, String> {
     }
     if let Some(wait) = request.wait_ms.filter(|&wait| wait > MAX_WAIT_MS) {
         return Err(format!("waitMs {wait} is out of range 0-{MAX_WAIT_MS}."));
+    }
+    // A size belongs to a PTY task's terminal; a pipe task's output is a byte stream. `start`
+    // reads an omitted `pty` as false, so a size there needs `pty: true`.
+    if let Some(name) = [("cols", request.cols), ("rows", request.rows)]
+        .into_iter()
+        .find_map(|(name, set)| set.is_some().then_some(name))
+    {
+        let applies = match request.action {
+            Action::Start => request.pty == Some(true),
+            _ => true,
+        };
+        if !applies {
+            return Err(format!(
+                "`{name}` applies to PTY tasks only; start with pty: true or remove it."
+            ));
+        }
+    }
+    if let Some((name, value, range)) = [
+        (
+            "cols",
+            request.cols,
+            process::PTY_COLS_MIN..=process::PTY_COLS_MAX,
+        ),
+        (
+            "rows",
+            request.rows,
+            process::PTY_ROWS_MIN..=process::PTY_ROWS_MAX,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(name, set, range)| {
+        set.filter(|value| !range.contains(value))
+            .map(|value| (name, value, range))
+    }) {
+        return Err(format!(
+            "{name} {value} is out of range {}-{}.",
+            range.start(),
+            range.end()
+        ));
     }
     if let Some(bytes) = request.max_bytes {
         if !MAX_BYTES_RANGE.contains(&bytes) {
@@ -448,6 +507,8 @@ impl Service {
                     command: request.command.unwrap_or_default(),
                     cwd,
                     pty: request.pty.unwrap_or(false),
+                    cols: request.cols.unwrap_or(process::PTY_COLS),
+                    rows: request.rows.unwrap_or(process::PTY_ROWS),
                     login: request.login_shell.unwrap_or(true),
                     keep: request.keep_tree.unwrap_or(false),
                     encoding: view.encoding.unwrap_or(encoding_rs::UTF_8),
@@ -501,10 +562,14 @@ impl Service {
                 let state = read_gate(&task_view, &call.cancel).await?;
                 let when = request.return_when.as_ref();
                 let watches_screen = when.and_then(|when| when.screen_condition());
-                let needs_pty = [("screen", view.screen), ("keys", request.keys.is_some())]
-                    .into_iter()
-                    .find_map(|(name, set)| set.then_some(name))
-                    .or(watches_screen);
+                let needs_pty = [
+                    ("screen", view.screen),
+                    ("keys", request.keys.is_some()),
+                    ("cols", request.cols.is_some() || request.rows.is_some()),
+                ]
+                .into_iter()
+                .find_map(|(name, set)| set.then_some(name))
+                .or(watches_screen);
                 if let Some(name) = needs_pty.filter(|_| !task.pty) {
                     return Err(format!(
                         "{name} applies to PTY tasks only; in pipe mode, write text with input and end lines with a newline."
@@ -517,13 +582,30 @@ impl Service {
                         "{name} needs UTF-8 output; this task was started with an encoding."
                     ));
                 }
+                // A PTY has no stdin half-close, so eof is refused before this poll changes
+                // anything, a resize included.
+                if request.eof == Some(true) && task.pty {
+                    return Err(
+                        "EOF_UNSUPPORTED_IN_PTY: a PTY has no stdin half-close. Press Ctrl-D with keys: [\"C-d\"], or kill the task."
+                            .into(),
+                    );
+                }
+                // Either axis may come alone: the axes this poll names are validated above, and
+                // the omitted ones are resolved under the input gate, beside the resize, so a
+                // concurrent poll cannot take this poll's axis from a stale pair.
+                let axes = match (request.cols, request.rows) {
+                    (None, None) => None,
+                    (cols_axis, rows_axis) => Some((cols_axis, rows_axis)),
+                };
                 let input = request.input.as_deref().unwrap_or_default().as_bytes();
                 let names = request.keys.as_deref().unwrap_or_default();
-                // One poll's input, keys, and eof go out as one sequence, and the wait's starting
-                // mark is taken after the gate, so screenAppears compares against the screen this
-                // caller's input changes.
-                let sends =
-                    request.input.is_some() || request.keys.is_some() || request.eof.is_some();
+                // One poll's resize, input, keys, and eof go out as one sequence, and the wait's
+                // starting mark is taken after the gate, so screenAppears compares against the
+                // screen this caller's resize and input change.
+                let sends = request.input.is_some()
+                    || request.keys.is_some()
+                    || request.eof.is_some()
+                    || axes.is_some();
                 let gate = if sends {
                     Some(tokio::select! {
                         biased;
@@ -535,28 +617,52 @@ impl Service {
                 } else {
                     None
                 };
-                // Every key is checked against the current modes before anything is written.
-                let mut parsed = Vec::with_capacity(names.len());
-                let mut data = input.to_vec();
-                if !names.is_empty() {
-                    let modes = task.modes()?;
-                    for name in names {
-                        let key = keys::parse(name)?;
-                        data.extend(keys::encode(name, key, modes)?);
-                        parsed.push(key);
+                // Every key is checked against the current modes before anything is written, and
+                // the limit holds for each burst: a mode declared during the call can encode the
+                // same keys longer than the modes the first pass read.
+                let encode = |task: &Task| -> Result<(Vec<u8>, Vec<keys::Key>), String> {
+                    let mut data = input.to_vec();
+                    let mut parsed = Vec::with_capacity(names.len());
+                    if !names.is_empty() {
+                        let modes = task.modes()?;
+                        for name in names {
+                            let key = keys::parse(name)?;
+                            data.extend(keys::encode(name, key, modes)?);
+                            parsed.push(key);
+                        }
                     }
-                }
-                if data.len() > MAX_INPUT_BYTES {
-                    return Err(
-                        "input and keys together exceed 16 KiB; send them in smaller pieces."
-                            .into(),
-                    );
-                }
+                    if data.len() > MAX_INPUT_BYTES {
+                        return Err(
+                            "input and keys together exceed 16 KiB; send them in smaller pieces."
+                                .into(),
+                        );
+                    }
+                    Ok((data, parsed))
+                };
+                let (mut data, parsed) = encode(&task)?;
                 let mark = wait::mark(&task, &task_view, &state, when)?;
+                // The resize goes out after every validation and before the input and keys:
+                // the emulator is at the new size before the program's redraw is parsed, the
+                // native resize runs with no lock capture needs held, and its replies reach the
+                // program through the same path as any other answer.
+                if let Some((cols_axis, rows_axis)) = axes {
+                    let (current_cols, current_rows) = task.size();
+                    task.resize(
+                        &self.tasks,
+                        cols_axis.unwrap_or(current_cols),
+                        rows_axis.unwrap_or(current_rows),
+                    )?;
+                }
                 let delay =
                     Duration::from_millis(request.key_delay_ms.unwrap_or(DEFAULT_KEY_DELAY_MS));
                 if delay.is_zero() {
                     // Without a pause, input and keys go out as one write, like a typed burst.
+                    // The resize settles a synchronized update the program held, and the modes
+                    // that held it declares are the terminal's from here on: the burst is
+                    // encoded again rather than sent with the modes the validation pass read.
+                    if axes.is_some() && !names.is_empty() {
+                        data = encode(&task)?.0;
+                    }
                     task.send(Some(&data), request.eof.unwrap_or(false))?;
                 } else {
                     task.send(Some(input), request.eof.unwrap_or(false))?;
@@ -564,7 +670,9 @@ impl Service {
                 }
                 drop(gate);
                 let default_wait =
-                    if (request.input.is_some() || request.keys.is_some()) && when.is_none() {
+                    if (request.input.is_some() || request.keys.is_some() || axes.is_some())
+                        && when.is_none()
+                    {
                         2_000
                     } else {
                         30_000
@@ -676,22 +784,26 @@ impl Service {
     }
 
     fn list(&self, session: &Session, view: &View) -> CallToolResult {
-        let tasks = self.tasks.all();
+        let tasks = self.tasks.listed();
         let mut lines = Vec::new();
         let mut entries = Vec::new();
         let mut shown = Vec::new();
-        for task in &tasks {
-            let snapshot = task.snapshot_held();
+        for (task, snapshot) in &tasks {
             let command: String = task.command.chars().take(120).collect();
             let code = snapshot
                 .exit_code
                 .map_or(String::new(), |code| format!(" {code}"));
+            // One read, so the line and the fields name the same size.
+            let size = task.pty.then(|| task.size());
             lines.push(format!(
                 "{} [{}{code}] {:.1}s{}{} · {} · {}",
                 task.id,
                 snapshot.state,
                 snapshot.elapsed.as_secs_f64(),
-                if task.pty { " pty" } else { "" },
+                match size {
+                    Some((cols, rows)) => format!(" pty {cols}x{rows}"),
+                    None => String::new(),
+                },
                 if snapshot.kept {
                     format!(" · keeps {}", members(&snapshot.held))
                 } else if snapshot.tree_ended {
@@ -707,9 +819,12 @@ impl Service {
             ));
             entries.push(json!({
                 "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
+                "cols": size.map(|(cols, _)| cols), "rows": size.map(|(_, rows)| rows),
                 "elapsedMs": snapshot.elapsed.as_millis() as u64, "command": command, "logPath": task.log_path,
                 "lifetimeExpired": snapshot.expired, "keepTree": task.keep, "keptRunning": snapshot.kept,
-                "held": members_json(&snapshot.held), "owner": task.owner,
+                "held": members_json(&snapshot.held),
+                "leftovers": members_json(&snapshot.leftovers), "killError": snapshot.kill_error,
+                "owner": task.owner,
                 "session": task.started_by.as_ref().map(|(session, _)| session),
                 "callId": task.started_by.as_ref().map(|(_, call)| *call),
             }));
@@ -1170,7 +1285,10 @@ impl Service {
         let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
         let mut status = status_line(&task, &snapshot);
         status.push_str(&ended.note(view.conditions));
-        status.push_str(&format!(" · screen, cursor row {row} col {col}"));
+        status.push_str(&format!(
+            " · screen {}x{}, cursor row {row} col {col}",
+            screen.cols, screen.rows_count
+        ));
         let budget = status_budget(&status, view.max_bytes, footer.len());
         output::cut_to(&mut status, budget);
         let room = view.max_bytes - status.len() - 2 - footer.len();
@@ -1197,6 +1315,8 @@ impl Service {
         };
         let mut structured = task_json(action, &task, &snapshot);
         structured["waitEndedBy"] = ended.json();
+        structured["cols"] = json!(screen.cols);
+        structured["rows"] = json!(screen.rows_count);
         structured["cursor"] = json!([row, col]);
         structured["omittedRows"] = json!(omitted);
         if render.output_mode != OutputMode::Text {
@@ -1271,6 +1391,9 @@ fn status_line(task: &Task, snapshot: &Snapshot) -> String {
             members(&snapshot.leftovers)
         ));
     }
+    if snapshot.forced_end {
+        line.push_str(" · root forced after 5 s exit grace");
+    }
     if snapshot.output_open {
         line.push_str(if snapshot.kept {
             " · processes it keeps hold the output open; later output may follow"
@@ -1311,6 +1434,7 @@ fn task_json(action: Action, task: &Task, snapshot: &Snapshot) -> Value {
         "lifetimeExpired": snapshot.expired,
         "logError": snapshot.log_error,
         "keepTree": task.keep,
+        "forcedEnd": snapshot.forced_end,
         "leftovers": members_json(&snapshot.leftovers),
         "keptRunning": snapshot.kept,
         "held": members_json(&snapshot.held),

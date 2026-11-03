@@ -1,0 +1,132 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "feat/**", "wip/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/wip/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The tree tests detach a heartbeat with Perl, standing in for util-linux `setsid -f`.
+      - name: detach fixture (linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          marker="$(mktemp)"
+          perl -MPOSIX -e 'exit if fork; POSIX::setsid() or die "setsid: $!"; exec @ARGV' \
+            sh -c "printf detached > $marker"
+          sleep 1
+          test "$(cat "$marker")" = detached
+
+      # Each executable runs directly, outside any Job: `cargo test` puts its children in one.
+      - name: test (linux, macOS)
+        if: runner.os != 'Windows'
+        env:
+          # Only macOS runs this step as a user with passwordless sudo: there the sudo case must
+          # fail when that prerequisite is gone rather than pass by skipping. Linux's unprivileged
+          # step keeps the variable unset, and its root case runs in the separate step below.
+          FASTEXEC_REQUIRE_ROOT_TEST: ${{ runner.os == 'macOS' && '1' || '0' }}
+        run: |
+          python3 scripts/ci/run-tests.py --timeout 1200 \
+            --note "src/tasks.rs unit tests (cfg(all(test, windows)): a Unix unit-test binary is not the task host)"
+
+      - name: test (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # GitHub's step Job forbids CREATE_BREAKAWAY_FROM_JOB (`Access is denied`), and the
+          # daemon cases must run outside any Job, so the suite runs from Task Scheduler: a
+          # scheduled task is not a child of this shell and carries no Job of its own.
+          $log = "$env:RUNNER_TEMP\windows-test.log"
+          $done = "$env:RUNNER_TEMP\windows-test.exit"
+          $cmd = "$env:RUNNER_TEMP\windows-test.cmd"
+          # The task runs as SYSTEM, whose profile holds no toolchain: name the runner's homes.
+          $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          @"
+          @echo off
+          set RUSTUP_HOME=$rustupHome
+          set CARGO_HOME=$cargoHome
+          set PATH=$cargoHome\bin;$env:PATH
+          cd /d $env:GITHUB_WORKSPACE
+          "$((Get-Command python).Source)" scripts\ci\run-tests.py --timeout 1200 --assert-outside-job > "$log" 2>&1
+          echo %ERRORLEVEL% > "$done"
+          "@ | Set-Content -Encoding ASCII $cmd
+          schtasks /create /tn fastexec-ci /tr "$cmd" /sc once /st 00:00 /ru SYSTEM /f | Out-Null
+          try {
+            schtasks /run /tn fastexec-ci | Out-Null
+            # The run announces itself by opening its log in the workspace; without that the task
+            # never started, and waiting for it would only burn the job timeout.
+            for ($waited = 0; -not (Test-Path "$env:GITHUB_WORKSPACE\ci-test.log") -and $waited -lt 120; $waited += 5) {
+              Start-Sleep 5
+            }
+            if (-not (Test-Path "$env:GITHUB_WORKSPACE\ci-test.log")) {
+              schtasks /query /tn fastexec-ci /v /fo list
+              throw 'the scheduled test run did not start'
+            }
+            for ($waited = 0; -not (Test-Path $done) -and $waited -lt 2400; $waited += 5) {
+              Start-Sleep 5
+            }
+            if (Test-Path $log) { Get-Content $log }
+            if (-not (Test-Path $done)) { throw 'the scheduled test run did not finish' }
+            exit [int](Get-Content $done)
+          } finally {
+            # Deleting a task leaves a running instance running: end it, then remove the task.
+            schtasks /end /tn fastexec-ci 2>&1 | Out-Null
+            schtasks /delete /tn fastexec-ci /f 2>&1 | Out-Null
+          }
+
+      # The setuid-root fixture needs root, a C compiler, and a suid-capable TMPDIR; with
+      # FASTEXEC_REQUIRE_ROOT_TEST=1 neither prerequisite can skip instead of failing.
+      - name: root-only test (linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The fixture's server runs as uid 65534, so nobody must reach the built image.
+          sudo namei -l target/debug/fastexec
+          sudo chmod o+x /home/runner /home/runner/work
+          sudo chmod -R o+rX "$GITHUB_WORKSPACE"
+          sudo install -d -m 1777 /var/tmp/fx-root
+          python3 scripts/ci/run-tests.py --timeout 600 --only mcp --sudo \
+            --note "src/tasks.rs unit tests (cfg(all(test, windows)): a Unix unit-test binary is not the task host)" \
+            --env FASTEXEC_REQUIRE_ROOT_TEST=1 \
+            --env TMPDIR=/var/tmp/fx-root \
+            --env HOME=/var/tmp/fx-root \
+            -- processes_the_server_may_not_kill_stay_held_and_reported --exact --nocapture
+
+      - name: test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}
+          path: |
+            ci-test.log
+            ci-*.log
+          if-no-files-found: ignore

@@ -32,6 +32,9 @@ use tokio_util::sync::CancellationToken;
 /// The largest request body the daemon reads: a call carries its arguments, not a file.
 pub const LIMIT: usize = 4 << 20;
 
+/// The value that names the address clients reach, when a proxy stands in front of the listener.
+pub const PUBLIC_URL: &str = "FASTEXEC_PUBLIC_URL";
+
 /// The daemon's HTTP front door: one listener, the token that admits a request, and the render
 /// its sessions use.
 pub struct Http {
@@ -43,6 +46,147 @@ pub struct Http {
     /// What the sessions this listener serves inherit: captured before the daemon leaves the
     /// directory it was started in.
     pub launch: Arc<LaunchContext>,
+    /// The base a `transfer` URL is minted from: the parsed [`PUBLIC_URL`], read once at start.
+    /// Its absence means each request's own Host and `X-Forwarded-Proto` name the address.
+    pub public_root: Option<Arc<str>>,
+}
+
+/// The root this process was started with: `None` when the variable is unset, the normalized root
+/// when it is valid, and the reason it cannot be used otherwise. Called once when an HTTP daemon
+/// starts, so nothing rereads the environment while a URL is minted.
+pub fn public_root() -> Result<Option<String>, String> {
+    root_of(std::env::var_os(PUBLIC_URL).as_deref())
+}
+
+/// [`public_root`] over a value that is already in hand, so the unset, the valid, the empty and
+/// the non-UTF-8 cases are all one function.
+fn root_of(value: Option<&std::ffi::OsStr>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(text) = value.to_str() else {
+        return Err(format!("{PUBLIC_URL} is not UTF-8"));
+    };
+    valid_root(text).map(Some)
+}
+
+/// A public root, validated and normalized: a scheme, a host, an optional port, and a path prefix
+/// that ends in one `/`. Every rejection names the variable and the reason.
+///
+/// The value crosses trust boundaries, so it is a small wrapper over [`http::Uri`] rather than a
+/// URL normalizer: what it states is kept byte for byte, and only the scheme case and the one
+/// trailing `/` are settled here.
+pub fn valid_root(text: &str) -> Result<String, String> {
+    // The value itself stays out of the message: a mistyped value can carry userinfo, and a
+    // refusal is written to a terminal and to a daemon log.
+    let refuse = |why: &str| Err(format!("{PUBLIC_URL} {why}"));
+    if text
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return refuse("contains whitespace or a control character");
+    }
+    if text.contains('?') || text.contains('#') {
+        return refuse("carries a query or a fragment");
+    }
+    let Ok(uri) = text.parse::<::http::Uri>() else {
+        return refuse(unparsed_form(text));
+    };
+    let Some(scheme) = uri.scheme_str() else {
+        return refuse("must start with http:// or https://");
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return refuse("must start with http:// or https://");
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let Some(authority) = uri.authority() else {
+        return refuse("names no host");
+    };
+    // The raw authority is what a port is judged on: `Authority::port()` answers `None` for a port
+    // it refuses, which would read as "no port at all".
+    let raw = authority.as_str();
+    if raw.contains('@') {
+        return refuse("carries userinfo");
+    }
+    if authority.host().is_empty() {
+        return refuse("names no host");
+    }
+    let port = match authority_port(raw) {
+        Ok(port) => port,
+        Err(why) => return refuse(why),
+    };
+    if let Some(port) = port {
+        if port.is_empty() {
+            return refuse("has an empty port");
+        }
+        if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return refuse("has a port that is not a decimal number");
+        }
+        match port.parse::<u32>() {
+            Ok(number) if (1..=65535).contains(&number) => {}
+            _ => return refuse("has a port outside 1-65535"),
+        }
+    }
+    let path = uri.path();
+    // The one trailing `/` a value may state is not an interior segment; anything else empty, and
+    // any literal dot segment, is refused rather than normalized away.
+    let mut segments: Vec<&str> = path.split('/').skip(1).collect();
+    if segments.last().is_some_and(|last| last.is_empty()) {
+        segments.pop();
+    }
+    for segment in segments {
+        if segment.is_empty() {
+            return refuse("has an empty path segment");
+        }
+        if segment == "." || segment == ".." {
+            return refuse("has a dot path segment");
+        }
+    }
+    let trailing = if path.ends_with('/') { "" } else { "/" };
+    Ok(format!("{scheme}://{raw}{path}{trailing}"))
+}
+
+/// Why a value that `http::Uri` refused is not a URL: a port that is not decimal digits is the
+/// common mistake worth naming.
+fn unparsed_form(text: &str) -> &'static str {
+    let Some((_, rest)) = text.split_once("://") else {
+        return "must start with http:// or https://";
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() {
+        return "names no host";
+    }
+    match authority_port(authority) {
+        Err(why) => why,
+        Ok(Some(port)) if !port.bytes().all(|byte| byte.is_ascii_digit()) => {
+            "has a port that is not a decimal number"
+        }
+        _ => "is not a URL",
+    }
+}
+
+/// The port a raw authority states, or why the part after its host is not one.
+///
+/// `http::Uri` reads a bracketed authority loosely: `[]` parses with a host of `[]`, and anything
+/// behind the closing `]` is dropped from `host()` and answers `None` from `port()`. The raw text is
+/// therefore read here, so a bracketed host is either a host with an optional port or a refusal.
+fn authority_port(authority: &str) -> Result<Option<&str>, &'static str> {
+    let Some(rest) = authority.strip_prefix('[') else {
+        let mut parts = authority.rsplitn(2, ':');
+        let last = parts.next().unwrap_or_default();
+        return Ok(parts.next().map(|_| last));
+    };
+    let Some((host, after)) = rest.split_once(']') else {
+        return Err("has an unclosed bracketed host");
+    };
+    if host.is_empty() {
+        return Err("names no host");
+    }
+    match after.strip_prefix(':') {
+        Some(port) => Ok(Some(port)),
+        None if after.is_empty() => Ok(None),
+        None => Err("has text after a bracketed host"),
+    }
 }
 
 /// What a reply carries: rmcp's own response type, so a refusal and a served call have one shape.
@@ -56,6 +200,7 @@ pub async fn serve(
     daemon: Arc<Daemon>,
     render: Render,
     launch: Arc<LaunchContext>,
+    public_root: Option<Arc<str>>,
     stopped: CancellationToken,
 ) {
     // Every session gets a server of its own over the daemon's service, so two HTTP clients share
@@ -66,6 +211,7 @@ pub async fn serve(
     let table = Arc::new(Transfers::new());
     let factory = {
         let table = Arc::clone(&table);
+        let public_root = public_root.clone();
         move || {
             let backend = Backend::Local {
                 service: Arc::clone(&service),
@@ -74,7 +220,12 @@ pub async fn serve(
                 launch: Arc::clone(&launch),
                 instructions: INSTRUCTIONS_DAEMON,
             };
-            Ok(Server::new(backend, &launch, Some(Arc::clone(&table))))
+            Ok(Server::new(
+                backend,
+                &launch,
+                Some(Arc::clone(&table)),
+                public_root.clone(),
+            ))
         }
     };
     let bound = listener
@@ -242,6 +393,11 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
             }
             if !authorized(request.headers(), &digest) {
                 return Ok(refusal(StatusCode::UNAUTHORIZED, "Bearer"));
+            }
+            // Two routes, and no other: a proxy that forwards its prefix without stripping it
+            // fails here, at `initialize`, rather than at a download an hour later.
+            if request.uri().path() != "/mcp" {
+                return Ok(refusal(StatusCode::NOT_FOUND, ""));
             }
             // A declared length over the cap is refused before a byte of it is read; a chunked
             // body over the cap fails at `Limited`, and rmcp answers that as an error response.
@@ -695,5 +851,109 @@ mod tests {
         assert!(allowed_hosts(bound, false).contains(&"127.0.0.2".to_owned()));
         // A daemon reachable through a proxy trusts the proxy for both.
         assert!(allowed_hosts(bound, true).is_empty());
+    }
+
+    /// Every value that names an address clients reach, normalized to what a URL is minted from.
+    #[test]
+    fn a_public_root_keeps_what_it_states_and_gains_one_trailing_slash() {
+        let valid = [
+            ("http://h", "http://h/"),
+            ("http://h/", "http://h/"),
+            ("https://h.example/mac", "https://h.example/mac/"),
+            ("https://h.example/mac/", "https://h.example/mac/"),
+            ("HTTP://Host.Example/Mac", "http://Host.Example/Mac/"),
+            (
+                "https://HtTpS.example:8443/mac/",
+                "https://HtTpS.example:8443/mac/",
+            ),
+            ("http://127.0.0.1:8765/mac/", "http://127.0.0.1:8765/mac/"),
+            ("https://h:65535/", "https://h:65535/"),
+            // A bracketed IPv6 host is an authority like any other, with or without a port.
+            ("http://[::1]", "http://[::1]/"),
+            ("http://[::1]:80/", "http://[::1]:80/"),
+            ("http://[::1]:8080/mac", "http://[::1]:8080/mac/"),
+            // Encoded bytes are what a proxy rewrites to, so they are kept as stated.
+            ("https://h/a%20b/", "https://h/a%20b/"),
+            ("https://h/%2E%2E/%2e/", "https://h/%2E%2E/%2e/"),
+        ];
+        for (value, expected) in valid {
+            assert_eq!(valid_root(value).as_deref(), Ok(expected), "{value:?}");
+        }
+    }
+
+    /// Each way a value cannot name an address, with the reason it is refused for.
+    #[test]
+    fn a_public_root_that_cannot_be_used_is_refused_with_its_reason() {
+        let refused = [
+            ("", "must start with http:// or https://"),
+            (
+                "http://h/ mac/",
+                "contains whitespace or a control character",
+            ),
+            (
+                "http://h/a\u{7}",
+                "contains whitespace or a control character",
+            ),
+            ("https://h/a?b=c", "carries a query or a fragment"),
+            ("https://h/a#b", "carries a query or a fragment"),
+            ("ftp://h/mac/", "must start with http:// or https://"),
+            ("h/mac/", "must start with http:// or https://"),
+            ("http:///mac/", "names no host"),
+            ("http://user@h/mac/", "carries userinfo"),
+            ("http://user:secret@h/mac/", "carries userinfo"),
+            ("http://h:/", "has an empty port"),
+            ("http://h:/mac/", "has an empty port"),
+            ("http://h:0/", "has a port outside 1-65535"),
+            ("http://h:65536/", "has a port outside 1-65535"),
+            ("http://h:abc/", "has a port that is not a decimal number"),
+            ("http://h:8a80/", "has a port that is not a decimal number"),
+            ("http://h:-1/", "has a port that is not a decimal number"),
+            ("http://[::1]:/", "has an empty port"),
+            ("http://[::1]:70000/", "has a port outside 1-65535"),
+            // `http::Uri` reads a bracketed authority loosely, so these are judged on the raw text.
+            ("http://[]/", "names no host"),
+            ("http://[]:80/mac/", "names no host"),
+            ("http://[::1]junk/mac/", "has text after a bracketed host"),
+            (
+                "http://[::1]junk:abc/mac/",
+                "has text after a bracketed host",
+            ),
+            ("http://[::1:8080/mac/", "has an unclosed bracketed host"),
+            ("http://h/./mac/", "has a dot path segment"),
+            ("http://h/../mac/", "has a dot path segment"),
+            ("http://h/mac/.", "has a dot path segment"),
+            ("http://h//mac/", "has an empty path segment"),
+            ("http://h/mac//deep/", "has an empty path segment"),
+        ];
+        for (value, reason) in refused {
+            let message = valid_root(value).expect_err(value);
+            // The reason and the variable, and never the value: a mistyped value can carry userinfo
+            // and this message reaches a terminal and a daemon log.
+            assert_eq!(
+                message,
+                format!("FASTEXEC_PUBLIC_URL {reason}"),
+                "{value:?}"
+            );
+        }
+    }
+
+    /// The variable is unset or it is a value; a value that is not UTF-8 cannot be a URL.
+    #[test]
+    fn an_unset_public_root_is_no_root_and_an_unreadable_one_is_refused() {
+        assert_eq!(root_of(None), Ok(None));
+        assert_eq!(
+            root_of(Some(std::ffi::OsStr::new("https://h/mac"))),
+            Ok(Some("https://h/mac/".to_owned()))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let message = root_of(Some(std::ffi::OsStr::from_bytes(b"https://h/\xff")))
+                .expect_err("a value that is not UTF-8");
+            assert!(
+                message.starts_with("FASTEXEC_PUBLIC_URL ") && message.contains("UTF-8"),
+                "{message}"
+            );
+        }
     }
 }
