@@ -77,7 +77,7 @@ pub fn main(args: &[OsString]) -> ! {
     // The control socket is closed across exec again before bash starts: the server cleared that
     // flag only for the exec into this host.
     #[cfg(target_os = "macos")]
-    let control = crate::tree_macos::from_fd(control);
+    let control = std::sync::Arc::new(std::sync::Mutex::new(crate::tree_macos::from_fd(control)));
     // The host shares bash's process group, the PTY's foreground group, so Ctrl-C, Ctrl-Z, the
     // hangup of a closing terminal, and a command's `kill 0` reach it too: it outlives every
     // signal but SIGKILL that would end or stop it. A handler, unlike SIG_IGN, resets to the
@@ -126,6 +126,10 @@ pub fn main(args: &[OsString]) -> ! {
         Err(error) => {
             eprintln!("fastexec: cannot start {}: {error}", bash.to_string_lossy());
             let _ = status.write_all(&127_i32.to_le_bytes());
+            #[cfg(target_os = "macos")]
+            if let Ok(mut control) = control.lock() {
+                let _ = control.write_all(b"D");
+            }
             std::process::exit(0);
         }
     };
@@ -138,7 +142,8 @@ pub fn main(args: &[OsString]) -> ! {
     let tracker = {
         let tracker = std::sync::Arc::new(std::sync::Mutex::new(crate::tree_macos::Tracker::new()));
         let served = std::sync::Arc::clone(&tracker);
-        std::thread::spawn(move || crate::tree_macos::serve(control, served));
+        let serving = std::sync::Arc::clone(&control);
+        std::thread::spawn(move || crate::tree_macos::serve(serving, served));
         // Members are observed while the tree runs, from the moment bash starts: a descendant that
         // detaches or is orphaned later is already known, so it stays in the tree. The scan is one
         // `proc_listallpids` and one `proc_pidinfo` per live process, every 100 ms.
@@ -163,7 +168,7 @@ pub fn main(args: &[OsString]) -> ! {
     #[cfg(not(target_os = "macos"))]
     std::thread::spawn(move || watch(lifeline));
     #[cfg(target_os = "macos")]
-    wait_macos(bash, bash_start, &mut status, &tracker);
+    wait_macos(bash, bash_start, &mut status, &tracker, &control);
     #[cfg(not(target_os = "macos"))]
     wait_linux(bash, &mut status);
 }
@@ -201,6 +206,7 @@ fn wait_macos(
     bash_start: u64,
     status: &mut File,
     tracker: &std::sync::Arc<std::sync::Mutex<crate::tree_macos::Tracker>>,
+    control: &std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>,
 ) -> ! {
     let mut reported = false;
     let mut reaped_bash = false;
@@ -235,8 +241,11 @@ fn wait_macos(
             && tracker
                 .lock()
                 .map(|mut tracker| tracker.empty())
-                .unwrap_or(true)
+                .unwrap_or(false)
         {
+            if let Ok(mut control) = control.lock() {
+                let _ = control.write_all(b"D");
+            }
             std::process::exit(0);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));

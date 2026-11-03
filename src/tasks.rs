@@ -654,24 +654,30 @@ impl Tasks {
             let ender = Arc::clone(&waiter_task);
             let ender_shared = Arc::clone(&waiter_shared);
             std::thread::spawn(move || {
-                child.wait_tree(&ender.tree);
-                // Kept children can still read after the root exits; close input at tree end.
-                *lock(&ender.input) = None;
-                // A resize that arrives from here on finds the control taken and fails, so
-                // nothing reaches a terminal that is about to close.
-                *lock(&ender.pty_control) = None;
-                drop(child);
-                let _ = std::fs::remove_file(&script_path);
-                // The script's status marker is no larger a leak than the script: it goes too.
-                if let Some(status) = &exit_status {
-                    let _ = std::fs::remove_file(status);
+                let tree_ended = child.wait_tree(&ender.tree);
+                if !tree_ended {
+                    *lock(&ender.kill_error) =
+                        Some("task host disconnected; tree cleanup is unconfirmed".into());
+                    ender.activity.send_replace(());
                 }
+                if tree_ended {
+                    // Unknown children may still use stdin, the terminal, or their script.
+                    *lock(&ender.input) = None;
+                    *lock(&ender.pty_control) = None;
+                    let _ = std::fs::remove_file(&script_path);
+                    if let Some(status) = &exit_status {
+                        let _ = std::fs::remove_file(status);
+                    }
+                }
+                drop(child);
                 // A task held at its root's exit is finished only here, so the cap is applied
                 // again under the guard that publishes the tree's end: retirement counts a task
                 // once its tree ended, and this is when that becomes true.
                 let mut registry = lock(&ender_shared.registry);
-                let _ = ender.tree_ended_at.set(Instant::now());
-                ender.tree_done.send_replace(true);
+                if tree_ended {
+                    let _ = ender.tree_ended_at.set(Instant::now());
+                    ender.tree_done.send_replace(true);
+                }
                 ender_shared.retire_finished(&mut registry);
                 drop(registry);
             });

@@ -2720,6 +2720,63 @@ fn a_stopped_host_is_woken_for_a_list_and_a_kill() {
     );
 }
 
+/// Losing only the host does not end its children, before or after the root's exit.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_crashed_host_leaves_cleanup_unconfirmed() {
+    for root_exited in [false, true] {
+        let (beat, beat_bash) = scratch("crashed-host");
+        let files = Files::new(&beat);
+        let pid_file = files.path("pid");
+        let root_pid_file = files.path("root-pid");
+        let host_pid_file = files.path("host-pid");
+        let command = format!(
+            "printf '%s' \"$$\" > '{}'; printf '%s' \"$PPID\" > '{}'; (for i in $(seq 200); do echo x >> '{}'; sleep 0.1; done) & printf '%s' \"$!\" > '{}'; {}",
+            root_pid_file.display(),
+            host_pid_file.display(),
+            beat_bash,
+            pid_file.display(),
+            if root_exited { "echo started" } else { "wait" }
+        );
+        let mut server = Server::start();
+        server.ok(json!({
+            "action": "start", "command": command, "keepTree": true, "waitMs": 1000,
+        }));
+        let host = wait_for_mark(&host_pid_file) as i32;
+        let child = Escaped::new(&pid_file);
+        let _root = (!root_exited).then(|| Escaped::new(&root_pid_file));
+        wait_for_heartbeat(&beat);
+        let task = server.id(1);
+        if root_exited {
+            wait_for_held_pid(&mut server, &task, child.pid as u32);
+        }
+        // The server stays alive; SIGKILL reaches only its task host.
+        assert_eq!(unsafe { libc::kill(host, libc::SIGKILL) }, 0);
+        wait_until("the lost host is reported", || {
+            let (list, _) = server.ok(json!({"action": "list"}));
+            (list["tasks"][0]["killError"].is_string() && list["tasks"][0]["keptRunning"] == true)
+                .then_some(())
+        });
+        for _ in 0..2 {
+            let (_, text, is_error) = server.call(json!({"action": "kill", "taskId": task}));
+            assert!(
+                is_error,
+                "a disconnected host cannot confirm cleanup: {text}"
+            );
+            let (list, text) = server.ok(json!({"action": "list"}));
+            assert_eq!(list["tasks"][0]["keptRunning"], true, "{text}");
+            assert!(list["tasks"][0]["killError"].is_string(), "{text}");
+        }
+        let before = file_len(&beat);
+        wait_until("the child still runs after host loss", || {
+            (file_len(&beat) > before).then_some(())
+        });
+        // Escaped rechecks the child's birth before killing it on every exit path; the loop is
+        // bounded too, so failed setup cannot leave a permanent writer.
+        drop(child);
+    }
+}
+
 /// A descendant the host observed stays in the tree after it leaves the session, the group, and
 /// its parent chain, and a kill reaches it.
 #[cfg(target_os = "macos")]
@@ -3602,16 +3659,20 @@ fn a_pty_task_starts_at_the_default_size_and_the_program_sees_it() {
 /// after a resize in the same call is the same burst it would be without one.
 #[test]
 fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
+    let (ready, ready_bash) = scratch("keyboard-mode-ready");
     let mut server = Server::start();
     let (out, text) = server.ok(json!({
         "action": "start", "pty": true, "cols": 100, "rows": 40, "waitMs": 1000,
-        "command": "printf '\\033[?2026h\\033[?1h\\r\\n'; stty raw -echo; head -c 3 | od -An -tx1"
+        "command": format!("stty raw -echo; printf '\\033[?2026h\\033[?1h\\033[6n'; IFS= read -r -d R reply; touch '{ready_bash}'; head -c 3 | od -An -tx1")
     }));
     assert!(!text.contains("Cannot"), "{text}");
     let task = server.id(1);
     let log = PathBuf::from(out["logPath"].as_str().unwrap());
-    // The resize arrives with the key: the sustained update is settled, the held DECCKM applies,
-    // and Up is the application-cursor form from here on.
+    // The cursor report follows both mode declarations in the emulator's input. Receiving it
+    // proves the modes were consumed and stty completed, even when login startup is slow.
+    wait_for_file(&ready);
+    // The resize arrives with the key: DECCKM declared during the synchronized update applies
+    // to the burst, even if that update timed out while waiting for the readiness handshake.
     server.ok(json!({
         "action": "poll", "taskId": task, "cols": 80, "rows": 20,
         "keys": ["Up"], "keyDelayMs": 0, "waitMs": 1000

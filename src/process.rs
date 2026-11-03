@@ -138,12 +138,13 @@ impl Child {
     }
 
     /// Blocks until no process of the tree runs.
-    pub fn wait_tree(&mut self, tree: &Tree) {
+    pub fn wait_tree(&mut self, tree: &Tree) -> bool {
         let mut pause = std::time::Duration::from_millis(10);
         while tree.members().is_none_or(|members| !members.is_empty()) {
             std::thread::sleep(pause);
             pause = (pause * 2).min(std::time::Duration::from_millis(500));
         }
+        true
     }
 }
 
@@ -175,16 +176,26 @@ impl Child {
     }
 
     /// Blocks until no process of the tree runs: the host leaves once it has no child left.
-    pub fn wait_tree(&mut self, tree: &Tree) {
+    pub fn wait_tree(&mut self, tree: &Tree) -> bool {
         let _ = std::io::copy(&mut self.status, &mut std::io::sink());
         self.reap(tree);
+        *lock(&tree.ended)
     }
 
     /// Reaps the host once it has exited, which the end of its status pipe shows. The tree is
-    /// marked ended first, under the lock `kill` holds, so no kill can reach a group ID that the
-    /// reaped PID frees for reuse.
+    /// settled first under the lock `kill` holds: Linux marks it ended, while macOS requires the
+    /// host's final confirmation. No later request may signal a PID released for reuse.
     fn reap(&mut self, tree: &Tree) -> i32 {
-        *lock(&tree.ended) = true;
+        let mut ended = lock(&tree.ended);
+        #[cfg(target_os = "macos")]
+        {
+            // Drain the host's final confirmation before releasing its PID for reuse.
+            *ended = tree.control.finish();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            *ended = true;
+        }
         self.host.wait().map_or(1, |status| {
             use std::os::unix::process::ExitStatusExt;
             status
@@ -587,7 +598,7 @@ pub struct Tree {
     /// dies, makes the host end the tree, as closing a kill-on-close job does on Windows.
     #[cfg(unix)]
     _lifeline: std::io::PipeWriter,
-    /// Set once the host is about to be reaped; `kill` and `members` then do nothing.
+    /// Set after confirmed tree completion, before releasing the host's PID for reuse.
     #[cfg(unix)]
     ended: std::sync::Mutex<bool>,
     /// The host's control socket: macOS asks the host which processes the tree holds, so no

@@ -13,7 +13,7 @@
 //! Wire format, both directions little-endian: a request is one byte, `M` or `K`. A members reply
 //! is `n` followed by a count and, per member, its pid, its name, and its name; a kill reply is
 //! `O`, or `E` with the errno of a member the host may not signal. The host writes `O` before the
-//! group signal ends it, so a socket that closes without a reply is a kill that succeeded.
+//! group signal ends it. `D` confirms natural tree completion; a bare disconnect proves nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -188,8 +188,7 @@ impl Tracker {
     }
 
     /// Signals the host's own group, the last step of a kill. The host names the group with its
-    /// own number, so it never reaches another task's group, and it ends here, which is what makes
-    /// a kill's success observable as the closed control socket.
+    /// own number, so it never reaches another task's group. The success reply precedes it.
     pub fn kill_group(&self) {
         // SAFETY: plain syscall; the group ID is this process's own and stays reserved while the
         // unreaped host holds it.
@@ -289,13 +288,16 @@ impl Tracker {
 
 /// Serves control requests until the server closes the socket, which it does when the tree ends
 /// or the server dies. The host ends the tree on its lifeline meanwhile, as on Linux.
-pub fn serve(control: UnixStream, tracker: Arc<Mutex<Tracker>>) {
-    let mut control = control;
+pub fn serve(control: Arc<Mutex<UnixStream>>, tracker: Arc<Mutex<Tracker>>) {
+    let Ok(mut reader) = lock(&control).try_clone() else {
+        return;
+    };
     loop {
         let mut op = [0_u8; 1];
-        if control.read_exact(&mut op).is_err() {
+        if reader.read_exact(&mut op).is_err() {
             return;
         }
+        let mut control = lock(&control);
         let reply = match op[0] {
             b'M' => {
                 let members = lock(&tracker).list();
@@ -369,10 +371,8 @@ fn kill_member(pid: i32) -> Option<std::io::Error> {
 /// to the host: a host stopped with `SIGSTOP` — as `kill -STOP 0` in a task's own group does —
 /// cannot answer, and a signal the server sends is not one the host has to run to receive.
 ///
-/// What a failure means is kept apart: a closed peer is the host ending, which is an answer, while
-/// a host that never answers inside one deadline, or one that answers with something other than the
-/// protocol, leaves the socket broken for good — no later request reads on it, so a late reply byte
-/// can never be mistaken for the start of the next one.
+/// A disconnect is not cleanup confirmation. A timeout or invalid reply also breaks the socket
+/// for good, so no later request can mistake a late byte for its own reply.
 pub struct Client {
     control: Mutex<Control>,
     host: i32,
@@ -386,6 +386,8 @@ struct Control {
 /// Whether the host is still answering on this socket.
 enum State {
     Open,
+    /// The host explicitly confirmed that no member remains.
+    Ended,
     /// The host ended: the peer closed the socket, or a write found it gone.
     Closed,
     /// The host did not answer in time, or answered with something the protocol does not allow.
@@ -432,12 +434,10 @@ impl Client {
     fn send(&self, control: &mut Control, byte: u8) -> bool {
         match control.stream.write_all(&[byte]) {
             Ok(()) => true,
-            Err(error) => {
-                control.state = if closed(&error) {
-                    State::Closed
-                } else {
-                    State::Broken
-                };
+            // The peer may have queued its final confirmation before closing.
+            Err(error) if closed(&error) => true,
+            Err(_) => {
+                control.state = State::Broken;
                 false
             }
         }
@@ -478,29 +478,35 @@ impl Client {
         true
     }
 
-    /// What the host said, if it said anything: `Some(list)` for an answer or for a host that has
-    /// ended, `None` when it never answered or answered wrongly — which says nothing about the
-    /// tree, so it is never read as an empty one.
+    /// Lists members, or reports no answer when the host cannot confirm membership.
     pub fn members(&self) -> Option<Vec<Member>> {
         let mut control = lock(&self.control);
         match control.state {
-            State::Closed => return Some(Vec::new()),
-            State::Broken => return None,
+            State::Ended => return Some(Vec::new()),
+            State::Closed | State::Broken => return None,
             State::Open => {}
         }
         if !self.send(&mut control, b'M') {
             return ended_or_silent(&control);
         }
         let deadline = Instant::now() + MEMBERS_BUDGET;
-        let mut head = [0_u8; 5];
-        if !self.read_exact(&mut control, &mut head, deadline) {
+        let mut op = [0_u8; 1];
+        if !self.read_exact(&mut control, &mut op, deadline) {
             return ended_or_silent(&control);
         }
-        if head[0] != b'n' {
+        if op[0] == b'D' {
+            control.state = State::Ended;
+            return Some(Vec::new());
+        }
+        if op[0] != b'n' {
             control.state = State::Broken;
             return None;
         }
-        let count = u32::from_le_bytes([head[1], head[2], head[3], head[4]]);
+        let mut count = [0_u8; 4];
+        if !self.read_exact(&mut control, &mut count, deadline) {
+            return ended_or_silent(&control);
+        }
+        let count = u32::from_le_bytes(count);
         let mut members = Vec::new();
         for _ in 0..count {
             let mut fixed = [0_u8; 6];
@@ -521,12 +527,12 @@ impl Client {
         Some(members)
     }
 
-    /// Kills the tree, or reports the errno of a member the host may not signal. A host that ends
-    /// instead of answering has ended the tree, which is what a kill asks for.
+    /// Kills the tree only on explicit confirmation, or reports the host's refusal or disconnect.
     pub fn kill(&self) -> std::io::Result<()> {
         let mut control = lock(&self.control);
         match control.state {
-            State::Closed => return Ok(()),
+            State::Ended => return Ok(()),
+            State::Closed => return killed_or_silent(&control),
             State::Broken => return Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
             State::Open => {}
         }
@@ -539,7 +545,10 @@ impl Client {
             return killed_or_silent(&control);
         }
         match op[0] {
-            b'O' => Ok(()),
+            b'O' | b'D' => {
+                control.state = State::Ended;
+                Ok(())
+            }
             b'E' => {
                 let mut errno = [0_u8; 4];
                 if !self.read_exact(&mut control, &mut errno, deadline) {
@@ -564,22 +573,33 @@ impl Client {
             }
         }
     }
-}
 
-/// The list a request that did not finish describes: an ended host holds nothing, while one that
-/// stayed silent describes nothing at all.
-fn ended_or_silent(control: &Control) -> Option<Vec<Member>> {
-    match control.state {
-        State::Closed => Some(Vec::new()),
-        State::Open | State::Broken => None,
+    pub fn finish(&self) -> bool {
+        // The status pipe reached EOF. Consume any last reply before the final confirmation;
+        // no client may retain an open channel once the host's PID is released for reuse.
+        while matches!(lock(&self.control).state, State::Open) {
+            let _ = self.members();
+        }
+        matches!(lock(&self.control).state, State::Ended)
     }
 }
 
-/// What a kill that did not get its answer means: an ended host took the tree with it, while a
-/// silent one confirmed nothing.
+/// Only an explicit completion confirms an empty tree.
+fn ended_or_silent(control: &Control) -> Option<Vec<Member>> {
+    match control.state {
+        State::Ended => Some(Vec::new()),
+        State::Open | State::Closed | State::Broken => None,
+    }
+}
+
+/// A disconnected or silent host confirms no cleanup.
 fn killed_or_silent(control: &Control) -> std::io::Result<()> {
     match control.state {
-        State::Closed => Ok(()),
+        State::Ended => Ok(()),
+        State::Closed => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "task host disconnected; tree cleanup is unconfirmed",
+        )),
         State::Open | State::Broken => Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
     }
 }
@@ -928,20 +948,21 @@ mod tests {
         assert!(!tracker.members.contains_key(&(700, 5)));
     }
 
-    /// A peer that ended is an answer: the tree holds nothing and the kill is done. A peer that
-    /// never answers is not: nothing about the tree is confirmed, so the list says nothing and the
-    /// kill fails rather than reporting a tree that ended.
+    /// Neither a closed peer nor a silent one confirms that its children ended.
     #[test]
-    fn a_closed_peer_answers_and_a_silent_one_does_not() {
+    fn a_closed_peer_and_a_silent_one_confirm_nothing() {
         let (server, peer) = UnixStream::pair().expect("a socket pair");
         let client = Client::new(server, 0);
         drop(peer);
         assert_eq!(
             client.members().map(|members| members.len()),
-            Some(0),
-            "a host that ended holds nothing"
+            None,
+            "a disconnected host says nothing about its children"
         );
-        assert!(client.kill().is_ok(), "a host that ended took the tree");
+        assert!(
+            client.kill().is_err(),
+            "a disconnected host cannot confirm a kill"
+        );
 
         let (server, peer) = UnixStream::pair().expect("a socket pair");
         let client = Client::new(server, 0);
@@ -960,6 +981,31 @@ mod tests {
         // The socket is broken for good: no later request reads a late reply byte as a header.
         assert!(client.members().is_none(), "the socket stays broken");
         drop(peer);
+    }
+
+    #[test]
+    fn final_confirmation_survives_a_pending_reply_and_peer_exit() {
+        let (server, mut peer) = UnixStream::pair().expect("a socket pair");
+        let client = Client::new(server, 0);
+        // A members reply already in flight can precede natural completion.
+        peer.write_all(b"n\0\0\0\0D").unwrap();
+        drop(peer);
+        assert!(
+            client.finish(),
+            "consume the final confirmation before reaping"
+        );
+        assert!(client.kill().is_ok());
+        assert_eq!(client.members().unwrap().len(), 0);
+
+        let (server, mut peer) = UnixStream::pair().expect("a socket pair");
+        let client = Client::new(server, 0);
+        peer.write_all(b"O").unwrap();
+        drop(peer);
+        assert!(
+            client.kill().is_ok(),
+            "a queued kill acknowledgement survives EOF"
+        );
+        assert!(client.finish());
     }
 
     /// The kernel telling us a process ended is a fact, and it is not the same as failing to read
