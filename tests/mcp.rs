@@ -3663,7 +3663,7 @@ fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
     let mut server = Server::start();
     let (out, text) = server.ok(json!({
         "action": "start", "pty": true, "cols": 100, "rows": 40, "waitMs": 1000,
-        "command": format!("stty raw -echo; printf '\\033[?2026h\\033[?1h\\033[6n'; IFS= read -r -d R reply; touch '{ready_bash}'; head -c 3 | od -An -tx1")
+        "command": format!("stty raw -echo; printf '\\033[?2026h\\033[?1h\\033[6n'; IFS= read -r -d R reply; printf '\\r\\n'; touch '{ready_bash}'; head -c 3 | od -An -tx1")
     }));
     assert!(!text.contains("Cannot"), "{text}");
     let task = server.id(1);
