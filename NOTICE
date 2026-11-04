@@ -17,7 +17,8 @@ encoding follows Windows Terminal src/terminal/input/terminalInput.cpp
 (https://github.com/microsoft/terminal), Copyright (c) Microsoft
 Corporation, licensed under the MIT license.
 
-vendor/conpty/x64/conpty.dll and vendor/conpty/x64/OpenConsole.exe are
-Microsoft's ConPTY (https://github.com/microsoft/terminal), Copyright (c)
+conpty.dll and OpenConsole.exe in vendor/conpty/x64 and vendor/conpty/arm64
+are Microsoft's ConPTY (https://github.com/microsoft/terminal), Copyright (c)
 Microsoft Corporation, licensed under the MIT license in
-vendor/conpty/LICENSE. Windows x64 builds of fastexec embed them.
+vendor/conpty/LICENSE. Windows x64 and arm64 builds of fastexec embed the
+files of their architecture.

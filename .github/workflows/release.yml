@@ -1,0 +1,144 @@
+name: release
+
+# A pushed tag vX.Y.Z builds every platform, runs the CI suite on the tagged commit, and creates a
+# draft GitHub Release. A manual run builds and smoke-tests the archives without releasing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One attempt per tag at a time, so a retagged attempt never overlaps an older one.
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: version
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor HEAD origin/main; then
+              echo "::error::tag $GITHUB_REF_NAME points to a commit outside main"
+              exit 1
+            fi
+          fi
+
+  ci:
+    needs: check
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { name: macos-amd64, runner: macos-latest, target: x86_64-apple-darwin }
+          - { name: macos-arm64, runner: macos-latest, target: aarch64-apple-darwin }
+          - { name: windows-amd64, runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      BIN: target/${{ matrix.target }}/release/fastexec${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The binary must start and report the release version over MCP stdio.
+      - name: smoke test
+        run: |
+          request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
+          reply="$(printf '%s\n' "$request" | env -u FASTEXEC_DAEMON "$BIN")"
+          echo "$reply"
+          grep -F "\"serverInfo\":{\"name\":\"fastexec\",\"version\":\"$VERSION\"}" <<< "$reply"
+
+      - name: package
+        env:
+          COPYFILE_DISABLE: "1"
+        run: |
+          name="fastexec-$VERSION-${{ matrix.name }}"
+          mkdir -p "dist/$name"
+          mkdir -p "dist/$name/vendor/conpty"
+          cp "$BIN" LICENSE NOTICE README.md "dist/$name/"
+          cp vendor/conpty/LICENSE "dist/$name/vendor/conpty/"
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            pwsh -NoProfile -NonInteractive -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [check, ci, build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A tag moved since this run started would receive archives built from another commit.
+          live="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF" --jq .sha)"
+          if [ "$live" != "${{ needs.check.outputs.commit }}" ]; then
+            echo "::error::$GITHUB_REF_NAME now points to $live, not the built ${{ needs.check.outputs.commit }}"
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --generate-notes --title "fastexec ${{ needs.check.outputs.version }}"

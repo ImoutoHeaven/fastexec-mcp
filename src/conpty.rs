@@ -1,4 +1,4 @@
-//! The ConPTY bundled for Windows x64 (`vendor/conpty`).
+//! The ConPTY bundled for Windows x64 and arm64 (`vendor/conpty`).
 //!
 //! The system ConPTY of older Windows releases re-renders a program's output: lines pushed off
 //! the screen through scroll regions, history cleared by full redraws, and alternate-screen
@@ -8,6 +8,20 @@
 //! ConPTY. Loading the extracted copy by its full path first makes that name resolve to it.
 
 #[cfg(all(windows, target_arch = "x86_64"))]
+macro_rules! arch {
+    () => {
+        "x64"
+    };
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+macro_rules! arch {
+    () => {
+        "arm64"
+    };
+}
+
+#[cfg(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod bundled {
     use std::fs::File;
     use std::io::Read;
@@ -18,11 +32,11 @@ mod bundled {
     const FILES: [(&str, &[u8]); 2] = [
         (
             "conpty.dll",
-            include_bytes!("../vendor/conpty/x64/conpty.dll"),
+            include_bytes!(concat!("../vendor/conpty/", arch!(), "/conpty.dll")),
         ),
         (
             "OpenConsole.exe",
-            include_bytes!("../vendor/conpty/x64/OpenConsole.exe"),
+            include_bytes!(concat!("../vendor/conpty/", arch!(), "/OpenConsole.exe")),
         ),
     ];
 
@@ -45,11 +59,12 @@ mod bundled {
         Ok(())
     }
 
-    /// Writes the files to a versioned directory in the user's temp directory, shared by every
-    /// server of this version, and pins them; returns the path of `conpty.dll`, whose host
-    /// `OpenConsole.exe` sits beside it and starts with every PTY.
+    /// Writes the files to a directory in the user's temp directory, shared by every server of
+    /// this version and architecture, and pins them; returns the path of `conpty.dll`, whose host
+    /// `OpenConsole.exe` sits beside it and starts with every PTY. The architecture keeps an
+    /// emulated x64 server and a native arm64 one on the same machine from sharing files.
     fn install() -> Result<PathBuf, String> {
-        let dir = std::env::temp_dir().join(format!("fastexec-conpty-{VERSION}"));
+        let dir = std::env::temp_dir().join(format!("fastexec-conpty-{VERSION}-{}", arch!()));
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
         for (name, bytes) in FILES {
@@ -98,7 +113,7 @@ mod bundled {
 /// Loads the bundled ConPTY once, before the first PTY starts. Returns why PTY tasks use the
 /// system ConPTY instead, on Windows; `None` elsewhere.
 pub fn load() -> Option<&'static str> {
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         static LOADED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
         let result = LOADED.get_or_init(|| {
@@ -111,7 +126,7 @@ pub fn load() -> Option<&'static str> {
         });
         result.as_ref().err().map(String::as_str)
     }
-    #[cfg(all(windows, not(target_arch = "x86_64")))]
+    #[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
     return Some("this build bundles no ConPTY for its architecture; using the system ConPTY");
     #[cfg(unix)]
     return None;

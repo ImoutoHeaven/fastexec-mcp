@@ -7,16 +7,24 @@ shared by every session in a namespace, opt-in with `FASTEXEC_DAEMON=on`.
 
 ## Requirements and Quickstart
 
-- **Build**: Rust `1.92+` (`edition = "2024"`).
-- **Runtime**: GNU bash on Linux, or [Git for Windows](https://git-scm.com/downloads)
+- **Runtime**: GNU bash on Linux and macOS, or [Git for Windows](https://git-scm.com/downloads)
   on Windows. Set `FASTEXEC_BASH` to an absolute GNU bash path to override discovery.
+- **Build** (optional): Rust `1.92+` (`edition = "2024"`).
 
-Build `target/release/fastexec` (`fastexec.exe` on Windows), then register its
-absolute path in Pi's `~/.pi/agent/mcp.json`:
+Download the archive for your platform from
+[Releases](https://github.com/ImoutoHeaven/fastexec-mcp/releases)
+(`linux`, `macos`, or `windows`, each `amd64` or `arm64`), check it against
+`SHA256SUMS`, and extract `fastexec` (`fastexec.exe` on Windows). The Linux
+binaries are static and run on any distribution. The macOS binaries are
+unsigned: clear the quarantine a browser download sets with
+`xattr -d com.apple.quarantine fastexec`. To build from source instead:
 
 ```bash
 cargo build --release
 ```
+
+Register the absolute path of the binary (`target/release/fastexec` when built)
+in Pi's `~/.pi/agent/mcp.json`:
 
 ```json
 {
@@ -272,5 +280,5 @@ See [`docs/fastexec-design.md`](docs/fastexec-design.md) for host timeouts,
 
 Licensed under [Apache-2.0](LICENSE). Derived parts from
 [FastCtx](https://github.com/yc-duan/fastctx) and key-encoding credits are in
-[`NOTICE`](NOTICE). Windows x64 builds embed Microsoft ConPTY under the MIT
+[`NOTICE`](NOTICE). Windows x64 and arm64 builds embed Microsoft ConPTY under the MIT
 license in [`vendor/conpty/README.md`](vendor/conpty/README.md).
