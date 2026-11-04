@@ -1644,7 +1644,10 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
     // A program on the alternate screen: the normal screen's history, then the session merged
     // from its frames. Each page is held back by a gate file the test creates only after the
     // screen shows the page before it, so a page is replaced only once it was drawn: a frame the
-    // recorder missed fails here rather than being papered over by a longer sleep.
+    // recorder missed fails here rather than being papered over by a longer sleep. Each page is
+    // a synchronized update, one frame however its writes arrive: the MSYS runtime writes a page
+    // a line or escape sequence at a time, and a loaded host pausing between them would show
+    // half-drawn pages. Drawn as lines, a page ends well inside the update's timeout.
     let gate = std::env::temp_dir().join(format!("fastexec-pty-gate-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&gate);
     std::fs::create_dir_all(&gate).unwrap();
@@ -1652,10 +1655,10 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
     let second_gate = gate.join("scrolled");
     let command = format!(
         concat!(
-            "seq -f 'normal %g' 1 40; printf 'a\\tb\\n\\033[?1049h'; rows=$(seq 1 30 | sed 'p'); ",
-            "printf '\\033[%d;1Hfirst %d\\033[K' $rows; ",
+            "seq -f 'normal %g' 1 40; printf 'a\\tb\\n\\033[?1049h'; ",
+            "printf '\\033[?2026h\\033[H%s\\033[?2026l' \"$(seq -f 'first %g' 1 30)\"; ",
             "while [ ! -f '{}' ]; do sleep 0.01; done; ",
-            "printf '\\033[%d;1Hsecond %d\\033[K' $rows; ",
+            "printf '\\033[?2026h\\033[H%s\\033[?2026l' \"$(seq -f 'second %g' 1 30)\"; ",
             "while [ ! -f '{}' ]; do sleep 0.01; done; ",
             "printf '\\r\\nscrolled %d' $(seq 1 40); read -r x"
         ),
