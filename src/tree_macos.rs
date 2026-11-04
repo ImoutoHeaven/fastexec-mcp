@@ -407,12 +407,14 @@ fn waited(error: &std::io::Error) -> bool {
     )
 }
 
-/// Whether an error means the peer ended the connection.
+/// Whether an error means the peer ended the connection. A write that races the peer's close can
+/// fail with ENOTCONN instead of EPIPE, and what the peer wrote before closing stays readable.
 fn closed(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
         std::io::ErrorKind::UnexpectedEof
             | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionAborted
     )
@@ -1006,6 +1008,23 @@ mod tests {
             "a queued kill acknowledgement survives EOF"
         );
         assert!(client.finish());
+    }
+
+    /// A request that races the host's exit still reads the confirmation the host left behind,
+    /// whichever error the kernel gives the request's write.
+    #[test]
+    fn final_confirmation_survives_a_request_racing_the_hosts_exit() {
+        for _ in 0..2000 {
+            let (server, mut peer) = UnixStream::pair().expect("a socket pair");
+            let client = Client::new(server, 0);
+            let host = std::thread::spawn(move || {
+                peer.write_all(b"D").unwrap();
+                drop(peer);
+            });
+            let members = client.members().map(|members| members.len());
+            host.join().unwrap();
+            assert_eq!(members, Some(0), "the confirmation was not read");
+        }
     }
 
     /// The kernel telling us a process ended is a fact, and it is not the same as failing to read
