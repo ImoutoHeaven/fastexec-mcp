@@ -165,6 +165,10 @@ namespace already has a daemon.
 `FASTEXEC_HTTP_TOKEN`, at least 16 visible ASCII characters, is the bearer token
 every `/mcp` request carries.
 
+Modern MCP clients use `server/discover` and sessionless requests; legacy
+clients keep the `initialize` handshake and independent output cursors. Modern
+HTTP requests share an output cursor under the listener's single bearer token.
+
 A systemd **user** unit shares `XDG_RUNTIME_DIR` with the user's shells, so
 `fastexec daemon status` and `stop` reach the daemon it started:
 

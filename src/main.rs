@@ -30,7 +30,7 @@ mod wait;
 use ipc::{ToDaemon, ToEndpoint};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use service::{Call, Render, Service};
@@ -52,6 +52,8 @@ struct Server {
     /// The base a `transfer` URL is minted from when a proxy names it at daemon start. `None` means
     /// each request's Host and `X-Forwarded-Proto` are the address the client saw.
     public_root: Option<Arc<str>>,
+    /// Sessionless HTTP calls share a reader under the listener's single bearer credential.
+    stateless_session: Option<Arc<Session>>,
 }
 
 /// Where this server's calls run: in this process, or on the namespace's daemon.
@@ -104,11 +106,19 @@ impl Server {
             router,
             transfers,
             public_root,
+            stateless_session: None,
         }
     }
 
     /// This server's session: the client name and a short random ID, its tasks' owner.
     fn session(&self, context: &RequestContext<RoleServer>) -> Result<Arc<Session>, String> {
+        if context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28)
+            && let Some(session) = &self.stateless_session
+        {
+            return Ok(Arc::clone(session));
+        }
         let Backend::Local {
             session, launch, ..
         } = &self.backend
@@ -129,12 +139,11 @@ impl Server {
     }
 }
 
-/// The client's name from the MCP handshake, for the session label.
+/// The client's name from request metadata or the legacy handshake.
 fn client_name(context: &RequestContext<RoleServer>) -> String {
-    context.peer.peer_info().map_or_else(
-        || "client".to_string(),
-        |info| info.client_info.name.clone(),
-    )
+    context
+        .client_info()
+        .map_or_else(|| "client".to_string(), |info| info.name)
 }
 
 /// Server instructions say when to use the tool; hosts that show one line take the first. The
@@ -210,8 +219,8 @@ fn hostname(launch: &LaunchContext) -> Option<String> {
 
 #[tool_handler(router = self.router)]
 impl ServerHandler for Server {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fastexec", env!("CARGO_PKG_VERSION")))
             .with_instructions(self.backend.instructions())
     }

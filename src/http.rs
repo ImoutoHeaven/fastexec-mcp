@@ -3,7 +3,7 @@
 
 use crate::daemon::Daemon;
 use crate::service::Render;
-use crate::session::LaunchContext;
+use crate::session::{LaunchContext, Session};
 use crate::transfer::{self, Admitted, Transfers};
 use crate::{Backend, INSTRUCTIONS_DAEMON, Server};
 use bytes::Bytes;
@@ -209,6 +209,11 @@ pub async fn serve(
     // One table for this listener: the factory hands it to every session, so a URL a session
     // makes is served by the same route that carries the requests.
     let table = Arc::new(Transfers::new());
+    let stateless_session = Session::new(
+        "http-stateless".to_owned(),
+        "http-stateless".to_owned(),
+        Arc::clone(&launch),
+    );
     let factory = {
         let table = Arc::clone(&table);
         let public_root = public_root.clone();
@@ -220,20 +225,22 @@ pub async fn serve(
                 launch: Arc::clone(&launch),
                 instructions: INSTRUCTIONS_DAEMON,
             };
-            Ok(Server::new(
+            let mut server = Server::new(
                 backend,
                 &launch,
                 Some(Arc::clone(&table)),
                 public_root.clone(),
-            ))
+            );
+            server.stateless_session = Some(Arc::clone(&stateless_session));
+            Ok(server)
         }
     };
     let bound = listener
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
     let mut config = StreamableHttpServerConfig::default();
-    // Sessions are the unit a client keeps its cursors in, so they are created and kept.
-    config.stateful_mode = true;
+    // Legacy clients keep independent sessions; rmcp routes modern requests without one.
+    config.legacy_session_mode = true;
     // A tool result is one answer, and every client here speaks event streams.
     config.json_response = false;
     config.sse_keep_alive = Some(Duration::from_secs(15));

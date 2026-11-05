@@ -426,6 +426,31 @@ impl Client {
         self.post(&message.to_string())
     }
 
+    /// A 2026 request carries its own metadata and never uses a protocol session.
+    fn modern(&mut self, method: &str, mut params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "http-modern-test", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let mut headers = format!("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {method}\r\n");
+        if let Some(name) = params["name"].as_str() {
+            headers.push_str(&format!("Mcp-Name: {name}\r\n"));
+        }
+        let response = self.post_with(
+            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string(),
+            &headers,
+        );
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert!(response.header("mcp-session-id").is_none());
+        let answer = response.answer(id);
+        assert!(answer["result"].is_object(), "{answer}");
+        assert_eq!(answer["result"]["resultType"], "complete", "{answer}");
+        answer["result"].clone()
+    }
+
     /// The MCP handshake, which names the session every later request carries.
     fn initialize(&mut self) {
         self.next_id += 1;
@@ -658,6 +683,60 @@ impl Drop for Stdio {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn modern_discovery_and_task_polls_work_without_a_handshake() {
+    let fixture = Fixture::new("modern");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let discovery = client.modern("server/discover", json!({}));
+    assert!(
+        discovery["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("2026-07-28"))
+    );
+    assert_eq!(
+        discovery["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "fastexec"
+    );
+    let listed = client.modern("tools/list", json!({}));
+    assert_eq!(listed["tools"].as_array().unwrap().len(), 5);
+    let started = client.modern(
+        "tools/call",
+        json!({"name": "exec", "arguments": {
+            "action": "start", "command": "printf MODERN_FIRST; read -r line; printf MODERN_SECOND",
+            "waitMs": 30000, "returnWhen": {"outputContains": ["MODERN_FIRST"]},
+        }}),
+    );
+    assert_ne!(started["isError"], true, "{started}");
+    assert!(
+        started["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("MODERN_FIRST")
+    );
+    let id = &started["structuredContent"]["taskId"];
+    let polled = client.modern(
+        "tools/call",
+        json!({"name": "exec", "arguments": {
+            "action": "poll", "taskId": id, "input": "go\n", "waitMs": 30000,
+        }}),
+    );
+    let text = polled["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("MODERN_SECOND"), "{polled}");
+    assert!(
+        !text.contains("MODERN_FIRST"),
+        "a new HTTP request must keep its output cursor: {polled}"
+    );
+    // A legacy client still has an independent cursor over the shared daemon's task.
+    let mut legacy = Client::new(fixture.addr, fixture.token.clone());
+    legacy.initialize();
+    let text = legacy.text(json!({"action": "poll", "taskId": id, "waitMs": 1000}));
+    assert!(
+        text.contains("MODERN_FIRST") && text.contains("MODERN_SECOND"),
+        "{text}"
+    );
 }
 
 #[test]
