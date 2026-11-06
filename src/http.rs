@@ -641,7 +641,7 @@ async fn transfer_put(request: Request<Incoming>, admitted: Admitted) -> Reply {
     // its place in the lock queue. Keep preparation in this handler, whose drop cancels it.
     let target = match prepare_upload(&admitted, offset).await {
         Ok(target) => target,
-        Err(reply) => return reply,
+        Err(status) => return transfer_empty(status, &[]),
     };
     let body = request.into_body();
     // Only an actual writer is detached: a disconnect must not drop a write before its accepted
@@ -659,19 +659,19 @@ struct UploadFile {
     turn: tokio::sync::OwnedMutexGuard<()>,
 }
 
-async fn prepare_upload(admitted: &Admitted, offset: u64) -> Result<UploadFile, Reply> {
+async fn prepare_upload(admitted: &Admitted, offset: u64) -> Result<UploadFile, StatusCode> {
     let path = admitted.path().to_path_buf();
     match presence(&path).await {
-        Presence::NotAFile => return Err(transfer_empty(StatusCode::CONFLICT, &[])),
-        Presence::Failed => return Err(transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[])),
-        Presence::Missing if offset > 0 => return Err(transfer_empty(StatusCode::CONFLICT, &[])),
+        Presence::NotAFile => return Err(StatusCode::CONFLICT),
+        Presence::Failed => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Presence::Missing if offset > 0 => return Err(StatusCode::CONFLICT),
         Presence::Missing => {
             let parent = path.parent().map(Path::to_path_buf);
             if let Some(parent) = parent
                 && !parent.as_os_str().is_empty()
                 && tokio::fs::create_dir_all(&parent).await.is_err()
             {
-                return Err(transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]));
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
         Presence::File(_) => {}
@@ -684,15 +684,15 @@ async fn prepare_upload(admitted: &Admitted, offset: u64) -> Result<UploadFile, 
         .truncate(false)
         .open(&path)
         .await
-        .map_err(|_| transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]))?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let turn = admitted
         .upload(&file)
         .await
-        .map_err(|_| transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]))?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     match file.metadata().await {
         Ok(metadata) if metadata.is_file() && offset <= metadata.len() => {}
-        Ok(_) => return Err(transfer_empty(StatusCode::CONFLICT, &[])),
-        Err(_) => return Err(transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[])),
+        Ok(_) => return Err(StatusCode::CONFLICT),
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
     Ok(UploadFile { file, turn })
 }
