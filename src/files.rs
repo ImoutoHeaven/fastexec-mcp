@@ -2778,6 +2778,23 @@ mod tests {
         String::from_utf16(units.strip_suffix(&[0]).unwrap_or(units)).unwrap()
     }
 
+    /// Windows may set the auto-inheritance bookkeeping flag when applying a DACL, without
+    /// changing owner, group, protection, or any ACE. Compare all of those security properties.
+    #[cfg(windows)]
+    fn windows_without_auto_inherited(sddl: &str) -> String {
+        let Some(start) = sddl.find("D:") else {
+            return sddl.to_owned();
+        };
+        let flags = start + 2;
+        let end = sddl[flags..].find('(').map_or(sddl.len(), |at| flags + at);
+        format!(
+            "{}{}{}",
+            &sddl[..flags],
+            sddl[flags..end].replace("AI", ""),
+            &sddl[end..]
+        )
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_atomic_save_preserves_owner_group_dacl_and_named_streams() {
@@ -2817,7 +2834,10 @@ mod tests {
             assert_eq!(std::fs::read(&stream).unwrap(), b"a named stream");
         }
         if let Some(before) = before {
-            assert_eq!(windows_security_text(&target), before);
+            assert_eq!(
+                windows_without_auto_inherited(&windows_security_text(&target)),
+                windows_without_auto_inherited(&before)
+            );
         }
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
     }

@@ -1352,7 +1352,9 @@ mod tests {
         use windows_sys::Win32::Security::{
             DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
         };
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, WRITE_DAC};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC,
+        };
 
         let root = std::env::temp_dir().join(format!(
             "fastexec-private-dacl-{}-{}",
@@ -1365,7 +1367,7 @@ mod tests {
             "the private DACL is accepted"
         );
         let file = std::fs::OpenOptions::new()
-            .access_mode(WRITE_DAC)
+            .access_mode(READ_CONTROL | WRITE_DAC)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(&root)
             .unwrap();
