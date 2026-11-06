@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as Upload;
 
@@ -30,6 +30,47 @@ pub struct Request {
 /// The files this session has published, by id.
 pub struct Transfers {
     entries: Mutex<HashMap<String, Entry>>,
+    /// Active writers share a lock by the opened file's identity, not by URL or path spelling.
+    /// Weak entries do not retain a lock for every file ever published.
+    uploads: Mutex<HashMap<FileIdentity, Weak<Upload<()>>>>,
+}
+
+/// The identity remains stable while an open handle keeps the file alive. Unlike a canonical
+/// path, it also identifies hard links and a file created through either of two capabilities.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+async fn file_identity(file: &tokio::fs::File) -> std::io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().await?;
+        Ok(FileIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        // SAFETY: the live file owns this handle; the call initializes the structure supplied
+        // for exactly its size, and no pointer escapes it.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(FileIdentity {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
 }
 
 struct Entry {
@@ -39,8 +80,6 @@ struct Entry {
     last_used: Instant,
     /// Requests in progress, which keep the entry alive.
     active: usize,
-    /// The lock that makes uploads to this entry take turns.
-    upload: Arc<Upload<()>>,
 }
 
 impl Default for Transfers {
@@ -53,6 +92,7 @@ impl Transfers {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            uploads: Mutex::new(HashMap::new()),
         }
     }
 
@@ -69,7 +109,6 @@ impl Transfers {
             path,
             last_used: now,
             active: 0,
-            upload: Arc::new(Upload::new(())),
         };
         let mut entries = lock(&self.entries);
         // A URL nobody ever asks for is swept here, so a table no request reaches still lets go
@@ -95,7 +134,6 @@ impl Transfers {
             table: Arc::clone(self),
             id: id.to_owned(),
             path: entry.path.clone(),
-            upload: Arc::clone(&entry.upload),
         })
     }
 }
@@ -113,7 +151,6 @@ pub struct Admitted {
     table: Arc<Transfers>,
     id: String,
     path: PathBuf,
-    upload: Arc<Upload<()>>,
 }
 
 impl Admitted {
@@ -122,9 +159,27 @@ impl Admitted {
         &self.path
     }
 
-    /// Waits for the uploads already running against this entry.
-    pub async fn upload(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.upload.lock().await
+    /// Waits for writers to the same opened file, including writers using another capability,
+    /// a relative path, a symlink or a hard link. The caller keeps the file open through the
+    /// write, so its identity cannot be recycled while this guard is in use.
+    pub async fn upload(
+        &self,
+        file: &tokio::fs::File,
+    ) -> std::io::Result<tokio::sync::OwnedMutexGuard<()>> {
+        let identity = file_identity(file).await?;
+        let upload = {
+            let mut uploads = lock(&self.table.uploads);
+            uploads.retain(|_, entry| entry.strong_count() > 0);
+            match uploads.get(&identity).and_then(Weak::upgrade) {
+                Some(upload) => upload,
+                None => {
+                    let upload = Arc::new(Upload::new(()));
+                    uploads.insert(identity, Arc::downgrade(&upload));
+                    upload
+                }
+            }
+        };
+        Ok(upload.lock_owned().await)
     }
 }
 

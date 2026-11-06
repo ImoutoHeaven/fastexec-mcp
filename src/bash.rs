@@ -62,56 +62,8 @@ fn validate(path: &Path, ctx: &LaunchContext) -> Result<(), String> {
     if !path.is_file() {
         return Err("the file does not exist".to_string());
     }
-    let mut command = crate::process::quiet_command(path);
-    // The candidate is checked in the environment its tasks would get, not the server's own. Its
-    // directory is not part of the check: a session's starting directory can be gone by the time
-    // its first task starts, and discovery still has to find bash.
-    command
-        .env_clear()
-        .envs(ctx.env.iter().map(|(name, value)| (name, value)));
-    let mut child = command
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    // `--version` reads no startup files, but a broken candidate must not stall discovery: one
-    // deadline covers both its exit and the end of its stdout.
-    // ponytail: on timeout only the candidate is killed; a descendant it started is left alone.
-    let timeout = std::time::Duration::from_secs(5);
-    let deadline = std::time::Instant::now() + timeout;
-    let mut stdout = child.stdout.take().expect("piped");
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // A version banner is short; the cap bounds memory if a stray descendant keeps writing.
-        // Reading one byte past it tells a full cap apart from a real end of output.
-        let mut bytes = Vec::new();
-        let _ = std::io::Read::read_to_end(
-            &mut std::io::Read::take(&mut stdout, BANNER_LIMIT + 1),
-            &mut bytes,
-        );
-        let _ = tx.send(bytes);
-    });
-    let text = rx.recv_timeout(timeout);
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            break status;
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("--version did not finish within 5 s".to_string());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    let bytes = text.map_err(|_| "--version output stayed open past 5 s".to_string())?;
-    if !status.success() {
-        return Err(format!("--version failed ({status})"));
-    }
-    if bytes.len() as u64 > BANNER_LIMIT {
-        return Err("--version printed more than 4 KiB".to_string());
-    }
+    let bytes =
+        crate::process::bash_version(path, ctx, BANNER_LIMIT, std::time::Duration::from_secs(5))?;
     if String::from_utf8_lossy(&bytes).contains("GNU bash") {
         Ok(())
     } else {

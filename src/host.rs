@@ -70,10 +70,6 @@ pub fn main(args: &[OsString]) -> ! {
         let _ = status.write_all(&errno.to_le_bytes());
         std::process::exit(3);
     }
-    if status.write_all(&STARTUP_READY.to_le_bytes()).is_err() {
-        // The server is gone; nothing to run for.
-        std::process::exit(3);
-    }
     // The control socket is closed across exec again before bash starts: the server cleared that
     // flag only for the exec into this host.
     #[cfg(target_os = "macos")]
@@ -116,6 +112,44 @@ pub fn main(args: &[OsString]) -> ! {
         libc::sigemptyset(&mut none);
         libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
     }
+    // Every helper thread must exist before bash runs. If a thread limit is exhausted, a
+    // failed startup must not orphan a command that already detached from the host's group.
+    #[cfg(target_os = "macos")]
+    let tracker = {
+        let tracker = std::sync::Arc::new(std::sync::Mutex::new(crate::tree_macos::Tracker::new()));
+        let served = std::sync::Arc::clone(&tracker);
+        let serving = std::sync::Arc::clone(&control);
+        std::thread::Builder::new()
+            .name("fastexec-control".into())
+            .spawn(move || crate::tree_macos::serve(serving, served))
+            .unwrap_or_else(|error| fail_start(&mut status, error));
+        let ticking = std::sync::Arc::clone(&tracker);
+        std::thread::Builder::new()
+            .name("fastexec-track".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if let Ok(mut tracker) = ticking.lock() {
+                        tracker.tick();
+                    }
+                }
+            })
+            .unwrap_or_else(|error| fail_start(&mut status, error));
+        let tracked = std::sync::Arc::clone(&tracker);
+        std::thread::Builder::new()
+            .name("fastexec-lifeline".into())
+            .spawn(move || watch_macos(lifeline, tracked))
+            .unwrap_or_else(|error| fail_start(&mut status, error));
+        tracker
+    };
+    #[cfg(not(target_os = "macos"))]
+    std::thread::Builder::new()
+        .name("fastexec-lifeline".into())
+        .spawn(move || watch(lifeline))
+        .unwrap_or_else(|error| fail_start(&mut status, error));
+    if status.write_all(&STARTUP_READY.to_le_bytes()).is_err() {
+        std::process::exit(3);
+    }
     // macOS passes a third descriptor, so its bash arguments start one place later.
     #[cfg(target_os = "macos")]
     let tail = &args[4..];
@@ -139,38 +173,16 @@ pub fn main(args: &[OsString]) -> ! {
     let bash_start = crate::tree_macos::start_time(bash).unwrap_or(0);
     release_stdio();
     #[cfg(target_os = "macos")]
-    let tracker = {
-        let tracker = std::sync::Arc::new(std::sync::Mutex::new(crate::tree_macos::Tracker::new()));
-        let served = std::sync::Arc::clone(&tracker);
-        let serving = std::sync::Arc::clone(&control);
-        std::thread::spawn(move || crate::tree_macos::serve(serving, served));
-        // Members are observed while the tree runs, from the moment bash starts: a descendant that
-        // detaches or is orphaned later is already known, so it stays in the tree. The scan is one
-        // `proc_listallpids` and one `proc_pidinfo` per live process, every 100 ms.
-        let ticking = std::sync::Arc::clone(&tracker);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if let Ok(mut tracker) = ticking.lock() {
-                    tracker.tick();
-                }
-            }
-        });
-        tracker
-    };
-    // The tracker is live from here: the lifeline handler ends a macOS tree by the same members
-    // the server asks about, and the group last, all from inside the host that owns the tree.
-    #[cfg(target_os = "macos")]
-    {
-        let tracked = std::sync::Arc::clone(&tracker);
-        std::thread::spawn(move || watch_macos(lifeline, tracked));
-    }
-    #[cfg(not(target_os = "macos"))]
-    std::thread::spawn(move || watch(lifeline));
-    #[cfg(target_os = "macos")]
     wait_macos(bash, bash_start, &mut status, &tracker, &control);
     #[cfg(not(target_os = "macos"))]
     wait_linux(bash, &mut status);
+}
+
+/// Startup failure is reported before the readiness word; no command has been launched.
+fn fail_start(status: &mut File, error: std::io::Error) -> ! {
+    let code = error.raw_os_error().unwrap_or(libc::EIO) as u32;
+    let _ = status.write_all(&code.to_le_bytes());
+    std::process::exit(3);
 }
 
 /// Waits for the children on Linux: the host is the subreaper, so ECHILD means no descendant is

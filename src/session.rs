@@ -234,6 +234,9 @@ mod tests {
         )
     }
 
+    // Unix discovery runs under the real task-host binary, so the corresponding test lives
+    // at the MCP boundary in tests/mcp.rs rather than in this test-harness executable.
+    #[cfg(windows)]
     #[test]
     fn bash_is_found_while_the_starting_directory_is_gone() {
         let gone = std::env::temp_dir().join(format!("fastexec-gone-{}", std::process::id()));

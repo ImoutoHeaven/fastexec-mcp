@@ -14,7 +14,7 @@ ranges return an error before execution.
 | --- | --- | --- |
 | `exec` | the action table below | Runs bash commands as tasks. |
 | `read` | `path`, `offset`, `limit` | Shows a text file, or an image inline. |
-| `write` | `path`, `content` | Writes a file in place. |
+| `write` | `path`, `content` | Saves a complete replacement of a regular file. |
 | `edit` | `path`, `edits` | Applies exact text replacements to a UTF-8 file. |
 | `transfer` | `path` | Publishes one file at a URL, on an HTTP session. |
 
@@ -81,8 +81,21 @@ ranges return an error before execution.
   that is not a recognized image and has a NUL byte in its first `8` KiB, are
   refused; any other file decodes as text, lossily, with a note naming the
   replacements.
-- **`write`**: Writes `content` in place, creating missing parent directories,
-  and keeps the permissions of a file that exists.
+- **`write`**: Saves `content`, creating missing parent directories. Content is
+  staged in a private sibling file and synced before it replaces the destination,
+  so a failed content write leaves the original intact. The parent directory
+  must be writable. Existing owner, permissions, and access-control metadata
+  are preserved; symlinks keep their normal target semantics. Non-regular files
+  and files with multiple hard links are refused: use `exec` for a deliberate
+  in-place update of those files. On Windows, a caller unable to retain a
+  different owner or group gets an error before replacement. If native file
+  replacement and its rollback both fail, the original is retained at the
+  recovery path named in the error rather than deleting the only remaining copy.
+  macOS saves use native ACL APIs: private staging suppresses inherited grants
+  during creation, then owner, group, mode, and the complete original ACL are
+  restored together. A volume that ignores ownership or cannot provide the
+  required private staging and permission preservation is refused before
+  publication; `exec` remains available for an explicit in-place operation.
 - **`edit`**: Each `edits[]` entry is `{oldText, newText}`, matched against the
   original file, not against the result of an earlier entry. Every `oldText`
   must be unique in that file, counted over every start position including
@@ -90,9 +103,13 @@ ranges return an error before execution.
   before fuzzy normalization can hide them; near copies are also ambiguous.
   A sole exact and a sole fuzzy match must map to the same original target,
   allowing for the whitespace fuzzy matching trims. The file must be UTF-8; a
-  byte-order mark and the first line ending style are kept, only the matched
-  bytes are replaced, and the result names each replaced block's first line in
-  the file it produced, marking a block whose match needed normalizing.
+  byte-order mark and every unmatched byte are kept, including mixed CRLF, LF,
+  and CR line endings. Inserted text follows the file's first line ending style.
+  The result names each replaced block's first line in the file it produced,
+  marking a block whose match needed normalizing. Saving uses the same staged
+  replacement and file restrictions as `write`. Both `read` and `edit` validate
+  the opened file as regular; a FIFO cannot block `edit` while it holds the
+  server's file-mutation lock.
 - **Paths**: A path resolves against the session's working directory, accepts
   `~` for the home directory, or is a native absolute path (`C:/...` or
   `C:\...` on Windows; a Git Bash `/c/...` path is not one).
@@ -169,8 +186,13 @@ These fields describe `exec` results.
 ## 3. Logs, Terminal Emulator, and Transcript Spool
 
 - **Logs and retention**: In the default mode each task logs raw output to
-  `<temp>/fastexec-<uid>-<pid>/<taskId>.log` on Unix (`0700` dir, `0600` file)
-  or `<temp>\fastexec-<pid>\<taskId>.log` on Windows; `on` mode logs under
+  `<temp>/fastexec-<uid>-<pid>-<random>/<taskId>.log` on Unix (`0700` dir, `0600` file)
+  or `<temp>\fastexec-<pid>-<random>\<taskId>.log` on Windows (owner-only DACL).
+  The directory is reserved atomically and existing shared directories or links
+  are refused. On macOS, creation also suppresses inherited ACL entries; existing
+  runtime directories with ACL entries, or on volumes that ignore ownership, are
+  refused. Windows validates an existing directory's owner, DACL, and reparse
+  status. `on` mode logs under
   `<runtime root>/ns/<namespace>/logs/` (section 6). Each task log caps at `64`
   MiB, and all logs on a server cap at `1` GiB total (evicting oldest finished
   task logs first). Past a cap or write error, capture keeps draining output
@@ -180,9 +202,12 @@ These fields describe `exec` results.
   `64` running and `256` finished tasks, drops a finished task after `24` hours,
   and keeps task logs and transcripts under
   `<runtime root>/ns/<namespace>/logs/` (section 6). The default mode removes its
-  log directory on server shutdown and cleans up one left by a server whose PID
-  is gone; `on` mode empties the namespace's `logs/` directory at daemon start
-  while it holds that namespace's `daemon.lock`.
+  log directory on server shutdown. On Linux it cleans up stale private log
+  directories for dead PIDs only when the effective owner, permissions, and
+  resolved ancestor paths are safe. It retains unverifiable entries. On macOS
+  and Windows stale default-mode directories are retained until a safe
+  platform-specific cleanup is available. `on` mode empties the namespace's
+  `logs/` directory at daemon start while holding its `daemon.lock`.
 - **Live PTY emulator and continuous transcript spool**: Each UTF-8 PTY task
   feeds output bytes into an `alacritty_terminal` (`0.26.0`) instance at the
   task's size (`src/terminal.rs`, `src/frames.rs`) that answers terminal queries
@@ -196,6 +221,17 @@ These fields describe `exec` results.
   `--- normal screen ---`) are written as final lines once settled. A
   `transcript` call returns unseen final lines followed by current pending
   lines; pending lines may change on the next call.
+- **Bounded terminal state**: A rendered cell retains at most `32` user combining
+  characters, and transcript row markers are replaced and retired once the
+  grid no longer references them. OSC control strings are bounded at `8` KiB;
+  an oversized string is discarded through its terminator without becoming
+  visible text. Unused window titles, hyperlinks, and clipboard contents are
+  not retained. The raw task log still receives the original bytes under its
+  normal limits. Filtered bytes are mapped back to raw positions so a screen
+  read cannot consume output still held by a synchronized update. Kitty keyboard
+  modes have a separate `128`-entry saved stack for each screen; an overflow
+  drops the oldest saved mode while current-mode queries and restores continue
+  to work.
 
 ## 4. PTY Keys and Bundled ConPTY
 
@@ -212,12 +248,16 @@ These fields describe `exec` results.
   poll capped at `30000` ms) waits for stdin to accept prior bytes (up to `5` s).
   When input or another key precedes a key, the delay separates it from a paste.
   Zero sends input and keys together.
-- **Bundled ConPTY (`src/conpty.rs`)**: Windows x64 builds embed Microsoft
-  ConPTY `1.24.260710001` (`conpty.dll` and `OpenConsole.exe`, MIT), extract and
-  pin them read-only in `%TEMP%\fastexec-conpty-1.24.260710001`, and load
-  `conpty.dll` before opening the first PTY so terminal output passes through
-  without legacy Windows console re-rendering. If loading fails, system ConPTY
-  is used and transcript results warn that lines may be missing.
+- **Bundled ConPTY (`src/conpty.rs`)**: Windows x64 and arm64 builds embed Microsoft
+  ConPTY `1.24.260710001` (`conpty.dll` and `OpenConsole.exe`, MIT). Each process
+  extracts into a newly reserved owner-only directory named
+  `%TEMP%\fastexec-conpty-<version>-<arch>-<pid>-<random>` and pins the verified files
+  read-only. The next process retires private copies whose owning process ended.
+  The exact verified DLL handle supplies the console API, and dependencies are searched
+  only in its private directory and System32. Loading happens before the first PTY so
+  terminal output passes through without legacy Windows console re-rendering. If loading
+  fails, the already loaded system kernel supplies ConPTY; CWD and PATH are never searched
+  for a replacement DLL. Transcript results warn that lines may be missing on that fallback.
 
 ## 5. Bash Launch and Process-Tree Ownership
 
@@ -229,7 +269,11 @@ These fields describe `exec` results.
   and `PYTHONIOENCODING=utf-8`; pipe mode also sets `TERM=dumb`, `NO_COLOR=1`,
   `CLICOLOR=0`, `FORCE_COLOR=0`, `EDITOR=true`, `VISUAL=true`,
   `GIT_EDITOR=true`, and `GIT_TERMINAL_PROMPT=0`, whereas PTY mode sets
-  `TERM=xterm-256color`.
+  `TERM=xterm-256color`. Bash discovery's `--version` probe uses the same
+  process-tree ownership as a task, with nonblocking output, a `4` KiB banner
+  limit, a `5` second deadline, and cleanup of descendants on every outcome.
+  Task workers and startup reapers are reserved before launching processes;
+  allocation failures return errors without admitting an untracked running task.
 - **Tree ownership (`src/process.rs`, `src/host.rs`)**:
   - **Windows**: Runs each task inside a Job Object with
     `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and breakaway disabled, because Git
@@ -351,8 +395,13 @@ These fields describe `exec` results.
   preflights and CORS response headers are not provided. HTTP sessions run with
   the daemon's own environment, and the `10` minute
   inactivity TTL expires idle ones without bounding their count or memory.
-  Streamed responses carry `X-Accel-Buffering: no`, which a proxy reads as the
-  instruction not to buffer them.
+  The HTTP listener admits at most `128` concurrent connections and allows
+  `10` seconds to receive request headers. Extra connections are closed without
+  queueing; management through the local daemon socket has its own capacity.
+  This header deadline does not impose a total timeout on uploads, SSE, or
+  long tool calls. Invalid HTTP syntax and ordinary client disconnects do not
+  append one error-log entry per request. Streamed responses carry
+  `X-Accel-Buffering: no`, which tells a proxy not to buffer them.
 - **Transfer route**: `/t/<capability id>` serves one file without the bearer
   token, which is what makes a URL usable by `curl`; the `transfer` tool mints
   the id and builds the URL from `FASTEXEC_PUBLIC_URL` when the daemon was
@@ -362,8 +411,13 @@ These fields describe `exec` results.
   `416` and ignoring any other form, so the whole file comes back with `200`.
   `HEAD` answers the current size. `PUT` writes the body at `?offset=` (default
   `0`), truncating the file to that offset before reading the body, refusing an
-  offset past the end with `409`, keeping the bytes of a body that disconnects,
-  and answering the new size. Any other method answers `405` with `Allow`.
+  offset past the end with `409`, and answering the new size on success. A
+  truncated or malformed body returns `400`; the received prefix is retained,
+  so `HEAD` and a later upload can resume from the actual size. Uploads to the
+  same open file identity serialize even across distinct capability URLs,
+  symlinks, and hard links; uploads to different files remain independent. A
+  disconnected upload waiting for that lock releases its open file and waiter.
+  Any other method answers `405` with `Allow`.
   Replies carry `Cache-Control: no-store`, `Content-Type:
   application/octet-stream`, and `X-Accel-Buffering: no`. `/t/` is answered
   before the bearer check and before the `4` MiB body cap that applies to

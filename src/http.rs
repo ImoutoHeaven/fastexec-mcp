@@ -13,7 +13,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, SessionConfig};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -28,9 +28,15 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 /// The largest request body the daemon reads: a call carries its arguments, not a file.
 pub const LIMIT: usize = 4 << 20;
+/// HTTP has its own connection budget, so unauthenticated peers cannot consume the daemon
+/// socket's management capacity or exhaust the process's file descriptors.
+const MAX_CONNECTIONS: usize = 128;
+/// Only request headers are timed: streaming bodies, SSE and long tool calls may take longer.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The value that names the address clients reach, when a proxy stands in front of the listener.
 pub const PUBLIC_URL: &str = "FASTEXEC_PUBLIC_URL";
@@ -267,6 +273,7 @@ pub async fn serve(
         table,
         inner,
     };
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             _ = stopped.cancelled() => break,
@@ -279,15 +286,27 @@ pub async fn serve(
                         continue;
                     }
                 };
+                // Never queue a task waiting for a slot: that would move the unbounded
+                // allocation from sockets into futures. The accepted socket is dropped at once.
+                let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                    continue;
+                };
                 let layer = layer.clone();
+                let stopped = stopped.clone();
                 tokio::spawn(async move {
-                    let served = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(layer))
-                        .await;
-                    // A client that hangs up mid-request is ordinary; anything else is worth the
-                    // log, which is the only place an HTTP fault shows.
+                    let _permit = permit;
+                    let mut builder = http1::Builder::new();
+                    builder.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT);
+                    let served = tokio::select! {
+                        _ = stopped.cancelled() => return,
+                        served = builder.serve_connection(
+                            TokioIo::new(stream), TowerToHyperService::new(layer)
+                        ) => served,
+                    };
+                    // Malformed or abandoned unauthenticated requests are ordinary client
+                    // faults. Logging each one would let a peer fill the daemon's error log.
                     if let Err(error) = served
-                        && !disconnect(&error)
+                        && !client_fault(&error)
                     {
                         eprintln!("fastexec: an HTTP connection failed: {error}");
                     }
@@ -350,8 +369,12 @@ pub fn remote_allowed() -> bool {
     std::env::var("FASTEXEC_HTTP_ALLOW_REMOTE").is_ok_and(|value| value == "1")
 }
 
-/// A connection error that is the client going away rather than the daemon failing.
-fn disconnect(error: &hyper::Error) -> bool {
+/// An invalid request, an idle peer or a disconnected client is not a server failure. Actual
+/// transport/storage faults still reach the daemon log instead of disappearing with them.
+fn client_fault(error: &hyper::Error) -> bool {
+    if error.is_parse() || error.is_incomplete_message() || error.is_timeout() {
+        return true;
+    }
     use std::error::Error;
     let mut source: Option<&(dyn Error + 'static)> = Some(error);
     while let Some(current) = source {
@@ -433,7 +456,11 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
 
 /// A refusal with no body, so nothing about why is said to a caller that was not admitted.
 fn refusal(status: StatusCode, challenge: &str) -> Reply {
-    let mut builder = Response::builder().status(status);
+    // The rejected request's body is deliberately unread. Closing prevents a peer from
+    // keeping a connection occupied forever by declaring a body and never sending it.
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONNECTION, "close");
     if !challenge.is_empty() {
         builder = builder.header(header::WWW_AUTHENTICATE, challenge);
     }
@@ -610,46 +637,77 @@ async fn transfer_put(request: Request<Incoming>, admitted: Admitted) -> Reply {
         Ok(offset) => offset,
         Err(()) => return transfer_empty(StatusCode::BAD_REQUEST, &[]),
     };
+    // A disconnected request waiting for another upload must release its file descriptor and
+    // its place in the lock queue. Keep preparation in this handler, whose drop cancels it.
+    let target = match prepare_upload(&admitted, offset).await {
+        Ok(target) => target,
+        Err(reply) => return reply,
+    };
     let body = request.into_body();
-    // The writer runs as a task of its own. A client that hangs up drops this handler before the
-    // bytes it already sent are flushed, and the lock must be released only after they are.
-    let task = tokio::spawn(async move { write_upload(admitted, offset, body).await });
+    // Only an actual writer is detached: a disconnect must not drop a write before its accepted
+    // bytes are flushed, or release the lock while that flush is still in flight.
+    let task = tokio::spawn(async move { write_upload(admitted, target, offset, body).await });
     match task.await {
         Ok(reply) => reply,
         Err(_) => transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
     }
 }
 
-/// Writes one part into the entry's file, from `offset` on, and answers its new size.
-async fn write_upload(admitted: Admitted, offset: u64, mut body: Incoming) -> Reply {
-    let _turn = admitted.upload().await;
+/// An opened file and the upload turn that protects its contents until the final flush.
+struct UploadFile {
+    file: tokio::fs::File,
+    turn: tokio::sync::OwnedMutexGuard<()>,
+}
+
+async fn prepare_upload(admitted: &Admitted, offset: u64) -> Result<UploadFile, Reply> {
     let path = admitted.path().to_path_buf();
     match presence(&path).await {
-        Presence::File(size) if offset > size => return transfer_empty(StatusCode::CONFLICT, &[]),
-        Presence::NotAFile => return transfer_empty(StatusCode::CONFLICT, &[]),
-        Presence::Failed => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
-        Presence::Missing if offset > 0 => return transfer_empty(StatusCode::CONFLICT, &[]),
+        Presence::NotAFile => return Err(transfer_empty(StatusCode::CONFLICT, &[])),
+        Presence::Failed => return Err(transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[])),
+        Presence::Missing if offset > 0 => return Err(transfer_empty(StatusCode::CONFLICT, &[])),
         Presence::Missing => {
             let parent = path.parent().map(Path::to_path_buf);
             if let Some(parent) = parent
                 && !parent.as_os_str().is_empty()
                 && tokio::fs::create_dir_all(&parent).await.is_err()
             {
-                return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]);
+                return Err(transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]));
             }
         }
         Presence::File(_) => {}
     }
-    let opened = tokio::fs::OpenOptions::new()
+    // Opening without truncation lets aliases discover the same file identity, including a
+    // file which did not exist when its URLs were minted. All mutations happen under its lock.
+    let file = tokio::fs::OpenOptions::new()
         .write(true)
-        .create(true)
+        .create(offset == 0)
         .truncate(false)
         .open(&path)
-        .await;
-    let mut file = match opened {
-        Ok(file) => file,
-        Err(_) => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
-    };
+        .await
+        .map_err(|_| transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]))?;
+    let turn = admitted
+        .upload(&file)
+        .await
+        .map_err(|_| transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]))?;
+    match file.metadata().await {
+        Ok(metadata) if metadata.is_file() && offset <= metadata.len() => {}
+        Ok(_) => return Err(transfer_empty(StatusCode::CONFLICT, &[])),
+        Err(_) => return Err(transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[])),
+    }
+    Ok(UploadFile { file, turn })
+}
+
+/// Writes one part into the entry's file, from `offset` on, and answers its new size.
+async fn write_upload(
+    _admitted: Admitted,
+    target: UploadFile,
+    offset: u64,
+    mut body: Incoming,
+) -> Reply {
+    let UploadFile {
+        mut file,
+        turn: _turn,
+    } = target;
     // The part replaces whatever followed `offset`, and nothing of the body is read before that.
     if file.set_len(offset).await.is_err()
         || file.seek(std::io::SeekFrom::Start(offset)).await.is_err()
@@ -659,11 +717,16 @@ async fn write_upload(admitted: Admitted, offset: u64, mut body: Incoming) -> Re
     // A write that fails is remembered to the end: a later flush can succeed on its own and must
     // not turn a rejected part into a success.
     let mut refused = false;
+    let mut incomplete = false;
     while let Some(frame) = body.frame().await {
         let frame = match frame {
             Ok(frame) => frame,
-            // A body that ends early keeps the bytes it did send: HEAD reports them.
-            Err(_) => break,
+            // Keep the accepted prefix for HEAD/resume, but an invalid chunk or a premature
+            // EOF is not a successful upload of the body the client declared.
+            Err(_) => {
+                incomplete = true;
+                break;
+            }
         };
         if let Some(data) = frame.data_ref() {
             // Each accepted part is flushed before the next frame is waited for, so a body that
@@ -679,6 +742,9 @@ async fn write_upload(admitted: Admitted, offset: u64, mut body: Incoming) -> Re
     let size = file.metadata().await.map(|metadata| metadata.len());
     drop(file);
     match size {
+        Ok(_) if !refused && flushed.is_ok() && incomplete => {
+            transfer_empty(StatusCode::BAD_REQUEST, &[])
+        }
         Ok(size) if !refused && flushed.is_ok() => transfer_text(StatusCode::OK, size.to_string()),
         // The disk refused part of the upload, or its size cannot be read: nothing to report.
         _ => transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
@@ -734,6 +800,10 @@ fn transfer_response(status: StatusCode, length: Option<u64>) -> http::response:
 
 fn transfer_empty(status: StatusCode, extra: &[(&str, &str)]) -> Reply {
     let mut builder = transfer_response(status, None);
+    if status.is_client_error() || status.is_server_error() {
+        // A refused capability or upload may also have a body the route did not consume.
+        builder = builder.header(header::CONNECTION, "close");
+    }
     for (name, value) in extra {
         builder = builder.header(*name, *value);
     }

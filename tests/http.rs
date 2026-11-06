@@ -1,6 +1,9 @@
 //! The daemon's Streamable HTTP front door, driven over a socket the way a client that speaks
 //! MCP over HTTP does: one request per connection, and an answer read back as it arrives.
 
+#[cfg(windows)]
+mod support;
+
 use serde_json::{Value, json};
 use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -27,6 +30,8 @@ struct Fixture {
     /// The public root this fixture's daemon is started with, when a case names one. It is set on
     /// this fixture's own commands only: no case changes the environment of the test process.
     public_url: Option<String>,
+    /// An explicitly chosen launch directory for path-alias regression tests.
+    cwd: Option<PathBuf>,
     /// The turn this fixture holds until it ends: held, never read.
     #[allow(dead_code)]
     starting: std::sync::MutexGuard<'static, ()>,
@@ -59,11 +64,15 @@ impl Fixture {
         let runtime =
             std::env::temp_dir().join(format!("fastexec-http-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&runtime);
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
         #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(&runtime).unwrap();
+        {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(&runtime).unwrap();
+        }
+        #[cfg(windows)]
+        support::create_private_runtime(&runtime);
         // The turn is taken before the fixture exists, so a start that panics still cleans up with
         // it held.
         let starting = STARTING.lock().unwrap_or_else(|error| error.into_inner());
@@ -74,6 +83,7 @@ impl Fixture {
             token: random_token(),
             pid: std::cell::Cell::new(None),
             public_url: None,
+            cwd: None,
             starting,
         }
     }
@@ -106,6 +116,9 @@ impl Fixture {
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
             .env_remove("FASTEXEC_TEST_NONE_LIMIT")
             .stdin(std::process::Stdio::null());
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
         match &self.public_url {
             Some(root) => command.env("FASTEXEC_PUBLIC_URL", root),
             None => command.env_remove("FASTEXEC_PUBLIC_URL"),
@@ -1508,4 +1521,410 @@ fn a_refused_disk_write_is_not_acknowledged_as_success() {
     );
     assert_eq!(put.status, 500, "{}", put.body);
     assert!(put.bytes.is_empty());
+}
+
+/// Opens a PUT whose first three bytes have arrived but whose body is not yet complete.
+fn begin_paused_upload(addr: SocketAddr, target: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let headers = format!(
+        "PUT {target} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 6\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(headers.as_bytes()).unwrap();
+    stream.write_all(b"AAA").unwrap();
+    stream.flush().unwrap();
+    stream
+}
+
+fn finish_paused_upload(mut stream: TcpStream) -> Response {
+    stream.write_all(b"CCC").unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    parse(&response)
+}
+
+/// Two capabilities may name the very same file. Neither upload may truncate or overwrite the
+/// other while it is still streaming, even though the callers use different path spellings.
+fn check_serial_uploads(fixture: &Fixture, first: &str, second: &str, file: &Path) {
+    let paused = begin_paused_upload(fixture.addr, first);
+    // Existing alias fixtures contain three bytes too ("old"). A HEAD length of three can
+    // therefore be observed before this PUT acquires the lock. Wait for its actual write.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let contents = std::fs::read(file);
+        if matches!(&contents, Ok(bytes) if bytes == b"AAA") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first upload did not write its prefix to {}: {contents:?}",
+            file.display(),
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let mut stream = TcpStream::connect(fixture.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let request = format!(
+        "PUT {second} HTTP/1.1\r\nHost: {}\r\nContent-Length: 3\r\nConnection: close\r\n\r\nBBB",
+        fixture.addr,
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    let (send_result, result) = std::sync::mpsc::channel();
+    let reading = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = stream.read_to_end(&mut bytes);
+        let _ = send_result.send((read, bytes));
+    });
+    let early = result.recv_timeout(Duration::from_millis(250));
+    let waited = matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+    // Finish both requests before asserting, so a failed check never leaves a writer stranded.
+    let first_reply = finish_paused_upload(paused);
+    let (read, bytes) = match early {
+        Ok(reply) => reply,
+        Err(_) => result.recv_timeout(Duration::from_secs(10)).unwrap(),
+    };
+    reading.join().unwrap();
+    read.unwrap();
+    let second_reply = parse(&bytes);
+    assert_eq!(first_reply.status, 200, "{}", first_reply.body);
+    assert_eq!(second_reply.status, 200, "{}", second_reply.body);
+    assert!(
+        waited,
+        "the second capability overwrote a still-active upload"
+    );
+    assert_eq!(std::fs::read(file).unwrap(), b"BBB");
+}
+
+#[test]
+fn transfer_uploads_to_one_file_serialize_across_capabilities_and_aliases() {
+    let mut fixture = Fixture::bare("transfer-file-identity");
+    fixture.cwd = Some(fixture.runtime.clone());
+    fixture.start();
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    // A previously missing file gets two IDs; opening it must not give each upload its own lock.
+    let file = published(&fixture, "same.bin");
+    let first = target_of(&publish(&mut client, &file));
+    let second = target_of(&publish(&mut client, &file));
+    assert_ne!(first, second);
+    check_serial_uploads(&fixture, &first, &second, &file);
+
+    let file = published(&fixture, "relative.bin");
+    let first = target_of(&publish(&mut client, &file));
+    let second = target_of(&publish(&mut client, Path::new("published/relative.bin")));
+    check_serial_uploads(&fixture, &first, &second, &file);
+
+    #[cfg(unix)]
+    {
+        // A symlinked directory also aliases a file that does not exist at publication time.
+        let alias_dir = fixture.runtime.join("alias-dir");
+        std::os::unix::fs::symlink(fixture.runtime.join("published"), &alias_dir).unwrap();
+        let file = published(&fixture, "symlink-dir.bin");
+        let first = target_of(&publish(&mut client, &file));
+        let second = target_of(&publish(&mut client, &alias_dir.join("symlink-dir.bin")));
+        check_serial_uploads(&fixture, &first, &second, &file);
+
+        let file = published(&fixture, "symlink-file.bin");
+        std::fs::write(&file, b"old").unwrap();
+        let alias = fixture.runtime.join("file-link");
+        std::os::unix::fs::symlink(&file, &alias).unwrap();
+        let first = target_of(&publish(&mut client, &file));
+        let second = target_of(&publish(&mut client, &alias));
+        check_serial_uploads(&fixture, &first, &second, &file);
+    }
+
+    // Hard links share content even though canonicalizing their paths yields different names.
+    let file = published(&fixture, "hardlink.bin");
+    std::fs::write(&file, b"old").unwrap();
+    let alias = fixture.runtime.join("hardlink-alias");
+    std::fs::hard_link(&file, &alias).unwrap();
+    let first = target_of(&publish(&mut client, &file));
+    let second = target_of(&publish(&mut client, &alias));
+    check_serial_uploads(&fixture, &first, &second, &file);
+}
+
+#[test]
+fn transfer_uploads_to_different_files_do_not_wait_for_each_other() {
+    let fixture = Fixture::new("transfer-independent");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let first_file = published(&fixture, "first.bin");
+    let second_file = published(&fixture, "second.bin");
+    let first = target_of(&publish(&mut client, &first_file));
+    let second = target_of(&publish(&mut client, &second_file));
+    let paused = begin_paused_upload(fixture.addr, &first);
+    assert_eq!(wait_for_size(fixture.addr, &first, 3), 3);
+    let response = send(fixture.addr, "PUT", &second, "", b"independent");
+    let first_reply = finish_paused_upload(paused);
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(first_reply.status, 200, "{}", first_reply.body);
+    assert_eq!(std::fs::read(&first_file).unwrap(), b"AAACCC");
+    assert_eq!(std::fs::read(&second_file).unwrap(), b"independent");
+}
+
+#[test]
+fn http_idle_connections_are_bounded_and_capacity_recovers() {
+    let fixture = Fixture::new("http-connection-limit");
+    let mut held = Vec::new();
+    for _ in 0..128 {
+        let mut stream = TcpStream::connect(fixture.addr).unwrap();
+        stream.write_all(b"G").unwrap();
+        held.push(stream);
+    }
+    let mut excess = TcpStream::connect(fixture.addr).unwrap();
+    excess
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    // The limit is before authentication and before parsing, so this request is refused as a
+    // connection instead of being served while all 128 existing connections remain admitted.
+    let request = format!(
+        "GET /mcp HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        fixture.addr
+    );
+    let _ = excess.write_all(request.as_bytes());
+    let mut bytes = Vec::new();
+    let ended = excess.read_to_end(&mut bytes);
+    assert!(
+        matches!(ended, Ok(0))
+            || ended.is_err_and(|error| matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            )),
+        "an excess unauthenticated connection was not closed: {:?}",
+        String::from_utf8_lossy(&bytes),
+    );
+    // HTTP pressure must not prevent the local management connection from working.
+    let (code, out, err) = fixture.run(&["daemon", "status"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("http"), "{out}");
+    drop(held);
+    // A closed connection hands its slot back promptly, not at a sweep ten minutes later.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut stream = TcpStream::connect(fixture.addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        if stream.write_all(request.as_bytes()).is_ok()
+            && stream.read_to_end(&mut bytes).is_ok()
+            && bytes.starts_with(b"HTTP/1.1 401")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "released HTTP capacity never recovered"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn http_incomplete_headers_time_out() {
+    let fixture = Fixture::new("http-header-timeout");
+    let mut stream = TcpStream::connect(fixture.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(14)))
+        .unwrap();
+    stream.write_all(b"POST /mcp HTTP/1.1\r\nHost: ").unwrap();
+    let mut bytes = Vec::new();
+    let ended = stream.read_to_end(&mut bytes);
+    assert!(
+        ended.is_ok()
+            || ended.is_err_and(|error| matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            )),
+        "an incomplete unauthenticated header held the connection past its deadline",
+    );
+    assert_eq!(send(fixture.addr, "GET", "/mcp", "", b"").status, 401);
+}
+
+#[test]
+fn http_unauthorized_incomplete_bodies_do_not_hold_a_connection() {
+    let fixture = Fixture::new("http-rejected-body");
+    let mut stream = TcpStream::connect(fixture.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nContent-Length: 1000\r\n\r\n",
+        fixture.addr,
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .expect("an unauthorized body was not drained indefinitely");
+    let response = parse(&bytes);
+    assert_eq!(response.status, 401);
+    assert_eq!(response.header("connection"), Some("close"));
+}
+
+#[test]
+fn http_a_long_tool_call_outlives_the_header_deadline() {
+    let fixture = Fixture::new("http-long-tool-call");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let result = client.call_tool(
+        "exec",
+        json!({
+            "action": "start", "command": "sleep 12\nprintf after-header-deadline", "waitMs": 15000,
+        }),
+    );
+    assert_ne!(result["isError"], json!(true), "{result}");
+    assert_eq!(
+        result["structuredContent"]["exitCode"],
+        json!(0),
+        "{result}"
+    );
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("after-header-deadline"),
+        "{result}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn disconnected_uploads_waiting_for_the_same_file_release_their_descriptors() {
+    let fixture = Fixture::new("transfer-cancelled-queue");
+    let pid = fixture.pid.get().expect("the fixture started a daemon");
+    let descriptors = || {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .count()
+    };
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let file = published(&fixture, "paused.bin");
+    let target = target_of(&publish(&mut client, &file));
+    let paused = begin_paused_upload(fixture.addr, &target);
+    assert_eq!(wait_for_size(fixture.addr, &target, 3), 3);
+    // Wait for the HEAD request's descriptor to be closed before taking the baseline.
+    std::thread::sleep(Duration::from_millis(30));
+    let active = descriptors();
+    for _ in 0..16 {
+        let before = descriptors();
+        let mut stream = TcpStream::connect(fixture.addr).unwrap();
+        let request = format!(
+            "PUT {target} HTTP/1.1\r\nHost: {}\r\nContent-Length: 3\r\nConnection: close\r\n\r\nBBB",
+            fixture.addr,
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // The new socket and file must both exist: closing a request before the server read its
+        // headers would not exercise cancellation of an upload already queued for the lock.
+        while descriptors() < before + 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            descriptors() >= before + 2,
+            "the upload did not reach the file lock"
+        );
+        drop(stream);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while descriptors() > active + 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let remaining = descriptors();
+    let finished = finish_paused_upload(paused);
+    assert_eq!(finished.status, 200);
+    assert!(
+        remaining <= active + 2,
+        "closed requests retained file descriptors behind a slow upload: {active} -> {remaining}"
+    );
+    assert_eq!(std::fs::read(file).unwrap(), b"AAACCC");
+}
+
+#[test]
+fn malformed_or_truncated_upload_bodies_keep_the_prefix_but_are_not_successful() {
+    let fixture = Fixture::new("transfer-invalid-body");
+    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    client.initialize();
+    let file = published(&fixture, "partial.bin");
+    let target = target_of(&publish(&mut client, &file));
+    for (framing, body) in [
+        ("Transfer-Encoding: chunked", &b"3\r\nABC\r\nBOGUS\r\n"[..]),
+        ("Content-Length: 10", &b"ABC"[..]),
+    ] {
+        std::fs::write(&file, b"old contents").unwrap();
+        let mut stream = TcpStream::connect(fixture.addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let headers = format!(
+            "PUT {target} HTTP/1.1\r\nHost: {}\r\n{framing}\r\nConnection: close\r\n\r\n",
+            fixture.addr,
+        );
+        stream.write_all(headers.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        let response = parse(&bytes);
+        assert_eq!(response.status, 400, "{framing}: {}", response.body);
+        assert_eq!(wait_for_size(fixture.addr, &target, 3), 3);
+        assert_eq!(std::fs::read(&file).unwrap(), b"ABC");
+        // The failed transfer is still resumable from its acknowledged prefix.
+        let resumed = send(
+            fixture.addr,
+            "PUT",
+            &format!("{target}?offset=3"),
+            "",
+            b"DEF",
+        );
+        assert_eq!(resumed.status, 200, "{}", resumed.body);
+        assert_eq!(std::fs::read(&file).unwrap(), b"ABCDEF");
+    }
+}
+
+#[test]
+fn malformed_http_requests_do_not_grow_the_daemon_error_log() {
+    let fixture = Fixture::new("http-malformed-log");
+    let log = std::fs::read_dir(fixture.runtime.join("ns"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("daemon.log"))
+        .find(|path| path.is_file())
+        .expect("the fixture owns one daemon log");
+    let before = std::fs::metadata(&log).unwrap().len();
+    for _ in 0..32 {
+        let invalid = exchange(
+            fixture.addr,
+            b"G\0T /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert_eq!(invalid.status, 400);
+        let mut abandoned = TcpStream::connect(fixture.addr).unwrap();
+        abandoned
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        abandoned.write_all(b"GET /mcp HTTP/1.1\r\nHost: ").unwrap();
+        abandoned.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut bytes = Vec::new();
+        let _ = abandoned.read_to_end(&mut bytes);
+    }
+    assert_eq!(send(fixture.addr, "GET", "/mcp", "", b"").status, 401);
+    std::thread::sleep(Duration::from_millis(50));
+    let after = std::fs::metadata(log).unwrap().len();
+    assert_eq!(
+        after, before,
+        "unauthenticated parse failures amplified into persistent error logs"
+    );
 }

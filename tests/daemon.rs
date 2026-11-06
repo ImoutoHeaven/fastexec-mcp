@@ -2,6 +2,9 @@
 //! directory of the test's own; and the MCP endpoint in `on` mode, which forwards every call to
 //! that daemon.
 
+#[cfg(windows)]
+mod support;
+
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Write};
@@ -26,12 +29,15 @@ struct Fixture {
 /// Creates a runtime directory the production code accepts: mode 0700 on Unix.
 fn create_root(path: &Path) {
     let _ = std::fs::remove_dir_all(path);
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(path).unwrap();
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(path).unwrap();
+    }
+    #[cfg(windows)]
+    support::create_private_runtime(path);
 }
 
 impl Fixture {

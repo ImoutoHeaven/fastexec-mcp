@@ -1296,20 +1296,33 @@ fn pty_keys_follow_the_kitty_keyboard_protocol_the_program_pushes() {
 }
 
 #[test]
-fn a_terminal_emulator_failure_leaves_the_output_flowing() {
+fn keyboard_stack_overflow_keeps_screen_keys_and_output_working() {
     let mut server = Server::start();
-    // alacritty_terminal 0.26 panics past 4096 kitty keyboard pushes.
+    // This used to trigger alacritty_terminal 0.26's 4097th-push panic. The bounded wrapper
+    // must leave both raw output and the emulator's screen and keyboard modes usable.
     let command = "printf '\\033[>1u%.0s' $(seq 1 4097); printf 'alive\\r\\n'; read -r x; printf 'done\\r\\n'";
     let (_, text) = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["alive"]}}));
     assert!(text.contains("alive"), "{text}");
-    let (_, text, is_error) =
-        server.call(json!({"action": "poll", "taskId": server.id(1), "keys": ["Enter"]}));
-    assert!(is_error && text.contains("stopped"), "{text}");
+    let (out, screen) = server.ok(json!({
+        "action": "poll", "taskId": server.id(1), "screen": true, "waitMs": 0
+    }));
+    assert_eq!(out["state"], "running", "{screen}");
+    assert!(
+        screen.split("\n\n[").next().unwrap().contains("alive"),
+        "{screen}"
+    );
     let (out, text) = server.ok(json!({
-        "action": "poll", "taskId": server.id(1), "input": "\r", "waitMs": 10000
+        "action": "poll", "taskId": server.id(1), "keys": ["Enter"], "waitMs": 10000
     }));
     assert_eq!(out["state"], "exited", "{text}");
     assert!(text.contains("done"), "{text}");
+    let (_, transcript) = server.ok(json!({
+        "action": "transcript", "taskId": server.id(1), "truncate": "none"
+    }));
+    assert!(
+        transcript.contains("alive") && transcript.contains("done"),
+        "{transcript}"
+    );
 }
 
 #[test]
@@ -1531,8 +1544,8 @@ fn screen_appears_and_gone_compare_with_the_screen_before_the_input() {
 fn screen_and_transcript_render_the_same_terminal() {
     let mut server = Server::start();
     // Each row needs the terminal to act on a sequence: REP repeats the last character, IRM
-    // inserts, a combining mark joins its base, a wide character fills two columns, combining
-    // marks all stack on their cell (DEL between them moves nothing), a tab
+    // inserts, a combining mark joins its base, a wide character fills two columns, excessive
+    // combining marks stop at the per-cell budget (DEL between them moves nothing), a tab
     // moves to its stop, and deleting the first half of a wide character leaves a blank.
     let command = concat!(
         "printf 'rep x\\033[4b\\r\\n'; ",
@@ -1546,7 +1559,7 @@ fn screen_and_transcript_render_the_same_terminal() {
         "rep xxxxx".to_string(),
         "irm aZbc".to_string(),
         "mix e\u{301} 中文!".to_string(),
-        format!("cap e{}", "\u{301}".repeat(40)),
+        format!("cap e{}", "\u{301}".repeat(32)),
         "tab a   b".to_string(),
         "dch  a".to_string(),
     ]
@@ -1566,6 +1579,17 @@ fn screen_and_transcript_render_the_same_terminal() {
         "screen: {text}"
     );
     assert_eq!(out["cursor"], json!([7, 1]), "{text}");
+    #[cfg(unix)]
+    {
+        // The rendering cap must not alter the bytes captured from the Unix PTY.
+        let raw = std::fs::read(out["logPath"].as_str().unwrap()).unwrap();
+        let full_run = format!("cap e{}", "\u{301}\u{7f}".repeat(40));
+        assert!(
+            raw.windows(full_run.len())
+                .any(|bytes| bytes == full_run.as_bytes()),
+            "all 40 original marks and DEL bytes must remain in the raw log"
+        );
+    }
     let (_, text) =
         server.ok(json!({"action": "transcript", "taskId": server.id(1), "truncate": "none"}));
     assert_eq!(
@@ -4018,4 +4042,213 @@ fn sustained_output_through_resizes_keeps_every_line() {
         started.elapsed()
     );
     let _ = std::fs::remove_file(&done);
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_discovery_still_works_after_the_session_directory_is_removed() {
+    let gone = Scratch::new("gone-launch-cwd");
+    std::fs::create_dir(&*gone).unwrap();
+    let mut server = Server::start_with(|command| {
+        command.current_dir(&*gone);
+    });
+    std::fs::remove_dir(&*gone).unwrap();
+    let cwd = std::env::temp_dir();
+    let (result, text) = server.ok(json!({
+        "action": "start", "command": "printf discovered", "cwd": cwd,
+        "loginShell": false, "waitMs": 10000
+    }));
+    assert_eq!(result["exitCode"], 0, "{text}");
+    assert!(text.starts_with("discovered"), "{text}");
+    // The successful discovery is cached, and later tasks still work from an explicit cwd.
+    let (result, text) = server.ok(json!({
+        "action": "start", "command": "printf cached", "cwd": cwd,
+        "loginShell": false, "waitMs": 10000
+    }));
+    assert_eq!(result["exitCode"], 0, "{text}");
+    assert!(text.starts_with("cached"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_version_probes_end_background_children_on_success_error_and_timeout() {
+    use std::os::unix::fs::PermissionsExt;
+    for (name, finish, should_succeed) in [
+        ("success", "exit 0", true),
+        ("failure", "exit 7", false),
+        ("timeout", "sleep 30", false),
+        ("large", "head -c 5000 /dev/zero; exit 0", false),
+    ] {
+        let dir = Scratch::new(&format!("bash-probe-{name}"));
+        std::fs::create_dir(&*dir).unwrap();
+        let wrapper = dir.join("bash");
+        let beat = dir.join("beat");
+        // A bounded heartbeat keeps stdout open after the version root exits. It is part of
+        // the probe's tree even though no user-visible Task exists for a failed discovery.
+        std::fs::write(&wrapper, format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then\n (for i in $(seq 300); do printf x >> '{}'; sleep 0.1; done) &\n while [ ! -s '{}' ]; do sleep 0.01; done\n printf 'GNU bash, version 5.2\\n'\n {finish}\nfi\nexec /bin/bash \"$@\"\n",
+            beat.display(), beat.display()
+        )).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut server = Server::start_with(|command| {
+            command.env("FASTEXEC_BASH", &wrapper);
+        });
+        let began = Instant::now();
+        let (_, text, is_error) = server.call(json!({
+            "action": "start", "command": "printf tested", "loginShell": false, "waitMs": 10000
+        }));
+        assert_eq!(!is_error, should_succeed, "{name}: {text}");
+        assert!(
+            began.elapsed() < Duration::from_secs(15),
+            "{name}: discovery was unbounded"
+        );
+        assert!(
+            file_len(&beat) > 0,
+            "{name}: the background child did not start"
+        );
+        assert_stops_growing(&beat);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bash_version_probe_owns_a_child_that_detaches_its_session() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Scratch::new("bash-probe-detached");
+    std::fs::create_dir(&*dir).unwrap();
+    let wrapper = dir.join("bash");
+    let beat = dir.join("beat");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n perl -MPOSIX -e 'exit if fork; POSIX::setsid() or die \"setsid: $!\"; exec @ARGV' /bin/sh -c 'for i in $(seq 300); do printf x >> \"{}\"; sleep 0.1; done'\n while [ ! -s '{}' ]; do sleep 0.01; done\n printf 'GNU bash, version 5.2\\n'\n exit 0\nfi\nexec /bin/bash \"$@\"\n",
+        beat.display(), beat.display()
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut server = Server::start_with(|command| {
+        command.env("FASTEXEC_BASH", &wrapper);
+    });
+    let (result, text) = server.ok(json!({
+        "action": "start", "command": "printf tested", "loginShell": false, "waitMs": 10000
+    }));
+    assert_eq!(result["exitCode"], 0, "{text}");
+    assert!(file_len(&beat) > 0, "the detached child did not start");
+    assert_stops_growing(&beat);
+}
+
+#[cfg(unix)]
+#[test]
+fn file_tools_preserve_the_original_after_an_os_write_failure() {
+    use std::os::unix::process::CommandExt;
+    let directory = Scratch::new("atomic-save-mcp");
+    std::fs::create_dir(&directory.0).unwrap();
+    let target = directory.join("target.txt");
+    let original = format!("{}needle\n", "original ".repeat(50));
+    std::fs::write(&target, &original).unwrap();
+    let mut server = Server::start_with(|command| {
+        // This is a fresh, isolated server; no other test or daemon inherits the limit.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let limit = libc::rlimit {
+                    rlim_cur: 1024,
+                    rlim_max: 1024,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    });
+    for (tool, arguments) in [
+        (
+            "write",
+            json!({"path": target, "content": "N".repeat(2048)}),
+        ),
+        (
+            "edit",
+            json!({"path": target, "edits": [{"oldText": "needle", "newText": "N".repeat(2048)}]}),
+        ),
+    ] {
+        let (text, error) = server.file(tool, arguments);
+        assert!(error, "{tool} must report the OS failure: {text}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            original.as_bytes(),
+            "{tool} corrupted the original"
+        );
+        assert_eq!(
+            std::fs::read_dir(&directory.0).unwrap().count(),
+            1,
+            "failed staging files must be removed"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn editing_a_fifo_returns_an_error_without_blocking_other_file_tools() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let directory = Scratch::new("fifo-edit-mcp");
+    std::fs::create_dir(&directory.0).unwrap();
+    let fifo = directory.join("pipe");
+    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // No writer opens this FIFO. A blocking read would hold the global mutation lock forever.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let target = directory.join("regular.txt");
+    let mut server = Server::start();
+    for (id, tool, arguments) in [
+        (
+            1001,
+            "edit",
+            json!({"path": fifo, "edits": [{"oldText": "needle", "newText": "changed"}]}),
+        ),
+        (
+            1002,
+            "write",
+            json!({"path": target, "content": "independent file"}),
+        ),
+        (1003, "read", json!({"path": fifo})),
+    ] {
+        server.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}}));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut replies = Vec::new();
+    while replies.len() < 3 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = server
+            .lines
+            .recv_timeout(remaining)
+            .expect("a FIFO must not block its edit or an unrelated file mutation");
+        if message["id"]
+            .as_u64()
+            .is_some_and(|id| (1001..=1003).contains(&id))
+        {
+            replies.push(message);
+        } else {
+            assert!(message["__stdout_ended"].is_null(), "{message}");
+        }
+    }
+    for id in [1001, 1003] {
+        let reply = replies.iter().find(|reply| reply["id"] == id).unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("not a regular file"),
+            "{reply}"
+        );
+    }
+    let written = replies.iter().find(|reply| reply["id"] == 1002).unwrap();
+    assert_ne!(written["result"]["isError"], true, "{written}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"independent file");
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
 }

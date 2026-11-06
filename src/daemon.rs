@@ -1083,7 +1083,7 @@ async fn serve_daemon(
     runtime::sweep(&paths.root, &namespace);
     let logs = paths.ns.join("logs");
     let _ = std::fs::remove_dir_all(&logs);
-    if let Err(error) = std::fs::create_dir_all(&logs) {
+    if let Err(error) = runtime::create_private(&logs) {
         eprintln!("fastexec: cannot create {}: {error}", logs.display());
         return 1;
     }

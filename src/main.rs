@@ -307,7 +307,7 @@ impl Server {
         }
     }
 
-    #[doc = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."]
+    #[doc = "Write content to a regular file. Creates missing parent directories and saves a complete replacement. Requires a writable parent directory and refuses files with multiple hard links; use exec for deliberate in-place writes."]
     #[tool(
         name = "write",
         annotations(title = "Write file", destructive_hint = true, idempotent_hint = false)
@@ -323,7 +323,7 @@ impl Server {
         }
     }
 
-    #[doc = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes."]
+    #[doc = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes. Bytes outside the matches are preserved. Saving requires a writable parent directory and a regular file with one hard link."]
     #[tool(
         name = "edit",
         annotations(title = "Edit file", destructive_hint = true, idempotent_hint = false)

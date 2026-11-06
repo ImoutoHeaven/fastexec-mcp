@@ -24,7 +24,7 @@ use windows_sys::Win32::Globalization::{
     CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal,
 };
 use windows_sys::Win32::System::Console::{COORD, HPCON};
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
@@ -43,9 +43,9 @@ type CreatePseudoConsoleFn =
 type ClosePseudoConsoleFn = unsafe extern "system" fn(HPCON);
 type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> windows_sys::core::HRESULT;
 
-/// The ConPTY entry points: from the `conpty.dll` this process already loaded when it answers to
-/// that name, else from `kernel32.dll`. Create, resize, and close come from one module: a
-/// console made by one module is resized and closed only through that module.
+/// The ConPTY entry points: from the verified bundled module's exact handle, else from the
+/// already loaded system kernel. Create, resize, and close come from one module: a console
+/// made by one module is resized and closed only through that module.
 struct ConPty {
     create: CreatePseudoConsoleFn,
     resize: ResizePseudoConsoleFn,
@@ -60,10 +60,9 @@ impl ConPty {
                 "this Windows has no ConPTY; Windows 10 version 1809 or newer is required",
             ));
         }
-        // `crate::conpty::load` loaded the extracted copy by its full path, so this name resolves
-        // to it. A bundled module is used only when it exports the whole API; a partial one would
-        // pair its create with another module's close.
-        let bundled = module("conpty.dll").ok().and_then(resolve);
+        // Only the module loaded from the verified bundled image may override the system
+        // API. A failed extraction must never search CWD or PATH for another conpty.dll.
+        let bundled = crate::conpty::module().and_then(resolve);
         let (create, resize, close) = match bundled.or_else(|| resolve(kernel)) {
             Some(triple) => triple,
             None => {
@@ -122,17 +121,12 @@ impl ConPty {
     }
 }
 
-/// A loaded module, without taking a second reference to one already loaded, so a task's start
-/// does not pin another one each time. A module loaded here stays loaded for the process.
+/// Returns a module already loaded by the process. The system kernel is a KnownDLL loaded
+/// at process startup; optional DLLs must never be loaded by a bare name from CWD or PATH.
 fn module(name: &str) -> std::io::Result<HANDLE> {
     let wide: Vec<u16> = OsStr::new(name).encode_wide().chain([0]).collect();
     // SAFETY: `wide` is a NUL-terminated module name.
     let loaded = unsafe { GetModuleHandleW(wide.as_ptr()) };
-    if !loaded.is_null() {
-        return Ok(loaded);
-    }
-    // SAFETY: as above; the module belongs to the process, not to this call.
-    let loaded = unsafe { LoadLibraryW(wide.as_ptr()) };
     if loaded.is_null() {
         return Err(std::io::Error::last_os_error());
     }
@@ -225,8 +219,6 @@ pub fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
 /// Creates bash suspended inside its console and puts it in the task's Job. The root runs no
 /// instruction until [`resume`] is called on it.
 fn create_in_job(launch: &Launch<'_>) -> std::io::Result<Suspended> {
-    // The bundled ConPTY is loaded before the name is looked up, exactly as it was before.
-    crate::conpty::load();
     let api = ConPty::load()?;
     let (input_reader, input_writer) = std::io::pipe()?;
     let (output_reader, output_writer) = std::io::pipe()?;
@@ -665,6 +657,28 @@ fn nul_terminated(value: &OsStr) -> std::io::Result<Vec<u16>> {
 mod tests {
     use super::*;
     use crate::session::LaunchContext;
+
+    #[test]
+    fn module_lookup_never_loads_an_unregistered_dll() {
+        let dir = std::env::temp_dir().join(format!(
+            "fastexec-module-test-{}-{}",
+            std::process::id(),
+            crate::tasks::random_chars(12).unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let source = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("version.dll");
+        let target = dir.join("fastexec-untrusted-probe.dll");
+        std::fs::copy(source, &target).unwrap();
+        let refused = module(target.to_str().unwrap()).is_err();
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(refused, "an optional DLL was loaded just by looking it up");
+        assert!(
+            module("kernel32.dll").is_ok(),
+            "the system kernel is already loaded"
+        );
+    }
 
     /// What the trap's file can hold at the moment the wait looks at it.
     #[test]

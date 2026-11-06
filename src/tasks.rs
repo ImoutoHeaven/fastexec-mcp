@@ -123,6 +123,110 @@ impl Drop for Pending<'_> {
     }
 }
 
+/// Workers are reserved before a process is created. A failed thread allocation drops the
+/// remaining job senders, so the workers already created exit without owning a task.
+struct Workers {
+    reader: mpsc::Sender<ReadWork>,
+    capture: mpsc::Sender<CaptureWork>,
+    input: mpsc::Sender<InputWork>,
+    waiter: mpsc::Sender<WaitWork>,
+    ender: mpsc::Sender<EndWork>,
+}
+
+struct ReadWork {
+    output: Box<dyn Read + Send>,
+    chunks: mpsc::SyncSender<(Instant, Vec<u8>)>,
+}
+
+struct CaptureWork {
+    shared: Arc<Tasks>,
+    task: Arc<Task>,
+    received: mpsc::Receiver<(Instant, Vec<u8>)>,
+    log: File,
+    answer: Option<mpsc::Sender<Input>>,
+    eof: mpsc::Sender<()>,
+}
+
+struct InputWork {
+    task: Arc<Task>,
+    input: Box<dyn Write + Send>,
+    received: mpsc::Receiver<Input>,
+}
+
+struct WaitWork {
+    shared: Arc<Tasks>,
+    task: Arc<Task>,
+    child: process::Child,
+    script: PathBuf,
+    exit_status: Option<PathBuf>,
+    eof: mpsc::Receiver<()>,
+    ender: mpsc::Sender<EndWork>,
+}
+
+struct EndWork {
+    shared: Arc<Tasks>,
+    task: Arc<Task>,
+    child: process::Child,
+    script: PathBuf,
+    exit_status: Option<PathBuf>,
+}
+
+fn worker<T: Send + 'static>(
+    name: &str,
+    work: impl FnOnce(T) + Send + 'static,
+) -> std::io::Result<mpsc::Sender<T>> {
+    let (send, received) = mpsc::channel();
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            if let Ok(job) = received.recv() {
+                work(job);
+            }
+        })?;
+    Ok(send)
+}
+
+impl Workers {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            reader: worker("fastexec-output", |job: ReadWork| {
+                read_chunks(job.output, job.chunks);
+            })?,
+            capture: worker("fastexec-capture", |job: CaptureWork| {
+                capture(&job.shared, &job.task, job.received, job.log, job.answer);
+                let _ = job.eof.send(());
+            })?,
+            input: worker("fastexec-input", |job: InputWork| {
+                let mut input = Some(job.input);
+                for message in job.received {
+                    match message {
+                        Input::Data(bytes) => {
+                            let delivered = input.as_mut().is_some_and(|input| {
+                                input.write_all(&bytes).and_then(|()| input.flush()).is_ok()
+                            });
+                            job.task.queued.fetch_sub(bytes.len(), Ordering::SeqCst);
+                            if !delivered && input.take().is_some() {
+                                *lock(&job.task.input) = None;
+                            }
+                        }
+                        Input::Eof => drop(input.take()),
+                    }
+                }
+            })?,
+            waiter: worker("fastexec-wait", wait_task)?,
+            ender: worker("fastexec-end", |job: EndWork| {
+                finish_tree(
+                    &job.shared,
+                    &job.task,
+                    job.child,
+                    &job.script,
+                    job.exit_status.as_deref(),
+                );
+            })?,
+        })
+    }
+}
+
 /// Crockford's base32 alphabet in lowercase.
 pub(crate) const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
@@ -353,7 +457,7 @@ pub struct StartArgs {
     pub launch: Arc<LaunchContext>,
 }
 
-/// `Tasks::new` uses one directory per process, so only one test builds one at a time.
+/// The process-backed tests serialize their shared fixtures.
 #[cfg(test)]
 pub(crate) static ONE_TASKS: Mutex<()> = Mutex::new(());
 
@@ -361,9 +465,25 @@ impl Tasks {
     pub fn new(limits: Limits) -> std::io::Result<Arc<Self>> {
         let temp = std::env::temp_dir();
         remove_stale_dirs(&temp);
-        let dir = temp.join(format!("{}{}", dir_prefix(), std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        Self::new_in(limits, dir)
+        // A predictable remove-then-create path lets another user win the creation race in
+        // a shared temp directory. mkdir itself reserves a fresh random name atomically.
+        for _ in 0..8 {
+            let dir = temp.join(format!(
+                "{}{}-{}",
+                dir_prefix(),
+                std::process::id(),
+                random_chars(12)?
+            ));
+            match crate::runtime::create_private_new(&dir) {
+                Ok(()) => return Self::new_in(limits, dir),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "cannot reserve a fresh private task log directory",
+        ))
     }
 
     /// A registry whose task logs live in `dir`, which is created if it is missing.
@@ -374,12 +494,7 @@ impl Tasks {
                 "Tasks needs a tokio runtime for the killAfterMs timer: {error}."
             ))
         })?;
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(&dir)?;
+        crate::runtime::create_private(&dir)?;
         Ok(Arc::new(Self {
             dir,
             handle,
@@ -494,6 +609,8 @@ impl Tasks {
         // creation, and the spawn below all run without the registry lock.
         let (id, mut pending) = self.admit()?;
         let bash = args.launch.bash()?.to_path_buf();
+        let workers =
+            Workers::new().map_err(|error| format!("Cannot prepare the task workers: {error}."))?;
         let log_path = self.dir.join(format!("{id}.log"));
         let log = private_file(&log_path)
             .map_err(|error| format!("Cannot create the task log: {error}."))?;
@@ -507,8 +624,13 @@ impl Tasks {
             None => args.command.clone(),
         };
         let script = if command.len() > process::SCRIPT_THRESHOLD_BYTES {
-            std::fs::write(&script_path, &command)
-                .map_err(|error| format!("Cannot write the command script: {error}."))?;
+            if let Err(error) =
+                private_file(&script_path).and_then(|mut file| file.write_all(command.as_bytes()))
+            {
+                let _ = std::fs::remove_file(&log_path);
+                let _ = std::fs::remove_file(&script_path);
+                return Err(format!("Cannot write the command script: {error}."));
+            }
             Some(script_path.as_path())
         } else {
             None
@@ -595,111 +717,46 @@ impl Tasks {
         self.arm_deadline(&task, kill_after_ms);
 
         let (eof_tx, eof_rx) = mpsc::channel::<()>();
-        let (shared, reader_task, output) = (Arc::clone(self), Arc::clone(&task), spawned.output);
-        let answer = args.pty.then(|| input_tx.clone());
-        std::thread::spawn(move || {
-            capture(&shared, &reader_task, output, log, answer);
-            let _ = eof_tx.send(());
-        });
-        let (input_task, mut input) = (Arc::clone(&task), Some(spawned.input));
-        std::thread::spawn(move || {
-            for message in input_rx {
-                match message {
-                    Input::Data(bytes) => {
-                        let delivered = input.as_mut().is_some_and(|input| {
-                            input.write_all(&bytes).and_then(|()| input.flush()).is_ok()
-                        });
-                        input_task.queued.fetch_sub(bytes.len(), Ordering::SeqCst);
-                        if !delivered && input.take().is_some() {
-                            // The program closed stdin; later input must be refused, not queued.
-                            *lock(&input_task.input) = None;
-                        }
-                    }
-                    Input::Eof => drop(input.take()),
-                }
-            }
-        });
-        let (waiter_shared, waiter_task, mut child) =
-            (Arc::clone(self), Arc::clone(&task), spawned.child);
-        std::thread::spawn(move || {
-            let (exit_code, forced_end) = child.wait(&waiter_task.tree);
-            // Read at the root's exit, so a kill or deadline during the drain below leaves a
-            // natural exit labeled as such.
-            let killed = waiter_task.kill_requested.load(Ordering::SeqCst);
-            let expired = waiter_task.expired.load(Ordering::SeqCst);
-            // A task is its whole tree: whatever the root leaves behind ends with it, unless
-            // the task keeps it.
-            // A tree whose members could not be listed is not an empty tree: it stays held.
-            let listed = if killed {
-                Some(Vec::new())
-            } else {
-                waiter_task.tree.members()
-            };
-            let mut leftovers = listed.clone().unwrap_or_default();
-            let mut kept = waiter_task.keep && !leftovers.is_empty();
-            let kill_error = if kept {
-                None
-            } else {
-                waiter_task.tree.kill().err().map(|error| error.to_string())
-            };
-            // A tree that could not be killed stays held, so kill and shutdown retry, and the
-            // leftovers are what survived, also after a kill of the root.
-            if kill_error.is_some() || listed.is_none() {
-                kept = true;
-                leftovers = waiter_task.tree.members().unwrap_or(leftovers);
-                *lock(&waiter_task.kill_error) = kill_error;
-            }
-            // The end of the tree closes a PTY, so its output reaches EOF; ConPTY's close can
-            // block, so it runs apart. The script stays until then: kept processes may run `$0`.
-            let ender = Arc::clone(&waiter_task);
-            let ender_shared = Arc::clone(&waiter_shared);
-            std::thread::spawn(move || {
-                let tree_ended = child.wait_tree(&ender.tree);
-                if !tree_ended {
-                    *lock(&ender.kill_error) =
-                        Some("task host disconnected; tree cleanup is unconfirmed".into());
-                    ender.activity.send_replace(());
-                }
-                if tree_ended {
-                    // Unknown children may still use stdin, the terminal, or their script.
-                    *lock(&ender.input) = None;
-                    *lock(&ender.pty_control) = None;
-                    let _ = std::fs::remove_file(&script_path);
-                    if let Some(status) = &exit_status {
-                        let _ = std::fs::remove_file(status);
-                    }
-                }
-                drop(child);
-                // A task held at its root's exit is finished only here, so the cap is applied
-                // again under the guard that publishes the tree's end: retirement counts a task
-                // once its tree ended, and this is when that becomes true.
-                let mut registry = lock(&ender_shared.registry);
-                if tree_ended {
-                    let _ = ender.tree_ended_at.set(Instant::now());
-                    ender.tree_done.send_replace(true);
-                }
-                ender_shared.retire_finished(&mut registry);
-                drop(registry);
-            });
-            let output_open = drain(&waiter_task, &eof_rx, kept);
-            // The registry guard spans the end and the retirement that follows it: a client that
-            // reads the end, through a result or a list, then sees a registry within the cap.
-            // Readers take the registry first, so they cannot look between the two steps.
-            let mut registry = lock(&waiter_shared.registry);
-            *lock(&waiter_task.end) = Some(Final {
-                exit_code,
-                killed,
-                expired,
-                forced_end,
-                elapsed: waiter_task.started.elapsed(),
-                output_open,
-                leftovers,
-                kept,
-            });
-            waiter_shared.retire_finished(&mut registry);
-            drop(registry);
-            waiter_task.done.send_replace(true);
-        });
+        let (chunks, received) = mpsc::sync_channel(1);
+        // A prepared worker waits for exactly one job and cannot fail before receiving it.
+        workers
+            .reader
+            .send(ReadWork {
+                output: spawned.output,
+                chunks,
+            })
+            .unwrap_or_else(|_| unreachable!("prepared output worker stopped"));
+        workers
+            .capture
+            .send(CaptureWork {
+                shared: Arc::clone(self),
+                task: Arc::clone(&task),
+                received,
+                log,
+                answer: args.pty.then(|| input_tx.clone()),
+                eof: eof_tx,
+            })
+            .unwrap_or_else(|_| unreachable!("prepared capture worker stopped"));
+        workers
+            .input
+            .send(InputWork {
+                task: Arc::clone(&task),
+                input: spawned.input,
+                received: input_rx,
+            })
+            .unwrap_or_else(|_| unreachable!("prepared input worker stopped"));
+        workers
+            .waiter
+            .send(WaitWork {
+                shared: Arc::clone(self),
+                task: Arc::clone(&task),
+                child: spawned.child,
+                script: script_path,
+                exit_status,
+                eof: eof_rx,
+                ender: workers.ender,
+            })
+            .unwrap_or_else(|_| unreachable!("prepared waiter worker stopped"));
         Ok(task)
     }
 
@@ -985,6 +1042,94 @@ impl Tasks {
     }
 }
 
+/// Waits for the root and publishes its result. The separately prepared ender owns the rest
+/// of the tree and closes the PTY in parallel: a slow OS wait or ConPTY close must not prevent
+/// the root result from being published after the bounded output drain.
+fn wait_task(job: WaitWork) {
+    let WaitWork {
+        shared,
+        task,
+        mut child,
+        script,
+        exit_status,
+        eof,
+        ender,
+    } = job;
+    let (exit_code, forced_end) = child.wait(&task.tree);
+    let killed = task.kill_requested.load(Ordering::SeqCst);
+    let expired = task.expired.load(Ordering::SeqCst);
+    let listed = if killed {
+        Some(Vec::new())
+    } else {
+        task.tree.members()
+    };
+    let mut leftovers = listed.clone().unwrap_or_default();
+    let mut kept = task.keep && !leftovers.is_empty();
+    let kill_error = if kept {
+        None
+    } else {
+        task.tree.kill().err().map(|error| error.to_string())
+    };
+    if kill_error.is_some() || listed.is_none() {
+        kept = true;
+        leftovers = task.tree.members().unwrap_or(leftovers);
+        *lock(&task.kill_error) = kill_error;
+    }
+    ender
+        .send(EndWork {
+            shared: Arc::clone(&shared),
+            task: Arc::clone(&task),
+            child,
+            script,
+            exit_status,
+        })
+        .unwrap_or_else(|_| unreachable!("prepared ender stopped"));
+    let output_open = drain(&task, &eof, kept);
+    let mut registry = lock(&shared.registry);
+    *lock(&task.end) = Some(Final {
+        exit_code,
+        killed,
+        expired,
+        forced_end,
+        elapsed: task.started.elapsed(),
+        output_open,
+        leftovers,
+        kept,
+    });
+    shared.retire_finished(&mut registry);
+    drop(registry);
+    task.done.send_replace(true);
+}
+
+fn finish_tree(
+    shared: &Tasks,
+    task: &Task,
+    mut child: process::Child,
+    script: &Path,
+    exit_status: Option<&Path>,
+) {
+    let tree_ended = child.wait_tree(&task.tree);
+    if !tree_ended {
+        *lock(&task.kill_error) =
+            Some("task host disconnected; tree cleanup is unconfirmed".into());
+        task.activity.send_replace(());
+    } else {
+        *lock(&task.input) = None;
+        *lock(&task.pty_control) = None;
+        let _ = std::fs::remove_file(script);
+        if let Some(status) = exit_status {
+            let _ = std::fs::remove_file(status);
+        }
+    }
+    drop(child);
+    let mut registry = lock(&shared.registry);
+    if tree_ended {
+        let _ = task.tree_ended_at.set(Instant::now());
+        task.tree_done.send_replace(true);
+    }
+    shared.retire_finished(&mut registry);
+}
+
 impl Spool {
     /// Appends final lines, each ending in a newline, in place of the pending lines. Past the
     /// per-task limit, the file keeps the lines that fit and takes no more.
@@ -1146,14 +1291,12 @@ fn answer_program(task: &Task, answer: &mpsc::Sender<Input>, reply: Vec<u8>) {
 fn capture(
     shared: &Tasks,
     task: &Task,
-    output: Box<dyn Read + Send>,
+    received: mpsc::Receiver<(Instant, Vec<u8>)>,
     log: File,
     answer: Option<mpsc::Sender<Input>>,
 ) {
-    // Output is read on its own thread, so a synchronized update ends at its deadline while
-    // the program writes nothing.
-    let (chunks, received) = mpsc::sync_channel(1);
-    std::thread::spawn(move || read_chunks(output, chunks));
+    // The prepared output worker reads independently, so synchronized updates still end
+    // at their deadline when the program writes nothing.
     let mut last = Vec::with_capacity(8);
     let mut log = Some(log);
     loop {
@@ -1843,7 +1986,7 @@ fn private_file(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// Log directories are `<prefix><pid>`. On Unix the prefix carries the user ID, so servers of
+/// Log directories are `<prefix><pid>-<random>`. On Unix the prefix carries the user ID, so servers of
 /// different users sharing /tmp neither collide nor examine each other's directories.
 fn dir_prefix() -> String {
     #[cfg(unix)]
@@ -1853,21 +1996,226 @@ fn dir_prefix() -> String {
     return "fastexec-".to_string();
 }
 
-/// Removes this user's log directories of fastexec servers that are no longer running.
+/// Resolve the parent once and require every ancestor to resist replacement by other users.
+/// Linux sticky directories are safe only if the directory owner is trusted as well.
+#[cfg(target_os = "linux")]
+fn safe_sweep_parent(temp: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let resolved = std::fs::canonicalize(temp).ok()?;
+    // SAFETY: geteuid has no preconditions.
+    let user = unsafe { libc::geteuid() };
+    for ancestor in resolved.ancestors() {
+        let meta = std::fs::symlink_metadata(ancestor).ok()?;
+        if !meta.is_dir()
+            || (meta.uid() != user && meta.uid() != 0)
+            || (meta.mode() & 0o022 != 0 && meta.mode() & libc::S_ISVTX == 0)
+        {
+            return None;
+        }
+    }
+    Some(resolved)
+}
+
+/// Remove only private log directories of dead servers when every parent protects the
+/// checked path from replacement. Unverifiable entries are retained rather than deleted.
 fn remove_stale_dirs(temp: &Path) {
+    // On macOS ACLs and Windows DACLs can grant rights not visible in Unix mode bits.
+    // Retain old logs there until deletion can be tied safely to a verified handle.
+    #[cfg(not(target_os = "linux"))]
+    let _ = temp;
+    #[cfg(target_os = "linux")]
+    let Some(temp) = safe_sweep_parent(temp) else {
+        return;
+    };
+    #[cfg(target_os = "linux")]
     let Ok(entries) = std::fs::read_dir(temp) else {
         return;
     };
+    #[cfg(target_os = "linux")]
     let prefix = dir_prefix();
+    #[cfg(target_os = "linux")]
     for entry in entries.flatten() {
         let name = entry.file_name();
         let pid = name
             .to_str()
             .and_then(|name| name.strip_prefix(prefix.as_str()))
-            .and_then(|pid| pid.parse().ok());
-        if pid.is_some_and(|pid| pid != std::process::id() && !process::is_alive(pid)) {
+            .and_then(|tail| {
+                match tail.split_once('-') {
+                    Some((pid, nonce))
+                        if nonce.len() == 12
+                            && nonce.bytes().all(|byte| ALPHABET.contains(&byte)) =>
+                    {
+                        pid.parse().ok()
+                    }
+                    Some(_) => None,
+                    // Also retire directories written by older versions.
+                    None => tail.parse().ok(),
+                }
+            });
+        if pid.is_some_and(|pid| pid != std::process::id() && !process::is_alive(pid))
+            && crate::runtime::create_private_unix_check(&entry.path()).is_ok()
+        {
             let _ = std::fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_directory_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_sweep_refuses_untrusted_entries_and_unsafe_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "fastexec-sweep-test-{}-{}",
+            std::process::id(),
+            random_chars(12).unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let prefix = dir_prefix();
+        let valid = root.join(format!("{prefix}2147483647"));
+        let shared = root.join(format!("{prefix}2147483646"));
+        let target = root.join("target");
+        let link = root.join(format!("{prefix}2147483645"));
+        let foreign = root.join(format!("{prefix}2147483644"));
+        let live = root.join(format!("{prefix}{}", std::process::id()));
+        for dir in [&valid, &shared, &target, &foreign, &live] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::set_permissions(&valid, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Exercise another owner's otherwise private directory when run as root.
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::CString::new(foreign.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(name.as_ptr(), 65534, 65534) }, 0);
+        }
+        symlink(&target, &link).unwrap();
+        let sentinel = shared.join("sentinel");
+        std::fs::write(&sentinel, "keep").unwrap();
+        // An untrusted non-sticky shared parent is never swept, even for a valid leaf.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        remove_stale_dirs(&root);
+        assert!(valid.exists());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        remove_stale_dirs(&root);
+        assert!(!valid.exists(), "private stale directory should be retired");
+        assert!(sentinel.exists(), "shared directory must not be removed");
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "symlink must not be removed"
+        );
+        assert!(target.exists());
+        assert!(live.exists(), "live process logs must not be removed");
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(
+                foreign.exists(),
+                "another user's private directory must not be removed"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_sweep_checks_ancestors_sticky_owner_and_new_names() {
+        let root = std::env::temp_dir().join(format!(
+            "fastexec-sweep-coverage-{}-{}",
+            std::process::id(),
+            random_chars(12).unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let prefix = dir_prefix();
+        let unsafe_ancestor = root.join("unsafe-ancestor");
+        let inner = unsafe_ancestor.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::set_permissions(&unsafe_ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let candidate = inner.join(format!("{prefix}2147483647-0123456789ab"));
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
+        remove_stale_dirs(&inner);
+        assert!(candidate.exists(), "unsafe ancestor must prevent sweeping");
+
+        let sticky = root.join("sticky");
+        std::fs::create_dir(&sticky).unwrap();
+        std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let good = sticky.join(format!("{prefix}2147483647-0123456789ab"));
+        let short = sticky.join(format!("{prefix}2147483646-short"));
+        let invalid = sticky.join(format!("{prefix}2147483645-0123456789a!"));
+        for dir in [&good, &short, &invalid] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        remove_stale_dirs(&sticky);
+        assert!(
+            !good.exists(),
+            "trusted sticky parent should allow safe cleanup"
+        );
+        assert!(
+            short.exists() && invalid.exists(),
+            "invalid suffixes must be retained"
+        );
+
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::ffi::OsStrExt;
+            let foreign_sticky = root.join("foreign-sticky");
+            std::fs::create_dir(&foreign_sticky).unwrap();
+            std::fs::set_permissions(&foreign_sticky, std::fs::Permissions::from_mode(0o1777))
+                .unwrap();
+            let candidate = foreign_sticky.join(format!("{prefix}2147483647"));
+            std::fs::create_dir(&candidate).unwrap();
+            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let name = std::ffi::CString::new(foreign_sticky.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(name.as_ptr(), 65534, 65534) }, 0);
+            remove_stale_dirs(&foreign_sticky);
+            assert!(
+                candidate.exists(),
+                "untrusted sticky owner must prevent sweeping"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_log_directories_refuse_shared_directories_and_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "fastexec-private-test-{}-{}",
+            std::process::id(),
+            random_chars(12).unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let shared = root.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let shared_refused = Tasks::new_in(Limits::OFF, shared).is_err();
+        let symlink_refused = Tasks::new_in(Limits::OFF, link).is_err();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            shared_refused,
+            "a directory open to other users was accepted"
+        );
+        assert!(
+            symlink_refused,
+            "a symlink was accepted as a private log directory"
+        );
     }
 }
 
@@ -1975,13 +2323,10 @@ mod tests {
         let before = tasks.log_limit - 97;
         tasks.log_bytes.store(before, Ordering::SeqCst);
         let log = File::create(tasks.dir.join("extra.log")).unwrap();
-        capture(
-            &tasks,
-            &task,
-            Box::new(std::io::Cursor::new([b'x'; 99])),
-            log,
-            None,
-        );
+        let (chunks, received) = mpsc::sync_channel(1);
+        chunks.send((Instant::now(), vec![b'x'; 99])).unwrap();
+        drop(chunks);
+        capture(&tasks, &task, received, log, None);
         let out = lock(&task.out);
         assert!(out.evicted);
         assert_eq!((out.written, out.dropped), (3, 99));

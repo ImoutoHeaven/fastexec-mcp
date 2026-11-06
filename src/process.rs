@@ -137,6 +137,16 @@ impl Child {
         (msys_signal_exit(code), forced)
     }
 
+    /// A pipe probe needs a nonblocking root check while it drains a bounded banner.
+    fn try_wait(&mut self, _tree: &Tree) -> std::io::Result<Option<i32>> {
+        match self {
+            Child::Pipe(child) => child
+                .try_wait()
+                .map(|status| status.map(|status| msys_signal_exit(status.code().unwrap_or(1)))),
+            Child::Pty { .. } => unreachable!("version probes use pipes"),
+        }
+    }
+
     /// Blocks until no process of the tree runs.
     pub fn wait_tree(&mut self, tree: &Tree) -> bool {
         let mut pause = std::time::Duration::from_millis(10);
@@ -173,6 +183,30 @@ impl Child {
         // processes that left both are out of reach.
         let _ = tree.kill();
         (self.reap(tree), false)
+    }
+
+    /// The host writes one atomic four-byte exit record. A readable or closed status pipe
+    /// can therefore be consumed without waiting for a running candidate.
+    fn try_wait(&mut self, tree: &Tree) -> std::io::Result<Option<i32>> {
+        use std::os::fd::AsRawFd;
+        let mut status = libc::pollfd {
+            fd: self.status.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd; zero timeout never waits.
+        match unsafe { libc::poll(&mut status, 1, 0) } {
+            -1 => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+            0 => Ok(None),
+            _ => Ok(Some(self.wait(tree).0)),
+        }
     }
 
     /// Blocks until no process of the tree runs: the host leaves once it has no child left.
@@ -218,6 +252,7 @@ pub(crate) fn msys_signal_exit(code: i32) -> i32 {
 }
 
 /// Creates a command that never allocates a console window on Windows.
+#[cfg(windows)]
 pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
     let mut command = Command::new(program);
@@ -238,6 +273,172 @@ pub fn spawn(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     };
     #[cfg(unix)]
     return spawn_host(launch);
+}
+
+/// The banner probe uses the same host/Job ownership as a task. Its output is nonblocking,
+/// so a candidate or descendant holding stdout cannot strand a reader thread after timeout.
+pub(crate) fn bash_version(
+    path: &Path,
+    context: &LaunchContext,
+    banner_limit: u64,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    // Reserve a reaper before a process exists. It also keeps an unkillable tree owned if the
+    // OS refuses cleanup; the caller reports that failure instead of blocking forever.
+    let (cleanup, pending) = std::sync::mpsc::channel::<(Child, Tree)>();
+    let (settled, settlement) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("fastexec-probe-reap".into())
+        .spawn(move || {
+            if let Ok((mut child, tree)) = pending.recv() {
+                let ended = child.wait_tree(&tree);
+                let _ = settled.send(ended);
+            }
+        })
+        .map_err(|error| format!("cannot prepare the --version reaper: {error}"))?;
+    let launch = Launch {
+        bash: path,
+        command: "",
+        script: None,
+        // Discovery must still work when the session's old working directory is gone.
+        cwd: path
+            .parent()
+            .ok_or("the bash path has no parent directory")?,
+        env: context,
+        login: false,
+        pty: false,
+        cols: PTY_COLS,
+        rows: PTY_ROWS,
+        exit_status: None,
+    };
+    #[cfg(unix)]
+    let spawned = spawn_host_args(&launch, vec!["--version".into()], true);
+    #[cfg(windows)]
+    let spawned = spawn_pipe_args(&launch, vec!["--version".into()], true);
+    let Spawned {
+        mut child,
+        mut output,
+        input,
+        tree,
+        ..
+    } = spawned.map_err(|error| error.to_string())?;
+    drop(input);
+    let result = (|| {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let mut status = None;
+        let mut output_ended = false;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err("--version did not finish within 5 s".to_string());
+            }
+            if status.is_none() {
+                status = child.try_wait(&tree).map_err(|error| error.to_string())?;
+                if status.is_some() {
+                    // No child is part of a version banner once its root has exited.
+                    tree.kill()
+                        .map_err(|error| format!("cannot end the --version tree: {error}"))?;
+                }
+            }
+            if !output_ended {
+                match output.read(&mut buffer) {
+                    Ok(0) => output_ended = true,
+                    Ok(read) => {
+                        bytes.extend_from_slice(&buffer[..read]);
+                        if bytes.len() as u64 > banner_limit {
+                            return Err("--version printed more than 4 KiB".to_string());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(format!("cannot read --version output: {error}")),
+                }
+            }
+            if let Some(code) = status
+                && output_ended
+            {
+                return if code == 0 {
+                    Ok(bytes)
+                } else {
+                    Err(format!("--version failed (exit code {code})"))
+                };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    })();
+    let killed = tree.kill();
+    cleanup
+        .send((child, tree))
+        .unwrap_or_else(|_| unreachable!("prepared probe reaper stopped"));
+    if let Err(error) = killed {
+        return Err(format!(
+            "cannot terminate the --version process tree: {error}"
+        ));
+    }
+    if settlement.recv_timeout(std::time::Duration::from_secs(1)) != Ok(true) {
+        return Err("the --version process tree did not confirm cleanup within 1 s".to_owned());
+    }
+    result
+}
+
+struct ProbeReader(std::io::PipeReader);
+
+impl Read for ProbeReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
+            use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+            let mut available = 0;
+            // SAFETY: this owns a readable anonymous pipe; optional buffers are null.
+            let peeked = unsafe {
+                PeekNamedPipe(
+                    self.0.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if peeked == 0 {
+                let error = std::io::Error::last_os_error();
+                return if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                    Ok(0)
+                } else {
+                    Err(error)
+                };
+            }
+            if available == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let take = buffer.len().min(available as usize);
+            self.0.read(&mut buffer[..take])
+        }
+        #[cfg(unix)]
+        self.0.read(buffer)
+    }
+}
+
+fn pipe_output(reader: std::io::PipeReader, probe: bool) -> std::io::Result<Box<dyn Read + Send>> {
+    if !probe {
+        return Ok(Box::new(reader));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: this owns the descriptor, and both calls only update its file status flags.
+        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(Box::new(ProbeReader(reader)))
 }
 
 pub(crate) fn bash_args(launch: &Launch<'_>) -> Vec<OsString> {
@@ -331,13 +532,23 @@ fn windows_path_environment(launch: &Launch<'_>, env: &mut Vec<(&'static str, Os
 
 #[cfg(windows)]
 fn spawn_pipe(launch: &Launch<'_>) -> std::io::Result<Spawned> {
+    spawn_pipe_args(launch, bash_args(launch), false)
+}
+
+#[cfg(windows)]
+fn spawn_pipe_args(
+    launch: &Launch<'_>,
+    args: Vec<OsString>,
+    probe: bool,
+) -> std::io::Result<Spawned> {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
     let (reader, writer) = std::io::pipe()?;
+    let output = pipe_output(reader, probe)?;
     let mut command = quiet_command(launch.bash);
     command
-        .args(bash_args(launch))
+        .args(args)
         .env_clear()
         .envs(launch.env.env.iter().map(|(name, value)| (name, value)))
         .envs(environment(launch))
@@ -346,6 +557,9 @@ fn spawn_pipe(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         .stdout(writer.try_clone()?)
         .stderr(writer)
         .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    if probe {
+        command.stderr(Stdio::null());
+    }
     let mut child = command.spawn()?;
     // The command still holds the pipe's write ends; dropping it lets the reader reach EOF.
     drop(command);
@@ -364,7 +578,7 @@ fn spawn_pipe(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     let input = Box::new(child.stdin.take().expect("stdin is piped"));
     Ok(Spawned {
         child: Child::Pipe(child),
-        output: Box::new(reader),
+        output,
         input,
         tree,
         pty: None,
@@ -390,6 +604,15 @@ fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
 /// host's controlling terminal, so bash ending leaves the terminal and its session up.
 #[cfg(unix)]
 fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
+    spawn_host_args(launch, bash_args(launch), false)
+}
+
+#[cfg(unix)]
+fn spawn_host_args(
+    launch: &Launch<'_>,
+    args: Vec<OsString>,
+    probe: bool,
+) -> std::io::Result<Spawned> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     let (mut status, status_writer) = std::io::pipe()?;
@@ -418,7 +641,7 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         .arg(crate::host::FLAG)
         .args(passed.iter().map(|fd| fd.to_string()))
         .arg(launch.bash)
-        .args(bash_args(launch))
+        .args(args)
         // The host needs no environment of its own: it execs bash with this one.
         .env_clear()
         .envs(launch.env.env.iter().map(|(name, value)| (name, value)))
@@ -438,8 +661,11 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
             .stdin(Stdio::piped())
             .stdout(writer.try_clone()?)
             .stderr(writer);
-        (None, Box::new(reader))
+        (None, pipe_output(reader, probe)?)
     };
+    if probe {
+        command.stderr(Stdio::null());
+    }
     let pty = launch.pty;
     // SAFETY: setsid, ioctl, and fcntl are async-signal-safe.
     unsafe {
@@ -482,7 +708,7 @@ fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         let _ = host.wait();
         let problem = std::io::Error::from_raw_os_error(startup as i32);
         return Err(std::io::Error::other(format!(
-            "Cannot become the subreaper of the task tree: {problem}"
+            "Cannot initialize the task host: {problem}"
         )));
     }
     // Past the spawn, an error drops the lifeline, and the host ends the tree.
@@ -784,6 +1010,7 @@ fn unix_members(_host: i32) -> Vec<Member> {
 }
 
 /// Reports whether a process with this PID exists.
+#[cfg(any(target_os = "linux", windows))]
 pub fn is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {

@@ -10,9 +10,11 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::PathBuf;
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::fs::Metadata;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::canonical_combining_class;
@@ -186,16 +188,8 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
 /// The text of one file, cut to the window and the limits a result may show.
 fn read_text(request: &ReadRequest, launch: &LaunchContext, http: bool) -> Result<Outcome, String> {
     let resolved = resolve(&request.path, launch)?;
-    let metadata = std::fs::metadata(&resolved)
+    let (mut file, metadata) = open_regular(&resolved)
         .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "Cannot read {}: it is not a regular file.",
-            request.path
-        ));
-    }
-    let mut file =
-        File::open(&resolved).map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
     let mut sniff = vec![0u8; SNIFF];
     let sniffed = read_upto(&mut file, &mut sniff)
         .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
@@ -235,6 +229,37 @@ fn read_text(request: &ReadRequest, launch: &LaunchContext, http: bool) -> Resul
     Ok(Outcome::text(
         Window::scan(source, request)?.render(request),
     ))
+}
+
+/// Both text readers reject special files before reading any data. The initial check avoids
+/// opening devices at all; the handle check covers replacement between metadata and open. On
+/// Unix, a FIFO swapped into that gap must not block open while edit holds the mutation lock.
+fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(io::Error::other("it is not a regular file"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+        // SAFETY: file owns this live handle. Reject named pipes/consoles before any read.
+        if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
+            return Err(io::Error::other("it is not a regular file"));
+        }
+    }
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("it is not a regular file"));
+    }
+    Ok((file, metadata))
 }
 
 /// Reads as much of `into` as the file gives, which is short only at the end.
@@ -674,9 +699,959 @@ fn write_text(request: &WriteRequest, launch: &LaunchContext) -> Result<String, 
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
     }
-    std::fs::write(&resolved, request.content.as_bytes())
+    save_text(&resolved, request.content.as_bytes())
         .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
     Ok(format!("Successfully wrote to {}", request.path))
+}
+
+/// Follows a final-component symlink without replacing the link itself, including a dangling
+/// link whose target can be created. Parent-directory symlinks keep their normal filesystem
+/// meaning. A finite walk also refuses cycles before any file is changed.
+fn write_target(path: &Path) -> io::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = std::fs::read_link(&target)?;
+                target = if link.is_absolute() {
+                    link
+                } else {
+                    target.parent().unwrap_or_else(|| Path::new(".")).join(link)
+                };
+            }
+            Ok(_) => return Ok(target),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(target),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "too many symbolic links",
+    ))
+}
+
+/// A fully staged replacement, removed on every failure. Closing before removal also makes
+/// cleanup work on Windows.
+struct Staged {
+    path: PathBuf,
+    file: Option<File>,
+    remove_on_drop: bool,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if self.remove_on_drop {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Staged {
+    fn new(parent: &Path, private: bool) -> io::Result<Self> {
+        for _ in 0..32 {
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
+            let name = format!(".fastexec-save-{:032x}", u128::from_le_bytes(random));
+            let path = parent.join(name);
+            match create_staging_file(&path, private) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                        remove_on_drop: true,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create a unique staging file",
+        ))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn create_staging_file(path: &Path, private: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(if private { 0o600 } else { 0o666 })
+        .open(path)
+}
+
+/// Darwin ACL grants are independent of the mode bits. Suppress inheritance in the creation
+/// syscall itself, so another user cannot open an inherited read handle to staged content.
+#[cfg(target_os = "macos")]
+fn create_staging_file(path: &Path, private: bool) -> io::Result<File> {
+    if private {
+        macos_access::create_private(path)
+    } else {
+        OpenOptions::new().write(true).create_new(true).open(path)
+    }
+}
+
+/// Extended ACLs are not among Darwin's public xattrs. Apple Libc uses fstatx/fchmodx for the
+/// ACL APIs, and XNU honors ACL_FLAG_NO_INHERIT on an initial openx_np security descriptor.
+#[cfg(target_os = "macos")]
+mod macos_access {
+    use super::*;
+    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    const ACL_TYPE_EXTENDED: c_int = 0x100;
+    const ACL_FLAG_NO_INHERIT: c_int = 1 << 17;
+    const FILESEC_OWNER: c_int = 1;
+    const FILESEC_GROUP: c_int = 2;
+    const FILESEC_MODE: c_int = 4;
+    const FILESEC_ACL: c_int = 5;
+
+    // These public Darwin interfaces are in libSystem but are not declared by the libc crate.
+    unsafe extern "C" {
+        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_free(acl: *mut c_void) -> c_int;
+        fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_flagset_np(acl: *mut c_void, flags: *mut *mut c_void) -> c_int;
+        fn acl_add_flag_np(flags: *mut c_void, flag: c_int) -> c_int;
+        fn filesec_init() -> *mut c_void;
+        fn filesec_free(security: *mut c_void);
+        fn filesec_set_property(
+            security: *mut c_void,
+            property: c_int,
+            value: *const c_void,
+        ) -> c_int;
+        fn openx_np(path: *const c_char, flags: c_int, security: *mut c_void) -> c_int;
+        fn fchmodx_np(fd: c_int, security: *mut c_void) -> c_int;
+        #[cfg(test)]
+        fn acl_to_text(acl: *mut c_void, length: *mut libc::ssize_t) -> *mut c_char;
+    }
+
+    struct Acl(*mut c_void);
+
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            // SAFETY: Acl exclusively owns an allocation returned by a Darwin ACL function.
+            unsafe { acl_free(self.0) };
+        }
+    }
+
+    impl Acl {
+        fn empty(no_inherit: bool) -> io::Result<Self> {
+            // SAFETY: zero entries creates an independently allocated, empty ACL.
+            let raw = unsafe { acl_init(0) };
+            if raw.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let acl = Self(raw);
+            if no_inherit {
+                let mut flags = std::ptr::null_mut();
+                // SAFETY: acl owns a live ACL and flags points into it until it is freed.
+                if unsafe { acl_get_flagset_np(acl.0, &mut flags) } != 0
+                    || unsafe { acl_add_flag_np(flags, ACL_FLAG_NO_INHERIT) } != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(acl)
+        }
+
+        fn read(file: &File) -> io::Result<Option<Self>> {
+            // SAFETY: the descriptor remains open for this synchronous metadata query.
+            let raw = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+            if !raw.is_null() {
+                return Ok(Some(Self(raw)));
+            }
+            let error = io::Error::last_os_error();
+            // With a live descriptor, Darwin's FILESEC_ACL property reports ENOENT when no
+            // ACL exists. Other errors cannot establish absence and must leave the target alone.
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+
+        fn has_entries(&self) -> io::Result<bool> {
+            let mut entry = std::ptr::null_mut();
+            // SAFETY: ACL_FIRST_ENTRY is 0; Darwin returns 0 for an entry, -1/EINVAL at the end.
+            if unsafe { acl_get_entry(self.0, 0, &mut entry) } == 0 {
+                return Ok(true);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+
+    struct Security(*mut c_void);
+
+    impl Drop for Security {
+        fn drop(&mut self) {
+            // SAFETY: Security owns a successful filesec_init allocation.
+            unsafe { filesec_free(self.0) };
+        }
+    }
+
+    impl Security {
+        fn new() -> io::Result<Self> {
+            // SAFETY: filesec_init returns a new descriptor, or null on failure.
+            let raw = unsafe { filesec_init() };
+            if raw.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(Self(raw))
+            }
+        }
+
+        fn set<T>(&self, property: c_int, value: &T) -> io::Result<()> {
+            // SAFETY: callers supply the documented type; filesec copies each value/ACL.
+            if unsafe { filesec_set_property(self.0, property, (value as *const T).cast()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
+    pub(super) fn create_private(path: &Path) -> io::Result<File> {
+        let path_c = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        let acl = Acl::empty(true)?;
+        let security = Security::new()?;
+        let mode: libc::mode_t = 0o600;
+        security.set(FILESEC_MODE, &mode)?;
+        security.set(FILESEC_ACL, &acl.0)?;
+        // SAFETY: path and security live through the call. Exclusive creation refuses every
+        // existing name; the restrictive mode and non-inheriting ACL take effect atomically.
+        let fd = unsafe {
+            openx_np(
+                path_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                security.0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful exclusive openx_np returned a new owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let verify = (|| {
+            let metadata = file.metadata()?;
+            // SAFETY: geteuid has no arguments and no side effects.
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(io::Error::other("the staging file is not private"));
+            }
+            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: the descriptor is live and fstatfs initializes the output on success.
+            if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful fstatfs initialized every field.
+            if unsafe { filesystem.assume_init() }.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0
+            {
+                return Err(io::Error::other(
+                    "the volume ignores ownership and cannot keep staging private",
+                ));
+            }
+            if let Some(acl) = Acl::read(&file)?
+                && acl.has_entries()?
+            {
+                return Err(io::Error::other(
+                    "the staging file inherited an access-control entry",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = verify {
+            // No content has been written, including on a filesystem that ignored the ACL.
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
+    pub(super) fn preserve(source: &File, staged: &File) -> io::Result<()> {
+        let acl = match Acl::read(source)? {
+            Some(acl) => acl,
+            // An empty ACL replaces every staging entry, including any inherited grant.
+            None => Acl::empty(false)?,
+        };
+        let metadata = source.metadata()?;
+        let mode = (metadata.mode() & 0o7777) as libc::mode_t;
+        let security = Security::new()?;
+        security.set(FILESEC_OWNER, &metadata.uid())?;
+        security.set(FILESEC_GROUP, &metadata.gid())?;
+        security.set(FILESEC_MODE, &mode)?;
+        security.set(FILESEC_ACL, &acl.0)?;
+        // SAFETY: the live file and security descriptor cover this synchronous operation.
+        // Set mode, ownership and ACL together: chmod(0644) followed by copying a deny ACL
+        // would briefly expose completed content, as would chown before restoring a mode of 0.
+        if unsafe { fchmodx_np(staged.as_raw_fd(), security.0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn acl_text(file: &File) -> io::Result<String> {
+        let Some(acl) = Acl::read(file)? else {
+            return Ok(String::new());
+        };
+        // SAFETY: the ACL is live; a null length pointer is allowed by acl_to_text.
+        let text = unsafe { acl_to_text(acl.0, std::ptr::null_mut()) };
+        if text.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let allocation = Acl(text.cast());
+        // SAFETY: acl_to_text returns a NUL-terminated string owned by allocation.
+        let result = unsafe { std::ffi::CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned();
+        drop(allocation);
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_entries(file: &File) -> io::Result<bool> {
+        Acl::read(file)?.map_or(Ok(false), |acl| acl.has_entries())
+    }
+}
+
+/// Install the restrictive DACL in CreateFile itself. Tightening an inherited DACL after opening
+/// an empty file would still let another user open a handle before it is tightened.
+#[cfg(windows)]
+fn create_staging_file(path: &Path, private: bool) -> io::Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
+    };
+    if !private {
+        return OpenOptions::new().write(true).create_new(true).open(path);
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let attributes = crate::transport::SecurityAttributes::owner_only(false)?;
+    let handle = attributes.with_raw(|raw| {
+        // SAFETY: the path and owner-only descriptor live through the synchronous call.
+        unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | WRITE_DAC | WRITE_OWNER,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                raw.cast::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                    .cast_const(),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        }
+    });
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful CREATE_NEW returned this new, uniquely owned handle.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// Replacing one hard-linked name would silently detach it from its peers. There is no atomic
+/// way to rewrite the shared inode, so require an explicit in-place update through exec instead.
+fn single_link(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    let links = {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata()?.nlink()
+    };
+    #[cfg(windows)]
+    let links = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        // SAFETY: the live file owns the handle and the structure is a writable output buffer.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        u64::from(info.nNumberOfLinks)
+    };
+    if links > 1 {
+        return Err(io::Error::other(format!(
+            "the file has {links} hard links; an atomic replacement would split them. Use exec for an explicit in-place update"
+        )));
+    }
+    Ok(())
+}
+
+/// Preserves an existing Unix file's owner before restoring its mode. A new inode owned by the
+/// server would otherwise take a user's file away from them when a privileged server edits it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn preserve_owner(file: &File, original: &Metadata) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let current = file.metadata()?;
+    if current.uid() != original.uid() || current.gid() != original.gid() {
+        // SAFETY: fchown acts on the live staging file, not a path another process can replace.
+        if unsafe { libc::fchown(file.as_raw_fd(), original.uid(), original.gid()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Keeps ACLs and extended attributes on the Unix platforms supported by the server. Linux
+/// file capabilities are deliberately not restored: a content write normally clears them.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn preserve_xattrs(original: &File, staged: &File) -> io::Result<()> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+    let (from, to) = (original.as_raw_fd(), staged.as_raw_fd());
+    let list = |fd, buffer: *mut libc::c_char, size: usize| {
+        #[cfg(target_os = "linux")]
+        // SAFETY: the caller supplies a writable buffer of size bytes, or null for a size query.
+        unsafe {
+            libc::flistxattr(fd, buffer, size)
+        }
+        #[cfg(target_os = "macos")]
+        // SAFETY: same contract, with no platform-specific flags.
+        unsafe {
+            libc::flistxattr(fd, buffer, size, 0)
+        }
+    };
+    let count = list(from, std::ptr::null_mut(), 0);
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOTSUP) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    let mut names = vec![0u8; count as usize];
+    if !names.is_empty() {
+        let count = list(from, names.as_mut_ptr().cast(), names.len());
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        names.truncate(count as usize);
+    }
+    // The sibling may inherit a default ACL or other directory attributes the original does
+    // not have. Remove those first; chmod alone could otherwise activate extra named ACL users.
+    let count = list(to, std::ptr::null_mut(), 0);
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut inherited = vec![0u8; count as usize];
+    if !inherited.is_empty() {
+        let count = list(to, inherited.as_mut_ptr().cast(), inherited.len());
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        inherited.truncate(count as usize);
+    }
+    for name in inherited.split_inclusive(|&byte| byte == 0) {
+        if names
+            .split_inclusive(|&byte| byte == 0)
+            .any(|original| original == name)
+        {
+            continue;
+        }
+        let name = CStr::from_bytes_with_nul(name).map_err(io::Error::other)?;
+        #[cfg(target_os = "linux")]
+        // SAFETY: the descriptor is live and the attribute name is terminated.
+        let removed = unsafe { libc::fremovexattr(to, name.as_ptr()) };
+        #[cfg(target_os = "macos")]
+        // SAFETY: same contract, with no platform-specific flags.
+        let removed = unsafe { libc::fremovexattr(to, name.as_ptr(), 0) };
+        if removed != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    for name in names.split_inclusive(|&byte| byte == 0) {
+        let name = CStr::from_bytes_with_nul(name).map_err(io::Error::other)?;
+        #[cfg(target_os = "linux")]
+        if name.to_bytes() == b"security.capability" {
+            continue;
+        }
+        let read = |buffer: *mut libc::c_void, size: usize| {
+            #[cfg(target_os = "linux")]
+            // SAFETY: name is terminated and buffer follows the same query/read contract above.
+            unsafe {
+                libc::fgetxattr(from, name.as_ptr(), buffer, size)
+            }
+            #[cfg(target_os = "macos")]
+            // SAFETY: same contract, with position and flags both zero.
+            unsafe {
+                libc::fgetxattr(from, name.as_ptr(), buffer, size, 0, 0)
+            }
+        };
+        let size = read(std::ptr::null_mut(), 0);
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut value = vec![0u8; size as usize];
+        let size = read(value.as_mut_ptr().cast(), value.len());
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if size as usize > value.len() {
+            return Err(io::Error::other(
+                "an extended attribute changed while it was being copied",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        // SAFETY: the names and buffers remain valid for the synchronous call.
+        let saved =
+            unsafe { libc::fsetxattr(to, name.as_ptr(), value.as_ptr().cast(), size as usize, 0) };
+        #[cfg(target_os = "macos")]
+        // SAFETY: same contract, with position and flags both zero.
+        let saved = unsafe {
+            libc::fsetxattr(
+                to,
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                size as usize,
+                0,
+                0,
+            )
+        };
+        if saved != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Restore access only after the staging content is complete. ReplaceFile preserves DACLs but
+/// does not promise to preserve the owner or group, so copy those explicitly before publishing.
+/// A protected staging DACL keeps directory inheritance from widening access to an existing file.
+#[cfg(windows)]
+fn preserve_windows_access(original: &File, staged: &File, protect: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
+    let mut filesystem_flags = 0u32;
+    // A volume query is only an optimization for filesystems without ACLs. SMB does not
+    // support this API, so an unavailable query must still try the file-security APIs below.
+    // SAFETY: only filesystem flags are requested from the volume holding the live handle.
+    let volume_known = unsafe {
+        GetVolumeInformationByHandleW(
+            original.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut filesystem_flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0;
+    // FILE_PERSISTENT_ACLS: FAT/exFAT have no security descriptor to preserve.
+    if volume_known && filesystem_flags & 0x00000008 == 0 {
+        return Ok(());
+    }
+    struct Security {
+        descriptor: PSECURITY_DESCRIPTOR,
+        owner: PSID,
+        group: PSID,
+        dacl: *mut ACL,
+    }
+    impl Drop for Security {
+        fn drop(&mut self) {
+            if !self.descriptor.is_null() {
+                // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
+                unsafe { LocalFree(self.descriptor) };
+            }
+        }
+    }
+    let read = |file: &File, information| -> io::Result<Security> {
+        let mut security = Security {
+            descriptor: std::ptr::null_mut(),
+            owner: std::ptr::null_mut(),
+            group: std::ptr::null_mut(),
+            dacl: std::ptr::null_mut(),
+        };
+        // SAFETY: the file owns the handle and every output is writable; the returned SIDs and
+        // ACL remain owned by the descriptor until Security is dropped.
+        let result = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                information,
+                &mut security.owner,
+                &mut security.group,
+                &mut security.dacl,
+                std::ptr::null_mut(),
+                &mut security.descriptor,
+            )
+        };
+        if result != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        if security.owner.is_null() || security.group.is_null() {
+            return Err(io::Error::other("the file's owner or group is missing"));
+        }
+        Ok(security)
+    };
+    let ownership = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
+    let source = read(original, ownership | DACL_SECURITY_INFORMATION)?;
+    let current = read(staged, ownership)?;
+    let (mut control, mut revision) = (0u16, 0u32);
+    // SAFETY: GetSecurityInfo returned a live security descriptor.
+    if unsafe { GetSecurityDescriptorControl(source.descriptor, &mut control, &mut revision) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let inheritance = if protect || control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    let mut information = DACL_SECURITY_INFORMATION | inheritance;
+    // Avoid an unnecessary ownership change when normal creation already chose the same SID.
+    // SAFETY: each non-null SID came from its still-live security descriptor.
+    if unsafe { EqualSid(source.owner, current.owner) } == 0 {
+        information |= OWNER_SECURITY_INFORMATION;
+    }
+    // SAFETY: same live-descriptor contract for the primary group SIDs.
+    if unsafe { EqualSid(source.group, current.group) } == 0 {
+        information |= GROUP_SECURITY_INFORMATION;
+    }
+    // SAFETY: these SIDs and ACL remain alive during this synchronous file-security call. A
+    // caller unable to preserve a different owner/group fails here, before touching the target.
+    let result = unsafe {
+        SetSecurityInfo(
+            staged.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            source.owner,
+            source.group,
+            source.dacl,
+            std::ptr::null(),
+        )
+    };
+    if result != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+    Ok(())
+}
+
+/// The documented ReplaceFile failure state in which the old file has already moved to the
+/// backup. Keep this recovery logic independent of Win32 so its destructive failure paths can
+/// also be exercised on the other supported platforms.
+#[cfg(any(windows, test))]
+fn replace_with_backup(
+    target: &Path,
+    replace: impl FnOnce(&Path) -> io::Result<()>,
+    restore: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Reserve a unique, owner-only name. ReplaceFile replaces this empty placeholder with the
+    // original file; no previously existing user's backup is overwritten.
+    let mut backup = Staged::new(parent, true)?;
+    drop(backup.file.take());
+    // A panic or an unexpected unwind must never remove a backup after the native call moved
+    // the original into it. Re-enable cleanup only in states that leave a complete target.
+    backup.remove_on_drop = false;
+    match replace(&backup.path) {
+        Ok(()) => {
+            backup.remove_on_drop = true;
+            Ok(())
+        }
+        // ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: the original is now at the supplied backup path.
+        Err(error) if error.raw_os_error() == Some(1177) => match restore(&backup.path) {
+            Ok(()) => {
+                backup.remove_on_drop = true;
+                Err(error)
+            }
+            Err(restore_error) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not replace {} ({error}) or restore it ({restore_error}); the original file is preserved at {}",
+                    target.display(),
+                    backup.path.display()
+                ),
+            )),
+        },
+        // With a non-null backup path, 1176 and all other documented failures keep the original
+        // at its original name. Only an unused backup placeholder needs cleanup in these states.
+        Err(error) => {
+            backup.remove_on_drop = true;
+            Err(error)
+        }
+    }
+}
+
+/// A no-replace move works on filesystems without hard links and cannot overwrite a file that
+/// another writer created during a failed replacement's rollback.
+#[cfg(windows)]
+fn move_new_windows(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both paths are terminated; no REPLACE_EXISTING or COPY_ALLOWED flags are set.
+    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> io::Result<(u32, u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    // SAFETY: the live file owns this handle and info is a writable output buffer.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(io::Error::other("the target is not a regular file"));
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    ))
+}
+
+#[cfg(windows)]
+fn unchanged_windows_target(original: &File, target: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+    let now = OpenOptions::new()
+        .read(true)
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(target)?;
+    if windows_file_identity(original)? != windows_file_identity(&now)? {
+        return Err(io::Error::other(
+            "the target changed while the replacement was being saved",
+        ));
+    }
+    Ok(())
+}
+
+/// Publishes a complete replacement. Windows ReplaceFile preserves the existing DACL and
+/// alternate streams; an ordinary rename would discard them. Ownership was copied beforehand.
+fn publish(staged: &Path, target: &Path, exists: bool) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if exists {
+            return std::fs::rename(staged, target);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let source = CString::new(staged.as_os_str().as_bytes()).map_err(io::Error::other)?;
+            let destination =
+                CString::new(target.as_os_str().as_bytes()).map_err(io::Error::other)?;
+            #[cfg(target_os = "linux")]
+            // Use the kernel entry point: the static musl shipped by supported Rust toolchains
+            // need not export the newer renameat2 C wrapper.
+            // SAFETY: both paths are terminated; the arguments match Linux renameat2's ABI.
+            let moved = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    source.as_ptr(),
+                    libc::AT_FDCWD,
+                    destination.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            #[cfg(target_os = "macos")]
+            // SAFETY: both paths are terminated and RENAME_EXCL refuses an existing name.
+            let moved = unsafe {
+                libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL)
+            };
+            if moved == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::EINVAL | libc::ENOTSUP)
+            ) {
+                return Err(error);
+            }
+        }
+        // Older kernels/filesystems can still publish the complete inode with a link. Neither
+        // route overwrites a file or a symlink created meanwhile.
+        std::fs::hard_link(staged, target)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+        if !exists {
+            return move_new_windows(staged, target);
+        }
+        let wide_target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+        let wide_staged: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
+        replace_with_backup(
+            target,
+            |backup| {
+                let backup: Vec<u16> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
+                // SAFETY: all three terminated paths remain live for the call. Supplying a backup
+                // prevents ERROR_UNABLE_TO_MOVE_REPLACEMENT (1176) from deleting the original.
+                if unsafe {
+                    ReplaceFileW(
+                        wide_target.as_ptr(),
+                        wide_staged.as_ptr(),
+                        backup.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            },
+            |backup| move_new_windows(backup, target),
+        )
+    }
+}
+
+/// Saves before touching the old inode: ENOSPC, quotas, failed syncs, and failed metadata
+/// preservation all leave the original intact. This requires a writable parent directory.
+fn save_text(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let target = write_target(path)?;
+    let original = match std::fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(io::Error::other("the target is not a regular file"));
+            }
+            let mut options = OpenOptions::new();
+            options.write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // A replaced final symlink is not followed, and a raced FIFO cannot block.
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            }
+            let file = options.open(&target)?;
+            #[cfg(windows)]
+            windows_file_identity(&file)?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other("the target is not a regular file"));
+            }
+            single_link(&file)?;
+            Some(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let metadata = original.as_ref().map(File::metadata).transpose()?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = Staged::new(parent, true)?;
+    // An empty probe obtains the ordinary create mode/DACL under this directory without ever
+    // exposing staged content, and without changing the process-global Unix umask.
+    let defaults = if metadata.is_none() {
+        Some(Staged::new(parent, false)?)
+    } else {
+        None
+    };
+    let file = staged.file.as_mut().expect("a new staging file is open");
+    #[cfg(not(target_os = "macos"))]
+    let permissions = match &metadata {
+        Some(metadata) => metadata.permissions(),
+        None => defaults
+            .as_ref()
+            .unwrap()
+            .file
+            .as_ref()
+            .unwrap()
+            .metadata()?
+            .permissions(),
+    };
+    file.write_all(bytes)?;
+    #[cfg(windows)]
+    {
+        let source = original
+            .as_ref()
+            .or_else(|| defaults.as_ref().and_then(|probe| probe.file.as_ref()))
+            .unwrap();
+        preserve_windows_access(source, file, original.is_some())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(metadata) = &metadata {
+        preserve_owner(file, metadata)?;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(original) = &original {
+        preserve_xattrs(original, file)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    file.set_permissions(permissions)?;
+    #[cfg(target_os = "macos")]
+    {
+        let source = original
+            .as_ref()
+            .or_else(|| defaults.as_ref().and_then(|probe| probe.file.as_ref()))
+            .unwrap();
+        macos_access::preserve(source, file)?;
+    }
+    file.sync_all()?;
+    if let Some(original) = &original {
+        single_link(original)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let before = original.metadata()?;
+            let now = std::fs::symlink_metadata(&target)?;
+            if !now.is_file() || before.dev() != now.dev() || before.ino() != now.ino() {
+                return Err(io::Error::other(
+                    "the target changed while the replacement was being saved",
+                ));
+            }
+        }
+        #[cfg(windows)]
+        unchanged_windows_target(original, &target)?;
+    }
+    drop(staged.file.take());
+    publish(&staged.path, &target, original.is_some())
 }
 
 /// One replacement matched against the content it is applied to.
@@ -700,7 +1675,10 @@ fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, St
     }
     let resolved = resolve(&request.path, launch)?;
     let _guard = lock();
-    let bytes = std::fs::read(&resolved)
+    let (mut file, _) = open_regular(&resolved)
+        .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
         .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
     let raw = String::from_utf8(bytes)
         .map_err(|_| format!("{} is not valid UTF-8. Edit it with exec.", request.path))?;
@@ -708,11 +1686,9 @@ fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, St
         Some(rest) => ("\u{feff}", rest),
         None => ("", raw.as_str()),
     };
-    let ending = detect_line_ending(content);
-    let normalized = normalize_to_lf(content);
-    let (replaced, lines) = apply_edits(&normalized, request, &request.path)?;
-    let written = format!("{bom}{}", restore_line_endings(&replaced, ending));
-    std::fs::write(&resolved, written.as_bytes())
+    let (replaced, lines) = apply_edits(content, request, &request.path)?;
+    let written = format!("{bom}{replaced}");
+    save_text(&resolved, written.as_bytes())
         .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
     let mut text = format!(
         "Successfully replaced {} block(s) in {}.",
@@ -728,14 +1704,16 @@ fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, St
     Ok(text)
 }
 
-/// Applies the edits to LF-normalized content, and answers with the new content and each edit's
-/// line in it, in the request's order.
+/// Matches in LF-normalized text but replaces the corresponding original byte ranges. Bytes
+/// outside those ranges, including mixed line endings, stay untouched.
 fn apply_edits(
     content: &str,
     request: &EditRequest,
     path: &str,
 ) -> Result<(String, Vec<(usize, bool)>), String> {
     let total = request.edits.len();
+    let normalized = LfText::new(content);
+    let ending = detect_line_ending(content);
     let edits: Vec<(String, String)> = request
         .edits
         .iter()
@@ -751,23 +1729,34 @@ fn apply_edits(
             return Err(format!("edits[{index}].oldText must not be empty."));
         }
     }
-    // Each edit is looked for in the content as it is, and then through the fuzzy form, which
-    // names the bytes of the content a match in that form stands for.
+    let inserted: Vec<String> = edits
+        .iter()
+        .map(|(_, new)| restore_line_endings(new, ending))
+        .collect();
+    // Fuzzy matching first maps back to normalized bytes; the newline map then names the
+    // original bytes, including both bytes of a CRLF when the match includes that newline.
     let mut matched: Vec<Matched<'_>> = Vec::new();
     for (index, (old, new)) in edits.iter().enumerate() {
-        let Some((at, len, fuzzy)) = find_span(content, old) else {
+        let Some((at, len, fuzzy)) = find_span(&normalized.text, old) else {
             return Err(not_found(path, index, total));
         };
-        let count = occurrences(content, old);
+        let count = occurrences(&normalized.text, old);
         if count > 1 {
             return Err(duplicate(path, index, total, count));
         }
+        let (raw_at, raw_end) = (normalized.original(at), normalized.original(at + len));
+        // An unchanged block must not normalize its own mixed newlines as a side effect.
+        let new_text = if normalized.text[at..at + len] == *new {
+            &content[raw_at..raw_end]
+        } else {
+            &inserted[index]
+        };
         matched.push(Matched {
             index,
-            at,
-            len,
+            at: raw_at,
+            len: raw_end - raw_at,
             fuzzy,
-            new_text: new,
+            new_text,
         });
     }
     matched.sort_by_key(|edit| edit.at);
@@ -786,7 +1775,7 @@ fn apply_edits(
     let mut lines = vec![(0usize, false); total];
     for edit in &matched {
         let at = starts[edit.index];
-        lines[edit.index] = (1 + replaced[..at].matches('\n').count(), edit.fuzzy);
+        lines[edit.index] = (1 + line_breaks(&replaced[..at]), edit.fuzzy);
     }
     Ok((replaced, lines))
 }
@@ -930,13 +1919,44 @@ fn replace(content: &str, matched: &[Matched<'_>]) -> (String, Vec<usize>) {
     (result, starts)
 }
 
-/// The line ending the content uses: CRLF only when its first `\n` follows a `\r`.
+/// A normalized view and the positions where a CRLF lost its CR. A boundary before the LF
+/// maps before the original CR; a boundary after it maps after the complete CRLF.
+struct LfText {
+    text: String,
+    crlf: Vec<usize>,
+}
+
+impl LfText {
+    fn new(content: &str) -> Self {
+        let crlf: Vec<usize> = content
+            .match_indices("\r\n")
+            .enumerate()
+            .map(|(removed, (at, _))| at - removed)
+            .collect();
+        Self {
+            text: normalize_to_lf(content),
+            crlf,
+        }
+    }
+
+    fn original(&self, offset: usize) -> usize {
+        offset + self.crlf.partition_point(|&at| at < offset)
+    }
+}
+
+/// Counts CRLF as one line break, along with individual CR and LF.
+fn line_breaks(text: &str) -> usize {
+    text.bytes()
+        .filter(|&byte| byte == b'\r' || byte == b'\n')
+        .count()
+        - text.matches("\r\n").count()
+}
+
+/// The first line ending is the convention used only for inserted text.
 fn detect_line_ending(content: &str) -> &'static str {
-    let Some(lf) = content.find('\n') else {
-        return "\n";
-    };
-    match content.find("\r\n") {
-        Some(crlf) if crlf < lf => "\r\n",
+    match content.find(['\r', '\n']) {
+        Some(at) if content[at..].starts_with("\r\n") => "\r\n",
+        Some(at) if content.as_bytes()[at] == b'\r' => "\r",
         _ => "\n",
     }
 }
@@ -946,8 +1966,8 @@ fn normalize_to_lf(text: &str) -> String {
 }
 
 fn restore_line_endings(text: &str, ending: &str) -> String {
-    if ending == "\r\n" {
-        text.replace('\n', "\r\n")
+    if ending != "\n" {
+        text.replace('\n', ending)
     } else {
         text.to_owned()
     }
@@ -1553,6 +2573,647 @@ mod tests {
         .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o750);
+    }
+
+    #[test]
+    fn edit_maps_cross_line_matches_and_reports_cr_lines() {
+        let scratch = Scratch::new("mapped-endings");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file("mixed.txt", "é\r\n中\nneedle\rtail\r\nend\n".as_bytes());
+        let reply = change(
+            "mixed.txt",
+            &[("中\nneedle", "新\nvalue"), ("end", "END")],
+            &launch,
+        )
+        .unwrap();
+        assert!(reply.contains("edits[0]: line 2"), "{reply}");
+        assert!(reply.contains("edits[1]: line 5"), "{reply}");
+        assert_eq!(
+            scratch.read("mixed.txt"),
+            "é\r\n新\r\nvalue\rtail\r\nEND\n".as_bytes()
+        );
+        scratch.file("same.txt", b"a\r\nb\nc\r");
+        assert!(change("same.txt", &[("a\nb\nc\n", "a\nb\nc\n")], &launch).is_err());
+        assert_eq!(scratch.read("same.txt"), b"a\r\nb\nc\r");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_saves_follow_existing_and_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+        let scratch = Scratch::new("save-links");
+        let launch = context(&scratch.0, &scratch.0);
+        let target = scratch.file("target.txt", b"old");
+        let link = scratch.0.join("link.txt");
+        symlink("target.txt", &link).unwrap();
+        change("link.txt", &[("old", "new")], &launch).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        save_text(&link, b"again").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"again");
+        let dangling = scratch.0.join("dangling.txt");
+        symlink("created.txt", &dangling).unwrap();
+        save_text(&dangling, b"created").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(scratch.read("created.txt"), b"created");
+    }
+
+    #[test]
+    fn atomic_saves_refuse_to_silently_split_hard_links() {
+        let scratch = Scratch::new("save-hard-links");
+        let launch = context(&scratch.0, &scratch.0);
+        let original = scratch.file("original.txt", b"original");
+        std::fs::hard_link(&original, scratch.0.join("alias.txt")).unwrap();
+        let error = save_text(&original, b"replacement")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("hard links") && error.contains("exec"),
+            "{error}"
+        );
+        assert!(change("original.txt", &[("original", "replacement")], &launch).is_err());
+        assert_eq!(scratch.read("original.txt"), b"original");
+        assert_eq!(scratch.read("alias.txt"), b"original");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_chmod_acl(path: &Path, entry: Option<&str>) {
+        let mut command = std::process::Command::new("/bin/chmod");
+        if let Some(entry) = entry {
+            command.args(["+a", entry]);
+        } else {
+            command.arg("-N");
+        }
+        let output = command.arg(path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_staging_rejects_parent_acl_inheritance_at_creation() {
+        use std::os::unix::fs::MetadataExt;
+        let scratch = Scratch::new("save-macos-private-acl");
+        macos_chmod_acl(&scratch.0, Some("everyone allow read,file_inherit"));
+        let ordinary_path = scratch.0.join("ordinary");
+        let ordinary = create_staging_file(&ordinary_path, false).unwrap();
+        assert!(
+            macos_access::has_entries(&ordinary).unwrap(),
+            "fixture must inherit its parent ACL"
+        );
+        let private_path = scratch.0.join("private");
+        let private = create_staging_file(&private_path, true).unwrap();
+        assert_eq!(private.metadata().unwrap().mode() & 0o077, 0);
+        assert!(!macos_access::has_entries(&private).unwrap());
+        // Final new files acquire ordinary defaults only after staging has finished.
+        let final_path = scratch.0.join("final");
+        save_text(&final_path, b"complete").unwrap();
+        let final_file = File::open(&final_path).unwrap();
+        assert_eq!(
+            macos_access::acl_text(&final_file).unwrap(),
+            macos_access::acl_text(&ordinary).unwrap()
+        );
+        assert_eq!(std::fs::read(final_path).unwrap(), b"complete");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_atomic_save_preserves_an_explicit_deny_acl() {
+        let scratch = Scratch::new("save-macos-deny-acl");
+        let path = scratch.file("target", b"original");
+        macos_chmod_acl(&path, Some("everyone deny read"));
+        let original = OpenOptions::new().write(true).open(&path).unwrap();
+        let before = macos_access::acl_text(&original).unwrap();
+        assert!(before.contains("deny"));
+        save_text(&path, b"replacement").unwrap();
+        let replaced = OpenOptions::new().write(true).open(&path).unwrap();
+        assert_eq!(macos_access::acl_text(&replaced).unwrap(), before);
+        // Remove the test's deny entry only after checking it survived the replacement.
+        macos_chmod_acl(&path, None);
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_atomic_save_does_not_add_parent_grants_to_a_file_without_an_acl() {
+        let scratch = Scratch::new("save-macos-no-acl");
+        macos_chmod_acl(&scratch.0, Some("everyone allow read,file_inherit"));
+        let path = scratch.file("target", b"original");
+        macos_chmod_acl(&path, None);
+        let original = File::open(&path).unwrap();
+        assert!(!macos_access::has_entries(&original).unwrap());
+        save_text(&path, b"replacement").unwrap();
+        let replaced = File::open(&path).unwrap();
+        assert!(!macos_access::has_entries(&replaced).unwrap());
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[cfg(windows)]
+    fn windows_security_text(path: &Path) -> String {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+            SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        };
+        struct Allocation(HLOCAL);
+        impl Drop for Allocation {
+            fn drop(&mut self) {
+                // SAFETY: both security APIs below return LocalAlloc-owned buffers.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+        let file = File::open(path).unwrap();
+        let mut descriptor = std::ptr::null_mut();
+        let information =
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        // SAFETY: the file and the descriptor output live for this synchronous query.
+        let result = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                information,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(result, ERROR_SUCCESS);
+        let _descriptor = Allocation(descriptor);
+        let (mut text, mut length) = (std::ptr::null_mut(), 0u32);
+        // SAFETY: descriptor is live, and both outputs are writable.
+        assert_ne!(
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    SDDL_REVISION_1,
+                    information,
+                    &mut text,
+                    &mut length,
+                )
+            },
+            0
+        );
+        let _text = Allocation(text.cast());
+        // SAFETY: the conversion returned length UTF-16 units, including the terminator.
+        let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
+        String::from_utf16(units.strip_suffix(&[0]).unwrap_or(units)).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_save_preserves_owner_group_dacl_and_named_streams() {
+        let scratch = Scratch::new("save-windows-metadata");
+        let target = scratch.0.join("target.txt");
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
+        let mut original = create_staging_file(&target, true).unwrap();
+        original.write_all(b"original").unwrap();
+        let mut flags = 0u32;
+        // SAFETY: only flags are requested from the volume holding this live file handle.
+        assert_ne!(
+            unsafe {
+                GetVolumeInformationByHandleW(
+                    original.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut flags,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            0
+        );
+        drop(original);
+        let stream = PathBuf::from(format!("{}:fastexec-test", target.display()));
+        let named_streams = flags & 0x00040000 != 0;
+        if named_streams {
+            std::fs::write(&stream, b"a named stream").unwrap();
+        }
+        let before = (flags & 0x00000008 != 0).then(|| windows_security_text(&target));
+        save_text(&target, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        if named_streams {
+            assert_eq!(std::fs::read(&stream).unwrap(), b"a named stream");
+        }
+        if let Some(before) = before {
+            assert_eq!(windows_security_text(&target), before);
+        }
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_publish_checks_the_open_originals_identity() {
+        let scratch = Scratch::new("save-windows-identity");
+        let target = scratch.file("target.txt", b"original");
+        let original = File::open(&target).unwrap();
+        unchanged_windows_target(&original, &target).unwrap();
+        std::fs::rename(&target, scratch.0.join("retired.txt")).unwrap();
+        std::fs::write(&target, b"a different file").unwrap();
+        let error = unchanged_windows_target(&original, &target).unwrap_err();
+        assert!(error.to_string().contains("target changed"), "{error}");
+        assert_eq!(scratch.read("target.txt"), b"a different file");
+        assert_eq!(scratch.read("retired.txt"), b"original");
+    }
+
+    #[test]
+    fn replacement_backup_is_removed_after_success() {
+        let scratch = Scratch::new("replace-backup-success");
+        let target = scratch.file("target.txt", b"original");
+        let staged = scratch.file("staged.txt", b"replacement");
+        replace_with_backup(
+            &target,
+            |backup| {
+                std::fs::rename(&target, backup)?;
+                std::fs::rename(&staged, &target)
+            },
+            |_| panic!("successful publication must not roll back"),
+        )
+        .unwrap();
+        assert_eq!(scratch.read("target.txt"), b"replacement");
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn replacement_failure_before_move_keeps_the_original() {
+        for code in [1175, 1176, 5] {
+            let scratch = Scratch::new(&format!("replace-backup-failed-{code}"));
+            let target = scratch.file("target.txt", b"original");
+            let staged = scratch.file("staged.txt", b"replacement");
+            let error = replace_with_backup(
+                &target,
+                |_| Err(io::Error::from_raw_os_error(code)),
+                |_| panic!("this failure leaves the original in place"),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+            assert_eq!(scratch.read("target.txt"), b"original");
+            assert_eq!(std::fs::read(staged).unwrap(), b"replacement");
+            assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn replacement_failure_after_move_restores_the_original() {
+        let scratch = Scratch::new("replace-backup-restored");
+        let target = scratch.file("target.txt", b"original");
+        let staged = scratch.file("staged.txt", b"replacement");
+        let error = replace_with_backup(
+            &target,
+            |backup| {
+                std::fs::rename(&target, backup)?;
+                Err(io::Error::from_raw_os_error(1177))
+            },
+            |backup| publish(backup, &target, false),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(1177));
+        assert_eq!(scratch.read("target.txt"), b"original");
+        assert_eq!(std::fs::read(staged).unwrap(), b"replacement");
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_replacement_and_rollback_keep_a_recoverable_original() {
+        let scratch = Scratch::new("replace-backup-retained");
+        let target = scratch.file("target.txt", b"original");
+        let mut staged = Staged::new(&scratch.0, true).unwrap();
+        staged
+            .file
+            .as_mut()
+            .unwrap()
+            .write_all(b"replacement")
+            .unwrap();
+        let recovery = std::cell::RefCell::new(PathBuf::new());
+        let error = replace_with_backup(
+            &target,
+            |backup| {
+                *recovery.borrow_mut() = backup.to_path_buf();
+                std::fs::rename(&target, backup)?;
+                Err(io::Error::from_raw_os_error(1177))
+            },
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected rollback failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        drop(staged);
+        assert!(!target.exists());
+        let recovery = recovery.into_inner();
+        assert_eq!(std::fs::read(&recovery).unwrap(), b"original");
+        assert!(
+            error.to_string().contains(recovery.to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn replacement_rollback_does_not_clobber_a_concurrent_target() {
+        let scratch = Scratch::new("replace-backup-concurrent");
+        let target = scratch.file("target.txt", b"original");
+        let recovery = std::cell::RefCell::new(PathBuf::new());
+        let error = replace_with_backup(
+            &target,
+            |backup| {
+                *recovery.borrow_mut() = backup.to_path_buf();
+                std::fs::rename(&target, backup)?;
+                std::fs::write(&target, b"a concurrent writer")?;
+                Err(io::Error::from_raw_os_error(1177))
+            },
+            |backup| publish(backup, &target, false),
+        )
+        .unwrap_err();
+        assert_eq!(scratch.read("target.txt"), b"a concurrent writer");
+        let recovery = recovery.into_inner();
+        assert_eq!(std::fs::read(&recovery).unwrap(), b"original");
+        assert!(
+            error.to_string().contains(recovery.to_str().unwrap()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn exclusive_publish_does_not_replace_a_raced_target() {
+        let scratch = Scratch::new("exclusive-publish");
+        let staged = scratch.file("staged.txt", b"new");
+        let target = scratch.file("target.txt", b"another writer");
+        assert!(publish(&staged, &target, false).is_err());
+        assert_eq!(scratch.read("target.txt"), b"another writer");
+        assert_eq!(scratch.read("staged.txt"), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_saves_refuse_special_files_without_opening_them() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let scratch = Scratch::new("save-special");
+        let fifo = scratch.0.join("fifo");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the terminated path is owned by the test.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(save_text(&fifo, b"must not replace the FIFO").is_err());
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert!(save_text(&scratch.0, b"must not replace the directory").is_err());
+        assert!(scratch.0.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privileged_save_preserves_owner_group_and_mode() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: getuid has no side effects.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let scratch = Scratch::new("save-owner");
+        let path = scratch.file("owned.txt", b"original");
+        let file = File::open(&path).unwrap();
+        // SAFETY: only this test's file is changed; the numeric IDs need no account lookup.
+        assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), 65534, 65534) }, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        save_text(&path, b"changed").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+            (65534, 65534, 0o640)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_test_xattr(path: &Path, name: &std::ffi::CStr, value: &[u8]) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: all buffers and terminated strings remain live for the call.
+        assert_eq!(
+            unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_xattr(path: &Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut value = vec![0u8; 1024];
+        // SAFETY: the value buffer is writable and the strings are terminated.
+        let size = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if size < 0 {
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENODATA)
+            );
+            return None;
+        }
+        value.truncate(size as usize);
+        Some(value)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_acl() -> Vec<u8> {
+        // Linux POSIX ACL xattr version 2: owner, named user, group, mask, other.
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (1u16, 7u16, u32::MAX),
+            (2, 6, 65534),
+            (4, 0, u32::MAX),
+            (16, 6, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        acl
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_save_preserves_existing_acl_and_xattrs() {
+        let scratch = Scratch::new("save-attributes");
+        let path = scratch.file("target.txt", b"original");
+        let acl = test_acl();
+        set_test_xattr(&path, c"user.fastexec-test", b"retained");
+        set_test_xattr(&path, c"system.posix_acl_access", &acl);
+        save_text(&path, b"changed").unwrap();
+        assert_eq!(
+            test_xattr(&path, c"user.fastexec-test"),
+            Some(b"retained".to_vec())
+        );
+        assert_eq!(test_xattr(&path, c"system.posix_acl_access"), Some(acl));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_save_does_not_gain_the_directories_default_acl() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("save-inherited-acl");
+        let path = scratch.file("target.txt", b"original");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(test_xattr(&path, c"system.posix_acl_access").is_none());
+        set_test_xattr(&scratch.0, c"system.posix_acl_default", &test_acl());
+        save_text(&path, b"changed").unwrap();
+        assert!(test_xattr(&path, c"system.posix_acl_access").is_none());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn regression_edit_preserves_unmatched_line_endings() {
+        let scratch = Scratch::new("mixed-endings");
+        let launch = context(&scratch.0, &scratch.0);
+        let original = b"\xef\xbb\xbffirst\r\nneedle\r\nlast\ncarriage\rreturn\n";
+        scratch.file("mixed.txt", original);
+        change("mixed.txt", &[("needle", "CHANGED")], &launch).unwrap();
+        assert_eq!(
+            scratch.read("mixed.txt"),
+            b"\xef\xbb\xbffirst\r\nCHANGED\r\nlast\ncarriage\rreturn\n"
+        );
+        scratch.file("cr.txt", b"one\rtwo\rthree\r");
+        let answer = change("cr.txt", &[("two", "TWO")], &launch).unwrap();
+        assert!(answer.ends_with("line 2"), "{answer}");
+        assert_eq!(scratch.read("cr.txt"), b"one\rTWO\rthree\r");
+    }
+
+    #[cfg(unix)]
+    fn failed_save_preserves_original(operation: &str) {
+        use std::os::unix::process::CommandExt;
+        let scratch = Scratch::new(&format!("failed-{operation}"));
+        let original = format!("{}needle\n", "original ".repeat(50));
+        let path = scratch.file("target.txt", original.as_bytes());
+        let mut worker = std::process::Command::new(std::env::current_exe().unwrap());
+        worker
+            .arg("--exact")
+            .arg("files::tests::failed_save_worker")
+            .arg("--nocapture")
+            .env("FASTEXEC_TEST_SAVE_FAILURE_PATH", &path)
+            .env("FASTEXEC_TEST_SAVE_FAILURE_OPERATION", operation);
+        // The limit belongs only to a fresh test child, never to other tests or the MCP host.
+        unsafe {
+            worker.pre_exec(|| {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let limit = libc::rlimit {
+                    rlim_cur: 1024,
+                    rlim_max: 1024,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = worker.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            scratch.read("target.txt"),
+            original.as_bytes(),
+            "{operation} reported an error but changed the original file"
+        );
+        assert_eq!(
+            std::fs::read_dir(&scratch.0).unwrap().count(),
+            1,
+            "no staging file is left"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_save_worker() {
+        let Some(path) = std::env::var_os("FASTEXEC_TEST_SAVE_FAILURE_PATH") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let launch = context(path.parent().unwrap(), path.parent().unwrap());
+        let operation = std::env::var("FASTEXEC_TEST_SAVE_FAILURE_OPERATION").unwrap();
+        let result = if operation == "write" {
+            write_text(
+                &WriteRequest {
+                    path: path.display().to_string(),
+                    content: "N".repeat(2048),
+                },
+                &launch,
+            )
+        } else {
+            change(
+                &path.display().to_string(),
+                &[("needle", &"N".repeat(2048))],
+                &launch,
+            )
+        };
+        assert!(
+            result.is_err(),
+            "the OS file-size limit must reject the save"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regression_failed_write_preserves_original() {
+        failed_save_preserves_original("write");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regression_failed_edit_preserves_original() {
+        failed_save_preserves_original("edit");
     }
 
     #[test]

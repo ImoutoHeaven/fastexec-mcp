@@ -23,7 +23,8 @@ use alacritty_terminal::vte::ansi::{
     KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedPrivateMode,
     PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
-use std::collections::{HashMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -43,6 +44,138 @@ const REPRINT_CONFIRM_LIMIT: usize = 30;
 /// A line whose rows wrap for longer is written out in pieces this long, so a program that
 /// prints without line breaks holds no more than this in memory.
 const LINE_LIMIT: usize = 1 << 20;
+
+/// More than the 30 non-starters in Unicode's stream-safe normalization limit, while bounding
+/// a cell that never advances the cursor. Private transcript marks do not consume this budget.
+const CELL_COMBINING_LIMIT: usize = 32;
+/// OSC metadata does not need megabytes. Buffer at most this much before discarding the whole
+/// control string, including across reads; the unabridged bytes still reach the task's raw log.
+const OSC_BYTES_LIMIT: usize = 8 * 1024;
+/// Saved keyboard modes per screen. Programs normally need one entry per nested terminal
+/// application. On overflow the oldest saved mode is discarded.
+const KEYBOARD_STACK_LIMIT: usize = 128;
+
+#[derive(Default)]
+enum OscState {
+    #[default]
+    Ground,
+    Escape,
+    Collect,
+    Discard,
+}
+
+/// vte's std-enabled OSC parser has no allocation ceiling. Hold an OSC until it ends, then feed
+/// it whole, or cancel the pending ESC and discard an oversized string through its terminator.
+/// The terminator never turns discarded title/clipboard/hyperlink data into visible text.
+#[derive(Default)]
+struct OscGuard {
+    state: OscState,
+    pending: Vec<u8>,
+    /// Forwarded parser offsets and raw-log offsets differ after dropping an oversized OSC.
+    forwarded: u64,
+    discarded: u64,
+    base_discarded: u64,
+    /// (Forwarded position, cumulative discarded bytes). Adjacent gaps coalesce, and entries
+    /// before the parser's synchronized-update buffer are retired after every read.
+    gaps: VecDeque<(u64, u64)>,
+}
+
+impl OscGuard {
+    fn filter<'a>(&mut self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
+        if matches!(self.state, OscState::Ground) && !bytes.contains(&0x1b) {
+            self.forwarded += bytes.len() as u64;
+            return Cow::Borrowed(bytes);
+        }
+        let mut output = Vec::with_capacity(bytes.len() + self.pending.len());
+        for &byte in bytes {
+            match self.state {
+                OscState::Ground => {
+                    output.push(byte);
+                    if byte == 0x1b {
+                        self.state = OscState::Escape;
+                    }
+                }
+                OscState::Escape => {
+                    if byte == b']' {
+                        self.pending.push(byte);
+                        self.state = OscState::Collect;
+                    } else {
+                        output.push(byte);
+                        // vte executes C0 controls and ignores DEL/non-ASCII while waiting for
+                        // an ESC final. An intermediate prevents ']' from starting an OSC.
+                        if matches!(byte, 0x18 | 0x1a | 0x20..=0x7e) {
+                            self.state = OscState::Ground;
+                        }
+                    }
+                }
+                OscState::Collect => {
+                    if matches!(byte, 0x07 | 0x18 | 0x1a | 0x1b) {
+                        output.append(&mut self.pending);
+                        output.push(byte);
+                        self.state = if byte == 0x1b {
+                            OscState::Escape
+                        } else {
+                            OscState::Ground
+                        };
+                    } else if self.pending.len() < OSC_BYTES_LIMIT {
+                        self.pending.push(byte);
+                    } else {
+                        // The current raw byte becomes CAN; the buffered bytes disappear.
+                        self.skip(output.len(), self.pending.len());
+                        self.pending.clear();
+                        output.push(0x18); // Cancel the ESC already fed to the parser.
+                        self.state = OscState::Discard;
+                    }
+                }
+                OscState::Discard => match byte {
+                    0x1b => {
+                        output.push(byte);
+                        self.state = OscState::Escape;
+                    }
+                    0x07 => {
+                        self.skip(output.len(), 1);
+                        self.state = OscState::Ground;
+                    }
+                    0x18 | 0x1a => {
+                        output.push(byte);
+                        self.state = OscState::Ground;
+                    }
+                    _ => self.skip(output.len(), 1),
+                },
+            }
+        }
+        self.forwarded += output.len() as u64;
+        Cow::Owned(output)
+    }
+
+    fn skip(&mut self, output: usize, bytes: usize) {
+        self.discarded += bytes as u64;
+        let position = self.forwarded + output as u64;
+        if let Some((last, discarded)) = self.gaps.back_mut()
+            && *last == position
+        {
+            *discarded = self.discarded;
+        } else {
+            self.gaps.push_back((position, self.discarded));
+        }
+    }
+
+    fn raw_position(&self, forwarded: u64) -> u64 {
+        let discarded = self
+            .gaps
+            .iter()
+            .rev()
+            .find(|&&(at, _)| at <= forwarded)
+            .map_or(self.base_discarded, |&(_, discarded)| discarded);
+        forwarded + discarded
+    }
+
+    fn retire(&mut self, through: u64) {
+        while self.gaps.front().is_some_and(|&(at, _)| at <= through) {
+            self.base_discarded = self.gaps.pop_front().unwrap().1;
+        }
+    }
+}
 
 /// Begins each alternate-screen session in a transcript, among the normal screen's lines where
 /// the session began.
@@ -144,6 +277,7 @@ impl Drawn {
 pub struct Live {
     recorder: Recorder,
     parser: Processor,
+    osc: OscGuard,
     replies: Replies,
     /// Output bytes read, including those a synchronized update still holds.
     read: u64,
@@ -189,6 +323,7 @@ impl Live {
         Live {
             recorder: Recorder::new(Term::new(config.clone(), &size, replies.clone()), config),
             parser: Processor::new(),
+            osc: OscGuard::default(),
             replies,
             read: 0,
             stopped: false,
@@ -229,6 +364,7 @@ impl Live {
         let expired = self
             .sync_deadline()
             .is_some_and(|deadline| deadline <= arrived);
+        let output = self.osc.filter(output);
         self.run(|recorder, parser| {
             if expired {
                 recorder.stop_sync(parser);
@@ -236,7 +372,7 @@ impl Live {
             if let Some(long) = pause {
                 recorder.pause(long);
             }
-            parser.advance(recorder, output);
+            parser.advance(recorder, &output);
             recorder.commit();
         })
     }
@@ -295,6 +431,8 @@ impl Live {
             // A panic would end the capture thread, and the program would block on a full PTY.
             self.stopped = catch_unwind(AssertUnwindSafe(|| step(recorder, parser))).is_err();
         }
+        let shown = self.osc.forwarded - self.parser.sync_bytes_count() as u64;
+        self.osc.retire(shown);
         let mut replies = self
             .replies
             .0
@@ -324,7 +462,12 @@ impl Live {
 
     /// Output bytes the screen shows: those read, without the ones a synchronized update holds.
     pub fn shown(&self) -> u64 {
-        self.read - self.parser.sync_bytes_count() as u64
+        let held = self.parser.sync_bytes_count() as u64;
+        if held == 0 {
+            self.read
+        } else {
+            self.osc.raw_position(self.osc.forwarded - held)
+        }
     }
 
     /// The visible rows without trailing spaces, blank rows at the bottom dropped, and the
@@ -466,10 +609,40 @@ struct ScreenLine {
     row_mark: Option<char>,
 }
 
+/// The current kitty flags and the modes a push will later restore, independently per screen.
+#[derive(Default)]
+struct KeyboardStack {
+    current: KeyboardModes,
+    saved: VecDeque<KeyboardModes>,
+}
+
+impl KeyboardStack {
+    fn push(&mut self, mode: KeyboardModes) {
+        if self.saved.len() == KEYBOARD_STACK_LIMIT {
+            self.saved.pop_front();
+        }
+        self.saved.push_back(self.current);
+        self.current = mode;
+    }
+
+    fn pop(&mut self, count: u16) {
+        let count = usize::from(count);
+        if count > self.saved.len() {
+            self.saved.clear();
+            self.current = KeyboardModes::NO_MODE;
+        } else if count != 0 {
+            let restore = self.saved.len() - count;
+            self.current = self.saved[restore];
+            self.saved.truncate(restore);
+        }
+    }
+}
+
 /// The terminal as the program drives it, recording the transcript: the rows it pushes off the
 /// normal screen, and the scrolls and frames of each alternate-screen session.
 struct Recorder {
     term: Term<Replies>,
+    keyboard: [KeyboardStack; 2],
     /// The history of the alternate-screen session on screen.
     session: Option<History>,
     /// The scroll region's first and last rows, zero-based.
@@ -508,6 +681,7 @@ impl Recorder {
         let rows = term.grid().screen_lines();
         Recorder {
             term,
+            keyboard: Default::default(),
             session: None,
             region: (0, rows.saturating_sub(1)),
             held: false,
@@ -599,6 +773,15 @@ impl Recorder {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// Keep only the current mode in the native stack. Its overflow branch in alacritty 0.26
+    /// removes a title instead of a keyboard entry and can panic; nesting lives in our bounded
+    /// stack. Updating the top also makes reports and screen swaps reflect direct flag changes.
+    fn sync_keyboard_mode(&mut self) {
+        let mode = self.keyboard[usize::from(self.alternate())].current;
+        Handler::pop_keyboard_modes(&mut self.term, u16::MAX);
+        Handler::push_keyboard_mode(&mut self.term, mode);
+    }
+
     fn push(&mut self, line: &str) {
         self.out.push_str(line);
         self.out.push('\n');
@@ -607,10 +790,28 @@ impl Recorder {
     /// Writes out the lines settled since the last call.
     fn commit(&mut self) {
         self.spill();
+        self.prune_marks();
         let lines = self.session.as_mut().map(History::commit);
         for line in lines.into_iter().flatten() {
             self.push(&line);
         }
+    }
+
+    /// A program can overwrite a marked row without scrolling it out. Keep only associations
+    /// that the normal grid or its unfinished logical line can still reference. While the
+    /// alternate grid is active the unchanged normal grid is inaccessible, so leave its marks.
+    fn prune_marks(&mut self) {
+        if self.alternate() || self.marked.is_empty() {
+            return;
+        }
+        let grid = self.term.grid();
+        let mut present: HashSet<char> = (0..grid.screen_lines())
+            .filter_map(|line| row_mark(&grid[Line(line as i32)]))
+            .collect();
+        if let Some((_, Some(mark))) = &self.partial {
+            present.insert(*mark);
+        }
+        self.marked.retain(|mark, _| present.contains(mark));
     }
 
     /// The output ended: the session on screen ends, and the normal screen's lines are written.
@@ -794,6 +995,7 @@ impl Recorder {
             self.marks += 1;
             let mark = mark_char(self.marks);
             let row = &mut self.term.grid_mut()[Line(line.row as i32)];
+            clear_row_marks(row);
             // A glyph is a base character other than whitespace, or a combining mark on a blank;
             // a blank row carries its mark in its first cell.
             let column = row[..]
@@ -808,6 +1010,7 @@ impl Recorder {
             row[Column(column)].push_zerowidth(mark);
             self.marked.insert(mark, on_screen);
         }
+        self.prune_marks();
     }
 
     /// The history of the alternate-screen session on screen.
@@ -952,6 +1155,28 @@ impl Handler for Recorder {
         // As the terminal does: a character with width wraps past the last column, and a wide
         // character wraps from it; wrapping at the scroll region's bottom scrolls.
         let width = c.width().unwrap_or(0);
+        if c.width() == Some(0) {
+            // Match alacritty's zero-width placement, including a wide glyph's spacer and a
+            // pending wrap. Only user text counts, so transcript row marks keep their meaning.
+            let grid = self.term.grid();
+            let mut column = grid.cursor.point.column;
+            if !grid.cursor.input_needs_wrap {
+                column.0 = column.0.saturating_sub(1);
+            }
+            let row = &grid[grid.cursor.point.line];
+            if row[column].flags.contains(Flags::WIDE_CHAR_SPACER) {
+                column.0 = column.0.saturating_sub(1);
+            }
+            let count = row[column]
+                .zerowidth()
+                .into_iter()
+                .flatten()
+                .filter(|&&mark| !is_mark(mark))
+                .count();
+            if count >= CELL_COMBINING_LIMIT {
+                return;
+            }
+        }
         let last_column = self.term.grid().cursor.point.column.0 + 1 >= self.term.columns();
         let wide_wraps =
             width == 2 && last_column && self.term.mode().contains(TermMode::LINE_WRAP);
@@ -1071,6 +1296,7 @@ impl Handler for Recorder {
             self.write_screen();
         }
         Handler::reset_state(&mut self.term);
+        self.keyboard = Default::default();
         let (_, rows) = self.size();
         self.region = (0, rows.saturating_sub(1));
         self.held = false;
@@ -1116,8 +1342,38 @@ impl Handler for Recorder {
         }
     }
 
+    fn push_keyboard_mode(&mut self, mode: KeyboardModes) {
+        let screen = usize::from(self.alternate());
+        self.keyboard[screen].push(mode);
+        self.sync_keyboard_mode();
+    }
+
+    fn pop_keyboard_modes(&mut self, to_pop: u16) {
+        let screen = usize::from(self.alternate());
+        self.keyboard[screen].pop(to_pop);
+        self.sync_keyboard_mode();
+    }
+
+    fn set_keyboard_mode(&mut self, mode: KeyboardModes, behavior: KeyboardModesApplyBehavior) {
+        let screen = usize::from(self.alternate());
+        let current = &mut self.keyboard[screen].current;
+        *current = match behavior {
+            KeyboardModesApplyBehavior::Replace => mode,
+            KeyboardModesApplyBehavior::Union => *current | mode,
+            KeyboardModesApplyBehavior::Difference => *current & !mode,
+        };
+        self.sync_keyboard_mode();
+    }
+
+    // There is no window, clipboard, or hyperlink UI in this emulator. Keeping their payloads
+    // (and thousands of stacked titles or distinct per-cell links) buys no observable behavior.
+    fn set_title(&mut self, _title: Option<String>) {}
+    fn push_title(&mut self) {}
+    fn pop_title(&mut self) {}
+    fn set_hyperlink(&mut self, _link: Option<Hyperlink>) {}
+    fn clipboard_store(&mut self, _clipboard: u8, _data: &[u8]) {}
+
     forward! {
-        set_title(title: Option<String>);
         set_cursor_style(style: Option<CursorStyle>);
         set_cursor_shape(shape: CursorShape);
         goto(line: i32, col: usize);
@@ -1154,18 +1410,11 @@ impl Handler for Recorder {
         set_color(index: usize, color: Rgb);
         dynamic_color_sequence(prefix: String, index: usize, terminator: &str);
         reset_color(index: usize);
-        clipboard_store(clipboard: u8, data: &[u8]);
         clipboard_load(clipboard: u8, terminator: &str);
-        push_title();
-        pop_title();
         text_area_size_pixels();
         text_area_size_chars();
-        set_hyperlink(link: Option<Hyperlink>);
         set_mouse_cursor_icon(icon: CursorIcon);
         report_keyboard_mode();
-        push_keyboard_mode(mode: KeyboardModes);
-        pop_keyboard_modes(to_pop: u16);
-        set_keyboard_mode(mode: KeyboardModes, behavior: KeyboardModesApplyBehavior);
         set_modify_other_keys(mode: ModifyOtherKeys);
         report_modify_other_keys();
         set_scp(char_path: ScpCharPath, update_mode: ScpUpdateMode);
@@ -1261,6 +1510,34 @@ fn row_mark(row: &Row<Cell>) -> Option<char> {
         .rfind(|&c| is_mark(c))
 }
 
+/// Replace a row's internal mark rather than adding one forever to an unchanged first glyph.
+/// Rebuild only the rare extra storage, preserving user combining marks and style attributes.
+fn clear_row_marks(row: &mut Row<Cell>) {
+    for cell in row[..].iter_mut() {
+        if !cell
+            .zerowidth()
+            .is_some_and(|marks| marks.iter().any(|&mark| is_mark(mark)))
+        {
+            continue;
+        }
+        let kept: Vec<char> = cell
+            .zerowidth()
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&mark| !is_mark(mark))
+            .collect();
+        let underline = cell.underline_color();
+        let hyperlink = cell.hyperlink();
+        cell.extra = None;
+        cell.set_underline_color(underline);
+        cell.set_hyperlink(hyperlink);
+        for mark in kept {
+            cell.push_zerowidth(mark);
+        }
+    }
+}
+
 /// A row as shown: a wide character once, a tab as a space, combining marks after their base.
 fn row_text(row: &Row<Cell>) -> String {
     let mut text = String::new();
@@ -1326,6 +1603,304 @@ mod tests {
 
     fn render_text(log: &[u8]) -> String {
         record(log, &[], true)
+    }
+
+    #[test]
+    fn an_internal_panic_stops_emulation_without_stopping_raw_progress() {
+        let mut live = Live::new();
+        live.process(b"before\r\n", Instant::now(), None);
+        let before = live.read;
+        // Inject at the existing panic boundary; no production input needs to be able to
+        // crash the emulator for the capture thread's failure isolation to remain covered.
+        let replies = live.run(|_, _| panic!("injected terminal failure"));
+        assert!(replies.is_empty());
+        assert!(live.stopped());
+        assert!(live.screen().unwrap_err().contains(STOPPED));
+        assert!(live.modes().err().unwrap().contains(STOPPED));
+        assert!(live.pending().is_empty());
+        assert!(live.sync_deadline().is_none());
+
+        let output = b"still captured\r\n\x1b[6n";
+        assert!(live.process(output, Instant::now(), None).is_empty());
+        assert_eq!(live.read, before + output.len() as u64);
+        assert_eq!(live.shown(), live.read);
+        let mut reentered = false;
+        live.run(|_, _| reentered = true);
+        assert!(
+            !reentered,
+            "a failed emulator must never resume on later output"
+        );
+        assert!(live.stopped());
+    }
+
+    #[test]
+    fn regression_keyboard_push_overflow_keeps_the_emulator_alive() {
+        let mut live = Live::new();
+        live.process("\x1b[>1u".repeat(4097).as_bytes(), Instant::now(), None);
+        assert!(
+            !live.stopped(),
+            "keyboard stack exhaustion must not stop all terminal features"
+        );
+        assert_eq!(live.modes().unwrap().kitty, 1);
+        assert_eq!(live.recorder.keyboard[0].saved.len(), KEYBOARD_STACK_LIMIT);
+        assert_eq!(live.process(b"\x1b[?u", Instant::now(), None), b"\x1b[?1u");
+        live.process(b"\x1b[<65535u", Instant::now(), None);
+        assert_eq!(live.modes().unwrap().kitty, 0);
+        assert!(live.recorder.keyboard[0].saved.is_empty());
+    }
+
+    #[test]
+    fn keyboard_queries_follow_direct_changes_and_nested_restores() {
+        let mut live = Live::new();
+        for (input, flags) in [
+            ("\x1b[=3u", 3),
+            ("\x1b[=4;2u", 7),
+            ("\x1b[=2;3u", 5),
+            ("\x1b[>8u", 8),
+            ("\x1b[>16u", 16),
+            ("\x1b[<u", 8),
+            ("\x1b[=9u", 9),
+            ("\x1b[<u", 5),
+            ("\x1b[<u", 0),
+        ] {
+            let replies = live.process(format!("{input}\x1b[?u").as_bytes(), Instant::now(), None);
+            assert_eq!(live.modes().unwrap().kitty, flags, "{input:?}");
+            assert_eq!(replies, format!("\x1b[?{flags}u").as_bytes(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn keyboard_stacks_are_per_screen_and_reset_together() {
+        let mut live = Live::new();
+        for (input, flags) in [
+            ("\x1b[=3u\x1b[>5u", 5),
+            ("\x1b[?1049h", 0),
+            ("\x1b[>8u", 8),
+            ("\x1b[?1049l", 5),
+            ("\x1b[<u", 3),
+            ("\x1b[?1049h", 8),
+            ("\x1bc", 0),
+            ("\x1b[?1049h", 0),
+            ("\x1b[?1049l\x1b[<u", 0),
+        ] {
+            let replies = live.process(format!("{input}\x1b[?u").as_bytes(), Instant::now(), None);
+            assert_eq!(live.modes().unwrap().kitty, flags, "{input:?}");
+            assert_eq!(replies, format!("\x1b[?{flags}u").as_bytes(), "{input:?}");
+        }
+        assert!(
+            live.recorder
+                .keyboard
+                .iter()
+                .all(|stack| stack.saved.is_empty())
+        );
+    }
+
+    #[test]
+    fn regression_osc_guard_preserves_the_raw_sync_cursor() {
+        let mut live = Live::new();
+        let arrived = Instant::now();
+        // An earlier discarded OSC makes raw and forwarded offsets differ before the sync.
+        let prefix = format!(
+            "\x1b]0;{}\x07before\r\n\x1b[?2026h",
+            "A".repeat(OSC_BYTES_LIMIT * 2)
+        );
+        live.process(prefix.as_bytes(), arrived, None);
+        live.process(b"held\x1b]0;partial", arrived, None);
+        assert_eq!(
+            live.shown(),
+            prefix.len() as u64,
+            "held OSC bytes must not consume unseen screen output"
+        );
+        let payload = [b'B'; 1024];
+        for _ in 0..32 {
+            live.process(&payload, arrived, None);
+            assert_eq!(
+                live.shown(),
+                prefix.len() as u64,
+                "discarded OSC bytes are raw bytes too"
+            );
+        }
+        live.process(b"\x07\x1b[?2026lafter", arrived, None);
+        assert_eq!(live.shown(), live.read);
+        assert_eq!(live.screen().unwrap().0, ["before", "heldafter"]);
+        assert!(!live.stopped());
+    }
+
+    #[test]
+    fn osc_offsets_survive_sync_end_resize_timeout_and_buffer_limit() {
+        for ending in ["explicit", "resize", "timeout", "buffer"] {
+            let mut live = Live::new();
+            let arrived = Instant::now();
+            live.process(b"A\x1b[?2026hB", arrived, None);
+            for _ in 0..12 {
+                let osc = format!("\x1b]0;{}\x07", "x".repeat(OSC_BYTES_LIMIT + 10));
+                live.process(osc.as_bytes(), arrived, None);
+                assert_eq!(live.shown(), 9);
+            }
+            assert!(!live.osc.gaps.is_empty());
+            match ending {
+                "explicit" => {
+                    live.end_sync();
+                }
+                "resize" => {
+                    live.resize(80, 25);
+                }
+                "timeout" => {
+                    let deadline = live.sync_deadline().unwrap();
+                    live.process(b"C", deadline, None);
+                }
+                "buffer" => {
+                    live.process(&vec![b'C'; 0x20_0000], arrived, None);
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(live.shown(), live.read, "{ending}");
+            assert!(
+                live.osc.gaps.is_empty(),
+                "{ending}: consumed gaps must not accumulate"
+            );
+            assert!(!live.stopped());
+            assert!(live.pending().contains("AB") || live.take_written().contains("AB"));
+        }
+    }
+
+    #[test]
+    fn sync_raw_offsets_do_not_depend_on_osc_chunk_boundaries() {
+        let held = b"B\x1b]0;small title\x07C";
+        for split in 0..=held.len() {
+            let mut live = Live::new();
+            let arrived = Instant::now();
+            live.process(b"A\x1b[?2026h", arrived, None);
+            live.process(&held[..split], arrived, None);
+            live.process(&held[split..], arrived, None);
+            assert_eq!(live.shown(), 9, "split {split}");
+            assert_eq!(live.screen().unwrap().0, ["A"]);
+            live.process(b"\x1b[?2026l", arrived, None);
+            assert_eq!(live.screen().unwrap().0, ["ABC"]);
+            assert_eq!(live.shown(), live.read);
+        }
+    }
+
+    #[test]
+    fn oversized_osc_is_bounded_across_chunks_and_does_not_become_text() {
+        for prefix in ["0;", "8;;https://example.test/", "52;c;"] {
+            for terminator in ["\x07", "\x1b\\", "\x18"] {
+                let mut live = Live::new();
+                live.process(
+                    format!("before\x1b]{prefix}").as_bytes(),
+                    Instant::now(),
+                    None,
+                );
+                let payload = [b'A'; 1024];
+                for _ in 0..32 {
+                    live.process(&payload, Instant::now(), None);
+                    assert!(live.osc.pending.len() <= OSC_BYTES_LIMIT);
+                }
+                live.process(
+                    format!("{terminator}after").as_bytes(),
+                    Instant::now(),
+                    None,
+                );
+                assert_eq!(live.screen().unwrap().0, ["beforeafter"]);
+                assert!(!live.stopped());
+                live.finish();
+                assert_eq!(live.take_written(), "beforeafter\n");
+            }
+        }
+    }
+
+    #[test]
+    fn osc_guard_preserves_normal_sequences_at_every_split() {
+        for bytes in [
+            &b"before\x1b]0;title\x07after"[..],
+            &b"\x1b]8;;https://example.test/\x1b\\link\x1b]8;;\x1b\\"[..],
+            &b"\x1b\0]0;title\x07\x1b[31mred\x1b[0m"[..],
+            &b"\x1b ]ordinary\x1b[?2026hframe\x1b[?2026l"[..],
+        ] {
+            for size in 1..=bytes.len() {
+                let mut guard = OscGuard::default();
+                let mut actual = Vec::new();
+                for chunk in bytes.chunks(size) {
+                    actual.extend_from_slice(&guard.filter(chunk));
+                }
+                assert_eq!(actual, bytes, "chunk size {size}");
+            }
+        }
+    }
+
+    #[test]
+    fn combining_limit_keeps_wide_glyphs_wraps_and_internal_marks() {
+        for prefix in ["中".to_string(), format!("{}a", "x".repeat(19))] {
+            let mut live = Live::at(20, 5);
+            live.process(prefix.as_bytes(), Instant::now(), None);
+            live.process(
+                "\u{301}\x1b[?1049h\x1b[?1049l".as_bytes(),
+                Instant::now(),
+                None,
+            );
+            live.process("\u{301}".repeat(256).as_bytes(), Instant::now(), None);
+            let grid = live.recorder.term.grid();
+            let cell = if prefix == "中" {
+                &grid[Line(0)][Column(0)]
+            } else {
+                &grid[Line(0)][Column(19)]
+            };
+            assert_eq!(
+                cell.zerowidth()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&mark| !is_mark(mark))
+                    .count(),
+                CELL_COMBINING_LIMIT
+            );
+            let before = live.screen().unwrap().0.join("");
+            assert!(before.starts_with(&prefix));
+            live.process(b"B", Instant::now(), None);
+            assert!(live.screen().unwrap().0.join("").ends_with('B'));
+            assert!(!live.stopped());
+        }
+    }
+
+    #[test]
+    fn regression_internal_row_marks_remain_bounded() {
+        let mut live = Live::new();
+        live.process(b"a", Instant::now(), None);
+        for n in 0..256 {
+            let frame = format!("\x1b[1;2H{n:04}\x1b[?1049h\x1b[?1049l");
+            live.process(frame.as_bytes(), Instant::now(), None);
+            live.take_written();
+        }
+        assert!(
+            live.recorder.marked.len() <= usize::from(PTY_ROWS) + 1,
+            "orphaned marker entries must retire"
+        );
+        let grid = live.recorder.term.grid();
+        assert!(
+            grid[Line(0)][Column(0)]
+                .zerowidth()
+                .unwrap_or_default()
+                .len()
+                <= 1,
+            "repeated marks must replace old marks"
+        );
+    }
+
+    #[test]
+    fn regression_combining_marks_are_bounded_per_cell() {
+        let mut live = Live::new();
+        live.process(b"a", Instant::now(), None);
+        let marks = "\u{301}".repeat(4096);
+        for _ in 0..16 {
+            live.process(marks.as_bytes(), Instant::now(), None);
+        }
+        let (rows, _) = live.screen().unwrap();
+        assert!(
+            rows[0].chars().count() <= 65,
+            "one cell must not hold an unlimited combining run"
+        );
+        assert!(!live.stopped());
+        live.process(b"OK", Instant::now(), None);
+        assert!(live.screen().unwrap().0[0].ends_with("OK"));
     }
 
     #[test]
@@ -2077,8 +2652,9 @@ mod tests {
                 format!("e{}.\n", "\u{301}".repeat(4)),
             ),
             (
+                // Pathological runs are capped; ordinary combining sequences above remain whole.
                 format!("e{}", "\u{301}".repeat(100)),
-                format!("e{}\n", "\u{301}".repeat(100)),
+                format!("e{}\n", "\u{301}".repeat(CELL_COMBINING_LIMIT)),
             ),
             // Strings longer than a MiB end where the program ends them, not earlier.
             (osc, "ok\n".to_string()),
