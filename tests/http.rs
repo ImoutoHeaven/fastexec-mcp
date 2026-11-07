@@ -1081,11 +1081,13 @@ fn minimum_budget_with_one_tenant_task_keeps_the_count_footer() {
     let (started, _) = tenant.modern_result(json!({
         "action": "start", "command": "read -r line", "waitMs": 0,
     }));
+    // A finished task this caller already saw is not counted.
+    caller.modern_result(json!({"action": "start", "command": "true", "waitMs": 30000}));
     let (_, text) = caller.modern_result(json!({
         "action": "start", "command": "true", "waitMs": 30000, "maxBytes": 100,
     }));
     assert!(text.len() <= 100, "{text:?}");
-    assert!(text.contains("(1 tasks; use list.)"), "{text}");
+    assert!(text.contains("(1 task; use list.)"), "{text}");
     assert!(
         !text.contains(
             started["taskId"]

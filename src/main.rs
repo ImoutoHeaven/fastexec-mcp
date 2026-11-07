@@ -121,7 +121,7 @@ impl Server {
         }
     }
 
-    /// This server's session: the client name and a short random ID, its tasks' owner.
+    /// The principal session for sessionless HTTP, or this server's client-named session.
     fn session(&self, context: &RequestContext<RoleServer>) -> Result<Arc<Session>, String> {
         let Backend::Local {
             session, launch, ..

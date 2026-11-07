@@ -944,11 +944,6 @@ impl Tasks {
                 snapshot.state == "running" || snapshot.kept
             })
             .count();
-        let total = touched
-            .iter()
-            .filter(|(task, _)| task.id != exclude)
-            .count()
-            + others;
         let others_text = match others {
             0 => String::new(),
             1 => "1 other running".into(),
@@ -1081,7 +1076,9 @@ impl Tasks {
         if line.len() <= cap {
             return Some((line, Vec::new()));
         }
-        let line = format!("({total} tasks; use list.)");
+        let total = entries.len() + others;
+        let plural = if total == 1 { "" } else { "s" };
+        let line = format!("({total} task{plural}; use list.)");
         (line.len() <= cap).then(|| (line, Vec::new()))
     }
 }

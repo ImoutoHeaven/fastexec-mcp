@@ -217,8 +217,10 @@ These fields describe `exec` results.
   scope. Running tasks and tasks keeping processes that the session has not
   addressed appear as `1 other running` or `<n> others running`, repeated until
   none remain. These counts never mark a task reported. If names do not fit,
-  the footer uses counts and `use list`, falling back to `(<n> tasks; use list.)`
-  at the smallest budget. A footer marks only tasks it names; `list` marks only
+  the footer uses counts and `use list`, falling back to `(1 task; use list.)`
+  or `(<n> tasks; use list.)` at the smallest budget, where the number counts
+  the tasks the footer would report.
+  A footer marks only tasks it names; `list` marks only
   shown tasks' existing session entries. These marks affect background notices,
   while each reader tracks its own reported exit for waiting.
 
@@ -481,8 +483,9 @@ These fields describe `exec` results.
   lifecycle chooses this path regardless of the named protocol version. Legacy
   HTTP `initialize` creates a client-named session after negotiation. The address is
   loopback unless `FASTEXEC_HTTP_ALLOW_REMOTE=1`, which belongs behind a
-  TLS-terminating proxy. Every `/mcp` request carries the bearer token, checked
-  before a session is created or resumed, and the token is dropped from the
+  TLS-terminating proxy. Every `/mcp` request carries a configured bearer
+  token, checked before a session is created or resumed, and
+  `FASTEXEC_HTTP_TOKEN` is dropped from the
   environment HTTP sessions launch tasks with; a `/mcp` body over `4` MiB is
   refused; `Origin` is
   limited to the bound address's own origin, the loopback names, and
