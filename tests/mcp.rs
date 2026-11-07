@@ -4831,7 +4831,10 @@ fn fresh_reader_notice_survives_kill_and_fits_every_result_mode() {
             "{mode}: {text}"
         );
         assert!(
-            text.lines().last().unwrap().ends_with("(1 task; use list.)"),
+            text.lines()
+                .last()
+                .unwrap()
+                .ends_with("(1 task; use list.)"),
             "{mode}: {text}"
         );
         let (_, text) = server.ok(request);
