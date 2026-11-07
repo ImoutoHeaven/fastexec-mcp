@@ -119,6 +119,8 @@ fn candidates(ctx: &LaunchContext) -> Vec<PathBuf> {
 #[cfg(not(windows))]
 fn candidates(ctx: &LaunchContext) -> Vec<PathBuf> {
     let mut out = vec![PathBuf::from("/bin/bash"), PathBuf::from("/usr/bin/bash")];
+    #[cfg(target_os = "freebsd")]
+    out.push(PathBuf::from("/usr/local/bin/bash"));
     out.extend(path_candidates("bash", ctx));
     out
 }

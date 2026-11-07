@@ -2,7 +2,7 @@
 //! directory of the test's own; and the MCP endpoint in `on` mode, which forwards every call to
 //! that daemon.
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "freebsd"))]
 mod support;
 
 use serde_json::{Value, json};
@@ -42,6 +42,8 @@ fn create_root(path: &Path) {
 
 impl Fixture {
     fn new(tag: &str) -> Fixture {
+        #[cfg(target_os = "freebsd")]
+        support::freebsd::init();
         let runtime =
             std::env::temp_dir().join(format!("fastexec-daemon-{}-{tag}", std::process::id()));
         create_root(&runtime);
@@ -56,6 +58,8 @@ impl Fixture {
 
     /// A namespace that shares an existing runtime directory, so two of them meet in one cache.
     fn sharing(runtime: &Path, scope: &str) -> Fixture {
+        #[cfg(target_os = "freebsd")]
+        support::freebsd::init();
         Fixture {
             runtime: runtime.to_path_buf(),
             namespace: format!("{scope}-{}", std::process::id()),
@@ -177,7 +181,11 @@ impl Fixture {
             };
             resolved(&path).starts_with(resolved(&expected))
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(target_os = "freebsd")]
+        {
+            support::freebsd::owns_process(pid, &expected)
+        }
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
         {
             std::fs::read_link(format!("/proc/{pid}/exe"))
                 .map(|path| path.starts_with(&expected))
@@ -187,15 +195,22 @@ impl Fixture {
 
     /// Ends one process by PID, and only when it is this fixture's own daemon.
     fn end_own_daemon(&self, pid: u32) -> bool {
-        if !self.owns_process(pid) {
-            return false;
+        #[cfg(target_os = "freebsd")]
+        {
+            support::freebsd::end_owned_process(pid, &self.runtime.join("bin"))
         }
-        let pid = pid.to_string();
-        #[cfg(windows)]
-        let output = Command::new("taskkill").args(["/F", "/PID", &pid]).output();
-        #[cfg(unix)]
-        let output = Command::new("kill").args(["-9", &pid]).output();
-        matches!(output, Ok(output) if output.status.success())
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            if !self.owns_process(pid) {
+                return false;
+            }
+            let pid = pid.to_string();
+            #[cfg(windows)]
+            let output = Command::new("taskkill").args(["/F", "/PID", &pid]).output();
+            #[cfg(unix)]
+            let output = Command::new("kill").args(["-9", &pid]).output();
+            matches!(output, Ok(output) if output.status.success())
+        }
     }
 }
 
@@ -217,6 +232,10 @@ impl Drop for Fixture {
             Err(error) => (false, format!("stop could not run: {error}")),
         };
         if stopped {
+            #[cfg(target_os = "freebsd")]
+            if let Some(pid) = self.pid.get() {
+                let _ = support::freebsd::reap_stopped(pid);
+            }
             // Nothing of this fixture is running, so the number it saw before is no longer its.
             self.pid.set(None);
         }
@@ -678,16 +697,32 @@ fn a_long_runtime_path_falls_back_to_a_short_socket() {
         .unwrap_or_else(|| panic!("no namespace in {out:?}"))
         .to_string();
     assert_eq!(namespace.len(), 16, "{namespace}");
+    #[cfg(target_os = "freebsd")]
+    let socket = short.join(&namespace).join("sock");
+    #[cfg(not(target_os = "freebsd"))]
     let socket = short.join(format!("{namespace}.sock"));
 
     // A namespace that died leaves its state and its fallback socket behind, before this start.
-    let dead = runtime.join("ns").join("0123456789abcdef");
+    let mut random = [0; 8];
+    getrandom::fill(&mut random).unwrap();
+    let dead_namespace = format!("{:016x}", u64::from_ne_bytes(random));
+    let dead = runtime.join("ns").join(&dead_namespace);
     std::fs::create_dir_all(&dead).unwrap();
     std::fs::write(dead.join("startup.lock"), b"").unwrap();
     std::fs::write(dead.join("daemon.lock"), b"").unwrap();
-    let dead_socket = short.join("0123456789abcdef.sock");
-    let _ = std::fs::create_dir_all(&short);
-    std::fs::write(&dead_socket, b"").unwrap();
+    #[cfg(target_os = "freebsd")]
+    let dead_socket = {
+        use std::os::unix::fs::DirBuilderExt;
+        let private = short.join(&dead_namespace);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .unwrap();
+        private.join("sock")
+    };
+    #[cfg(not(target_os = "freebsd"))]
+    let dead_socket = short.join(format!("{dead_namespace}.sock"));
+    std::fs::File::create_new(&dead_socket).unwrap();
     let _ = std::fs::remove_file(&socket);
 
     let (code, out, err) = probe.run(&["daemon", "start"]);
@@ -706,6 +741,11 @@ fn a_long_runtime_path_falls_back_to_a_short_socket() {
     assert!(
         !dead_socket.exists(),
         "the dead namespace's socket was left behind"
+    );
+    #[cfg(target_os = "freebsd")]
+    assert!(
+        !dead_socket.parent().unwrap().exists(),
+        "the dead fallback namespace directory was left behind"
     );
 
     let (code, _, err) = probe.run(&["daemon", "stop"]);
@@ -1483,7 +1523,11 @@ fn is_alive(pid: u32) -> bool {
         }
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "freebsd")]
+    {
+        support::freebsd::is_alive(pid)
+    }
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
     {
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             && let Some(rest) = stat.rsplit(')').next()
@@ -1657,4 +1701,17 @@ fn a_stopped_foreground_daemon_ends_and_takes_its_task_with_it() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(!is_alive(task), "the task outlived the daemon that ran it");
+}
+
+#[cfg(target_os = "freebsd")]
+#[test]
+fn freebsd_fixture_fallback_cleanup_owns_its_daemon() {
+    let fixture = Fixture::new("freebsd-fallback");
+    let (code, out, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let pid = pid_of(&out).unwrap();
+    assert!(fixture.owns_process(pid));
+    assert!(!fixture.owns_process(std::process::id()));
+    assert!(fixture.end_own_daemon(pid));
+    assert!(!is_alive(pid));
 }

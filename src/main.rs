@@ -8,6 +8,8 @@ mod daemon;
 mod endpoint;
 mod files;
 mod frames;
+#[cfg(target_os = "freebsd")]
+mod freebsd_fs;
 #[cfg(unix)]
 mod host;
 mod http;
@@ -23,8 +25,14 @@ mod tasks;
 mod terminal;
 mod transfer;
 mod transport;
+#[cfg(target_os = "freebsd")]
+mod tree_freebsd;
+#[cfg(target_os = "linux")]
+mod tree_linux;
 #[cfg(target_os = "macos")]
 mod tree_macos;
+#[cfg(unix)]
+mod unix_pty;
 mod wait;
 
 use ipc::{ToDaemon, ToEndpoint};
@@ -504,6 +512,21 @@ fn progress(
 }
 
 fn main() {
+    #[cfg(unix)]
+    // Keep every child waitable before starting any thread or helper. Inheriting SIG_IGN or
+    // SA_NOCLDWAIT would let the kernel reuse a task host's PID before its Tree is finished.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) == -1 {
+            eprintln!(
+                "fastexec: cannot retain child exit statuses: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(1);
+        }
+    }
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     #[cfg(unix)]
     {

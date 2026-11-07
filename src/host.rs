@@ -2,7 +2,7 @@
 //!
 //! The server starts the fastexec binary again with [`FLAG`] as the leader of a new session. The
 //! host then:
-//! - on Linux, becomes the child subreaper of its descendants, so processes that daemonize
+//! - on Linux and FreeBSD, becomes the child reaper of its descendants, so processes that daemonize
 //!   (`setsid`, a double fork) are adopted by it instead of init and stay in the tree;
 //! - runs bash in its own session and process group, and stays its leader after bash exits, so
 //!   a PTY task's terminal hangs up only when the whole tree is gone;
@@ -22,8 +22,8 @@ use std::os::fd::{FromRawFd, RawFd};
 /// The first argument that makes the fastexec binary run as a task host.
 pub const FLAG: &str = "--fastexec-task-host";
 
-/// The host's first word on the status pipe: 0 when the host is ready to run bash, else a
-/// Linux errno saying why it cannot own the task's tree. The root bash's exit code follows as a
+/// The host's first word on the status pipe: 0 after its bash spawn attempt, else a
+/// Unix errno saying why it cannot own the task's tree. The root bash's exit code follows as a
 /// second word.
 pub const STARTUP_READY: u32 = 0;
 
@@ -59,9 +59,25 @@ pub fn main(args: &[OsString]) -> ! {
     // become the subreaper would silently leave daemonizing processes outside the tree, so it
     // fails the start instead of running bash.
     #[cfg(target_os = "linux")]
-    // SAFETY: plain prctl; its failure is reported below.
-    let startup = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-    #[cfg(not(target_os = "linux"))]
+    let startup = match crate::tree_linux::acquire() {
+        Ok(()) => 0,
+        Err(error) => {
+            let errno = error.raw_os_error().unwrap_or(libc::EIO) as u32;
+            let _ = status.write_all(&errno.to_le_bytes());
+            std::process::exit(3);
+        }
+    };
+    #[cfg(target_os = "freebsd")]
+    // SAFETY: acquire reaper ownership before any descendants are created.
+    let startup = unsafe {
+        libc::procctl(
+            libc::P_PID,
+            0,
+            libc::PROC_REAP_ACQUIRE,
+            std::ptr::null_mut(),
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     let startup = 0;
     if startup == -1 {
         let errno = std::io::Error::last_os_error()
@@ -70,6 +86,10 @@ pub fn main(args: &[OsString]) -> ! {
         let _ = status.write_all(&errno.to_le_bytes());
         std::process::exit(3);
     }
+    // FreeBSD discards unread PTY bytes when the final slave closes or the session leader exits.
+    // Keep one private slave until the whole tree has ended and the master has consumed its output.
+    #[cfg(target_os = "freebsd")]
+    let terminal = retain_terminal().unwrap_or_else(|error| fail_start(&mut status, error));
     // The control socket is closed across exec again before bash starts: the server cleared that
     // flag only for the exec into this host.
     #[cfg(target_os = "macos")]
@@ -95,10 +115,13 @@ pub fn main(args: &[OsString]) -> ! {
         libc::SIGTRAP,
         libc::SIGSYS,
     ];
+    // FreeBSD's <sys/signal.h> extends realtime signals through SIGRTMAX (126).
+    // libc does not export that constant on FreeBSD; Linux's highest signal is 64.
+    const LAST_SIGNAL: libc::c_int = if cfg!(target_os = "freebsd") { 126 } else { 64 };
     // SAFETY: each action is fully initialized and `ignore` is async-signal-safe; sigaction
     // rejects numbers that are not signals, and the mask is cleared before any thread starts.
     unsafe {
-        for signal in (1..65).filter(|signal| !KEPT.contains(signal)) {
+        for signal in (1..=LAST_SIGNAL).filter(|signal| !KEPT.contains(signal)) {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
             action.sa_flags = libc::SA_RESTART;
@@ -112,6 +135,11 @@ pub fn main(args: &[OsString]) -> ! {
         libc::sigemptyset(&mut none);
         libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
     }
+    // Lifeline cleanup waits for the one spawn attempt to finish. Otherwise a disconnected
+    // server could trigger an empty-tree kill while the main thread is still creating bash.
+    let spawning = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let spawn_guard = spawning.lock().unwrap_or_else(|error| error.into_inner());
+    let after_spawn = std::sync::Arc::clone(&spawning);
     // Every helper thread must exist before bash runs. If a thread limit is exhausted, a
     // failed startup must not orphan a command that already detached from the host's group.
     #[cfg(target_os = "macos")]
@@ -138,18 +166,27 @@ pub fn main(args: &[OsString]) -> ! {
         let tracked = std::sync::Arc::clone(&tracker);
         std::thread::Builder::new()
             .name("fastexec-lifeline".into())
-            .spawn(move || watch_macos(lifeline, tracked))
+            .spawn(move || {
+                let guard = after_spawn
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                drop(guard);
+                watch_macos(lifeline, tracked);
+            })
             .unwrap_or_else(|error| fail_start(&mut status, error));
         tracker
     };
     #[cfg(not(target_os = "macos"))]
     std::thread::Builder::new()
         .name("fastexec-lifeline".into())
-        .spawn(move || watch(lifeline))
+        .spawn(move || {
+            let guard = after_spawn
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            drop(guard);
+            watch(lifeline);
+        })
         .unwrap_or_else(|error| fail_start(&mut status, error));
-    if status.write_all(&STARTUP_READY.to_le_bytes()).is_err() {
-        std::process::exit(3);
-    }
     // macOS passes a third descriptor, so its bash arguments start one place later.
     #[cfg(target_os = "macos")]
     let tail = &args[4..];
@@ -159,7 +196,10 @@ pub fn main(args: &[OsString]) -> ! {
         Ok(bash) => bash.id() as libc::pid_t,
         Err(error) => {
             eprintln!("fastexec: cannot start {}: {error}", bash.to_string_lossy());
+            let _ = status.write_all(&STARTUP_READY.to_le_bytes());
             let _ = status.write_all(&127_i32.to_le_bytes());
+            #[cfg(target_os = "freebsd")]
+            drain_terminal(terminal.as_ref());
             #[cfg(target_os = "macos")]
             if let Ok(mut control) = control.lock() {
                 let _ = control.write_all(b"D");
@@ -171,11 +211,18 @@ pub fn main(args: &[OsString]) -> ! {
     // exit must not reach a successor that took the number.
     #[cfg(target_os = "macos")]
     let bash_start = crate::tree_macos::start_time(bash).unwrap_or(0);
+    drop(spawn_guard);
+    // A caller may kill immediately after readiness, so it must never observe a host that has
+    // yet to create its command. A closed status pipe does not relinquish an existing tree:
+    // the lifeline watcher owns cleanup if the server disappeared during startup.
+    let _ = status.write_all(&STARTUP_READY.to_le_bytes());
     release_stdio();
     #[cfg(target_os = "macos")]
     wait_macos(bash, bash_start, &mut status, &tracker, &control);
-    #[cfg(not(target_os = "macos"))]
-    wait_linux(bash, &mut status);
+    #[cfg(target_os = "freebsd")]
+    wait_reaper(bash, &mut status, terminal);
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+    wait_reaper(bash, &mut status);
 }
 
 /// Startup failure is reported before the readiness word; no command has been launched.
@@ -185,21 +232,33 @@ fn fail_start(status: &mut File, error: std::io::Error) -> ! {
     std::process::exit(3);
 }
 
-/// Waits for the children on Linux: the host is the subreaper, so ECHILD means no descendant is
-/// left and the tree has ended.
+/// Waits for the children: Linux and FreeBSD retain every orphan under this reaper, so
+/// ECHILD means no descendant is left and the tree has ended.
 #[cfg(not(target_os = "macos"))]
-fn wait_linux(bash: libc::pid_t, status: &mut File) -> ! {
+fn wait_reaper(
+    bash: libc::pid_t,
+    status: &mut File,
+    #[cfg(target_os = "freebsd")] terminal: Option<File>,
+) -> ! {
     let mut reported = false;
     loop {
         let mut wait_status = 0;
         // SAFETY: plain syscall with a valid status pointer.
         let pid = unsafe { libc::waitpid(-1, &mut wait_status, 0) };
         if pid == -1 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                // No child or descendant is left under the Linux/FreeBSD reaper. Drain only
+                // here: a kept background writer must never delay the root's exit status.
+                #[cfg(target_os = "freebsd")]
+                drain_terminal(terminal.as_ref());
+                std::process::exit(0);
             }
-            // ECHILD: no child is left, and on Linux no descendant either.
-            std::process::exit(0);
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                // An unexpected wait failure cannot prove completion or abandon owned children.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            continue;
         }
         if pid == bash && !reported {
             reported = true;
@@ -273,6 +332,90 @@ fn exit_code(wait_status: libc::c_int) -> i32 {
     }
 }
 
+/// Keeps the PTY slave private to the host; pipe tasks retain no extra output descriptor.
+#[cfg(target_os = "freebsd")]
+fn retain_terminal() -> std::io::Result<Option<File>> {
+    // SAFETY: stdin is installed by the parent before exec; isatty borrows that descriptor.
+    if unsafe { libc::isatty(0) } == 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOTTY) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: duplicate the valid slave without exposing it to bash or any later exec.
+    let fd = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new descriptor owned by this File.
+    Ok(Some(unsafe { File::from_raw_fd(fd) }))
+}
+
+/// FreeBSD's session teardown revokes its terminal and flushes unread output. With no child
+/// writers left, tcdrain waits only for capture; closing the master releases a dead server's host.
+#[cfg(target_os = "freebsd")]
+fn drain_terminal(terminal: Option<&File>) {
+    use std::os::fd::AsRawFd;
+    let Some(terminal) = terminal else { return };
+    // A command may leave another process group in the foreground. SIGTTOU must be blocked
+    // for this thread's drain, even when that group is now gone; no command is spawned again.
+    let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: the initialized signal set contains only SIGTTOU; only this thread's mask changes.
+    unsafe {
+        libc::sigemptyset(&mut blocked);
+        libc::sigaddset(&mut blocked, libc::SIGTTOU);
+    }
+    // pthread_sigmask returns an error number directly. Do not drain as a background group
+    // until the block is installed; a failure cannot justify discarding queued output.
+    while unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) } != 0 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    // Once no command can read input, late Ctrl-S/Ctrl-C must not stop or flush the final
+    // output, and echoed input (including the full-queue bell) must not extend its drain.
+    // Preserve output conversion; these flags affect only input interpretation and echo.
+    let fd = terminal.as_raw_fd();
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor and termios record stay valid across each retry.
+    if !terminal_operation(|| unsafe { libc::tcgetattr(fd, &mut attributes) }) {
+        return;
+    }
+    attributes.c_iflag &= !(libc::IXON | libc::IXOFF | libc::IMAXBEL);
+    attributes.c_lflag &= !(libc::ISIG | libc::IEXTEN | libc::ECHO | libc::ECHONL);
+    // SAFETY: TCSANOW updates the initialized settings without flushing either queue.
+    if !terminal_operation(|| unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attributes) }) {
+        return;
+    }
+    // A finished command can already have stopped output. Resume the final queue before
+    // draining it; live kept trees never get here, so their input behavior is unchanged.
+    for request in [libc::TIOCSTART, libc::TIOCDRAIN] {
+        // SAFETY: these argument-free ioctls implement tcflow(TCOON) and tcdrain on
+        // FreeBSD; the private slave stays open throughout both operations.
+        if !terminal_operation(|| unsafe { libc::ioctl(fd, request, 0) }) {
+            return;
+        }
+    }
+}
+
+/// Completes a final terminal operation, or stops once the terminal is no longer usable.
+#[cfg(target_os = "freebsd")]
+fn terminal_operation(mut operation: impl FnMut() -> libc::c_int) -> bool {
+    loop {
+        if operation() == 0 {
+            return true;
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ENXIO) | Some(libc::ENOTTY)) {
+            return false;
+        }
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            // A timeout or unexpected failure is not proof that queued output was consumed.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+}
+
 /// Points the host's standard streams at /dev/null, so the task's output reaches EOF once bash
 /// and its descendants close it. A PTY stays the session's controlling terminal.
 fn release_stdio() {
@@ -293,8 +436,18 @@ fn release_stdio() {
 #[cfg(not(target_os = "macos"))]
 fn watch(mut lifeline: File) {
     read_lifeline(&mut lifeline);
-    let _ = crate::process::kill_tree(std::process::id() as i32);
-    std::process::exit(1);
+    // A privileged descendant may reject SIGKILL. Retain reaper ownership until it ends or
+    // becomes signalable, including when the server has died and cannot retry the request.
+    loop {
+        if crate::process::kill_tree(std::process::id() as i32).is_ok() {
+            // FreeBSD's main thread must finish the PTY drain before the session ends.
+            #[cfg(target_os = "freebsd")]
+            return;
+            #[cfg(not(target_os = "freebsd"))]
+            std::process::exit(1);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 /// Ends the tree on macOS once the lifeline reaches EOF: the tracker kills the members it holds,

@@ -160,7 +160,11 @@ pub(crate) fn create_private(dir: &Path) -> io::Result<()> {
     {
         private_macos::create_all(dir)
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "freebsd")]
+    {
+        crate::freebsd_fs::create_private_all(dir)
+    }
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
     {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true);
@@ -183,7 +187,11 @@ pub(crate) fn create_private_new(dir: &Path) -> io::Result<()> {
         private_macos::create_leaf(dir)?;
         create_private_unix_check(dir)
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "freebsd")]
+    {
+        crate::freebsd_fs::create_private_directory(dir)
+    }
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
     {
         let mut builder = std::fs::DirBuilder::new();
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
@@ -541,7 +549,7 @@ fn create_private_windows_check(dir: &Path) -> io::Result<()> {
 pub(crate) fn create_private_unix_check(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
@@ -549,9 +557,9 @@ pub(crate) fn create_private_unix_check(dir: &Path) -> io::Result<()> {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(dir)?
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let meta = file.metadata()?;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     let meta = std::fs::symlink_metadata(dir)?;
     if !meta.is_dir() {
         return Err(io::Error::other(format!(
@@ -573,6 +581,8 @@ pub(crate) fn create_private_unix_check(dir: &Path) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     private_macos::check_acl(&file, dir)?;
+    #[cfg(target_os = "freebsd")]
+    crate::freebsd_fs::check_private_acl(&file)?;
     Ok(())
 }
 
@@ -623,6 +633,15 @@ fn endpoint(ns: &Path, namespace: &str) -> io::Result<OsString> {
     // short, and a long TMPDIR would defeat that.
     let dir = std::path::Path::new("/tmp").join(format!("fastexec-{}", user_id()));
     create_private(&dir)?;
+    #[cfg(target_os = "freebsd")]
+    {
+        // A retained O_SEARCH descriptor can bypass a directory's later permission changes.
+        // This second directory is created only after its parent's inherited ACLs are removed.
+        let private = dir.join(namespace);
+        create_private(&private)?;
+        Ok(private.join("sock").into_os_string())
+    }
+    #[cfg(not(target_os = "freebsd"))]
     Ok(dir.join(format!("{namespace}.sock")).into_os_string())
 }
 
@@ -651,6 +670,10 @@ impl Lock {
 /// to a temporary name and then renamed, so a half-written copy is never started.
 pub fn cached_exe(root: &Path, build: &str, deadline: Instant) -> io::Result<PathBuf> {
     let dir = root.join("bin");
+    #[cfg(target_os = "freebsd")]
+    // Protect the cache even from an O_SEARCH handle retained for the outer runtime directory.
+    create_private(&dir)?;
+    #[cfg(not(target_os = "freebsd"))]
     std::fs::create_dir_all(&dir)?;
     // One starter at a time touches the cache: publishing an image, marking it used, and sweeping
     // older ones must not interleave. The lock file stays, so every starter locks one inode.
@@ -787,10 +810,19 @@ pub fn sweep(root: &Path, own_namespace: &str) {
         // so deleting the namespace's own entries would leave it behind.
         #[cfg(unix)]
         {
-            let fallback = std::path::Path::new("/tmp")
-                .join(format!("fastexec-{}", user_id()))
-                .join(format!("{name}.sock"));
-            let _ = std::fs::remove_file(fallback);
+            let fallback = std::path::Path::new("/tmp").join(format!("fastexec-{}", user_id()));
+            #[cfg(target_os = "freebsd")]
+            {
+                let private = fallback.join(name);
+                if create_private_unix_check(&fallback).is_ok()
+                    && create_private_unix_check(&private).is_ok()
+                {
+                    let _ = std::fs::remove_file(private.join("sock"));
+                    let _ = std::fs::remove_dir(private);
+                }
+            }
+            #[cfg(not(target_os = "freebsd"))]
+            let _ = std::fs::remove_file(fallback.join(format!("{name}.sock")));
         }
         let Ok(files) = std::fs::read_dir(&dir) else {
             continue;
@@ -1422,5 +1454,243 @@ mod tests {
             "the lock was not released"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    mod retained_search {
+        use super::*;
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        // FreeBSD exposes connectat publicly; Rust libc does not declare it yet.
+        unsafe extern "C" {
+            fn connectat(
+                directory: libc::c_int,
+                socket: libc::c_int,
+                address: *const libc::sockaddr,
+                length: libc::socklen_t,
+            ) -> libc::c_int;
+        }
+
+        struct TempDirectory(PathBuf);
+
+        impl TempDirectory {
+            fn new(label: &str) -> Self {
+                let path = std::env::temp_dir().join(format!(
+                    "fastexec-{label}-{}-{}",
+                    std::process::id(),
+                    crate::tasks::random_chars(12).unwrap()
+                ));
+                create_private_new(&path).unwrap();
+                Self(path)
+            }
+        }
+
+        impl Drop for TempDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        struct SocketPath {
+            path: PathBuf,
+            private: Option<PathBuf>,
+        }
+
+        impl Drop for SocketPath {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.path);
+                if let Some(private) = &self.private {
+                    let _ = std::fs::remove_dir(private);
+                }
+            }
+        }
+
+        fn require_root() -> bool {
+            // SAFETY: geteuid has no preconditions.
+            if unsafe { libc::geteuid() } == 0 {
+                return true;
+            }
+            assert_ne!(
+                std::env::var("FASTEXEC_REQUIRE_ROOT_TEST").as_deref(),
+                Ok("1"),
+                "the retained O_SEARCH capability regressions require root"
+            );
+            eprintln!("skipped: retained O_SEARCH regressions require root to drop to uid 1");
+            false
+        }
+
+        fn search_handle(path: &Path) -> OwnedFd {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // A root-issued fd inherited across setuid models an already-held search capability;
+            // no shared runtime directory needs to be made public for the fixture.
+            // SAFETY: the terminated path lives through open and the returned fd is owned once.
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_SEARCH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(fd >= 0, "O_SEARCH: {}", io::Error::last_os_error());
+            // SAFETY: open returned this valid descriptor, and ownership is transferred once.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
+
+        // Every caller's child closure uses only native syscalls and already-prepared pointers.
+        fn peer_exit(probe: impl FnOnce() -> libc::c_int) -> libc::c_int {
+            // SAFETY: the child does no allocation, locking, unwinding or Rust teardown.
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork: {}", io::Error::last_os_error());
+            if child == 0 {
+                // SAFETY: these are native syscalls; _exit skips all inherited Rust destructors.
+                unsafe {
+                    if libc::setgroups(0, std::ptr::null()) != 0
+                        || libc::setgid(1) != 0
+                        || libc::setuid(1) != 0
+                    {
+                        libc::_exit(100);
+                    }
+                    libc::_exit(probe());
+                }
+            }
+            let mut status = 0;
+            loop {
+                // SAFETY: this waits only for this fixture's child and writes a live status slot.
+                let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+                if waited == child {
+                    break;
+                }
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINTR));
+            }
+            assert!(
+                libc::WIFEXITED(status),
+                "peer terminated abnormally: {status}"
+            );
+            libc::WEXITSTATUS(status)
+        }
+
+        #[test]
+        fn freebsd_cached_image_denies_a_retained_outer_search_handle() {
+            if !require_root() {
+                return;
+            }
+            let root = TempDirectory::new("search-cache");
+            let held = search_handle(&root.0);
+            let directory = held.as_raw_fd();
+            std::fs::write(root.0.join("control.lock"), b"").unwrap();
+            std::fs::set_permissions(
+                root.0.join("control.lock"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            cached_exe(&root.0, &build_id().unwrap(), Instant::now() + START_WAIT).unwrap();
+            // Do not let a restrictive caller umask hide a publicly searchable cache directory.
+            std::fs::set_permissions(
+                root.0.join("bin").join(CACHE_LOCK),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            let denied = peer_exit(|| {
+                // SAFETY: the inherited fd and static C strings are valid; all operations are native.
+                unsafe {
+                    let control = libc::openat(directory, c"control.lock".as_ptr(), libc::O_RDONLY);
+                    if control < 0 || libc::flock(control, libc::LOCK_EX | libc::LOCK_NB) != 0 {
+                        libc::_exit(101);
+                    }
+                    libc::close(control);
+                    let cache = libc::openat(directory, c"bin/cache.lock".as_ptr(), libc::O_RDONLY);
+                    if cache < 0 {
+                        return *libc::__error();
+                    }
+                    let locked = libc::flock(cache, libc::LOCK_EX | libc::LOCK_NB);
+                    libc::close(cache);
+                    if locked == 0 { 0 } else { 102 }
+                }
+            });
+            assert_eq!(
+                denied,
+                libc::EACCES,
+                "openat(bin/cache.lock) must be PermissionDenied, even through a retained search fd"
+            );
+        }
+
+        #[test]
+        fn freebsd_short_endpoint_denies_a_retained_outer_search_handle() {
+            if !require_root() {
+                return;
+            }
+            let root = TempDirectory::new("search-socket");
+            let namespace = namespace_of("search-socket", root.0.as_os_str().as_bytes());
+            let outer = Path::new("/tmp").join(format!("fastexec-{}", user_id()));
+            assert!(
+                !outer.join(&namespace).exists(),
+                "fixture namespace already exists"
+            );
+            assert!(!outer.join(format!("{namespace}.sock")).exists());
+            let long = root.0.join("long-runtime-".repeat(12)).join(&namespace);
+            create_private(&long).unwrap();
+            let path = PathBuf::from(endpoint(&long, &namespace).unwrap());
+            let cleanup = SocketPath {
+                private: path
+                    .parent()
+                    .filter(|parent| *parent != outer.as_path())
+                    .map(Path::to_owned),
+                path,
+            };
+            let held = search_handle(&outer);
+            let directory = held.as_raw_fd();
+            let listener = std::os::unix::net::UnixListener::bind(&cleanup.path).unwrap();
+            // A 0777 socket reproduces an open umask without changing this process's global umask.
+            std::fs::set_permissions(&cleanup.path, std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            let relative = CString::new(
+                cleanup
+                    .path
+                    .strip_prefix(&outer)
+                    .unwrap()
+                    .as_os_str()
+                    .as_bytes(),
+            )
+            .unwrap();
+            // SAFETY: zero is a valid initialization of the sockaddr fields and path buffer.
+            let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            address.sun_len = std::mem::size_of_val(&address) as u8;
+            address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            assert!(relative.as_bytes_with_nul().len() <= address.sun_path.len());
+            for (slot, byte) in address
+                .sun_path
+                .iter_mut()
+                .zip(relative.as_bytes_with_nul())
+            {
+                *slot = *byte as libc::c_char;
+            }
+            let pointer = std::ptr::from_ref(&address).cast::<libc::sockaddr>();
+            let length = std::mem::size_of_val(&address) as libc::socklen_t;
+            let denied = peer_exit(|| {
+                // SAFETY: all pointers were prepared before fork; no Rust runtime work happens here.
+                unsafe {
+                    let socket = libc::socket(
+                        libc::AF_UNIX,
+                        libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                        0,
+                    );
+                    if socket < 0 {
+                        libc::_exit(103);
+                    }
+                    let result = connectat(directory, socket, pointer, length);
+                    let error = if result == 0 { 0 } else { *libc::__error() };
+                    libc::close(socket);
+                    error
+                }
+            });
+            drop(listener);
+            assert_eq!(
+                denied,
+                libc::EACCES,
+                "connectat must be PermissionDenied even when the socket itself is mode 0777"
+            );
+        }
     }
 }

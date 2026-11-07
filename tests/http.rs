@@ -1,7 +1,7 @@
 //! The daemon's Streamable HTTP front door, driven over a socket the way a client that speaks
 //! MCP over HTTP does: one request per connection, and an answer read back as it arrives.
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "freebsd"))]
 mod support;
 
 use serde_json::{Value, json};
@@ -61,6 +61,8 @@ impl Fixture {
     /// A fixture with its runtime directory, and no daemon yet: the shape of a start that is
     /// expected to be refused.
     fn bare(tag: &str) -> Fixture {
+        #[cfg(target_os = "freebsd")]
+        support::freebsd::init();
         let runtime =
             std::env::temp_dir().join(format!("fastexec-http-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&runtime);
@@ -178,7 +180,11 @@ impl Fixture {
             };
             resolved(&path).starts_with(resolved(&expected))
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(target_os = "freebsd")]
+        {
+            support::freebsd::owns_process(pid, &expected)
+        }
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
         {
             std::fs::read_link(format!("/proc/{pid}/exe"))
                 .map(|path| path.starts_with(&expected))
@@ -203,7 +209,15 @@ impl Drop for Fixture {
             // stopped.
             Err(error) => (false, format!("stop could not run: {error}")),
         };
+        #[cfg(target_os = "freebsd")]
+        if stopped && let Some(pid) = self.pid.get() {
+            let _ = support::freebsd::reap_stopped(pid);
+        }
         let pid = if stopped { None } else { self.pid.get() };
+        #[cfg(target_os = "freebsd")]
+        let killed = pid
+            .is_some_and(|pid| support::freebsd::end_owned_process(pid, &self.runtime.join("bin")));
+        #[cfg(not(target_os = "freebsd"))]
         let killed = pid.is_some_and(|pid| self.owns_process(pid) && end_process(pid));
         let gone = stopped || killed;
         let _ = std::fs::remove_dir_all(&self.runtime);
@@ -215,7 +229,8 @@ impl Drop for Fixture {
     }
 }
 
-/// Ends one process by PID.
+/// Ends one process by PID after the caller checks its image.
+#[cfg(not(target_os = "freebsd"))]
 fn end_process(pid: u32) -> bool {
     let pid = pid.to_string();
     #[cfg(windows)]
@@ -1927,4 +1942,18 @@ fn malformed_http_requests_do_not_grow_the_daemon_error_log() {
         after, before,
         "unauthenticated parse failures amplified into persistent error logs"
     );
+}
+
+#[cfg(target_os = "freebsd")]
+#[test]
+fn freebsd_fixture_fallback_cleanup_owns_its_daemon() {
+    let fixture = Fixture::new("freebsd-fallback");
+    let pid = fixture.pid.get().unwrap();
+    assert!(fixture.owns_process(pid));
+    assert!(!fixture.owns_process(std::process::id()));
+    assert!(support::freebsd::end_owned_process(
+        pid,
+        &fixture.runtime.join("bin")
+    ));
+    assert!(!support::freebsd::is_alive(pid));
 }

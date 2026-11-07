@@ -5,6 +5,8 @@
 //! (Apache-2.0, Copyright 2026 yc-duan), modified for fastexec.
 
 use crate::session::LaunchContext;
+#[cfg(unix)]
+use crate::unix_pty::open as open_pty;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -692,25 +694,7 @@ fn spawn_host_args(
     drop((status_writer, lifeline_reader));
     #[cfg(target_os = "macos")]
     drop(control_host);
-    // The host reports whether it runs bash before the task is reported as started; this word is
-    // the first thing it writes to its status pipe, before it starts bash.
-    let mut startup = [0_u8; 4];
-    if let Err(error) = status.read_exact(&mut startup) {
-        let _ = host.kill();
-        let _ = host.wait();
-        return Err(std::io::Error::other(format!(
-            "The task host ended before it reported readiness: {error}"
-        )));
-    }
-    let startup = u32::from_le_bytes(startup);
-    if startup != crate::host::STARTUP_READY {
-        let _ = host.kill();
-        let _ = host.wait();
-        let problem = std::io::Error::from_raw_os_error(startup as i32);
-        return Err(std::io::Error::other(format!(
-            "Cannot initialize the task host: {problem}"
-        )));
-    }
+    finish_host_startup(&mut host, &mut status)?;
     // Past the spawn, an error drops the lifeline, and the host ends the tree.
     let input: Box<dyn Write + Send> = match &master {
         Some(master) => Box::new(master.try_clone()?),
@@ -741,44 +725,81 @@ fn spawn_host_args(
     })
 }
 
-/// A pseudo-terminal of `cols` by `rows`: (master, slave), neither inherited across exec.
+/// Readiness is the first status word after the bash spawn attempt finishes.
 #[cfg(unix)]
-fn open_pty(cols: u16, rows: u16) -> std::io::Result<(std::fs::File, std::fs::File)> {
-    use std::os::fd::FromRawFd;
-    let (mut master, mut slave) = (0, 0);
-    let mut size = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: every pointer is valid for the call; null name and termios are allowed.
-    let opened = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut size,
-        )
-    };
-    if opened == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: openpty returned two fresh descriptors owned here.
-    let pair = unsafe {
-        (
-            std::fs::File::from_raw_fd(master),
-            std::fs::File::from_raw_fd(slave),
-        )
-    };
-    for fd in [master, slave] {
-        // SAFETY: plain fcntl on a descriptor owned by `pair`.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-            return Err(std::io::Error::last_os_error());
+fn finish_host_startup(
+    host: &mut std::process::Child,
+    status: &mut std::io::PipeReader,
+) -> std::io::Result<()> {
+    let mut startup = [0_u8; 4];
+    let error = match status.read_exact(&mut startup) {
+        Err(error) => std::io::Error::other(format!(
+            "The task host ended before it reported readiness: {error}"
+        )),
+        Ok(()) => {
+            let startup = u32::from_le_bytes(startup);
+            if startup == crate::host::STARTUP_READY {
+                return Ok(());
+            }
+            let problem = std::io::Error::from_raw_os_error(startup as i32);
+            std::io::Error::other(format!("Cannot initialize the task host: {problem}"))
         }
+    };
+    // Bash may have started and killed the host before READY. Its session still belongs to
+    // this unreaped child, so end the reserved group before releasing the host's PID.
+    // SAFETY: pre_exec established this child's session, and no wait has released its number.
+    unsafe { libc::kill(-(host.id() as libc::pid_t), libc::SIGKILL) };
+    let _ = host.kill();
+    let _ = host.wait();
+    Err(error)
+}
+
+#[cfg(all(test, unix))]
+mod startup_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn a_failed_startup_ends_commands_in_the_reserved_host_group() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 10 & printf 'started\\n'; kill -KILL $$"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        // SAFETY: setsid is async-signal-safe and starts an isolated test session.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut host = command.spawn().unwrap();
+        let mut output = BufReader::new(host.stdout.take().unwrap());
+        let mut started = String::new();
+        output.read_line(&mut started).unwrap();
+        assert_eq!(started, "started\n");
+        // A dead host closes its status writer without sending READY; its command still owns stdout.
+        let (mut status, writer) = std::io::pipe().unwrap();
+        drop(writer);
+        let error = finish_host_startup(&mut host, &mut status).unwrap_err();
+        assert!(error.to_string().contains("before it reported readiness"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut tail = Vec::new();
+            let _ = tx.send(output.read_to_end(&mut tail));
+        });
+        let ended = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // A broken cleanup still leaves no fixture behind: the bounded sleep eventually exits.
+        reader.join().unwrap();
+        assert!(
+            matches!(ended, Ok(Ok(0))),
+            "the failed startup left its background command holding stdout: {ended:?}"
+        );
     }
-    Ok(pair)
 }
 
 #[cfg(unix)]
@@ -816,7 +837,7 @@ mod refusing_control_tests {
 pub struct Tree {
     #[cfg(windows)]
     job: std::os::windows::io::OwnedHandle,
-    /// The task host: session leader, process group leader, and on Linux the subreaper that
+    /// The task host: session leader, process group leader, and Linux/FreeBSD reaper that
     /// adopts every orphan of the tree. macOS never names it: the host answers instead.
     #[cfg(all(unix, not(target_os = "macos")))]
     host: i32,
@@ -871,7 +892,7 @@ impl Tree {
 
     /// The processes of the tree other than its root: on Windows those in its job, apart from
     /// console hosts; on Linux the host's descendants and the members of its session and
-    /// group. Other Unix systems list none.
+    /// group; on FreeBSD the kernel reaper's descendants, including nested reapers.
     pub fn members(&self) -> Option<Vec<Member>> {
         #[cfg(windows)]
         {
@@ -894,7 +915,18 @@ impl Tree {
             if *ended {
                 return Some(Vec::new());
             }
-            Some(unix_members(self.host))
+            #[cfg(target_os = "freebsd")]
+            {
+                crate::tree_freebsd::members(self.host).ok()
+            }
+            #[cfg(target_os = "linux")]
+            {
+                crate::tree_linux::members(self.host).ok()
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            {
+                Some(unix_members(self.host))
+            }
         }
     }
 
@@ -904,36 +936,20 @@ impl Tree {
     }
 }
 
-/// Kills the tree whose host is `host`: its other members first, while the host lives to adopt
-/// the orphans of each pass, then the host's group, the host included. A member the server may
-/// not signal, such as a process sudo runs as root, fails the kill and leaves the host alive to
-/// hold the tree.
+/// Kills the tree whose host is `host` while it lives to adopt the orphans of each pass. An empty
+/// FreeBSD host finishes its PTY drain before exiting; a dead host's reserved group is still
+/// cleaned up. A member the server may not signal fails the kill and leaves the host alive.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn kill_tree(host: i32) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        // A pass kills the members it sees; their children reparent to the host for the next.
-        let mut denied = None;
-        for _ in 0..8 {
-            let members = unix_members(host);
-            denied = None;
-            if members.is_empty() {
-                break;
-            }
-            for member in members {
-                // SAFETY: plain syscall on a PID read from /proc this pass.
-                if unsafe { libc::kill(member.pid as i32, libc::SIGKILL) } == -1 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        denied = Some(error);
-                    }
-                }
-            }
-        }
-        if let Some(error) = denied {
-            return Err(error);
-        }
+    #[cfg(target_os = "freebsd")]
+    if matches!(
+        crate::tree_freebsd::kill(host)?,
+        crate::tree_freebsd::KillResult::EmptyHost
+    ) {
+        return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    crate::tree_linux::kill(host)?;
     // SAFETY: plain syscall; the group ID stays reserved while the unreaped host holds it.
     if unsafe { libc::kill(-host, libc::SIGKILL) } == -1 {
         let error = std::io::Error::last_os_error();
@@ -944,67 +960,10 @@ pub fn kill_tree(host: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Live processes other than `host` that descend from it or share its session or group, from
-/// /proc. Job control (`set -m`) moves processes into other groups of the session.
-#[cfg(target_os = "linux")]
-fn unix_members(host: i32) -> Vec<Member> {
-    struct Entry {
-        pid: i32,
-        ppid: i32,
-        group: i32,
-        session: i32,
-        zombie: bool,
-        name: String,
-    }
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    let entries: Vec<Entry> = dir
-        .flatten()
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
-            // comm holds whatever bytes a process named itself with.
-            let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-            let stat = String::from_utf8_lossy(&stat);
-            // pid (comm) state ppid pgrp session ...; comm may hold spaces and parentheses.
-            let (head, rest) = stat.rsplit_once(')')?;
-            let name = head.split_once('(')?.1.to_string();
-            let fields: Vec<&str> = rest.split_whitespace().collect();
-            let number = |index: usize| fields.get(index)?.parse::<i32>().ok();
-            Some(Entry {
-                pid,
-                ppid: number(1)?,
-                group: number(2)?,
-                session: number(3)?,
-                zombie: fields.first() == Some(&"Z"),
-                name,
-            })
-        })
-        .collect();
-    let mut inside = std::collections::HashSet::from([host]);
-    // Parents can come after their children in /proc order, so passes repeat until none adds.
-    loop {
-        let before = inside.len();
-        for entry in &entries {
-            if inside.contains(&entry.ppid) || entry.session == host || entry.group == host {
-                inside.insert(entry.pid);
-            }
-        }
-        if inside.len() == before {
-            break;
-        }
-    }
-    entries
-        .into_iter()
-        .filter(|entry| entry.pid != host && !entry.zombie && inside.contains(&entry.pid))
-        .map(|entry| Member {
-            pid: entry.pid as u32,
-            name: entry.name,
-        })
-        .collect()
-}
-
-#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))
+))]
 fn unix_members(_host: i32) -> Vec<Member> {
     Vec::new()
 }

@@ -81,9 +81,11 @@ ranges return an error before execution.
   that is not a recognized image and has a NUL byte in its first `8` KiB, are
   refused; any other file decodes as text, lossily, with a note naming the
   replacements.
-- **`write`**: Saves `content`, creating missing parent directories. Content is
-  staged in a private sibling file and synced before it replaces the destination,
-  so a failed content write leaves the original intact. The parent directory
+- **`write`**: Saves `content`, creating missing parent directories of the final
+  target, including a dangling symlink's resolved target. Relative, absolute,
+  and chained symlinks are preserved; `edit` still requires an existing file.
+  Content is staged in a private sibling file and synced before it replaces the
+  destination, so a failed content write leaves the original intact. The parent directory
   must be writable. Existing owner, permissions, and access-control metadata
   are preserved; symlinks keep their normal target semantics. Non-regular files
   and files with multiple hard links are refused: use `exec` for a deliberate
@@ -96,6 +98,21 @@ ranges return an error before execution.
   restored together. A volume that ignores ownership or cannot provide the
   required private staging and permission preservation is refused before
   publication; `exec` remains available for an explicit in-place operation.
+  FreeBSD stages inside a new random sibling directory, removes inherited ACLs
+  while that directory is still empty, checks its owner, `0700` mode and trivial
+  ACL, then creates a `0600` file inside it. Completed saves preserve owner,
+  group, mode, native POSIX.1e or NFSv4 ACLs, and USER extended attributes;
+  chmod precedes ACL restoration so ZFS cannot discard the restored grants.
+  SYSTEM attributes are copied when the caller can inspect them, excluding
+  native ACL storage that is copied through the public ACL APIs. When the kernel
+  reports active vnode MAC labeling, existing files are not atomically replaced,
+  even by root: copying persistent attributes does not relabel an in-memory
+  vnode. New files retain the kernel-created SYSTEM attributes while MAC labeling
+  is active. `exec` remains available for an explicit in-place update.
+  Administrator-only application metadata in the SYSTEM namespace requires a
+  sufficiently privileged server to preserve it. Attribute
+  lengths are checked again after reading so a concurrent growth cannot be
+  saved as a truncated value.
 - **`edit`**: Each `edits[]` entry is `{oldText, newText}`, matched against the
   original file, not against the result of an earlier entry. Every `oldText`
   must be unique in that file, counted over every start position including
@@ -191,7 +208,18 @@ These fields describe `exec` results.
   The directory is reserved atomically and existing shared directories or links
   are refused. On macOS, creation also suppresses inherited ACL entries; existing
   runtime directories with ACL entries, or on volumes that ignore ownership, are
-  refused. Windows validates an existing directory's owner, DACL, and reparse
+  refused. FreeBSD makes each new directory private and empty before creating
+  children. Shared runtime names are published only after those checks, from a
+  random sibling with FreeBSD 15.1 `renameat2(RENAME_NOREPLACE)`, so concurrent
+  starters cannot use a partially initialized directory. Existing destinations
+  are never replaced; unsupported filesystems are refused rather than using an
+  overwrite-capable fallback. UFS and ZFS are tested. Existing directories with
+  non-trivial access ACLs or inheritable POSIX default ACLs are refused without
+  changing those ACLs. Its executable cache
+  and short-path sockets each sit inside an additional private directory created
+  after the outer directory's ACLs are removed, so an earlier `O_SEARCH` handle
+  cannot reach them. Windows validates
+  an existing directory's owner, DACL, and reparse
   status. `on` mode logs under
   `<runtime root>/ns/<namespace>/logs/` (section 6). Each task log caps at `64`
   MiB, and all logs on a server cap at `1` GiB total (evicting oldest finished
@@ -205,8 +233,9 @@ These fields describe `exec` results.
   log directory on server shutdown. On Linux it cleans up stale private log
   directories for dead PIDs only when the effective owner, permissions, and
   resolved ancestor paths are safe. It retains unverifiable entries. On macOS
-  and Windows stale default-mode directories are retained until a safe
-  platform-specific cleanup is available. `on` mode empties the namespace's
+  and Windows, and on FreeBSD, stale default-mode directories are retained;
+  automatic stale-directory cleanup currently runs only on Linux. `on` mode
+  empties the namespace's
   `logs/` directory at daemon start while holding its `daemon.lock`.
 - **Live PTY emulator and continuous transcript spool**: Each UTF-8 PTY task
   feeds output bytes into an `alacritty_terminal` (`0.26.0`) instance at the
@@ -275,13 +304,47 @@ These fields describe `exec` results.
   Task workers and startup reapers are reserved before launching processes;
   allocation failures return errors without admitting an untracked running task.
 - **Tree ownership (`src/process.rs`, `src/host.rs`)**:
+  Unix entry points restore `SIGCHLD` to its default disposition with automatic
+  reaping disabled before spawning children. Each task host's PID stays reserved
+  until its owning server explicitly waits for it. Readiness follows the bash
+  spawn attempt; if the host dies before readiness, startup cleanup ends its
+  reserved process group before reaping the host. Unix PTY descriptors are
+  created with `O_CLOEXEC`, so an unrelated spawned command cannot retain them
+  across exec. Linux opens the matching slave with `TIOCGPTPEER`, so another
+  devpts mount cannot redirect a pathname lookup. FreeBSD and macOS use a
+  separate buffer per allocation, with `ptsname_r` and `TIOCPTYGNAME` respectively.
   - **Windows**: Runs each task inside a Job Object with
     `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and breakaway disabled, because Git
     Bash starts `&` children with breakaway whenever a Job allows it.
   - **Linux**: A separate task host leads the session and adopts daemonized
-    descendants as a subreaper. Tree termination sends `SIGKILL` to discovered
-    descendants and the host's group. A lifeline pipe triggers cleanup if the
-    server dies.
+    descendants as a subreaper. Cleanup pins candidate processes with pidfds
+    before reading their authoritative ancestry, verifies membership again,
+    and signals the pinned processes. An empty scan alone cannot prove that
+    cleanup is complete: the host exits only after `waitpid` reports `ECHILD`,
+    and its pidfd confirms that exit before cleanup succeeds. This requires kernel
+    `5.3+`, readable `/proc`, and allowed `pidfd_open`/`pidfd_send_signal`
+    syscalls. The host checks pidfd availability before running bash; a failure
+    to read procfs during cleanup is reported as an error. A lifeline pipe
+    triggers cleanup if the server dies. A host
+    retains ownership and retries when a privileged descendant cannot be killed.
+  - **FreeBSD**: The task host acquires a kernel reaper with `PROC_REAP_ACQUIRE`
+    before starting bash. `PROC_REAP_GETPIDS` identifies descendants, including
+    nested reapers; `PROC_REAP_KILL` lets the kernel select signal targets
+    without a numeric PID-reuse race. Detached sessions and double forks stay
+    owned, without procfs. Partial kills and native permission errors keep the
+    host alive and are reported rather than treated as an empty tree. The
+    lifeline cleanup preserves reaper ownership while an unkillable descendant
+    remains. PTY allocation uses `posix_openpt` and `ptsname_r` with a separate
+    path buffer for each call; FreeBSD's `openpty` uses shared `ptsname` storage
+    and can open another task's slave during concurrent starts. Both descriptors
+    are created with `O_CLOEXEC`. The host retains a private PTY slave. After every
+    descendant is reaped, it disables terminal input controls and echo, resumes any stopped
+    output, and drains queued bytes before its session closes. Late input cannot
+    stop or discard the finished command's output. The root's exit status is
+    reported before this final drain,
+    so a kept background writer does not delay that result. An empty live host
+    completes the drain itself; an already dead host's reserved process group
+    is still cleaned up.
   - **macOS**: The same task host owns membership, because nothing adopts an
     orphan there: it scans the process table every 100 ms and tracks the
     processes it started by pid and start time, so a descendant seen once stays

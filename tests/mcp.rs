@@ -7,6 +7,10 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "freebsd")]
+#[path = "support/private_runtime.rs"]
+mod private_runtime;
+
 struct Server {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -282,6 +286,91 @@ fn assert_stops_growing(path: &PathBuf) {
     std::thread::sleep(Duration::from_millis(800));
     assert_eq!(file_len(path), before, "a descendant kept running");
     let _ = std::fs::remove_file(path);
+}
+
+/// Readiness authorizes an immediate kill, so the host must have completed its only spawn.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_task_host_reports_readiness_after_its_command_exists() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    for _ in 0..32 {
+        let (mut status, status_writer) = std::io::pipe().unwrap();
+        let (lifeline_reader, lifeline) = std::io::pipe().unwrap();
+        let descriptors = [status_writer.as_raw_fd(), lifeline_reader.as_raw_fd()];
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        command
+            .arg("--fastexec-task-host")
+            .args(descriptors.iter().map(|fd| fd.to_string()))
+            .args(["/bin/sh", "-c", "exec sleep 300"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        // SAFETY: only async-signal-safe syscalls execute between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for fd in descriptors {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let mut host = command.spawn().unwrap();
+        drop((status_writer, lifeline_reader));
+        let mut ready = [0; 4];
+        status.read_exact(&mut ready).unwrap();
+        assert_eq!(ready, [0; 4], "the host failed startup");
+        let children =
+            std::fs::read(format!("/proc/{}/task/{}/children", host.id(), host.id())).unwrap();
+        // Dropping the lifeline also exercises cleanup before any user-visible task exists.
+        drop(lifeline);
+        host.wait().unwrap();
+        assert!(
+            children.iter().any(|byte| !byte.is_ascii_whitespace()),
+            "the host reported READY before creating its command"
+        );
+    }
+}
+
+/// An inherited automatic-reaping policy must not release a task host's PID before its Tree.
+#[cfg(unix)]
+#[test]
+fn a_server_restores_waitable_child_statuses_before_starting_tasks() {
+    use std::os::unix::process::CommandExt;
+    for (disposition, flags) in [(libc::SIG_IGN, 0), (libc::SIG_DFL, libc::SA_NOCLDWAIT)] {
+        let mut server = Server::start_with(|command| unsafe {
+            command.pre_exec(move || {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = disposition;
+                action.sa_flags = flags;
+                libc::sigemptyset(&mut action.sa_mask);
+                if libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        });
+        for pty in [false, true] {
+            let (out, text) = server.ok(json!({
+                "action": "start", "command": "printf child-status; exit 17",
+                "pty": pty, "waitMs": 10000
+            }));
+            assert_eq!(out["state"], "exited", "{text}");
+            assert_eq!(out["exitCode"], 17, "{text}");
+            assert!(text.contains("child-status"), "{text}");
+        }
+        let (out, _) = server.ok(json!({
+            "action": "start", "command": "sleep 30", "waitMs": 0
+        }));
+        let (ended, text) = server.ok(json!({"action": "kill", "taskId": out["taskId"]}));
+        assert_eq!(ended["state"], "killed", "{text}");
+        assert_eq!(ended["leftovers"], json!([]), "{text}");
+    }
 }
 
 #[test]
@@ -723,10 +812,16 @@ fn tiny_stream_and_transcript_windows_keep_requested_ends_and_truthful_omissions
             assert!(text.len() <= 100, "{text}");
             let body = out["output"].as_str().unwrap();
             if mode != "tail" {
-                assert!(body.starts_with("line001"), "{mode}: {body}");
+                assert!(
+                    body.starts_with("line001"),
+                    "{mode}: output={body:?}; result={out}; text={text:?}"
+                );
             }
             if mode != "head" {
-                assert!(body.ends_with("line050"), "{mode}: {body}");
+                assert!(
+                    body.ends_with("line050"),
+                    "{mode}: output={body:?}; result={out}; text={text:?}"
+                );
             }
             let shown: Vec<u64> = body
                 .lines()
@@ -1626,8 +1721,8 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
     // Like Codex, history lines are then inserted through a scroll region above a fixed
     // composer row. All push lines past the 30-row screen.
     let command = concat!(
-        "seq -f 'kept %g' 1 40; printf '\\033[2J\\033[H\\033[3J'; seq -f 'kept %g' 1 45; ",
-        "printf '\\033[2J\\033[H\\033[3J'; seq -f 'plain %g' 1 40; ",
+        "printf 'kept %s\\n' {1..40}; printf '\\033[2J\\033[H\\033[3J'; printf 'kept %s\\n' {1..45}; ",
+        "printf '\\033[2J\\033[H\\033[3J'; printf 'plain %s\\n' {1..40}; ",
         "printf '\\033[30;1H> composer'; ",
         "for k in $(seq 1 40); do ",
         "printf '\\033[1;29r\\033[29;1H\\r\\ninsert %d\\033[r\\033[30;1H> composer\\033[K' $k; done"
@@ -1679,10 +1774,10 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
     let second_gate = gate.join("scrolled");
     let command = format!(
         concat!(
-            "seq -f 'normal %g' 1 40; printf 'a\\tb\\n\\033[?1049h'; ",
-            "printf '\\033[?2026h\\033[H%s\\033[?2026l' \"$(seq -f 'first %g' 1 30)\"; ",
+            "printf 'normal %s\\n' {{1..40}}; printf 'a\\tb\\n\\033[?1049h'; ",
+            "printf '\\033[?2026h\\033[H%s\\033[?2026l' \"$(printf 'first %s\\n' {{1..30}})\"; ",
             "while [ ! -f '{}' ]; do sleep 0.01; done; ",
-            "printf '\\033[?2026h\\033[H%s\\033[?2026l' \"$(seq -f 'second %g' 1 30)\"; ",
+            "printf '\\033[?2026h\\033[H%s\\033[?2026l' \"$(printf 'second %s\\n' {{1..30}})\"; ",
             "while [ ! -f '{}' ]; do sleep 0.01; done; ",
             "printf '\\r\\nscrolled %d' $(seq 1 40); read -r x"
         ),
@@ -3047,12 +3142,121 @@ fn native_birth(pid: i32) -> Option<u64> {
     Some(seconds * 1_000_000 + micros)
 }
 
+/// A kept writer must not make terminal draining delay the root's independent exit status.
+#[cfg(target_os = "freebsd")]
+#[test]
+fn freebsd_a_continuous_pty_writer_does_not_delay_the_kept_roots_status() {
+    let mut server = Server::start();
+    let (out, text) = server.ok(json!({
+        "action": "start", "pty": true, "keepTree": true, "loginShell": false,
+        "waitMs": 3000, "killAfterMs": 15000, "maxBytes": 1024,
+        "command": "(end=$((SECONDS + 20)); while (( SECONDS < end )); do printf 'background-output\\n'; done) & printf 'root-ended\\n'; exit 23",
+    }));
+    assert_eq!(out["state"], "exited", "{text}");
+    assert_eq!(out["exitCode"], 23, "{text}");
+    assert_eq!(out["keptRunning"], true, "{text}");
+    let (out, text) = server.ok(json!({
+        "action": "kill", "taskId": out["taskId"], "waitMs": 5000,
+    }));
+    assert_eq!(out["exitCode"], 23, "{text}");
+    assert_eq!(out["keptRunning"], false, "{text}");
+    assert_eq!(out["held"], json!([]), "{text}");
+    assert!(out["killError"].is_null(), "{text}");
+}
+
+/// A host killed externally no longer has a reaper, but its unreaped PID still reserves its group.
+#[cfg(target_os = "freebsd")]
+#[test]
+fn freebsd_a_dead_host_still_cleans_up_its_reserved_process_group() {
+    let (beat, beat_bash) = scratch("dead-freebsd-host");
+    let mut server = Server::start();
+    let command = format!(
+        "(for i in {{1..200}}; do printf x >> '{beat_bash}'; sleep 0.1; done) & while [ ! -s '{beat_bash}' ]; do sleep 0.01; done; read -r gate; kill -KILL \"$PPID\"; sleep 20"
+    );
+    let (out, _) = server.ok(json!({
+        "action": "start", "command": command, "waitMs": 0,
+    }));
+    // Start has observed READY before the command is allowed to kill its host.
+    let (out, text) = server.ok(json!({
+        "action": "poll", "taskId": out["taskId"], "input": "kill\n", "waitMs": 10000,
+    }));
+    assert_eq!(out["exitCode"], 137, "{text}");
+    assert_stops_growing(&beat);
+}
+
+/// A trap in bash must survive the process-group signal without losing its task reaper.
+#[cfg(target_os = "freebsd")]
+#[test]
+fn freebsd_realtime_group_signals_preserve_the_host_and_tree_cleanup() {
+    for signal in [65, 126] {
+        let (beat, beat_bash) = scratch(&format!("realtime-{signal}"));
+        let mut server = Server::start();
+        let command = format!(
+            "trap ':' {signal}; perl -MPOSIX -e 'exit if fork; POSIX::setsid() or die; exec @ARGV' /bin/sh -c 'for i in $(seq 300); do printf x >> \"{beat_bash}\"; sleep 0.1; done'; while [ ! -s '{beat_bash}' ]; do sleep 0.01; done; kill -{signal} 0; printf 'survived\\n'"
+        );
+        let (out, text) = server.ok(json!({
+            "action": "start", "command": command, "waitMs": 10000,
+        }));
+        assert_eq!(out["exitCode"], 0, "signal {signal}: {text}");
+        assert!(text.contains("survived"), "{text}");
+        assert_stops_growing(&beat);
+    }
+}
+
+/// FreeBSD's descendant query stops at nested reapers; both their membership and kill must recurse.
+#[cfg(target_os = "freebsd")]
+#[test]
+fn freebsd_nested_reapers_keep_detached_descendants_owned() {
+    let dir = Scratch::new("nested-reaper");
+    std::fs::create_dir(&*dir).unwrap();
+    let source = dir.join("reaper.c");
+    let fixture = dir.join("reaper");
+    let beat = dir.join("beat");
+    let mark = dir.join("pids");
+    std::fs::write(&source, include_str!("fixtures/freebsd-reaper.c")).unwrap();
+    assert!(
+        Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&fixture)
+            .status()
+            .unwrap()
+            .success(),
+        "the nested reaper fixture did not compile"
+    );
+    let mut server = Server::start();
+    let (out, text) = server.ok(json!({
+        "action": "start", "keepTree": true, "waitMs": 10000,
+        "command": format!("'{}' '{}' '{}' & echo started",
+            fixture.display(), beat.display(), mark.display()),
+    }));
+    assert_eq!(out["keptRunning"], true, "{text}");
+    wait_for_heartbeat(&beat);
+    let pids: Vec<u64> = std::fs::read_to_string(mark)
+        .unwrap()
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 2);
+    let (list, text) = server.ok(json!({"action": "list"}));
+    let held = list["tasks"][0]["held"].as_array().unwrap();
+    for pid in pids {
+        assert!(
+            held.iter().any(|member| member["pid"] == pid),
+            "the nested reaper member {pid} was lost: {text}"
+        );
+    }
+    server.ok(json!({"action": "kill", "taskId": server.id(1), "waitMs": 5000}));
+    assert_stops_growing(&beat);
+}
+
 /// A process the server may not signal, as one sudo runs as root, stays held and reported. The
-/// fixture needs root and a C compiler, as in the Linux test container; elsewhere it is skipped.
-#[cfg(target_os = "linux")]
+/// fixture needs root and a C compiler; CI requires both on Linux and FreeBSD.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[test]
 fn processes_the_server_may_not_kill_stay_held_and_reported() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     // CI and fx-test set this, so the case cannot pass by skipping when a prerequisite is missing.
     let required = std::env::var("FASTEXEC_REQUIRE_ROOT_TEST").is_ok_and(|value| value == "1");
@@ -3065,15 +3269,126 @@ fn processes_the_server_may_not_kill_stay_held_and_reported() {
         eprintln!("skipped: a setuid-root fixture needs root");
         return;
     }
-    let (dir, _) = scratch("root-daemon");
-    std::fs::create_dir_all(&*dir).unwrap();
+    // The setuid binary may only touch this instance's root-owned directory. Create it
+    // exclusively, keep it private while compiling, and bind the helper to its original inode.
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).unwrap();
+    let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = std::env::temp_dir().join(format!("fastexec-root-fixture-{nonce}"));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .unwrap();
+    let mut scratch = Scratch(path);
+    scratch.0 = scratch.canonicalize().unwrap();
+    let dir = scratch.join("instance");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let metadata = std::fs::symlink_metadata(&dir).unwrap();
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.uid(), 0);
+    assert_eq!(metadata.mode() & 0o777, 0o700);
+    #[cfg(target_os = "freebsd")]
+    private_runtime::create_private_runtime(&dir);
+
+    let beats = [dir.join("exit"), dir.join("kill")];
+    let stops = [dir.join("exit.stop"), dir.join("kill.stop")];
+    // Every byte gets its own escape, for both C literals and Bash's ANSI-C quoting.
+    let escaped = |path: &std::path::Path| -> String {
+        path.as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\x{byte:02x}"))
+            .collect()
+    };
     let source = dir.join("daemon.c");
+    let declarations = format!(
+        "#define _GNU_SOURCE\n\
+         #include <errno.h>\n\
+         #include <fcntl.h>\n\
+         #include <stdint.h>\n\
+         #include <stdio.h>\n\
+         #include <string.h>\n\
+         #include <sys/stat.h>\n\
+         #include <unistd.h>\n\
+         static const char directory[] = \"{}\";\n\
+         static const uintmax_t directory_device = UINTMAX_C({});\n\
+         static const uintmax_t directory_inode = UINTMAX_C({});\n\
+         static const char *beats[] = {{\"exit\", \"kill\"}};\n\
+         static const char *stops[] = {{\"exit.stop\", \"kill.stop\"}};\n",
+        escaped(&dir),
+        metadata.dev(),
+        metadata.ino()
+    );
     std::fs::write(
         &source,
-        // It ends by itself after 60 s, so a failing run leaves no immortal root process.
-        "#define _GNU_SOURCE\n#include <stdio.h>\n#include <unistd.h>\nint main(int argc, char **argv) {\n  if (argc < 2 || setresuid(0, 0, 0) != 0) return 1;\n  for (int i = 0; i < 600; i++) { FILE *f = fopen(argv[1], \"a\"); if (f) { fputs(\"x\\n\", f); fclose(f); } usleep(100000); }\n  return 0;\n}\n",
+        declarations
+            // It ends by itself after 60 s, so a failing run leaves no immortal root process.
+            + r#"static int open_directory(void) {
+  int fd = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) { perror("fixture directory"); return -1; }
+  struct stat st;
+  if (fstat(fd, &st) != 0) { perror("fixture directory"); close(fd); return -1; }
+  if (!S_ISDIR(st.st_mode) || st.st_uid != 0 || (st.st_mode & 07777) != 0755 ||
+      (uintmax_t)st.st_dev != directory_device || (uintmax_t)st.st_ino != directory_inode) {
+    fprintf(stderr, "fixture directory identity or permissions changed\n");
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+static int stopped(int directory_fd, const char *name) {
+  struct stat st;
+  if (fstatat(directory_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+    if (errno == ENOENT) return 0;
+    perror("fixture stop");
+    return -1;
+  }
+  if (!S_ISREG(st.st_mode) || st.st_uid != 0 || st.st_nlink != 1 ||
+      (st.st_mode & 07777) != 0600) {
+    fprintf(stderr, "fixture stop identity or permissions changed\n");
+    return -1;
+  }
+  return 1;
+}
+static int heartbeat(int fd, int pid, int parent) {
+  if (dprintf(fd, "%d %d\n", pid, parent) < 0) { perror("fixture heartbeat"); return 1; }
+  return 0;
+}
+int main(int argc, char **argv) {
+  if (argc != 2) return 2;
+  int which;
+  if (strcmp(argv[1], "--check-root") == 0) which = -1;
+  else if (strcmp(argv[1], "exit") == 0) which = 0;
+  else if (strcmp(argv[1], "kill") == 0) which = 1;
+  else return 2;
+  if (geteuid() != 0) {
+    fprintf(stderr, "setuid-root fixture: uid=%u euid=%u; check TMPDIR mount flags and inherited privilege restrictions\n",
+            (unsigned)getuid(), (unsigned)geteuid());
+    return 1;
+  }
+  int directory_fd = open_directory();
+  if (directory_fd < 0) return 1;
+  if (setresuid(0, 0, 0) != 0) { perror("fixture setresuid"); return 1; }
+  if (which < 0) return close(directory_fd) != 0;
+  umask(077);
+  int fd = openat(directory_fd, beats[which],
+                  O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) { perror("fixture heartbeat"); return 1; }
+  for (int i = 0; i < 600; i++) {
+    int stop = stopped(directory_fd, stops[which]);
+    if (stop < 0) return 1;
+    if (stop > 0) break;
+    if (heartbeat(fd, (int)getpid(), (int)getppid()) != 0) return 1;
+    usleep(100000);
+  }
+  int failed = heartbeat(fd, 0, 0);
+  if (close(fd) != 0 || close(directory_fd) != 0) failed = 1;
+  return failed;
+}
+"#,
     )
     .unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
     let fixture = dir.join("root-daemon");
     match Command::new("cc")
         .arg(&source)
@@ -3091,60 +3406,201 @@ fn processes_the_server_may_not_kill_stay_held_and_reported() {
         }
         built => assert!(built.unwrap().success(), "the fixture did not compile"),
     }
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o4755)).unwrap();
-    let (fixture, beats) = (fixture.display(), [dir.join("exit"), dir.join("kill")]);
-    let mut server = Server::start_with(|command| {
-        command.uid(65534).gid(65534);
-    });
-    let mut pids = Vec::new();
 
-    // At the root's exit.
-    let command = format!("{fixture} {} & sleep 0.5; echo started", beats[0].display());
-    let (out, text) = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
+    // The private outer directory keeps these ordinary-binary checks under one identity.
+    let check_plain = |executable: &std::path::Path, argument: &str| {
+        Command::new(executable)
+            .arg(argument)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    assert!(check_plain(&fixture, "--check-root").status.success());
+    std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let rejected = check_plain(&fixture, "--check-root");
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("fixture directory"));
+    std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let moved = Scratch(dir.with_extension("original"));
+    std::fs::rename(&*dir, &*moved).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o755)
+        .create(&*dir)
+        .unwrap();
+    let plain = moved.join("root-daemon");
+    assert_eq!(std::fs::metadata(&plain).unwrap().mode() & 0o7777, 0o755);
+    assert_ne!(std::fs::metadata(&*dir).unwrap().ino(), metadata.ino());
+    let rejected = check_plain(&plain, "exit");
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("fixture directory"));
+    assert!(beats.iter().chain(&stops).all(|path| !path.exists()));
+    std::fs::remove_dir(&*dir).unwrap();
+    std::os::unix::fs::symlink(&*moved, &*dir).unwrap();
+    let rejected = check_plain(&plain, "exit");
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("fixture directory"));
+    assert!(!moved.join("exit").exists());
+    std::fs::remove_file(&*dir).unwrap();
+    std::fs::rename(&*moved, &*dir).unwrap();
+
+    std::fs::write(&beats[0], b"original").unwrap();
+    assert_eq!(check_plain(&fixture, "exit").status.code(), Some(1));
+    assert_eq!(std::fs::read(&beats[0]).unwrap(), b"original");
+    std::fs::remove_file(&beats[0]).unwrap();
+    std::fs::set_permissions(&*scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    let check = Command::new(&fixture)
+        .arg("--check-root")
+        .uid(65534)
+        .gid(65534)
+        .current_dir(&*dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the setuid fixture as uid 65534");
+    assert!(
+        check.status.success(),
+        "the fixture must become root before testing protected descendants ({}): {}",
+        dir.display(),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    // Invalid arguments never select a file, even though the executable becomes root.
+    let sentinel = dir.join("not-a-fixture-path");
+    std::fs::write(&sentinel, b"original").unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for arguments in [
+        vec![sentinel.as_os_str()],
+        vec![std::ffi::OsStr::new("exit"), sentinel.as_os_str()],
+        vec![beats[0].as_os_str(), stops[1].as_os_str()],
+        vec![std::ffi::OsStr::new("--check-root"), sentinel.as_os_str()],
+    ] {
+        let rejected = Command::new(&fixture)
+            .args(arguments)
+            .uid(65534)
+            .gid(65534)
+            .current_dir(&*dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(rejected.status.code(), Some(2));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"original");
+        assert!(beats.iter().chain(&stops).all(|path| !path.exists()));
+    }
+    let fixture = format!("$'{}'", escaped(&fixture));
+    let mut server = Server::start_with(|command| {
+        command
+            .uid(65534)
+            .gid(65534)
+            .current_dir(&*dir)
+            .env("HOME", &*dir);
+    });
+    // Stop through private files, never old numeric PIDs: the bounded fixture may already
+    // have exited and released its PID on a slow machine. This guard also runs after a panic.
+    struct StopFixtures {
+        beats: [PathBuf; 2],
+        stops: [PathBuf; 2],
+    }
+    impl Drop for StopFixtures {
+        fn drop(&mut self) {
+            for path in &self.stops {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(b"stop"));
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.beats.iter().any(|path| {
+                path.exists()
+                    && !std::fs::read_to_string(path).is_ok_and(|text| text.ends_with("0 0\n"))
+            }) && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let stopping = StopFixtures {
+        beats: beats.clone(),
+        stops,
+    };
+    let identity = |beat: &PathBuf| -> (i64, i64) {
+        let text = std::fs::read_to_string(beat).unwrap();
+        let (pid, parent) = text.lines().last().unwrap().split_once(' ').unwrap();
+        (pid.parse().unwrap(), parent.parse().unwrap())
+    };
+
+    // At the root's exit. The heartbeat is written only after becoming root: a fixed delay
+    // could let bash end while its scheduled child was still an unprivileged exec candidate.
+    let command = format!("{fixture} exit & read -r ready; echo started");
+    server.ok(json!({"action": "start", "command": command, "waitMs": 0}));
+    wait_for_heartbeat(&beats[0]);
+    let (out, text) = server.ok(json!({
+        "action": "poll", "taskId": server.id(1), "input": "ready\n", "waitMs": 10000
+    }));
     assert_eq!(out["keptRunning"], true, "{text}");
     assert!(
         text.contains("could not end root-daemon (") && text.contains("kill retries"),
         "{text}"
     );
     assert!(out["killError"].is_string(), "{out}");
-    pids.extend(
+    assert!(
         out["leftovers"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|member| member["pid"].as_i64().unwrap()),
+            .any(|member| member["pid"] == identity(&beats[0]).0),
+        "the root fixture is reported among the protected descendants: {out}"
     );
     let (_, text, is_error) = server.call(json!({"action": "kill", "taskId": server.id(1)}));
     assert!(is_error && text.contains("Cannot terminate"), "{text}");
 
     // After a kill of the running root.
-    let command = format!("{fixture} {} & sleep 300", beats[1].display());
-    server.ok(json!({"action": "start", "command": command, "waitMs": 1000}));
+    let command = format!("{fixture} kill & sleep 300");
+    server.ok(json!({"action": "start", "command": command, "waitMs": 0}));
+    wait_for_heartbeat(&beats[1]);
     let (_, text, is_error) = server.call(json!({"action": "kill", "taskId": server.id(2)}));
     assert!(is_error && text.contains("Cannot terminate"), "{text}");
     let (out, text) = server.ok(json!({"action": "poll", "taskId": server.id(2), "waitMs": 10000}));
     assert_eq!(out["state"], "killed", "{text}");
     assert_eq!(out["keptRunning"], true, "{text}");
     assert!(text.contains("could not end root-daemon ("), "{text}");
-    pids.extend(
+    assert!(
         out["leftovers"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|member| member["pid"].as_i64().unwrap()),
+            .any(|member| member["pid"] == identity(&beats[1]).0),
+        "the root fixture is reported among the protected descendants: {out}"
     );
 
     for beat in &beats {
         let before = file_len(beat);
         std::thread::sleep(Duration::from_millis(500));
         assert!(file_len(beat) > before, "the fixture should still run");
+        let metadata = std::fs::metadata(beat).unwrap();
+        assert_eq!(metadata.uid(), 0);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
     }
-    for pid in pids {
-        // SAFETY: plain syscall, as root, on the fixtures' PIDs.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let parents: Vec<_> = beats.iter().map(|beat| identity(beat).1).collect();
+    assert!(parents.iter().all(|pid| *pid > 1));
+    // A dead server cannot retry a denied kill. Its hosts must retain their reaper ownership
+    // until the privileged descendants end, instead of abandoning them to the system init.
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    for (beat, host) in beats.iter().zip(&parents) {
+        assert_eq!(
+            identity(beat).1,
+            *host,
+            "fixture {beat:?} lost its task host"
+        );
     }
+    drop(stopping);
     for beat in &beats {
+        assert_eq!(identity(beat), (0, 0), "the fixture acknowledged its stop");
         assert_stops_growing(beat);
     }
 }
@@ -4072,6 +4528,11 @@ fn bash_discovery_still_works_after_the_session_directory_is_removed() {
 #[cfg(unix)]
 #[test]
 fn bash_version_probes_end_background_children_on_success_error_and_timeout() {
+    let bash = if cfg!(target_os = "freebsd") {
+        "/usr/local/bin/bash"
+    } else {
+        "/bin/bash"
+    };
     use std::os::unix::fs::PermissionsExt;
     for (name, finish, should_succeed) in [
         ("success", "exit 0", true),
@@ -4086,7 +4547,7 @@ fn bash_version_probes_end_background_children_on_success_error_and_timeout() {
         // A bounded heartbeat keeps stdout open after the version root exits. It is part of
         // the probe's tree even though no user-visible Task exists for a failed discovery.
         std::fs::write(&wrapper, format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then\n (for i in $(seq 300); do printf x >> '{}'; sleep 0.1; done) &\n while [ ! -s '{}' ]; do sleep 0.01; done\n printf 'GNU bash, version 5.2\\n'\n {finish}\nfi\nexec /bin/bash \"$@\"\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then\n (for i in $(seq 300); do printf x >> '{}'; sleep 0.1; done) &\n while [ ! -s '{}' ]; do sleep 0.01; done\n printf 'GNU bash, version 5.2\\n'\n {finish}\nfi\nexec {bash} \"$@\"\n",
             beat.display(), beat.display()
         )).unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4110,16 +4571,21 @@ fn bash_version_probes_end_background_children_on_success_error_and_timeout() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[test]
 fn bash_version_probe_owns_a_child_that_detaches_its_session() {
+    let bash = if cfg!(target_os = "freebsd") {
+        "/usr/local/bin/bash"
+    } else {
+        "/bin/bash"
+    };
     use std::os::unix::fs::PermissionsExt;
     let dir = Scratch::new("bash-probe-detached");
     std::fs::create_dir(&*dir).unwrap();
     let wrapper = dir.join("bash");
     let beat = dir.join("beat");
     std::fs::write(&wrapper, format!(
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n perl -MPOSIX -e 'exit if fork; POSIX::setsid() or die \"setsid: $!\"; exec @ARGV' /bin/sh -c 'for i in $(seq 300); do printf x >> \"{}\"; sleep 0.1; done'\n while [ ! -s '{}' ]; do sleep 0.01; done\n printf 'GNU bash, version 5.2\\n'\n exit 0\nfi\nexec /bin/bash \"$@\"\n",
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n perl -MPOSIX -e 'exit if fork; POSIX::setsid() or die \"setsid: $!\"; exec @ARGV' /bin/sh -c 'for i in $(seq 300); do printf x >> \"{}\"; sleep 0.1; done'\n while [ ! -s '{}' ]; do sleep 0.01; done\n printf 'GNU bash, version 5.2\\n'\n exit 0\nfi\nexec {bash} \"$@\"\n",
         beat.display(), beat.display()
     )).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();

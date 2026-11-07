@@ -105,6 +105,21 @@ jobs:
             tar -czf "$name.tar.gz" "$name"
           fi
 
+      - name: smoke test Linux archive on Alpine
+        if: startsWith(matrix.name, 'linux-')
+        env:
+          ARCHIVE_PLATFORM: ${{ matrix.name }}
+        run: |
+          docker run --rm --init -v "$GITHUB_WORKSPACE/dist:/archives:ro" \
+            -v "$GITHUB_WORKSPACE/scripts/ci/smoke-release.py:/smoke-release.py:ro" \
+            -e VERSION -e ARCHIVE_PLATFORM alpine:3.23 sh -ec '
+              apk add --no-cache bash python3
+              mkdir /tmp/archive
+              tar -xzf "/archives/fastexec-$VERSION-$ARCHIVE_PLATFORM.tar.gz" -C /tmp/archive
+              python3 /smoke-release.py \
+                "/tmp/archive/fastexec-$VERSION-$ARCHIVE_PLATFORM/fastexec" "$VERSION"
+            '
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.name }}
@@ -113,8 +128,51 @@ jobs:
             dist/*.zip
           if-no-files-found: error
 
+  build-freebsd:
+    name: build (freebsd-amd64)
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: native build, package and smoke test
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: "15.1"
+          arch: x86_64
+          mem: 6144
+          cpu: 4
+          envs: VERSION
+          prepare: |
+            pkg install -y bash rust python3
+          run: |
+            set -eu
+            export CARGO_TARGET_DIR=/tmp/fastexec-release-target
+            export CARGO_BUILD_JOBS=2
+            freebsd-version
+            rustc --version
+            cargo build --release --locked
+            name="fastexec-$VERSION-freebsd-amd64"
+            mkdir -p "dist/$name/vendor/conpty"
+            cp "$CARGO_TARGET_DIR/release/fastexec" LICENSE NOTICE README.md "dist/$name/"
+            cp vendor/conpty/LICENSE "dist/$name/vendor/conpty/"
+            tar -czf "dist/$name.tar.gz" -C dist "$name"
+            probe=$(mktemp -d)
+            trap 'rm -rf "$probe"' EXIT
+            tar -xzf "dist/$name.tar.gz" -C "$probe"
+            python3 scripts/ci/smoke-release.py "$probe/$name/fastexec" "$VERSION"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-freebsd-amd64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
   release:
-    needs: [check, ci, build]
+    needs: [check, ci, build, build-freebsd]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

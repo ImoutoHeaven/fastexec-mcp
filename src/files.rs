@@ -10,7 +10,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
 use std::fs::Metadata;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -693,13 +693,15 @@ fn format_size(bytes: u64) -> String {
 fn write_text(request: &WriteRequest, launch: &LaunchContext) -> Result<String, String> {
     let resolved = resolve(&request.path, launch)?;
     let _guard = lock();
-    if let Some(parent) = resolved.parent()
+    let target = write_target(&resolved)
+        .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
+    if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
     }
-    save_text(&resolved, request.content.as_bytes())
+    save_target(target, request.content.as_bytes())
         .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
     Ok(format!("Successfully wrote to {}", request.path))
 }
@@ -736,6 +738,8 @@ struct Staged {
     path: PathBuf,
     file: Option<File>,
     remove_on_drop: bool,
+    #[cfg(target_os = "freebsd")]
+    directory: Option<PathBuf>,
 }
 
 impl Drop for Staged {
@@ -743,6 +747,10 @@ impl Drop for Staged {
         drop(self.file.take());
         if self.remove_on_drop {
             let _ = std::fs::remove_file(&self.path);
+        }
+        #[cfg(target_os = "freebsd")]
+        if let Some(directory) = &self.directory {
+            let _ = std::fs::remove_dir(directory);
         }
     }
 }
@@ -754,16 +762,37 @@ impl Staged {
             getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
             let name = format!(".fastexec-save-{:032x}", u128::from_le_bytes(random));
             let path = parent.join(name);
+            #[cfg(target_os = "freebsd")]
+            let directory = if private {
+                match crate::runtime::create_private_new(&path) {
+                    Ok(()) => Some(path.clone()),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            #[cfg(target_os = "freebsd")]
+            let path = directory.as_ref().map_or(path, |dir| dir.join("content"));
             match create_staging_file(&path, private) {
                 Ok(file) => {
                     return Ok(Self {
                         path,
                         file: Some(file),
                         remove_on_drop: true,
+                        #[cfg(target_os = "freebsd")]
+                        directory,
                     });
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    #[cfg(target_os = "freebsd")]
+                    if let Some(directory) = directory {
+                        let _ = std::fs::remove_dir(directory);
+                    }
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                }
             }
         }
         Err(io::Error::new(
@@ -1097,7 +1126,7 @@ fn single_link(file: &File) -> io::Result<()> {
 
 /// Preserves an existing Unix file's owner before restoring its mode. A new inode owned by the
 /// server would otherwise take a user's file away from them when a privileged server edits it.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
 fn preserve_owner(file: &File, original: &Metadata) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -1548,7 +1577,11 @@ fn publish(staged: &Path, target: &Path, exists: bool) -> io::Result<()> {
 /// Saves before touching the old inode: ENOSPC, quotas, failed syncs, and failed metadata
 /// preservation all leave the original intact. This requires a writable parent directory.
 fn save_text(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let target = write_target(path)?;
+    save_target(write_target(path)?, bytes)
+}
+
+/// Writes to the resolved target without following a final link again after creating parents.
+fn save_target(target: PathBuf, bytes: &[u8]) -> io::Result<()> {
     let original = match std::fs::symlink_metadata(&target) {
         Ok(metadata) => {
             if !metadata.is_file() {
@@ -1594,7 +1627,7 @@ fn save_text(path: &Path, bytes: &[u8]) -> io::Result<()> {
         None
     };
     let file = staged.file.as_mut().expect("a new staging file is open");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     let permissions = match &metadata {
         Some(metadata) => metadata.permissions(),
         None => defaults
@@ -1615,7 +1648,7 @@ fn save_text(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .unwrap();
         preserve_windows_access(source, file, original.is_some())?;
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
     if let Some(metadata) = &metadata {
         preserve_owner(file, metadata)?;
     }
@@ -1623,8 +1656,16 @@ fn save_text(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(original) = &original {
         preserve_xattrs(original, file)?;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     file.set_permissions(permissions)?;
+    #[cfg(target_os = "freebsd")]
+    {
+        let source = original
+            .as_ref()
+            .or_else(|| defaults.as_ref().and_then(|probe| probe.file.as_ref()))
+            .unwrap();
+        crate::freebsd_fs::preserve(source, file, original.is_some())?;
+    }
     #[cfg(target_os = "macos")]
     {
         let source = original
@@ -2628,6 +2669,132 @@ mod tests {
         assert_eq!(scratch.read("created.txt"), b"created");
     }
 
+    fn file_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(target, link);
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                #[cfg(windows)]
+                if error.raw_os_error() == Some(1314) && std::env::var_os("CI").is_none() {
+                    eprintln!(
+                        "skipped: creating a Windows symlink requires Developer Mode or its privilege"
+                    );
+                    return false;
+                }
+                panic!("cannot create fixture symlink {}: {error}", link.display());
+            }
+        }
+    }
+
+    #[test]
+    fn write_creates_dangling_symlink_target_parents() {
+        let scratch = Scratch::new("write-link-parents");
+        let launch = context(&scratch.0, &scratch.0);
+        let links = scratch.0.join("links");
+        std::fs::create_dir(&links).unwrap();
+        for (name, absolute, chained) in [
+            ("relative", false, false),
+            ("absolute", true, false),
+            ("chained", false, true),
+        ] {
+            let target = scratch.0.join(name).join("missing").join("nested.txt");
+            let stored = if absolute {
+                target.clone()
+            } else {
+                Path::new("..")
+                    .join(name)
+                    .join("missing")
+                    .join("nested.txt")
+            };
+            let direct = links.join(format!("{name}.link"));
+            if !file_symlink(&stored, &direct) {
+                return;
+            }
+            let direct_before = std::fs::read_link(&direct).unwrap();
+            let link = if chained {
+                let link = links.join("chain.link");
+                if !file_symlink(direct.file_name().unwrap().as_ref(), &link) {
+                    return;
+                }
+                link
+            } else {
+                direct.clone()
+            };
+            let link_before = std::fs::read_link(&link).unwrap();
+            let path = link.to_string_lossy().into_owned();
+            write_text(
+                &WriteRequest {
+                    path: path.clone(),
+                    content: "created".to_owned(),
+                },
+                &launch,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"created");
+            assert_eq!(std::fs::read(&link).unwrap(), b"created");
+            assert_eq!(std::fs::read_link(&direct).unwrap(), direct_before);
+            assert_eq!(std::fs::read_link(&link).unwrap(), link_before);
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            change(&path, &[("created", "edited")], &launch).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"edited");
+            assert_eq!(std::fs::read_link(&direct).unwrap(), direct_before);
+            assert_eq!(std::fs::read_link(&link).unwrap(), link_before);
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn edit_does_not_create_dangling_symlink_target_parents() {
+        let scratch = Scratch::new("edit-link-parents");
+        let launch = context(&scratch.0, &scratch.0);
+        let link = scratch.0.join("link.txt");
+        if !file_symlink(&Path::new("missing").join("nested.txt"), &link) {
+            return;
+        }
+        let link_before = std::fs::read_link(&link).unwrap();
+        assert!(change("link.txt", &[("old", "new")], &launch).is_err());
+        assert!(!scratch.0.join("missing").exists());
+        assert_eq!(std::fs::read_link(&link).unwrap(), link_before);
+    }
+
+    #[test]
+    fn write_does_not_replace_a_symlink_targets_non_directory_parent() {
+        let scratch = Scratch::new("write-link-obstruction");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file("blocked", b"keep this file");
+        let link = scratch.0.join("link.txt");
+        let target = Path::new("blocked").join("missing").join("file.txt");
+        if !file_symlink(&target, &link) {
+            return;
+        }
+        let link_before = std::fs::read_link(&link).unwrap();
+        assert!(
+            write_text(
+                &WriteRequest {
+                    path: "link.txt".to_owned(),
+                    content: "new".to_owned()
+                },
+                &launch,
+            )
+            .is_err()
+        );
+        assert_eq!(scratch.read("blocked"), b"keep this file");
+        assert_eq!(std::fs::read_link(&link).unwrap(), link_before);
+    }
+
     #[test]
     fn atomic_saves_refuse_to_silently_split_hard_links() {
         let scratch = Scratch::new("save-hard-links");
@@ -2644,6 +2811,279 @@ mod tests {
         assert!(change("original.txt", &[("original", "replacement")], &launch).is_err());
         assert_eq!(scratch.read("original.txt"), b"original");
         assert_eq!(scratch.read("alias.txt"), b"original");
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn freebsd_acl_fixture(scratch: &Scratch) -> Option<bool> {
+        let kind = crate::freebsd_fs::test_acl_is_nfs4(&File::open(&scratch.0).unwrap()).unwrap();
+        if kind.is_none() {
+            assert_ne!(
+                std::env::var("FASTEXEC_REQUIRE_ACL_TEST").as_deref(),
+                Ok("1"),
+                "the mandatory FreeBSD ACL fixture does not support ACLs"
+            );
+            eprintln!("ACL filesystem cases run in scripts/ci/freebsd-acl-tests.sh");
+        }
+        if kind.is_some() {
+            // SAFETY: geteuid has no preconditions; UID 1 is the separate ACL test subject.
+            assert_ne!(
+                unsafe { libc::geteuid() },
+                1,
+                "the ACL fixture must not run as its peer UID"
+            );
+        }
+        kind
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn freebsd_set_acl(path: &Path, args: &[&str]) {
+        let output = std::process::Command::new("setfacl")
+            .args(args)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "setfacl failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn freebsd_inherit_acl(path: &Path, nfs4: bool) {
+        if nfs4 {
+            freebsd_set_acl(
+                path,
+                &[
+                    "-a",
+                    "0",
+                    "owner@:rwxpDdaARWcCos:fd:allow,user:1:rwxpDdaARWcCos:fd:allow",
+                ],
+            );
+        } else {
+            freebsd_set_acl(path, &["-d", "-m", "u::rwx,u:1:rwx,g::r-x,m::rwx,o::---"]);
+        }
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_user_attributes_survive_write_and_edit() {
+        use std::os::fd::AsRawFd;
+        let scratch = Scratch::new("save-freebsd-attributes");
+        let path = scratch.file("original.txt", b"original");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let value = b"binary\0attribute\xff";
+        // SAFETY: the descriptor, terminated name and byte buffer are live.
+        assert_eq!(
+            unsafe {
+                libc::extattr_set_fd(
+                    file.as_raw_fd(),
+                    libc::EXTATTR_NAMESPACE_USER,
+                    c"fastexec-test".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                )
+            },
+            value.len() as isize
+        );
+        save_text(&path, b"replacement").unwrap();
+        let launch = context(&scratch.0, &scratch.0);
+        change("original.txt", &[("replacement", "edited")], &launch).unwrap();
+        let saved = File::open(&path).unwrap();
+        let mut actual = [0u8; 64];
+        // SAFETY: the live descriptor names the replacement and the output buffer is valid.
+        let count = unsafe {
+            libc::extattr_get_fd(
+                saved.as_raw_fd(),
+                libc::EXTATTR_NAMESPACE_USER,
+                c"fastexec-test".as_ptr(),
+                actual.as_mut_ptr().cast(),
+                actual.len(),
+            )
+        };
+        assert_eq!(count, value.len() as isize);
+        assert_eq!(&actual[..value.len()], value);
+        assert_eq!(scratch.read("original.txt"), b"edited");
+        assert_eq!(
+            std::fs::read_dir(&scratch.0).unwrap().count(),
+            1,
+            "staging leaked"
+        );
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_acl_original_survives_write_and_edit() {
+        let scratch = Scratch::new("save-freebsd-acl");
+        let Some(nfs4) = freebsd_acl_fixture(&scratch) else {
+            return;
+        };
+        let path = scratch.file("original.txt", b"original");
+        if nfs4 {
+            freebsd_set_acl(&path, &["-a", "0", "user:1:r-----a-R-c--s::allow"]);
+        } else {
+            freebsd_set_acl(&path, &["-m", "u:1:r--,m::r--"]);
+        }
+        let original = File::open(&path).unwrap();
+        save_text(&path, b"replacement").unwrap();
+        let launch = context(&scratch.0, &scratch.0);
+        change("original.txt", &[("replacement", "edited")], &launch).unwrap();
+        assert!(crate::freebsd_fs::test_equal_acl(&original, &File::open(&path).unwrap()).unwrap());
+        assert_eq!(scratch.read("original.txt"), b"edited");
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_acl_staging_is_private_and_new_files_keep_the_default_acl() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("save-freebsd-inherit");
+        let Some(nfs4) = freebsd_acl_fixture(&scratch) else {
+            return;
+        };
+        freebsd_inherit_acl(&scratch.0, nfs4);
+        let probe = Staged::new(&scratch.0, false).unwrap();
+        let private = Staged::new(&scratch.0, true).unwrap();
+        let directory = private.directory.as_ref().unwrap();
+        crate::runtime::create_private_unix_check(directory).unwrap();
+        assert_eq!(
+            private
+                .file
+                .as_ref()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let complete = scratch.0.join("complete.txt");
+        save_text(&complete, b"complete content").unwrap();
+        assert!(
+            crate::freebsd_fs::test_equal_acl(
+                probe.file.as_ref().unwrap(),
+                &File::open(&complete).unwrap(),
+            )
+            .unwrap()
+        );
+        assert_eq!(std::fs::read(&complete).unwrap(), b"complete content");
+        drop(private);
+        drop(probe);
+        assert_eq!(
+            std::fs::read_dir(&scratch.0).unwrap().count(),
+            1,
+            "staging leaked"
+        );
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_acl_existing_runtime_policy_is_refused_without_changing_it() {
+        let scratch = Scratch::new("runtime-freebsd-existing-acl");
+        let Some(nfs4) = freebsd_acl_fixture(&scratch) else {
+            return;
+        };
+        let runtime = scratch.0.join("runtime");
+        crate::runtime::create_private_new(&runtime).unwrap();
+        if nfs4 {
+            freebsd_set_acl(&runtime, &["-a", "0", "user:1:r-x---a-R-c--s::allow"]);
+        } else {
+            freebsd_set_acl(&runtime, &["-m", "u:1:r-x,m::---"]);
+        }
+        let listing = |path: &Path| {
+            let output = std::process::Command::new("getfacl")
+                .arg("-q")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        let before = listing(&runtime);
+        assert!(crate::runtime::create_private(&runtime).is_err());
+        assert_eq!(listing(&runtime), before);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_acl_new_runtime_directories_block_inheritance() {
+        let scratch = Scratch::new("runtime-freebsd-inherit");
+        let Some(nfs4) = freebsd_acl_fixture(&scratch) else {
+            return;
+        };
+        freebsd_inherit_acl(&scratch.0, nfs4);
+        let middle = scratch.0.join("middle");
+        let leaf = middle.join("runtime");
+        crate::runtime::create_private(&leaf).unwrap();
+        crate::runtime::create_private_unix_check(&middle).unwrap();
+        crate::runtime::create_private_unix_check(&leaf).unwrap();
+        let child = leaf.join("child");
+        crate::runtime::create_private_new(&child).unwrap();
+        crate::runtime::create_private_unix_check(&child).unwrap();
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_acl_an_inaccessible_new_directory_is_refused_before_use() {
+        let scratch = Scratch::new("runtime-freebsd-denied-inherit");
+        let Some(nfs4) = freebsd_acl_fixture(&scratch) else {
+            return;
+        };
+        let require_denied =
+            std::env::var("FASTEXEC_REQUIRE_DENIED_ACL_TEST").as_deref() == Ok("1");
+        if !nfs4 {
+            assert!(
+                !require_denied,
+                "the required denied-ACL fixture needs NFSv4 ACLs"
+            );
+            return;
+        }
+        let target = scratch.file("original.txt", b"original");
+        let original = File::open(&target).unwrap();
+        freebsd_set_acl(&scratch.0, &["-a", "0", "owner@:r-x-----------:di:deny"]);
+        // UFS may constrain inherited denies by the requested mode; ZFS restricted preserves them.
+        let probe = scratch.0.join("probe");
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&probe)
+            .unwrap();
+        let readable = File::open(&probe).is_ok();
+        if require_denied {
+            assert!(
+                !readable,
+                "the mandatory non-root restricted fixture must deny directory reads"
+            );
+        }
+        let denied = scratch.0.join("denied");
+        let result = crate::runtime::create_private_new(&denied);
+        if readable {
+            result.unwrap();
+            crate::runtime::create_private_unix_check(&denied).unwrap();
+            save_text(&target, b"replacement").unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                !denied.exists(),
+                "an unusable empty directory was not cleaned up"
+            );
+            assert!(save_text(&target, b"replacement").is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"original");
+            assert!(
+                crate::freebsd_fs::test_equal_acl(&original, &File::open(&target).unwrap())
+                    .unwrap()
+            );
+            assert_eq!(
+                std::fs::read_dir(&scratch.0).unwrap().count(),
+                2,
+                "failed staging leaked"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

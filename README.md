@@ -7,15 +7,23 @@ shared by every session in a namespace, opt-in with `FASTEXEC_DAEMON=on`.
 
 ## Requirements and Quickstart
 
-- **Runtime**: GNU bash on Linux and macOS, or [Git for Windows](https://git-scm.com/downloads)
-  on Windows. Set `FASTEXEC_BASH` to an absolute GNU bash path to override discovery.
+- **Runtime**: GNU bash on Linux (including Alpine), macOS, and FreeBSD, or
+  [Git for Windows](https://git-scm.com/downloads) on Windows. Install bash with
+  `apk add bash` on Alpine or `pkg install bash` on FreeBSD. Set `FASTEXEC_BASH`
+  to an absolute GNU bash path to override discovery. Linux requires kernel
+  `5.3+`, readable `/proc`, and permission to use `pidfd_open` and
+  `pidfd_send_signal`; these keep process-tree termination safe when PIDs are reused.
 - **Build** (optional): Rust `1.92+` (`edition = "2024"`).
 
 Download the archive for your platform from
 [Releases](https://github.com/ImoutoHeaven/fastexec-mcp/releases)
-(`linux`, `macos`, or `windows`, each `amd64` or `arm64`), check it against
-`SHA256SUMS`, and extract `fastexec` (`fastexec.exe` on Windows). The Linux
-binaries are static and run on any distribution. The macOS binaries are
+(`linux`, `macos`, or `windows`, each `amd64` or `arm64`, and `freebsd-amd64`),
+check it against `SHA256SUMS`, and extract `fastexec` (`fastexec.exe` on Windows).
+The Linux binaries link musl statically and run directly on Alpine without a
+glibc compatibility package. The FreeBSD archive is built and tested on FreeBSD
+15.1; source builds require FreeBSD 15.1 or newer and use its native toolchain.
+Shared runtime directories require atomic no-replace directory renames; UFS and
+ZFS are tested. The macOS binaries are
 unsigned: clear the quarantine a browser download sets with
 `xattr -d com.apple.quarantine fastexec`. To build from source instead:
 
