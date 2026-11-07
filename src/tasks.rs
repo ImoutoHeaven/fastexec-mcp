@@ -5,9 +5,10 @@ use crate::output::{
     incomplete_utf8_suffix,
 };
 use crate::process::{self, Launch, Member, Tree};
-use crate::session::{LaunchContext, ReadState, Session};
+use crate::session::{LaunchContext, ReadState, Reader, Session, TaskEntry};
 use crate::terminal::Live;
 use encoding_rs::Encoding;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -253,13 +254,10 @@ fn task_id(epoch: &str, number: u64) -> String {
 pub fn random_chars(digits: usize) -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|error| {
-        std::io::Error::other(format!(
-            "Cannot read the OS random source for the task ID epoch: {error}."
-        ))
+        std::io::Error::other(format!("Cannot read the OS random source: {error}."))
     })?;
-    let mut out = base32(u128::from_be_bytes(bytes), 26);
-    out.truncate(digits);
-    Ok(out)
+    let out = base32(u128::from_be_bytes(bytes), 26);
+    Ok(out[26 - digits..].into())
 }
 
 /// A fresh 128-bit epoch from the OS random source: 26 characters, the top two bits zero.
@@ -436,6 +434,8 @@ pub struct Snapshot {
     pub kill_error: Option<String>,
 }
 
+pub type Started = (Arc<Task>, Arc<TaskEntry>, Arc<Reader>);
+
 pub struct StartArgs {
     pub command: String,
     pub cwd: PathBuf,
@@ -603,7 +603,12 @@ impl Tasks {
         });
     }
 
-    pub fn start(self: &Arc<Self>, args: StartArgs) -> Result<Arc<Task>, String> {
+    pub fn start(
+        self: &Arc<Self>,
+        args: StartArgs,
+        session: &Session,
+        key: String,
+    ) -> Result<Started, String> {
         let kill_after_ms = args.kill_after_ms;
         // Admission holds a place against the running limit, so the bash lookup, the file
         // creation, and the spawn below all run without the registry lock.
@@ -704,6 +709,8 @@ impl Tasks {
             size_error: Mutex::new(None),
         });
         let mut registry = lock(&self.registry);
+        let entry = session.entry(&task);
+        let reader = entry.start_reader(key);
         registry.tasks.push(Arc::clone(&task));
         pending.release(&mut registry);
         let stopping = registry.stopping;
@@ -757,7 +764,7 @@ impl Tasks {
                 ender: workers.ender,
             })
             .unwrap_or_else(|_| unreachable!("prepared waiter worker stopped"));
-        Ok(task)
+        Ok((task, entry, reader))
     }
 
     /// Keeps the [`Limits::max_finished`] most recently finished tasks and deletes the logs of
@@ -903,19 +910,13 @@ impl Tasks {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 
-    /// One line naming the other tasks that need attention, at most `cap` bytes: finished tasks
-    /// whose final state no result has shown yet (failures first), tasks whose held processes
-    /// ended unseen, then running tasks and tasks whose held processes changed since a result
-    /// showed them or failed to be killed. Returns the line and the
-    /// tasks it names with the snapshots it showed, which the caller marks reported once the
-    /// line is delivered.
-    /// Drops this session's views of tasks that have retired. Registry then session locks, the
-    /// order every other reader takes them in.
-    pub fn prune_views(&self, session: &Session) {
+    /// Drops retired entries under the registry-then-session lock order.
+    pub fn prune_entries(&self, session: &Session) {
         let registry = lock(&self.registry);
         session.touched(&registry.tasks);
     }
 
+    /// Returns the bounded notice and only the tasks actually named in it.
     pub fn background(
         &self,
         session: &Session,
@@ -924,9 +925,39 @@ impl Tasks {
     ) -> Option<(String, Vec<Shown>)> {
         // Registry and session locks are taken together, in that order, so a task that starts
         // meanwhile cannot be pruned as retired; both are released before any snapshot.
-        let touched = {
+        let (touched, others) = {
             let registry = lock(&self.registry);
-            session.touched(&registry.tasks)
+            let touched = session.touched(&registry.tasks);
+            let own: HashSet<_> = touched.iter().map(|(task, _)| task.id.as_str()).collect();
+            let others: Vec<_> = registry
+                .tasks
+                .iter()
+                .filter(|task| task.id != exclude && !own.contains(task.id.as_str()))
+                .cloned()
+                .collect();
+            (touched, others)
+        };
+        let others = others
+            .iter()
+            .filter(|task| {
+                let snapshot = task.snapshot();
+                snapshot.state == "running" || snapshot.kept
+            })
+            .count();
+        let total = touched
+            .iter()
+            .filter(|(task, _)| task.id != exclude)
+            .count()
+            + others;
+        let others_text = match others {
+            0 => String::new(),
+            1 => "1 other running".into(),
+            n => format!("{n} others running"),
+        };
+        let others_clause = if others == 0 {
+            String::new()
+        } else {
+            format!("; {others_text}")
         };
         // Rank 0: failed or expired; 1: other finished, or held processes ended; 2: running or
         // holding processes. Newest first within a rank.
@@ -940,20 +971,22 @@ impl Tasks {
         let mut entries: Vec<(u8, Notice, Arc<Task>, Snapshot)> = touched
             .into_iter()
             .filter(|(task, _)| task.id != exclude)
-            .filter_map(|(task, view)| {
+            .filter_map(|(task, entry)| {
                 let mut snapshot = task.snapshot();
                 let (rank, notice) = match snapshot.state {
                     "running" => (2, Notice::Running),
-                    _ if !view.is_reported() => {
+                    _ if !entry.is_reported() => {
                         let failed = snapshot.state == "exited" && snapshot.exit_code != Some(0)
                             || snapshot.expired;
                         (if failed { 0 } else { 1 }, Notice::Root)
                     }
-                    _ if snapshot.tree_ended && !view.tree_end_reported() => (1, Notice::TreeEnded),
+                    _ if snapshot.tree_ended && !entry.tree_end_reported() => {
+                        (1, Notice::TreeEnded)
+                    }
                     _ if snapshot.kept => {
                         snapshot.held = task.tree.members().unwrap_or_default();
                         if snapshot.kill_error.is_none()
-                            && view.keeps_reported().as_ref() == Some(&pids(&snapshot.held))
+                            && entry.keeps_reported().as_ref() == Some(&pids(&snapshot.held))
                         {
                             return None;
                         }
@@ -964,7 +997,7 @@ impl Tasks {
                 Some((rank, notice, task, snapshot))
             })
             .collect();
-        if entries.is_empty() {
+        if entries.is_empty() && others == 0 {
             return None;
         }
         entries.sort_by_key(|(rank, ..)| *rank);
@@ -1025,19 +1058,30 @@ impl Tasks {
                 })
                 .collect();
             let rest = entries.len() - shown;
-            let line = if rest == 0 {
-                format!("(Background: {}.)", named.join(", "))
-            } else {
-                format!(
-                    "(Background: {}; {rest} more; {counts}; use list.)",
+            let line = match (rest, others) {
+                (0, 0) => format!("(Background: {}.)", named.join(", ")),
+                (0, _) => format!(
+                    "(Background: {}; {others_text}; use list.)",
                     named.join(", ")
-                )
+                ),
+                _ => format!(
+                    "(Background: {}; {rest} more; {counts}{others_clause}; use list.)",
+                    named.join(", ")
+                ),
             };
             if line.len() <= cap {
                 return Some((line, shown_tasks(shown)));
             }
         }
-        let line = format!("(Background: {counts}; use list.)");
+        let line = if entries.is_empty() {
+            format!("(Background: {others_text}; use list.)")
+        } else {
+            format!("(Background: {counts}{others_clause}; use list.)")
+        };
+        if line.len() <= cap {
+            return Some((line, Vec::new()));
+        }
+        let line = format!("({total} tasks; use list.)");
         (line.len() <= cap).then(|| (line, Vec::new()))
     }
 }
@@ -2243,6 +2287,20 @@ mod ids {
     }
 
     #[test]
+    fn short_random_keys_use_the_full_alphabet_at_every_position() {
+        let mut high = [false; 4];
+        for _ in 0..128 {
+            let key = random_chars(4).unwrap();
+            assert_eq!(key.len(), 4);
+            for (i, byte) in key.bytes().enumerate() {
+                assert!(ALPHABET.contains(&byte));
+                high[i] |= ALPHABET[8..].contains(&byte);
+            }
+        }
+        assert!(high.into_iter().all(|seen| seen));
+    }
+
+    #[test]
     fn task_ids_carry_the_epoch_and_never_repeat() {
         let epoch = new_epoch().unwrap();
         let first = task_id(&epoch, 1);
@@ -2291,6 +2349,12 @@ mod tests {
         Session::new(label.into(), label.into(), launch())
     }
 
+    fn start(tasks: &Arc<Tasks>, args: StartArgs) -> Result<Arc<Task>, String> {
+        tasks
+            .start(args, &session("test-client"), random_chars(4).unwrap())
+            .map(|(task, _, _)| task)
+    }
+
     fn start_args() -> StartArgs {
         StartArgs {
             command: "printf abc".into(),
@@ -2312,7 +2376,7 @@ mod tests {
     fn a_chunk_whose_reservation_evicts_its_own_log_gives_it_back() {
         let _one_at_a_time = lock(&ONE_TASKS);
         let (_runtime, tasks) = tasks();
-        let task = tasks.start(start_args()).unwrap();
+        let task = start(&tasks, start_args()).unwrap();
         // Its own capture is done too, so nothing else touches the accounting below.
         let deadline = Instant::now() + Duration::from_secs(30);
         while task.is_running() || !task.output_closed() {
@@ -2336,7 +2400,7 @@ mod tests {
     }
 
     #[test]
-    fn a_list_call_drops_the_views_of_tasks_that_have_retired() {
+    fn a_list_call_drops_the_entries_of_tasks_that_have_retired() {
         let _one_at_a_time = lock(&ONE_TASKS);
         // One finished task is kept, so the earlier ones retire as the loop goes on.
         let (runtime, tasks) = tasks_with(Limits {
@@ -2347,9 +2411,9 @@ mod tests {
         let session = session("prune");
         let mut started = Vec::new();
         for _ in 0..3 {
-            let task = tasks.start(start_args()).unwrap();
-            // What a start does with the task it created, and what a retired one leaves behind.
-            session.view(&task);
+            let (task, _, _) = tasks
+                .start(start_args(), &session, random_chars(4).unwrap())
+                .unwrap();
             finish(&task);
             started.push(task);
         }
@@ -2360,7 +2424,7 @@ mod tests {
         );
         assert!(
             session.existing(retired).is_some(),
-            "the view was gone before the call"
+            "the entry was gone before the call"
         );
         // A list call is all it takes; it never reaches the background footer.
         let service = Service::new(Arc::clone(&tasks), false);
@@ -2379,7 +2443,7 @@ mod tests {
         runtime.block_on(service.call(request, call));
         assert!(
             session.existing(retired).is_none(),
-            "a retired task's view survived a list call"
+            "a retired task's entry survived a list call"
         );
         tasks.shutdown();
     }
@@ -2388,14 +2452,16 @@ mod tests {
     fn expire_finished_drops_a_task_past_its_ttl_and_keeps_a_running_one() {
         let _one_at_a_time = lock(&ONE_TASKS);
         let (_runtime, tasks) = tasks_with(Limits::ON);
-        let finished = tasks.start(start_args()).unwrap();
+        let finished = start(&tasks, start_args()).unwrap();
         finish(&finished);
-        let running = tasks
-            .start(StartArgs {
+        let running = start(
+            &tasks,
+            StartArgs {
                 command: "sleep 30".into(),
                 ..start_args()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let ttl = Limits::ON.finished_ttl.unwrap();
         // Nothing is old enough yet, so nothing goes.
         tasks.expire_finished(Instant::now());
@@ -2442,9 +2508,9 @@ mod tests {
             command: "sleep 30".into(),
             ..start_args()
         };
-        let first = tasks.start(long()).unwrap();
-        let second = tasks.start(long()).unwrap();
-        let Err(refused) = tasks.start(start_args()) else {
+        let first = start(&tasks, long()).unwrap();
+        let second = start(&tasks, long()).unwrap();
+        let Err(refused) = start(&tasks, start_args()) else {
             panic!("a third task was admitted under a limit of 2");
         };
         assert!(refused.starts_with("TOO_MANY_TASKS"), "{refused}");
@@ -2464,7 +2530,7 @@ mod tests {
         let (_runtime, tasks) = tasks();
         // A start in flight counts against the limit as if its task were already running.
         lock(&tasks.registry).pending = Limits::OFF.max_running;
-        let Err(refused) = tasks.start(start_args()) else {
+        let Err(refused) = start(&tasks, start_args()) else {
             panic!(
                 "a start was admitted with {} starts in flight",
                 Limits::OFF.max_running
@@ -2474,7 +2540,7 @@ mod tests {
         lock(&tasks.registry).pending = 0;
         // A stopping server admits nothing.
         lock(&tasks.registry).stopping = true;
-        let Err(refused) = tasks.start(start_args()) else {
+        let Err(refused) = start(&tasks, start_args()) else {
             panic!("a start was admitted while the server was stopping");
         };
         assert!(refused.contains("shutting down"), "{refused}");
@@ -2485,7 +2551,7 @@ mod tests {
             ..start_args()
         };
         assert!(
-            tasks.start(failed).is_err(),
+            start(&tasks, failed).is_err(),
             "a start with a missing cwd ran"
         );
         assert_eq!(lock(&tasks.registry).pending, 0);
@@ -2516,13 +2582,15 @@ mod tests {
         let _one_at_a_time = lock(&ONE_TASKS);
         let (_runtime, tasks) = tasks();
         // The first task cannot finish until it gets a line: no timing guess.
-        let slow = tasks
-            .start(StartArgs {
+        let slow = start(
+            &tasks,
+            StartArgs {
                 command: "read -r line; printf '%s' \"$line\"".into(),
                 ..start_args()
-            })
-            .unwrap();
-        let quick = tasks.start(start_args()).unwrap();
+            },
+        )
+        .unwrap();
+        let quick = start(&tasks, start_args()).unwrap();
         finish(&quick);
         slow.send(
             Some(
@@ -2559,7 +2627,7 @@ mod tests {
     fn a_read_of_an_evicted_log_is_an_outcome_not_an_error() {
         let _one_at_a_time = lock(&ONE_TASKS);
         let (_runtime, tasks) = tasks();
-        let task = tasks.start(start_args()).unwrap();
+        let task = start(&tasks, start_args()).unwrap();
         finish(&task);
         let written = lock(&task.out).written;
         assert!(written > 0, "the task wrote nothing");
@@ -2611,7 +2679,7 @@ mod tests {
         let mut from = 0;
         assert_eq!(task.scan(&mut matcher, &mut from).unwrap(), None);
         // A log that is gone while the task is not evicted stays an error.
-        let live = tasks.start(start_args()).unwrap();
+        let live = start(&tasks, start_args()).unwrap();
         finish(&live);
         std::fs::remove_file(tasks.dir.join(format!("{}.log", live.id))).unwrap();
         let mut matcher =
@@ -2705,7 +2773,7 @@ mod tests {
         let mut args = start_args();
         args.command = "read -r line".into();
         args.pty = true;
-        let task = tasks.start(args).unwrap();
+        let task = start(&tasks, args).unwrap();
         let weak = Arc::downgrade(&task);
         task.kill().unwrap();
         runtime.block_on(async {
@@ -2748,7 +2816,7 @@ mod tests {
         let mut args = start_args();
         args.command = "read -r line".into();
         args.pty = true;
-        let task = tasks.start(args).unwrap();
+        let task = start(&tasks, args).unwrap();
         let racer = Arc::clone(&task);
         let shared = Arc::clone(&tasks);
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2839,7 +2907,7 @@ mod tests {
         args.command = "for i in $(seq 1 20); do printf 'row %02d\\n' $i; done; \
                         printf 'tail-marker\\n'; read -r line"
             .into();
-        let task = tasks.start(args).unwrap();
+        let task = start(&tasks, args).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !task
             .screen()
@@ -2894,15 +2962,18 @@ mod tests {
             std::env::temp_dir(),
             vec![("FASTEXEC_BASH".into(), "/nonexistent/bash".into())],
         ));
-        let Err(refused) = tasks.start(StartArgs {
-            launch: Arc::clone(&bad),
-            ..start_args()
-        }) else {
+        let Err(refused) = start(
+            &tasks,
+            StartArgs {
+                launch: Arc::clone(&bad),
+                ..start_args()
+            },
+        ) else {
             panic!("a task started with an invalid bash override");
         };
         assert!(refused.contains("FASTEXEC_BASH"), "{refused}");
         // A context that finds bash still starts a task, and its start got its place back.
-        let task = tasks.start(start_args()).unwrap();
+        let task = start(&tasks, start_args()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while task.is_running() || !task.output_closed() {
             assert!(Instant::now() < deadline, "the task never finished");
@@ -2915,12 +2986,14 @@ mod tests {
     fn two_sessions_read_one_task_independently() {
         let _one_at_a_time = lock(&ONE_TASKS);
         let (_runtime, tasks) = tasks();
-        let task = tasks
-            .start(StartArgs {
+        let task = start(
+            &tasks,
+            StartArgs {
                 command: "printf 'a\\nb\\n'".into(),
                 ..start_args()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while task.is_running() || !task.output_closed() {
             assert!(Instant::now() < deadline, "the task never finished");
@@ -2928,8 +3001,8 @@ mod tests {
         }
         let (first, second) = (session("a-1"), session("b-2"));
         let read = |session: &Arc<Session>| -> String {
-            let view = session.view(&task);
-            let mut state = view.read.try_lock().expect("the read gate is free");
+            let reader = session.entry(&task).reader(Some("test")).unwrap();
+            let mut state = reader.read.try_lock().expect("the read gate is free");
             let window = task
                 .read_window(
                     &mut state,

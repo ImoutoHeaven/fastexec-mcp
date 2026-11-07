@@ -945,7 +945,7 @@ fn a_task_outlives_the_endpoint_that_started_it() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["taskId"] == json!(id))
+        .find(|entry| entry["taskId"] == json!(id.split_once('.').unwrap().0))
         .unwrap_or_else(|| panic!("no task in {listed}"))
         .clone();
     assert_eq!(entry["callId"], json!(1), "{listed}");
@@ -969,7 +969,7 @@ fn a_task_outlives_the_endpoint_that_started_it() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["taskId"] == json!(id))
+        .find(|entry| entry["taskId"] == json!(id.split_once('.').unwrap().0))
         .unwrap_or_else(|| panic!("the second endpoint does not see the task: {listed}"));
     assert_eq!(entry["session"], json!(session), "{listed}");
     assert_eq!(entry["callId"], json!(1), "{listed}");

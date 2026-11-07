@@ -10,6 +10,7 @@ use crate::session::{LaunchContext, Session};
 use crate::tasks::{Limits, Tasks};
 use crate::transport::Listener;
 use rmcp::model::{CallToolResult, ContentBlock};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -282,7 +283,7 @@ impl Daemon {
             tokio::spawn(async move {
                 http::serve(
                     http.listener,
-                    http.token,
+                    http.digests,
                     daemon,
                     http.render,
                     http.launch,
@@ -1108,8 +1109,11 @@ async fn serve_daemon(
                     return 1;
                 }
             };
-            let token = match crate::http_token() {
-                Ok(token) => token,
+            let digests = match crate::http_token() {
+                Ok(tokens) => tokens
+                    .iter()
+                    .map(|token| Sha256::digest(token.as_bytes()).into())
+                    .collect(),
                 Err(message) => {
                     eprintln!("fastexec: {message}");
                     return 1;
@@ -1145,7 +1149,7 @@ async fn serve_daemon(
                 Some(bound),
                 Some(Http {
                     listener,
-                    token,
+                    digests,
                     render,
                     launch,
                     public_root,
@@ -1612,7 +1616,7 @@ mod tests {
         let entry = |id: &str| {
             entries
                 .iter()
-                .find(|entry| entry["taskId"] == json!(id))
+                .find(|entry| entry["taskId"] == json!(id.split_once('.').unwrap().0))
                 .expect("the task is listed")
                 .clone()
         };

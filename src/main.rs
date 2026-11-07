@@ -38,7 +38,10 @@ mod wait;
 use ipc::{ToDaemon, ToEndpoint};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, InitializeRequestParams, InitializeResult,
+    ServerCapabilities, ServerConfig,
+};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use service::{Call, Render, Service};
@@ -60,8 +63,8 @@ struct Server {
     /// The base a `transfer` URL is minted from when a proxy names it at daemon start. `None` means
     /// each request's Host and `X-Forwarded-Proto` are the address the client saw.
     public_root: Option<Arc<str>>,
-    /// Sessionless HTTP calls share a reader under the listener's single bearer credential.
-    stateless_session: Option<Arc<Session>>,
+    /// Sessionless HTTP calls select the session for their authenticated token.
+    principals: Option<Arc<[Arc<Session>]>>,
 }
 
 /// Where this server's calls run: in this process, or on the namespace's daemon.
@@ -70,7 +73,7 @@ enum Backend {
     Local {
         service: Arc<Service>,
         render: Render,
-        /// Created on the first tool call, when the client's name is known.
+        /// Created by initialize, or the first tool call of a stdio client that skips it.
         session: Arc<OnceLock<Result<Arc<Session>, String>>>,
         /// What this server's tasks inherit: the environment captured at startup, so a later
         /// change to the server's own environment cannot reach them.
@@ -114,37 +117,49 @@ impl Server {
             router,
             transfers,
             public_root,
-            stateless_session: None,
+            principals: None,
         }
     }
 
     /// This server's session: the client name and a short random ID, its tasks' owner.
     fn session(&self, context: &RequestContext<RoleServer>) -> Result<Arc<Session>, String> {
-        if context
-            .protocol_version()
-            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28)
-            && let Some(session) = &self.stateless_session
-        {
-            return Ok(Arc::clone(session));
-        }
         let Backend::Local {
             session, launch, ..
         } = &self.backend
         else {
             return Err("this server has no tasks of its own".to_owned());
         };
+        if session.get().is_none()
+            && let Some(principals) = &self.principals
+        {
+            let principal = context
+                .extensions
+                .get::<::http::request::Parts>()
+                .and_then(|parts| parts.extensions.get::<http::Principal>())
+                .ok_or_else(|| "Internal error: HTTP request has no principal.".to_owned())?;
+            return principals
+                .get(principal.0)
+                .cloned()
+                .ok_or_else(|| "Internal error: HTTP principal is out of range.".to_owned());
+        }
         session
-            .get_or_init(|| {
-                let short = tasks::random_chars(6)
-                    .map_err(|error| format!("Cannot name the session: {error}"))?;
-                Ok(Session::new(
-                    short.clone(),
-                    format!("{}-{short}", client_name(context)),
-                    Arc::clone(launch),
-                ))
-            })
+            .get_or_init(|| client_session(context, launch))
             .clone()
     }
+}
+
+/// A session named for the client that initializes or first uses this server.
+fn client_session(
+    context: &RequestContext<RoleServer>,
+    launch: &Arc<LaunchContext>,
+) -> Result<Arc<Session>, String> {
+    let short =
+        tasks::random_chars(6).map_err(|error| format!("Cannot name the session: {error}"))?;
+    Ok(Session::new(
+        short.clone(),
+        format!("{}-{short}", client_name(context)),
+        Arc::clone(launch),
+    ))
 }
 
 /// The client's name from request metadata or the legacy handshake.
@@ -227,6 +242,25 @@ fn hostname(launch: &LaunchContext) -> Option<String> {
 
 #[tool_handler(router = self.router)]
 impl ServerHandler for Server {
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, rmcp::ErrorData> {
+        let result = self.negotiate_initialize(&request)?;
+        context.peer.set_peer_info(request);
+        if let Backend::Local {
+            session, launch, ..
+        } = &self.backend
+        {
+            session
+                .get_or_init(|| client_session(&context, launch))
+                .clone()
+                .map_err(|message| rmcp::ErrorData::internal_error(message, None))?;
+        }
+        Ok(result)
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fastexec", env!("CARGO_PKG_VERSION")))
@@ -977,19 +1011,41 @@ pub fn render() -> Result<Render, String> {
     })
 }
 
-/// The token a `--http` daemon admits requests with: at least 16 visible ASCII characters, from
-/// the environment. A token an `Authorization` header cannot carry exactly is refused here rather
-/// than starting a daemon nobody can reach.
-pub fn http_token() -> Result<String, String> {
-    const MESSAGE: &str = "FASTEXEC_HTTP_TOKEN must be at least 16 visible ASCII characters";
-    match std::env::var("FASTEXEC_HTTP_TOKEN") {
-        Ok(token)
-            if token.len() >= 16 && token.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) =>
-        {
-            Ok(token)
+/// The tokens a `--http` daemon admits, separated by ASCII whitespace. Diagnostics name
+/// positions only, so a refused configuration never exposes a credential.
+pub fn http_token() -> Result<Vec<String>, String> {
+    http_tokens(std::env::var_os("FASTEXEC_HTTP_TOKEN").as_deref())
+}
+
+fn http_tokens(value: Option<&std::ffi::OsStr>) -> Result<Vec<String>, String> {
+    let value = value.map_or(&[][..], std::ffi::OsStr::as_encoded_bytes);
+    let mut tokens = Vec::new();
+    for (index, token) in value
+        .split(u8::is_ascii_whitespace)
+        .filter(|token| !token.is_empty())
+        .enumerate()
+    {
+        let position = index + 1;
+        if token.len() < 16 || !token.iter().all(|byte| (0x21..=0x7e).contains(byte)) {
+            return Err(format!(
+                "FASTEXEC_HTTP_TOKEN token {position} must be at least 16 visible ASCII characters"
+            ));
         }
-        Ok(_) | Err(_) => Err(MESSAGE.to_owned()),
+        let token = std::str::from_utf8(token).expect("visible ASCII");
+        if let Some(previous) = tokens.iter().position(|prior| prior == token) {
+            return Err(format!(
+                "FASTEXEC_HTTP_TOKEN token {position} duplicates token {}",
+                previous + 1
+            ));
+        }
+        tokens.push(token.to_owned());
     }
+    if tokens.is_empty() {
+        return Err(
+            "FASTEXEC_HTTP_TOKEN token 1 is missing; at least one token is required".to_owned(),
+        );
+    }
+    Ok(tokens)
 }
 
 /// The address a `--http` argument names, refused when it is outside loopback and serving there
@@ -1182,5 +1238,54 @@ mod daemon_flag_tests {
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod http_token_tests {
+    use super::http_tokens;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn several_tokens_keep_their_positions_across_ascii_whitespace() {
+        let first = "0123456789abcdef";
+        let second = "fedcba9876543210";
+        let third = "visible!@#$%^&*()";
+        let value = format!(" \t{first}\n{second}\r\n{third}\x0c ");
+        assert_eq!(
+            http_tokens(Some(OsStr::new(&value))).unwrap(),
+            [first, second, third]
+        );
+    }
+
+    #[test]
+    fn missing_short_non_ascii_and_duplicate_tokens_name_positions_only() {
+        let good = "0123456789abcdef";
+        for value in [None, Some(""), Some(" \t\r\n\x0c")] {
+            let error = http_tokens(value.map(OsStr::new)).unwrap_err();
+            assert!(error.contains("token 1"), "{error}");
+        }
+        for bad in ["secret-short", "0123456789abcdefé", "0123456789abcdef\0"] {
+            let value = format!("{good} {bad}");
+            let error = http_tokens(Some(OsStr::new(&value))).unwrap_err();
+            assert!(error.contains("token 2"), "{error}");
+            assert!(!error.contains(good) && !error.contains(bad), "{error}");
+        }
+        let value = format!("{good} fedcba9876543210 {good}");
+        let error = http_tokens(Some(OsStr::new(&value))).unwrap_err();
+        assert!(error.contains("token 3 duplicates token 1"), "{error}");
+        assert!(!error.contains(good), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_tokens_are_refused_at_their_position() {
+        use std::os::unix::ffi::OsStrExt;
+        let error = http_tokens(Some(OsStr::from_bytes(
+            b"0123456789abcdef abcdef0123456789\xff",
+        )))
+        .unwrap_err();
+        assert!(error.contains("token 2"), "{error}");
+        assert!(!error.contains("abcdef"), "{error}");
     }
 }

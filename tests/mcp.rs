@@ -21,6 +21,10 @@ struct Server {
     started: Vec<String>,
 }
 
+fn bare_id(handle: &str) -> &str {
+    handle.split_once('.').expect("a reader handle").0
+}
+
 impl Server {
     fn start() -> Server {
         Server::start_with(|_| {})
@@ -181,6 +185,10 @@ impl Server {
     /// The ID of the `n`th task this server started, counting from 1.
     fn id(&self, n: usize) -> String {
         self.started[n - 1].clone()
+    }
+
+    fn bare_id(&self, n: usize) -> String {
+        bare_id(&self.started[n - 1]).to_owned()
     }
 
     fn ok(&mut self, arguments: Value) -> (Value, String) {
@@ -518,7 +526,7 @@ fn structured_content_can_be_disabled_for_every_action() {
         check(
             &mut server,
             json!({"action": "list"}),
-            &format!("{id} [exited 0]"),
+            &format!("{} [exited 0]", bare_id(&id)),
             false,
         );
         check(
@@ -600,8 +608,8 @@ fn background_footer_names_unreported_tasks_once_failures_first() {
     let footer = text.lines().last().unwrap();
     let expected = format!(
         "(Background: {} exited 7, {} exited 0.)",
-        server.id(3),
-        server.id(2)
+        server.bare_id(3),
+        server.bare_id(2)
     );
     assert_eq!(footer, expected, "{text}");
 
@@ -609,8 +617,8 @@ fn background_footer_names_unreported_tasks_once_failures_first() {
     let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
     let footer = text.lines().last().unwrap();
     assert!(
-        footer.starts_with(&format!("(Background: {} running ", server.id(1)))
-            && !footer.contains(&server.id(2)),
+        footer.starts_with(&format!("(Background: {} running ", server.bare_id(1)))
+            && !footer.contains(&server.bare_id(2)),
         "{text}"
     );
 
@@ -623,7 +631,7 @@ fn background_footer_names_unreported_tasks_once_failures_first() {
     assert!(text.len() <= 1024, "{} bytes", text.len());
     let footer = text.lines().last().unwrap();
     assert!(
-        footer.starts_with(&format!("(Background: {} running ", server.id(9)))
+        footer.starts_with(&format!("(Background: {} running ", server.bare_id(9)))
             && footer.ends_with("; 3 more; 6 running; use list.)"),
         "{text}"
     );
@@ -679,7 +687,7 @@ fn list_fits_max_bytes_and_leaves_the_tasks_it_omits_due() {
     );
     let (first, last) = (text.lines().next().unwrap(), text.lines().last().unwrap());
     assert!(
-        first.starts_with(&format!("{} [exited 3]", server.id(8))),
+        first.starts_with(&format!("{} [exited 3]", server.bare_id(8))),
         "newest first: {text}"
     );
     assert!(
@@ -687,7 +695,7 @@ fn list_fits_max_bytes_and_leaves_the_tasks_it_omits_due() {
             && last.ends_with(" tasks omitted; raise maxBytes to see them] ..."),
         "{text}"
     );
-    assert!(!text.contains(&server.id(1)), "{text}");
+    assert!(!text.contains(&server.bare_id(1)), "{text}");
     // The footer still names the tasks the list left out, newest first, and none it showed.
     let listed: Vec<String> = text
         .lines()
@@ -698,7 +706,7 @@ fn list_fits_max_bytes_and_leaves_the_tasks_it_omits_due() {
     let footer = text.lines().last().unwrap();
     let newest_omitted = (1..=8)
         .rev()
-        .map(|n| server.id(n))
+        .map(|n| server.bare_id(n))
         .find(|id| !listed.contains(id))
         .unwrap();
     assert!(
@@ -714,7 +722,8 @@ fn list_fits_max_bytes_and_leaves_the_tasks_it_omits_due() {
     assert!(text.len() <= 400, "{} bytes: {text}", text.len());
     let lines: Vec<&str> = text.lines().collect();
     assert!(
-        lines[0].starts_with(&server.id(9)) && lines.last().unwrap().starts_with(&server.id(1)),
+        lines[0].starts_with(&server.bare_id(9))
+            && lines.last().unwrap().starts_with(&server.bare_id(1)),
         "head_tail keeps both ends: {text}"
     );
     assert_eq!(
@@ -767,7 +776,7 @@ fn long_command_yields_then_poll_returns_only_unseen_output() {
 }
 
 #[test]
-fn a_hundred_byte_result_keeps_the_whole_task_id() {
+fn a_hundred_byte_result_keeps_the_whole_task_handle() {
     let mut server = Server::start_with(|command| {
         command.env("FASTEXEC_STRUCTURED_CONTENT", "false");
     });
@@ -790,9 +799,14 @@ fn a_hundred_byte_result_keeps_the_whole_task_id() {
         .and_then(|rest| rest.split(' ').next())
         .unwrap_or_else(|| panic!("no task ID in {text:?}"))
         .to_string();
-    assert_eq!(id.len(), 28, "the whole task ID survives: {text:?}");
+    let (task, reader) = id.split_once('.').expect("a reader handle");
+    assert_eq!(task.len(), 28, "the whole task ID survives: {text:?}");
+    assert_eq!(reader.len(), 4, "the whole reader key survives: {text:?}");
     let (_, listed) = server.ok(json!({"action": "list"}));
-    assert!(listed.contains(&id), "list names the same task: {listed:?}");
+    assert!(
+        listed.contains(task) && !listed.contains(&id),
+        "list names the bare task: {listed:?}"
+    );
     server.ok(json!({"action": "kill", "taskId": id}));
 }
 
@@ -2097,7 +2111,7 @@ fn keep_tree_keeps_what_bash_leaves_until_kill_or_deadline() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|task| task["taskId"] == id)
+            .find(|task| task["taskId"] == bare_id(id.as_str().unwrap()))
             .cloned()
             .unwrap();
         assert_eq!(entry["keptRunning"], true);
@@ -2177,7 +2191,7 @@ fn log_eviction_spares_tasks_that_keep_processes() {
     let files = |server: &mut Server, id: &str| {
         let (out, text) = server.ok(json!({"action": "poll", "taskId": id, "waitMs": 0}));
         let log = PathBuf::from(out["logPath"].as_str().unwrap());
-        let transcript = log.with_file_name(format!("{id}.transcript.txt"));
+        let transcript = log.with_extension("transcript.txt");
         (text, log, transcript)
     };
     let assert_kept = |server: &mut Server| {
@@ -2243,7 +2257,7 @@ fn retirement_counts_kept_processes_ending_as_finishing() {
     let (out, _) = server.ok(json!({"action": "list"}));
     let tasks = out["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 64, "{out}");
-    let listed = |id: &str| tasks.iter().any(|task| task["taskId"] == id);
+    let listed = |id: &str| tasks.iter().any(|task| task["taskId"] == bare_id(id));
     assert!(
         listed(&kept),
         "the task that just became finished stays: {out}"
@@ -2259,7 +2273,7 @@ fn retirement_counts_kept_processes_ending_as_finishing() {
         let (out, _) = server.ok(json!({"action": "list"}));
         let tasks = out["tasks"].as_array().unwrap();
         if tasks.len() == 64 {
-            let listed = |id: &str| tasks.iter().any(|task| task["taskId"] == id);
+            let listed = |id: &str| tasks.iter().any(|task| task["taskId"] == bare_id(id));
             assert!(
                 listed(&kept) && !listed(&server.id(2)) && !listed(&server.id(3)),
                 "the earliest finishers go first"
@@ -2336,13 +2350,16 @@ fn waits_on_kept_processes_last_until_they_end_or_a_condition_holds() {
     assert_eq!(out["exitCode"], 3, "{text}");
     let failed = server.id(3);
     // The footer names the processes a task keeps once.
-    assert!(text.contains(&format!("{ready} keeps ")), "{text}");
+    assert!(
+        text.contains(&format!("{} keeps ", bare_id(&ready))),
+        "{text}"
+    );
 
     // The footer leaves out held processes it showed, and names the end of a tree it did not
     // show once.
     let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
     assert!(
-        !text.contains(&format!("{ready} keeps ")),
+        !text.contains(&format!("{} keeps ", bare_id(&ready))),
         "shown once: {text}"
     );
     server.ok(json!({"action": "kill", "taskId": failed}));
@@ -2353,12 +2370,12 @@ fn waits_on_kept_processes_last_until_they_end_or_a_condition_holds() {
     std::thread::sleep(Duration::from_millis(2000));
     let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
     assert!(
-        text.contains(&format!("{short} kept processes ended")),
+        text.contains(&format!("{} kept processes ended", bare_id(&short))),
         "{text}"
     );
     let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
     assert!(
-        !text.contains(&format!("{short} kept")),
+        !text.contains(&format!("{} kept", bare_id(&short))),
         "shown once: {text}"
     );
     // The footer names held processes once, and again once they change; a task's own result,
@@ -2374,10 +2391,13 @@ fn waits_on_kept_processes_last_until_they_end_or_a_condition_holds() {
     wait_for_file(&short);
     // The held list is named once while it stays the same.
     let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
-    assert!(text.contains(&format!("{two} keeps ")), "{text}");
+    assert!(
+        text.contains(&format!("{} keeps ", bare_id(&two))),
+        "{text}"
+    );
     let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
     assert!(
-        !text.contains(&format!("{two} keeps ")),
+        !text.contains(&format!("{} keeps ", bare_id(&two))),
         "named once: {text}"
     );
     // Ending one held process changes the list, so the footer names it again; then it falls
@@ -2386,10 +2406,13 @@ fn waits_on_kept_processes_last_until_they_end_or_a_condition_holds() {
         "pid=$(cat '{short_bash}'); kill \"$pid\"; while kill -0 \"$pid\" 2>/dev/null; do sleep 0.05; done"
     );
     let (_, text) = server.ok(json!({"action": "start", "command": command, "waitMs": 60000}));
-    assert!(text.contains(&format!("{two} keeps ")), "{text}");
+    assert!(
+        text.contains(&format!("{} keeps ", bare_id(&two))),
+        "{text}"
+    );
     let (_, text) = server.ok(json!({"action": "start", "command": "true"}));
     assert!(
-        !text.contains(&format!("{two} keeps ")),
+        !text.contains(&format!("{} keeps ", bare_id(&two))),
         "named once: {text}"
     );
     server.ok(json!({"action": "kill", "taskId": two}));
@@ -2487,7 +2510,7 @@ fn wait_for_held_pid(server: &mut Server, task: &str, pid: u32) -> u32 {
     loop {
         let (list, text) = server.ok(json!({"action": "list"}));
         for entry in list["tasks"].as_array().into_iter().flatten() {
-            if entry["taskId"] != json!(task) {
+            if entry["taskId"] != json!(bare_id(task)) {
                 continue;
             }
             for member in entry["held"].as_array().into_iter().flatten() {
@@ -2743,7 +2766,7 @@ fn an_unobserved_escape_is_never_claimed() {
     let (list, listing) = server.ok(json!({"action": "list"}));
     let mut claimed = false;
     for entry in list["tasks"].as_array().into_iter().flatten() {
-        if entry["taskId"] != json!(task) {
+        if entry["taskId"] != json!(bare_id(&task)) {
             continue;
         }
         for field in ["held", "leftovers"] {
@@ -2929,7 +2952,7 @@ fn a_detached_descendant_stays_owned_once_observed() {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|entry| entry["taskId"] == json!(task))
+        .filter(|entry| entry["taskId"] == json!(bare_id(&task)))
         .flat_map(|entry| entry["held"].as_array().into_iter().flatten())
         .filter_map(|member| member["pid"].as_i64())
         .collect::<Vec<_>>();
@@ -3039,7 +3062,7 @@ fn a_sudo_child_the_server_may_not_kill_is_held_and_reported() {
         .as_array()
         .into_iter()
         .flatten()
-        .find(|entry| entry["taskId"] == json!(task))
+        .find(|entry| entry["taskId"] == json!(bare_id(&task)))
         .unwrap_or_else(|| panic!("the task is listed: {listing}"));
     assert_eq!(
         entry["keptRunning"],
@@ -3656,7 +3679,7 @@ fn finishing_after_many_short_tasks_keeps_its_own_output() {
     let (out, _) = server.ok(json!({"action": "list"}));
     let tasks = out["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 64, "{out}");
-    let kept = |id: &str| tasks.iter().any(|task| task["taskId"] == id);
+    let kept = |id: &str| tasks.iter().any(|task| task["taskId"] == bare_id(id));
     assert!(
         kept(&server.id(1)) && !kept(&server.id(2)) && !kept(&server.id(3)),
         "the earliest finishers go first"
@@ -4717,4 +4740,104 @@ fn editing_a_fifo_returns_an_error_without_blocking_other_file_tools() {
             .file_type()
             .is_fifo()
     );
+}
+
+#[test]
+fn reader_handles_keep_independent_cursors_with_bare_id_attaches() {
+    let mut server = Server::start();
+    let (started, text) = server.ok(json!({
+        "action": "start", "command": "printf 'reader-first\\n'; IFS= read -r line; printf 'reader-second:%s\\n' \"$line\"",
+        "loginShell": false, "waitMs": 10000,
+        "returnWhen": {"outputContains": ["reader-first"]}
+    }));
+    let first = started["taskId"].as_str().unwrap().to_owned();
+    let task = bare_id(&first).to_owned();
+    assert!(
+        text.contains(&first) && !text.contains("new reader"),
+        "{text}"
+    );
+    let (listed, listing) = server.ok(json!({"action": "list"}));
+    assert_eq!(listed["tasks"][0]["taskId"], task);
+    assert!(
+        listing.starts_with(&task) && !listing.contains(&first),
+        "{listing}"
+    );
+
+    let (attached, text) = server.ok(json!({"action": "poll", "taskId": task, "waitMs": 0}));
+    let second = attached["taskId"].as_str().unwrap().to_owned();
+    assert_ne!(first, second);
+    assert_eq!(bare_id(&second), task);
+    assert!(
+        text.starts_with("reader-first\n") && text.contains(" · new reader"),
+        "{text}"
+    );
+    let (_, text) = server.ok(json!({"action": "poll", "taskId": first, "waitMs": 0}));
+    assert!(
+        text.starts_with("(no new output)") && !text.contains("new reader"),
+        "{text}"
+    );
+
+    let (_, text) =
+        server.ok(json!({"action": "poll", "taskId": first, "input": "next\n", "waitMs": 10000}));
+    assert!(
+        text.starts_with("reader-second:next\n") && !text.contains("reader-first"),
+        "{text}"
+    );
+    let (_, text) = server.ok(json!({"action": "poll", "taskId": second, "waitMs": 10000}));
+    assert!(
+        text.starts_with("reader-second:next\n") && !text.contains("new reader"),
+        "{text}"
+    );
+    let (again, text) = server.ok(json!({"action": "poll", "taskId": task, "waitMs": 0}));
+    assert_ne!(again["taskId"], first);
+    assert_ne!(again["taskId"], second);
+    assert!(
+        text.starts_with("reader-first\nreader-second:next\n") && text.contains("new reader"),
+        "{text}"
+    );
+}
+
+#[test]
+fn fresh_reader_notice_survives_kill_and_fits_every_result_mode() {
+    let mut server = Server::start();
+    server.ok(json!({"action": "start", "command": "sleep 60", "loginShell": false, "waitMs": 0}));
+    for mode in ["stream", "screen", "transcript"] {
+        let (started, text) = server.ok(json!({
+            "action": "start", "command": "printf 'reader-ready\\n'; sleep 60", "loginShell": false,
+            "pty": mode != "stream", "waitMs": 10000,
+            "returnWhen": {"outputContains": ["reader-ready"]}
+        }));
+        assert!(!text.contains("new reader"), "{mode}: {text}");
+        let (killed, text) = server.ok(json!({
+            "action": "kill", "taskId": bare_id(started["taskId"].as_str().unwrap()), "maxBytes": 100
+        }));
+        let handle = killed["taskId"].as_str().unwrap().to_owned();
+        assert!(
+            text.len() <= 100 && text.contains(&handle) && !text.contains("new reader"),
+            "{mode}: {text}"
+        );
+        let mut request = if mode == "transcript" {
+            json!({"action": "transcript", "taskId": handle, "maxBytes": 100})
+        } else {
+            json!({"action": "poll", "taskId": handle, "maxBytes": 100, "waitMs": 0})
+        };
+        if mode == "screen" {
+            request["screen"] = json!(true);
+        }
+        let (result, text) = server.ok(request.clone());
+        assert_eq!(result["taskId"], handle);
+        assert!(
+            text.len() <= 100 && text.contains(&handle) && text.contains(" · new reader"),
+            "{mode}: {text}"
+        );
+        assert!(
+            text.lines().last().unwrap().ends_with("tasks; use list.)"),
+            "{mode}: {text}"
+        );
+        let (_, text) = server.ok(request);
+        assert!(
+            text.len() <= 100 && !text.contains("new reader"),
+            "{mode}: {text}"
+        );
+    }
 }

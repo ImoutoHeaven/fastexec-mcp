@@ -1,9 +1,8 @@
-//! A reader's own state: the cursor and reported flags a result consumes, kept per task so two
-//! sessions reading one task each see all of it.
+//! Session-scoped task notices and independent, bounded reader cursors.
 
 use crate::output::Cleaner;
-use crate::tasks::{Snapshot, Task, pids};
-use std::collections::{HashMap, HashSet};
+use crate::tasks::{ALPHABET, Snapshot, Task, pids, random_chars};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,16 +99,12 @@ fn name_matches(key: &OsStr, name: &str) -> bool {
     }
 }
 
-/// A reader: its own cursors, cleaning state, and reported flags for every task it addresses.
+/// A session's task entries and background-notice scope.
 pub struct Session {
-    /// The session ID its own client chose: the full one for a daemon session, and the short one
-    /// the stdio adapter makes for itself.
     pub id: String,
-    /// The client name and a short ID, shown as a task's owner.
     pub label: String,
-    /// What this session's tasks inherit.
     pub launch: Arc<LaunchContext>,
-    views: Mutex<HashMap<String, Arc<TaskView>>>,
+    tasks: Mutex<HashMap<String, Arc<TaskEntry>>>,
 }
 
 impl Session {
@@ -118,80 +113,136 @@ impl Session {
             id,
             label,
             launch,
-            views: Mutex::default(),
+            tasks: Mutex::default(),
         })
     }
 
-    /// This session's state for `task`, added the first time the session addresses it.
-    pub fn view(&self, task: &Task) -> Arc<TaskView> {
+    pub fn entry(&self, task: &Task) -> Arc<TaskEntry> {
         Arc::clone(
-            lock(&self.views)
+            lock(&self.tasks)
                 .entry(task.id.clone())
-                .or_insert_with(|| Arc::new(TaskView::default())),
+                .or_insert_with(|| Arc::new(TaskEntry::default())),
         )
     }
 
-    /// This session's state for `task`, if it has addressed it. Never inserts.
-    pub fn existing(&self, task: &Task) -> Option<Arc<TaskView>> {
-        lock(&self.views).get(&task.id).cloned()
+    /// Never inserts: a list or footer cannot attach the caller to another task.
+    pub fn existing(&self, task: &Task) -> Option<Arc<TaskEntry>> {
+        lock(&self.tasks).get(&task.id).cloned()
     }
 
-    /// The views of the tasks in `tasks` this session has addressed, newest first, dropping
-    /// entries whose task has retired. `tasks` is the registry's order, oldest first; the
-    /// caller holds the registry lock, so a task cannot be added or retired meanwhile.
-    pub fn touched(&self, tasks: &[Arc<Task>]) -> Vec<(Arc<Task>, Arc<TaskView>)> {
-        let mut views = lock(&self.views);
+    /// The caller holds the registry lock; entries retire with their tasks.
+    pub fn touched(&self, tasks: &[Arc<Task>]) -> Vec<(Arc<Task>, Arc<TaskEntry>)> {
+        let mut entries = lock(&self.tasks);
         let present: HashSet<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
-        views.retain(|id, _| present.contains(id.as_str()));
+        entries.retain(|id, _| present.contains(id.as_str()));
         tasks
             .iter()
             .rev()
             .filter_map(|task| {
-                views
+                entries
                     .get(&task.id)
-                    .map(|view| (Arc::clone(task), Arc::clone(view)))
+                    .map(|entry| (Arc::clone(task), Arc::clone(entry)))
             })
             .collect()
     }
 }
 
-/// One session's state for one task: what its results have read and what they have shown.
+/// Splits an optional reader suffix before lookup or any task side effect.
+pub fn parse_handle(handle: &str) -> Result<(&str, Option<&str>), String> {
+    let Some((id, key)) = handle.split_once('.') else {
+        return Ok((handle, None));
+    };
+    if id.is_empty() || key.len() != 4 || !key.bytes().all(|byte| ALPHABET.contains(&byte)) {
+        return Err(
+            "taskId must be a bare task ID or <taskId>.<reader>, with 4 Crockford base32 reader characters."
+                .into(),
+        );
+    }
+    Ok((id, Some(key)))
+}
+
+const MAX_READERS: usize = 16;
+
 #[derive(Default)]
-pub struct TaskView {
-    /// The read state. Held for a whole read, so one session's reads of a task run one at a
-    /// time; another session's reads of it do not wait.
-    pub read: Arc<tokio::sync::Mutex<ReadState>>,
-    /// Set once a result of this session has shown the task's final state.
+struct Readers {
+    by_key: HashMap<String, Arc<Reader>>,
+    lru: VecDeque<String>,
+}
+
+/// This session's state for one task: its readers and what its results told it.
+#[derive(Default)]
+pub struct TaskEntry {
+    readers: Mutex<Readers>,
     reported: AtomicBool,
-    /// Set once a result of this session has shown that the processes held past the root's exit
-    /// ended.
     tree_end_reported: AtomicBool,
-    /// The sorted PIDs of the held processes a result of this session last showed.
     keeps_reported: Mutex<Option<Vec<u32>>>,
 }
 
-impl TaskView {
-    /// The gate a read holds for its whole duration.
-    pub fn read_gate(&self) -> Arc<tokio::sync::Mutex<ReadState>> {
-        Arc::clone(&self.read)
+impl TaskEntry {
+    /// Called while the registry is locked, before this new task becomes visible.
+    pub fn start_reader(&self, key: String) -> Arc<Reader> {
+        let mut readers = lock(&self.readers);
+        assert!(readers.by_key.is_empty(), "a new task already has readers");
+        let reader = Arc::new(Reader::new(key.clone(), false));
+        readers.lru.push_back(key.clone());
+        readers.by_key.insert(key, Arc::clone(&reader));
+        reader
     }
-    /// Whether a result of this session has shown the task's final state.
+
+    /// Resolve and touch atomically, so one live handle always uses one read gate.
+    pub fn reader(&self, key: Option<&str>) -> Result<Arc<Reader>, String> {
+        let mut readers = lock(&self.readers);
+        if let Some(key) = key
+            && let Some(reader) = readers.by_key.get(key).cloned()
+        {
+            readers.lru.retain(|old| old != key);
+            readers.lru.push_back(key.into());
+            return Ok(reader);
+        }
+        let key = match key {
+            Some(key) => key.into(),
+            None => loop {
+                let key =
+                    random_chars(4).map_err(|error| format!("Cannot name the reader: {error}"))?;
+                if !readers.by_key.contains_key(&key) {
+                    break key;
+                }
+            },
+        };
+        if readers.by_key.len() == MAX_READERS {
+            let idle = readers.lru.iter().position(|key| {
+                let reader = &readers.by_key[key];
+                Arc::strong_count(reader) == 1 && Arc::strong_count(&reader.read) == 1
+            });
+            let Some(idle) = idle else {
+                return Err(
+                    "All 16 readers for this task are busy; retry when a read finishes.".into(),
+                );
+            };
+            let old = readers
+                .lru
+                .remove(idle)
+                .expect("the idle reader is present");
+            readers.by_key.remove(&old);
+        }
+        let reader = Arc::new(Reader::new(key.clone(), true));
+        readers.lru.push_back(key.clone());
+        readers.by_key.insert(key, Arc::clone(&reader));
+        Ok(reader)
+    }
+
     pub fn is_reported(&self) -> bool {
         self.reported.load(Ordering::SeqCst)
     }
 
-    /// Whether a result of this session has shown the end of the processes held past the exit.
     pub fn tree_end_reported(&self) -> bool {
         self.tree_end_reported.load(Ordering::SeqCst)
     }
 
-    /// The held processes this session's results last showed by name.
     pub fn keeps_reported(&self) -> Option<Vec<u32>> {
         lock(&self.keeps_reported).clone()
     }
 
-    /// Records what a delivered result of this session showed: the task's final state, and the
-    /// end of the processes it held. A task that ends after its snapshot stays due.
     pub fn mark_reported(&self, shown: &Snapshot) {
         if shown.state != "running" {
             self.reported.store(true, Ordering::SeqCst);
@@ -201,8 +252,7 @@ impl TaskView {
         }
     }
 
-    /// Records the held processes a background footer or the list showed by name; a task's own
-    /// status line may be cut before them.
+    /// A task's own status line may be cut before its held processes.
     pub fn mark_keeps_reported(&self, shown: &Snapshot) {
         if shown.kept && shown.kill_error.is_none() {
             *lock(&self.keeps_reported) = Some(pids(&shown.held));
@@ -210,7 +260,52 @@ impl TaskView {
     }
 }
 
-/// Where this session's next read of a task starts, and how much of a PTY task's transcript it
+/// One cursor over one task, including the root exit this reader has seen.
+pub struct Reader {
+    pub key: String,
+    pub read: Arc<tokio::sync::Mutex<ReadState>>,
+    reported: AtomicBool,
+    fresh: AtomicBool,
+}
+
+impl Reader {
+    fn new(key: String, fresh: bool) -> Self {
+        Self {
+            key,
+            read: Arc::default(),
+            reported: AtomicBool::new(false),
+            fresh: AtomicBool::new(fresh),
+        }
+    }
+
+    pub fn handle(&self, task_id: &str) -> String {
+        format!("{task_id}.{}", self.key)
+    }
+
+    pub fn read_gate(&self) -> Arc<tokio::sync::Mutex<ReadState>> {
+        Arc::clone(&self.read)
+    }
+
+    pub fn is_reported(&self) -> bool {
+        self.reported.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_reported(&self, shown: &Snapshot) {
+        if shown.state != "running" {
+            self.reported.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn is_fresh(&self) -> bool {
+        self.fresh.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_delivered(&self) {
+        self.fresh.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Where this reader's next read of a task starts, and how much of a PTY task's transcript it
 /// has shown.
 #[derive(Default)]
 pub struct ReadState {
@@ -224,6 +319,129 @@ pub struct ReadState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handles_are_bare_ids_or_exact_reader_suffixes() {
+        assert_eq!(parse_handle("task-1").unwrap(), ("task-1", None));
+        assert_eq!(
+            parse_handle("task-1.abcd").unwrap(),
+            ("task-1", Some("abcd"))
+        );
+        for invalid in [
+            "a.b.abcd", ".abcd", "a.abc", "a.abcde", "a.ABCD", "a.ilou", "a.abç",
+        ] {
+            assert!(
+                parse_handle(invalid)
+                    .unwrap_err()
+                    .contains("<taskId>.<reader>")
+            );
+        }
+    }
+
+    #[test]
+    fn readers_attach_recreate_and_touch_the_idle_lru() {
+        let entry = TaskEntry::default();
+        let initial = entry.start_reader("0000".into());
+        assert!(!initial.is_fresh());
+        initial.read.try_lock().unwrap().cursor = 12;
+        let same = entry.reader(Some("0000")).unwrap();
+        assert!(Arc::ptr_eq(&initial, &same));
+        drop((initial, same));
+        for n in 1..16 {
+            let reader = entry.reader(Some(&format!("{n:04}"))).unwrap();
+            reader.read.try_lock().unwrap().cursor = 42;
+            reader.mark_delivered();
+        }
+        assert_eq!(
+            entry
+                .reader(Some("0000"))
+                .unwrap()
+                .read
+                .try_lock()
+                .unwrap()
+                .cursor,
+            12
+        );
+        entry.reader(Some("zzzz")).unwrap();
+        assert!(lock(&entry.readers).by_key.contains_key("0000"));
+        assert!(!lock(&entry.readers).by_key.contains_key("0001"));
+        let recreated = entry.reader(Some("0001")).unwrap();
+        assert!(recreated.is_fresh());
+        assert_eq!(recreated.read.try_lock().unwrap().cursor, 0);
+        let attached = entry.reader(None).unwrap();
+        assert!(attached.is_fresh());
+        assert_eq!(attached.key.len(), 4);
+        assert!(attached.key.bytes().all(|byte| ALPHABET.contains(&byte)));
+        assert_ne!(attached.key, recreated.key);
+        assert_eq!(lock(&entry.readers).by_key.len(), MAX_READERS);
+    }
+
+    #[test]
+    fn sixteen_busy_readers_refuse_an_attach_without_losing_a_gate() {
+        let entry = TaskEntry::default();
+        let busy: Vec<_> = (0..16)
+            .map(|n| entry.reader(Some(&format!("{n:04}"))).unwrap())
+            .collect();
+        assert!(entry.reader(None).err().unwrap().contains("16 readers"));
+        let same = entry.reader(Some(&busy[0].key)).unwrap();
+        assert!(Arc::ptr_eq(&same, &busy[0]));
+        drop((same, busy));
+        assert!(entry.reader(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_waiting_gate_is_not_evicted_by_sixteen_more_attaches() {
+        let entry = TaskEntry::default();
+        let reader = entry.reader(Some("gate")).unwrap();
+        let gate = reader.read_gate();
+        let held = reader.read_gate().lock_owned().await;
+        drop(reader);
+        let queued = Arc::clone(&gate).lock_owned();
+        tokio::pin!(queued);
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(queued.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        for n in 0..16 {
+            entry.reader(Some(&format!("{n:04}"))).unwrap();
+        }
+        let current = entry.reader(Some("gate")).unwrap();
+        assert!(Arc::ptr_eq(&current.read, &gate));
+        drop(held);
+        let waiting = queued.await;
+        drop(waiting);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_blocking_read_keeps_its_gate_until_it_finishes() {
+        let entry = TaskEntry::default();
+        let reader = entry.reader(Some("gate")).unwrap();
+        let held = reader.read_gate().lock_owned().await;
+        drop(reader);
+        let (started, ready) = std::sync::mpsc::channel();
+        let (finish, released) = std::sync::mpsc::channel();
+        let reading = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            released.recv().unwrap();
+            drop(held);
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        reading.abort();
+        for n in 0..16 {
+            entry.reader(Some(&format!("{n:04}"))).unwrap();
+        }
+        let gate_refs = lock(&entry.readers)
+            .by_key
+            .get("gate")
+            .map(|reader| Arc::strong_count(&reader.read));
+        finish.send(()).unwrap();
+        reading.await.unwrap();
+        assert_eq!(gate_refs, Some(2));
+    }
 
     fn context(env: &[(&str, &str)]) -> LaunchContext {
         LaunchContext::new(

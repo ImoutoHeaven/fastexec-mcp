@@ -3,7 +3,7 @@
 //! task ends when they do, once a result has shown the root's exit.
 
 use crate::output::{Cleaner, Matcher};
-use crate::session::{ReadState, TaskView};
+use crate::session::{ReadState, Reader};
 use crate::tasks::Task;
 use encoding_rs::Encoding;
 use schemars::JsonSchema;
@@ -158,7 +158,7 @@ pub struct Mark {
 
 pub fn mark(
     task: &Task,
-    view: &TaskView,
+    reader: &Reader,
     state: &ReadState,
     when: Option<&ReturnWhen>,
 ) -> Result<Mark, String> {
@@ -174,7 +174,7 @@ pub fn mark(
         cursor,
         cleaner,
         rows,
-        root_reported: view.is_reported(),
+        root_reported: reader.is_reported(),
     })
 }
 

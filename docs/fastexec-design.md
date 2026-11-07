@@ -25,11 +25,24 @@ ranges return an error before execution.
 | `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Spawns `command` in GNU bash and waits up to `waitMs` (default `30000`, range `0–240000`). `cols`/`rows` set a PTY terminal's size (default `120×30`). |
 | `poll` | `taskId`, `cols`, `rows`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Resizes the terminal (PTY only), writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only), waits (`2000` ms with a resize, `input`, or `keys` and no `returnWhen`, `30000` ms otherwise), and returns unseen output. |
 | `kill` | `taskId`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns its final state. On a finished `keepTree` task, ends held processes while keeping the root exit result. |
-| `list` | `truncate`, `maxBytes` | Lists tasks in this server (the namespace's daemon in `on` mode, newest first) with their state, owner, session, call ID, and held processes; text fits `maxBytes` while `structuredContent.tasks` stays complete. |
+| `list` | `truncate`, `maxBytes` | Lists bare task IDs in this server (the namespace's daemon in `on` mode, newest first) with their state, owner, session, call ID, and held processes; creates no readers. Polling a listed ID attaches a new reader. Text fits `maxBytes` while `structuredContent.tasks` stays complete. |
 | `transcript` | `taskId`, `truncate` (default `"tail"`), `maxBytes` | Reads a UTF-8 PTY task's terminal transcript from the first unseen final line, followed by pending lines. Does not wait or advance the `poll` cursor. |
 
 ### Key Parameter Rules
 
+- **`taskId` and readers**: `start`, `poll`, `kill`, and `transcript` return a
+  reader handle, `<taskId>.<reader>`, in the status line and structured result.
+  The reader suffix is four Crockford base32 characters. Reusing a handle in
+  the same session preserves its cursor; passing a bare task ID creates a new
+  reader from the beginning of the retained log. An unknown valid reader key
+  is recreated under that key, including after eviction or a session ending.
+  Each task entry holds at most `16` readers, evicting the least recently used
+  idle reader when needed; an active reader, a waiter, or a cancelled call's
+  still-running blocking read cannot be evicted. If every reader is busy,
+  attachment is refused. A new attachment's first delivered output, transcript,
+  or screen result says `new reader`; `kill` and cancelled calls leave that
+  notice pending. A cancelled blocking read may still advance its cursor.
+  Retention and output limits apply to each reader.
 - **`waitMs` vs. `killAfterMs`**: `waitMs` (`0–240000`) bounds only the current
   call's wait. A call that hits `waitMs`, matches `returnWhen`, or is cancelled
   leaves the task running (use `list` to recover the `taskId` of a cancelled
@@ -180,7 +193,8 @@ failures set `isError` and `ok: false`; schema-decoding errors may have no
 
 These fields describe `exec` results.
 
-- **`start`, `poll`, `kill`**: `ok`, `action`, `taskId`, `state` (`"running"`,
+- **`start`, `poll`, `kill`, `transcript`**: `ok`, `action`, `taskId` (reader
+  handle), `state` (`"running"`,
   `"exited"`, `"killed"`), `exitCode`, `forcedEnd`, `pty`, `elapsedMs`,
   `logPath`, `lifetimeExpired`, `logError`, `keepTree`, `leftovers`
   (`[{ pid, name }]`), `keptRunning`, `held` (`[{ pid, name }]`), `killError`.
@@ -191,18 +205,28 @@ These fields describe `exec` results.
 - **`transcript` (additional)**: `transcriptPath`, `transcriptLines`,
   `finalLines`, `firstLine`, `omittedLines`, `omittedRange`, `cutLines`, and
   `encodingErrors`.
-- **`list`**: `ok`, `action`, and `tasks` (`taskId`, `state`, `exitCode`, `pty`,
+- **`list`**: `ok`, `action`, and `tasks` (`taskId` as a bare task ID, `state`, `exitCode`, `pty`,
   `cols`, `rows`, `elapsedMs`, `command` up to 120 chars, `logPath`,
   `lifetimeExpired`, `keepTree`, `keptRunning`, `held`, `leftovers`, `killError`,
   `owner`, `session`, `callId`). `cols` and `rows` are `null` for a pipe task.
 - **Background footer**: Appended to `start`, `poll`, `kill`, and `transcript`
   results (up to `512` bytes and `maxBytes / 4`) naming up to three other tasks
-  that finished unseen, had held processes end, are still running, or have a
-  changed (or failed-to-kill) set of held processes not yet shown.
+  this session has addressed, using bare task IDs. These tasks finished unseen,
+  had held processes end, are still running, or have a changed (or failed-to-kill)
+  set of held processes not yet shown. HTTP clients sharing a token share this
+  scope. Running tasks and tasks keeping processes that the session has not
+  addressed appear as `1 other running` or `<n> others running`, repeated until
+  none remain. These counts never mark a task reported. If names do not fit,
+  the footer uses counts and `use list`, falling back to `(<n> tasks; use list.)`
+  at the smallest budget. A footer marks only tasks it names; `list` marks only
+  shown tasks' existing session entries. These marks affect background notices,
+  while each reader tracks its own reported exit for waiting.
 
 ## 3. Logs, Terminal Emulator, and Transcript Spool
 
-- **Logs and retention**: In the default mode each task logs raw output to
+- **Logs and retention**: File names use the bare task ID, without the reader
+  suffix; readers share the same retained log and transcript files. In the
+  default mode each task logs raw output to
   `<temp>/fastexec-<uid>-<pid>-<random>/<taskId>.log` on Unix (`0700` dir, `0600` file)
   or `<temp>\fastexec-<pid>-<random>\<taskId>.log` on Windows (owner-only DACL).
   The directory is reserved atomically and existing shared directories or links
@@ -413,9 +437,12 @@ These fields describe `exec` results.
   frame at most `64` MiB, one connection carries at most `32` concurrent calls,
   and the daemon serves at most `128` connections.
 - **Sessions**: Each endpoint process holds one random session ID with its own
-  cursors, and a reconnect keeps them. A session with no live connection is
-  dropped after `10` minutes, and the table holds at most `256` sessions. The
-  endpoint says `Bye` when its stdin closes, which drops the session at once.
+  task entries and readers, and a reconnect keeps them. An endpoint session with
+  no live connection is dropped after `10` minutes, and the table holds at most
+  `256` endpoint sessions. The endpoint says `Bye` when its stdin closes, which
+  drops that session at once. Sessionless HTTP has one principal session per
+  configured token for the listener's entire lifetime; these sessions do not
+  expire. A session's entries retire with their tasks.
 - **Lifetimes**: The daemon does not exit idle by default. Starting it with
   `--idle-exit on` enables exit after `10` minutes with no connections and an
   empty task registry (finished tasks stay for up to `24` hours). `--idle-exit off`
@@ -445,8 +472,14 @@ These fields describe `exec` results.
   and `stop` never start a daemon, and `stop` without one exits `0`. Start flags
   only apply to a new daemon; stop the existing one before changing its
   idle-exit policy.
-- **HTTP**: `--http <addr>` with `FASTEXEC_HTTP_TOKEN`, at least `16` visible
-  ASCII characters, serves the same toolset over Streamable HTTP. The address is
+- **HTTP**: `--http <addr>` with `FASTEXEC_HTTP_TOKEN`, one or more unique tokens
+  separated by ASCII whitespace, serves the same toolset over Streamable HTTP.
+  Each token is at least `16` visible ASCII characters; empty lists, invalid
+  tokens, and duplicates are refused with token positions, never token values.
+  Sessionless requests use the authenticated token's principal session (`t1`,
+  `t2`, etc., with owner labels `http-t1`, `http-t2`, etc.). The inline `_meta`
+  lifecycle chooses this path regardless of the named protocol version. Legacy
+  HTTP `initialize` creates a client-named session after negotiation. The address is
   loopback unless `FASTEXEC_HTTP_ALLOW_REMOTE=1`, which belongs behind a
   TLS-terminating proxy. Every `/mcp` request carries the bearer token, checked
   before a session is created or resumed, and the token is dropped from the
@@ -456,8 +489,9 @@ These fields describe `exec` results.
   `FASTEXEC_HTTP_ALLOWED_ORIGINS`, where an entry without a port matches any
   port. This is request Origin validation, not CORS support: browser cross-origin
   preflights and CORS response headers are not provided. HTTP sessions run with
-  the daemon's own environment, and the `10` minute
-  inactivity TTL expires idle ones without bounding their count or memory.
+  the daemon's own environment. The `10` minute inactivity TTL expires idle
+  legacy HTTP sessions without bounding their count or memory; principal
+  sessions last until the listener stops.
   The HTTP listener admits at most `128` concurrent connections and allows
   `10` seconds to receive request headers. Extra connections are closed without
   queueing; management through the local daemon socket has its own capacity.

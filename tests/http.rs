@@ -23,8 +23,8 @@ struct Fixture {
     runtime: PathBuf,
     namespace: String,
     addr: SocketAddr,
-    /// The token this fixture's daemon admits, made for this run alone.
-    token: String,
+    /// The tokens this fixture's daemon admits, made for this run alone.
+    tokens: Vec<String>,
     /// The daemon this fixture saw running, so cleanup can end that one process by PID.
     pid: std::cell::Cell<Option<u32>>,
     /// The public root this fixture's daemon is started with, when a case names one. It is set on
@@ -82,7 +82,7 @@ impl Fixture {
             runtime,
             namespace: format!("http{tag}-{}", std::process::id()),
             addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            token: random_token(),
+            tokens: vec![random_token()],
             pid: std::cell::Cell::new(None),
             public_url: None,
             cwd: None,
@@ -108,7 +108,7 @@ impl Fixture {
             .args(args)
             .env("FASTEXEC_TEST_RUNTIME_DIR", &self.runtime)
             .env("FASTEXEC_NAMESPACE", &self.namespace)
-            .env("FASTEXEC_HTTP_TOKEN", &self.token)
+            .env("FASTEXEC_HTTP_TOKEN", self.tokens.join(" "))
             // Nothing this process carries may change what a case sets up itself.
             .env_remove("FASTEXEC_DAEMON")
             .env_remove("FASTEXEC_HTTP_ALLOW_REMOTE")
@@ -455,15 +455,20 @@ impl Client {
     }
 
     /// A 2026 request carries its own metadata and never uses a protocol session.
-    fn modern(&mut self, method: &str, mut params: Value) -> Value {
+    fn modern(&mut self, method: &str, params: Value) -> Value {
+        self.inline("2026-07-28", method, params)
+    }
+
+    /// Inline lifecycle metadata selects a principal session even with an older version.
+    fn inline(&mut self, version: &str, method: &str, mut params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         params["_meta"] = json!({
-            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/protocolVersion": version,
             "io.modelcontextprotocol/clientInfo": {"name": "http-modern-test", "version": "1"},
             "io.modelcontextprotocol/clientCapabilities": {},
         });
-        let mut headers = format!("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {method}\r\n");
+        let mut headers = format!("MCP-Protocol-Version: {version}\r\nMcp-Method: {method}\r\n");
         if let Some(name) = params["name"].as_str() {
             headers.push_str(&format!("Mcp-Name: {name}\r\n"));
         }
@@ -475,18 +480,35 @@ impl Client {
         assert!(response.header("mcp-session-id").is_none());
         let answer = response.answer(id);
         assert!(answer["result"].is_object(), "{answer}");
-        assert_eq!(answer["result"]["resultType"], "complete", "{answer}");
+        if version == "2026-07-28" {
+            assert_eq!(answer["result"]["resultType"], "complete", "{answer}");
+        }
         answer["result"].clone()
+    }
+
+    /// A sessionless exec result, its structured content and its text.
+    fn modern_result(&mut self, arguments: Value) -> (Value, String) {
+        let result = self.modern(
+            "tools/call",
+            json!({"name": "exec", "arguments": arguments}),
+        );
+        assert_ne!(result["isError"], true, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap().to_owned();
+        (result["structuredContent"].clone(), text)
     }
 
     /// The MCP handshake, which names the session every later request carries.
     fn initialize(&mut self) {
+        self.initialize_version("2025-06-18");
+    }
+
+    fn initialize_version(&mut self, version: &str) {
         self.next_id += 1;
         let id = self.next_id;
         let response = self.send(json!({
             "jsonrpc": "2.0", "id": id, "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": version,
                 "capabilities": {},
                 "clientInfo": {"name": "http-test", "version": "0"},
             },
@@ -716,7 +738,7 @@ impl Drop for Stdio {
 #[test]
 fn modern_discovery_and_task_polls_work_without_a_handshake() {
     let fixture = Fixture::new("modern");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     let discovery = client.modern("server/discover", json!({}));
     assert!(
         discovery["supportedVersions"]
@@ -758,7 +780,7 @@ fn modern_discovery_and_task_polls_work_without_a_handshake() {
         "a new HTTP request must keep its output cursor: {polled}"
     );
     // A legacy client still has an independent cursor over the shared daemon's task.
-    let mut legacy = Client::new(fixture.addr, fixture.token.clone());
+    let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
     legacy.initialize();
     let text = legacy.text(json!({"action": "poll", "taskId": id, "waitMs": 1000}));
     assert!(
@@ -768,9 +790,319 @@ fn modern_discovery_and_task_polls_work_without_a_handshake() {
 }
 
 #[test]
+fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
+    let mut fixture = Fixture::bare("principals");
+    fixture.tokens.push(random_token());
+    fixture.start();
+    let mut a = Client::new(fixture.addr, fixture.tokens[0].clone());
+    let mut b = Client::new(fixture.addr, fixture.tokens[0].clone());
+    let mut other = Client::new(fixture.addr, fixture.tokens[1].clone());
+
+    let (started, text) = a.modern_result(json!({
+        "action": "start",
+        "command": "printf 'A_FIRST\\n'; read -r line; printf 'A_SECOND\\n'; read -r line",
+        "waitMs": 30000, "returnWhen": {"outputContains": ["A_FIRST"]},
+    }));
+    let a_handle = started["taskId"].as_str().unwrap();
+    let a_id = a_handle.split_once('.').unwrap().0;
+    assert!(
+        text.contains(a_handle) && text.contains("A_FIRST"),
+        "{text}"
+    );
+    assert!(!text.contains("new reader"), "{text}");
+
+    let (other_started, text) = other.modern_result(json!({
+        "action": "start", "command": "printf 'OTHER_FIRST\\n'; read -r line",
+        "waitMs": 30000, "returnWhen": {"outputContains": ["OTHER_FIRST"]},
+    }));
+    let other_handle = other_started["taskId"].as_str().unwrap();
+    let other_id = other_handle.split_once('.').unwrap().0;
+    assert!(text.contains("1 other running"), "{text}");
+    assert!(
+        !text.contains(a_id),
+        "another principal has counts only: {text}"
+    );
+
+    let (b_started, text) = b.modern_result(json!({
+        "action": "start", "command": "printf 'B_FIRST\\n'; read -r line",
+        "waitMs": 30000, "returnWhen": {"outputContains": ["B_FIRST"]},
+    }));
+    let b_id = b_started["taskId"]
+        .as_str()
+        .unwrap()
+        .split_once('.')
+        .unwrap()
+        .0;
+    assert!(
+        text.contains(a_id),
+        "the same token sees its own tasks: {text}"
+    );
+    assert!(!text.contains(a_handle), "footer task IDs are bare: {text}");
+    assert!(text.contains("1 other running"), "{text}");
+    assert!(!text.contains(other_id), "{text}");
+
+    let (attached, text) = b.modern_result(json!({
+        "action": "poll", "taskId": a_id, "waitMs": 0,
+    }));
+    let b_handle = attached["taskId"].as_str().unwrap();
+    assert_ne!(b_handle, a_handle);
+    assert_eq!(b_handle.split_once('.').unwrap().0, a_id);
+    assert!(
+        text.contains("A_FIRST") && text.contains(" · new reader"),
+        "{text}"
+    );
+    assert!(text.contains(b_handle), "{text}");
+
+    let (_, text) = a.modern_result(json!({
+        "action": "poll", "taskId": a_handle, "input": "go\n",
+        "waitMs": 30000, "returnWhen": {"outputContains": ["A_SECOND"]},
+    }));
+    assert!(
+        text.contains("A_SECOND") && !text.contains("A_FIRST"),
+        "{text}"
+    );
+    assert!(!text.contains("new reader"), "{text}");
+
+    let (_, text) = b.modern_result(json!({
+        "action": "poll", "taskId": b_handle, "waitMs": 0,
+    }));
+    assert!(
+        text.contains("A_SECOND") && !text.contains("A_FIRST"),
+        "{text}"
+    );
+    assert!(!text.contains("new reader"), "{text}");
+
+    let (listed, _) = other.modern_result(json!({"action": "list"}));
+    let tasks = listed["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 3, "{listed}");
+    for (id, owner) in [(a_id, "http-t1"), (b_id, "http-t1"), (other_id, "http-t2")] {
+        let task = tasks.iter().find(|task| task["taskId"] == id).unwrap();
+        assert_eq!(task["owner"], owner, "{task}");
+        assert!(!task["taskId"].as_str().unwrap().contains('.'), "{task}");
+    }
+    // Listing a tenant's task creates no entry and cannot hide its repeated count.
+    for _ in 0..2 {
+        let (_, text) = other.modern_result(json!({
+            "action": "poll", "taskId": other_handle, "waitMs": 0,
+        }));
+        assert!(text.contains("2 others running"), "{text}");
+        assert!(!text.contains(a_id) && !text.contains(b_id), "{text}");
+    }
+}
+
+#[test]
+fn sessionless_exit_reporting_is_local_to_each_reader() {
+    let fixture = Fixture::new("reader-exit");
+    let mut a = Client::new(fixture.addr, fixture.tokens[0].clone());
+    let mut b = Client::new(fixture.addr, fixture.tokens[0].clone());
+    let (started, text) = a.modern_result(json!({
+        "action": "start", "command": "sleep 60 & echo ROOT_EXIT",
+        "keepTree": true, "loginShell": false, "waitMs": 30000,
+    }));
+    assert_eq!(started["state"], "exited", "{text}");
+    assert_eq!(started["keptRunning"], true, "{text}");
+    assert_eq!(started["waitEndedBy"]["condition"], "task_ended", "{text}");
+    let a_handle = started["taskId"].as_str().unwrap();
+    let id = a_handle.split_once('.').unwrap().0;
+
+    let (waited, text) = a.modern_result(json!({
+        "action": "poll", "taskId": a_handle, "waitMs": 150,
+    }));
+    assert_eq!(waited["keptRunning"], true, "{text}");
+    assert_eq!(waited["waitEndedBy"]["condition"], "max_wait", "{text}");
+
+    let (attached, text) = b.modern_result(json!({
+        "action": "poll", "taskId": id, "waitMs": 1000,
+    }));
+    assert_eq!(attached["keptRunning"], true, "{text}");
+    assert_eq!(attached["waitEndedBy"]["condition"], "task_ended", "{text}");
+    assert!(
+        text.contains("ROOT_EXIT") && text.contains(" · new reader"),
+        "{text}"
+    );
+    assert_ne!(attached["taskId"], started["taskId"]);
+
+    let (killed, text) = a.modern_result(json!({"action": "kill", "taskId": a_handle}));
+    assert_eq!(killed["keptRunning"], false, "{text}");
+    assert_eq!(killed["taskId"], a_handle, "{text}");
+}
+
+#[test]
+fn invalid_http_requests_create_no_reader_and_change_no_task_state() {
+    let fixture = Fixture::new("invalid-reader");
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
+    for pty in [false, true] {
+        let mut arguments = json!({
+            "action": "start", "pty": pty, "loginShell": false,
+            "command": "printf 'READY\\n'; while IFS= read -r line; do printf 'GOT_%s\\n' \"$line\"; done",
+            "waitMs": 30000, "returnWhen": {"outputContains": ["READY"]},
+        });
+        if pty {
+            arguments["cols"] = json!(80);
+            arguments["rows"] = json!(24);
+        }
+        let (started, _) = client.modern_result(arguments);
+        let handle = started["taskId"].as_str().unwrap();
+        let id = handle.split_once('.').unwrap().0;
+        // The start reader is now the oldest of 16 idle readers. Any invalid call that allocates
+        // a reader would evict it; its final poll below would replay READY and say new reader.
+        for _ in 0..15 {
+            let (_, text) = client.modern_result(json!({
+                "action": "poll", "taskId": id, "waitMs": 0,
+            }));
+            assert!(text.contains(" · new reader"), "{text}");
+        }
+        let mut invalid = vec![
+            json!({"action": "poll", "taskId": format!("{id}.abc"), "input": "POISON\n"}),
+            json!({"action": "kill", "taskId": format!("{id}.abcd.extra")}),
+            json!({"action": "kill", "taskId": id, "input": "POISON\n"}),
+            json!({"action": "poll", "taskId": id, "rows": 201, "input": "POISON\n"}),
+        ];
+        if pty {
+            invalid.extend([
+                json!({"action": "poll", "taskId": id, "keys": ["NotAKey"],
+                    "cols": 100, "rows": 40, "input": "POISON\n"}),
+                json!({"action": "poll", "taskId": id, "eof": true,
+                    "cols": 100, "rows": 40, "input": "POISON\n"}),
+            ]);
+        } else {
+            invalid.extend([
+                json!({"action": "poll", "taskId": id, "screen": true, "input": "POISON\n"}),
+                json!({"action": "poll", "taskId": id, "keys": ["Enter"], "input": "POISON\n"}),
+                json!({"action": "poll", "taskId": id, "cols": 100, "input": "POISON\n"}),
+                json!({"action": "poll", "taskId": id,
+                    "returnWhen": {"screenContains": ["READY"]}, "input": "POISON\n"}),
+                json!({"action": "transcript", "taskId": id}),
+            ]);
+        }
+        for arguments in invalid {
+            let result = client.modern(
+                "tools/call",
+                json!({"name": "exec", "arguments": arguments}),
+            );
+            assert_eq!(result["isError"], true, "pty={pty}: {result}");
+        }
+
+        let (listed, _) = client.modern_result(json!({"action": "list"}));
+        let task = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["taskId"] == id)
+            .unwrap();
+        assert_eq!(task["state"], "running", "{task}");
+        if pty {
+            assert_eq!(task["cols"], 80, "{task}");
+            assert_eq!(task["rows"], 24, "{task}");
+        }
+        let (polled, text) = client.modern_result(json!({
+            "action": "poll", "taskId": handle, "input": "SAFE\n",
+            "waitMs": 30000, "returnWhen": {"outputContains": ["GOT_SAFE"]},
+        }));
+        assert_eq!(polled["taskId"], handle);
+        assert!(text.contains("GOT_SAFE"), "pty={pty}: {text}");
+        assert!(!text.contains("POISON"), "pty={pty}: {text}");
+        assert!(
+            !text.contains("READY"),
+            "the reader was not evicted: pty={pty}: {text}"
+        );
+        assert!(!text.contains("new reader"), "pty={pty}: {text}");
+        client.modern_result(json!({"action": "kill", "taskId": handle}));
+    }
+}
+
+#[test]
+fn inline_requests_with_an_older_version_use_the_principal_session() {
+    let fixture = Fixture::new("inline-old");
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
+    let started = client.inline("2025-06-18", "tools/call", json!({
+        "name": "exec", "arguments": {
+            "action": "start", "command": "printf 'OLD_FIRST\\n'; read -r line; printf 'OLD_SECOND\\n'",
+            "waitMs": 30000, "returnWhen": {"outputContains": ["OLD_FIRST"]},
+        },
+    }));
+    assert_ne!(started["isError"], true, "{started}");
+    let handle = started["structuredContent"]["taskId"].as_str().unwrap();
+    let polled = client.inline(
+        "2025-06-18",
+        "tools/call",
+        json!({
+            "name": "exec", "arguments": {
+                "action": "poll", "taskId": handle, "input": "go\n", "waitMs": 30000,
+            },
+        }),
+    );
+    let text = polled["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("OLD_SECOND") && !text.contains("OLD_FIRST"),
+        "{polled}"
+    );
+    assert!(!text.contains("new reader"), "{polled}");
+    assert_eq!(polled["structuredContent"]["taskId"], handle);
+
+    let (listed, _) = client.modern_result(json!({"action": "list"}));
+    let task = &listed["tasks"][0];
+    assert_eq!(task["taskId"], handle.split_once('.').unwrap().0);
+    assert_eq!(task["owner"], "http-t1");
+}
+
+#[test]
+fn legacy_initialize_with_a_modern_version_keeps_its_client_session() {
+    let fixture = Fixture::new("legacy-new");
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
+    client.initialize_version("2026-07-28");
+    let (started, _) = client.result(json!({
+        "action": "start", "command": "true", "waitMs": 30000,
+    }));
+    let (listed, _) = client.result(json!({"action": "list"}));
+    let task = &listed["tasks"][0];
+    assert_eq!(
+        task["taskId"],
+        started["taskId"]
+            .as_str()
+            .unwrap()
+            .split_once('.')
+            .unwrap()
+            .0
+    );
+    assert!(
+        task["owner"].as_str().unwrap().starts_with("http-test-"),
+        "{task}"
+    );
+}
+
+#[test]
+fn minimum_budget_with_one_tenant_task_keeps_the_count_footer() {
+    let mut fixture = Fixture::bare("tenant-budget");
+    fixture.tokens.push(random_token());
+    fixture.start();
+    let mut tenant = Client::new(fixture.addr, fixture.tokens[0].clone());
+    let mut caller = Client::new(fixture.addr, fixture.tokens[1].clone());
+    let (started, _) = tenant.modern_result(json!({
+        "action": "start", "command": "read -r line", "waitMs": 0,
+    }));
+    let (_, text) = caller.modern_result(json!({
+        "action": "start", "command": "true", "waitMs": 30000, "maxBytes": 100,
+    }));
+    assert!(text.len() <= 100, "{text:?}");
+    assert!(text.contains("(1 tasks; use list.)"), "{text}");
+    assert!(
+        !text.contains(
+            started["taskId"]
+                .as_str()
+                .unwrap()
+                .split_once('.')
+                .unwrap()
+                .0
+        ),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_session_runs_a_task_over_http() {
     let fixture = Fixture::new("run");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let mut tools = client.tools();
     tools.sort_unstable();
@@ -804,7 +1136,7 @@ fn a_session_runs_a_task_over_http() {
 #[test]
 fn a_stdio_endpoint_lists_the_task_an_http_session_started() {
     let fixture = Fixture::new("shared");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let (structured, started) = client.result(json!({
         "action": "start", "command": "sleep 60", "waitMs": 0,
@@ -820,7 +1152,7 @@ fn a_stdio_endpoint_lists_the_task_an_http_session_started() {
     let tasks = structured["tasks"].as_array().cloned().unwrap_or_default();
     let task = tasks
         .iter()
-        .find(|task| task["taskId"] == json!(id))
+        .find(|task| task["taskId"] == json!(id.split_once('.').unwrap().0))
         .unwrap_or_else(|| panic!("the HTTP task is not listed: {text}"));
     assert!(
         task["owner"]
@@ -865,7 +1197,7 @@ fn a_declared_body_over_the_cap_is_refused_before_it_is_read() {
     let fixture = Fixture::new("large");
     let request = format!(
         "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: 5000000\r\nConnection: close\r\nAuthorization: Bearer {}\r\n\r\n",
-        fixture.addr, fixture.token
+        fixture.addr, fixture.tokens[0]
     );
     let response = exchange(fixture.addr, request.as_bytes());
     assert_eq!(response.status, 413, "{:?}", response.body);
@@ -887,7 +1219,7 @@ fn a_declared_body_over_the_cap_is_refused_before_it_is_read() {
         .unwrap();
     let head = format!(
         "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAuthorization: Bearer {}\r\n\r\n",
-        fixture.addr, fixture.token
+        fixture.addr, fixture.tokens[0]
     );
     let _ = stream.write_all(head.as_bytes());
     let bytes = body.as_bytes();
@@ -939,7 +1271,7 @@ fn a_browser_origin_from_elsewhere_is_refused_and_none_is_accepted() {
     .to_string();
     let evil = raw(
         fixture.addr,
-        &fixture.token,
+        &fixture.tokens[0],
         "Origin: http://evil.example\r\n",
         &body,
     );
@@ -954,7 +1286,7 @@ fn a_browser_origin_from_elsewhere_is_refused_and_none_is_accepted() {
         "{:?}",
         evil.headers
     );
-    let plain = raw(fixture.addr, &fixture.token, "", &body);
+    let plain = raw(fixture.addr, &fixture.tokens[0], "", &body);
     assert_eq!(plain.status, 200, "{:?}", plain.body);
     assert!(
         plain.header("mcp-session-id").is_some(),
@@ -1010,7 +1342,7 @@ fn a_start_outside_loopback_or_without_a_long_enough_token_is_refused() {
 #[test]
 fn file_tools_round_trip_over_http_and_name_transfer_for_a_binary() {
     let fixture = Fixture::new("files");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let dir = std::env::temp_dir().join(format!("fastexec-http-files-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1103,7 +1435,7 @@ fn wait_for_size(addr: SocketAddr, target: &str, expected: u64) -> u64 {
 #[test]
 fn transfer_is_listed_over_http_and_names_the_scheme_the_client_saw() {
     let fixture = Fixture::new("transfer-url");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let tools = client.tools();
     assert!(tools.contains(&"transfer".to_owned()), "{tools:?}");
@@ -1142,7 +1474,7 @@ fn a_named_root_wins_over_the_host_and_keeps_its_prefix() {
     let root = "https://files.example/mac/";
     let mut fixture = Fixture::bare("public-root").with_public_url(root);
     fixture.start();
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let path = published(&fixture, "rooted.bin");
     let url = publish(&mut client, &path);
@@ -1183,7 +1515,7 @@ fn a_second_start_with_another_root_keeps_the_root_the_daemon_has() {
     let first = "https://first.example/mac/";
     let mut fixture = Fixture::bare("root-kept").with_public_url(first);
     fixture.start();
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     // A start that finds a running HTTP daemon keeps that daemon, and with it the root it minted
     // from when it started.
@@ -1198,7 +1530,7 @@ fn a_second_start_with_another_root_keeps_the_root_the_daemon_has() {
 #[test]
 fn a_path_that_is_not_mcp_is_not_found() {
     let fixture = Fixture::new("routes");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let body = json!({
         "jsonrpc": "2.0",
@@ -1221,7 +1553,7 @@ fn a_path_that_is_not_mcp_is_not_found() {
         ("/MCP", 404),
         ("/t/mcp", 404),
     ] {
-        let answer = post_to(fixture.addr, &fixture.token, target, "", &body);
+        let answer = post_to(fixture.addr, &fixture.tokens[0], target, "", &body);
         assert_eq!(answer.status, status, "{target}: {:?}", answer.body);
     }
     // A path nobody may use is refused as unauthenticated before it is reported missing.
@@ -1264,7 +1596,7 @@ fn a_daemon_refuses_a_public_root_it_cannot_use() {
 #[test]
 fn an_upload_and_a_download_over_t_need_no_token() {
     let fixture = Fixture::new("transfer-io");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "up.bin");
     let target = target_of(&publish(&mut client, &file));
@@ -1313,7 +1645,7 @@ fn an_upload_and_a_download_over_t_need_no_token() {
 #[test]
 fn ranges_offsets_and_unknown_ids_answer_as_specified() {
     let fixture = Fixture::new("transfer-edges");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "edges.bin");
     std::fs::write(&file, b"hello world").unwrap();
@@ -1395,7 +1727,7 @@ fn ranges_offsets_and_unknown_ids_answer_as_specified() {
 #[test]
 fn an_interrupted_upload_leaves_a_prefix_that_resumes() {
     let fixture = Fixture::new("transfer-resume");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "resume.bin");
     let target = target_of(&publish(&mut client, &file));
@@ -1449,7 +1781,7 @@ fn send_chunked(addr: SocketAddr, target: &str, body: &[u8]) -> Response {
 #[test]
 fn an_upload_larger_than_the_call_cap_arrives_whole() {
     let fixture = Fixture::new("transfer-large");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "large.bin");
     let target = target_of(&publish(&mut client, &file));
@@ -1509,7 +1841,7 @@ impl MemoryFile {
 #[test]
 fn a_refused_disk_write_is_not_acknowledged_as_success() {
     let fixture = Fixture::new("transfer-sealed");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let addr = fixture.addr;
     // The control: an unsealed memory file accepts the same upload and answers its size.
@@ -1626,7 +1958,7 @@ fn transfer_uploads_to_one_file_serialize_across_capabilities_and_aliases() {
     let mut fixture = Fixture::bare("transfer-file-identity");
     fixture.cwd = Some(fixture.runtime.clone());
     fixture.start();
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     // A previously missing file gets two IDs; opening it must not give each upload its own lock.
     let file = published(&fixture, "same.bin");
@@ -1672,7 +2004,7 @@ fn transfer_uploads_to_one_file_serialize_across_capabilities_and_aliases() {
 #[test]
 fn transfer_uploads_to_different_files_do_not_wait_for_each_other() {
     let fixture = Fixture::new("transfer-independent");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let first_file = published(&fixture, "first.bin");
     let second_file = published(&fixture, "second.bin");
@@ -1791,7 +2123,7 @@ fn http_unauthorized_incomplete_bodies_do_not_hold_a_connection() {
 #[test]
 fn http_a_long_tool_call_outlives_the_header_deadline() {
     let fixture = Fixture::new("http-long-tool-call");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let result = client.call_tool(
         "exec",
@@ -1824,7 +2156,7 @@ fn disconnected_uploads_waiting_for_the_same_file_release_their_descriptors() {
             .unwrap()
             .count()
     };
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "paused.bin");
     let target = target_of(&publish(&mut client, &file));
@@ -1871,7 +2203,7 @@ fn disconnected_uploads_waiting_for_the_same_file_release_their_descriptors() {
 #[test]
 fn malformed_or_truncated_upload_bodies_keep_the_prefix_but_are_not_successful() {
     let fixture = Fixture::new("transfer-invalid-body");
-    let mut client = Client::new(fixture.addr, fixture.token.clone());
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "partial.bin");
     let target = target_of(&publish(&mut client, &file));

@@ -6,7 +6,7 @@ use crate::conpty;
 use crate::keys;
 use crate::output::{self, Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
 use crate::process;
-use crate::session::{ReadState, Session, TaskView};
+use crate::session::{ReadState, Reader, Session, TaskEntry, parse_handle};
 use crate::tasks::{self, EVICTED_TRANSCRIPT, Snapshot, StartArgs, Task, Tasks};
 use crate::wait::{self, WaitEnd};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -38,6 +38,7 @@ const NOTES_RESERVE: usize = 260;
 const MIN_BODY_BUDGET: usize = 256;
 /// Largest background footer; bounded results give it at most a quarter of `maxBytes`.
 const FOOTER_LIMIT: usize = 512;
+const NEW_READER_NOTE: &str = " · new reader";
 /// `truncate: "none"` returns at most this much output; the rest is an omitted range.
 const NONE_LIMIT: usize = 4 << 20;
 
@@ -74,7 +75,7 @@ pub struct Request {
     /// start: keep the processes the command leaves running when its bash exits, such as a server a CLI starts for itself (adb, Gradle daemon), until kill on this task or the end of the tasks' owner (the session in the default mode, the daemon with FASTEXEC_DAEMON=on) (default false: they end with bash).
     #[serde(skip_serializing_if = "Option::is_none")]
     keep_tree: Option<bool>,
-    /// poll, kill, transcript: the task to act on.
+    /// poll, kill, transcript: a reader handle (<taskId>.<reader>) to continue, or a bare task ID to attach a new reader from the retained log's beginning.
     #[serde(skip_serializing_if = "Option::is_none")]
     task_id: Option<String>,
     /// poll: text written to the task exactly as given, before `keys` and before waiting, at most 16 KiB.
@@ -460,9 +461,9 @@ impl Service {
 
     /// Runs one call and renders its result.
     pub async fn call(&self, request: Request, mut call: Call<'_>) -> CallToolResult {
-        // Views of tasks that have retired are dropped here, so a call that never reaches the
+        // Entries of tasks that have retired are dropped here, so a call that never reaches the
         // background footer cannot keep them alive.
-        self.tasks.prune_views(call.session);
+        self.tasks.prune_entries(call.session);
         call.render = call.render.effective();
         let action = request.action;
         let result = match self.handle(request, &call).await {
@@ -521,17 +522,15 @@ impl Service {
                 // The session takes the task even when this request is cancelled meanwhile, so
                 // its own task shows in its background footer.
                 let starting = Arc::clone(&session);
-                let task = tokio::task::spawn_blocking(move || {
-                    let task = tasks.start(args)?;
-                    starting.view(&task);
-                    Ok::<_, String>(task)
-                })
-                .await
-                .map_err(|error| format!("Internal failure while starting: {error}."))??;
-                let task_view = session.view(&task);
-                let state = read_gate(&task_view, &call.cancel).await?;
+                let key = tasks::random_chars(4)
+                    .map_err(|error| format!("Cannot name the reader: {error}"))?;
+                let (task, entry, task_reader) =
+                    tokio::task::spawn_blocking(move || tasks.start(args, &starting, key))
+                        .await
+                        .map_err(|error| format!("Internal failure while starting: {error}."))??;
+                let state = read_gate(&task_reader, &call.cancel).await?;
                 let when = request.return_when.as_ref();
-                let mark = wait::mark(&task, &task_view, &state, when)?;
+                let mark = wait::mark(&task, &task_reader, &state, when)?;
                 let encoding = view.encoding.unwrap_or(task.encoding);
                 let wait = request.wait_ms.unwrap_or(30_000);
                 let ended = wait::wait(
@@ -544,22 +543,24 @@ impl Service {
                     call.progress.as_ref(),
                 )
                 .await?;
-                self.window_result(
-                    call.render,
-                    &session,
-                    Action::Start,
-                    task,
-                    task_view,
-                    state,
-                    view,
-                    ended,
+                read_result(
+                    &call.cancel,
+                    self.window_result(
+                        call.render,
+                        &session,
+                        Action::Start,
+                        task,
+                        entry,
+                        task_reader,
+                        state,
+                        view,
+                        ended,
+                    ),
                 )
                 .await
             }
             Action::Poll => {
-                let task = self.task(request.task_id.as_deref())?;
-                let task_view = session.view(&task);
-                let state = read_gate(&task_view, &call.cancel).await?;
+                let (task, key) = self.task(request.task_id.as_deref())?;
                 let when = request.return_when.as_ref();
                 let watches_screen = when.and_then(|when| when.screen_condition());
                 let needs_pty = [
@@ -599,6 +600,13 @@ impl Service {
                 };
                 let input = request.input.as_deref().unwrap_or_default().as_bytes();
                 let names = request.keys.as_deref().unwrap_or_default();
+                let parsed = names
+                    .iter()
+                    .map(|name| keys::parse(name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let entry = session.entry(&task);
+                let task_reader = entry.reader(key)?;
+                let state = read_gate(&task_reader, &call.cancel).await?;
                 // One poll's resize, input, keys, and eof go out as one sequence, and the wait's
                 // starting mark is taken after the gate, so screenAppears compares against the
                 // screen this caller's resize and input change.
@@ -620,15 +628,12 @@ impl Service {
                 // Every key is checked against the current modes before anything is written, and
                 // the limit holds for each burst: a mode declared during the call can encode the
                 // same keys longer than the modes the first pass read.
-                let encode = |task: &Task| -> Result<(Vec<u8>, Vec<keys::Key>), String> {
+                let encode = |task: &Task| -> Result<Vec<u8>, String> {
                     let mut data = input.to_vec();
-                    let mut parsed = Vec::with_capacity(names.len());
                     if !names.is_empty() {
                         let modes = task.modes()?;
-                        for name in names {
-                            let key = keys::parse(name)?;
+                        for (name, key) in names.iter().zip(parsed.iter().copied()) {
                             data.extend(keys::encode(name, key, modes)?);
-                            parsed.push(key);
                         }
                     }
                     if data.len() > MAX_INPUT_BYTES {
@@ -637,10 +642,10 @@ impl Service {
                                 .into(),
                         );
                     }
-                    Ok((data, parsed))
+                    Ok(data)
                 };
-                let (mut data, parsed) = encode(&task)?;
-                let mark = wait::mark(&task, &task_view, &state, when)?;
+                let mut data = encode(&task)?;
+                let mark = wait::mark(&task, &task_reader, &state, when)?;
                 // The resize goes out after every validation and before the input and keys:
                 // the emulator is at the new size before the program's redraw is parsed, the
                 // native resize runs with no lock capture needs held, and its replies reach the
@@ -661,7 +666,7 @@ impl Service {
                     // that held it declares are the terminal's from here on: the burst is
                     // encoded again rather than sent with the modes the validation pass read.
                     if axes.is_some() && !names.is_empty() {
-                        data = encode(&task)?.0;
+                        data = encode(&task)?;
                     }
                     task.send(Some(&data), request.eof.unwrap_or(false))?;
                 } else {
@@ -689,21 +694,26 @@ impl Service {
                     call.progress.as_ref(),
                 )
                 .await?;
-                self.window_result(
-                    call.render,
-                    &session,
-                    Action::Poll,
-                    task,
-                    task_view,
-                    state,
-                    view,
-                    ended,
+                read_result(
+                    &call.cancel,
+                    self.window_result(
+                        call.render,
+                        &session,
+                        Action::Poll,
+                        task,
+                        entry,
+                        task_reader,
+                        state,
+                        view,
+                        ended,
+                    ),
                 )
                 .await
             }
             Action::Kill => {
-                let task = self.task(request.task_id.as_deref())?;
-                let task_view = session.view(&task);
+                let (task, key) = self.task(request.task_id.as_deref())?;
+                let entry = session.entry(&task);
+                let task_reader = entry.reader(key)?;
                 task.kill().map_err(|error| {
                     format!(
                         "Cannot terminate the process tree of {}: {error}. Poll to see its state, or retry kill.",
@@ -715,27 +725,35 @@ impl Service {
                     let _ = done.wait_for(|done| *done).await;
                     let _ = tree_done.wait_for(|done| *done).await;
                 };
-                let _ = tokio::time::timeout(KILL_WAIT, finished).await;
+                tokio::select! {
+                    biased;
+                    _ = call.cancel.cancelled() => {
+                        return Err("Cancelled while ending the task; use poll to see its state.".into());
+                    }
+                    _ = tokio::time::timeout(KILL_WAIT, finished) => {}
+                }
                 let snapshot = task.snapshot_held();
-                let mut text = status_line(&task, &snapshot);
+                let mut text = status_line(&task, &snapshot, &task_reader);
                 if snapshot.state == "running" || snapshot.kept {
                     text.push_str(" · the tree did not exit within 5 s; poll later to confirm");
                 }
-                let budget = status_budget(&text, view.max_bytes, 0);
-                output::cut_to(&mut text, budget);
                 let background =
                     self.tasks
                         .background(&session, &task.id, FOOTER_LIMIT.min(view.max_bytes / 4));
-                if let Some((line, _)) = &background {
-                    text.push('\n');
-                    text.push_str(line);
-                }
-                let result = success(text, task_json(Action::Kill, &task, &snapshot));
-                report(&session, &task_view, &snapshot, background);
+                let footer = background
+                    .as_ref()
+                    .map_or(String::new(), |(line, _)| format!("\n{line}"));
+                fit_status(&mut text, view.max_bytes, footer.len(), false);
+                text.push_str(&footer);
+                let result = success(
+                    text,
+                    task_json(Action::Kill, &task, &snapshot, &task_reader),
+                );
+                report(&session, &entry, &task_reader, &snapshot, background);
                 Ok(result)
             }
             Action::Transcript => {
-                let task = self.task(request.task_id.as_deref())?;
+                let (task, key) = self.task(request.task_id.as_deref())?;
                 if !task.pty {
                     return Err("transcript applies to PTY tasks only; poll returns a pipe task's output, and its log holds every byte.".into());
                 }
@@ -745,18 +763,30 @@ impl Service {
                             .into(),
                     );
                 }
-                let task_view = session.view(&task);
-                let state = read_gate(&task_view, &call.cancel).await?;
-                self.transcript_result(call.render, &session, task, task_view, state, view)
-                    .await
+                let entry = session.entry(&task);
+                let task_reader = entry.reader(key)?;
+                let state = read_gate(&task_reader, &call.cancel).await?;
+                read_result(
+                    &call.cancel,
+                    self.transcript_result(
+                        call.render,
+                        &session,
+                        task,
+                        entry,
+                        task_reader,
+                        state,
+                        view,
+                    ),
+                )
+                .await
             }
         }
     }
 
-    fn task(&self, id: Option<&str>) -> Result<Arc<Task>, String> {
-        let id = id.unwrap_or_default();
+    fn task<'a>(&self, handle: Option<&'a str>) -> Result<(Arc<Task>, Option<&'a str>), String> {
+        let (id, key) = parse_handle(handle.unwrap_or_default())?;
         if let Some(task) = self.tasks.find(id) {
-            return Ok(task);
+            return Ok((task, key));
         }
         // An ID whose epoch differs came from another server, whose tasks this one never had.
         let epoch_differs = id
@@ -836,9 +866,9 @@ impl Service {
         // to mark.
         for index in kept {
             let (task, snapshot) = &shown[index];
-            if let Some(task_view) = session.existing(task) {
-                task_view.mark_reported(snapshot);
-                task_view.mark_keeps_reported(snapshot);
+            if let Some(entry) = session.existing(task) {
+                entry.mark_reported(snapshot);
+                entry.mark_keeps_reported(snapshot);
             }
         }
         let text = if lines.is_empty() {
@@ -953,10 +983,9 @@ async fn press(
     Ok(())
 }
 
-/// The session's read gate for a task, taken with cancellation: one session's reads of a task
-/// run one at a time, and another session's reads of it do not wait.
+/// A handle's read gate, held by queued waits and blocking reads even after cancellation.
 async fn read_gate(
-    view: &TaskView,
+    reader: &Reader,
     cancel: &CancellationToken,
 ) -> Result<tokio::sync::OwnedMutexGuard<ReadState>, String> {
     tokio::select! {
@@ -964,7 +993,19 @@ async fn read_gate(
         _ = cancel.cancelled() => {
             Err("Cancelled before the output was read; the task keeps running.".into())
         }
-        state = view.read_gate().lock_owned() => Ok(state),
+        state = reader.read_gate().lock_owned() => Ok(state),
+    }
+}
+
+/// A cancelled render cannot consume the fresh notice; its blocking read still owns the gate.
+async fn read_result(
+    cancel: &CancellationToken,
+    result: impl std::future::Future<Output = Result<CallToolResult, String>>,
+) -> Result<CallToolResult, String> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("Cancelled while reading output; use poll to continue.".into()),
+        result = result => result,
     }
 }
 
@@ -972,15 +1013,18 @@ async fn read_gate(
 /// result is built.
 fn report(
     session: &Session,
-    view: &TaskView,
+    entry: &TaskEntry,
+    reader: &Reader,
     shown: &Snapshot,
     background: Option<(String, Vec<tasks::Shown>)>,
 ) {
-    view.mark_reported(shown);
+    reader.mark_reported(shown);
+    entry.mark_reported(shown);
     for (task, shown) in background.map(|(_, shown)| shown).unwrap_or_default() {
-        let task_view = session.view(&task);
-        task_view.mark_reported(&shown);
-        task_view.mark_keeps_reported(&shown);
+        if let Some(entry) = session.existing(&task) {
+            entry.mark_reported(&shown);
+            entry.mark_keeps_reported(&shown);
+        }
     }
 }
 
@@ -992,14 +1036,25 @@ impl Service {
         session: &Session,
         action: Action,
         task: Arc<Task>,
-        task_view: Arc<TaskView>,
+        entry: Arc<TaskEntry>,
+        task_reader: Arc<Reader>,
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
         ended: WaitEnd,
     ) -> Result<CallToolResult, String> {
         if view.screen {
             return self
-                .screen_result(render, session, action, task, task_view, state, view, ended)
+                .screen_result(
+                    render,
+                    session,
+                    action,
+                    task,
+                    entry,
+                    task_reader,
+                    state,
+                    view,
+                    ended,
+                )
                 .await;
         }
         let reader = Arc::clone(&task);
@@ -1016,10 +1071,15 @@ impl Service {
         // stayed open, which the status line notes), so the window below holds all of it. The
         // status line can only grow by its notes.
         let before = task.snapshot_held();
-        let reserved = status_line(&task, &before).len()
+        let reserved = status_line(&task, &before, &task_reader).len()
             + ended.note(view.conditions).len()
             + NOTES_RESERVE
-            + footer.len();
+            + footer.len()
+            + if task_reader.is_fresh() {
+                NEW_READER_NOTE.len()
+            } else {
+                0
+            };
         let budget = match view.truncate {
             Truncate::None => none_limit(),
             _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
@@ -1042,7 +1102,7 @@ impl Service {
             log_error: after.log_error,
             ..before
         };
-        let mut status = status_line(&task, &snapshot);
+        let mut status = status_line(&task, &snapshot, &task_reader);
         status.push_str(&ended.note(view.conditions));
         if window.bad_lines > 0 {
             status.push_str(&format!(
@@ -1051,19 +1111,21 @@ impl Service {
                 encoding.name()
             ));
         }
-        let mut structured = task_json(action, &task, &snapshot);
+        let mut structured = task_json(action, &task, &snapshot, &task_reader);
         structured["waitEndedBy"] = ended.json();
         let text = self.layout(
             render,
             &window,
             status,
+            task_reader.is_fresh(),
             &footer,
             &view,
             "(no new output)",
             &mut structured,
         );
         let result = success(text, structured);
-        report(session, &task_view, &snapshot, background);
+        task_reader.mark_delivered();
+        report(session, &entry, &task_reader, &snapshot, background);
         drop(state);
         Ok(result)
     }
@@ -1072,12 +1134,14 @@ impl Service {
     /// then the pending ones, which the file also holds after the final lines until output
     /// changes them. The result shows the last lines by default, where a program's newest
     /// output is.
+    #[allow(clippy::too_many_arguments)]
     async fn transcript_result(
         &self,
         render: Render,
         session: &Session,
         task: Arc<Task>,
-        task_view: Arc<TaskView>,
+        entry: Arc<TaskEntry>,
+        task_reader: Arc<Reader>,
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
     ) -> Result<CallToolResult, String> {
@@ -1101,7 +1165,7 @@ impl Service {
         let footer = background
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
-        let mut status = status_line(&task, &snapshot);
+        let mut status = status_line(&task, &snapshot, &task_reader);
         status.push_str(&format!(
             " · transcript {total} lines, final through {}; this read starts at line {} · {}",
             transcript.lines,
@@ -1124,7 +1188,16 @@ impl Service {
             Truncate::None => none_limit(),
             _ => view
                 .max_bytes
-                .saturating_sub(status.len() + NOTES_RESERVE + footer.len())
+                .saturating_sub(
+                    status.len()
+                        + NOTES_RESERVE
+                        + footer.len()
+                        + if task_reader.is_fresh() {
+                            NEW_READER_NOTE.len()
+                        } else {
+                            0
+                        },
+                )
                 .max(MIN_BODY_BUDGET),
         };
         let spec = WindowSpec {
@@ -1134,7 +1207,7 @@ impl Service {
             encoding: encoding_rs::UTF_8,
             source: "transcript",
         };
-        let mut structured = task_json(Action::Transcript, &task, &snapshot);
+        let mut structured = task_json(Action::Transcript, &task, &snapshot, &task_reader);
         structured["transcriptPath"] = json!(transcript.path);
         structured["transcriptLines"] = json!(total);
         structured["finalLines"] = json!(transcript.lines);
@@ -1188,13 +1261,15 @@ impl Service {
             render,
             &window,
             status,
+            task_reader.is_fresh(),
             &footer,
             &view,
             "(no transcript lines since the last read)",
             &mut structured,
         );
         let result = success(text, structured);
-        report(session, &task_view, &snapshot, background);
+        task_reader.mark_delivered();
+        report(session, &entry, &task_reader, &snapshot, background);
         drop(state);
         Ok(result)
     }
@@ -1207,18 +1282,19 @@ impl Service {
         render: Render,
         window: &Window,
         mut status: String,
+        fresh: bool,
         footer: &str,
         view: &View,
         empty: &str,
         structured: &mut Value,
     ) -> String {
         let room = if view.truncate == Truncate::None {
+            if fresh {
+                status.push_str(NEW_READER_NOTE);
+            }
             usize::MAX
         } else {
-            // Hard guarantee: the whole text fits maxBytes. A status line longer than half the
-            // budget is cut too; structuredContent.logPath, when enabled, keeps the full path.
-            let budget = status_budget(&status, view.max_bytes, footer.len());
-            output::cut_to(&mut status, budget);
+            fit_status(&mut status, view.max_bytes, footer.len(), fresh);
             view.max_bytes - status.len() - 2 - footer.len()
         };
         let (output, cut_lines, omitted) = window.fit(room);
@@ -1251,7 +1327,8 @@ impl Service {
         session: &Session,
         action: Action,
         task: Arc<Task>,
-        task_view: Arc<TaskView>,
+        entry: Arc<TaskEntry>,
+        task_reader: Arc<Reader>,
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
         ended: WaitEnd,
@@ -1283,14 +1360,18 @@ impl Service {
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
         read.map_err(|error| format!("Cannot read the task log: {error}."))?;
         let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
-        let mut status = status_line(&task, &snapshot);
+        let mut status = status_line(&task, &snapshot, &task_reader);
         status.push_str(&ended.note(view.conditions));
         status.push_str(&format!(
             " · screen {}x{}, cursor row {row} col {col}",
             screen.cols, screen.rows_count
         ));
-        let budget = status_budget(&status, view.max_bytes, footer.len());
-        output::cut_to(&mut status, budget);
+        fit_status(
+            &mut status,
+            view.max_bytes,
+            footer.len(),
+            task_reader.is_fresh(),
+        );
         let room = view.max_bytes - status.len() - 2 - footer.len();
         let mut omitted = 0;
         let mut body = screen.rows.join("\n");
@@ -1313,7 +1394,7 @@ impl Service {
         } else {
             format!("{shown}\n\n{status}{footer}")
         };
-        let mut structured = task_json(action, &task, &snapshot);
+        let mut structured = task_json(action, &task, &snapshot, &task_reader);
         structured["waitEndedBy"] = ended.json();
         structured["cols"] = json!(screen.cols);
         structured["rows"] = json!(screen.rows_count);
@@ -1323,7 +1404,8 @@ impl Service {
             structured["output"] = json!(body);
         }
         let result = success(text, structured);
-        report(session, &task_view, &snapshot, background);
+        task_reader.mark_delivered();
+        report(session, &entry, &task_reader, &snapshot, background);
         drop(state);
         Ok(result)
     }
@@ -1335,16 +1417,31 @@ fn status_prefix(status: &str) -> usize {
     status.find(" · ").unwrap_or(status.len())
 }
 
-/// The room a status line gets: half the budget, or enough for its `[state] taskId` prefix and
-/// the cut marker, whichever is more, and never more than the text leaves after `reserved`.
-fn status_budget(status: &str, max_bytes: usize, reserved: usize) -> usize {
-    let needed = status_prefix(status) + output::MARK.len() + 1;
-    (max_bytes / 2 + 1)
-        .max(needed)
-        .min(max_bytes.saturating_sub(2 + reserved))
+/// Keep the handle and first-read notice whole, even when a footer leaves no room for details.
+fn fit_status(status: &mut String, max_bytes: usize, reserved: usize, fresh: bool) {
+    let notice = if fresh { NEW_READER_NOTE } else { "" };
+    let room = max_bytes.saturating_sub(2 + reserved + notice.len());
+    let prefix = status_prefix(status);
+    if prefix > room {
+        let (state, handle) = status[..prefix].split_once("] ").expect("a status prefix");
+        let state = state.split_ascii_whitespace().next().expect("a task state");
+        *status = format!("{state}] {handle}");
+    }
+    let prefix = status_prefix(status);
+    let budget = (max_bytes / 2).max(prefix + output::MARK.len()).min(room);
+    if status.len() > budget {
+        if budget < prefix + output::MARK.len() {
+            status.truncate(prefix);
+        } else {
+            output::cut_to(status, budget + 1);
+        }
+    }
+    // Even the longest task ID and compact state fit with a capped footer at maxBytes=100.
+    debug_assert!(status.len() <= room);
+    status.push_str(notice);
 }
 
-fn status_line(task: &Task, snapshot: &Snapshot) -> String {
+fn status_line(task: &Task, snapshot: &Snapshot, reader: &Reader) -> String {
     let state = match snapshot.exit_code {
         Some(code) if snapshot.state == "exited" => format!("exited {code}"),
         Some(code) => format!("{} (exit {code})", snapshot.state),
@@ -1352,7 +1449,7 @@ fn status_line(task: &Task, snapshot: &Snapshot) -> String {
     };
     let mut line = format!(
         "[{state}] {} · {:.1}s · {} lines · log {}",
-        task.id,
+        reader.handle(&task.id),
         snapshot.elapsed.as_secs_f64(),
         snapshot.lines,
         task.log_path.display()
@@ -1421,11 +1518,11 @@ fn members(members: &[process::Member]) -> String {
     text
 }
 
-fn task_json(action: Action, task: &Task, snapshot: &Snapshot) -> Value {
+fn task_json(action: Action, task: &Task, snapshot: &Snapshot, reader: &Reader) -> Value {
     json!({
         "ok": true,
         "action": action_name(action),
-        "taskId": task.id,
+        "taskId": reader.handle(&task.id),
         "state": snapshot.state,
         "exitCode": snapshot.exit_code,
         "pty": task.pty,
@@ -1478,4 +1575,124 @@ pub fn error_result(action: Action, message: &str) -> CallToolResult {
     result.structured_content =
         Some(json!({ "ok": false, "action": action_name(action), "error": message }));
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_during_blocking_render_keeps_reader_fresh_and_gate_pinned() {
+        let entry = Arc::new(TaskEntry::default());
+        let reader = entry.reader(None).unwrap();
+        let rendering = Arc::clone(&reader);
+        let reporting = Arc::clone(&entry);
+        let state = reader.read_gate().lock_owned().await;
+        let cancel = CancellationToken::new();
+        let cancelled = cancel.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let call = tokio::spawn(async move {
+            read_result(&cancelled, async move {
+                let state = tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                    state
+                })
+                .await
+                .unwrap();
+                rendering.mark_delivered();
+                let snapshot = Snapshot {
+                    state: "exited",
+                    exit_code: Some(0),
+                    forced_end: false,
+                    elapsed: Duration::ZERO,
+                    lines: 0,
+                    dropped: 0,
+                    evicted: false,
+                    output_open: false,
+                    expired: false,
+                    log_error: None,
+                    leftovers: Vec::new(),
+                    kept: false,
+                    tree_ended: true,
+                    held: Vec::new(),
+                    kill_error: None,
+                };
+                rendering.mark_reported(&snapshot);
+                reporting.mark_reported(&snapshot);
+                drop(state);
+                Ok(success(String::new(), Value::Null))
+            })
+            .await
+        });
+        started.await.unwrap();
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.unwrap_err().contains("Cancelled"));
+        assert!(reader.is_fresh());
+        assert!(!reader.is_reported() && !entry.is_reported() && !entry.tree_end_reported());
+        assert!(reader.read.try_lock().is_err());
+        release.send(()).unwrap();
+        let _state = tokio::time::timeout(Duration::from_secs(5), reader.read_gate().lock_owned())
+            .await
+            .unwrap();
+        assert!(reader.is_fresh());
+        assert!(!reader.is_reported() && !entry.is_reported());
+        read_result(&CancellationToken::new(), async {
+            reader.mark_delivered();
+            Ok(success(String::new(), Value::Null))
+        })
+        .await
+        .unwrap();
+        assert!(!reader.is_fresh());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_token_wins_over_a_ready_result() {
+        let reader = TaskEntry::default().reader(None).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = read_result(&cancel, async {
+            reader.mark_delivered();
+            Ok(success(String::new(), Value::Null))
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(reader.is_fresh());
+    }
+
+    #[test]
+    fn smallest_status_budget_keeps_handles_notices_and_footers_whole() {
+        let footer = "\n(999999 tasks; use list.)";
+        assert_eq!(footer.len(), 26);
+        for digits in [1, 13] {
+            let handle = format!("{}-{}.abcd", "0".repeat(26), "z".repeat(digits));
+            for state in [
+                "running",
+                "exited 255",
+                "killed (exit -9)",
+                "killed (exit -2147483648)",
+                "exited -2147483648",
+            ] {
+                for fresh in [false, true] {
+                    for max in [100, 101, 128, 256] {
+                        let mut status = format!(
+                            "[{state}] {handle} · 1.0s · 100 lines · log /{}",
+                            "x".repeat(200)
+                        );
+                        fit_status(&mut status, max, footer.len(), fresh);
+                        let text = format!("\n\n{status}{footer}");
+                        assert!(text.len() <= max, "{max}: {text}");
+                        assert!(status.contains(&handle), "{text}");
+                        assert_eq!(status.ends_with(NEW_READER_NOTE), fresh, "{text}");
+                        assert!(text.ends_with(footer), "{text}");
+                    }
+                }
+            }
+        }
+    }
 }

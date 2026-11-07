@@ -170,12 +170,26 @@ ends the process first, by a close deadline it enforces or a forced termination.
 It runs with idle exit off, refuses `--idle-exit`, and exits `1` when the
 namespace already has a daemon.
 
-`FASTEXEC_HTTP_TOKEN`, at least 16 visible ASCII characters, is the bearer token
-every `/mcp` request carries.
+`FASTEXEC_HTTP_TOKEN` holds one or more bearer tokens separated by ASCII
+whitespace. Each token needs at least 16 visible ASCII characters; empty lists
+and duplicate tokens are refused. Every `/mcp` request carries one of them.
 
-Modern MCP clients use `server/discover` and sessionless requests; legacy
-clients keep the `initialize` handshake and independent output cursors. Modern
-HTTP requests share an output cursor under the listener's single bearer token.
+Modern MCP clients use `server/discover` and sessionless requests. Each token
+has its own session for the listener's lifetime, with owner labels `http-t1`,
+`http-t2`, and so on in configuration order. Clients sharing a token share
+background notices. Other clients' running tasks appear as a count in the
+footer; `list` shows all tasks with their owner labels. Legacy clients retain
+their client-named sessions through the `initialize` handshake.
+
+A `start` result's `taskId` is a reader handle, `<taskId>.<reader>`. Poll with
+that handle to keep your own output cursor. IDs from `list` and background
+notices are bare task IDs: polling one creates a new reader from the beginning
+of the retained log and returns its handle with a `new reader` notice. A task
+can hold 16 readers per session; a new reader replaces the least recently used
+idle reader, while readers with active calls stay in place. A handle whose
+reader was evicted, or belongs to an ended session, attaches again from the
+retained log's beginning. These reader rules also apply to stdio and daemon
+endpoint clients.
 
 A systemd **user** unit shares `XDG_RUNTIME_DIR` with the user's shells, so
 `fastexec daemon status` and `stop` reach the daemon it started:

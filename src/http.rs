@@ -41,12 +41,12 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// The value that names the address clients reach, when a proxy stands in front of the listener.
 pub const PUBLIC_URL: &str = "FASTEXEC_PUBLIC_URL";
 
-/// The daemon's HTTP front door: one listener, the token that admits a request, and the render
-/// its sessions use.
+/// The daemon's HTTP front door: one listener, the token digests that admit requests, and the
+/// render its sessions use.
 pub struct Http {
     pub listener: TcpListener,
-    /// The token a request must present as `Authorization: Bearer`.
-    pub token: String,
+    /// The SHA-256 digests of tokens accepted as `Authorization: Bearer`.
+    pub digests: Vec<[u8; 32]>,
     /// How results are rendered for the sessions this listener serves.
     pub render: Render,
     /// What the sessions this listener serves inherit: captured before the daemon leaves the
@@ -202,24 +202,24 @@ type Reply = Response<BoxBody<Bytes, std::io::Error>>;
 /// Serves MCP over Streamable HTTP on `listener` until the daemon stops.
 pub async fn serve(
     listener: TcpListener,
-    token: String,
+    digests: Vec<[u8; 32]>,
     daemon: Arc<Daemon>,
     render: Render,
     launch: Arc<LaunchContext>,
     public_root: Option<Arc<str>>,
     stopped: CancellationToken,
 ) {
-    // Every session gets a server of its own over the daemon's service, so two HTTP clients share
-    // the daemon's tasks and keep their own cursors, exactly as two endpoints do.
+    // The factory makes a server for each legacy session or inline-lifecycle request.
     let service = Arc::clone(&daemon.service());
     // One table for this listener: the factory hands it to every session, so a URL a session
     // makes is served by the same route that carries the requests.
     let table = Arc::new(Transfers::new());
-    let stateless_session = Session::new(
-        "http-stateless".to_owned(),
-        "http-stateless".to_owned(),
-        Arc::clone(&launch),
-    );
+    let principals: Arc<[Arc<Session>]> = (0..digests.len())
+        .map(|index| {
+            let id = format!("t{}", index + 1);
+            Session::new(id.clone(), format!("http-{id}"), Arc::clone(&launch))
+        })
+        .collect();
     let factory = {
         let table = Arc::clone(&table);
         let public_root = public_root.clone();
@@ -237,7 +237,7 @@ pub async fn serve(
                 Some(Arc::clone(&table)),
                 public_root.clone(),
             );
-            server.stateless_session = Some(Arc::clone(&stateless_session));
+            server.principals = Some(Arc::clone(&principals));
             Ok(server)
         }
     };
@@ -269,7 +269,7 @@ pub async fn serve(
     // listener's own port is the upgrade, so no configured origin stays port-agnostic.
     let inner = StreamableHttpService::new(factory, Arc::new(sessions), config);
     let layer = Bearer {
-        digest: Sha256::digest(token.as_bytes()).into(),
+        digests: digests.into(),
         table,
         inner,
     };
@@ -392,12 +392,16 @@ fn client_fault(error: &hyper::Error) -> bool {
     false
 }
 
-/// The token check and the body cap, in front of rmcp: a request without the token never reaches
+/// The token position authenticated before rmcp receives a request.
+#[derive(Clone, Copy)]
+pub struct Principal(pub usize);
+
+/// The token check and the body cap, in front of rmcp: a request without a token never reaches
 /// a session, and one over the cap is refused before it is read.
 #[derive(Clone)]
 struct Bearer {
-    /// The SHA-256 of the token, so the comparison is over two fixed-size values.
-    digest: [u8; 32],
+    /// Fixed-size digests shared by every request on this listener.
+    digests: Arc<[[u8; 32]]>,
     /// The files this listener publishes under `/t/`.
     table: Arc<Transfers>,
     inner: StreamableHttpService<Server, LocalSessionManager>,
@@ -414,16 +418,16 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
 
     fn call(&mut self, request: Request<Incoming>) -> Self::Future {
         let mut inner = self.inner.clone();
-        let digest = self.digest;
+        let digests = Arc::clone(&self.digests);
         let table = Arc::clone(&self.table);
         Box::pin(async move {
             // A transfer is its own front door: no token, no body cap, and never a session.
             if request.uri().path().starts_with("/t/") {
                 return Ok(serve_transfer(request, table).await);
             }
-            if !authorized(request.headers(), &digest) {
+            let Some(principal) = authorized(request.headers(), &digests) else {
                 return Ok(refusal(StatusCode::UNAUTHORIZED, "Bearer"));
-            }
+            };
             // Two routes, and no other: a proxy that forwards its prefix without stripping it
             // fails here, at `initialize`, rather than at a download an hour later.
             if request.uri().path() != "/mcp" {
@@ -434,7 +438,8 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
             if declared_length(request.headers()).is_some_and(|length| length > LIMIT as u64) {
                 return Ok(refusal(StatusCode::PAYLOAD_TOO_LARGE, ""));
             }
-            let (parts, body) = request.into_parts();
+            let (mut parts, body) = request.into_parts();
+            parts.extensions.insert(Principal(principal));
             let request = Request::from_parts(parts, Limited::new(body, LIMIT));
             let answer = inner
                 .call(request)
@@ -484,29 +489,27 @@ fn declared_length(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// Whether the request carries this daemon's token. The digest comparison touches every byte of
-/// both values, so the time it takes says nothing about how much of a guess was right.
-fn authorized(headers: &HeaderMap, digest: &[u8; 32]) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let Some((scheme, token)) = value.split_once(' ') else {
-        return false;
-    };
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return false;
+/// The token position, comparing every byte of every digest without a match-dependent branch.
+fn authorized(headers: &HeaderMap, digests: &[[u8; 32]]) -> Option<usize> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
+        return None;
     }
-    // The token is compared as the header carries it: the daemon accepted only bytes a header
-    // can hold, so nothing here is trimmed or reinterpreted.
+    // A credential is compared exactly as the header carries it, without trimming.
     let given: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-    given
+    digests
         .iter()
-        .zip(digest)
-        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
-        == 0
+        .enumerate()
+        .fold(0usize, |matched, (index, digest)| {
+            let difference = given
+                .iter()
+                .zip(digest)
+                .fold(0u8, |difference, (a, b)| difference | (a ^ b));
+            let mask = 0usize.wrapping_sub(usize::from(difference == 0));
+            (matched & !mask) | ((index + 1) & mask)
+        })
+        .checked_sub(1)
 }
 
 /// The bytes a streamed file is read in.
@@ -889,30 +892,29 @@ mod tests {
     }
 
     #[test]
-    fn the_token_admits_only_itself() {
-        let token = "0123456789abcdef";
-        assert!(authorized(
-            &headers(&format!("Bearer {token}")),
-            &digest(token)
-        ));
-        assert!(authorized(
-            &headers(&format!("bearer {token}")),
-            &digest(token)
-        ));
-        assert!(!authorized(
-            &headers(&format!("Bearer {token}x")),
-            &digest(token)
-        ));
-        assert!(!authorized(
-            &headers(&format!("Bearer {}", &token[..15])),
-            &digest(token)
-        ));
-        assert!(!authorized(
-            &headers("Basic 0123456789abcdef"),
-            &digest(token)
-        ));
-        assert!(!authorized(&headers(token), &digest(token)));
-        assert!(!authorized(&HeaderMap::new(), &digest(token)));
+    fn the_tokens_admit_only_themselves_and_return_their_positions() {
+        let tokens = ["0123456789abcdef", "fedcba9876543210", "a_different_token"];
+        let digests = tokens.map(digest);
+        for (index, token) in tokens.iter().enumerate() {
+            for scheme in ["Bearer", "bearer", "BEARER"] {
+                assert_eq!(
+                    authorized(&headers(&format!("{scheme} {token}")), &digests),
+                    Some(index)
+                );
+            }
+        }
+        for value in [
+            "Bearer 0123456789abcdefx",
+            "Bearer 0123456789abcde",
+            "Bearer  0123456789abcdef",
+            "Bearer ",
+            "Basic 0123456789abcdef",
+            "0123456789abcdef",
+        ] {
+            assert_eq!(authorized(&headers(value), &digests), None);
+        }
+        assert_eq!(authorized(&HeaderMap::new(), &digests), None);
+        assert_eq!(authorized(&headers("Bearer 0123456789abcdef"), &[]), None);
     }
 
     #[test]

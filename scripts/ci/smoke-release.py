@@ -149,7 +149,7 @@ def smoke(binary, version):
                 task = result["taskId"]
             with contextlib.closing(Client(binary, env, version)) as second:
                 listed, _ = second.tool("exec", {"action": "list"})
-                assert any(item["taskId"] == task for item in listed["tasks"]), listed
+                assert any(item["taskId"] == task.split(".", 1)[0] for item in listed["tasks"]), listed
                 result, text = second.tool("exec", {
                     "action": "poll", "taskId": task, "input": "again\n", "waitMs": 10000,
                 })
