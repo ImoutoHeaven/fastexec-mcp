@@ -1,5 +1,10 @@
 # fastexec
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/fastexec-dark.svg">
+  <img src="assets/fastexec.svg" alt="fastexec" width="560">
+</picture>
+
 `fastexec` is an MCP server that runs bash commands as background tasks, with
 stdin pipes, interactive PTYs, bounded output, and process-tree termination, and
 reads, writes, and edits files on the host. It also runs a background daemon
