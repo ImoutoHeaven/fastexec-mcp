@@ -250,13 +250,15 @@ pub async fn serve(
     // A tool result is one answer, and every client here speaks event streams.
     config.json_response = false;
     config.sse_keep_alive = Some(Duration::from_secs(15));
+    // Gemini rejects empty SSE priming events before reading the JSON-RPC answer.
+    config.sse_retry = None;
     config.cancellation_token = stopped.child_token();
     config.allowed_hosts = allowed_hosts(bound, remote_allowed());
     config.allowed_origins = allowed_origins(bound, &origins_from_env());
     let mut session_config = SessionConfig::default();
     session_config.channel_capacity = 16;
     session_config.keep_alive = Some(Duration::from_secs(600));
-    session_config.sse_retry = Some(Duration::from_secs(3));
+    session_config.sse_retry = None;
     session_config.completed_cache_ttl = Duration::from_secs(60);
     session_config.init_timeout = Some(Duration::from_secs(60));
     let mut sessions = LocalSessionManager::default();

@@ -1047,6 +1047,61 @@ fn inline_requests_with_an_older_version_use_the_principal_session() {
 }
 
 #[test]
+fn legacy_sse_responses_start_with_json_instead_of_empty_priming_events() {
+    let fixture = Fixture::new("sse-json");
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
+    let headers = "User-Agent: Google\r\nMCP-Protocol-Version: 2025-11-25\r\n";
+    for (method, params) in [
+        (
+            "initialize",
+            json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"roots": {"listChanged": true}, "sampling": {}},
+                "clientInfo": {"name": "mcp", "version": "0.1.0"},
+            }),
+        ),
+        ("tools/list", json!({})),
+        (
+            "tools/call",
+            json!({"name": "exec", "arguments": {"action": "list"}}),
+        ),
+    ] {
+        client.next_id += 1;
+        let id = client.next_id;
+        let response = client.post_with(
+            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string(),
+            headers,
+        );
+        assert_eq!(response.status, 200, "{method}: {}", response.body);
+        assert_eq!(response.header("content-type"), Some("text/event-stream"));
+        // Gemini rejects an empty priming event before it reads the JSON-RPC answer.
+        let data = response
+            .body
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .expect("an SSE data event");
+        let answer: Value = serde_json::from_str(data.trim())
+            .unwrap_or_else(|error| panic!("{method}: first SSE data must be JSON: {error}"));
+        assert_eq!(answer["id"], id);
+        assert!(answer["result"].is_object(), "{method}: {answer}");
+        match method {
+            "initialize" => {
+                assert_eq!(answer["result"]["protocolVersion"], "2025-11-25");
+                client.session = Some(response.header("mcp-session-id").unwrap().to_owned());
+                let notified = client.post_with(
+                    &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
+                    headers,
+                );
+                assert_eq!(notified.status, 202);
+            }
+            "tools/list" => assert!(!answer["result"]["tools"].as_array().unwrap().is_empty()),
+            "tools/call" => assert_ne!(answer["result"]["isError"], true),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn legacy_initialize_with_a_modern_version_keeps_its_client_session() {
     let fixture = Fixture::new("legacy-new");
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
