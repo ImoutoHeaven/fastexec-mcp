@@ -4186,11 +4186,12 @@ fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
     let (ready, ready_bash) = scratch("keyboard-mode-ready");
     let (received, received_bash) = scratch("keyboard-mode-received");
     let (done, done_bash) = scratch("keyboard-mode-done");
+    // Up is three non-newline ASCII bytes; Bash 3.2 supports -n, but not -N.
     let mut server = Server::start();
     let (out, text) = server.ok(json!({
         "action": "start", "pty": true, "loginShell": false,
         "cols": 100, "rows": 40, "waitMs": 0,
-        "command": format!("stty raw -echo; printf '\\033[?2026h\\033[?1h'; : > '{ready_bash}'; IFS= read -r -N3 key; printf '%s' \"$key\" > '{received_bash}'; : > '{done_bash}'")
+        "command": format!("set -e; stty raw -echo; printf '\\033[?2026h\\033[?1h'; : > '{ready_bash}'; IFS= read -r -n3 key || {{ status=$?; printf 'key read failed: status=%s bash=%s\\n' \"$status\" \"$BASH_VERSION\" >&2; exit \"$status\"; }}; printf '%s' \"$key\" > '{received_bash}'; : > '{done_bash}'")
     }));
     assert!(!text.contains("Cannot"), "{text}");
     let task = server.id(1);
