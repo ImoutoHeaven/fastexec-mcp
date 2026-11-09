@@ -160,6 +160,51 @@ fn the_first_write_to_closed_stdin_reports_the_writer_error() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_resize_input_risk_stays_explicit_for_short_keys_and_later_input() {
+    let mut server = Server::start();
+    let task = server.task(json!({
+        "action": "start", "pty": true, "cols": 100, "rows": 40,
+        "command": "printf 'READY\\n'; sleep 30",
+        "returnWhen": {"outputContains": ["READY"]}, "waitMs": 10_000
+    }));
+    for arguments in [
+        json!({"action": "poll", "taskId": task, "cols": 80, "rows": 20,
+               "keys": ["Up"], "keyDelayMs": 0, "waitMs": 0, "maxBytes": 100}),
+        json!({"action": "poll", "taskId": task, "input": "x",
+               "waitMs": 0, "maxBytes": 100, "raw": true}),
+    ] {
+        let result = server.exec(arguments);
+        assert_ne!(result["isError"], true, "{result}");
+        let warning = result["structuredContent"]["inputWarning"]
+            .as_str()
+            .unwrap();
+        for risk in [
+            "leading input byte",
+            "after a resize",
+            "short keys",
+            "does not confirm delivery to the program",
+        ] {
+            assert!(warning.contains(risk), "{result}");
+        }
+        assert!(
+            text(&result).contains(warning),
+            "full warning beyond maxBytes: {result}"
+        );
+        assert!(
+            result["structuredContent"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str() == Some(warning)),
+            "{result}"
+        );
+    }
+    let ended = server.exec(json!({"action": "kill", "taskId": task, "waitMs": 10_000}));
+    assert_ne!(ended["isError"], true, "{ended}");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn canonical_input_keys_and_cross_poll_lines_always_report_the_risk() {

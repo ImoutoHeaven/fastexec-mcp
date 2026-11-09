@@ -4186,18 +4186,18 @@ fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
     let (ready, ready_bash) = scratch("keyboard-mode-ready");
     let (received, received_bash) = scratch("keyboard-mode-received");
     let (done, done_bash) = scratch("keyboard-mode-done");
-    // Up is three non-newline ASCII bytes; Bash 3.2 supports -n, but not -N.
+    let (stderr, stderr_bash) = scratch("keyboard-mode-stderr");
     let mut server = Server::start();
     let (out, text) = server.ok(json!({
         "action": "start", "pty": true, "loginShell": false,
         "cols": 100, "rows": 40, "waitMs": 0,
-        "command": format!("set -e; stty raw -echo; printf '\\033[?2026h\\033[?1h'; : > '{ready_bash}'; IFS= read -r -n3 key || {{ status=$?; printf 'key read failed: status=%s bash=%s\\n' \"$status\" \"$BASH_VERSION\" >&2; exit \"$status\"; }}; printf '%s' \"$key\" > '{received_bash}'; : > '{done_bash}'")
+        "command": format!("set -e; stty raw -echo; printf '\\033[?2026h\\033[?1h'; : > '{ready_bash}'; dd bs=1 count=3 of='{received_bash}' 2> '{stderr_bash}'; : > '{done_bash}'")
     }));
     assert!(!text.contains("Cannot"), "{text}");
     let task = server.id(1);
     let log = PathBuf::from(out["logPath"].as_str().unwrap());
-    // A CPR can belong to ConPTY's startup rather than this fixture. Wait for stty and the
-    // exact declarations in capture's raw log: capture feeds the emulator before writing it.
+    // ConPTY can query CPR during startup. The ready file follows stty; the exact
+    // declarations in the raw log prove capture has already fed the emulator.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let read = std::fs::read_to_string(&log).unwrap_or_default();
@@ -4211,19 +4211,25 @@ fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    server.ok(json!({
+    let (poll_out, poll_text) = server.ok(json!({
         "action": "poll", "taskId": task, "cols": 80, "rows": 20,
         "keys": ["Up"], "keyDelayMs": 0, "waitMs": 1000
     }));
-    // The same bash reads the key; neither a new stdin reader nor ConPTY's synchronized
-    // display output decides which bytes arrived. Publish done only after the file closes.
+    // Keep the byte assertion independent of Bash's resize-sensitive read builtin.
+    // The shell publishes done only after dd closes the file.
     let deadline = Instant::now() + Duration::from_secs(30);
     while !done.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the program never finished reading the key: {:?}",
-            std::fs::read_to_string(&log).unwrap_or_default()
-        );
+        if Instant::now() >= deadline {
+            let (state, state_text, state_error) = server.call(json!({
+                "action": "poll", "taskId": task, "waitMs": 0, "raw": true
+            }));
+            panic!(
+                "the program never finished reading the key: raw={:?}; received={:?}; reader stderr={:?}; start={out} {text:?}; poll={poll_out} {poll_text:?}; failure state={state} {state_text:?} isError={state_error}",
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                std::fs::read(&*received).ok(),
+                std::fs::read_to_string(&*stderr).ok()
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     let bytes = std::fs::read(&*received).unwrap();

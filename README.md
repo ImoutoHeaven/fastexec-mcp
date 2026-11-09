@@ -125,6 +125,8 @@ mid-session.
   writes are acknowledged; a failed or unconfirmed write returns an error and
   may have partially taken effect. Canonical PTY input warns that long lines can
   be discarded even when split across polls; use a pipe or file for long text.
+  Windows MSYS readers may also lose a leading byte after a resize, even for
+  short keys; PTY input results explicitly warn about this [known risk](https://github.com/ImoutoHeaven/fastexec-mcp/issues/5).
   Output capture failures and permanent log loss are explicit, with warnings
   preserved even beyond `maxBytes`.
 - **Sensitive input and logs**: MCP hosts may log tool arguments (`command`,

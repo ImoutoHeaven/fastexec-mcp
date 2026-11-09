@@ -321,7 +321,10 @@ These fields describe `exec` results.
   can still take effect later; it must not be retried blindly. On Unix, canonical
   terminal input emits a warning that is never shortened: its line discipline
   can discard long lines, including a line accumulated over several polls.
-  Use a pipe or file when exact long-text delivery is required.
+  Use a pipe or file when exact long-text delivery is required. Windows PTY input
+  always warns that its mode could not be verified: MSYS console readers may
+  discard a leading byte after a resize, even for short keys ([#5](https://github.com/ImoutoHeaven/fastexec-mcp/issues/5)).
+  Writer acknowledgement does not confirm delivery to the application.
 - **Bundled ConPTY (`src/conpty.rs`)**: Windows x64 and arm64 builds embed Microsoft
   ConPTY `1.24.260710001` (`conpty.dll` and `OpenConsole.exe`, MIT). Each process
   extracts into a newly reserved owner-only directory named

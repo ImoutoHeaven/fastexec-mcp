@@ -1915,6 +1915,11 @@ impl Task {
                 Some(Ok(Some(true))) => Some(
                     "Canonical PTY input may silently discard long lines (Linux: over 4095 bytes), even across multiple polls. A terminal write does not confirm delivery to the program. Use pipe stdin or a file for long text.".to_owned()
                 ),
+                #[cfg(windows)]
+                _ => Some(
+                    "The Windows PTY input mode could not be verified. MSYS console readers may discard a leading input byte after a resize, even for short keys; terminal input can also transform or discard long lines across polls. A terminal write does not confirm delivery to the program. Use pipe stdin or a file when exact text delivery is required.".to_owned()
+                ),
+                #[cfg(not(windows))]
                 _ => Some(
                     "The PTY input mode could not be verified; terminal input may be transformed or discarded, including long lines split across polls. A terminal write does not confirm delivery to the program. Use pipe stdin or a file for long text.".to_owned()
                 ),
