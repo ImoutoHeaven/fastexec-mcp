@@ -209,6 +209,36 @@ fn a_short_transcript_fails_without_advancing_its_reader() {
     assert_eq!(consumed["structuredContent"]["output"], "");
 }
 
+fn task_location(result: &Value, structured: bool) -> (String, PathBuf) {
+    if structured {
+        (
+            result["structuredContent"]["taskId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            PathBuf::from(result["structuredContent"]["logPath"].as_str().unwrap()),
+        )
+    } else {
+        let body = text(result);
+        let status = body
+            .lines()
+            .find(|line| line.starts_with("[exited 0] "))
+            .unwrap();
+        (
+            status.split_whitespace().nth(2).unwrap().to_owned(),
+            PathBuf::from(
+                status
+                    .split_once(" · log ")
+                    .unwrap()
+                    .1
+                    .split(" · ")
+                    .next()
+                    .unwrap(),
+            ),
+        )
+    }
+}
+
 fn assert_encoding_warning(result: &Value, structured: bool) {
     assert_ne!(result["isError"], true, "{}", text(result));
     let body = text(result);
@@ -233,58 +263,38 @@ fn encoding_warnings_survive_every_mode_and_small_output_budget() {
     for mode in ["text", "both", "structured"] {
         for structured in [false, true] {
             let mut server = Server::with_render(mode, structured);
-            for view in 0..3 {
-                let mut arguments = json!({"action": "start", "command": "printf '\\377DATA\\n'",
-                                           "waitMs": 10000, "maxBytes": 100});
-                match view {
-                    0 => {}
-                    1 => arguments["raw"] = json!(true),
-                    2 => {
-                        arguments["pty"] = json!(true);
-                        arguments["screen"] = json!(true);
-                    }
-                    _ => unreachable!(),
-                }
+            for raw in [false, true] {
+                let arguments = json!({"action": "start", "command": "printf '\\377DATA\\n'",
+                                       "waitMs": 10000, "maxBytes": 100, "raw": raw});
                 assert_encoding_warning(&server.exec(arguments), structured);
             }
 
-            // A transcript has its own UTF-8 bytes; corrupt one without shortening the file.
+            // ConPTY can normalize invalid program bytes; corrupt the retained files instead.
             let started = server.exec(json!({"action": "start", "pty": true,
                 "command": "printf 'ADATA\\n'", "waitMs": 10000}));
             assert_ne!(started["isError"], true, "{}", text(&started));
-            let (handle, path) = if structured {
-                (
-                    started["structuredContent"]["taskId"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                    PathBuf::from(started["structuredContent"]["logPath"].as_str().unwrap()),
-                )
-            } else {
-                let body = text(&started);
-                let status = body
-                    .lines()
-                    .find(|line| line.starts_with("[exited 0] "))
-                    .unwrap();
-                (
-                    status.split_whitespace().nth(2).unwrap().to_owned(),
-                    PathBuf::from(
-                        status
-                            .split_once(" · log ")
-                            .unwrap()
-                            .1
-                            .split(" · ")
-                            .next()
-                            .unwrap(),
-                    ),
-                )
-            };
+            let (handle, path) = task_location(&started, structured);
+            let task_id = handle.split_once('.').unwrap().0;
+            let mut log = std::fs::read(&path).unwrap();
+            assert!(!log.is_empty());
+            assert!(std::str::from_utf8(&log).is_ok());
+            let payload = log
+                .windows(b"ADATA".len())
+                .rposition(|part| part == b"ADATA")
+                .expect("the PTY log contains the displayed payload");
+            log[payload] = 0xff;
+            assert!(std::str::from_utf8(&log).is_err());
+            std::fs::write(&path, log).unwrap();
+            let screen = server.exec(json!({"action": "poll", "taskId": task_id,
+                "screen": true, "waitMs": 0, "maxBytes": 100}));
+            assert_encoding_warning(&screen, structured);
+
             let path = path.with_extension("transcript.txt");
             let mut bytes = std::fs::read(&path).unwrap();
             assert!(bytes.starts_with(b"ADATA\n"));
             bytes[0] = 0xff;
             std::fs::write(&path, bytes).unwrap();
-            let result = server.exec(json!({"action": "transcript", "taskId": handle,
+            let result = server.exec(json!({"action": "transcript", "taskId": task_id,
                                            "maxBytes": 100}));
             assert_encoding_warning(&result, structured);
         }
