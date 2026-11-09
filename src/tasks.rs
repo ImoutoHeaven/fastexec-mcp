@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 /// What a server admits and keeps: how many tasks may run at once, how many finished tasks stay
 /// in the registry, and how long a finished one is kept.
@@ -49,6 +50,7 @@ impl Limits {
 const TASK_LOG_LIMIT: u64 = 64 << 20;
 const TOTAL_LOG_LIMIT: u64 = 1 << 30;
 const INPUT_QUEUE_LIMIT: usize = 1 << 20;
+const INPUT_WRITE_LIMIT: Duration = Duration::from_secs(5);
 /// Output that pauses this long has finished a frame: the chunks of one redraw arrive within
 /// a millisecond or two of each other, frames 8 ms or more apart.
 const FRAME_PAUSE: Duration = Duration::from_millis(4);
@@ -134,15 +136,18 @@ struct Workers {
     ender: mpsc::Sender<EndWork>,
 }
 
+type OutputChunk = std::io::Result<(Instant, Vec<u8>)>;
+
 struct ReadWork {
     output: Box<dyn Read + Send>,
-    chunks: mpsc::SyncSender<(Instant, Vec<u8>)>,
+    chunks: mpsc::SyncSender<OutputChunk>,
+    pty: bool,
 }
 
 struct CaptureWork {
     shared: Arc<Tasks>,
     task: Arc<Task>,
-    received: mpsc::Receiver<(Instant, Vec<u8>)>,
+    received: mpsc::Receiver<OutputChunk>,
     log: File,
     answer: Option<mpsc::Sender<Input>>,
     eof: mpsc::Sender<()>,
@@ -191,7 +196,7 @@ impl Workers {
     fn new() -> std::io::Result<Self> {
         Ok(Self {
             reader: worker("fastexec-output", |job: ReadWork| {
-                read_chunks(job.output, job.chunks);
+                read_chunks(job.output, job.chunks, job.pty);
             })?,
             capture: worker("fastexec-capture", |job: CaptureWork| {
                 capture(&job.shared, &job.task, job.received, job.log, job.answer);
@@ -200,17 +205,27 @@ impl Workers {
             input: worker("fastexec-input", |job: InputWork| {
                 let mut input = Some(job.input);
                 for message in job.received {
-                    match message {
-                        Input::Data(bytes) => {
-                            let delivered = input.as_mut().is_some_and(|input| {
-                                input.write_all(&bytes).and_then(|()| input.flush()).is_ok()
-                            });
-                            job.task.queued.fetch_sub(bytes.len(), Ordering::SeqCst);
-                            if !delivered && input.take().is_some() {
-                                *lock(&job.task.input) = None;
-                            }
-                        }
-                        Input::Eof => drop(input.take()),
+                    let delivered = input
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                        .and_then(|input| {
+                            input.write_all(&message.bytes).and_then(|()| input.flush())
+                        })
+                        .map_err(|error| {
+                            format!("INPUT_WRITE_FAILED: stdin is closed or unwritable: {error}; the input may have been partially delivered.")
+                        });
+                    job.task
+                        .queued
+                        .fetch_sub(message.bytes.len(), Ordering::SeqCst);
+                    if let Err(error) = &delivered {
+                        *lock(&job.task.input_error) = Some(error.clone());
+                        *lock(&job.task.input) = None;
+                    }
+                    if message.eof || delivered.is_err() {
+                        drop(input.take());
+                    }
+                    if let Some(done) = message.done {
+                        let _ = done.send(delivered);
                     }
                 }
             })?,
@@ -298,6 +313,8 @@ pub struct Task {
     /// Signals each captured output chunk and each synchronized update its timeout ends.
     activity: watch::Sender<()>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
+    input_warning: Mutex<Option<String>>,
+    input_error: Mutex<Option<String>>,
     queued: AtomicUsize,
     /// One poll's `input`, `keys`, and `eof` go out as one sequence: this gate holds the next
     /// sequence out, so a delayed key press cannot land in the middle of another write.
@@ -378,7 +395,9 @@ struct Output {
     evicted: bool,
     /// The first log write failure; capture stops storing output after it.
     log_error: Option<String>,
-    /// Output reached EOF: every captured byte is final.
+    /// An unexpected output read failure: the captured prefix is incomplete.
+    capture_error: Option<String>,
+    /// Capture ended, at EOF or with a recorded read error: captured bytes are final.
     closed: bool,
     /// When the last output byte arrived, stored or not, or the end of a synchronized update by
     /// timeout or end of output showed the frame it held.
@@ -403,9 +422,10 @@ struct Final {
     kept: bool,
 }
 
-enum Input {
-    Data(Vec<u8>),
-    Eof,
+struct Input {
+    bytes: Vec<u8>,
+    eof: bool,
+    done: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 /// Task state for rendering.
@@ -422,6 +442,9 @@ pub struct Snapshot {
     pub output_open: bool,
     pub expired: bool,
     pub log_error: Option<String>,
+    pub capture_error: Option<String>,
+    pub input_warning: Option<String>,
+    pub input_error: Option<String>,
     /// Processes the root left running when it exited.
     pub leftovers: Vec<Member>,
     /// The task holds its tree past the root's exit, and some of it still runs.
@@ -701,6 +724,8 @@ impl Tasks {
             done: watch::Sender::new(false),
             activity: watch::Sender::new(()),
             input: Mutex::new(Some(input_tx.clone())),
+            input_warning: Mutex::new(None),
+            input_error: Mutex::new(None),
             queued: AtomicUsize::new(0),
             input_gate: tokio::sync::Mutex::new(()),
             terminal,
@@ -731,6 +756,7 @@ impl Tasks {
             .send(ReadWork {
                 output: spawned.output,
                 chunks,
+                pty: args.pty,
             })
             .unwrap_or_else(|_| unreachable!("prepared output worker stopped"));
         workers
@@ -1294,16 +1320,23 @@ fn short(elapsed: Duration) -> String {
 }
 
 /// Reads `output` until EOF and passes it on in chunks, each with the time it was read.
-fn read_chunks(mut output: Box<dyn Read + Send>, chunks: mpsc::SyncSender<(Instant, Vec<u8>)>) {
+fn read_chunks(mut output: Box<dyn Read + Send>, chunks: mpsc::SyncSender<OutputChunk>, pty: bool) {
+    #[cfg(not(unix))]
+    let _ = pty;
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         match output.read(&mut buffer) {
             Ok(0) => break,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break, // a closed PTY reports EIO on Unix
+            #[cfg(unix)]
+            Err(error) if pty && error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) => {
+                let _ = chunks.send(Err(error));
+                break;
+            }
             Ok(read) => {
                 if chunks
-                    .send((Instant::now(), buffer[..read].to_vec()))
+                    .send(Ok((Instant::now(), buffer[..read].to_vec())))
                     .is_err()
                 {
                     break;
@@ -1318,10 +1351,13 @@ fn read_chunks(mut output: Box<dyn Read + Send>, chunks: mpsc::SyncSender<(Insta
 fn answer_program(task: &Task, answer: &mpsc::Sender<Input>, reply: Vec<u8>) {
     if !reply.is_empty()
         && task.admit(reply.len())
-        && let Err(error) = answer.send(Input::Data(reply))
-        && let Input::Data(reply) = error.0
+        && let Err(error) = answer.send(Input {
+            bytes: reply,
+            eof: false,
+            done: None,
+        })
     {
-        task.queued.fetch_sub(reply.len(), Ordering::SeqCst);
+        task.queued.fetch_sub(error.0.bytes.len(), Ordering::SeqCst);
     }
 }
 
@@ -1332,7 +1368,7 @@ fn answer_program(task: &Task, answer: &mpsc::Sender<Input>, reply: Vec<u8>) {
 fn capture(
     shared: &Tasks,
     task: &Task,
-    received: mpsc::Receiver<(Instant, Vec<u8>)>,
+    received: mpsc::Receiver<OutputChunk>,
     log: File,
     answer: Option<mpsc::Sender<Input>>,
 ) {
@@ -1367,8 +1403,15 @@ fn capture(
                 }
             }
         };
-        let Some((arrived, chunk)) = received else {
+        let Some(received) = received else {
             break;
+        };
+        let (arrived, chunk) = match received {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                lock(&task.out).capture_error = Some(error.to_string());
+                break;
+            }
         };
         let chunk = chunk.as_slice();
         // The emulator stays locked until the chunk is in the log, so a screen and the log
@@ -1544,12 +1587,9 @@ impl Task {
         let mut buffer = vec![0_u8; 64 * 1024];
         while *from < written {
             let want = (written - *from).min(buffer.len() as u64) as usize;
-            let read = file.read(&mut buffer[..want])?;
-            if read == 0 {
-                break;
-            }
-            *from += read as u64;
-            if matcher.push(&buffer[..read]) == Some(0) {
+            file.read_exact(&mut buffer[..want])?;
+            *from += want as u64;
+            if matcher.push(&buffer[..want]) == Some(0) {
                 break;
             }
         }
@@ -1564,7 +1604,7 @@ impl Task {
             .map(|end| (end.exit_code, end.kept))
     }
 
-    /// Output has reached EOF.
+    /// Output capture has ended, normally or with a recorded error.
     pub fn output_closed(&self) -> bool {
         lock(&self.out).closed
     }
@@ -1605,17 +1645,15 @@ impl Task {
             output_open: end.as_ref().is_some_and(|end| end.output_open) && !out.closed,
             expired: end.as_ref().is_some_and(|end| end.expired),
             log_error: out.log_error.clone(),
+            capture_error: out.capture_error.clone(),
+            input_warning: lock(&self.input_warning).clone(),
+            input_error: lock(&self.input_error).clone(),
             kill_error: lock(&self.kill_error).clone(),
             leftovers: end.map(|end| end.leftovers).unwrap_or_default(),
             kept: held_past_exit && !tree_done,
             tree_ended: held_past_exit && tree_done,
             held: Vec::new(),
         }
-    }
-
-    /// Input still queued for the writer: bytes the program's stdin has not accepted yet.
-    pub fn input_pending(&self) -> bool {
-        self.queued.load(Ordering::SeqCst) > 0
     }
 
     /// Reserves room in the input queue for `size` bytes.
@@ -1773,8 +1811,8 @@ impl Task {
 
     /// Writes the pending lines into the transcript file after its final lines, and returns
     /// what this read covers: the final lines no earlier read of this session has shown, then
-    /// the pending lines. The next read starts after these final lines.
-    pub fn transcript(&self, shared: &Tasks, state: &mut ReadState) -> Result<Transcript, String> {
+    /// the pending lines. The caller commits the next position only after reading them.
+    pub fn transcript(&self, shared: &Tasks, state: &ReadState) -> Result<Transcript, String> {
         let terminal = self
             .terminal
             .as_ref()
@@ -1811,7 +1849,7 @@ impl Task {
         } else {
             spool.stopped.clone()
         };
-        let (start, shown) = std::mem::replace(&mut state.shown, (spool.bytes, spool.lines));
+        let (start, shown) = state.shown;
         Ok(Transcript {
             path: self.transcript_path(),
             first_line: shown + 1,
@@ -1824,37 +1862,97 @@ impl Task {
         })
     }
 
-    /// Queues `input`, then closes stdin when `eof` is set. Validation happens before any write.
-    pub fn send(&self, input: Option<&[u8]>, eof: bool) -> Result<(), String> {
+    /// Queues one write and confirms its result; a timeout never claims delivery or safe retry.
+    pub async fn send(
+        &self,
+        input: Option<&[u8]>,
+        eof: bool,
+        cancel: &CancellationToken,
+    ) -> Result<(), String> {
+        let Some(done) = self.queue_input(input, eof)? else {
+            return Ok(());
+        };
+        let uncertain = tokio::select! {
+            biased;
+            result = done => {
+                let result = result.unwrap_or_else(|_| Err(
+                    "INPUT_DELIVERY_UNCONFIRMED: the input writer stopped before confirming delivery; input may have been partially delivered. Do not blindly retry.".into()
+                ));
+                if let Err(error) = &result {
+                    *lock(&self.input_error) = Some(error.clone());
+                }
+                return result;
+            },
+            _ = cancel.cancelled() => "the call was cancelled",
+            _ = tokio::time::sleep(INPUT_WRITE_LIMIT) => "the input writer did not finish within 5 s",
+        };
+        let error = format!(
+            "INPUT_DELIVERY_UNCONFIRMED: {uncertain}; input may be partially delivered or still queued, and may take effect later. Do not blindly retry."
+        );
+        *lock(&self.input_error) = Some(error.clone());
+        Err(error)
+    }
+
+    fn queue_input(
+        &self,
+        input: Option<&[u8]>,
+        eof: bool,
+    ) -> Result<Option<oneshot::Receiver<Result<(), String>>>, String> {
         let data = input.filter(|bytes| !bytes.is_empty());
         if eof && self.pty {
             return Err("EOF_UNSUPPORTED_IN_PTY: a PTY has no stdin half-close. Press Ctrl-D with keys: [\"C-d\"], or kill the task.".into());
         }
+        if data.is_none() && !eof {
+            return Ok(None);
+        }
+        let bytes = data.unwrap_or_default();
+        if self.pty && !bytes.is_empty() {
+            let mode = lock(&self.pty_control)
+                .as_ref()
+                .map(|control| control.canonical_input());
+            let warning = match mode {
+                Some(Ok(Some(false))) => None,
+                Some(Ok(Some(true))) => Some(
+                    "Canonical PTY input may silently discard long lines (Linux: over 4095 bytes), even across multiple polls. A terminal write does not confirm delivery to the program. Use pipe stdin or a file for long text.".to_owned()
+                ),
+                _ => Some(
+                    "The PTY input mode could not be verified; terminal input may be transformed or discarded, including long lines split across polls. A terminal write does not confirm delivery to the program. Use pipe stdin or a file for long text.".to_owned()
+                ),
+            };
+            if let Some(warning) = warning {
+                *lock(&self.input_warning) = Some(warning);
+            }
+        }
         let mut sender = lock(&self.input);
         let Some(tx) = sender.as_ref() else {
             return match data {
-                None => Ok(()), // nothing to deliver; closing a closed stdin is a no-op
+                None => Ok(None), // closing a closed stdin is a no-op
                 Some(_) if self.is_running() => Err(
                     "stdin is closed (eof was sent or the program closed it); the input was not delivered.".into(),
                 ),
                 Some(_) => Err("The task has exited; the input was not delivered.".into()),
             };
         };
-        if let Some(text) = data {
-            if !self.admit(text.len()) {
-                return Err("INPUT_BACKPRESSURE: 1 MiB of earlier input is still waiting for the program to read it. Poll for output, then retry.".into());
-            }
-            if tx.send(Input::Data(text.to_vec())).is_err() {
-                self.queued.fetch_sub(text.len(), Ordering::SeqCst);
-                *sender = None;
-                return Err("stdin is closed; the input was not delivered.".into());
-            }
+        if !self.admit(bytes.len()) {
+            return Err("INPUT_BACKPRESSURE: 1 MiB of earlier input is still waiting for the program to read it. Poll for output, then retry.".into());
+        }
+        let (done, result) = oneshot::channel();
+        if tx
+            .send(Input {
+                bytes: bytes.to_vec(),
+                eof,
+                done: Some(done),
+            })
+            .is_err()
+        {
+            self.queued.fetch_sub(bytes.len(), Ordering::SeqCst);
+            *sender = None;
+            return Err("stdin is closed; the input was not delivered.".into());
         }
         if eof {
-            let _ = tx.send(Input::Eof);
             *sender = None;
         }
-        Ok(())
+        Ok(Some(result))
     }
 
     /// Terminates the task's tree. A running task is marked killed, and the waiter thread records
@@ -1973,12 +2071,9 @@ impl Task {
             let mut buffer = vec![0_u8; 64 * 1024];
             while remaining > 0 {
                 let want = remaining.min(buffer.len() as u64) as usize;
-                let read = file.read(&mut buffer[..want])?;
-                if read == 0 {
-                    break;
-                }
-                builder.push(&buffer[..read]);
-                remaining -= read as u64;
+                file.read_exact(&mut buffer[..want])?;
+                builder.push(&buffer[..want]);
+                remaining -= want as u64;
             }
         }
         let window = builder.finish();
@@ -2260,6 +2355,68 @@ mod private_directory_tests {
     }
 }
 
+#[cfg(test)]
+mod output_reads {
+    use super::*;
+
+    struct InterruptedThenFailed(u8);
+
+    impl Read for InterruptedThenFailed {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            match self.0 {
+                1 => Err(std::io::ErrorKind::Interrupted.into()),
+                2 => {
+                    buffer[..6].copy_from_slice(b"prefix");
+                    Ok(6)
+                }
+                3 => Err(std::io::Error::other("output read failed")),
+                _ => panic!("an unexpected error must end capture"),
+            }
+        }
+    }
+
+    #[test]
+    fn unexpected_output_read_errors_follow_the_captured_prefix() {
+        for pty in [false, true] {
+            let (sender, received) = mpsc::sync_channel(2);
+            read_chunks(Box::new(InterruptedThenFailed(0)), sender, pty);
+            let mut chunks = received.into_iter();
+            assert_eq!(chunks.next().unwrap().unwrap().1, b"prefix");
+            assert_eq!(
+                chunks.next().unwrap().unwrap_err().to_string(),
+                "output read failed"
+            );
+            assert!(chunks.next().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_pty_treats_eio_as_end_of_output() {
+        struct Eio;
+        impl Read for Eio {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+        for pty in [false, true] {
+            let (sender, received) = mpsc::sync_channel(1);
+            read_chunks(Box::new(Eio), sender, pty);
+            let chunks: Vec<_> = received.into_iter().collect();
+            if pty {
+                assert!(chunks.is_empty());
+            } else {
+                assert_eq!(chunks.len(), 1);
+                assert_eq!(
+                    chunks[0].as_ref().unwrap_err().raw_os_error(),
+                    Some(libc::EIO)
+                );
+            }
+        }
+    }
+}
+
 // Pure ID logic, so it runs on every platform; the tests below launch commands.
 #[cfg(test)]
 mod ids {
@@ -2385,7 +2542,7 @@ mod tests {
         tasks.log_bytes.store(before, Ordering::SeqCst);
         let log = File::create(tasks.dir.join("extra.log")).unwrap();
         let (chunks, received) = mpsc::sync_channel(1);
-        chunks.send((Instant::now(), vec![b'x'; 99])).unwrap();
+        chunks.send(Ok((Instant::now(), vec![b'x'; 99]))).unwrap();
         drop(chunks);
         capture(&tasks, &task, received, log, None);
         let out = lock(&task.out);
@@ -2577,7 +2734,7 @@ mod tests {
     #[test]
     fn eviction_takes_the_log_that_ended_earliest_not_the_one_that_started_first() {
         let _one_at_a_time = lock(&ONE_TASKS);
-        let (_runtime, tasks) = tasks();
+        let (runtime, tasks) = tasks();
         // The first task cannot finish until it gets a line: no timing guess.
         let slow = start(
             &tasks,
@@ -2589,14 +2746,9 @@ mod tests {
         .unwrap();
         let quick = start(&tasks, start_args()).unwrap();
         finish(&quick);
-        slow.send(
-            Some(
-                b"done
-",
-            ),
-            false,
-        )
-        .unwrap();
+        runtime
+            .block_on(slow.send(Some(b"done\n"), false, &CancellationToken::new()))
+            .unwrap();
         finish(&slow);
         // Registry order is start order here, and the end times are the other way round.
         let (slow_end, quick_end) = (slow.ended_at().unwrap(), quick.ended_at().unwrap());

@@ -28,8 +28,6 @@ const DEFAULT_KEY_DELAY_MS: u64 = 150;
 const MAX_KEY_DELAY_MS: u64 = 2_000;
 /// Longest pause the keys of one poll add up to before its wait begins.
 const MAX_KEY_PAUSE_MS: u64 = 30_000;
-/// Longest a key waits for the program's stdin to accept the input before it.
-const INPUT_ACCEPT_LIMIT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_BYTES: u64 = 16 * 1024;
 const MAX_BYTES_RANGE: std::ops::RangeInclusive<u64> = 100..=1024 * 1024;
 /// Room in `maxBytes` for the omission marker, the encoding note, and separators.
@@ -57,7 +55,7 @@ pub enum Action {
 pub struct Request {
     /// start: run a command. poll: send input and/or wait, then read unseen output. kill: terminate a task's process tree. list: this server's tasks. transcript: a PTY task's output as a terminal shows it, from the first line no earlier transcript returned, then the pending lines still on screen.
     pub action: Action,
-    /// start: the bash command line.
+    /// start: the bash command line. NUL bytes (U+0000) are rejected before execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     command: Option<String>,
     /// start: absolute working directory. Omit for the working directory the session started in.
@@ -78,7 +76,7 @@ pub struct Request {
     /// poll, kill, transcript: a reader handle (<taskId>.<reader>) to continue, or a bare task ID to attach a new reader from the retained log's beginning.
     #[serde(skip_serializing_if = "Option::is_none")]
     task_id: Option<String>,
-    /// poll: text written to the task exactly as given, before `keys` and before waiting, at most 16 KiB.
+    /// poll: at most 16 KiB written to stdin before keys and waiting. Write failures are reported; terminal line discipline can transform or discard PTY input, which is warned separately.
     #[serde(skip_serializing_if = "Option::is_none")]
     input: Option<String>,
     /// poll, PTY only: keys pressed after `input` is written, in array order, e.g. ["Enter"] or ["Escape", ":", "q", "Enter"]. One key per item, named as in tmux send-keys: Enter, Tab, BTab, Escape, Space, BSpace, Up, Down, Left, Right, Home, End, PageUp/PgUp/PPage, PageDown/PgDn/NPage, Insert/IC, Delete/DC, F1-F12, KP0-KP9, KP/, KP*, KP-, KP+, KP., KPEnter, [NUL]-[US] for C0 controls, 0xHH for a code point, or one character; prefixes C- (Ctrl), M- (Meta/Alt), S- (Shift) combine, as in C-c, M-x, C-M-a, S-Up, and ^c means C-c. Names ignore case. Arrow and keypad keys follow the program's cursor and keypad modes. An unknown name, or a modifier the key cannot carry (C-Enter, S-a) in the program's mode when the poll starts, is an error before anything is sent.
@@ -101,7 +99,7 @@ pub struct Request {
     /// start, poll, list, transcript: output window mode (default head_tail; transcript defaults to tail).
     #[serde(skip_serializing_if = "Option::is_none")]
     truncate: Option<Truncate>,
-    /// start, poll, kill, list, transcript: byte budget of the result, 100-1048576 (default 16384); error messages stay whole.
+    /// start, poll, kill, list, transcript: byte budget of the result, 100-1048576 (default 16384); errors and correctness warnings stay whole even beyond this budget.
     #[schemars(range(min = 100, max = 1048576))]
     #[serde(skip_serializing_if = "Option::is_none")]
     max_bytes: Option<u64>,
@@ -223,6 +221,14 @@ fn validate(request: &Request) -> Result<View, String> {
                 .is_none_or(|c| c.trim().is_empty()) =>
         {
             return Err("start needs a non-empty `command`.".into());
+        }
+        Action::Start
+            if request
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains('\0')) =>
+        {
+            return Err("`command` contains a NUL byte (U+0000); no command was started.".into());
         }
         Action::Poll | Action::Kill | Action::Transcript if request.task_id.is_none() => {
             return Err(format!(
@@ -668,9 +674,11 @@ impl Service {
                     if axes.is_some() && !names.is_empty() {
                         data = encode(&task)?;
                     }
-                    task.send(Some(&data), request.eof.unwrap_or(false))?;
+                    task.send(Some(&data), request.eof.unwrap_or(false), &call.cancel)
+                        .await?;
                 } else {
-                    task.send(Some(input), request.eof.unwrap_or(false))?;
+                    task.send(Some(input), request.eof.unwrap_or(false), &call.cancel)
+                        .await?;
                     press(&task, input, names, parsed, delay, &call.cancel).await?;
                 }
                 drop(gate);
@@ -818,7 +826,13 @@ impl Service {
         let mut lines = Vec::new();
         let mut entries = Vec::new();
         let mut shown = Vec::new();
+        let mut warnings = Vec::new();
         for (task, snapshot) in &tasks {
+            warnings.extend(
+                task_warnings(snapshot)
+                    .into_iter()
+                    .map(|warning| format!("{}: {warning}", task.id)),
+            );
             let command: String = task.command.chars().take(120).collect();
             let code = snapshot
                 .exit_code
@@ -848,7 +862,13 @@ impl Service {
                 command.replace('\n', " ")
             ));
             entries.push(json!({
+                "ok": task_io_ok(snapshot),
                 "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
+                "captureError": snapshot.capture_error, "logError": snapshot.log_error,
+                "inputWarning": snapshot.input_warning, "inputError": snapshot.input_error,
+                "droppedBytes": snapshot.dropped, "logEvicted": snapshot.evicted,
+                "outputOpen": snapshot.output_open, "outputIncomplete": output_incomplete(snapshot),
+                "warnings": task_warnings(snapshot),
                 "cols": size.map(|(cols, _)| cols), "rows": size.map(|(_, rows)| rows),
                 "elapsedMs": snapshot.elapsed.as_millis() as u64, "command": command, "logPath": task.log_path,
                 "lifetimeExpired": snapshot.expired, "keepTree": task.keep, "keptRunning": snapshot.kept,
@@ -878,7 +898,7 @@ impl Service {
         };
         success(
             text,
-            json!({ "ok": true, "action": "list", "tasks": entries }),
+            json!({ "ok": true, "action": "list", "tasks": entries, "warnings": warnings }),
         )
     }
 }
@@ -944,25 +964,7 @@ async fn press(
     let mut size = input.len();
     for (index, (name, key)) in names.iter().zip(parsed).enumerate() {
         let sent = |error: String| format!("{error} The first {index} keys were sent.");
-        // Input still queued, from this poll or an earlier one, goes first.
-        let mut follows = index > 0 || !input.is_empty();
-        let accepted = tokio::time::Instant::now() + INPUT_ACCEPT_LIMIT;
-        // ponytail: polls the input queue; a delivery signal from the writer if 5 ms
-        // granularity ever matters.
-        while task.input_pending() {
-            follows = true;
-            if tokio::time::Instant::now() >= accepted {
-                return Err(sent(
-                    "The program has not accepted earlier input for 5 s; the task keeps running."
-                        .into(),
-                ));
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => return Err(sent("Cancelled; the task keeps running.".into())),
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
-            }
-        }
-        if follows {
+        if index > 0 || !input.is_empty() {
             tokio::select! {
                 _ = cancel.cancelled() => return Err(sent("Cancelled; the task keeps running.".into())),
                 _ = tokio::time::sleep(delay) => {}
@@ -978,7 +980,7 @@ async fn press(
                 "Key {name:?} in the program's current keyboard mode takes input and keys past 16 KiB; send fewer keys per poll."
             )));
         }
-        task.send(Some(&bytes), false).map_err(sent)?;
+        task.send(Some(&bytes), false, cancel).await.map_err(sent)?;
     }
     Ok(())
 }
@@ -997,7 +999,25 @@ async fn read_gate(
     }
 }
 
-/// A cancelled render cannot consume the fresh notice; its blocking read still owns the gate.
+/// A blocking read owns the gate, but only a delivered result commits its working copy.
+struct StagedRead {
+    guard: tokio::sync::OwnedMutexGuard<ReadState>,
+    state: ReadState,
+}
+
+impl StagedRead {
+    fn new(guard: tokio::sync::OwnedMutexGuard<ReadState>) -> Self {
+        let state = guard.clone();
+        Self { guard, state }
+    }
+
+    fn commit(mut self) -> tokio::sync::OwnedMutexGuard<ReadState> {
+        *self.guard = self.state;
+        self.guard
+    }
+}
+
+/// A cancelled render drops its staged state while its blocking read still owns the gate.
 async fn read_result(
     cancel: &CancellationToken,
     result: impl std::future::Future<Output = Result<CallToolResult, String>>,
@@ -1084,11 +1104,17 @@ impl Service {
             Truncate::None => none_limit(),
             _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
         };
-        let (window, state) = tokio::task::spawn_blocking(move || {
-            let mut state = state;
-            let window =
-                reader.read_window(&mut state, view.truncate, budget, view.raw, encoding, None);
-            (window, state)
+        let (window, read) = tokio::task::spawn_blocking(move || {
+            let mut read = StagedRead::new(state);
+            let window = reader.read_window(
+                &mut read.state,
+                view.truncate,
+                budget,
+                view.raw,
+                encoding,
+                None,
+            );
+            (window, read)
         })
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
@@ -1100,17 +1126,13 @@ impl Service {
             dropped: after.dropped,
             evicted: after.evicted,
             log_error: after.log_error,
+            capture_error: after.capture_error,
+            input_warning: after.input_warning,
+            input_error: after.input_error,
             ..before
         };
         let mut status = status_line(&task, &snapshot, &task_reader);
         status.push_str(&ended.note(view.conditions));
-        if window.bad_lines > 0 {
-            status.push_str(&format!(
-                " · {} lines had bytes invalid in {}; pass encoding (e.g. big5, gbk)",
-                window.bad_lines,
-                encoding.name()
-            ));
-        }
         let mut structured = task_json(action, &task, &snapshot, &task_reader);
         structured["waitEndedBy"] = ended.json();
         let text = self.layout(
@@ -1124,6 +1146,7 @@ impl Service {
             &mut structured,
         );
         let result = success(text, structured);
+        let state = read.commit();
         task_reader.mark_delivered();
         report(session, &entry, &task_reader, &snapshot, background);
         drop(state);
@@ -1147,10 +1170,10 @@ impl Service {
     ) -> Result<CallToolResult, String> {
         let snapshot = task.snapshot_held();
         let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
-        let (transcript, state) = tokio::task::spawn_blocking(move || {
-            let mut state = state;
-            let transcript = reader.transcript(&tasks, &mut state);
-            (transcript, state)
+        let (transcript, read) = tokio::task::spawn_blocking(move || {
+            let read = StagedRead::new(state);
+            let transcript = reader.transcript(&tasks, &read.state);
+            (transcript, read)
         })
         .await
         .map_err(|error| format!("Internal failure while reading: {error}."))?;
@@ -1172,18 +1195,6 @@ impl Service {
             transcript.first_line,
             transcript.path.display()
         ));
-        if transcript.cut {
-            status.push_str(" · pending lines past the transcript's 64 MiB limit are left out");
-        }
-        if let Some(reason) = &transcript.stopped {
-            status.push_str(&format!(
-                " · the transcript stops after line {}: {reason}",
-                transcript.lines
-            ));
-        }
-        if let Some(warning) = conpty::load() {
-            status.push_str(&format!(" · {warning}, so lines may be missing"));
-        }
         let budget = match view.truncate {
             Truncate::None => none_limit(),
             _ => view
@@ -1212,8 +1223,34 @@ impl Service {
         structured["transcriptLines"] = json!(total);
         structured["finalLines"] = json!(transcript.lines);
         structured["firstLine"] = json!(transcript.first_line);
+        structured["transcriptIncomplete"] =
+            json!(transcript.cut || transcript.stopped.is_some() || conpty::load().is_some());
+        structured["transcriptError"] = json!(transcript.stopped);
+        if transcript.cut {
+            structured["warnings"].as_array_mut().unwrap().push(json!(
+                "pending lines past the transcript's 64 MiB limit are left out"
+            ));
+        }
+        if let Some(reason) = &transcript.stopped {
+            structured["warnings"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(format!(
+                    "the transcript stops after line {}: {reason}",
+                    transcript.lines
+                )));
+        }
+        if let Some(warning) = conpty::load() {
+            structured["warnings"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(format!(
+                    "{warning}, so transcript lines may be missing"
+                )));
+        }
         let logged = Arc::clone(&task);
-        let window = tokio::task::spawn_blocking(move || {
+        let (window, read) = tokio::task::spawn_blocking(move || {
+            let mut read = read;
             /// Reads the final lines into `builder`.
             fn read_into(
                 path: &std::path::Path,
@@ -1228,35 +1265,33 @@ impl Service {
                 let mut buffer = vec![0_u8; 64 * 1024];
                 while remaining > 0 {
                     let want = remaining.min(buffer.len() as u64) as usize;
-                    let read = file.read(&mut buffer[..want])?;
-                    if read == 0 {
-                        break;
-                    }
-                    builder.push(&buffer[..read]);
-                    remaining -= read as u64;
+                    file.read_exact(&mut buffer[..want])?;
+                    builder.push(&buffer[..want]);
+                    remaining -= want as u64;
                 }
                 Ok(())
             }
             let mut cleaner = Cleaner::default();
             let mut builder = WindowBuilder::new(spec, &mut cleaner, transcript.first_line);
-            if let Err(error) = read_into(
+            let window = match read_into(
                 &transcript.path,
                 transcript.start,
                 transcript.bytes,
                 &mut builder,
             ) {
-                // Writing the pending lines can evict this very task's files; the result is then
-                // the evicted one, as if the eviction had been seen up front.
-                if logged.evicted() {
-                    return Err(EVICTED_TRANSCRIPT.to_string());
+                Err(_) if logged.evicted() => Err(EVICTED_TRANSCRIPT.to_string()),
+                Err(error) => Err(format!("Cannot read the transcript file: {error}.")),
+                Ok(()) => {
+                    builder.push(transcript.pending.as_bytes());
+                    read.state.shown = (transcript.bytes, transcript.lines);
+                    Ok(builder.finish())
                 }
-                return Err(format!("Cannot read the transcript file: {error}."));
-            }
-            builder.push(transcript.pending.as_bytes());
-            Ok(builder.finish())
+            };
+            (window, read)
         })
         .await
-        .map_err(|error| format!("Internal failure while reading: {error}."))??;
+        .map_err(|error| format!("Internal failure while reading: {error}."))?;
+        let window = window?;
         let text = self.layout(
             render,
             &window,
@@ -1268,6 +1303,7 @@ impl Service {
             &mut structured,
         );
         let result = success(text, structured);
+        let state = read.commit();
         task_reader.mark_delivered();
         report(session, &entry, &task_reader, &snapshot, background);
         drop(state);
@@ -1344,21 +1380,21 @@ impl Service {
         let screen = task.screen()?;
         // The stream counts as read up to the output the screen shows.
         let (reader, until) = (Arc::clone(&task), screen.log_end);
-        let (read, state) = tokio::task::spawn_blocking(move || {
-            let mut state = state;
-            let read = reader.read_window(
-                &mut state,
+        let (window, read) = tokio::task::spawn_blocking(move || {
+            let mut read = StagedRead::new(state);
+            let window = reader.read_window(
+                &mut read.state,
                 Truncate::Tail,
                 MIN_BODY_BUDGET,
                 false,
                 reader.encoding,
                 Some(until),
             );
-            (read, state)
+            (window, read)
         })
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
-        read.map_err(|error| format!("Cannot read the task log: {error}."))?;
+        let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
         let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
         let mut status = status_line(&task, &snapshot, &task_reader);
         status.push_str(&ended.note(view.conditions));
@@ -1400,10 +1436,12 @@ impl Service {
         structured["rows"] = json!(screen.rows_count);
         structured["cursor"] = json!([row, col]);
         structured["omittedRows"] = json!(omitted);
+        add_encoding_warning(&mut structured, &window);
         if render.output_mode != OutputMode::Text {
             structured["output"] = json!(body);
         }
         let result = success(text, structured);
+        let state = read.commit();
         task_reader.mark_delivered();
         report(session, &entry, &task_reader, &snapshot, background);
         drop(state);
@@ -1460,20 +1498,6 @@ fn status_line(task: &Task, snapshot: &Snapshot, reader: &Reader) -> String {
     if snapshot.expired {
         line.push_str(" · killed by killAfterMs");
     }
-    if let Some(error) = &snapshot.log_error {
-        line.push_str(&format!(
-            " · log write failed ({error}); {} bytes were not stored",
-            snapshot.dropped
-        ));
-    } else if snapshot.dropped > 0 {
-        line.push_str(&format!(
-            " · {} bytes past the log limit were not stored",
-            snapshot.dropped
-        ));
-    }
-    if snapshot.evicted {
-        line.push_str(" · log evicted under the 1 GiB total limit");
-    }
     if snapshot.kept {
         let names = members(&snapshot.held);
         line.push_str(&match &snapshot.kill_error {
@@ -1490,13 +1514,6 @@ fn status_line(task: &Task, snapshot: &Snapshot, reader: &Reader) -> String {
     }
     if snapshot.forced_end {
         line.push_str(" · root forced after 5 s exit grace");
-    }
-    if snapshot.output_open {
-        line.push_str(if snapshot.kept {
-            " · processes it keeps hold the output open; later output may follow"
-        } else {
-            " · output stayed open after exit; later output may follow"
-        });
     }
     line
 }
@@ -1520,7 +1537,7 @@ fn members(members: &[process::Member]) -> String {
 
 fn task_json(action: Action, task: &Task, snapshot: &Snapshot, reader: &Reader) -> Value {
     json!({
-        "ok": true,
+        "ok": task_io_ok(snapshot),
         "action": action_name(action),
         "taskId": reader.handle(&task.id),
         "state": snapshot.state,
@@ -1530,6 +1547,14 @@ fn task_json(action: Action, task: &Task, snapshot: &Snapshot, reader: &Reader) 
         "logPath": task.log_path,
         "lifetimeExpired": snapshot.expired,
         "logError": snapshot.log_error,
+        "captureError": snapshot.capture_error,
+        "inputWarning": snapshot.input_warning,
+        "inputError": snapshot.input_error,
+        "droppedBytes": snapshot.dropped,
+        "logEvicted": snapshot.evicted,
+        "outputOpen": snapshot.output_open,
+        "outputIncomplete": output_incomplete(snapshot),
+        "warnings": task_warnings(snapshot),
         "keepTree": task.keep,
         "forcedEnd": snapshot.forced_end,
         "leftovers": members_json(&snapshot.leftovers),
@@ -1537,6 +1562,62 @@ fn task_json(action: Action, task: &Task, snapshot: &Snapshot, reader: &Reader) 
         "held": members_json(&snapshot.held),
         "killError": snapshot.kill_error,
     })
+}
+
+fn task_io_ok(snapshot: &Snapshot) -> bool {
+    snapshot.capture_error.is_none()
+        && snapshot.log_error.is_none()
+        && snapshot.input_error.is_none()
+}
+
+fn output_incomplete(snapshot: &Snapshot) -> bool {
+    snapshot.capture_error.is_some()
+        || snapshot.log_error.is_some()
+        || snapshot.dropped > 0
+        || snapshot.evicted
+}
+
+fn task_warnings(snapshot: &Snapshot) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(error) = &snapshot.capture_error {
+        warnings.push(format!(
+            "output capture failed ({error}); output is incomplete"
+        ));
+    }
+    if let Some(error) = &snapshot.log_error {
+        warnings.push(format!(
+            "log write failed ({error}); {} bytes were not stored",
+            snapshot.dropped
+        ));
+    } else if snapshot.dropped > 0 {
+        warnings.push(format!(
+            "{} bytes past the log limit were not stored",
+            snapshot.dropped
+        ));
+    }
+    if snapshot.evicted {
+        warnings
+            .push("log evicted under the 1 GiB total limit; stored output is unavailable".into());
+    }
+    if snapshot.output_open {
+        warnings.push(if snapshot.kept {
+            "processes it keeps hold the output open; later output may follow".into()
+        } else {
+            "output stayed open after exit; later output may follow".into()
+        });
+    }
+    if let Some(error) = &snapshot.kill_error {
+        warnings.push(format!(
+            "could not end the task's process tree: {error}; kill retries"
+        ));
+    }
+    if let Some(error) = &snapshot.input_error {
+        warnings.push(error.clone());
+    }
+    if let Some(warning) = &snapshot.input_warning {
+        warnings.push(warning.clone());
+    }
+    warnings
 }
 
 fn members_json(members: &[process::Member]) -> Value {
@@ -1551,7 +1632,21 @@ fn members_json(members: &[process::Member]) -> Value {
 fn add_window(value: &mut Value, window: &Window, omitted: Option<(u64, u64)>) {
     value["omittedLines"] = json!(omitted.map_or(0, |(first, last)| last - first + 1));
     value["omittedRange"] = json!(omitted.map(|(first, last)| [first, last]));
+    add_encoding_warning(value, window);
+}
+
+fn add_encoding_warning(value: &mut Value, window: &Window) {
     value["encodingErrors"] = json!(window.bad_lines);
+    if window.bad_lines > 0 {
+        value["warnings"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(format!(
+                "{} lines had bytes invalid in {}; pass encoding on a stream read (e.g. big5, gbk)",
+                window.bad_lines,
+                window.encoding.name()
+            )));
+    }
 }
 
 fn action_name(action: Action) -> &'static str {
@@ -1564,8 +1659,26 @@ fn action_name(action: Action) -> &'static str {
     }
 }
 
-fn success(text: String, structured: Value) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+fn success(mut text: String, structured: Value) -> CallToolResult {
+    // Completeness and delivery warnings stay whole, like tool errors, beyond maxBytes.
+    if let Some(warnings) = structured["warnings"].as_array() {
+        let warnings = warnings
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|warning| format!("Warning: {warning}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !warnings.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&warnings);
+        }
+    }
+    let content = vec![ContentBlock::text(text)];
+    let mut result = if structured["ok"] == false {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    };
     result.structured_content = Some(structured);
     result
 }
@@ -1582,25 +1695,141 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn critical_warnings_survive_small_budgets_and_every_render_mode() {
+        let service = Service::new(Tasks::new(tasks::Limits::OFF).unwrap(), false);
+        let snapshot = Snapshot {
+            state: "exited",
+            exit_code: Some(0),
+            forced_end: false,
+            elapsed: Duration::ZERO,
+            lines: 1,
+            dropped: 128,
+            evicted: true,
+            output_open: true,
+            expired: false,
+            log_error: None,
+            capture_error: Some("read failed".into()),
+            input_warning: Some("canonical input may be discarded".into()),
+            input_error: Some("stdin write failed".into()),
+            leftovers: Vec::new(),
+            kept: false,
+            tree_ended: true,
+            held: Vec::new(),
+            kill_error: None,
+        };
+        assert!(output_incomplete(&snapshot));
+        let warnings = task_warnings(&snapshot);
+        assert_eq!(warnings.len(), 6);
+        for mode in [OutputMode::Text, OutputMode::Both, OutputMode::Structured] {
+            for structured_content in [false, true] {
+                for raw in [false, true] {
+                    let render = Render {
+                        output_mode: mode,
+                        structured_content,
+                    }
+                    .effective();
+                    let view = View {
+                        truncate: Truncate::HeadTail,
+                        max_bytes: 100,
+                        raw,
+                        encoding: None,
+                        screen: false,
+                        conditions: false,
+                    };
+                    let mut cleaner = Cleaner::default();
+                    let mut builder = WindowBuilder::new(
+                        WindowSpec {
+                            truncate: view.truncate,
+                            budget: 256,
+                            raw,
+                            encoding: encoding_rs::UTF_8,
+                            source: "log",
+                        },
+                        &mut cleaner,
+                        1,
+                    );
+                    builder.push(b"captured prefix\n");
+                    let window = builder.finish();
+                    let mut structured = json!({ "ok": task_io_ok(&snapshot), "warnings": warnings,
+                        "exitCode": snapshot.exit_code, "outputIncomplete": output_incomplete(&snapshot) });
+                    let text = service.layout(
+                        render,
+                        &window,
+                        format!("[exited 0] task.reader · log {}", "x".repeat(200)),
+                        false,
+                        "",
+                        &view,
+                        "(no new output)",
+                        &mut structured,
+                    );
+                    let result = suppress(success(text, structured), render);
+                    let value = serde_json::to_value(result).unwrap();
+                    assert_eq!(value["isError"], true);
+                    let text = value["content"][0]["text"].as_str().unwrap();
+                    assert!(text.find("[exited 0]").unwrap() < text.find("Warning:").unwrap());
+                    for warning in &warnings {
+                        assert!(text.contains(&format!("Warning: {warning}")), "{text}");
+                    }
+                    if structured_content {
+                        assert_eq!(value["structuredContent"]["exitCode"], 0);
+                        assert_eq!(value["structuredContent"]["outputIncomplete"], true);
+                        assert_eq!(value["structuredContent"]["warnings"], json!(warnings));
+                    } else {
+                        assert!(value.get("structuredContent").is_none());
+                    }
+                }
+            }
+        }
+        service.tasks.shutdown();
+    }
+
+    #[tokio::test]
     async fn cancellation_during_blocking_render_keeps_reader_fresh_and_gate_pinned() {
         let entry = Arc::new(TaskEntry::default());
         let reader = entry.reader(None).unwrap();
+        fn read_payload(state: &mut ReadState) -> Window {
+            let bytes = b"prefix\n\x1b[";
+            let mut builder = WindowBuilder::new(
+                WindowSpec {
+                    truncate: Truncate::None,
+                    budget: 1024,
+                    raw: false,
+                    encoding: encoding_rs::UTF_8,
+                    source: "log",
+                },
+                &mut state.cleaner,
+                state.lines_before + 1,
+            );
+            builder.push(&bytes[state.cursor as usize..]);
+            let window = builder.finish();
+            state.cursor = bytes.len() as u64;
+            state.lines_before += window.newlines;
+            window
+        }
+
         let rendering = Arc::clone(&reader);
         let reporting = Arc::clone(&entry);
-        let state = reader.read_gate().lock_owned().await;
+        let mut state = reader.read_gate().lock_owned().await;
+        state.shown = (7, 2);
+        let initial_cleaner = format!("{:?}", state.cleaner);
         let cancel = CancellationToken::new();
         let cancelled = cancel.clone();
         let (entered, started) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
         let call = tokio::spawn(async move {
             read_result(&cancelled, async move {
-                let state = tokio::task::spawn_blocking(move || {
+                let read = tokio::task::spawn_blocking(move || {
+                    let mut read = StagedRead::new(state);
+                    let window = read_payload(&mut read.state);
+                    assert_eq!(window.fit(1024).0, "prefix");
+                    read.state.shown = (77, 7);
                     entered.send(()).unwrap();
                     blocked.recv().unwrap();
-                    state
+                    read
                 })
                 .await
                 .unwrap();
+                let state = read.commit();
                 rendering.mark_delivered();
                 let snapshot = Snapshot {
                     state: "exited",
@@ -1613,6 +1842,9 @@ mod tests {
                     output_open: false,
                     expired: false,
                     log_error: None,
+                    capture_error: None,
+                    input_warning: None,
+                    input_error: None,
                     leftovers: Vec::new(),
                     kept: false,
                     tree_ended: true,
@@ -1637,17 +1869,33 @@ mod tests {
         assert!(!reader.is_reported() && !entry.is_reported() && !entry.tree_end_reported());
         assert!(reader.read.try_lock().is_err());
         release.send(()).unwrap();
-        let _state = tokio::time::timeout(Duration::from_secs(5), reader.read_gate().lock_owned())
+        let state = tokio::time::timeout(Duration::from_secs(5), reader.read_gate().lock_owned())
             .await
             .unwrap();
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.lines_before, 0);
+        assert_eq!(state.shown, (7, 2));
+        assert_eq!(format!("{:?}", state.cleaner), initial_cleaner);
         assert!(reader.is_fresh());
         assert!(!reader.is_reported() && !entry.is_reported());
+        let mut read = StagedRead::new(state);
+        let output = read_payload(&mut read.state).fit(1024).0;
+        assert_eq!(
+            output, "prefix",
+            "the retry must read and clean the whole original payload"
+        );
         read_result(&CancellationToken::new(), async {
+            let state = read.commit();
             reader.mark_delivered();
-            Ok(success(String::new(), Value::Null))
+            drop(state);
+            Ok(success(output, Value::Null))
         })
         .await
         .unwrap();
+        let state = reader.read_gate().lock_owned().await;
+        assert_eq!(state.cursor, b"prefix\n\x1b[".len() as u64);
+        assert_eq!(state.lines_before, 1);
+        assert_eq!(state.shown, (7, 2));
         assert!(!reader.is_fresh());
     }
 

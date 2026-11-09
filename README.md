@@ -121,6 +121,12 @@ mid-session.
 - **Pipe stdin vs. PTY keys**: Pipe-mode stdin stays open until `eof: true` or
   exit (pass `< /dev/null` when stdin is unused). In PTY mode (`pty: true`),
   send text with `input` and terminal keys (such as `"Enter"` or `"C-c"`) with `keys`.
+- **Data integrity feedback**: Invalid or oversized requests are rejected. Input
+  writes are acknowledged; a failed or unconfirmed write returns an error and
+  may have partially taken effect. Canonical PTY input warns that long lines can
+  be discarded even when split across polls; use a pipe or file for long text.
+  Output capture failures and permanent log loss are explicit, with warnings
+  preserved even beyond `maxBytes`.
 - **Sensitive input and logs**: MCP hosts may log tool arguments (`command`,
   `input`, `keys`). Task output is written to log files (up to `64` MiB per
   task), and PTY transcripts record terminal-rendered screen text, including

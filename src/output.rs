@@ -251,6 +251,7 @@ pub struct Window {
     pub omitted: Option<(u64, u64)>,
     /// Lines that held byte sequences invalid in the selected encoding.
     pub bad_lines: u64,
+    pub encoding: &'static Encoding,
     /// LF bytes consumed, for the caller's line cursor.
     pub newlines: u64,
 }
@@ -592,6 +593,7 @@ impl<'a> WindowBuilder<'a> {
             source: self.spec.source,
             omitted: self.omitted,
             bad_lines: self.bad_lines,
+            encoding: self.spec.encoding,
             newlines: self.newlines,
         }
     }

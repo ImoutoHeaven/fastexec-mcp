@@ -22,7 +22,7 @@ ranges return an error before execution.
 
 | Action | Allowed Parameters | Summary |
 | --- | --- | --- |
-| `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Spawns `command` in GNU bash and waits up to `waitMs` (default `30000`, range `0–240000`). `cols`/`rows` set a PTY terminal's size (default `120×30`). |
+| `start` | `command`, `cwd`, `pty`, `loginShell`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Rejects NUL bytes in `command` before execution, then spawns it in GNU bash and waits up to `waitMs` (default `30000`, range `0–240000`). `cols`/`rows` set a PTY terminal's size (default `120×30`). |
 | `poll` | `taskId`, `cols`, `rows`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Resizes the terminal (PTY only), writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only), waits (`2000` ms with a resize, `input`, or `keys` and no `returnWhen`, `30000` ms otherwise), and returns unseen output. |
 | `kill` | `taskId`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns its final state. On a finished `keepTree` task, ends held processes while keeping the root exit result. |
 | `list` | `truncate`, `maxBytes` | Lists bare task IDs in this server (the namespace's daemon in `on` mode, newest first) with their state, owner, session, call ID, and held processes; creates no readers. Polling a listed ID attaches a new reader. Text fits `maxBytes` while `structuredContent.tasks` stays complete. |
@@ -41,7 +41,9 @@ ranges return an error before execution.
   still-running blocking read cannot be evicted. If every reader is busy,
   attachment is refused. A new attachment's first delivered output, transcript,
   or screen result says `new reader`; `kill` and cancelled calls leave that
-  notice pending. A cancelled blocking read may still advance its cursor.
+  notice pending. Log and transcript range reads reject premature EOF. Reader
+  cursors and decoding state commit only after complete rendering succeeds;
+  failed or cancelled reads leave unseen output available for the next call.
   Retention and output limits apply to each reader.
 - **`waitMs` vs. `killAfterMs`**: `waitMs` (`0–240000`) bounds only the current
   call's wait. A call that hits `waitMs`, matches `returnWhen`, or is cancelled
@@ -62,7 +64,8 @@ ranges return an error before execution.
 - **Window and encoding options**:
   - `maxBytes`: `100–1048576` (default `16384`). Rejected when
     `truncate: "none"`. Bounds the output window, status line, and background
-    footer together; metadata and JSON framing are outside that budget.
+    footer together; metadata and JSON framing are outside that budget. Correctness
+    warnings remain whole even when they exceed the budget.
   - `truncate`: `"head_tail"` (default for `start`/`poll`: ~10% head, ~90%
     tail), `"head"`, `"tail"` (default for `transcript`), or `"none"` (all
     unseen lines whole up to `4` MiB, with the rest reported as an omitted
@@ -139,7 +142,9 @@ ranges return an error before execution.
   marking a block whose match needed normalizing. Saving uses the same staged
   replacement and file restrictions as `write`. Both `read` and `edit` validate
   the opened file as regular; a FIFO cannot block `edit` while it holds the
-  server's file-mutation lock.
+  server's file-mutation lock. An edit fixes the read target and verifies its
+  identity, contents, and the requested path again before publishing; a changed
+  target or concurrent content update is an error.
 - **Paths**: A path resolves against the session's working directory, accepts
   `~` for the home directory, or is a native absolute path (`C:/...` or
   `C:\...` on Windows; a Git Bash `/c/...` path is not one).
@@ -196,19 +201,27 @@ These fields describe `exec` results.
 - **`start`, `poll`, `kill`, `transcript`**: `ok`, `action`, `taskId` (reader
   handle), `state` (`"running"`,
   `"exited"`, `"killed"`), `exitCode`, `forcedEnd`, `pty`, `elapsedMs`,
-  `logPath`, `lifetimeExpired`, `logError`, `keepTree`, `leftovers`
+  `logPath`, `lifetimeExpired`, `logError`, `captureError`, `outputIncomplete`,
+  `droppedBytes`, `logEvicted`, `outputOpen`, `inputWarning`, `inputError`,
+  `warnings`, `keepTree`, `leftovers`
   (`[{ pid, name }]`), `keptRunning`, `held` (`[{ pid, name }]`), `killError`.
-- **`start`, `poll` (additional)**: `waitEndedBy` (`{ condition, text? }`). With
-  `screen: true`, adds `cols`, `rows`, `cursor` (`[row, col]`), and `omittedRows`. Otherwise adds
-  `omittedLines`, `omittedRange` (`[first, last]` or `null`), `cutLines`, and
-  `encodingErrors`.
+- **`start`, `poll` (additional)**: `waitEndedBy` (`{ condition, text? }`) and
+  `encodingErrors`. With `screen: true`, adds `cols`, `rows`, `cursor`
+  (`[row, col]`), and `omittedRows`. Otherwise adds `omittedLines`,
+  `omittedRange` (`[first, last]` or `null`) and `cutLines`.
 - **`transcript` (additional)**: `transcriptPath`, `transcriptLines`,
-  `finalLines`, `firstLine`, `omittedLines`, `omittedRange`, `cutLines`, and
-  `encodingErrors`.
+  `finalLines`, `firstLine`, `omittedLines`, `omittedRange`, `cutLines`,
+  `encodingErrors`, `transcriptIncomplete`, and `transcriptError`.
 - **`list`**: `ok`, `action`, and `tasks` (`taskId` as a bare task ID, `state`, `exitCode`, `pty`,
   `cols`, `rows`, `elapsedMs`, `command` up to 120 chars, `logPath`,
   `lifetimeExpired`, `keepTree`, `keptRunning`, `held`, `leftovers`, `killError`,
-  `owner`, `session`, `callId`). `cols` and `rows` are `null` for a pipe task.
+  `owner`, `session`, `callId`, and each task's correctness fields listed above).
+  The list result has its own `warnings`. `cols` and `rows` are `null` for a pipe task.
+- **Integrity failures**: An input write, output capture, or log write failure
+  sets the task result's `ok: false` and `isError: true`, while preserving the
+  command's exit code and captured output. Permanent log loss and uncertain
+  canonical PTY delivery remain explicit warnings. Warnings are present in text
+  and metadata regardless of output mode and are never shortened by `maxBytes`.
 - **Background footer**: Appended to `start`, `poll`, `kill`, and `transcript`
   results (up to `512` bytes and `maxBytes / 4`) naming up to three other tasks
   this session has addressed, using bare task IDs. These tasks finished unseen,
@@ -302,7 +315,13 @@ These fields describe `exec` results.
 - **Key pacing**: `keyDelayMs` (`0–2000`, default `150`; requested pauses per
   poll capped at `30000` ms) waits for stdin to accept prior bytes (up to `5` s).
   When input or another key precedes a key, the delay separates it from a paste.
-  Zero sends input and keys together.
+  Zero sends input and keys together. Each write waits for the writer's completion
+  acknowledgement; failed writes return an error. A write still pending after
+  `5` s, or cancelled while pending, returns an unconfirmed-delivery error and
+  can still take effect later; it must not be retried blindly. On Unix, canonical
+  terminal input emits a warning that is never shortened: its line discipline
+  can discard long lines, including a line accumulated over several polls.
+  Use a pipe or file when exact long-text delivery is required.
 - **Bundled ConPTY (`src/conpty.rs`)**: Windows x64 and arm64 builds embed Microsoft
   ConPTY `1.24.260710001` (`conpty.dll` and `OpenConsole.exe`, MIT). Each process
   extracts into a newly reserved owner-only directory named

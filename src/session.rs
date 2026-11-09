@@ -307,7 +307,7 @@ impl Reader {
 
 /// Where this reader's next read of a task starts, and how much of a PTY task's transcript it
 /// has shown.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ReadState {
     pub cursor: u64,
     pub lines_before: u64,

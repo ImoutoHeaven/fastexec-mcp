@@ -789,7 +789,16 @@ fn a_hundred_byte_result_keeps_the_whole_task_handle() {
         "waitMs": 60000,
         "maxBytes": 100,
     }));
-    assert!(text.len() <= 100, "the whole text fits: {text:?}");
+    let window = text.split("\n\nWarning:").next().unwrap();
+    assert!(window.len() <= 100, "the output window fits: {text:?}");
+    if text.len() > 100 {
+        assert!(
+            text.contains(
+                "Warning: processes it keeps hold the output open; later output may follow"
+            ),
+            "only the complete warning exceeds the window budget: {text:?}"
+        );
+    }
     let status = text
         .lines()
         .find(|line| line.starts_with("[exited 137] "))
@@ -1213,22 +1222,13 @@ fn pipe_input_arrives_verbatim_and_eof_closes_stdin() {
     // A program that closes its stdin refuses later input instead of queueing it.
     let (_, text) = server.ok(json!({"action": "start", "command": "exec 0<&-; echo stdin-closed; sleep 30", "waitMs": 30000, "returnWhen": {"outputContains": ["stdin-closed"]}}));
     assert!(text.starts_with("stdin-closed\n"), "{text}");
-    // A write discovers the closed reader asynchronously. Wait for rejection,
-    // rather than assuming the writer thread has finished after a fixed sleep.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let (_, text, is_error) = server
-            .call(json!({"action": "poll", "taskId": server.id(2), "input": "x\n", "waitMs": 50}));
-        if is_error {
-            assert!(text.contains("stdin is closed"), "{text}");
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "closed stdin still accepts input: {text}"
-        );
-    }
-    server.ok(json!({"action": "kill", "taskId": server.id(2)}));
+    let (_, text, is_error) = server
+        .call(json!({"action": "poll", "taskId": server.id(2), "input": "x\n", "waitMs": 50}));
+    assert!(is_error && text.contains("stdin is closed"), "{text}");
+    let (out, text, is_error) = server.call(json!({"action": "kill", "taskId": server.id(2)}));
+    assert!(is_error, "the task must retain its input failure: {text}");
+    assert_eq!(out["state"], "killed", "{text}");
+    assert!(out["inputError"].as_str().is_some(), "{text}");
 }
 
 #[test]
@@ -3886,11 +3886,33 @@ fn encoding_decodes_legacy_output_and_long_commands_run_from_a_script() {
         assert!(text.starts_with("中\n"), "{encoding}: {text}");
     }
     // Past 8,190 characters an argument would be cut on Windows; the script carries it whole.
-    for length in [9_000, 100_000] {
+    for length in [7_999, 8_000, 8_001, 9_000, 131_073, 900_000] {
         let long = format!("x='{}'; echo ${{#x}}", "a".repeat(length));
         let (_, text) = server.ok(json!({"action": "start", "command": long}));
         assert!(text.starts_with(&format!("{length}\n")), "{text}");
     }
+}
+
+#[test]
+fn nul_commands_are_rejected_before_short_or_script_execution() {
+    let mut server = Server::start();
+    for pty in [false, true] {
+        for length in [512, 8_000, 8_001, 131_073] {
+            let (marker, marker_bash) = scratch(&format!("nul-command-{pty}-{length}"));
+            let prefix = format!("printf ran > '{marker_bash}'; printf 'A\0B';\n#");
+            let command = format!("{prefix}{}", "x".repeat(length - prefix.len()));
+            assert_eq!(command.len(), length);
+            let (out, text, is_error) = server.call(json!({
+                "action": "start", "command": command, "pty": pty, "loginShell": false
+            }));
+            assert!(is_error, "{text}");
+            assert_eq!(out["ok"], false, "{text}");
+            assert!(text.contains("NUL byte"), "{text}");
+            assert!(!marker.exists(), "an invalid command ran before rejection");
+        }
+    }
+    let (out, _) = server.ok(json!({"action": "list"}));
+    assert_eq!(out["tasks"], json!([]), "{out}");
 }
 
 #[test]

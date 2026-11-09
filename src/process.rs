@@ -70,6 +70,24 @@ impl PtyControl {
         })
     }
 
+    /// Whether the current line discipline is canonical; ConPTY does not expose Unix termios.
+    pub fn canonical_input(&self) -> std::io::Result<Option<bool>> {
+        #[cfg(windows)]
+        {
+            Ok(None)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: the owned master is live and attributes is writable for tcgetattr.
+            if unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut attributes) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Some(attributes.c_lflag & libc::ICANON != 0))
+        }
+    }
+
     /// The terminal is `cols` by `rows` from now on, and the program is told: Unix sends
     /// SIGWINCH to its process group, and ConPTY repaints the whole screen.
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {

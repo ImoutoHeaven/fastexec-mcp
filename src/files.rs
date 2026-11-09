@@ -701,7 +701,7 @@ fn write_text(request: &WriteRequest, launch: &LaunchContext) -> Result<String, 
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
     }
-    save_target(target, request.content.as_bytes())
+    save_target(target, request.content.as_bytes(), None)
         .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
     Ok(format!("Successfully wrote to {}", request.path))
 }
@@ -1574,21 +1574,89 @@ fn publish(staged: &Path, target: &Path, exists: bool) -> io::Result<()> {
     }
 }
 
-/// Saves before touching the old inode: ENOSPC, quotas, failed syncs, and failed metadata
-/// preservation all leave the original intact. This requires a writable parent directory.
-fn save_text(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    save_target(write_target(path)?, bytes)
+/// An edit keeps the file it read separate from the path that can be changed meanwhile.
+struct EditSource {
+    path: PathBuf,
+    target: PathBuf,
+    file: File,
+    content: String,
 }
 
-/// Writes to the resolved target without following a final link again after creating parents.
-fn save_target(target: PathBuf, bytes: &[u8]) -> io::Result<()> {
-    let original = match std::fs::symlink_metadata(&target) {
+impl EditSource {
+    fn read(path: PathBuf) -> io::Result<Self> {
+        let target = std::fs::canonicalize(&path)?;
+        let (mut file, _) = open_regular(&target)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let content = String::from_utf8(bytes)
+            .map_err(|_| io::Error::other("the file is not valid UTF-8; edit it with exec"))?;
+        Ok(Self {
+            path,
+            target,
+            file,
+            content,
+        })
+    }
+
+    fn changed() -> io::Error {
+        io::Error::other("the file changed after it was read; read it again and retry the edit")
+    }
+
+    fn verify_target(&self, current: Option<&File>) -> io::Result<()> {
+        let current = current.ok_or_else(Self::changed)?;
+        if std::fs::canonicalize(&self.path)? != self.target {
+            return Err(Self::changed());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let before = self.file.metadata()?;
+            let now = current.metadata()?;
+            if before.dev() != now.dev() || before.ino() != now.ino() {
+                return Err(Self::changed());
+            }
+        }
+        #[cfg(windows)]
+        if windows_file_identity(&self.file)? != windows_file_identity(current)? {
+            return Err(Self::changed());
+        }
+        Ok(())
+    }
+
+    fn verify_content(&self, current: &mut File) -> io::Result<()> {
+        current.rewind()?;
+        let mut offset = 0;
+        let mut buffer = [0; 8192];
+        loop {
+            let read = current.read(&mut buffer)?;
+            if read == 0 {
+                return if offset == self.content.len() {
+                    Ok(())
+                } else {
+                    Err(Self::changed())
+                };
+            }
+            if self.content.as_bytes().get(offset..offset + read) != Some(&buffer[..read]) {
+                return Err(Self::changed());
+            }
+            offset += read;
+        }
+    }
+
+    fn save(&self, bytes: &[u8]) -> io::Result<()> {
+        save_target(self.target.clone(), bytes, Some(self))
+    }
+}
+
+/// Stage the complete replacement before publishing, and reject an edit of a changed file.
+fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io::Result<()> {
+    let mut original = match std::fs::symlink_metadata(&target) {
         Ok(metadata) => {
             if !metadata.is_file() {
                 return Err(io::Error::other("the target is not a regular file"));
             }
             let mut options = OpenOptions::new();
-            options.write(true);
+            options.write(true).read(source.is_some());
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -1613,6 +1681,9 @@ fn save_target(target: PathBuf, bytes: &[u8]) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
+    if let Some(source) = source {
+        source.verify_target(original.as_ref())?;
+    }
     let metadata = original.as_ref().map(File::metadata).transpose()?;
     let parent = target
         .parent()
@@ -1675,6 +1746,10 @@ fn save_target(target: PathBuf, bytes: &[u8]) -> io::Result<()> {
         macos_access::preserve(source, file)?;
     }
     file.sync_all()?;
+    if let Some(source) = source {
+        source.verify_content(original.as_mut().ok_or_else(EditSource::changed)?)?;
+        source.verify_target(original.as_ref())?;
+    }
     if let Some(original) = &original {
         single_link(original)?;
         #[cfg(unix)]
@@ -1716,20 +1791,16 @@ fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, St
     }
     let resolved = resolve(&request.path, launch)?;
     let _guard = lock();
-    let (mut file, _) = open_regular(&resolved)
+    let source = EditSource::read(resolved)
         .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
-    let raw = String::from_utf8(bytes)
-        .map_err(|_| format!("{} is not valid UTF-8. Edit it with exec.", request.path))?;
-    let (bom, content) = match raw.strip_prefix('\u{feff}') {
+    let (bom, content) = match source.content.strip_prefix('\u{feff}') {
         Some(rest) => ("\u{feff}", rest),
-        None => ("", raw.as_str()),
+        None => ("", source.content.as_str()),
     };
     let (replaced, lines) = apply_edits(content, request, &request.path)?;
     let written = format!("{bom}{replaced}");
-    save_text(&resolved, written.as_bytes())
+    source
+        .save(written.as_bytes())
         .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
     let mut text = format!(
         "Successfully replaced {} block(s) in {}.",
@@ -2296,6 +2367,10 @@ mod tests {
         .map(|outcome| outcome.text)
     }
 
+    fn save_text(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        save_target(write_target(path)?, bytes, None)
+    }
+
     fn change(
         path: &str,
         edits: &[(&str, &str)],
@@ -2687,6 +2762,82 @@ mod tests {
                 panic!("cannot create fixture symlink {}: {error}", link.display());
             }
         }
+    }
+
+    #[test]
+    fn edit_rejects_a_retargeted_symlink_without_changing_either_file() {
+        let scratch = Scratch::new("edit-retargeted-link");
+        let first = scratch.file("first.txt", b"old content");
+        let other = scratch.file("other.txt", b"must stay intact");
+        let link = scratch.0.join("link.txt");
+        if !file_symlink(&first, &link) {
+            return;
+        }
+        let source = EditSource::read(link.clone()).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        assert!(file_symlink(&other, &link));
+        let error = source.save(b"edited content").unwrap_err();
+        assert!(
+            error.to_string().contains("changed after it was read"),
+            "{error}"
+        );
+        assert_eq!(scratch.read("first.txt"), b"old content");
+        assert_eq!(scratch.read("other.txt"), b"must stay intact");
+    }
+
+    #[test]
+    fn edit_rejects_another_inode_even_when_its_content_matches() {
+        let scratch = Scratch::new("edit-replaced-inode");
+        let path = scratch.file("target.txt", b"old content");
+        let source = EditSource::read(path.clone()).unwrap();
+        std::fs::rename(&path, scratch.0.join("retired.txt")).unwrap();
+        std::fs::write(&path, b"old content").unwrap();
+        let error = source.save(b"edited content").unwrap_err();
+        assert!(
+            error.to_string().contains("changed after it was read"),
+            "{error}"
+        );
+        assert_eq!(scratch.read("target.txt"), b"old content");
+        assert_eq!(scratch.read("retired.txt"), b"old content");
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn edit_rejects_in_place_changes_to_the_file_it_read() {
+        let scratch = Scratch::new("edit-changed-content");
+        for changed in [b"other value".as_slice(), b"old content plus bytes", b"old"] {
+            let path = scratch.file("target.txt", b"old content");
+            let source = EditSource::read(path.clone()).unwrap();
+            std::fs::write(&path, changed).unwrap();
+            let error = source.save(b"edited content").unwrap_err();
+            assert!(
+                error.to_string().contains("changed after it was read"),
+                "{error}"
+            );
+            assert_eq!(scratch.read("target.txt"), changed);
+            assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_rejects_a_retargeted_parent_directory_link() {
+        use std::os::unix::fs::symlink;
+        let scratch = Scratch::new("edit-retargeted-parent");
+        scratch.file("first/target.txt", b"old content");
+        scratch.file("other/target.txt", b"must stay intact");
+        let link = scratch.0.join("directory");
+        symlink(scratch.0.join("first"), &link).unwrap();
+        let source = EditSource::read(link.join("target.txt")).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(scratch.0.join("other"), &link).unwrap();
+        let error = source.save(b"edited content").unwrap_err();
+        assert!(
+            error.to_string().contains("changed after it was read"),
+            "{error}"
+        );
+        assert_eq!(scratch.read("first/target.txt"), b"old content");
+        assert_eq!(scratch.read("other/target.txt"), b"must stay intact");
     }
 
     #[test]
@@ -4069,7 +4220,7 @@ mod tests {
         scratch.file("a.txt", b"one\n\xfftwo\n");
         assert_eq!(
             change("a.txt", &[("two", "TWO")], &launch).unwrap_err(),
-            "a.txt is not valid UTF-8. Edit it with exec."
+            "Could not edit file: a.txt. the file is not valid UTF-8; edit it with exec."
         );
     }
 
