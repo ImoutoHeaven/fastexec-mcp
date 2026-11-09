@@ -4179,46 +4179,59 @@ fn a_pty_task_starts_at_the_default_size_and_the_program_sees_it() {
     server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
 }
 
-/// `start` takes the size, and a poll resizes: the resize goes out before the poll's input, so the
-/// program sees the new size when it reads the input that follows it.
-/// A zero-delay burst travels as one write, and the keys in it carry the keyboard mode the
-/// program declared, application-cursor included. A synchronized update the program holds
-/// withholds its printing, not its mode: the declaration applies as it arrives, so the burst
-/// after a resize in the same call is the same burst it would be without one.
+/// A resize in the same poll as a zero-delay key applies a synchronized update's held modes
+/// before encoding the burst, including application-cursor mode.
 #[test]
 fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
     let (ready, ready_bash) = scratch("keyboard-mode-ready");
+    let (received, received_bash) = scratch("keyboard-mode-received");
+    let (done, done_bash) = scratch("keyboard-mode-done");
     let mut server = Server::start();
     let (out, text) = server.ok(json!({
-        "action": "start", "pty": true, "cols": 100, "rows": 40, "waitMs": 1000,
-        "command": format!("stty raw -echo; printf '\\033[?2026h\\033[?1h\\033[6n'; IFS= read -r -d R reply; printf '\\r\\n'; touch '{ready_bash}'; head -c 3 | od -An -tx1")
+        "action": "start", "pty": true, "loginShell": false,
+        "cols": 100, "rows": 40, "waitMs": 0,
+        "command": format!("stty raw -echo; printf '\\033[?2026h\\033[?1h'; : > '{ready_bash}'; IFS= read -r -N3 key; printf '%s' \"$key\" > '{received_bash}'; : > '{done_bash}'")
     }));
     assert!(!text.contains("Cannot"), "{text}");
     let task = server.id(1);
     let log = PathBuf::from(out["logPath"].as_str().unwrap());
-    // The cursor report follows both mode declarations in the emulator's input. Receiving it
-    // proves the modes were consumed and stty completed, even when login startup is slow.
-    wait_for_file(&ready);
-    // The resize arrives with the key: DECCKM declared during the synchronized update applies
-    // to the burst, even if that update timed out while waiting for the readiness handshake.
+    // A CPR can belong to ConPTY's startup rather than this fixture. Wait for stty and the
+    // exact declarations in capture's raw log: capture feeds the emulator before writing it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let read = std::fs::read_to_string(&log).unwrap_or_default();
+        if ready.exists() && read.contains("\x1b[?2026h\x1b[?1h") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the program's keyboard modes were not captured (ready={}): {read:?}",
+            ready.exists()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     server.ok(json!({
         "action": "poll", "taskId": task, "cols": 80, "rows": 20,
         "keys": ["Up"], "keyDelayMs": 0, "waitMs": 1000
     }));
+    // The same bash reads the key; neither a new stdin reader nor ConPTY's synchronized
+    // display output decides which bytes arrived. Publish done only after the file closes.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let bytes = loop {
-        let read = std::fs::read_to_string(&log).unwrap_or_default();
-        if od(&read).contains("1b 4f 41") {
-            break read;
-        }
+    while !done.exists() {
         assert!(
             Instant::now() < deadline,
-            "the program never read the application-cursor key: {read:?}"
+            "the program never finished reading the key: {:?}",
+            std::fs::read_to_string(&log).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(50));
-    };
-    assert!(
-        !od(&bytes).contains("1b 5b 41"),
+    }
+    let bytes = std::fs::read(&*received).unwrap();
+    assert_eq!(
+        bytes, b"\x1bOA",
+        "the burst carries application-cursor mode: {bytes:?}"
+    );
+    assert_ne!(
+        bytes, b"\x1b[A",
         "the burst used the modes the validation pass saw: {bytes:?}"
     );
     server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
