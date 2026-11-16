@@ -126,6 +126,7 @@ pub struct Request {
 /// Output options shared by start and poll.
 pub(crate) struct View {
     nested: bool,
+    owned_by_script: bool,
     truncate: Truncate,
     max_bytes: usize,
     raw: bool,
@@ -366,6 +367,7 @@ pub(crate) fn validate(request: &Request) -> Result<View, String> {
     }
     Ok(View {
         nested: false,
+        owned_by_script: false,
         truncate: request
             .truncate
             .unwrap_or(if request.action == Action::Transcript {
@@ -422,7 +424,7 @@ pub struct Render {
 impl Render {
     /// Structured content off also means text only, so a caller that asks for structured output
     /// without structured content still gets the output body.
-    fn effective(self) -> Self {
+    pub(crate) fn effective(self) -> Self {
         Self {
             output_mode: if self.structured_content {
                 self.output_mode
@@ -446,6 +448,7 @@ pub fn suppress(mut result: CallToolResult, render: Render) -> CallToolResult {
 /// ways the caller can stop it or watch it.
 pub struct Call<'a> {
     pub session: &'a Arc<Session>,
+    pub launch: Option<&'a Arc<crate::session::LaunchContext>>,
     pub render: Render,
     pub cancel: CancellationToken,
     /// The call replaces this with its latest progress message; a forwarder sends them.
@@ -456,6 +459,12 @@ pub struct Call<'a> {
     pub nested: bool,
     /// Records a nested start before its caller's wait can be cancelled.
     pub started: Option<&'a codemode::ScriptHandle>,
+}
+
+impl<'a> Call<'a> {
+    fn launch(&self) -> &'a Arc<crate::session::LaunchContext> {
+        self.launch.unwrap_or(&self.session.launch)
+    }
 }
 
 /// The tool's operations and renderers, independent of any transport.
@@ -505,14 +514,9 @@ impl Service {
     ) -> CallToolResult {
         self.tasks.prune_entries(call.session);
         call.render = call.render.effective();
-        let result = self.start_script(request, &call, http).await;
-        let result = match result {
+        let result = match self.start_script(request, &call, http).await {
             Ok(result) => result,
-            Err(message) => {
-                let mut result = error_result(Action::Start, &message);
-                result.structured_content.as_mut().unwrap()["action"] = json!("codemode");
-                result
-            }
+            Err(message) => codemode_error(&message),
         };
         suppress(result, call.render)
     }
@@ -527,8 +531,14 @@ impl Service {
         let start = request.as_exec()?;
         let mut view = validate(&start)?;
         view.nested = call.nested;
+        let base_launch = call.launch();
+        let launch = match start.cwd {
+            None => Arc::clone(base_launch),
+            Some(dir) => Arc::new(base_launch.with_cwd(validate_cwd(&dir)?)),
+        };
         let args = ScriptArgs {
             code: request.code,
+            launch,
             kill_after_ms: start.kill_after_ms,
             http,
             call_id: call.call_id,
@@ -614,20 +624,12 @@ impl Service {
         view.nested = call.nested;
         let session = Arc::clone(call.session);
         match request.action {
-            Action::List => Ok(self.list(&session, &view)),
+            Action::List => Ok(self.list(&session, &view, call.started)),
             Action::Start => {
+                let base_launch = call.launch();
                 let cwd = match request.cwd {
-                    None => session.launch.cwd.clone(),
-                    Some(dir) => {
-                        let dir = PathBuf::from(dir);
-                        if !dir.is_absolute() || !dir.is_dir() {
-                            return Err(format!(
-                                "cwd {} is not an existing absolute directory.",
-                                dir.display()
-                            ));
-                        }
-                        dir
-                    }
+                    None => base_launch.cwd.clone(),
+                    Some(dir) => validate_cwd(&dir)?,
                 };
                 let args = StartArgs {
                     command: request.command.unwrap_or_default(),
@@ -641,7 +643,7 @@ impl Service {
                     kill_after_ms: request.kill_after_ms,
                     owner: session.label.clone(),
                     started_by: call.call_id.map(|id| (session.id.clone(), id)),
-                    launch: Arc::clone(&session.launch),
+                    launch: Arc::clone(base_launch),
                 };
                 let tasks = Arc::clone(&self.tasks);
                 // The session takes the task even when this request is cancelled meanwhile, so
@@ -649,12 +651,16 @@ impl Service {
                 let starting = Arc::clone(&session);
                 let key = tasks::random_chars(4)
                     .map_err(|error| format!("Cannot name the reader: {error}"))?;
+                if call.nested && call.cancel.is_cancelled() {
+                    return Err("Cancelled before the command was started.".into());
+                }
                 let (task, entry, task_reader) =
                     tokio::task::spawn_blocking(move || tasks.start(args, &starting, key))
                         .await
                         .map_err(|error| format!("Internal failure while starting: {error}."))??;
                 if let Some(script) = call.started {
                     script.record_started(task_reader.handle(&task.id));
+                    view.owned_by_script = true;
                 }
                 self.wait_started(
                     (task, entry, task_reader),
@@ -667,6 +673,7 @@ impl Service {
             }
             Action::Poll => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
+                view.owned_by_script = call.started.is_some_and(|script| script.owns(&task.id));
                 let when = request.return_when.as_ref();
                 let watches_screen = when.and_then(|when| when.screen_condition());
                 let needs_pty = [
@@ -871,11 +878,13 @@ impl Service {
                     &snapshot,
                     background,
                     view.nested,
+                    call.started.is_some_and(|script| script.owns(&task.id)),
                 );
                 Ok(result)
             }
             Action::Transcript => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
+                view.owned_by_script = call.started.is_some_and(|script| script.owns(&task.id));
                 if task.is_script() {
                     return Err(
                         "A codemode task has no terminal or transcript; poll returns its output."
@@ -955,7 +964,12 @@ impl Service {
         }
     }
 
-    fn list(&self, session: &Session, view: &View) -> CallToolResult {
+    fn list(
+        &self,
+        session: &Session,
+        view: &View,
+        script: Option<&codemode::ScriptHandle>,
+    ) -> CallToolResult {
         let tasks = self.tasks.listed();
         let mut lines = Vec::new();
         let mut entries = Vec::new();
@@ -1021,11 +1035,15 @@ impl Service {
         // to mark.
         for index in kept {
             let (task, snapshot) = &shown[index];
-            if !view.nested
+            if !view.nested {
+                if let Some(entry) = session.existing(task) {
+                    entry.mark_reported(snapshot);
+                    entry.mark_keeps_reported(snapshot);
+                }
+            } else if script.is_some_and(|script| script.owns(&task.id))
                 && let Some(entry) = session.existing(task)
             {
                 entry.mark_reported(snapshot);
-                entry.mark_keeps_reported(snapshot);
             }
         }
         let text = if lines.is_empty() {
@@ -1175,9 +1193,13 @@ fn report(
     shown: &Snapshot,
     background: Option<(String, Vec<tasks::Shown>)>,
     nested: bool,
+    owned_by_script: bool,
 ) {
     reader.mark_reported(shown);
     if nested {
+        if owned_by_script {
+            entry.mark_reported(shown);
+        }
         return;
     }
     entry.mark_reported(shown);
@@ -1315,6 +1337,7 @@ impl Service {
             &snapshot,
             background,
             view.nested,
+            view.owned_by_script,
         );
         drop(state);
         Ok(result)
@@ -1485,6 +1508,7 @@ impl Service {
             &snapshot,
             background,
             view.nested,
+            view.owned_by_script,
         );
         drop(state);
         Ok(result)
@@ -1633,6 +1657,7 @@ impl Service {
             &snapshot,
             background,
             view.nested,
+            view.owned_by_script,
         );
         drop(state);
         Ok(result)
@@ -2026,10 +2051,28 @@ fn success(mut text: String, structured: Value) -> CallToolResult {
     result
 }
 
+pub(crate) fn validate_cwd(dir: &str) -> Result<PathBuf, String> {
+    let dir = PathBuf::from(dir);
+    if !dir.is_absolute() || !dir.is_dir() {
+        return Err(format!(
+            "cwd {} is not an existing absolute directory.",
+            dir.display()
+        ));
+    }
+    Ok(dir)
+}
+
 pub fn error_result(action: Action, message: &str) -> CallToolResult {
+    error_named(action_name(action), message)
+}
+
+pub fn codemode_error(message: &str) -> CallToolResult {
+    error_named("codemode", message)
+}
+
+fn error_named(action: &str, message: &str) -> CallToolResult {
     let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
-    result.structured_content =
-        Some(json!({ "ok": false, "action": action_name(action), "error": message }));
+    result.structured_content = Some(json!({ "ok": false, "action": action, "error": message }));
     result
 }
 
@@ -2051,6 +2094,7 @@ mod tests {
     fn script_call(session: &Arc<Session>, nested: bool) -> Call<'_> {
         Call {
             session,
+            launch: None,
             render: Render {
                 output_mode: OutputMode::Both,
                 structured_content: true,
@@ -2349,6 +2393,7 @@ mod tests {
                     .effective();
                     let view = View {
                         nested: false,
+                        owned_by_script: false,
                         truncate: Truncate::HeadTail,
                         max_bytes: 100,
                         raw,

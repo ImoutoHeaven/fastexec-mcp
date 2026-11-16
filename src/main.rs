@@ -70,6 +70,7 @@ impl schemars::JsonSchema for CodemodeArguments {
 #[derive(Clone)]
 struct Server {
     backend: Backend,
+    instructions: String,
     /// This server's own routes: the tool list and the description of `exec` are built per
     /// server, because what they say about the host differs between servers.
     router: ToolRouter<Server>,
@@ -94,18 +95,18 @@ enum Backend {
         /// What this server's tasks inherit: the environment captured at startup, so a later
         /// change to the server's own environment cannot reach them.
         launch: Arc<LaunchContext>,
-        /// What this server tells a client about where its tasks live.
-        instructions: &'static str,
+        /// Whether tasks belong to a shared daemon rather than ending with this session.
+        daemon: bool,
     },
     /// `on` mode: the daemon owns every task, and this process only carries calls to it.
     Daemon(Arc<endpoint::Endpoint>),
 }
 
 impl Backend {
-    fn instructions(&self) -> &'static str {
+    fn daemon_owned(&self) -> bool {
         match self {
-            Self::Local { instructions, .. } => instructions,
-            Self::Daemon(_) => INSTRUCTIONS_DAEMON,
+            Self::Local { daemon, .. } => *daemon,
+            Self::Daemon(_) => true,
         }
     }
 }
@@ -149,8 +150,10 @@ impl Server {
                 ));
             }
         }
+        let instructions = server_instructions(backend.daemon_owned(), codemode);
         Self {
             backend,
+            instructions,
             router,
             transfers,
             public_root,
@@ -206,12 +209,24 @@ fn client_name(context: &RequestContext<RoleServer>) -> String {
         .map_or_else(|| "client".to_string(), |info| info.name)
 }
 
-/// Server instructions say when to use the tool; hosts that show one line take the first. The
-/// second line says where the tasks live, which is the one thing that differs between the modes.
-const INSTRUCTIONS_LOCAL: &str = "Run bash tasks with exec and read, write, and edit files on this host.
-Prefer it over one-shot shell tools when a command may outlive a single call or needs input; tasks end when the session ends.";
-const INSTRUCTIONS_DAEMON: &str = "Run bash tasks with exec and read, write, and edit files on this host.
-Prefer it over one-shot shell tools when a command may outlive a single call or needs input; tasks run in a shared background daemon, outlive this session, and are visible to every session using it.";
+/// Server instructions say when to use the tools; hosts that show one line take the first. The
+/// second line states how long tasks live, and codemode adds a routing hint when enabled.
+fn server_instructions(daemon_owned: bool, codemode: bool) -> String {
+    let lifetime = if daemon_owned {
+        "tasks run in a shared background daemon, outlive this session, and are visible to every session using it."
+    } else {
+        "tasks end when the session ends."
+    };
+    if codemode {
+        format!(
+            "Run bash tasks with exec, orchestrate multi-step tool workflows in JavaScript with codemode, and read, write, and edit files on this host.\nPrefer exec over one-shot shell tools when a command may outlive a single call or needs input; {lifetime}\nPrefer codemode over multi-turn exec or read calls when aggregating across multiple files, looping or branching on tool results, or filtering bulky output in-process to save context."
+        )
+    } else {
+        format!(
+            "Run bash tasks with exec and read, write, and edit files on this host.\nPrefer it over one-shot shell tools when a command may outlive a single call or needs input; {lifetime}"
+        )
+    }
+}
 
 /// The `exec` tool's description: the static text, the Windows paragraph on Windows, and one
 /// line saying where this server's tasks run. Nothing in it changes while the server runs.
@@ -304,7 +319,7 @@ impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fastexec", env!("CARGO_PKG_VERSION")))
-            .with_instructions(self.backend.instructions())
+            .with_instructions(self.instructions.clone())
     }
 }
 
@@ -353,26 +368,26 @@ impl Server {
                 render,
                 session: _,
                 launch: _,
-                instructions: _,
-            } => {
-                let result = match self.session(&context) {
-                    Ok(session) => {
-                        let (progress, _forwarder) = progress(&context);
-                        let call = Call {
-                            session: &session,
-                            render: *render,
-                            cancel: context.ct.clone(),
-                            progress,
-                            call_id: None,
-                            nested: false,
-                            started: None,
-                        };
-                        service.call(request, call).await
-                    }
-                    Err(message) => service::error_result(request.action, &message),
-                };
-                service::suppress(result, *render)
-            }
+                daemon: _,
+            } => match self.session(&context) {
+                Ok(session) => {
+                    let (progress, _forwarder) = progress(&context);
+                    let call = Call {
+                        session: &session,
+                        launch: None,
+                        render: *render,
+                        cancel: context.ct.clone(),
+                        progress,
+                        call_id: None,
+                        nested: false,
+                        started: None,
+                    };
+                    service.call(request, call).await
+                }
+                Err(message) => {
+                    service::suppress(service::error_result(request.action, &message), *render)
+                }
+            },
         }
     }
 
@@ -397,9 +412,6 @@ impl Server {
                 return CallToolResult::error(vec![ContentBlock::text(error.to_string())]);
             }
         };
-        if let Err(message) = codemode::validate(&request) {
-            return CallToolResult::error(vec![ContentBlock::text(message)]);
-        }
         match &self.backend {
             Backend::Daemon(endpoint) => forward(endpoint, "codemode", &request, &context).await,
             Backend::Local {
@@ -408,12 +420,13 @@ impl Server {
                 let session = match self.session(&context) {
                     Ok(session) => session,
                     Err(message) => {
-                        return CallToolResult::error(vec![ContentBlock::text(message)]);
+                        return service::suppress(service::codemode_error(&message), *render);
                     }
                 };
                 let (progress, _forwarder) = progress(&context);
                 let call = Call {
                     session: &session,
+                    launch: None,
                     render: *render,
                     cancel: context.ct.clone(),
                     progress,
@@ -421,12 +434,9 @@ impl Server {
                     nested: false,
                     started: None,
                 };
-                service::suppress(
-                    service
-                        .codemode(request, call, self.transfers.is_some())
-                        .await,
-                    *render,
-                )
+                service
+                    .codemode(request, call, self.transfers.is_some())
+                    .await
             }
         }
     }
@@ -439,8 +449,14 @@ impl Server {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         match &self.backend {
-            Backend::Local { launch, .. } => {
-                files::read(request, Arc::clone(launch), self.transfers.is_some()).await
+            Backend::Local { launch, render, .. } => {
+                files::read(
+                    request,
+                    Arc::clone(launch),
+                    self.transfers.is_some(),
+                    *render,
+                )
+                .await
             }
             Backend::Daemon(endpoint) => forward(endpoint, "read", &request, &context).await,
         }
@@ -457,7 +473,9 @@ impl Server {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         match &self.backend {
-            Backend::Local { launch, .. } => files::write(request, Arc::clone(launch)).await,
+            Backend::Local { launch, render, .. } => {
+                files::write(request, Arc::clone(launch), *render).await
+            }
             Backend::Daemon(endpoint) => forward(endpoint, "write", &request, &context).await,
         }
     }
@@ -473,7 +491,9 @@ impl Server {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         match &self.backend {
-            Backend::Local { launch, .. } => files::edit(request, Arc::clone(launch)).await,
+            Backend::Local { launch, render, .. } => {
+                files::edit(request, Arc::clone(launch), *render).await
+            }
             Backend::Daemon(endpoint) => forward(endpoint, "edit", &request, &context).await,
         }
     }
@@ -492,27 +512,31 @@ impl Server {
         Parameters(request): Parameters<transfer::Request>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let Some(table) = &self.transfers else {
-            return CallToolResult::error(vec![ContentBlock::text(
-                "transfer needs an HTTP session, and this one is stdio.",
-            )]);
-        };
         let Backend::Local { launch, render, .. } = &self.backend else {
             return CallToolResult::error(vec![ContentBlock::text(
                 "transfer needs an HTTP session, and this one is stdio.",
             )]);
         };
+        let effective = render.effective();
+        let fail = |message: String| {
+            let mut result = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
+            result.structured_content = Some(serde_json::json!({ "ok": false, "error": message }));
+            service::suppress(result, effective)
+        };
+        let Some(table) = &self.transfers else {
+            return fail("transfer needs an HTTP session, and this one is stdio.".to_owned());
+        };
         let path = match files::resolve(&request.path, launch) {
             Ok(path) => path,
-            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+            Err(message) => return fail(message),
         };
         let url = match transfer_url(path, table, &context, self.public_root.as_deref()) {
             Ok(url) => url,
-            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+            Err(message) => return fail(message),
         };
         let mut result = CallToolResult::success(vec![ContentBlock::text(url.clone())]);
-        result.structured_content = Some(serde_json::json!({ "url": url }));
-        service::suppress(result, *render)
+        result.structured_content = Some(serde_json::json!({ "ok": true, "url": url }));
+        service::suppress(result, effective)
     }
 }
 
@@ -1273,7 +1297,7 @@ async fn serve() {
             render,
             session: Arc::new(OnceLock::new()),
             launch: Arc::clone(&launch),
-            instructions: INSTRUCTIONS_LOCAL,
+            daemon: false,
         };
         (backend, Some(tasks))
     };

@@ -5,11 +5,12 @@
 //! edit hold the whole file, because they rewrite it.
 
 use crate::images;
+use crate::service::{self, OutputMode, Render};
 use crate::session::LaunchContext;
 use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
 use std::fs::Metadata;
 use std::fs::{File, OpenOptions};
@@ -86,74 +87,125 @@ pub async fn call(
     arguments: Value,
     launch: Arc<LaunchContext>,
     http: bool,
+    render: Render,
 ) -> CallToolResult {
     match tool {
         "read" => match serde_json::from_value::<ReadRequest>(arguments) {
-            Ok(request) => read(request, launch, http).await,
-            Err(error) => failed(format!("failed to deserialize parameters: {error}")),
+            Ok(request) => read(request, launch, http, render).await,
+            Err(error) => schema_failed(format!("failed to deserialize parameters: {error}")),
         },
         "write" => match serde_json::from_value::<WriteRequest>(arguments) {
-            Ok(request) => write(request, launch).await,
-            Err(error) => failed(format!("failed to deserialize parameters: {error}")),
+            Ok(request) => write(request, launch, render).await,
+            Err(error) => schema_failed(format!("failed to deserialize parameters: {error}")),
         },
         "edit" => match serde_json::from_value::<EditRequest>(arguments) {
-            Ok(request) => edit(request, launch).await,
-            Err(error) => failed(format!("failed to deserialize parameters: {error}")),
+            Ok(request) => edit(request, launch, render).await,
+            Err(error) => schema_failed(format!("failed to deserialize parameters: {error}")),
         },
-        other => failed(format!("unknown tool {other}")),
+        other => schema_failed(format!("unknown tool {other}")),
     }
 }
 
 /// Reads one file: its text, or the message saying why it is not shown.
-pub async fn read(request: ReadRequest, launch: Arc<LaunchContext>, http: bool) -> CallToolResult {
-    match tokio::task::spawn_blocking(move || read_text(&request, &launch, http)).await {
-        Ok(Ok(outcome)) => CallToolResult::success(outcome.blocks()),
+pub async fn read(
+    request: ReadRequest,
+    launch: Arc<LaunchContext>,
+    http: bool,
+    render: Render,
+) -> CallToolResult {
+    let effective = render.effective();
+    let result = match tokio::task::spawn_blocking(move || read_text(&request, &launch, http)).await
+    {
+        Ok(Ok(outcome)) => outcome.into_result(effective),
         Ok(Err(message)) => failed(message),
         Err(error) => failed(format!("the file operation did not finish: {error}")),
-    }
+    };
+    service::suppress(result, effective)
 }
 
 /// What a read answers with: its text, and the image that text names when the file is an image.
 pub struct Outcome {
     pub text: String,
+    pub notice: String,
+    pub body: Option<String>,
     pub image: Option<(String, String)>,
+    pub structured: Value,
 }
 
 impl Outcome {
-    fn text(text: String) -> Self {
-        Self { text, image: None }
-    }
-
-    /// The result's content: the text, then the image when there is one.
-    fn blocks(self) -> Vec<ContentBlock> {
-        let mut blocks = vec![ContentBlock::text(self.text)];
+    fn into_result(self, render: Render) -> CallToolResult {
+        let mut structured = self.structured;
+        if render.output_mode != OutputMode::Text
+            && let Some(body) = self.body
+        {
+            structured["text"] = json!(body);
+        }
+        let shown = if render.output_mode == OutputMode::Structured && self.image.is_none() {
+            self.notice
+        } else {
+            self.text
+        };
+        let mut blocks = vec![ContentBlock::text(shown)];
         if let Some((data, mime)) = self.image {
             blocks.push(ContentBlock::image(data, mime));
         }
-        blocks
+        let mut result = CallToolResult::success(blocks);
+        result.structured_content = Some(structured);
+        result
     }
 }
 
 /// Writes one file, creating its parent directories.
-pub async fn write(request: WriteRequest, launch: Arc<LaunchContext>) -> CallToolResult {
-    finished(tokio::task::spawn_blocking(move || write_text(&request, &launch)).await)
+pub async fn write(
+    request: WriteRequest,
+    launch: Arc<LaunchContext>,
+    render: Render,
+) -> CallToolResult {
+    let effective = render.effective();
+    let path = request.path.clone();
+    let bytes = request.content.len();
+    let outcome = tokio::task::spawn_blocking(move || write_text(&request, &launch)).await;
+    let result =
+        finished(outcome.map(|res| {
+            res.map(|text| (text, json!({ "ok": true, "path": path, "bytes": bytes })))
+        }));
+    service::suppress(result, effective)
 }
 
 /// Applies targeted replacements to one file.
-pub async fn edit(request: EditRequest, launch: Arc<LaunchContext>) -> CallToolResult {
-    finished(tokio::task::spawn_blocking(move || edit_text(&request, &launch)).await)
+pub async fn edit(
+    request: EditRequest,
+    launch: Arc<LaunchContext>,
+    render: Render,
+) -> CallToolResult {
+    let effective = render.effective();
+    let result =
+        finished(tokio::task::spawn_blocking(move || edit_outcome(&request, &launch)).await);
+    service::suppress(result, effective)
 }
 
-/// A blocking operation's answer: its text, or its message as the error result.
-fn finished(outcome: Result<Result<String, String>, tokio::task::JoinError>) -> CallToolResult {
+/// A blocking operation's answer: its text and structured metadata, or its message as an error.
+fn finished(
+    outcome: Result<Result<(String, Value), String>, tokio::task::JoinError>,
+) -> CallToolResult {
     match outcome {
-        Ok(Ok(text)) => CallToolResult::success(vec![ContentBlock::text(text)]),
+        Ok(Ok((text, structured))) => {
+            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+            result.structured_content = Some(structured);
+            result
+        }
         Ok(Err(message)) => failed(message),
         Err(error) => failed(format!("the file operation did not finish: {error}")),
     }
 }
 
 fn failed(message: String) -> CallToolResult {
+    let mut result = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
+    result.structured_content = Some(json!({ "ok": false, "error": message }));
+    result
+}
+
+fn schema_failed(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
@@ -198,17 +250,28 @@ fn read_text(request: &ReadRequest, launch: &LaunchContext, http: bool) -> Resul
         // far larger than any inline image is never loaded.
         let bytes = images::read_encoded(&mut file, metadata.len())
             .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
-        let Some(bytes) = bytes else {
-            let omitted = images::oversized(mime);
-            return Ok(Outcome {
-                text: omitted.text,
-                image: omitted.image,
-            });
+        let processed = match bytes {
+            Some(bytes) => images::process(bytes, mime),
+            None => images::oversized(mime),
         };
-        let processed = images::process(bytes, mime);
+        let attached = processed.image.is_some();
+        let structured = json!({
+            "ok": true,
+            "kind": "image",
+            "path": request.path,
+            "mimeType": processed.mime,
+            "attached": attached,
+            "originalWidth": processed.original_width,
+            "originalHeight": processed.original_height,
+            "width": processed.width,
+            "height": processed.height,
+        });
         return Ok(Outcome {
+            notice: processed.text.clone(),
             text: processed.text,
+            body: None,
             image: processed.image,
+            structured,
         });
     }
     if sniff[..sniffed].contains(&0) {
@@ -226,9 +289,7 @@ fn read_text(request: &ReadRequest, launch: &LaunchContext, http: bool) -> Resul
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
     let source = Source::new(BufReader::new(file));
-    Ok(Outcome::text(
-        Window::scan(source, request)?.render(request),
-    ))
+    Ok(Window::scan(source, request)?.render(request))
 }
 
 /// Both text readers reject special files before reading any data. The initial check avoids
@@ -545,59 +606,105 @@ impl Window {
         }
     }
 
-    /// The result text: the window, cut to the budget, with the notice that says how to see more.
-    fn render(&self, request: &ReadRequest) -> String {
+    /// The result text and structured metadata: the window, cut to the budget, with the notice
+    /// that says how to see more.
+    fn render(&self, request: &ReadRequest) -> Outcome {
         let start = request.offset.map_or(0, |offset| offset.saturating_sub(1));
         let start_display = start + 1;
         let trailing = self.trailing_element();
         let shown = self.shown_lines - u64::from(trailing && self.shown_lines == self.window_lines);
-        let truncated = self.content_lines() > MAX_LINES || self.window_bytes > MAX_BYTES;
-        let mut text = String::new();
-        if truncated && self.first_line_bytes > MAX_BYTES {
-            text.push_str(&format!(
+        let budget_truncated = self.content_lines() > MAX_LINES || self.window_bytes > MAX_BYTES;
+        let line_too_long = budget_truncated && self.first_line_bytes > MAX_BYTES;
+        let mut body = String::new();
+        let mut notices = Vec::new();
+        let mut truncated = budget_truncated;
+        let mut next_offset = None;
+        let shown_lines;
+
+        if line_too_long {
+            shown_lines = 0;
+            notices.push(format!(
                 "[Line {start_display} is {}, exceeds {} limit. Use exec: sed -n '{start_display}p' {} | head -c {MAX_BYTES}]",
                 format_size(self.first_line_bytes),
                 format_size(MAX_BYTES),
                 request.path
             ));
-        } else if truncated {
+        } else if budget_truncated {
+            shown_lines = shown;
             let end_display = start_display + shown - 1;
             let next = end_display + 1;
-            text.push_str(&self.content);
+            next_offset = Some(next);
+            body.push_str(&self.content);
             if self.stopped_on_bytes() {
-                text.push_str(&format!(
-                    "\n\n[Showing lines {start_display}-{end_display} of {} ({} limit). Use offset={next} to continue.]",
+                notices.push(format!(
+                    "[Showing lines {start_display}-{end_display} of {} ({} limit). Use offset={next} to continue.]",
                     self.total_lines,
                     format_size(MAX_BYTES)
                 ));
             } else {
-                text.push_str(&format!(
-                    "\n\n[Showing lines {start_display}-{end_display} of {}. Use offset={next} to continue.]",
+                notices.push(format!(
+                    "[Showing lines {start_display}-{end_display} of {}. Use offset={next} to continue.]",
                     self.total_lines
                 ));
             }
         } else {
-            text.push_str(&self.content);
+            shown_lines = shown;
+            body.push_str(&self.content);
             // The selected content keeps the file's final newline, even when the line budget
             // stopped the scan right before the empty line that newline adds.
             if trailing && self.shown_lines != self.window_lines {
-                text.push('\n');
+                body.push('\n');
             }
             if let Some(limit) = request.limit {
                 let selected_end = start.saturating_add(limit);
                 if selected_end < self.total_lines {
                     let remaining = self.total_lines - selected_end;
                     let next = selected_end + 1;
-                    text.push_str(&format!(
-                        "\n\n[{remaining} more lines in file. Use offset={next} to continue.]"
+                    truncated = true;
+                    next_offset = Some(next);
+                    notices.push(format!(
+                        "[{remaining} more lines in file. Use offset={next} to continue.]"
                     ));
                 }
             }
         }
         if self.lossy {
-            text.push_str("\n\n[Invalid UTF-8 was replaced with U+FFFD.]");
+            notices.push("[Invalid UTF-8 was replaced with U+FFFD.]".to_owned());
         }
-        text
+        let notice_block = notices.join("\n\n");
+        let text = if line_too_long {
+            notice_block.clone()
+        } else if notice_block.is_empty() {
+            body.clone()
+        } else {
+            format!("{body}\n\n{notice_block}")
+        };
+        let notice = if notice_block.is_empty() {
+            format!("[read] {} · {shown_lines} lines", request.path)
+        } else {
+            notice_block
+        };
+        let end_line = (shown_lines > 0).then_some(start_display + shown_lines - 1);
+        let structured = json!({
+            "ok": true,
+            "kind": "text",
+            "path": request.path,
+            "startLine": start_display,
+            "endLine": end_line,
+            "shownLines": shown_lines,
+            "totalLines": self.total_lines,
+            "truncated": truncated,
+            "nextOffset": next_offset,
+            "lineTooLong": line_too_long,
+            "lossy": self.lossy,
+        });
+        Outcome {
+            text,
+            notice,
+            body: Some(body),
+            image: None,
+            structured,
+        }
     }
 }
 
@@ -1783,7 +1890,7 @@ struct Matched<'a> {
 }
 
 /// Applies every edit to one file: exact matches first, and the fuzzy form when any edit needs it.
-fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, String> {
+fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> Result<(String, Value), String> {
     if request.edits.is_empty() {
         return Err(
             "Edit tool input is invalid. edits must contain at least one replacement.".to_owned(),
@@ -1807,13 +1914,26 @@ fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, St
         request.edits.len(),
         request.path
     );
+    let mut edits = Vec::with_capacity(lines.len());
     for (index, (line, fuzzy)) in lines.iter().enumerate() {
         text.push_str(&format!("\nedits[{index}]: line {line}"));
         if *fuzzy {
             text.push_str(" (fuzzy match)");
         }
+        edits.push(json!({ "line": line, "fuzzy": fuzzy }));
     }
-    Ok(text)
+    let structured = json!({
+        "ok": true,
+        "path": request.path,
+        "replacements": request.edits.len(),
+        "edits": edits,
+    });
+    Ok((text, structured))
+}
+
+#[cfg(test)]
+fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, String> {
+    edit_outcome(request, launch).map(|(text, _)| text)
 }
 
 /// Matches in LF-normalized text but replaces the corresponding original byte ranges. Bytes

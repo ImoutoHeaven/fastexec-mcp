@@ -4,7 +4,7 @@ use crate::files;
 use crate::images;
 use crate::output::Truncate;
 use crate::service::{self, Call, OutputMode, Render, Service};
-use crate::session::Session;
+use crate::session::{LaunchContext, Session, parse_handle};
 use crate::tasks::{TASK_LOG_LIMIT, Task, Tasks};
 use base64::Engine;
 use rquickjs::context::EvalOptions;
@@ -13,11 +13,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{PipeWriter, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,9 @@ const STALLED: &str = "The script is waiting on a promise that can never settle:
 pub struct Request {
     /// Body of an async JavaScript function, up to 256 KiB. Top-level await and return work.
     pub code: String,
+    /// Absolute working directory for nested exec (when it omits cwd) and relative paths in read, write, and edit. Omit for the session's default working directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Wait up to this many ms for output or completion, 0-240000; default 30000.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
@@ -88,6 +92,9 @@ pub fn validate(request: &Request) -> Result<(), String> {
     if request.code.contains('\0') {
         return Err("code must not contain NUL bytes; use a JavaScript \\0 escape.".into());
     }
+    if let Some(dir) = &request.cwd {
+        service::validate_cwd(dir)?;
+    }
     service::validate(&request.as_exec()?).map(|_| ())
 }
 
@@ -116,6 +123,7 @@ struct Report {
     bridge_bytes: usize,
     cancelled: Vec<CallInfo>,
     started: Vec<String>,
+    started_ids: HashSet<String>,
 }
 
 impl Report {
@@ -169,10 +177,31 @@ struct Control {
     cancel: CancellationToken,
     wake: mpsc::Sender<Wake>,
     report: Mutex<Report>,
+    in_flight: (Mutex<usize>, Condvar),
 }
 
 #[derive(Clone)]
 pub struct ScriptHandle(Arc<Control>);
+
+struct InFlightGuard(ScriptHandle);
+
+impl InFlightGuard {
+    fn enter(script: ScriptHandle) -> Self {
+        *lock(&script.0.in_flight.0) += 1;
+        Self(script)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let (count, idle) = &self.0.0.in_flight;
+        let mut active = lock(count);
+        *active -= 1;
+        if *active == 0 {
+            idle.notify_all();
+        }
+    }
+}
 
 impl ScriptHandle {
     pub fn kill(&self) {
@@ -192,9 +221,23 @@ impl ScriptHandle {
 
     pub fn record_started(&self, handle: String) {
         let mut report = lock(&self.0.report);
+        if let Ok((id, _)) = parse_handle(&handle) {
+            report.started_ids.insert(id.to_owned());
+        }
         if !report.started.contains(&handle) {
             report.started.push(handle);
         }
+    }
+
+    pub fn owns(&self, task_id: &str) -> bool {
+        lock(&self.0.report).started_ids.contains(task_id)
+    }
+
+    fn cancel_and_drain(&self) {
+        self.0.cancel.cancel();
+        let (count, idle) = &self.0.in_flight;
+        let active = lock(count);
+        let _ = idle.wait_timeout_while(active, Duration::from_secs(5), |&mut active| active > 0);
     }
 
     fn finish(&self) -> Vec<CallInfo> {
@@ -214,6 +257,7 @@ impl ScriptHandle {
 pub struct Work {
     pub service: Arc<Service>,
     pub session: Arc<Session>,
+    pub launch: Arc<LaunchContext>,
     pub http: bool,
     pub call_id: Option<u64>,
     pub code: String,
@@ -242,6 +286,7 @@ pub fn prepare(runtime: Handle) -> Result<(ScriptHandle, ScriptWorker), String> 
         cancel: CancellationToken::new(),
         wake,
         report: Mutex::new(Report::default()),
+        in_flight: (Mutex::new(0), Condvar::new()),
     }));
     let (sender, job) = mpsc::sync_channel(1);
     let control = script.clone();
@@ -303,6 +348,7 @@ impl Output {
 struct Host {
     service: Arc<Service>,
     session: Arc<Session>,
+    launch: Arc<LaunchContext>,
     http: bool,
     call_id: Option<u64>,
     runtime: Handle,
@@ -326,11 +372,9 @@ impl ToolCall {
         }
         let invalid = |error: serde_json::Error| format!("Invalid {tool} arguments: {error}");
         match tool {
-            "exec" => {
-                let request = serde_json::from_value(value).map_err(invalid)?;
-                service::validate(&request)?;
-                Ok(Self::Exec(Box::new(request)))
-            }
+            "exec" => serde_json::from_value(value)
+                .map(|request| Self::Exec(Box::new(request)))
+                .map_err(invalid),
             "read" => serde_json::from_value(value)
                 .map(Self::Read)
                 .map_err(invalid),
@@ -390,7 +434,10 @@ impl Host {
                 return Err(error);
             }
         };
-        if matches!(&request, ToolCall::Exec(request) if request.action == service::Action::Start) {
+        if let ToolCall::Exec(request) = &request
+            && request.action == service::Action::Start
+            && service::validate(request).is_ok()
+        {
             if self.starts >= MAX_STARTS {
                 lock(&self.script.0.report).remove(id);
                 return Err(STARTS_ERROR.into());
@@ -401,12 +448,19 @@ impl Host {
         let semaphore = Arc::clone(&self.semaphore);
         let service = Arc::clone(&self.service);
         let session = Arc::clone(&self.session);
+        let launch = Arc::clone(&self.launch);
         let script = self.script.clone();
+        let in_flight = InFlightGuard::enter(script.clone());
         let http = self.http;
         let call_id = self.call_id;
         let cancel = script.0.cancel.child_token();
+        let nested_render = Render {
+            output_mode: OutputMode::Both,
+            structured_content: true,
+        };
         self.runtime.spawn(async move {
-            let permit = tokio::select! {
+            let _in_flight = in_flight;
+            let _permit = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return,
                 permit = semaphore.acquire_owned() => match permit {
@@ -421,10 +475,8 @@ impl Host {
                             *request,
                             Call {
                                 session: &session,
-                                render: Render {
-                                    output_mode: OutputMode::Both,
-                                    structured_content: true,
-                                },
+                                launch: Some(&launch),
+                                render: nested_render,
                                 cancel: cancel.clone(),
                                 progress: None,
                                 call_id,
@@ -435,15 +487,20 @@ impl Host {
                         .await
                 }
                 request => {
-                    let launch = Arc::clone(&session.launch);
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
                         result = async move {
                             match request {
-                                ToolCall::Read(request) => files::read(request, launch, http).await,
-                                ToolCall::Write(request) => files::write(request, launch).await,
-                                ToolCall::Edit(request) => files::edit(request, launch).await,
+                                ToolCall::Read(request) => {
+                                    files::read(request, launch, http, nested_render).await
+                                }
+                                ToolCall::Write(request) => {
+                                    files::write(request, launch, nested_render).await
+                                }
+                                ToolCall::Edit(request) => {
+                                    files::edit(request, launch, nested_render).await
+                                }
                                 ToolCall::Exec(_) => unreachable!(),
                             }
                         } => result,
@@ -467,7 +524,6 @@ impl Host {
                 outcome = Outcome::Limit;
             }
             let _ = script.0.wake.send(Wake::Settled { id, outcome });
-            drop(permit);
         });
         Ok(id)
     }
@@ -517,6 +573,7 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
     let Work {
         service,
         session,
+        launch,
         http,
         call_id,
         code,
@@ -534,6 +591,7 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
     let host = Rc::new(RefCell::new(Host {
         service,
         session,
+        launch,
         http,
         call_id,
         runtime,
@@ -547,13 +605,15 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
             &code,
             &script,
             receiver,
-            host,
+            Rc::clone(&host),
             Rc::clone(&output),
             &task,
             &tasks,
         )
     }))
     .unwrap_or_else(|_| Err("The JavaScript worker panicked.".into()));
+    drop(host);
+    script.cancel_and_drain();
     let pending = script.finish();
     let exit_code = if script.0.stopped.load(Ordering::Acquire) {
         output.borrow_mut().diagnostic(&format!(
@@ -996,6 +1056,7 @@ mod tests {
                 .start_script(
                     ScriptArgs {
                         code: code.into(),
+                        launch: Arc::clone(&self.session.launch),
                         kill_after_ms: deadline,
                         http: false,
                         call_id: None,
@@ -1071,6 +1132,7 @@ mod tests {
         let mut host = Host {
             service: Arc::clone(&fixture.service),
             session: Arc::clone(&fixture.session),
+            launch: Arc::clone(&fixture.session.launch),
             http: false,
             call_id: None,
             runtime,
@@ -1084,7 +1146,14 @@ mod tests {
         assert_eq!(host.starts, MAX_STARTS);
         assert_eq!(host.call("exec".into(), args).unwrap_err(), STARTS_ERROR);
         assert_eq!(host.starts, MAX_STARTS);
-        assert_eq!(lock(&script.0.report).pending.len(), 1);
+        // Unvalidated start requests resolve as tool errors without consuming start slots.
+        host.call(
+            "exec".into(),
+            json!({"action":"start","command":""}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(host.starts, MAX_STARTS);
+        assert_eq!(lock(&script.0.report).pending.len(), 2);
         host.call("read".into(), json!({"path":"missing"}).to_string())
             .unwrap();
         assert_eq!(host.starts, MAX_STARTS);
@@ -1120,7 +1189,8 @@ mod tests {
             serde_json::from_value(json!({"code": "x".repeat(MAX_CODE + 1)})).unwrap();
         assert!(validate(&request).unwrap_err().contains("256 KiB"));
         for extra in [
-            json!({"cwd":"/"}),
+            json!({"cwd":"relative/dir"}),
+            json!({"pty":true}),
             json!({"waitMs":240001}),
             json!({"returnWhen":{"screenContains":["x"]}}),
         ] {
@@ -1133,9 +1203,11 @@ mod tests {
                 serde_json::from_value::<Request>(value).map_or(true, |r| validate(&r).is_err())
             );
         }
-        let request: Request =
-            serde_json::from_value(json!({"code":"return '\\0'", "waitMs":0, "killAfterMs":0}))
-                .unwrap();
+        let dir = std::env::temp_dir();
+        let request: Request = serde_json::from_value(
+            json!({"code":"return '\\0'", "cwd": dir, "waitMs":0, "killAfterMs":0}),
+        )
+        .unwrap();
         assert!(validate(&request).is_ok());
     }
 
@@ -1192,22 +1264,27 @@ mod tests {
         let fixture = Fixture::new();
         let code = r#"
             const write = await tools.write({path:'fixture.txt',content:'old\n'});
-            if (write.isError !== false || write.structuredContent !== undefined) throw new Error('write shape');
+            if (write.isError !== false || write.structuredContent.ok !== true || write.structuredContent.bytes !== 4) throw new Error('write shape');
             const edit = await tools.edit({path:'fixture.txt',edits:[{oldText:'old',newText:'new'}]});
-            if (edit.isError) throw new Error('edit failed');
+            if (edit.isError || edit.structuredContent.ok !== true || edit.structuredContent.edits[0].line !== 1) throw new Error('edit failed');
             const missing = await tools.read({path:'missing.txt'});
-            if (missing.isError !== true) throw new Error('missing file must resolve');
+            if (missing.isError !== true || missing.structuredContent.ok !== false) throw new Error('missing file must resolve');
+            const badExec = await tools.exec({action:'start',command:''});
+            if (badExec.isError !== true || badExec.structuredContent.ok !== false || badExec.structuredContent.action !== 'start') throw new Error('empty exec must resolve as error');
             for (const args of [null, [], 'x', {path:'fixture.txt',surprise:true}]) {
                 let rejected = false;
                 try { await tools.read(args); } catch (e) { rejected = true; }
                 if (!rejected) throw new Error('invalid arguments resolved');
             }
+            for (const args of [null, {action:'bogus'}, {action:'list',surprise:true}]) {
+                let rejected = false;
+                try { await tools.exec(args); } catch (e) { if (e instanceof TypeError) rejected = true; }
+                if (!rejected) throw new Error('invalid exec schema resolved');
+            }
             try { tools.codemode({code:'return 1'}); throw new Error('unknown tool accepted'); }
             catch(e) { if (!(e instanceof TypeError)) throw e; }
-            try { await tools.exec({action:'start',command:''}); throw new Error('empty exec accepted'); }
-            catch(e) { if (!(e instanceof TypeError)) throw e; }
             const results = await Promise.all(Array.from({length:20}, () => tools.read({path:'fixture.txt'})));
-            if (results.some(r => r.isError || !r.content[0].text.includes('new'))) throw new Error('queued read failed');
+            if (results.some(r => r.isError || r.structuredContent.text !== 'new\n' || r.structuredContent.truncated !== false)) throw new Error('queued read failed');
             text(results.length);
         "#;
         let (state, output) = fixture.result(code).await;

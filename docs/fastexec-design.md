@@ -87,12 +87,16 @@ ranges return an error before execution.
 
 ### Codemode
 
-`FASTEXEC_CODEMODE=true` adds `codemode`. Its required `code` is an async
+`FASTEXEC_CODEMODE=true` adds `codemode` and includes JavaScript orchestration
+guidance in server `instructions`. Its required `code` is an async
 function body with top-level `await` and `return`, up to 256 KiB of UTF-8,
 nonempty after trimming and without NUL bytes. Unknown parameters are refused.
-It shares `exec start`'s wait and output options: `waitMs`, `killAfterMs`,
-`truncate`, `maxBytes`, `raw`, and `returnWhen` (`outputContains`, `quietMs`).
-Argument and admission failures return `isError: true` without creating a task.
+It shares `exec start`'s directory, wait, and output options: `cwd`, `waitMs`,
+`killAfterMs`, `truncate`, `maxBytes`, `raw`, and `returnWhen`
+(`outputContains`, `quietMs`). Schema-decoding failures return a tool error
+without `structuredContent`; parameter validation and admission failures return
+`isError: true` with `structuredContent` (`ok: false`, `action: "codemode"`)
+without creating a task.
 
 A script is a task with `kind: "codemode"`. The start result has
 `action: "codemode"`; later `exec poll`, `kill`, and `list` use the same task
@@ -115,26 +119,34 @@ show Error stacks. A non-undefined return value is appended last. `exit()`
 ends successfully even inside a try/catch. Each script owns its globals;
 bridge functions bind the built-ins they depend on before user code runs.
 
-Nested calls resolve to `{content, structuredContent?, isError}`, with a
-boolean `isError`. Invalid argument shapes and invalid exec requests reject;
-file and task operation failures resolve with `isError: true`. Nested exec
-uses both output forms with structured content enabled. File results have no
-structuredContent. Eight nested calls run at once, with 1024 queued calls;
-additional calls reject with RangeError. Pending tool arguments and results
-have a separate 128 MiB budget per script; exceeding it rejects the call with
-RangeError. A completed result that cannot fit rejects after the operation
-ran; its error identifies this case, and the operation remains in effect.
-A script awaiting a promise with no
+Nested calls resolve to `{content, structuredContent, isError}`, with a
+boolean `isError`. Schema-invalid argument shapes and unknown tools reject with
+`TypeError`; validation and operational failures across `exec`, `read`, `write`,
+and `edit` resolve with `isError: true` and `structuredContent.ok: false`.
+Nested calls use `both` output mode with structured content enabled: `exec`
+places clean output in `structuredContent.output`, text `read` places clean file
+text without truncation or UTF-8 notices in `structuredContent.text` alongside
+`truncated` and `nextOffset`, `write` reports `{ok, path, bytes}`, and `edit`
+reports `{ok, path, replacements, edits}`. Eight nested calls run at once, with
+1024 queued calls; additional calls reject with RangeError. Pending tool
+arguments and results have a separate 128 MiB budget per script; exceeding it
+rejects the call with RangeError. A completed result that cannot fit rejects
+after the operation ran; its error identifies this case, and the operation
+remains in effect. A script awaiting a promise with no
 pending tool call or JavaScript job fails because it has no way to settle.
 
-Calls use the script's session and launch context. A nested task's reader can
-be polled by the caller, and IPC children retain the outer call ID. Nested
-calls advance their reader state but do not consume session background
-notifications. A start registers its handle before waiting, so cancellation
-does not hide an already-created task. Each script accepts at most 4096
-validated exec start calls, counting calls that later fail or are cancelled.
-Further starts reject with RangeError, so the complete startedTasks history
-stays bounded.
+Calls use the script's session and launch context (with `cwd` overridden when
+the script sets `cwd`). A nested task's reader can be polled by the caller, and
+IPC children retain the outer call ID. Nested calls advance their reader state;
+tasks started outside the script keep their session background notifications
+pending, whereas tasks started by the script whose completion is already
+observed inside the script mark their session entry reported so finished helper
+commands do not pollute subsequent outer `Background:` footers. When a script
+ends, in-flight nested calls are cancelled and drained before publishing the
+final script report, so any `exec start` already inside process creation is
+recorded in `startedTasks`. Each script accepts at most 4096 validated exec
+start calls, counting calls that later fail or are cancelled. Further starts
+reject with RangeError, so the complete startedTasks history stays bounded.
 
 Script output streams through the existing pipe capture and task log. The
 64 MiB per-script limit includes text and image files, with 4 KiB reserved
@@ -256,21 +268,21 @@ its tasks. In `on` mode a disconnect ends nothing; the daemon keeps the tasks
 ### `FASTEXEC_STRUCTURED_CONTENT` and `FASTEXEC_OUTPUT_MODE`
 
 Set these strings in the MCP server's `env` configuration. Both are read at
-startup; invalid values exit with status `1`. They shape `exec` and `codemode` results:
-`read`, `write`, and `edit` answer with their own text or image content, and
-`transfer` adds `structuredContent.url` when structured content is enabled.
+startup; invalid values exit with status `1`. They shape tool results across
+`exec`, `codemode`, `read`, `write`, `edit`, and `transfer`.
 
 - **`FASTEXEC_STRUCTURED_CONTENT`**: `"true"` (default) attaches
   `structuredContent` JSON metadata; `"false"` omits `structuredContent` on all
   results and uses text output placement.
 - **`FASTEXEC_OUTPUT_MODE`** (when structured content is enabled):
-  - `"text"` (default): `content` holds the output body, status line, and
-    background footer; `structuredContent` holds metadata only.
-  - `"both"`: `content` holds body + status + footer, and
-    `structuredContent.output` also holds the output body.
-  - `"structured"`: `content` holds only the status line and footer;
-    `structuredContent.output` holds the output body (for hosts like Codex that
-    consume structured tool output).
+  - `"text"` (default): `content` holds the full text (output body + status/footer
+    for tasks, or file text + notices for `read`); `structuredContent` holds
+    metadata without duplicating task output or file text.
+  - `"both"`: `content` holds the full text, and `structuredContent.output`
+    (tasks) or `structuredContent.text` (text `read`) also holds the clean body.
+  - `"structured"`: `content` holds only the status/notice line;
+    `structuredContent.output` (tasks) or `structuredContent.text` (text `read`)
+    holds the clean body (for hosts like Codex that consume structured tool output).
 
 ### `FASTEXEC_DAEMON`
 

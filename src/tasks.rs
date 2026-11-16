@@ -547,6 +547,7 @@ pub struct StartArgs {
 
 pub(crate) struct ScriptArgs {
     pub code: String,
+    pub launch: Arc<LaunchContext>,
     pub kill_after_ms: Option<u64>,
     pub http: bool,
     pub call_id: Option<u64>,
@@ -963,6 +964,7 @@ impl Tasks {
         worker.start(codemode::Work {
             service: args.service,
             session: Arc::clone(session),
+            launch: args.launch,
             http: args.http,
             call_id: args.call_id,
             code: args.code,
@@ -983,6 +985,8 @@ impl Tasks {
         let output_open = drain(task, &captured, false);
         let mut registry = lock(&self.registry);
         let killed = task.kill_requested.load(Ordering::SeqCst);
+        let _ = task.tree_ended_at.set(Instant::now());
+        task.tree_done.send_replace(true);
         *lock(&task.end) = Some(Final {
             exit_code: if killed { None } else { exit_code },
             killed,
@@ -993,8 +997,6 @@ impl Tasks {
             leftovers: Vec::new(),
             kept: false,
         });
-        let _ = task.tree_ended_at.set(Instant::now());
-        task.tree_done.send_replace(true);
         self.retire_finished(&mut registry);
         drop(registry);
         task.done.send_replace(true);
@@ -2913,6 +2915,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"action": "list"})).unwrap();
         let call = Call {
             session: &session,
+            launch: None,
             render: Render {
                 output_mode: OutputMode::Text,
                 structured_content: true,
@@ -3195,6 +3198,7 @@ mod tests {
         let session = Session::new("ctx-1".into(), "ctx-1".into(), Arc::clone(&launch));
         let call = || crate::service::Call {
             session: &session,
+            launch: None,
             render: crate::service::Render {
                 output_mode: crate::service::OutputMode::Text,
                 structured_content: true,
@@ -3563,6 +3567,7 @@ mod script_tests {
     fn script_args(tasks: &Arc<Tasks>) -> ScriptArgs {
         ScriptArgs {
             code: "return undefined".into(),
+            launch: Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new())),
             kill_after_ms: None,
             http: false,
             call_id: None,
@@ -3672,6 +3677,7 @@ mod script_tests {
         let service = crate::service::Service::new(Arc::clone(&tasks), false);
         let call = || crate::service::Call {
             session: &session,
+            launch: None,
             render: crate::service::Render {
                 output_mode: crate::service::OutputMode::Both,
                 structured_content: true,

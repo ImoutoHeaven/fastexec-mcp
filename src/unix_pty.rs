@@ -114,11 +114,15 @@ pub(crate) fn open_observed(
 #[cfg(any(target_os = "macos", test))]
 fn retry_master_open(mut allocate: impl FnMut() -> io::Result<RawFd>) -> io::Result<RawFd> {
     const EREDRIVEOPEN: i32 = -6;
-    // At most five attempts; never yield after the final failure.
-    for _ in 0..4 {
+    // At most five attempts; never back off after the final failure.
+    for attempt in 0..4 {
         match allocate() {
             Err(error) if error.raw_os_error() == Some(EREDRIVEOPEN) => {
-                std::thread::yield_now();
+                if attempt < 2 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(100 * (attempt - 1)));
+                }
             }
             result => return result,
         }

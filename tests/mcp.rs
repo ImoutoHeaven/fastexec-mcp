@@ -5114,6 +5114,18 @@ fn codemode_requires_explicit_enable_and_respects_yolo() {
             tool["inputSchema"]["properties"]["code"]["type"], "string",
             "{tool}"
         );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["cwd"]["type"],
+            json!(["string", "null"]),
+            "{tool}"
+        );
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("Prefer this over multi-turn exec or read calls"),
+            "{tool}"
+        );
         assert!(
             tool["inputSchema"]["required"]
                 .as_array()
@@ -5155,19 +5167,44 @@ fn codemode_requires_explicit_enable_and_respects_yolo() {
 #[test]
 fn codemode_invalid_arguments_do_not_create_tasks() {
     let mut server = codemode_server();
+    // Schema-decoding failures have no structuredContent.
     for args in [
         json!({}),
         json!({"code":42}),
+        json!({"code":"return 1", "pty":true}),
+        json!({"code":"return 1", "returnWhen":{"screenContains":["x"]}}),
+    ] {
+        let result = code_result(&mut server, args);
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(result.get("structuredContent").is_none(), "{result}");
+        let (listed, _) = server.ok(json!({"action":"list"}));
+        assert!(listed["tasks"].as_array().unwrap().is_empty(), "{listed}");
+    }
+    // Parameter and business validation failures carry structuredContent with action: "codemode".
+    for args in [
         json!({"code":"  "}),
         json!({"code":"x\0y"}),
-        json!({"code":"return 1", "cwd":"/tmp"}),
+        json!({"code":"return 1", "cwd":"relative/path"}),
+        json!({"code":"return 1", "cwd":"/nonexistent-fastexec-dir-xyz"}),
         json!({"code":"return 1", "waitMs":240001}),
-        json!({"code":"return 1", "returnWhen":{"screenContains":["x"]}}),
+        json!({"code":"return 1", "returnWhen":{}}),
+        json!({"code":"return 1", "returnWhen":{"quietMs":5}}),
         json!({"code":"return 1", "truncate":"none", "maxBytes":100}),
         json!({"code":"x".repeat(256 * 1024 + 1)}),
     ] {
         let result = code_result(&mut server, args);
         assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["structuredContent"]["ok"], false, "{result}");
+        assert_eq!(
+            result["structuredContent"]["action"], "codemode",
+            "{result}"
+        );
+        assert!(
+            result["structuredContent"]["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "{result}"
+        );
         let (listed, _) = server.ok(json!({"action":"list"}));
         assert!(listed["tasks"].as_array().unwrap().is_empty(), "{listed}");
     }
@@ -5236,14 +5273,19 @@ const [command, file, absent] = await Promise.all([
   tools.read({path:'note.txt'}), tools.read({path:'absent.txt'})
 ]);
 if (written.isError !== false || edited.isError !== false || command.isError !== false || absent.isError !== true) throw new Error('isError shape');
+if (written.structuredContent.ok !== true || written.structuredContent.bytes !== 11) throw new Error('write structured shape');
+if (edited.structuredContent.ok !== true || edited.structuredContent.replacements !== 1 || edited.structuredContent.edits[0].line !== 2) throw new Error('edit structured shape');
 if (command.structuredContent.output !== 'nested-output' || !command.content[0].text.includes('nested-output')) throw new Error('exec shape');
-if ('structuredContent' in file || file.content[0].text !== 'alpha\nBETA\n') throw new Error('file shape');
+if (file.structuredContent.ok !== true || file.structuredContent.text !== 'alpha\nBETA\n' || file.structuredContent.truncated !== false || file.structuredContent.nextOffset !== null || file.content[0].text !== 'alpha\nBETA\n') throw new Error('file shape');
+if (absent.structuredContent.ok !== false || typeof absent.structuredContent.error !== 'string') throw new Error('absent shape');
 const reads = await Promise.all(Array.from({length:20}, () => tools.read({path:'note.txt'})));
-if (reads.length !== 20 || reads.some(r => r.isError)) throw new Error('queued reads');
+if (reads.length !== 20 || reads.some(r => r.isError || r.structuredContent.text !== 'alpha\nBETA\n')) throw new Error('queued reads');
 text('nested-ok');
 "#;
         let result = code_result(&mut server, json!({"code":code}));
         assert_eq!(result["isError"], false, "{result}");
+        let bad = code_result(&mut server, json!({"code":"   "}));
+        assert_eq!(bad["isError"], true, "{bad}");
         if structured == "true" {
             assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
             assert_eq!(
@@ -5251,8 +5293,10 @@ text('nested-ok');
                 "{result}"
             );
             assert!(!code_text(&result).contains("nested-ok"), "{result}");
+            assert_eq!(bad["structuredContent"]["action"], "codemode", "{bad}");
         } else {
             assert!(result.get("structuredContent").is_none(), "{result}");
+            assert!(bad.get("structuredContent").is_none(), "{bad}");
             assert!(
                 code_text(&result).contains("nested-ok")
                     && !code_text(&result).contains("Script error:"),
@@ -5269,10 +5313,18 @@ fn codemode_rejects_bad_nested_calls_and_survives_changed_prototypes() {
 let rejected = 0;
 for (const call of [
   () => tools.read(null), () => tools.read({path:'x', bogus:true}),
-  () => tools.exec({action:'start'}), () => tools.exec({action:'list', bogus:true}),
+  () => tools.exec({action:'bogus'}), () => tools.exec({action:'list', bogus:true}),
   () => tools.codemode({code:'return 1'})
-]) { try { await call(); } catch { rejected++; } }
+]) { try { await call(); } catch (e) { if (e instanceof TypeError) rejected++; } }
 if (rejected !== 5) throw new Error('invalid calls resolved: ' + rejected);
+for (const bad of [
+  await tools.exec({action:'start'}),
+  await tools.exec({action:'start', command:''}),
+  await tools.exec({action:'start', command:'true', waitMs:240001}),
+  await tools.edit({path:'x', edits:[]})
+]) {
+  if (bad.isError !== true || bad.structuredContent.ok !== false) throw new Error('validation failure did not resolve uniformly');
+}
 const pending = tools.read({path:'a-file-that-does-not-exist'});
 Map.prototype.get = Map.prototype.set = Map.prototype.delete = () => { throw new Error('changed Map'); };
 Promise.prototype.then = () => { throw new Error('changed Promise'); };
@@ -5538,5 +5590,228 @@ fn codemode_nested_calls_do_not_consume_other_tasks_background_notifications() {
     assert!(
         code_text(&result).contains(bare_id(&other)) && code_text(&result).contains("Background:"),
         "{result}"
+    );
+}
+
+#[test]
+fn codemode_awaited_helper_tasks_do_not_pollute_outer_background_footer() {
+    let mut server = codemode_server();
+    let code = r#"
+for (let i = 0; i < 6; i++) {
+  const res = await tools.exec({
+    action: 'start',
+    command: i % 2 === 0 ? `printf ok-${i}` : `exit ${i}`,
+    loginShell: false,
+  });
+  if (res.isError || res.structuredContent.state !== 'exited') throw new Error('helper failed');
+}
+const delayed = await tools.exec({
+  action: 'start',
+  command: 'sleep 0.05; exit 3',
+  loginShell: false,
+  waitMs: 0,
+});
+const polled = await tools.exec({
+  action: 'poll',
+  taskId: delayed.structuredContent.taskId,
+  waitMs: 10000,
+});
+if (polled.structuredContent.exitCode !== 3) throw new Error('delayed helper exit');
+return 'clean';
+"#;
+    let result = code_result(&mut server, json!({"code":code}));
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(
+        !code_text(&result).contains("Background:"),
+        "awaited helper tasks leaked into outer Background footer: {}",
+        code_text(&result)
+    );
+    let (_, next_text) = server.ok(json!({
+        "action":"start", "command":"printf outer", "loginShell":false
+    }));
+    assert!(
+        !next_text.contains("Background:"),
+        "later outer call received stale helper notifications: {next_text}"
+    );
+}
+
+#[test]
+fn codemode_script_cwd_applies_to_file_tools_and_nested_exec() {
+    let outer = Scratch::new("codemode-outer-cwd");
+    let inner = Scratch::new("codemode-inner-cwd");
+    std::fs::create_dir_all(&*outer).unwrap();
+    std::fs::create_dir_all(&*inner).unwrap();
+    let mut server = Server::start_with(|command| {
+        command
+            .current_dir(&*outer)
+            .env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_OUTPUT_MODE", "both");
+    });
+    let code = format!(
+        r#"
+await tools.write({{path:'sub/item.txt', content:'one\ntwo\n'}});
+await tools.edit({{path:'sub/item.txt', edits:[{{oldText:'two', newText:'TWO'}}]}});
+const [readBack, runInner, runOuter] = await Promise.all([
+  tools.read({{path:'sub/item.txt'}}),
+  tools.exec({{action:'start', command:'printf inner-ok > from-exec.txt', loginShell:false}}),
+  tools.exec({{action:'start', command:'printf outer-ok > from-override.txt', cwd:{}, loginShell:false}}),
+]);
+if (runInner.isError || runOuter.isError) throw new Error('nested exec failed');
+return {{ file: readBack.structuredContent.text }};
+"#,
+        json!(outer.to_string_lossy())
+    );
+    let result = code_result(&mut server, json!({"code":code, "cwd": &*inner}));
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(inner.join("sub/item.txt").is_file());
+    assert!(!outer.join("sub/item.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(inner.join("sub/item.txt")).unwrap(),
+        "one\nTWO\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(inner.join("from-exec.txt")).unwrap(),
+        "inner-ok"
+    );
+    assert!(!outer.join("from-exec.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(outer.join("from-override.txt")).unwrap(),
+        "outer-ok"
+    );
+    assert!(!inner.join("from-override.txt").exists());
+    let parsed: Value =
+        serde_json::from_str(result["structuredContent"]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed["file"], "one\nTWO\n");
+}
+
+#[test]
+fn file_tools_paginate_via_structured_content_and_honor_output_modes() {
+    let dir = Scratch::new("file-structured");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let big: String = (1..=2500)
+        .map(|line| format!("line-{line:04}-payload-text\n"))
+        .collect();
+    std::fs::write(dir.join("big.txt"), &big).unwrap();
+
+    let mut server = Server::start_with(|command| {
+        command
+            .current_dir(&*dir)
+            .env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_OUTPUT_MODE", "both");
+    });
+    let code = r#"
+let offset = 1;
+let pages = 0;
+const parts = [];
+while (offset !== null) {
+  const page = await tools.read({path:'big.txt', offset});
+  if (page.isError) throw new Error('read failed');
+  if (page.structuredContent.text.includes('[Showing lines')) {
+    throw new Error('truncation notice leaked into structuredContent.text');
+  }
+  parts.push(page.structuredContent.text);
+  pages++;
+  offset = page.structuredContent.nextOffset;
+}
+const joined = parts.join('\n');
+return {pages, bytes: joined.length};
+"#;
+    let result = code_result(&mut server, json!({"code":code}));
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    let summary: Value =
+        serde_json::from_str(result["structuredContent"]["output"].as_str().unwrap()).unwrap();
+    assert!(summary["pages"].as_u64().unwrap() >= 2, "{summary}");
+    assert_eq!(summary["bytes"].as_u64().unwrap(), big.len() as u64);
+
+    // Direct MCP structured-only mode keeps file bodies in structuredContent.text only.
+    let mut structured_only = Server::start_with(|command| {
+        command
+            .current_dir(&*dir)
+            .env("FASTEXEC_OUTPUT_MODE", "structured");
+    });
+    let reply = structured_only.request(
+        "tools/call",
+        json!({"name":"read", "arguments":{"path":"big.txt"}}),
+    );
+    let read_res = &reply["result"];
+    assert_eq!(read_res["isError"], false, "{reply}");
+    assert_eq!(read_res["structuredContent"]["truncated"], true, "{reply}");
+    assert!(
+        read_res["structuredContent"]["nextOffset"].is_u64(),
+        "{reply}"
+    );
+    assert!(
+        !read_res["structuredContent"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[Showing lines"),
+        "{reply}"
+    );
+    assert!(
+        read_res["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Showing lines"),
+        "{reply}"
+    );
+}
+
+#[test]
+fn codemode_drains_inflight_spawns_before_publishing_started_tasks() {
+    let mut server = codemode_server();
+    // Fire unawaited starts and return immediately; any child that actually spawned must already
+    // be present in the initial codemode result's startedTasks.
+    let code = r#"
+for (let i = 0; i < 4; i++) {
+  tools.exec({action:'start', command:'sleep 30', loginShell:false, waitMs:60000});
+}
+await Promise.resolve();
+return 'returned-early';
+"#;
+    let result = code_result(&mut server, json!({"code":code}));
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    let reported: std::collections::HashSet<String> =
+        result["structuredContent"]["codemode"]["startedTasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| bare_id(entry["taskId"].as_str().unwrap()).to_owned())
+            .collect();
+    let (listed, _) = server.ok(json!({"action":"list"}));
+    let running_bash: Vec<String> = listed["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "bash")
+        .map(|task| task["taskId"].as_str().unwrap().to_owned())
+        .collect();
+    for id in &running_bash {
+        assert!(
+            reported.contains(id),
+            "spawned bash task {id} missed initial startedTasks report {reported:?}: {result}"
+        );
+        server.ok(json!({"action":"kill", "taskId":id}));
+    }
+}
+
+#[test]
+fn server_instructions_advertise_codemode_only_when_enabled() {
+    let mut disabled = Server::start();
+    let init_off = disabled.request(
+        "initialize",
+        json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}),
+    );
+    let instructions_off = init_off["result"]["instructions"].as_str().unwrap();
+    assert!(!instructions_off.contains("codemode"), "{instructions_off}");
+
+    let mut enabled = codemode_server();
+    let init_on = enabled.request(
+        "initialize",
+        json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}),
+    );
+    let instructions_on = init_on["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions_on.contains("codemode") && instructions_on.contains("Prefer codemode"),
+        "{instructions_on}"
     );
 }

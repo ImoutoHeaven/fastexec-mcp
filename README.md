@@ -107,9 +107,10 @@ mid-session.
 
 ## JavaScript tasks
 
-Set `FASTEXEC_CODEMODE=true` to expose `codemode`. Its `code` argument is the
-body of an async JavaScript function. The script can call `exec`, `read`,
-`write`, and `edit`, inspect their results, and return only the output it needs:
+Set `FASTEXEC_CODEMODE=true` to expose `codemode` and advertise it in server
+instructions. Its `code` argument is the body of an async JavaScript function.
+The script can call `exec`, `read`, `write`, and `edit`, inspect their
+structured results, and return only the output it needs:
 
 ```javascript
 const [run, file] = await Promise.all([
@@ -117,7 +118,7 @@ const [run, file] = await Promise.all([
   tools.read({path: "README.md", limit: 5})
 ]);
 text(run.structuredContent.output);
-text(file.content[0].text);
+text(file.structuredContent.text);
 ```
 
 `text`, `console.log/info/warn/error/debug`, and a returned value write to the
@@ -125,8 +126,10 @@ task log. `image(await tools.read({path: "shot.png"}))` saves and returns an
 image. A result carries at most four images and 4718592 base64 bytes; warnings
 name saved images that can be read separately.
 
-`codemode` accepts `waitMs`, `returnWhen` with `outputContains` or `quietMs`,
-`killAfterMs`, `truncate`, `maxBytes`, and `raw`. Continue with `exec poll`,
+`codemode` accepts `cwd`, `waitMs`, `returnWhen` with `outputContains` or `quietMs`,
+`killAfterMs`, `truncate`, `maxBytes`, and `raw`. When `cwd` is set, nested `exec`
+starts (unless they pass their own `cwd`) and relative paths in `read`, `write`,
+and `edit` resolve against it. Continue with `exec poll`,
 stop with `exec kill`, and inspect with `exec list`. A script has no terminal
 or input. JavaScript has no Node APIs, modules, timers, filesystem or network
 access; host operations go through `tools`.
@@ -148,8 +151,9 @@ bound the script's lifetime.
 only `true` or `false`; invalid values stop startup.
 An endpoint's environment decides whether it advertises codemode, even when
 its daemon was started without it. HTTP uses the daemon's startup setting.
-Nested `exec` always returns text and structured output so scripts work with
-any outer output setting.
+Nested calls always include `structuredContent` (`exec` sets `output`, text
+`read` sets clean `text` plus `truncated` and `nextOffset`, `write` sets `bytes`,
+and `edit` sets `edits`) so scripts work with any outer output setting.
 
 Each script has 128 MiB of VM memory, eight tool calls in flight with up to
 1024 queued, a separate 128 MiB budget for pending tool arguments and results,

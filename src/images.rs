@@ -60,6 +60,11 @@ pub struct Processed {
     pub text: String,
     /// The image block, base64 data and MIME type, when the image could be processed.
     pub image: Option<(String, String)>,
+    pub mime: String,
+    pub original_width: Option<u32>,
+    pub original_height: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// The MIME type of an image whose first bytes are `prefix`, when the file is one a model reads.
@@ -93,6 +98,8 @@ pub fn detect(prefix: &[u8]) -> Option<&'static str> {
 pub(crate) struct Inline {
     pub bytes: Vec<u8>,
     pub mime: String,
+    pub original_width: u32,
+    pub original_height: u32,
     pub width: u32,
     pub height: u32,
     pub hints: Vec<String>,
@@ -115,9 +122,15 @@ pub fn process(bytes: Vec<u8>, mime: &str) -> Processed {
         text.push('\n');
         text.push_str(&hint);
     }
+    let out_mime = image.mime.clone();
     Processed {
         text,
         image: Some((base64(&image.bytes), image.mime)),
+        mime: out_mime,
+        original_width: Some(image.original_width),
+        original_height: Some(image.original_height),
+        width: Some(image.width),
+        height: Some(image.height),
     }
 }
 
@@ -143,6 +156,8 @@ fn prepare(bytes: Vec<u8>, mime: &str) -> Result<Inline, String> {
     Ok(Inline {
         bytes: resized.bytes,
         mime: resized.mime,
+        original_width: resized.original_width,
+        original_height: resized.original_height,
         width: resized.width,
         height: resized.height,
         hints,
@@ -154,6 +169,11 @@ fn failed(mime: &str, message: &str) -> Processed {
     Processed {
         text: format!("Read image file [{mime}]\n{message}"),
         image: None,
+        mime: mime.to_owned(),
+        original_width: None,
+        original_height: None,
+        width: None,
+        height: None,
     }
 }
 

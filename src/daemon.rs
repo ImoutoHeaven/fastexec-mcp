@@ -742,6 +742,7 @@ async fn run_call(
     let forwarder = Forwarder(tokio::spawn(forward_progress(id, latest, outgoing.clone())));
     let call = Call {
         session: &session,
+        launch: None,
         render,
         cancel: token.clone(),
         progress: Some(progress),
@@ -760,7 +761,7 @@ async fn run_call(
         // A file tool runs in the daemon's own process, with the session's launch context and no
         // HTTP session behind it.
         let launch = Arc::clone(&session.launch);
-        crate::files::call(&tool, arguments, launch, false).await
+        crate::files::call(&tool, arguments, launch, false, render).await
     };
     // The result goes out last. Aborting the forwarder is not enough on its own: one already
     // inside an encode or a send could still queue a frame after the result, so this waits for

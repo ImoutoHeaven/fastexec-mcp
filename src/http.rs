@@ -5,7 +5,7 @@ use crate::daemon::Daemon;
 use crate::service::Render;
 use crate::session::{LaunchContext, Session};
 use crate::transfer::{self, Admitted, Transfers};
-use crate::{Backend, INSTRUCTIONS_DAEMON, Server};
+use crate::{Backend, Server};
 use bytes::Bytes;
 use http::header::HeaderName;
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
@@ -234,7 +234,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
                 render,
                 session: Arc::new(OnceLock::new()),
                 launch: Arc::clone(&launch),
-                instructions: INSTRUCTIONS_DAEMON,
+                daemon: true,
             };
             let mut server = Server::new(
                 backend,

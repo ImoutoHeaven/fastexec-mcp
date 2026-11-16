@@ -43,6 +43,19 @@ impl LaunchContext {
         ))
     }
 
+    /// This context with `cwd` replaced, preserving its environment and cached bash path.
+    pub fn with_cwd(&self, cwd: PathBuf) -> Self {
+        let bash = OnceLock::new();
+        if let Some(found) = self.bash.get() {
+            let _ = bash.set(found.clone());
+        }
+        Self {
+            cwd,
+            env: self.env.clone(),
+            bash,
+        }
+    }
+
     /// This context with `name` removed from its environment, so the tasks it starts cannot carry
     /// a secret the caller used to reach the server.
     pub fn without(mut self, name: &str) -> Self {

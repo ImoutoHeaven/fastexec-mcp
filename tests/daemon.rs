@@ -1926,6 +1926,23 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
             "{listed}"
         );
     }
+    let invalid = enabled.request(
+        "tools/call",
+        json!({"name":"codemode","arguments":{"code":"   "}}),
+    )["result"]
+        .clone();
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    assert_eq!(
+        invalid["structuredContent"]["action"], "codemode",
+        "{invalid}"
+    );
+    let read_img = enabled.request(
+        "tools/call",
+        json!({"name":"read","arguments":{"path":"shot.png"}}),
+    )["result"]
+        .clone();
+    assert_eq!(read_img["structuredContent"]["kind"], "image", "{read_img}");
+    assert_eq!(read_img["structuredContent"]["width"], 8, "{read_img}");
     let result = enabled.request("tools/call", json!({"name":"codemode","arguments":{
         "code":"image(await tools.read({path:'shot.png'})); const child = await tools.exec({action:'start',command:'printf nested',loginShell:false}); text(child.structuredContent.taskId); return child.structuredContent.output;"
     }}))["result"].clone();
