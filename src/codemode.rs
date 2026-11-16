@@ -18,7 +18,6 @@ use std::io::{PipeWriter, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
-use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -237,7 +236,8 @@ impl ScriptHandle {
         self.0.cancel.cancel();
         let (count, idle) = &self.0.in_flight;
         let active = lock(count);
-        let _ = idle.wait_timeout_while(active, Duration::from_secs(5), |&mut active| active > 0);
+        // A start can still be registering its task; only the caller's wait has a deadline.
+        drop(idle.wait_while(active, |&mut active| active > 0));
     }
 
     fn finish(&self) -> Vec<CallInfo> {
@@ -1330,6 +1330,41 @@ mod tests {
         assert!(cancelled.iter().all(|call| call.tool == "read"));
         assert!(started.is_empty());
         assert_eq!(std::fs::read_to_string(&task.log_path).unwrap(), "done\n");
+    }
+
+    #[tokio::test]
+    async fn finishing_waits_for_a_slow_inflight_start_to_be_reported() {
+        let fixture = Fixture::new();
+        let task = fixture.start("while (true) {}", None);
+        let script = task.script().unwrap().clone();
+        // Hold an admitted start before its task is registered, past the old five-second drain.
+        let in_flight = InFlightGuard::enter(script.clone());
+        lock(&script.0.report)
+            .admit(
+                1,
+                CallInfo {
+                    tool: "exec".into(),
+                    action: Some("start".into()),
+                    task_id: None,
+                },
+                0,
+            )
+            .unwrap();
+        task.kill().unwrap();
+        let still_running =
+            tokio::time::timeout(Duration::from_secs(6), task.done().wait_for(|done| *done))
+                .await
+                .is_err();
+        let handle = "late-start.abcd".to_owned();
+        script.record_started(handle.clone());
+        drop(in_flight);
+        complete(&task).await;
+        assert!(
+            still_running,
+            "script finished before the admitted start registered"
+        );
+        assert_eq!(script.report().1, vec![handle]);
+        assert_eq!(task.snapshot().state, "killed");
     }
 
     #[tokio::test]

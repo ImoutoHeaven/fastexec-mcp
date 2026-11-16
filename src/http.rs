@@ -542,7 +542,7 @@ async fn serve_transfer(request: Request<Incoming>, table: Arc<Transfers>) -> Re
         return transfer_empty(StatusCode::NOT_FOUND, &[]);
     };
     match *request.method() {
-        Method::GET => transfer_get(request, admitted).await,
+        Method::GET => transfer_get(request.headers(), admitted).await,
         Method::HEAD => transfer_head(admitted).await,
         Method::PUT => transfer_put(request, admitted).await,
         _ => transfer_empty(
@@ -570,15 +570,28 @@ async fn presence(path: &Path) -> Presence {
 }
 
 /// Downloads a file, or the one range of it that was asked for.
-async fn transfer_get(request: Request<Incoming>, admitted: Admitted) -> Reply {
-    let size = match presence(admitted.path()).await {
-        Presence::File(size) => size,
+async fn transfer_get(headers: &HeaderMap, admitted: Admitted) -> Reply {
+    match presence(admitted.path()).await {
+        Presence::File(_) => {}
         Presence::Failed => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
         Presence::Missing | Presence::NotAFile => {
             return transfer_empty(StatusCode::NOT_FOUND, &[]);
         }
+    }
+    let mut file = match tokio::fs::File::open(admitted.path()).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return transfer_empty(StatusCode::NOT_FOUND, &[]);
+        }
+        Err(_) => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
     };
-    let range = match ranges(request.headers()) {
+    // Atomic saves may replace the path after the precheck; size and bytes share this handle.
+    let size = match file.metadata().await {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return transfer_empty(StatusCode::NOT_FOUND, &[]),
+        Err(_) => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+    };
+    let range = match ranges(headers) {
         Some(value) => transfer::parse_range(&value, size),
         None => transfer::Range::Whole,
     };
@@ -597,13 +610,6 @@ async fn transfer_get(request: Request<Incoming>, admitted: Admitted) -> Reply {
             Some(format!("bytes {start}-{end}/{size}")),
         ),
         transfer::Range::Whole => (0, size, StatusCode::OK, None),
-    };
-    let mut file = match tokio::fs::File::open(admitted.path()).await {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return transfer_empty(StatusCode::NOT_FOUND, &[]);
-        }
-        Err(_) => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
     };
     if start > 0 && file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
         return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]);
@@ -889,6 +895,64 @@ impl hyper::body::Body for FileBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downloads_size_the_file_opened_after_an_atomic_replacement() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = std::env::temp_dir().join(format!(
+                "fastexec-transfer-replace-{}",
+                crate::tasks::random_chars(12).unwrap()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("file.txt");
+            let replacement = directory.join("replacement.txt");
+            let table = Arc::new(Transfers::new());
+            let id = table.create(path.clone()).unwrap();
+            for partial in [false, true] {
+                std::fs::write(&path, b"old").unwrap();
+                std::fs::write(&replacement, b"replacement").unwrap();
+                let mut headers = HeaderMap::new();
+                if partial {
+                    headers.insert(header::RANGE, "bytes=3-".parse().unwrap());
+                }
+                let mut download = Box::pin(transfer_get(&headers, table.admit(&id).unwrap()));
+                let (release, blocked) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                assert!(
+                    std::future::poll_fn(|context| {
+                        Poll::Ready(download.as_mut().poll(context).is_pending())
+                    })
+                    .await
+                );
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                // One blocking worker drains the queued path metadata before this marker.
+                tokio::task::spawn_blocking(|| {}).await.unwrap();
+                std::fs::rename(&replacement, &path).unwrap();
+                let response = download.await;
+                let (status, length, body) = if partial {
+                    assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 3-10/11");
+                    (StatusCode::PARTIAL_CONTENT, "8", &b"lacement"[..])
+                } else {
+                    (StatusCode::OK, "11", &b"replacement"[..])
+                };
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()[header::CONTENT_LENGTH], length);
+                assert_eq!(
+                    response.into_body().collect().await.unwrap().to_bytes(),
+                    body
+                );
+            }
+            std::fs::remove_dir_all(directory).unwrap();
+        });
+    }
 
     fn headers(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

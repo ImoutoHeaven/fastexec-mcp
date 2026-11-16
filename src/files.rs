@@ -500,8 +500,10 @@ struct Window {
     window_bytes: u64,
     /// Lines of the selected content that fit the budget.
     shown_lines: u64,
-    /// Whether the last selected line was empty, which is the element a final `\n` adds.
+    /// Whether the last selected line was empty.
     last_line_empty: bool,
+    /// Whether the selected window reaches the file's final split element.
+    at_eof: bool,
     /// The selected line that was refused for its size, rather than the line budget running out.
     tripped_at: Option<u64>,
 }
@@ -529,6 +531,7 @@ impl Window {
                 window.skip_line(in_window, length);
             }
         }
+        window.at_eof = end >= window.total_lines;
         if start >= window.total_lines {
             return Err(format!(
                 "Offset {} is beyond end of file ({} lines total)",
@@ -586,14 +589,11 @@ impl Window {
     /// Whether the selected content ends with the empty element a final `\n` adds, which the
     /// truncation does not count as a line.
     fn trailing_element(&self) -> bool {
-        self.window_lines > 1 && self.last_line_empty
+        self.window_lines > 0 && self.last_line_empty && self.at_eof
     }
 
     /// The lines of the selected content, counted the way the truncation counts them.
     fn content_lines(&self) -> u64 {
-        if self.window_lines == 1 && self.last_line_empty {
-            return 0;
-        }
         self.window_lines - u64::from(self.trailing_element())
     }
 
@@ -1900,12 +1900,13 @@ fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> Result<(String
     let _guard = lock();
     let source = EditSource::read(resolved)
         .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
-    let (bom, content) = match source.content.strip_prefix('\u{feff}') {
-        Some(rest) => ("\u{feff}", rest),
-        None => ("", source.content.as_str()),
-    };
-    let (replaced, lines) = apply_edits(content, request, &request.path)?;
-    let written = format!("{bom}{replaced}");
+    let (mut written, lines) = apply_edits(&source.content, request, &request.path)?;
+    if source.content.starts_with('\u{feff}') && !written.starts_with('\u{feff}') {
+        written.insert(0, '\u{feff}');
+    }
+    if written == source.content {
+        return Err(no_change(&request.path, request.edits.len()));
+    }
     source
         .save(written.as_bytes())
         .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
@@ -2563,6 +2564,42 @@ mod tests {
             window(&path, Some(12), None, &launch).unwrap_err(),
             "Offset 12 is beyond end of file (11 lines total)"
         );
+    }
+
+    #[test]
+    fn read_counts_selected_empty_lines_before_the_end_of_file() {
+        let scratch = Scratch::new("selected-empty-lines");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file("three.txt", b"a\n\nb");
+        for (offset, limit, body, shown, end) in [(1, 2, "a\n", 2, 2), (2, 1, "", 1, 2)] {
+            let outcome = read_text(
+                &ReadRequest {
+                    path: scratch.path("three.txt"),
+                    offset: Some(offset),
+                    limit: Some(limit),
+                },
+                &launch,
+                false,
+            )
+            .unwrap();
+            assert_eq!(outcome.body.as_deref(), Some(body));
+            assert_eq!(outcome.structured["shownLines"], shown);
+            assert_eq!(outcome.structured["endLine"], end);
+            assert_eq!(outcome.structured["nextOffset"], 3);
+        }
+        scratch.file("empty.txt", b"");
+        let empty = read_text(
+            &ReadRequest {
+                path: scratch.path("empty.txt"),
+                offset: None,
+                limit: None,
+            },
+            &launch,
+            false,
+        )
+        .unwrap();
+        assert_eq!(empty.structured["shownLines"], 0);
+        assert!(empty.structured["endLine"].is_null());
     }
 
     #[test]
@@ -4028,6 +4065,39 @@ mod tests {
     }
 
     #[test]
+    fn edit_accepts_the_bom_returned_by_read() {
+        let scratch = Scratch::new("read-edit-bom");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file("bom.txt", "\u{feff}one\ntwo\n".as_bytes());
+        let read_back = whole(&scratch.path("bom.txt"), &launch, false).unwrap();
+        change(
+            "bom.txt",
+            &[(&read_back, &read_back.replace("one", "ONE"))],
+            &launch,
+        )
+        .unwrap();
+        assert_eq!(scratch.read("bom.txt"), "\u{feff}ONE\ntwo\n".as_bytes());
+        change("bom.txt", &[("\u{feff}ONE", "one")], &launch).unwrap();
+        assert_eq!(scratch.read("bom.txt"), "\u{feff}one\ntwo\n".as_bytes());
+        assert!(change("bom.txt", &[("\u{feff}one", "one")], &launch).is_err());
+        scratch.file("repeated.txt", "\u{feff}one\none\n".as_bytes());
+        change("repeated.txt", &[("\u{feff}one", "\u{feff}ONE")], &launch).unwrap();
+        assert_eq!(
+            scratch.read("repeated.txt"),
+            "\u{feff}ONE\none\n".as_bytes()
+        );
+        scratch.file("internal.txt", "\u{feff}one\nx\u{feff}two\n".as_bytes());
+        change("internal.txt", &[("one", "ONE")], &launch).unwrap();
+        assert_eq!(
+            scratch.read("internal.txt"),
+            "\u{feff}ONE\nx\u{feff}two\n".as_bytes()
+        );
+        scratch.file("only-bom.txt", "\u{feff}".as_bytes());
+        change("only-bom.txt", &[("\u{feff}", "\u{feff}one")], &launch).unwrap();
+        assert_eq!(scratch.read("only-bom.txt"), "\u{feff}one".as_bytes());
+    }
+
+    #[test]
     fn edit_matches_a_typographic_copy_and_keeps_the_bytes_around_it() {
         let scratch = Scratch::new("fuzzy");
         let launch = context(&scratch.0, &scratch.0);
@@ -4423,15 +4493,15 @@ mod tests {
         let launch = context(&scratch.0, &scratch.0);
         // The first byte of the last line's `é` is the final byte of the first 8192-byte read,
         // so the decoder holds it while the line before it is still empty: that empty line is
-        // the selected window's last element, not a line of its own.
+        // real content and must remain available after the 2000-line budget is reached.
         let text = format!("{}\n{}{}tail", "x\n".repeat(2000), "a".repeat(4190), 'é');
         scratch.file("carry.txt", text.as_bytes());
         let path = scratch.path("carry.txt");
         assert_eq!(
             window(&path, None, Some(2001), &launch).unwrap(),
             format!(
-                "{}\n\n[1 more lines in file. Use offset=2002 to continue.]",
-                "x\n".repeat(2000)
+                "{}\n\n[Showing lines 1-2000 of 2002. Use offset=2001 to continue.]",
+                "x\n".repeat(2000).trim_end_matches('\n')
             )
         );
     }

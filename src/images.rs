@@ -337,27 +337,12 @@ fn dimension_note(image: &Resized) -> Option<String> {
         return None;
     }
     Some(format!(
-        "[Image: original {}x{}, displayed at {}x{}. Multiply coordinates by {} to map to original image.]",
-        image.original_width,
-        image.original_height,
-        image.width,
-        image.height,
-        format_scale(image.original_width, image.width)
+        "[Image: original {ow}x{oh}, displayed at {w}x{h}. Multiply x coordinates by {ow}/{w} and y coordinates by {oh}/{h} to map to original image.]",
+        ow = image.original_width,
+        oh = image.original_height,
+        w = image.width,
+        h = image.height,
     ))
-}
-
-/// A ratio at two decimals the way JS `toFixed(2)` rounds it: an exact hundredth tie goes up,
-/// so 2250/2000 prints 1.13 while 5350/2000 prints 2.67.
-fn format_scale(original_width: u32, displayed_width: u32) -> String {
-    let scale = f64::from(original_width) / f64::from(displayed_width);
-    // Representable ties here are odd eighths, and multiplying by eight is exact for them.
-    let eighths = scale * 8.0;
-    if eighths.fract() == 0.0 && eighths as u64 % 2 == 1 {
-        let cents = (scale * 100.0).round() as u64;
-        format!("{}.{:02}", cents / 100, cents % 100)
-    } else {
-        format!("{scale:.2}")
-    }
 }
 
 /// Every pixel of a decoder, with the default allocation limit kept.
@@ -610,7 +595,7 @@ mod tests {
         let processed = process(png, "image/png");
         assert_eq!(
             processed.text,
-            "Read image file [image/png]\n[Image: original 3000x1000, displayed at 2000x667. Multiply coordinates by 1.50 to map to original image.]"
+            "Read image file [image/png]\n[Image: original 3000x1000, displayed at 2000x667. Multiply x coordinates by 3000/2000 and y coordinates by 1000/667 to map to original image.]"
         );
         let (data, mime) = processed.image.expect("the image is sent");
         assert_eq!(mime, "image/png");
@@ -631,7 +616,7 @@ mod tests {
         assert!(data.len() < MAX_BASE64);
         assert_eq!(
             processed.text,
-            "Read image file [image/jpeg]\n[Image: original 2000x2000, displayed at 2000x2000. Multiply coordinates by 1.00 to map to original image.]"
+            "Read image file [image/jpeg]\n[Image: original 2000x2000, displayed at 2000x2000. Multiply x coordinates by 2000/2000 and y coordinates by 2000/2000 to map to original image.]"
         );
     }
 
@@ -673,24 +658,36 @@ mod tests {
     }
 
     #[test]
-    fn process_rounds_the_scale_note_like_javascript() {
-        // An exact hundredth tie goes up: 2250/2000 is 1.125.
+    fn process_reports_exact_scales_for_each_axis() {
+        // Keep the exact non-integer ratio rather than rounding it to two decimals.
         let wide = encoded(&solid(2250, 2), ImageFormat::Png);
         assert_eq!(
             process(wide, "image/png").text,
-            "Read image file [image/png]\n[Image: original 2250x2, displayed at 2000x2. Multiply coordinates by 1.13 to map to original image.]"
+            "Read image file [image/png]\n[Image: original 2250x2, displayed at 2000x2. Multiply x coordinates by 2250/2000 and y coordinates by 2/2 to map to original image.]"
         );
-        // A tie the binary value misses by a hair stays down: 5350/2000 is 2.675.
+        // Integer pixel rounding leaves different scale factors on each axis.
         let taller = encoded(&solid(5350, 2), ImageFormat::Png);
         assert_eq!(
             process(taller, "image/png").text,
-            "Read image file [image/png]\n[Image: original 5350x2, displayed at 2000x1. Multiply coordinates by 2.67 to map to original image.]"
+            "Read image file [image/png]\n[Image: original 5350x2, displayed at 2000x1. Multiply x coordinates by 5350/2000 and y coordinates by 2/1 to map to original image.]"
         );
         // A very thin image keeps a visible side instead of failing.
         let thin = encoded(&solid(5000, 1), ImageFormat::Png);
         assert_eq!(
             process(thin, "image/png").text,
-            "Read image file [image/png]\n[Image: original 5000x1, displayed at 2000x1. Multiply coordinates by 2.50 to map to original image.]"
+            "Read image file [image/png]\n[Image: original 5000x1, displayed at 2000x1. Multiply x coordinates by 5000/2000 and y coordinates by 1/1 to map to original image.]"
+        );
+    }
+
+    #[test]
+    fn process_maps_a_one_pixel_wide_image_on_the_vertical_axis() {
+        let narrow = encoded(&solid(1, 4000), ImageFormat::Png);
+        let processed = process(narrow, "image/png");
+        assert_eq!(processed.width, Some(1));
+        assert_eq!(processed.height, Some(2000));
+        assert_eq!(
+            processed.text,
+            "Read image file [image/png]\n[Image: original 1x4000, displayed at 1x2000. Multiply x coordinates by 1/1 and y coordinates by 4000/2000 to map to original image.]"
         );
     }
 
