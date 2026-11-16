@@ -746,9 +746,16 @@ async fn run_call(
         cancel: token.clone(),
         progress: Some(progress),
         call_id: Some(id),
+        nested: false,
+        started: None,
     };
     let result = if tool == "exec" {
         service.call_json(arguments, call).await
+    } else if tool == "codemode" {
+        match serde_json::from_value::<crate::codemode::Request>(arguments) {
+            Ok(request) => service.codemode(request, call, false).await,
+            Err(problem) => error(problem.to_string()),
+        }
     } else {
         // A file tool runs in the daemon's own process, with the session's launch context and no
         // HTTP session behind it.
@@ -1096,6 +1103,13 @@ async fn serve_daemon(
             return 1;
         }
     };
+    let codemode = match crate::codemode() {
+        Ok(codemode) => codemode,
+        Err(message) => {
+            eprintln!("fastexec: {message}");
+            return 1;
+        }
+    };
     // The launch context is captured before the daemon leaves its starting directory, so HTTP
     // sessions keep that directory as the one a task starts in.
     let (http_addr, http, config) = match http {
@@ -1150,6 +1164,7 @@ async fn serve_daemon(
                     digests,
                     render,
                     yolo,
+                    codemode,
                     launch,
                     public_root,
                 }),

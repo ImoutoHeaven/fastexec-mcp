@@ -79,6 +79,7 @@ impl Fixture {
             .env_remove("FASTEXEC_OUTPUT_MODE")
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
             .env_remove("FASTEXEC_YOLO")
+            .env_remove("FASTEXEC_CODEMODE")
             .stdin(std::process::Stdio::null());
         if let Some(tmpdir) = &self.tmpdir {
             command
@@ -284,6 +285,7 @@ impl Endpoint {
             .env_remove("FASTEXEC_OUTPUT_MODE")
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
             .env_remove("FASTEXEC_YOLO")
+            .env_remove("FASTEXEC_CODEMODE")
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
             .env_remove("FASTEXEC_TEST_NONE_LIMIT");
         configure(&mut command);
@@ -297,8 +299,16 @@ impl Endpoint {
         let (sender, lines) = channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Ok(value) = serde_json::from_str(&line) {
-                    let _ = sender.send(value);
+                match serde_json::from_str(&line) {
+                    Ok(value) => {
+                        let _ = sender.send(value);
+                    }
+                    Err(error) => {
+                        let _ = sender.send(
+                            json!({"__stdout_error": format!("invalid JSON: {error}: {line:?}")}),
+                        );
+                        return;
+                    }
                 }
             }
         });
@@ -347,6 +357,11 @@ impl Endpoint {
                 .lines
                 .recv_timeout(deadline - Instant::now())
                 .expect("response in time");
+            assert!(
+                message["__stdout_error"].is_null(),
+                "{}",
+                message["__stdout_error"]
+            );
             if message["id"] == json!(id) {
                 return message;
             }
@@ -1878,4 +1893,115 @@ fn invalid_yolo_refuses_start_without_blocking_status_or_stop() {
     let (code, out, err) = fixture.run(&["daemon", "status"]);
     assert_eq!(code, 0, "{out}{err}");
     assert!(out.starts_with("No fastexec daemon"), "{out}");
+}
+
+#[test]
+fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images() {
+    let fixture = Fixture::new("codemode");
+    let image =
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 6, image::Rgb([7, 8, 9])));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(fixture.runtime.join("shot.png"), &png).unwrap();
+    let (status, out, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(status, 0, "{out}{err}");
+    let mut enabled = Endpoint::start_with(&fixture, |command| {
+        command
+            .current_dir(&fixture.runtime)
+            .env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_OUTPUT_MODE", "both");
+    });
+    let mut plain = Endpoint::start(&fixture);
+    for (endpoint, expected) in [(&mut enabled, true), (&mut plain, false)] {
+        let listed = endpoint.request("tools/list", json!({}));
+        assert_eq!(
+            listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "codemode"),
+            expected,
+            "{listed}"
+        );
+    }
+    let result = enabled.request("tools/call", json!({"name":"codemode","arguments":{
+        "code":"image(await tools.read({path:'shot.png'})); const child = await tools.exec({action:'start',command:'printf nested',loginShell:false}); text(child.structuredContent.taskId); return child.structuredContent.output;"
+    }}))["result"].clone();
+    assert_eq!(result["isError"], false, "{result}");
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert_eq!(
+        result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .count(),
+        1,
+        "{result}"
+    );
+    let handle = result["structuredContent"]["taskId"].as_str().unwrap();
+    let bare = handle.split_once('.').unwrap().0;
+    let fresh = plain.request(
+        "tools/call",
+        json!({"name":"exec","arguments":{"action":"poll","taskId":bare,"waitMs":0}}),
+    )["result"]
+        .clone();
+    assert_eq!(fresh["isError"], false, "{fresh}");
+    assert!(
+        fresh["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nested"),
+        "{fresh}"
+    );
+    let block = fresh["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "image")
+        .unwrap();
+    assert_eq!(
+        block["data"],
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png),
+        "{fresh}"
+    );
+    let (listed, text, error) = enabled.call(json!({"action":"list"}));
+    assert!(!error, "{text}");
+    let tasks = listed["tasks"].as_array().unwrap();
+    let script = tasks
+        .iter()
+        .find(|task| task["kind"] == "codemode")
+        .unwrap();
+    let child = tasks.iter().find(|task| task["kind"] == "bash").unwrap();
+    assert!(!script["callId"].is_null(), "{listed}");
+    assert_eq!(script["callId"], child["callId"], "{listed}");
+    assert_eq!(script["session"], child["session"], "{listed}");
+}
+
+#[test]
+fn invalid_codemode_is_rejected_by_daemon_start_and_run() {
+    let fixture = Fixture::new("codemode-invalid");
+    for action in ["start", "run"] {
+        let output = fixture
+            .command(&["daemon", action])
+            .env("FASTEXEC_CODEMODE", "on")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid FASTEXEC_CODEMODE"),
+            "{output:?}"
+        );
+    }
+    let output = fixture
+        .command(&["daemon", "status"])
+        .env("FASTEXEC_CODEMODE", "on")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("No fastexec daemon"),
+        "{output:?}"
+    );
 }

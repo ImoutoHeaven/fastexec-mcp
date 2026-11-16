@@ -1,5 +1,6 @@
 //! Task registry: spawn, log capture, unseen-output cursors, input queues, and shutdown.
 
+use crate::codemode;
 use crate::output::{
     Matcher, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix,
     incomplete_utf8_suffix,
@@ -24,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_running: usize,
+    pub max_scripts: usize,
     pub max_finished: usize,
     pub finished_ttl: Option<Duration>,
 }
@@ -33,6 +35,7 @@ impl Limits {
     /// never expire.
     pub const OFF: Limits = Limits {
         max_running: 16,
+        max_scripts: 4,
         max_finished: 64,
         finished_ttl: None,
     };
@@ -42,12 +45,13 @@ impl Limits {
     #[allow(dead_code)] // the daemon entry point picks it in block 9
     pub const ON: Limits = Limits {
         max_running: 64,
+        max_scripts: 8,
         max_finished: 256,
         finished_ttl: Some(Duration::from_secs(24 * 60 * 60)),
     };
 }
 
-const TASK_LOG_LIMIT: u64 = 64 << 20;
+pub(crate) const TASK_LOG_LIMIT: u64 = 64 << 20;
 const TOTAL_LOG_LIMIT: u64 = 1 << 30;
 const INPUT_QUEUE_LIMIT: usize = 1 << 20;
 const INPUT_WRITE_LIMIT: Duration = Duration::from_secs(5);
@@ -96,6 +100,7 @@ struct Registry {
     tasks: Vec<Arc<Task>>,
     /// Starts admitted but not yet inserted; they count against [`Limits::max_running`].
     pending: usize,
+    pending_scripts: usize,
     /// Set by [`Tasks::shutdown`]: no start is admitted from then on.
     stopping: bool,
 }
@@ -105,6 +110,7 @@ struct Registry {
 struct Pending<'a> {
     registry: &'a Mutex<Registry>,
     counted: bool,
+    script: bool,
 }
 
 impl Pending<'_> {
@@ -113,6 +119,9 @@ impl Pending<'_> {
     fn release(&mut self, registry: &mut Registry) {
         if self.counted {
             registry.pending -= 1;
+            if self.script {
+                registry.pending_scripts -= 1;
+            }
             self.counted = false;
         }
     }
@@ -121,16 +130,21 @@ impl Pending<'_> {
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
         if self.counted {
-            lock(self.registry).pending -= 1;
+            let mut registry = lock(self.registry);
+            self.release(&mut registry);
         }
     }
 }
 
 /// Workers are reserved before a process is created. A failed thread allocation drops the
 /// remaining job senders, so the workers already created exit without owning a task.
-struct Workers {
+struct OutputWorkers {
     reader: mpsc::Sender<ReadWork>,
     capture: mpsc::Sender<CaptureWork>,
+}
+
+struct Workers {
+    output: OutputWorkers,
     input: mpsc::Sender<InputWork>,
     waiter: mpsc::Sender<WaitWork>,
     ender: mpsc::Sender<EndWork>,
@@ -192,7 +206,7 @@ fn worker<T: Send + 'static>(
     Ok(send)
 }
 
-impl Workers {
+impl OutputWorkers {
     fn new() -> std::io::Result<Self> {
         Ok(Self {
             reader: worker("fastexec-output", |job: ReadWork| {
@@ -202,6 +216,14 @@ impl Workers {
                 capture(&job.shared, &job.task, job.received, job.log, job.answer);
                 let _ = job.eof.send(());
             })?,
+        })
+    }
+}
+
+impl Workers {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            output: OutputWorkers::new()?,
             input: worker("fastexec-input", |job: InputWork| {
                 let mut input = Some(job.input);
                 for message in job.received {
@@ -284,6 +306,47 @@ fn new_epoch() -> std::io::Result<String> {
 pub const EVICTED_TRANSCRIPT: &str =
     "The files of this task were evicted under the 1 GiB total limit; its transcript is gone.";
 
+enum Root {
+    Process(Tree),
+    Script(codemode::ScriptHandle),
+}
+
+impl Root {
+    fn kill(&self) -> std::io::Result<()> {
+        match self {
+            Self::Process(tree) => tree.kill(),
+            Self::Script(script) => {
+                script.kill();
+                Ok(())
+            }
+        }
+    }
+
+    fn members(&self) -> Option<Vec<Member>> {
+        match self {
+            Self::Process(tree) => tree.members(),
+            Self::Script(_) => Some(Vec::new()),
+        }
+    }
+
+    fn process(&self) -> &Tree {
+        match self {
+            Self::Process(tree) => tree,
+            Self::Script(_) => unreachable!("a script has no process tree"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StoredImage {
+    pub index: usize,
+    pub end_byte: u64,
+    pub path: PathBuf,
+    pub mime: String,
+    pub base64_len: usize,
+    pub size: u64,
+}
+
 pub struct Task {
     pub id: String,
     pub command: String,
@@ -297,7 +360,7 @@ pub struct Task {
     /// The session ID and daemon call that started the task, when a daemon call started it.
     pub started_by: Option<(String, u64)>,
     started: Instant,
-    tree: Tree,
+    root: Root,
     /// Set once no process of the tree runs.
     tree_done: watch::Sender<bool>,
     /// When the tree ended, set before `tree_done`.
@@ -404,11 +467,13 @@ struct Output {
     last_output: Option<Instant>,
     /// Bytes the transcript file holds, counted under the total log limit.
     transcript: u64,
+    image_bytes: u64,
+    images: Vec<StoredImage>,
 }
 
 #[derive(Clone)]
 struct Final {
-    exit_code: i32,
+    exit_code: Option<i32>,
     killed: bool,
     expired: bool,
     /// The script had finished but the root did not terminate, so the root was ended for it.
@@ -478,6 +543,14 @@ pub struct StartArgs {
     pub started_by: Option<(String, u64)>,
     /// What the task inherits: its environment, and the bash found in it.
     pub launch: Arc<LaunchContext>,
+}
+
+pub(crate) struct ScriptArgs {
+    pub code: String,
+    pub kill_after_ms: Option<u64>,
+    pub http: bool,
+    pub call_id: Option<u64>,
+    pub service: Arc<crate::service::Service>,
 }
 
 /// The process-backed tests serialize their shared fixtures.
@@ -576,7 +649,7 @@ impl Tasks {
         };
         for (task, snapshot) in &mut entries {
             if snapshot.kept {
-                snapshot.held = task.tree.members().unwrap_or_default();
+                snapshot.held = task.root.members().unwrap_or_default();
             }
         }
         entries
@@ -584,7 +657,7 @@ impl Tasks {
 
     /// Takes a place against [`Limits::max_running`] and the next task ID. The guard gives the
     /// place back on drop, so every failed start releases it.
-    fn admit(&self) -> Result<(String, Pending<'_>), String> {
+    fn admit(&self, script: bool) -> Result<(String, Pending<'_>), String> {
         let mut registry = lock(&self.registry);
         if registry.stopping {
             return Err("The server is shutting down; the task was not started.".into());
@@ -600,12 +673,27 @@ impl Tasks {
                 "TOO_MANY_TASKS: {limit} tasks are running or keep processes. Wait for one to finish or kill one, then retry."
             ));
         }
+        if script {
+            let running = registry
+                .tasks
+                .iter()
+                .filter(|task| task.is_script() && task.is_running())
+                .count();
+            let limit = self.limits.max_scripts;
+            if running + registry.pending_scripts >= limit {
+                return Err(format!(
+                    "TOO_MANY_SCRIPTS: {limit} codemode tasks are running. Wait for one to finish or kill one, then retry."
+                ));
+            }
+            registry.pending_scripts += 1;
+        }
         registry.pending += 1;
         Ok((
             self.next_id(),
             Pending {
                 registry: &self.registry,
                 counted: true,
+                script,
             },
         ))
     }
@@ -635,7 +723,7 @@ impl Tasks {
         let kill_after_ms = args.kill_after_ms;
         // Admission holds a place against the running limit, so the bash lookup, the file
         // creation, and the spawn below all run without the registry lock.
-        let (id, mut pending) = self.admit()?;
+        let (id, mut pending) = self.admit(false)?;
         let bash = args.launch.bash()?.to_path_buf();
         let workers =
             Workers::new().map_err(|error| format!("Cannot prepare the task workers: {error}."))?;
@@ -713,7 +801,7 @@ impl Tasks {
             owner: args.owner,
             started_by: args.started_by,
             started: Instant::now(),
-            tree: spawned.tree,
+            root: Root::Process(spawned.tree),
             tree_done: watch::Sender::new(false),
             tree_ended_at: OnceLock::new(),
             kill_error: Mutex::new(None),
@@ -744,7 +832,7 @@ impl Tasks {
             // The server began stopping while this tree was created: it ends now, and it joins
             // the registry anyway so the capture, input, and waiter threads clean up as usual.
             task.kill_requested.store(true, Ordering::SeqCst);
-            let _ = task.tree.kill();
+            let _ = task.root.kill();
         }
         self.arm_deadline(&task, kill_after_ms);
 
@@ -752,6 +840,7 @@ impl Tasks {
         let (chunks, received) = mpsc::sync_channel(1);
         // A prepared worker waits for exactly one job and cannot fail before receiving it.
         workers
+            .output
             .reader
             .send(ReadWork {
                 output: spawned.output,
@@ -760,6 +849,7 @@ impl Tasks {
             })
             .unwrap_or_else(|_| unreachable!("prepared output worker stopped"));
         workers
+            .output
             .capture
             .send(CaptureWork {
                 shared: Arc::clone(self),
@@ -791,6 +881,179 @@ impl Tasks {
             })
             .unwrap_or_else(|_| unreachable!("prepared waiter worker stopped"));
         Ok((task, entry, reader))
+    }
+
+    pub(crate) fn start_script(
+        self: &Arc<Self>,
+        args: ScriptArgs,
+        session: &Arc<Session>,
+        key: String,
+    ) -> Result<Started, String> {
+        let (id, mut pending) = self.admit(true)?;
+        let (script, worker) = codemode::prepare(self.handle.clone())?;
+        let output = OutputWorkers::new()
+            .map_err(|error| format!("Cannot prepare the script workers: {error}."))?;
+        let (pipe, writer) =
+            std::io::pipe().map_err(|error| format!("Cannot create the script pipe: {error}."))?;
+        let log_path = self.dir.join(format!("{id}.log"));
+        let log = private_file(&log_path)
+            .map_err(|error| format!("Cannot create the script log: {error}."))?;
+        let task = Arc::new(Task {
+            id,
+            command: format!("[codemode] {}", args.code),
+            pty: false,
+            log_path,
+            encoding: encoding_rs::UTF_8,
+            keep: false,
+            owner: session.label.clone(),
+            started_by: args.call_id.map(|id| (session.id.clone(), id)),
+            started: Instant::now(),
+            root: Root::Script(script),
+            tree_done: watch::Sender::new(false),
+            tree_ended_at: OnceLock::new(),
+            kill_error: Mutex::new(None),
+            kill_requested: AtomicBool::new(false),
+            expired: AtomicBool::new(false),
+            out: Mutex::default(),
+            end: Mutex::new(None),
+            done: watch::Sender::new(false),
+            activity: watch::Sender::new(()),
+            input: Mutex::new(None),
+            input_warning: Mutex::new(None),
+            input_error: Mutex::new(None),
+            queued: AtomicUsize::new(0),
+            input_gate: tokio::sync::Mutex::new(()),
+            terminal: None,
+            size: Mutex::new((0, 0)),
+            pty_control: Mutex::new(None),
+            size_error: Mutex::new(None),
+        });
+        let mut registry = lock(&self.registry);
+        let entry = session.entry(&task);
+        let reader = entry.start_reader(key);
+        registry.tasks.push(Arc::clone(&task));
+        pending.release(&mut registry);
+        let stopping = registry.stopping;
+        drop(registry);
+        if stopping {
+            let _ = task.kill();
+        }
+        self.arm_deadline(&task, args.kill_after_ms);
+        let (eof, captured) = mpsc::channel();
+        let (chunks, received) = mpsc::sync_channel(1);
+        output
+            .reader
+            .send(ReadWork {
+                output: Box::new(pipe),
+                chunks,
+                pty: false,
+            })
+            .unwrap_or_else(|_| unreachable!("prepared output worker stopped"));
+        output
+            .capture
+            .send(CaptureWork {
+                shared: Arc::clone(self),
+                task: Arc::clone(&task),
+                received,
+                log,
+                answer: None,
+                eof,
+            })
+            .unwrap_or_else(|_| unreachable!("prepared capture worker stopped"));
+        worker.start(codemode::Work {
+            service: args.service,
+            session: Arc::clone(session),
+            http: args.http,
+            call_id: args.call_id,
+            code: args.code,
+            writer,
+            task: Arc::clone(&task),
+            tasks: Arc::clone(self),
+            captured,
+        });
+        Ok((task, entry, reader))
+    }
+
+    pub(crate) fn finish_script(
+        &self,
+        task: &Task,
+        exit_code: Option<i32>,
+        captured: mpsc::Receiver<()>,
+    ) {
+        let output_open = drain(task, &captured, false);
+        let mut registry = lock(&self.registry);
+        let killed = task.kill_requested.load(Ordering::SeqCst);
+        *lock(&task.end) = Some(Final {
+            exit_code: if killed { None } else { exit_code },
+            killed,
+            expired: task.expired.load(Ordering::SeqCst),
+            forced_end: false,
+            elapsed: task.started.elapsed(),
+            output_open,
+            leftovers: Vec::new(),
+            kept: false,
+        });
+        let _ = task.tree_ended_at.set(Instant::now());
+        task.tree_done.send_replace(true);
+        self.retire_finished(&mut registry);
+        drop(registry);
+        task.done.send_replace(true);
+    }
+
+    /// Saves and publishes metadata before the marker can reach a reader.
+    pub(crate) fn store_image(
+        &self,
+        task: &Task,
+        index: usize,
+        bytes: &[u8],
+        mime: &str,
+        end_byte: u64,
+    ) -> Result<PathBuf, String> {
+        let size = bytes.len() as u64;
+        if !self.reserve(size) {
+            return Err("Image exceeds the 1 GiB total task output limit.".into());
+        }
+        let path = task.image_path(index, mime);
+        let mut file = match private_file(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                return Err(format!("Cannot create the image: {error}."));
+            }
+        };
+        if let Err(error) = file.write_all(bytes) {
+            self.log_bytes.fetch_sub(size, Ordering::SeqCst);
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("Cannot save the image: {error}."));
+        }
+        drop(file);
+        let mut out = lock(&task.out);
+        if out.evicted {
+            self.log_bytes.fetch_sub(size, Ordering::SeqCst);
+            let _ = std::fs::remove_file(&path);
+            return Err("The task log and images have been evicted.".into());
+        }
+        out.image_bytes += size;
+        out.images.push(StoredImage {
+            index,
+            end_byte,
+            path: path.clone(),
+            mime: mime.to_owned(),
+            base64_len: bytes.len().div_ceil(3) * 4,
+            size,
+        });
+        Ok(path)
+    }
+
+    pub(crate) fn remove_image(&self, task: &Task, index: usize) {
+        let mut out = lock(&task.out);
+        if let Some(position) = out.images.iter().position(|image| image.index == index) {
+            let image = out.images.remove(position);
+            out.image_bytes -= image.size;
+            self.log_bytes.fetch_sub(image.size, Ordering::SeqCst);
+            let _ = std::fs::remove_file(image.path);
+        }
     }
 
     /// Keeps the [`Limits::max_finished`] most recently finished tasks and deletes the logs of
@@ -865,10 +1128,16 @@ impl Tasks {
         let mut out = lock(&task.out);
         if !out.evicted {
             out.evicted = true;
-            self.log_bytes
-                .fetch_sub(out.written + out.transcript, Ordering::SeqCst);
+            self.log_bytes.fetch_sub(
+                out.written + out.transcript + out.image_bytes,
+                Ordering::SeqCst,
+            );
             let _ = std::fs::remove_file(&task.log_path);
             let _ = std::fs::remove_file(task.transcript_path());
+            for image in out.images.drain(..) {
+                let _ = std::fs::remove_file(image.path);
+            }
+            out.image_bytes = 0;
         }
     }
 
@@ -931,7 +1200,7 @@ impl Tasks {
             if task.is_running() {
                 task.kill_requested.store(true, Ordering::SeqCst);
             }
-            let _ = task.tree.kill();
+            let _ = task.root.kill();
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -1005,7 +1274,7 @@ impl Tasks {
                         (1, Notice::TreeEnded)
                     }
                     _ if snapshot.kept => {
-                        snapshot.held = task.tree.members().unwrap_or_default();
+                        snapshot.held = task.root.members().unwrap_or_default();
                         if snapshot.kill_error.is_none()
                             && entry.keeps_reported().as_ref() == Some(&pids(&snapshot.held))
                         {
@@ -1122,24 +1391,24 @@ fn wait_task(job: WaitWork) {
         eof,
         ender,
     } = job;
-    let (exit_code, forced_end) = child.wait(&task.tree);
+    let (exit_code, forced_end) = child.wait(task.root.process());
     let killed = task.kill_requested.load(Ordering::SeqCst);
     let expired = task.expired.load(Ordering::SeqCst);
     let listed = if killed {
         Some(Vec::new())
     } else {
-        task.tree.members()
+        task.root.members()
     };
     let mut leftovers = listed.clone().unwrap_or_default();
     let mut kept = task.keep && !leftovers.is_empty();
     let kill_error = if kept {
         None
     } else {
-        task.tree.kill().err().map(|error| error.to_string())
+        task.root.kill().err().map(|error| error.to_string())
     };
     if kill_error.is_some() || listed.is_none() {
         kept = true;
-        leftovers = task.tree.members().unwrap_or(leftovers);
+        leftovers = task.root.members().unwrap_or(leftovers);
         *lock(&task.kill_error) = kill_error;
     }
     ender
@@ -1154,7 +1423,7 @@ fn wait_task(job: WaitWork) {
     let output_open = drain(&task, &eof, kept);
     let mut registry = lock(&shared.registry);
     *lock(&task.end) = Some(Final {
-        exit_code,
+        exit_code: Some(exit_code),
         killed,
         expired,
         forced_end,
@@ -1175,7 +1444,7 @@ fn finish_tree(
     script: &Path,
     exit_status: Option<&Path>,
 ) {
-    let tree_ended = child.wait_tree(&task.tree);
+    let tree_ended = child.wait_tree(task.root.process());
     if !tree_ended {
         *lock(&task.kill_error) =
             Some("task host disconnected; tree cleanup is unconfirmed".into());
@@ -1505,6 +1774,52 @@ fn capture(
 }
 
 impl Task {
+    pub fn is_script(&self) -> bool {
+        matches!(self.root, Root::Script(_))
+    }
+
+    pub(crate) fn script(&self) -> Option<&codemode::ScriptHandle> {
+        match &self.root {
+            Root::Script(script) => Some(script),
+            Root::Process(_) => None,
+        }
+    }
+
+    pub(crate) fn image_path(&self, index: usize, mime: &str) -> PathBuf {
+        let extension = match mime {
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "png",
+        };
+        self.log_path
+            .with_file_name(format!("{}-img-{index}.{extension}", self.id))
+    }
+
+    pub(crate) fn images_between(
+        &self,
+        start: u64,
+        end: u64,
+        seen: usize,
+    ) -> Vec<(StoredImage, bool)> {
+        let out = lock(&self.out);
+        out.images
+            .iter()
+            .filter_map(|image| {
+                if image.index <= seen {
+                    return None;
+                }
+                if start < image.end_byte && image.end_byte <= end {
+                    Some((image.clone(), false))
+                } else if out.dropped > 0 && end >= out.written && image.end_byte > out.written {
+                    Some((image.clone(), true))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn is_running(&self) -> bool {
         lock(&self.end).is_none()
     }
@@ -1598,7 +1913,7 @@ impl Task {
 
     /// How the root ended, once it has: its exit code, and whether the task held processes past
     /// the exit.
-    pub fn root_end(&self) -> Option<(i32, bool)> {
+    pub fn root_end(&self) -> Option<(Option<i32>, bool)> {
         lock(&self.end)
             .as_ref()
             .map(|end| (end.exit_code, end.kept))
@@ -1618,7 +1933,7 @@ impl Task {
     pub fn snapshot_held(&self) -> Snapshot {
         let mut snapshot = self.snapshot();
         if snapshot.kept {
-            snapshot.held = self.tree.members().unwrap_or_default();
+            snapshot.held = self.root.members().unwrap_or_default();
         }
         snapshot
     }
@@ -1634,7 +1949,7 @@ impl Task {
                 Some(end) if end.killed => "killed",
                 Some(_) => "exited",
             },
-            exit_code: end.as_ref().map(|end| end.exit_code),
+            exit_code: end.as_ref().and_then(|end| end.exit_code),
             forced_end: end.as_ref().is_some_and(|end| end.forced_end),
             elapsed: end
                 .as_ref()
@@ -1970,7 +2285,7 @@ impl Task {
         }
         // Recorded for a running task too: its root may have exited already, with the waiter
         // past its own kill.
-        let killed = self.tree.kill();
+        let killed = self.root.kill();
         *lock(&self.kill_error) = killed.as_ref().err().map(|error| error.to_string());
         killed
     }
@@ -2564,6 +2879,7 @@ mod tests {
         // One finished task is kept, so the earlier ones retire as the loop goes on.
         let (runtime, tasks) = tasks_with(Limits {
             max_running: 16,
+            max_scripts: 4,
             max_finished: 1,
             finished_ttl: None,
         });
@@ -2598,6 +2914,8 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             progress: None,
             call_id: None,
+            nested: false,
+            started: None,
         };
         runtime.block_on(service.call(request, call));
         assert!(
@@ -2878,6 +3196,8 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             progress: None,
             call_id: None,
+            nested: false,
+            started: None,
         };
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         // A pipe task and a PTY task see the same environment and the same default directory.
@@ -3183,6 +3503,179 @@ mod tests {
             "",
             "a second read of one session sees nothing new"
         );
+        tasks.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod script_tests {
+    use super::*;
+
+    fn fixture(limits: Limits) -> (tokio::runtime::Runtime, Arc<Tasks>, Arc<Session>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let tasks = {
+            let _entered = runtime.enter();
+            Tasks::new(limits).unwrap()
+        };
+        let session = Session::new(
+            "script".into(),
+            "script".into(),
+            Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new())),
+        );
+        (runtime, tasks, session)
+    }
+
+    #[test]
+    fn script_admission_counts_pending_starts_and_releases_both_limits() {
+        let (_runtime, tasks, _session) = fixture(Limits {
+            max_running: 2,
+            max_scripts: 1,
+            ..Limits::OFF
+        });
+        let (_, script) = tasks.admit(true).unwrap();
+        assert!(
+            tasks
+                .admit(true)
+                .err()
+                .unwrap()
+                .contains("TOO_MANY_SCRIPTS")
+        );
+        let (_, process) = tasks.admit(false).unwrap();
+        assert!(tasks.admit(false).err().unwrap().contains("TOO_MANY_TASKS"));
+        drop(script);
+        let (_, next) = tasks.admit(true).unwrap();
+        drop((next, process));
+        let registry = lock(&tasks.registry);
+        assert_eq!((registry.pending, registry.pending_scripts), (0, 0));
+        drop(registry);
+        tasks.shutdown();
+    }
+
+    fn script_args(tasks: &Arc<Tasks>) -> ScriptArgs {
+        ScriptArgs {
+            code: "return undefined".into(),
+            kill_after_ms: None,
+            http: false,
+            call_id: None,
+            service: Arc::new(crate::service::Service::new(Arc::clone(tasks), false)),
+        }
+    }
+
+    #[test]
+    fn failed_script_start_releases_admission_and_prepared_workers() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        std::fs::remove_dir_all(&tasks.dir).unwrap();
+        assert!(
+            tasks
+                .start_script(script_args(&tasks), &session, "1234".into())
+                .is_err()
+        );
+        assert_eq!(tasks.pending(), 0);
+        assert_eq!(lock(&tasks.registry).pending_scripts, 0);
+        assert!(tasks.all().is_empty());
+        std::fs::create_dir(&tasks.dir).unwrap();
+        let (task, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "1234".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        assert_eq!(task.snapshot().exit_code, Some(0));
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn stored_images_follow_byte_ranges_and_release_their_quota_on_eviction() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let (task, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "1234".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        let before = tasks.log_bytes.load(Ordering::SeqCst);
+        let first = tasks
+            .store_image(&task, 1, b"one", "image/png", 10)
+            .unwrap();
+        assert!(
+            tasks
+                .store_image(&task, 1, b"replacement", "image/png", 10)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        let second = tasks
+            .store_image(&task, 2, b"two", "image/png", 20)
+            .unwrap();
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), before + 6);
+        assert!(task.images_between(0, 9, 0).is_empty());
+        assert_eq!(task.images_between(9, 10, 0)[0].0.index, 1);
+        assert_eq!(task.images_between(10, 20, 1)[0].0.index, 2);
+        assert!(task.images_between(20, 20, 2).is_empty());
+        {
+            let mut out = lock(&task.out);
+            out.dropped = 1;
+        }
+        let missing = task.images_between(0, 0, 1);
+        assert_eq!((missing[0].0.index, missing[0].1), (2, true));
+        assert!(task.images_between(0, 0, 2).is_empty());
+        let service = crate::service::Service::new(Arc::clone(&tasks), false);
+        let call = || crate::service::Call {
+            session: &session,
+            render: crate::service::Render {
+                output_mode: crate::service::OutputMode::Both,
+                structured_content: true,
+            },
+            cancel: CancellationToken::new(),
+            progress: None,
+            call_id: None,
+            nested: false,
+            started: None,
+        };
+        runtime.block_on(async {
+            let request = serde_json::json!({
+                "action":"poll","taskId":format!("{}.1234", task.id),"waitMs":0,
+            });
+            let first = service.call_json(request.clone(), call()).await;
+            let first = first.structured_content.unwrap();
+            let omitted = first["codemode"]["imagesNotAttached"].as_array().unwrap();
+            assert_eq!(omitted.len(), 2);
+            assert!(omitted.iter().all(|image| image["reason"] == "log_dropped"));
+            assert!(
+                first["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| warning.as_str().unwrap().contains("image(s) not attached"))
+            );
+            let second = service.call_json(request, call()).await;
+            let second = second.structured_content.unwrap();
+            assert!(
+                second["codemode"]["imagesNotAttached"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                second["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|warning| !warning.as_str().unwrap().contains("image(s) not attached"))
+            );
+        });
+        tasks.evict_log(&task);
+        assert!(!first.exists() && !second.exists());
+        assert!(task.images_between(0, 20, 0).is_empty());
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
         tasks.shutdown();
     }
 }

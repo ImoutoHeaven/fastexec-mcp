@@ -2,13 +2,14 @@
 //! tasks, and render the result. The MCP adapter in main.rs calls it in-process; the daemon will
 //! call it for IPC and HTTP callers.
 
-use crate::conpty;
 use crate::keys;
 use crate::output::{self, Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
 use crate::process;
 use crate::session::{ReadState, Reader, Session, TaskEntry, parse_handle};
-use crate::tasks::{self, EVICTED_TRANSCRIPT, Snapshot, StartArgs, Task, Tasks};
+use crate::tasks::{self, EVICTED_TRANSCRIPT, ScriptArgs, Snapshot, StartArgs, Task, Tasks};
 use crate::wait::{self, WaitEnd};
+use crate::{codemode, conpty, images};
+use base64::Engine;
 use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -123,7 +124,8 @@ pub struct Request {
 }
 
 /// Output options shared by start and poll.
-struct View {
+pub(crate) struct View {
+    nested: bool,
     truncate: Truncate,
     max_bytes: usize,
     raw: bool,
@@ -143,7 +145,7 @@ fn none_limit() -> usize {
         .unwrap_or(NONE_LIMIT)
 }
 
-fn validate(request: &Request) -> Result<View, String> {
+pub(crate) fn validate(request: &Request) -> Result<View, String> {
     let present = [
         ("command", request.command.is_some()),
         ("cwd", request.cwd.is_some()),
@@ -363,6 +365,7 @@ fn validate(request: &Request) -> Result<View, String> {
         return Err(format!("{name} needs UTF-8 output; remove encoding."));
     }
     Ok(View {
+        nested: false,
         truncate: request
             .truncate
             .unwrap_or(if request.action == Action::Transcript {
@@ -450,6 +453,9 @@ pub struct Call<'a> {
     /// The daemon's call ID, kept on a task a start creates so `list` can name the call that
     /// started it. The stdio adapter has no call IDs, so it passes `None`.
     pub call_id: Option<u64>,
+    pub nested: bool,
+    /// Records a nested start before its caller's wait can be cancelled.
+    pub started: Option<&'a codemode::ScriptHandle>,
 }
 
 /// The tool's operations and renderers, independent of any transport.
@@ -491,8 +497,121 @@ impl Service {
         }
     }
 
+    pub async fn codemode(
+        self: &Arc<Self>,
+        request: codemode::Request,
+        mut call: Call<'_>,
+        http: bool,
+    ) -> CallToolResult {
+        self.tasks.prune_entries(call.session);
+        call.render = call.render.effective();
+        let result = self.start_script(request, &call, http).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(message) => {
+                let mut result = error_result(Action::Start, &message);
+                result.structured_content.as_mut().unwrap()["action"] = json!("codemode");
+                result
+            }
+        };
+        suppress(result, call.render)
+    }
+
+    async fn start_script(
+        self: &Arc<Self>,
+        request: codemode::Request,
+        call: &Call<'_>,
+        http: bool,
+    ) -> Result<CallToolResult, String> {
+        codemode::validate(&request)?;
+        let start = request.as_exec()?;
+        let mut view = validate(&start)?;
+        view.nested = call.nested;
+        let args = ScriptArgs {
+            code: request.code,
+            kill_after_ms: start.kill_after_ms,
+            http,
+            call_id: call.call_id,
+            service: Arc::clone(self),
+        };
+        let tasks = Arc::clone(&self.tasks);
+        let session = Arc::clone(call.session);
+        let key =
+            tasks::random_chars(4).map_err(|error| format!("Cannot name the reader: {error}"))?;
+        let started = tokio::task::spawn_blocking(move || tasks.start_script(args, &session, key))
+            .await
+            .map_err(|error| format!("Internal failure while starting: {error}."))??;
+        self.wait_started(
+            started,
+            start.wait_ms.unwrap_or(30_000),
+            start.return_when.as_ref(),
+            view,
+            call,
+        )
+        .await
+    }
+
+    async fn wait_started(
+        &self,
+        started: tasks::Started,
+        wait_ms: u64,
+        when: Option<&wait::ReturnWhen>,
+        view: View,
+        call: &Call<'_>,
+    ) -> Result<CallToolResult, String> {
+        let (task, entry, reader) = started;
+        let state = read_gate(&reader, &call.cancel).await?;
+        let mark = wait::mark(&task, &reader, &state, when)?;
+        let encoding = view.encoding.unwrap_or(task.encoding);
+        let ended = wait::wait(
+            &task,
+            wait_ms,
+            when,
+            mark,
+            encoding,
+            &call.cancel,
+            call.progress.as_ref(),
+        )
+        .await?;
+        read_result(
+            &call.cancel,
+            self.window_result(
+                call.render,
+                call.session,
+                Action::Start,
+                task,
+                entry,
+                reader,
+                state,
+                view,
+                ended,
+            ),
+        )
+        .await
+    }
+
     async fn handle(&self, request: Request, call: &Call<'_>) -> Result<CallToolResult, String> {
-        let view = validate(&request)?;
+        if request.action == Action::Poll
+            && let Ok((task, _)) = self.task(request.task_id.as_deref())
+            && task.is_script()
+            && (request.input.is_some()
+                || request.eof.is_some()
+                || request.keys.is_some()
+                || request.key_delay_ms.is_some()
+                || request.cols.is_some()
+                || request.rows.is_some()
+                || request.screen.is_some()
+                || request.encoding.is_some()
+                || request
+                    .return_when
+                    .as_ref()
+                    .and_then(|when| when.screen_condition())
+                    .is_some())
+        {
+            return Err("A codemode task takes no input, eof, keys, resize, screen, or encoding; poll it with waitMs and returnWhen.".into());
+        }
+        let mut view = validate(&request)?;
+        view.nested = call.nested;
         let session = Arc::clone(call.session);
         match request.action {
             Action::List => Ok(self.list(&session, &view)),
@@ -534,34 +653,15 @@ impl Service {
                     tokio::task::spawn_blocking(move || tasks.start(args, &starting, key))
                         .await
                         .map_err(|error| format!("Internal failure while starting: {error}."))??;
-                let state = read_gate(&task_reader, &call.cancel).await?;
-                let when = request.return_when.as_ref();
-                let mark = wait::mark(&task, &task_reader, &state, when)?;
-                let encoding = view.encoding.unwrap_or(task.encoding);
-                let wait = request.wait_ms.unwrap_or(30_000);
-                let ended = wait::wait(
-                    &task,
-                    wait,
-                    when,
-                    mark,
-                    encoding,
-                    &call.cancel,
-                    call.progress.as_ref(),
-                )
-                .await?;
-                read_result(
-                    &call.cancel,
-                    self.window_result(
-                        call.render,
-                        &session,
-                        Action::Start,
-                        task,
-                        entry,
-                        task_reader,
-                        state,
-                        view,
-                        ended,
-                    ),
+                if let Some(script) = call.started {
+                    script.record_started(task_reader.handle(&task.id));
+                }
+                self.wait_started(
+                    (task, entry, task_reader),
+                    request.wait_ms.unwrap_or(30_000),
+                    request.return_when.as_ref(),
+                    view,
+                    call,
                 )
                 .await
             }
@@ -741,13 +841,20 @@ impl Service {
                     _ = tokio::time::timeout(KILL_WAIT, finished) => {}
                 }
                 let snapshot = task.snapshot_held();
-                let mut text = status_line(&task, &snapshot, &task_reader);
+                let mut text = status_line(&self.tasks, &task, &snapshot, &task_reader);
                 if snapshot.state == "running" || snapshot.kept {
-                    text.push_str(" · the tree did not exit within 5 s; poll later to confirm");
+                    text.push_str(if task.is_script() {
+                        " · the script did not end within 5 s; poll later to confirm"
+                    } else {
+                        " · the tree did not exit within 5 s; poll later to confirm"
+                    });
                 }
-                let background =
-                    self.tasks
-                        .background(&session, &task.id, FOOTER_LIMIT.min(view.max_bytes / 4));
+                let background = self.background(
+                    &session,
+                    &task.id,
+                    FOOTER_LIMIT.min(view.max_bytes / 4),
+                    view.nested,
+                );
                 let footer = background
                     .as_ref()
                     .map_or(String::new(), |(line, _)| format!("\n{line}"));
@@ -755,13 +862,26 @@ impl Service {
                 text.push_str(&footer);
                 let result = success(
                     text,
-                    task_json(Action::Kill, &task, &snapshot, &task_reader),
+                    task_json(&self.tasks, Action::Kill, &task, &snapshot, &task_reader),
                 );
-                report(&session, &entry, &task_reader, &snapshot, background);
+                report(
+                    &session,
+                    &entry,
+                    &task_reader,
+                    &snapshot,
+                    background,
+                    view.nested,
+                );
                 Ok(result)
             }
             Action::Transcript => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
+                if task.is_script() {
+                    return Err(
+                        "A codemode task has no terminal or transcript; poll returns its output."
+                            .into(),
+                    );
+                }
                 if !task.pty {
                     return Err("transcript applies to PTY tasks only; poll returns a pipe task's output, and its log holds every byte.".into());
                 }
@@ -821,6 +941,20 @@ impl Service {
         })
     }
 
+    fn background(
+        &self,
+        session: &Session,
+        id: &str,
+        cap: usize,
+        nested: bool,
+    ) -> Option<(String, Vec<tasks::Shown>)> {
+        if nested {
+            None
+        } else {
+            self.tasks.background(session, id, cap)
+        }
+    }
+
     fn list(&self, session: &Session, view: &View) -> CallToolResult {
         let tasks = self.tasks.listed();
         let mut lines = Vec::new();
@@ -863,6 +997,7 @@ impl Service {
             ));
             entries.push(json!({
                 "ok": task_io_ok(snapshot),
+                "kind": if task.is_script() { "codemode" } else { "bash" },
                 "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
                 "captureError": snapshot.capture_error, "logError": snapshot.log_error,
                 "inputWarning": snapshot.input_warning, "inputError": snapshot.input_error,
@@ -886,7 +1021,9 @@ impl Service {
         // to mark.
         for index in kept {
             let (task, snapshot) = &shown[index];
-            if let Some(entry) = session.existing(task) {
+            if !view.nested
+                && let Some(entry) = session.existing(task)
+            {
                 entry.mark_reported(snapshot);
                 entry.mark_keeps_reported(snapshot);
             }
@@ -1037,8 +1174,12 @@ fn report(
     reader: &Reader,
     shown: &Snapshot,
     background: Option<(String, Vec<tasks::Shown>)>,
+    nested: bool,
 ) {
     reader.mark_reported(shown);
+    if nested {
+        return;
+    }
     entry.mark_reported(shown);
     for (task, shown) in background.map(|(_, shown)| shown).unwrap_or_default() {
         if let Some(entry) = session.existing(&task) {
@@ -1083,7 +1224,7 @@ impl Service {
             Truncate::None => FOOTER_LIMIT,
             _ => FOOTER_LIMIT.min(view.max_bytes / 4),
         };
-        let background = self.tasks.background(session, &task.id, footer_cap);
+        let background = self.background(session, &task.id, footer_cap, view.nested);
         let footer = background
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
@@ -1091,7 +1232,7 @@ impl Service {
         // stayed open, which the status line notes), so the window below holds all of it. The
         // status line can only grow by its notes.
         let before = task.snapshot_held();
-        let reserved = status_line(&task, &before, &task_reader).len()
+        let reserved = status_line(&self.tasks, &task, &before, &task_reader).len()
             + ended.note(view.conditions).len()
             + NOTES_RESERVE
             + footer.len()
@@ -1104,8 +1245,9 @@ impl Service {
             Truncate::None => none_limit(),
             _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
         };
-        let (window, read) = tokio::task::spawn_blocking(move || {
+        let (window, images, read) = tokio::task::spawn_blocking(move || {
             let mut read = StagedRead::new(state);
+            let start = read.state.cursor;
             let window = reader.read_window(
                 &mut read.state,
                 view.truncate,
@@ -1114,11 +1256,20 @@ impl Service {
                 encoding,
                 None,
             );
-            (window, read)
+            let images = if window.is_ok() {
+                read_images(&reader, start, read.state.cursor, read.state.images_seen)
+            } else {
+                Ok(ImageRead::default())
+            };
+            if let Ok(images) = &images {
+                read.state.images_seen = images.seen;
+            }
+            (window, images, read)
         })
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
         let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
+        let images = images?;
         // Log metadata, such as an eviction during the read, is taken after it.
         let after = task.snapshot();
         let snapshot = Snapshot {
@@ -1131,10 +1282,18 @@ impl Service {
             input_error: after.input_error,
             ..before
         };
-        let mut status = status_line(&task, &snapshot, &task_reader);
+        let mut status = status_line(&self.tasks, &task, &snapshot, &task_reader);
         status.push_str(&ended.note(view.conditions));
-        let mut structured = task_json(action, &task, &snapshot, &task_reader);
+        let mut structured = task_json(&self.tasks, action, &task, &snapshot, &task_reader);
         structured["waitEndedBy"] = ended.json();
+        if task.is_script() {
+            structured["codemode"]["imagesAttached"] = json!(images.content.len());
+            structured["codemode"]["imagesNotAttached"] = json!(images.omitted);
+            structured["warnings"]
+                .as_array_mut()
+                .unwrap()
+                .extend(images.warnings.into_iter().map(Value::String));
+        }
         let text = self.layout(
             render,
             &window,
@@ -1145,10 +1304,18 @@ impl Service {
             "(no new output)",
             &mut structured,
         );
-        let result = success(text, structured);
+        let mut result = success(text, structured);
+        result.content.extend(images.content);
         let state = read.commit();
         task_reader.mark_delivered();
-        report(session, &entry, &task_reader, &snapshot, background);
+        report(
+            session,
+            &entry,
+            &task_reader,
+            &snapshot,
+            background,
+            view.nested,
+        );
         drop(state);
         Ok(result)
     }
@@ -1184,11 +1351,11 @@ impl Service {
             Truncate::None => FOOTER_LIMIT,
             _ => FOOTER_LIMIT.min(view.max_bytes / 4),
         };
-        let background = self.tasks.background(session, &task.id, footer_cap);
+        let background = self.background(session, &task.id, footer_cap, view.nested);
         let footer = background
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
-        let mut status = status_line(&task, &snapshot, &task_reader);
+        let mut status = status_line(&self.tasks, &task, &snapshot, &task_reader);
         status.push_str(&format!(
             " · transcript {total} lines, final through {}; this read starts at line {} · {}",
             transcript.lines,
@@ -1218,7 +1385,13 @@ impl Service {
             encoding: encoding_rs::UTF_8,
             source: "transcript",
         };
-        let mut structured = task_json(Action::Transcript, &task, &snapshot, &task_reader);
+        let mut structured = task_json(
+            &self.tasks,
+            Action::Transcript,
+            &task,
+            &snapshot,
+            &task_reader,
+        );
         structured["transcriptPath"] = json!(transcript.path);
         structured["transcriptLines"] = json!(total);
         structured["finalLines"] = json!(transcript.lines);
@@ -1305,7 +1478,14 @@ impl Service {
         let result = success(text, structured);
         let state = read.commit();
         task_reader.mark_delivered();
-        report(session, &entry, &task_reader, &snapshot, background);
+        report(
+            session,
+            &entry,
+            &task_reader,
+            &snapshot,
+            background,
+            view.nested,
+        );
         drop(state);
         Ok(result)
     }
@@ -1369,9 +1549,12 @@ impl Service {
         view: View,
         ended: WaitEnd,
     ) -> Result<CallToolResult, String> {
-        let background =
-            self.tasks
-                .background(session, &task.id, FOOTER_LIMIT.min(view.max_bytes / 4));
+        let background = self.background(
+            session,
+            &task.id,
+            FOOTER_LIMIT.min(view.max_bytes / 4),
+            view.nested,
+        );
         let footer = background
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
@@ -1396,7 +1579,7 @@ impl Service {
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
         let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
         let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
-        let mut status = status_line(&task, &snapshot, &task_reader);
+        let mut status = status_line(&self.tasks, &task, &snapshot, &task_reader);
         status.push_str(&ended.note(view.conditions));
         status.push_str(&format!(
             " · screen {}x{}, cursor row {row} col {col}",
@@ -1430,7 +1613,7 @@ impl Service {
         } else {
             format!("{shown}\n\n{status}{footer}")
         };
-        let mut structured = task_json(action, &task, &snapshot, &task_reader);
+        let mut structured = task_json(&self.tasks, action, &task, &snapshot, &task_reader);
         structured["waitEndedBy"] = ended.json();
         structured["cols"] = json!(screen.cols);
         structured["rows"] = json!(screen.rows_count);
@@ -1443,7 +1626,14 @@ impl Service {
         let result = success(text, structured);
         let state = read.commit();
         task_reader.mark_delivered();
-        report(session, &entry, &task_reader, &snapshot, background);
+        report(
+            session,
+            &entry,
+            &task_reader,
+            &snapshot,
+            background,
+            view.nested,
+        );
         drop(state);
         Ok(result)
     }
@@ -1479,7 +1669,7 @@ fn fit_status(status: &mut String, max_bytes: usize, reserved: usize, fresh: boo
     status.push_str(notice);
 }
 
-fn status_line(task: &Task, snapshot: &Snapshot, reader: &Reader) -> String {
+fn status_line(tasks: &Tasks, task: &Task, snapshot: &Snapshot, reader: &Reader) -> String {
     let state = match snapshot.exit_code {
         Some(code) if snapshot.state == "exited" => format!("exited {code}"),
         Some(code) => format!("{} (exit {code})", snapshot.state),
@@ -1515,6 +1705,27 @@ fn status_line(task: &Task, snapshot: &Snapshot, reader: &Reader) -> String {
     if snapshot.forced_end {
         line.push_str(" · root forced after 5 s exit grace");
     }
+    if let Some(report) = script_report(tasks, task) {
+        if snapshot.state == "killed" {
+            line.push_str(&format!(
+                " · cancelled {} pending call(s) only; ",
+                report.cancelled
+            ));
+            if report.running.is_empty() {
+                line.push_str("tasks started with exec keep running");
+            } else {
+                line.push_str(&format!(
+                    "tasks it started keep running: {}; stop each with exec kill",
+                    task_handles(&report.running)
+                ));
+            }
+        } else if snapshot.state != "running" && !report.running.is_empty() {
+            line.push_str(&format!(
+                " · tasks it started still running: {}",
+                task_handles(&report.running)
+            ));
+        }
+    }
     line
 }
 
@@ -1535,10 +1746,136 @@ fn members(members: &[process::Member]) -> String {
     text
 }
 
-fn task_json(action: Action, task: &Task, snapshot: &Snapshot, reader: &Reader) -> Value {
-    json!({
+#[derive(Default)]
+struct ImageRead {
+    content: Vec<ContentBlock>,
+    omitted: Vec<Value>,
+    warnings: Vec<String>,
+    seen: usize,
+}
+
+fn read_images(task: &Task, start: u64, end: u64, seen: usize) -> Result<ImageRead, String> {
+    let mut result = ImageRead {
+        seen,
+        ..ImageRead::default()
+    };
+    let mut bytes = 0;
+    let mut unavailable = Vec::new();
+    for (image, dropped) in task.images_between(start, end, seen) {
+        result.seen = result.seen.max(image.index);
+        let reason = if dropped {
+            Some("log_dropped")
+        } else if result.content.len() == 4 || bytes + image.base64_len > images::MAX_BASE64 {
+            Some("budget")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            result
+                .omitted
+                .push(json!({"index": image.index, "path": image.path, "reason": reason}));
+            unavailable.push(format!("#{} {}", image.index, image.path.display()));
+            continue;
+        }
+        let read = || -> std::io::Result<String> {
+            let mut data = Vec::new();
+            File::open(&image.path)?
+                .take(image.size + 1)
+                .read_to_end(&mut data)?;
+            if data.len() as u64 != image.size {
+                return Err(std::io::Error::other(
+                    "image size changed; read its path directly",
+                ));
+            }
+            Ok(base64::engine::general_purpose::STANDARD.encode(data))
+        };
+        let encoded = match read() {
+            Ok(encoded) => encoded,
+            Err(_) if task.evicted() => {
+                result
+                    .omitted
+                    .push(json!({"index": image.index, "reason": "evicted"}));
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot read stored image {}: {error}.",
+                    image.path.display()
+                ));
+            }
+        };
+        bytes += encoded.len();
+        result
+            .content
+            .push(ContentBlock::image(encoded, image.mime));
+    }
+    if !unavailable.is_empty() {
+        result.warnings.push(format!(
+            "{} image(s) not attached (4 images or {} base64 bytes per result, or image markers lost from the log): {}; read their paths.",
+            unavailable.len(), images::MAX_BASE64, unavailable.join(", "),
+        ));
+    }
+    Ok(result)
+}
+
+struct ScriptReport {
+    value: Value,
+    running: Vec<String>,
+    cancelled: usize,
+}
+
+fn script_report(tasks: &Tasks, task: &Task) -> Option<ScriptReport> {
+    let (cancelled, handles) = task.script()?.report();
+    let mut running = Vec::new();
+    let started = handles
+        .into_iter()
+        .map(|handle| {
+            let task = parse_handle(&handle)
+                .ok()
+                .and_then(|(id, _)| tasks.find(id));
+            let state = task.as_ref().map_or("unknown", |task| {
+                if task.is_running() || task.keeps_processes() {
+                    running.push(handle.clone());
+                }
+                task.snapshot().state
+            });
+            json!({"taskId": handle, "state": state})
+        })
+        .collect::<Vec<_>>();
+    Some(ScriptReport {
+        cancelled: cancelled.len(),
+        running,
+        value: json!({
+            "cancelledCalls": cancelled, "startedTasks": started,
+            "imagesAttached": 0, "imagesNotAttached": [],
+        }),
+    })
+}
+
+fn task_handles(handles: &[String]) -> String {
+    let mut text = handles
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if handles.len() > 3 {
+        text.push_str(&format!(" and {} more", handles.len() - 3));
+    }
+    text
+}
+
+fn task_json(
+    tasks: &Tasks,
+    action: Action,
+    task: &Task,
+    snapshot: &Snapshot,
+    reader: &Reader,
+) -> Value {
+    let mut value = json!({
         "ok": task_io_ok(snapshot),
-        "action": action_name(action),
+        "action": if task.is_script() && action == Action::Start { "codemode" } else { action_name(action) },
+        "kind": if task.is_script() { "codemode" } else { "bash" },
         "taskId": reader.handle(&task.id),
         "state": snapshot.state,
         "exitCode": snapshot.exit_code,
@@ -1561,7 +1898,11 @@ fn task_json(action: Action, task: &Task, snapshot: &Snapshot, reader: &Reader) 
         "keptRunning": snapshot.kept,
         "held": members_json(&snapshot.held),
         "killError": snapshot.kill_error,
-    })
+    });
+    if let Some(report) = script_report(tasks, task) {
+        value["codemode"] = report.value;
+    }
+    value
 }
 
 fn task_io_ok(snapshot: &Snapshot) -> bool {
@@ -1596,8 +1937,10 @@ fn task_warnings(snapshot: &Snapshot) -> Vec<String> {
         ));
     }
     if snapshot.evicted {
-        warnings
-            .push("log evicted under the 1 GiB total limit; stored output is unavailable".into());
+        warnings.push(
+            "log evicted under the 1 GiB total limit; stored output and images are unavailable"
+                .into(),
+        );
     }
     if snapshot.output_open {
         warnings.push(if snapshot.kept {
@@ -1694,6 +2037,282 @@ pub fn error_result(action: Action, message: &str) -> CallToolResult {
 mod tests {
     use super::*;
 
+    fn script_fixture() -> (Arc<Service>, Arc<Tasks>, Arc<Session>) {
+        let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let launch = Arc::new(crate::session::LaunchContext::new(
+            std::env::temp_dir(),
+            Vec::new(),
+        ));
+        let session = Session::new("script-test".into(), "script-test".into(), launch);
+        (service, tasks, session)
+    }
+
+    fn script_call(session: &Arc<Session>, nested: bool) -> Call<'_> {
+        Call {
+            session,
+            render: Render {
+                output_mode: OutputMode::Both,
+                structured_content: true,
+            },
+            cancel: CancellationToken::new(),
+            progress: None,
+            call_id: None,
+            nested,
+            started: None,
+        }
+    }
+
+    fn pixel_url() -> String {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    }
+
+    fn image_count(result: &CallToolResult) -> usize {
+        serde_json::to_value(&result.content)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn codemode_images_follow_readers_despite_truncated_or_structured_text() {
+        let (service, tasks, session) = script_fixture();
+        let code = format!("for(let i=0;i<6;i++) image({});", json!(pixel_url()));
+        for mode in [OutputMode::Both, OutputMode::Structured] {
+            let mut call = script_call(&session, false);
+            call.render.output_mode = mode;
+            let result = service
+                .codemode(
+                    serde_json::from_value(json!({
+                        "code": code, "maxBytes": 100, "truncate": "tail", "raw": true,
+                    }))
+                    .unwrap(),
+                    call,
+                    false,
+                )
+                .await;
+            assert_eq!(result.is_error, Some(false), "{result:?}");
+            assert_eq!(image_count(&result), 4, "{result:?}");
+            let data = result.structured_content.unwrap();
+            assert_eq!(data["codemode"]["imagesAttached"], 4);
+            assert_eq!(
+                data["codemode"]["imagesNotAttached"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let handle = data["taskId"].as_str().unwrap();
+            let empty = service
+                .call_json(
+                    json!({"action":"poll","taskId":handle,"waitMs":0}),
+                    script_call(&session, false),
+                )
+                .await;
+            assert_eq!(image_count(&empty), 0);
+            let bare = parse_handle(handle).unwrap().0;
+            let reread = service
+                .call_json(
+                    json!({"action":"poll","taskId":bare,"waitMs":0}),
+                    script_call(&session, false),
+                )
+                .await;
+            assert_eq!(image_count(&reread), 4);
+        }
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn codemode_images_obey_the_combined_base64_budget() {
+        let (service, tasks, session) = script_fixture();
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(pixel_url().split_once(',').unwrap().1)
+            .unwrap();
+        bytes.resize(2 << 20, 0);
+        let encoded_size = bytes.len().div_ceil(3) * 4;
+        assert!(encoded_size < images::MAX_BASE64 && 2 * encoded_size > images::MAX_BASE64);
+        let path = std::env::temp_dir().join(format!(
+            "fastexec-image-budget-{}.png",
+            tasks::random_chars(8).unwrap()
+        ));
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+        }
+        let code = format!(
+            "const pic = await tools.read({{path:{}}}); image(pic); image(pic);",
+            json!(path.to_str().unwrap())
+        );
+        let result = service
+            .codemode(
+                serde_json::from_value(json!({"code":code})).unwrap(),
+                script_call(&session, false),
+                false,
+            )
+            .await;
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        assert_eq!(image_count(&result), 1);
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["exitCode"], 0);
+        assert_eq!(data["codemode"]["imagesAttached"], 1);
+        let omitted = data["codemode"]["imagesNotAttached"].as_array().unwrap();
+        assert_eq!(omitted.len(), 1);
+        assert_eq!(omitted[0]["index"], 2);
+        assert_eq!(omitted[0]["reason"], "budget");
+        let again = service
+            .call_json(
+                json!({
+                    "action":"poll","taskId":data["taskId"],"waitMs":0,
+                }),
+                script_call(&session, false),
+            )
+            .await;
+        assert_eq!(image_count(&again), 0);
+        assert!(
+            again.structured_content.unwrap()["codemode"]["imagesNotAttached"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let (id, _) = parse_handle(data["taskId"].as_str().unwrap()).unwrap();
+        let image_path = tasks.find(id).unwrap().image_path(1, "image/png");
+        let shorter = bytes.len() - 1;
+        assert_eq!(shorter.div_ceil(3) * 4, encoded_size);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&image_path)
+            .unwrap()
+            .set_len(shorter as u64)
+            .unwrap();
+        let fresh = json!({"action":"poll","taskId":format!("{id}.5678"),"waitMs":0});
+        let changed = service
+            .call_json(fresh.clone(), script_call(&session, false))
+            .await;
+        assert_eq!(changed.is_error, Some(true));
+        assert!(
+            serde_json::to_string(&changed.content)
+                .unwrap()
+                .contains("image size changed")
+        );
+        std::fs::write(&image_path, &bytes).unwrap();
+        let retried = service.call_json(fresh, script_call(&session, false)).await;
+        assert_eq!(
+            image_count(&retried),
+            1,
+            "a failed image read must leave its reader uncommitted"
+        );
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nested_results_consume_reader_state_without_consuming_session_notices() {
+        let (service, tasks, session) = script_fixture();
+        let result = service
+            .codemode(
+                serde_json::from_value(json!({"code":"return 7"})).unwrap(),
+                script_call(&session, true),
+                false,
+            )
+            .await;
+        let data = result.structured_content.unwrap();
+        let handle = data["taskId"].as_str().unwrap();
+        let (id, key) = parse_handle(handle).unwrap();
+        let task = tasks.find(id).unwrap();
+        let entry = session.entry(&task);
+        assert!(entry.reader(key).unwrap().is_reported());
+        assert!(!entry.is_reported());
+        service
+            .call_json(json!({"action":"list"}), script_call(&session, true))
+            .await;
+        service
+            .call_json(
+                json!({"action":"kill","taskId":handle}),
+                script_call(&session, true),
+            )
+            .await;
+        assert!(!entry.is_reported());
+        assert!(tasks.background(&session, "another-task", 512).is_some());
+        service
+            .codemode(
+                serde_json::from_value(json!({"code":"return 8"})).unwrap(),
+                script_call(&session, false),
+                false,
+            )
+            .await;
+        assert!(entry.is_reported());
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn script_poll_rejects_presence_even_when_false_or_empty() {
+        let (service, tasks, session) = script_fixture();
+        let result = service
+            .codemode(
+                serde_json::from_value(json!({"code":"return 1"})).unwrap(),
+                script_call(&session, false),
+                false,
+            )
+            .await;
+        let data = result.structured_content.unwrap();
+        for fields in [
+            json!({"input":""}),
+            json!({"eof":false}),
+            json!({"keys":[]}),
+            json!({"keyDelayMs":0}),
+            json!({"cols":80}),
+            json!({"rows":24}),
+            json!({"screen":false}),
+            json!({"encoding":"utf-8"}),
+            json!({"returnWhen":{"screenContains":["x"]}}),
+        ] {
+            let mut request = json!({"action":"poll","taskId":data["taskId"],"waitMs":0});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let result = service
+                .call_json(request, script_call(&session, false))
+                .await;
+            assert_eq!(result.is_error, Some(true), "{result:?}");
+            assert!(
+                serde_json::to_string(&result.content)
+                    .unwrap()
+                    .contains("A codemode task takes no input")
+            );
+        }
+        let result = service
+            .call_json(
+                json!({"action":"transcript","taskId":data["taskId"]}),
+                script_call(&session, false),
+            )
+            .await;
+        assert!(
+            serde_json::to_string(&result.content)
+                .unwrap()
+                .contains("has no terminal")
+        );
+        tasks.shutdown();
+    }
+
     #[tokio::test]
     async fn critical_warnings_survive_small_budgets_and_every_render_mode() {
         let service = Service::new(Tasks::new(tasks::Limits::OFF).unwrap(), false);
@@ -1729,6 +2348,7 @@ mod tests {
                     }
                     .effective();
                     let view = View {
+                        nested: false,
                         truncate: Truncate::HeadTail,
                         max_bytes: 100,
                         raw,
@@ -1823,6 +2443,7 @@ mod tests {
                     let window = read_payload(&mut read.state);
                     assert_eq!(window.fit(1024).0, "prefix");
                     read.state.shown = (77, 7);
+                    read.state.images_seen = 9;
                     entered.send(()).unwrap();
                     blocked.recv().unwrap();
                     read
@@ -1875,6 +2496,7 @@ mod tests {
         assert_eq!(state.cursor, 0);
         assert_eq!(state.lines_before, 0);
         assert_eq!(state.shown, (7, 2));
+        assert_eq!(state.images_seen, 0);
         assert_eq!(format!("{:?}", state.cleaner), initial_cleaner);
         assert!(reader.is_fresh());
         assert!(!reader.is_reported() && !entry.is_reported());

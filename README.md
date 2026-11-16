@@ -18,7 +18,9 @@ shared by every session in a namespace, opt-in with `FASTEXEC_DAEMON=on`.
   to an absolute GNU bash path to override discovery. Linux requires kernel
   `5.3+`, readable `/proc`, and permission to use `pidfd_open` and
   `pidfd_send_signal`; these keep process-tree termination safe when PIDs are reused.
-- **Build** (optional): Rust `1.92+` (`edition = "2024"`).
+- **Build** (optional): Rust `1.92+` (`edition = "2024"`) and a C compiler.
+  Linux musl builds need `musl-tools`. FreeBSD builds also need `llvm`; set
+  `LIBCLANG_PATH` to its `lib` directory, such as `/usr/local/llvm21/lib`.
 
 Download the archive for your platform from
 [Releases](https://github.com/ImoutoHeaven/fastexec-mcp/releases)
@@ -102,6 +104,63 @@ differ only in those collide.
 or `deferred` exposure for a remote server: a `direct` server that has not
 connected within the first prompt's 10 second wait changes the declared tools
 mid-session.
+
+## JavaScript tasks
+
+Set `FASTEXEC_CODEMODE=true` to expose `codemode`. Its `code` argument is the
+body of an async JavaScript function. The script can call `exec`, `read`,
+`write`, and `edit`, inspect their results, and return only the output it needs:
+
+```javascript
+const [run, file] = await Promise.all([
+  tools.exec({action: "start", command: "printf ready", loginShell: false}),
+  tools.read({path: "README.md", limit: 5})
+]);
+text(run.structuredContent.output);
+text(file.content[0].text);
+```
+
+`text`, `console.log/info/warn/error/debug`, and a returned value write to the
+task log. `image(await tools.read({path: "shot.png"}))` saves and returns an
+image. A result carries at most four images and 4718592 base64 bytes; warnings
+name saved images that can be read separately.
+
+`codemode` accepts `waitMs`, `returnWhen` with `outputContains` or `quietMs`,
+`killAfterMs`, `truncate`, `maxBytes`, and `raw`. Continue with `exec poll`,
+stop with `exec kill`, and inspect with `exec list`. A script has no terminal
+or input. JavaScript has no Node APIs, modules, timers, filesystem or network
+access; host operations go through `tools`.
+
+Stopping a script cancels its pending tool calls. Bash tasks it already
+started continue running, and the result lists their handles for `exec kill`.
+A request cancellation ends only that request's wait. Set `killAfterMs` to
+bound the script's lifetime.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `FASTEXEC_CODEMODE` | `false` | Exposes the JavaScript tool when `true`. |
+| `FASTEXEC_YOLO` | `false` | Overrides annotations on all exposed tools, including codemode. |
+| `FASTEXEC_STRUCTURED_CONTENT` | `true` | Includes task metadata in results. |
+| `FASTEXEC_OUTPUT_MODE` | `text` | Places task output in `text`, `both`, or `structured` output. |
+| `FASTEXEC_DAEMON` | `off` | Runs tasks in the shared daemon when `on`. |
+
+`FASTEXEC_CODEMODE`, `FASTEXEC_YOLO`, and `FASTEXEC_STRUCTURED_CONTENT` accept
+only `true` or `false`; invalid values stop startup.
+An endpoint's environment decides whether it advertises codemode, even when
+its daemon was started without it. HTTP uses the daemon's startup setting.
+Nested `exec` always returns text and structured output so scripts work with
+any outer output setting.
+
+Each script has 128 MiB of VM memory, eight tool calls in flight with up to
+1024 queued, a separate 128 MiB budget for pending tool arguments and results,
+64 MiB of output including images and diagnostic space, and up
+to 64 images. Up to four scripts run in a local stdio server, or eight in a
+daemon. Each script accepts at most 4096 `exec start` calls, including calls
+that later fail or are cancelled; further starts reject with `RangeError`.
+If a completed tool result cannot fit the bridge budget, its call rejects
+with `RangeError` after the operation ran; inspect its effects before retrying.
+The existing total task and log limits also apply. See
+[`src/description-codemode.md`](src/description-codemode.md) for the tool contract.
 
 ## Key Constraints
 

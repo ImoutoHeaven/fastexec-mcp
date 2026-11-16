@@ -310,6 +310,8 @@ impl Reader {
 #[derive(Clone, Default)]
 pub struct ReadState {
     pub cursor: u64,
+    /// Images returned or warned about, including markers lost with dropped log bytes.
+    pub images_seen: usize,
     pub lines_before: u64,
     pub cleaner: Cleaner,
     /// Bytes and lines of the final transcript lines a result has shown.

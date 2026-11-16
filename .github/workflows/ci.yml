@@ -187,7 +187,7 @@ jobs:
           mem: 6144
           cpu: 4
           prepare: |
-            pkg install -y bash rust python3 perl5
+            pkg install -y bash rust python3 perl5 llvm
           run: |
             set -eu
             run_script=$(mktemp ./ci-freebsd-run.XXXXXX)
@@ -203,6 +203,7 @@ jobs:
             mount -p
             export CARGO_TARGET_DIR=/tmp/fastexec-ci-target
             export CARGO_BUILD_JOBS=2
+            export LIBCLANG_PATH="$(ls -d /usr/local/llvm*/lib | tail -n 1)"
             export FASTEXEC_REQUIRE_ROOT_TEST=1
             freebsd-version
             rustc --version

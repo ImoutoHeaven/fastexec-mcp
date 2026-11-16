@@ -78,6 +78,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: musl compiler
+        if: startsWith(matrix.name, 'linux-')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -147,11 +151,12 @@ jobs:
           cpu: 4
           envs: VERSION
           prepare: |
-            pkg install -y bash rust python3
+            pkg install -y bash rust python3 llvm
           run: |
             set -eu
             export CARGO_TARGET_DIR=/tmp/fastexec-release-target
             export CARGO_BUILD_JOBS=2
+            export LIBCLANG_PATH="$(ls -d /usr/local/llvm*/lib | tail -n 1)"
             freebsd-version
             rustc --version
             cargo build --release --locked

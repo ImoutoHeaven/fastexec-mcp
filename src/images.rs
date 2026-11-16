@@ -9,7 +9,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 const MAX_DIMENSION: u32 = 2000;
 
 /// The base64 payload an inline image may have: 4.5 MiB, with room under a 5 MiB API limit.
-const MAX_BASE64: usize = 4718592;
+pub(crate) const MAX_BASE64: usize = 4718592;
 
 /// The bytes Pi sniffs a file with before it decides it is an image.
 const SNIFF: usize = 4100;
@@ -89,13 +89,44 @@ pub fn detect(prefix: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// The normalized bytes saved by codemode and encoded by read.
+pub(crate) struct Inline {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    pub hints: Vec<String>,
+}
+
+/// Detects the bytes rather than trusting a caller's MIME label.
+pub(crate) fn inline(bytes: Vec<u8>) -> Result<Inline, String> {
+    let mime = detect(&bytes).ok_or_else(|| CONVERT_FAILURE.to_string())?;
+    prepare(bytes, mime)
+}
+
 /// An image's bytes as they will be sent, or the text saying why they are not.
 pub fn process(bytes: Vec<u8>, mime: &str) -> Processed {
+    let image = match prepare(bytes, mime) {
+        Ok(image) => image,
+        Err(message) => return failed(mime, &message),
+    };
+    let mut text = format!("Read image file [{}]", image.mime);
+    for hint in image.hints {
+        text.push('\n');
+        text.push_str(&hint);
+    }
+    Processed {
+        text,
+        image: Some((base64(&image.bytes), image.mime)),
+    }
+}
+
+fn prepare(bytes: Vec<u8>, mime: &str) -> Result<Inline, String> {
     let Some(normalized) = normalize(bytes, mime) else {
-        return failed(mime, CONVERT_FAILURE);
+        return Err(CONVERT_FAILURE.to_string());
     };
     let Some(resized) = resize(&normalized.bytes, &normalized.mime) else {
-        return failed(mime, RESIZE_FAILURE);
+        return Err(RESIZE_FAILURE.to_string());
     };
     let mut hints = Vec::new();
     if let Some(from) = &normalized.converted_from
@@ -109,15 +140,13 @@ pub fn process(bytes: Vec<u8>, mime: &str) -> Processed {
     if let Some(note) = dimension_note(&resized) {
         hints.push(note);
     }
-    let mut text = format!("Read image file [{}]", resized.mime);
-    for hint in hints {
-        text.push('\n');
-        text.push_str(&hint);
-    }
-    Processed {
-        text,
-        image: Some((resized.data, resized.mime)),
-    }
+    Ok(Inline {
+        bytes: resized.bytes,
+        mime: resized.mime,
+        width: resized.width,
+        height: resized.height,
+        hints,
+    })
 }
 
 /// The text-only result for an image that stays unshown.
@@ -171,7 +200,7 @@ fn base_mime(mime: &str) -> String {
 
 /// The bytes an image is sent as: unchanged when they already fit, else re-encoded smaller.
 struct Resized {
-    data: String,
+    bytes: Vec<u8>,
     mime: String,
     original_width: u32,
     original_height: u32,
@@ -195,7 +224,7 @@ fn resize(bytes: &[u8], mime: &str) -> Option<Resized> {
         && input_base64 < MAX_BASE64
     {
         return Some(Resized {
-            data: base64(bytes),
+            bytes: bytes.to_vec(),
             mime: mime.to_owned(),
             original_width,
             original_height,
@@ -219,10 +248,9 @@ fn resize(bytes: &[u8], mime: &str) -> Option<Resized> {
     loop {
         let candidate = image.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
         for (bytes, mime) in encodings(&candidate) {
-            let data = base64(&bytes);
-            if data.len() < MAX_BASE64 {
+            if bytes.len().div_ceil(3) * 4 < MAX_BASE64 {
                 return Some(Resized {
-                    data,
+                    bytes,
                     mime,
                     original_width,
                     original_height,

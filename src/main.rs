@@ -1,6 +1,7 @@
 //! MCP stdio server: the rmcp adapter over the service, and the process lifecycle around it.
 
 mod bash;
+mod codemode;
 mod conpty;
 #[cfg(windows)]
 mod conpty_spawn;
@@ -50,6 +51,21 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use tasks::{Limits, Tasks};
 use tokio::sync::watch;
+
+// Keep the advertised schema while returning invalid tool arguments as tool errors.
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct CodemodeArguments(serde_json::Value);
+
+impl schemars::JsonSchema for CodemodeArguments {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        codemode::Request::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        codemode::Request::json_schema(generator)
+    }
+}
 
 #[derive(Clone)]
 struct Server {
@@ -102,16 +118,20 @@ impl Server {
         transfers: Option<Arc<transfer::Transfers>>,
         public_root: Option<Arc<str>>,
         yolo: bool,
+        codemode: bool,
     ) -> Self {
         let mut router = Self::tool_router();
         let exec = router
             .map
             .get_mut("exec")
             .expect("the generated router has the exec route");
-        exec.attr.description = Some(exec_description(launch).into());
+        exec.attr.description = Some(exec_description(launch, codemode).into());
         if transfers.is_none() {
             // A stdio session has no route to serve a URL from, so it never sees the tool.
             router.remove_route("transfer");
+        }
+        if !codemode {
+            router.remove_route("codemode");
         }
         if yolo {
             for route in router.map.values_mut() {
@@ -195,7 +215,7 @@ Prefer it over one-shot shell tools when a command may outlive a single call or 
 
 /// The `exec` tool's description: the static text, the Windows paragraph on Windows, and one
 /// line saying where this server's tasks run. Nothing in it changes while the server runs.
-fn exec_description(launch: &LaunchContext) -> String {
+fn exec_description(launch: &LaunchContext, codemode: bool) -> String {
     let mut description = include_str!("description.md").trim_end().to_owned();
     if cfg!(windows) {
         description.push_str("\n\n");
@@ -204,6 +224,9 @@ fn exec_description(launch: &LaunchContext) -> String {
     if cfg!(target_os = "macos") {
         description.push_str("\n\n");
         description.push_str(include_str!("description-macos.md").trim_end());
+    }
+    if codemode {
+        description.push_str("\n\npoll, kill, and list also take codemode tasks. A codemode task takes no input, eof, keys,\nresize, screen, encoding, or transcript; killing it cancels only the calls the script is\nawaiting, and the tasks it started keep running.");
     }
     description.push_str("\n\nHost: ");
     description.push_str(&host_line(launch));
@@ -341,12 +364,69 @@ impl Server {
                             cancel: context.ct.clone(),
                             progress,
                             call_id: None,
+                            nested: false,
+                            started: None,
                         };
                         service.call(request, call).await
                     }
                     Err(message) => service::error_result(request.action, &message),
                 };
                 service::suppress(result, *render)
+            }
+        }
+    }
+
+    #[doc = include_str!("description-codemode.md")]
+    #[tool(
+        name = "codemode",
+        annotations(
+            title = "Run JavaScript",
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn codemode(
+        &self,
+        Parameters(arguments): Parameters<CodemodeArguments>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let request: codemode::Request = match serde_json::from_value(arguments.0) {
+            Ok(request) => request,
+            Err(error) => {
+                return CallToolResult::error(vec![ContentBlock::text(error.to_string())]);
+            }
+        };
+        if let Err(message) = codemode::validate(&request) {
+            return CallToolResult::error(vec![ContentBlock::text(message)]);
+        }
+        match &self.backend {
+            Backend::Daemon(endpoint) => forward(endpoint, "codemode", &request, &context).await,
+            Backend::Local {
+                service, render, ..
+            } => {
+                let session = match self.session(&context) {
+                    Ok(session) => session,
+                    Err(message) => {
+                        return CallToolResult::error(vec![ContentBlock::text(message)]);
+                    }
+                };
+                let (progress, _forwarder) = progress(&context);
+                let call = Call {
+                    session: &session,
+                    render: *render,
+                    cancel: context.ct.clone(),
+                    progress,
+                    call_id: None,
+                    nested: false,
+                    started: None,
+                };
+                service::suppress(
+                    service
+                        .codemode(request, call, self.transfers.is_some())
+                        .await,
+                    *render,
+                )
             }
         }
     }
@@ -762,6 +842,9 @@ async fn cli_start(
     if let Err(message) = yolo() {
         return fail(&message);
     }
+    if let Err(message) = codemode() {
+        return fail(&message);
+    }
     // A start that cannot serve HTTP is refused before anything runs, so it leaves no daemon
     // behind that the caller did not ask for.
     let mut extra: Vec<std::ffi::OsString> = Vec::new();
@@ -1048,6 +1131,15 @@ pub fn yolo() -> Result<bool, String> {
     )
 }
 
+/// Whether this server advertises JavaScript task orchestration.
+pub fn codemode() -> Result<bool, String> {
+    parse_bool_env(
+        "FASTEXEC_CODEMODE",
+        std::env::var_os("FASTEXEC_CODEMODE").as_deref(),
+        false,
+    )
+}
+
 fn parse_bool_env(
     name: &str,
     value: Option<&std::ffi::OsStr>,
@@ -1130,6 +1222,13 @@ async fn serve() {
             std::process::exit(1);
         }
     };
+    let codemode = match codemode() {
+        Ok(codemode) => codemode,
+        Err(message) => {
+            eprintln!("fastexec: {message}");
+            std::process::exit(1);
+        }
+    };
     // Captured once, at startup: the client's own environment is the server's own here.
     let launch = match LaunchContext::current() {
         Ok(launch) => Arc::new(launch),
@@ -1178,7 +1277,7 @@ async fn serve() {
         };
         (backend, Some(tasks))
     };
-    let server = Server::new(backend, &launch, None, None, yolo);
+    let server = Server::new(backend, &launch, None, None, yolo, codemode);
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
         inner: tokio::io::stdin(),

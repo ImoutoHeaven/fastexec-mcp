@@ -51,6 +51,8 @@ pub struct Http {
     pub render: Render,
     /// Whether all tools are advertised as read-only via `FASTEXEC_YOLO`.
     pub yolo: bool,
+    /// Whether HTTP sessions advertise the codemode tool.
+    pub codemode: bool,
     /// What the sessions this listener serves inherit: captured before the daemon leaves the
     /// directory it was started in.
     pub launch: Arc<LaunchContext>,
@@ -208,6 +210,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         digests,
         render,
         yolo,
+        codemode,
         launch,
         public_root,
     } = http;
@@ -239,6 +242,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
                 Some(Arc::clone(&table)),
                 public_root.clone(),
                 yolo,
+                codemode,
             );
             server.principals = Some(Arc::clone(&principals));
             Ok(server)

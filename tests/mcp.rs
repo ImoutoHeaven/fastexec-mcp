@@ -50,6 +50,7 @@ impl Server {
             .env_remove("FASTEXEC_TEST_RUNTIME_DIR")
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
             .env_remove("FASTEXEC_YOLO")
+            .env_remove("FASTEXEC_CODEMODE")
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
             .env_remove("FASTEXEC_TEST_NONE_LIMIT");
         configure(&mut command);
@@ -72,11 +73,15 @@ impl Server {
                         let _ = tx.send(json!({"__stdout_ended": "end of file"}));
                         return;
                     }
-                    Ok(_) => {
-                        if let Ok(value) = serde_json::from_str(&line) {
+                    Ok(_) => match serde_json::from_str(&line) {
+                        Ok(value) => {
                             let _ = tx.send(value);
                         }
-                    }
+                        Err(error) => {
+                            let _ = tx.send(json!({"__stdout_ended": format!("invalid JSON: {error}: {line:?}")}));
+                            return;
+                        }
+                    },
                     Err(error) => {
                         let _ = tx.send(json!({"__stdout_ended": format!("{error}")}));
                         return;
@@ -484,6 +489,7 @@ fn output_modes_place_start_and_poll_body_without_losing_metadata() {
         .env_remove("FASTEXEC_OUTPUT_MODE")
         .env_remove("FASTEXEC_STRUCTURED_CONTENT")
         .env_remove("FASTEXEC_YOLO")
+        .env_remove("FASTEXEC_CODEMODE")
         .env("FASTEXEC_OUTPUT_MODE", "bogus")
         .output()
         .unwrap();
@@ -562,6 +568,7 @@ fn structured_content_can_be_disabled_for_every_action() {
 
     let result = Command::new(env!("CARGO_BIN_EXE_fastexec"))
         .env_remove("FASTEXEC_YOLO")
+        .env_remove("FASTEXEC_CODEMODE")
         .env("FASTEXEC_OUTPUT_MODE", "text")
         .env("FASTEXEC_STRUCTURED_CONTENT", "bogus")
         .output()
@@ -4098,6 +4105,7 @@ fn daemon_command(exe: &str, runtime: &std::path::Path, namespace: &str, action:
         .env("FASTEXEC_TEST_RUNTIME_DIR", runtime)
         .env("FASTEXEC_NAMESPACE", namespace)
         .env_remove("FASTEXEC_YOLO")
+        .env_remove("FASTEXEC_CODEMODE")
         .stdin(Stdio::null());
     command
 }
@@ -4998,4 +5006,524 @@ fn yolo_overrides_stdio_tool_annotations_and_rejects_invalid_values() {
             "{bad:?}: {stderr:?}"
         );
     }
+}
+
+fn codemode_server() -> Server {
+    Server::start_with(|command| {
+        command
+            .env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_OUTPUT_MODE", "both");
+    })
+}
+
+fn code_result(server: &mut Server, arguments: Value) -> Value {
+    let reply = server.request(
+        "tools/call",
+        json!({"name":"codemode", "arguments":arguments}),
+    );
+    assert!(reply["result"].is_object(), "{reply}");
+    reply["result"].clone()
+}
+
+fn code_text(result: &Value) -> &str {
+    result["content"][0]["text"].as_str().unwrap_or_default()
+}
+
+fn image_count(result: &Value) -> usize {
+    result["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| block["type"] == "image")
+        .count()
+}
+
+fn image_data_url(width: u32, height: u32) -> String {
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        width,
+        height,
+        image::Rgb([7, 8, 9]),
+    ));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    format!(
+        "data:image/png;base64,{}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png)
+    )
+}
+
+#[test]
+fn codemode_requires_explicit_enable_and_respects_yolo() {
+    for setting in [None, Some("false")] {
+        let mut server = Server::start_with(|command| {
+            if let Some(value) = setting {
+                command.env("FASTEXEC_CODEMODE", value);
+            }
+        });
+        let listed = server.request("tools/list", json!({}));
+        assert!(
+            !listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "codemode"),
+            "{listed}"
+        );
+        let reply = server.request(
+            "tools/call",
+            json!({"name":"codemode", "arguments":{"code":"return 1"}}),
+        );
+        assert!(
+            reply["error"].is_object() || reply["result"]["isError"] == true,
+            "{reply}"
+        );
+    }
+    for yolo in [false, true] {
+        let mut server = Server::start_with(|command| {
+            command
+                .env("FASTEXEC_CODEMODE", "true")
+                .env("FASTEXEC_YOLO", yolo.to_string());
+        });
+        let listed = server.request("tools/list", json!({}));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 5, "{listed}");
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "codemode")
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], yolo, "{tool}");
+        assert_eq!(tool["annotations"]["destructiveHint"], !yolo, "{tool}");
+        assert_eq!(tool["annotations"]["openWorldHint"], !yolo, "{tool}");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{tool}");
+        assert_eq!(
+            tool["inputSchema"]["properties"]["code"]["type"], "string",
+            "{tool}"
+        );
+        assert!(
+            tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("code")),
+            "{tool}"
+        );
+        let exec = tools.iter().find(|tool| tool["name"] == "exec").unwrap();
+        let description = exec["description"].as_str().unwrap();
+        assert!(
+            description.contains("poll, kill, and list also take codemode tasks"),
+            "{description}"
+        );
+        assert!(
+            description.lines().last().unwrap().starts_with("Host: "),
+            "{description}"
+        );
+    }
+    for bad in ["", "on", "off", "1", "0", "bogus"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+            .env_remove("FASTEXEC_DAEMON")
+            .env_remove("FASTEXEC_OUTPUT_MODE")
+            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_YOLO")
+            .env("FASTEXEC_CODEMODE", bad)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{bad:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("invalid FASTEXEC_CODEMODE")
+                && stderr.contains("expected true or false"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn codemode_invalid_arguments_do_not_create_tasks() {
+    let mut server = codemode_server();
+    for args in [
+        json!({}),
+        json!({"code":42}),
+        json!({"code":"  "}),
+        json!({"code":"x\0y"}),
+        json!({"code":"return 1", "cwd":"/tmp"}),
+        json!({"code":"return 1", "waitMs":240001}),
+        json!({"code":"return 1", "returnWhen":{"screenContains":["x"]}}),
+        json!({"code":"return 1", "truncate":"none", "maxBytes":100}),
+        json!({"code":"x".repeat(256 * 1024 + 1)}),
+    ] {
+        let result = code_result(&mut server, args);
+        assert_eq!(result["isError"], true, "{result}");
+        let (listed, _) = server.ok(json!({"action":"list"}));
+        assert!(listed["tasks"].as_array().unwrap().is_empty(), "{listed}");
+    }
+}
+
+#[test]
+fn codemode_streams_script_results_and_preserves_error_lines() {
+    let mut server = codemode_server();
+    let result = code_result(
+        &mut server,
+        json!({"code":"text('first'); await Promise.resolve(); console.log('second', {ok:true}); return {last:3};"}),
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    let task = &result["structuredContent"];
+    assert_eq!(task["action"], "codemode", "{result}");
+    assert_eq!(task["kind"], "codemode", "{result}");
+    assert_eq!(task["exitCode"], 0, "{result}");
+    assert_eq!(
+        task["output"], "first\nsecond {\"ok\":true}\n{\"last\":3}",
+        "{result}"
+    );
+    for code in [
+        "try { exit(); } catch { text('caught'); } text('after');",
+        "return undefined;",
+    ] {
+        let result = code_result(&mut server, json!({"code":code}));
+        assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+        assert_eq!(result["structuredContent"]["output"], "", "{result}");
+    }
+    for (code, expected) in [
+        ("text('before');\nthrow new Error('boom');", "codemode.js:2"),
+        (
+            "await new Promise(() => {});",
+            "promise that can never settle",
+        ),
+        ("const = ;", "SyntaxError"),
+        ("Promise.reject(new Error('unhandled'));", "unhandled"),
+    ] {
+        let result = code_result(&mut server, json!({"code":code}));
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["exitCode"], 1, "{result}");
+        assert!(
+            code_text(&result).contains("Script error:") && code_text(&result).contains(expected),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn codemode_nested_results_keep_their_shape_under_outer_render_settings() {
+    let dir = Scratch::new("codemode-files");
+    std::fs::create_dir_all(&*dir).unwrap();
+    for structured in ["true", "false"] {
+        let mut server = Server::start_with(|command| {
+            command
+                .current_dir(&*dir)
+                .env("FASTEXEC_CODEMODE", "true")
+                .env("FASTEXEC_OUTPUT_MODE", "structured")
+                .env("FASTEXEC_STRUCTURED_CONTENT", structured);
+        });
+        let code = r#"
+const written = await tools.write({path:'note.txt', content:'alpha\nbeta\n'});
+const edited = await tools.edit({path:'note.txt', edits:[{oldText:'beta', newText:'BETA'}]});
+const [command, file, absent] = await Promise.all([
+  tools.exec({action:'start', command:'printf nested-output', loginShell:false}),
+  tools.read({path:'note.txt'}), tools.read({path:'absent.txt'})
+]);
+if (written.isError !== false || edited.isError !== false || command.isError !== false || absent.isError !== true) throw new Error('isError shape');
+if (command.structuredContent.output !== 'nested-output' || !command.content[0].text.includes('nested-output')) throw new Error('exec shape');
+if ('structuredContent' in file || file.content[0].text !== 'alpha\nBETA\n') throw new Error('file shape');
+const reads = await Promise.all(Array.from({length:20}, () => tools.read({path:'note.txt'})));
+if (reads.length !== 20 || reads.some(r => r.isError)) throw new Error('queued reads');
+text('nested-ok');
+"#;
+        let result = code_result(&mut server, json!({"code":code}));
+        assert_eq!(result["isError"], false, "{result}");
+        if structured == "true" {
+            assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+            assert_eq!(
+                result["structuredContent"]["output"], "nested-ok",
+                "{result}"
+            );
+            assert!(!code_text(&result).contains("nested-ok"), "{result}");
+        } else {
+            assert!(result.get("structuredContent").is_none(), "{result}");
+            assert!(
+                code_text(&result).contains("nested-ok")
+                    && !code_text(&result).contains("Script error:"),
+                "{result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn codemode_rejects_bad_nested_calls_and_survives_changed_prototypes() {
+    let mut server = codemode_server();
+    let code = r#"
+let rejected = 0;
+for (const call of [
+  () => tools.read(null), () => tools.read({path:'x', bogus:true}),
+  () => tools.exec({action:'start'}), () => tools.exec({action:'list', bogus:true}),
+  () => tools.codemode({code:'return 1'})
+]) { try { await call(); } catch { rejected++; } }
+if (rejected !== 5) throw new Error('invalid calls resolved: ' + rejected);
+const pending = tools.read({path:'a-file-that-does-not-exist'});
+Map.prototype.get = Map.prototype.set = Map.prototype.delete = () => { throw new Error('changed Map'); };
+Promise.prototype.then = () => { throw new Error('changed Promise'); };
+JSON.parse = JSON.stringify = () => { throw new Error('changed JSON'); };
+const result = await pending;
+if (result.isError !== true) throw new Error('missing file did not resolve');
+text('settled');
+"#;
+    let result = code_result(&mut server, json!({"code":code}));
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert_eq!(result["structuredContent"]["output"], "settled", "{result}");
+}
+
+#[test]
+fn codemode_kill_reports_pending_calls_and_leaves_started_tasks_running() {
+    let mut server = codemode_server();
+    let result = code_result(
+        &mut server,
+        json!({
+            "code":"const child = await tools.exec({action:'start',command:'sleep 30',waitMs:0,loginShell:false}); text('child=' + child.structuredContent.taskId); const waiting = tools.exec({action:'poll',taskId:child.structuredContent.taskId,waitMs:60000}); text('waiting'); await waiting;",
+            "waitMs":10000, "returnWhen":{"outputContains":["waiting"]}
+        }),
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    let script = result["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let child = code_text(&result)
+        .lines()
+        .find_map(|line| line.strip_prefix("child="))
+        .unwrap()
+        .to_owned();
+    for extra in [
+        json!({"input":"x"}),
+        json!({"eof":false}),
+        json!({"keys":["Enter"]}),
+        json!({"keyDelayMs":0}),
+        json!({"cols":80}),
+        json!({"rows":24}),
+        json!({"screen":false}),
+        json!({"encoding":"utf-8"}),
+        json!({"returnWhen":{"screenContains":["x"]}}),
+        json!({"returnWhen":{"screenAppears":["x"]}}),
+        json!({"returnWhen":{"screenGone":["x"]}}),
+    ] {
+        let mut args = json!({"action":"poll", "taskId":script, "waitMs":0});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (_, text, error) = server.call(args);
+        assert!(
+            error && text.contains("A codemode task takes no input"),
+            "{text}"
+        );
+    }
+    let (_, text, error) = server.call(json!({"action":"transcript", "taskId":script}));
+    assert!(error && text.to_lowercase().contains("terminal"), "{text}");
+    let (stopped, text) = server.ok(json!({"action":"kill", "taskId":script}));
+    assert_eq!(stopped["state"], "killed", "{stopped}: {text}");
+    assert!(stopped["exitCode"].is_null(), "{stopped}");
+    assert!(
+        text.contains("tasks it started") && text.contains("keep running"),
+        "{text}"
+    );
+    assert!(
+        stopped["codemode"]["cancelledCalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|call| call["tool"] == "exec" && call["action"] == "poll"),
+        "{stopped}"
+    );
+    assert!(
+        stopped["codemode"]["startedTasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["taskId"] == child && task["state"] == "running"),
+        "{stopped}"
+    );
+    let (listed, _) = server.ok(json!({"action":"list"}));
+    assert!(
+        listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["taskId"] == bare_id(&child)
+                && task["state"] == "running"
+                && task["kind"] == "bash"),
+        "{listed}"
+    );
+    server.ok(json!({"action":"kill", "taskId":child}));
+}
+
+#[test]
+fn codemode_deadlines_stop_bytecode_and_microtasks() {
+    let mut server = codemode_server();
+    for code in ["while (true) {}", "while (true) await null;"] {
+        let result = code_result(
+            &mut server,
+            json!({"code":code,"killAfterMs":300,"waitMs":10000}),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["state"], "killed", "{result}");
+        assert_eq!(
+            result["structuredContent"]["lifetimeExpired"], true,
+            "{result}"
+        );
+        assert!(
+            result["structuredContent"]["exitCode"].is_null(),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn codemode_outer_request_cancellation_only_ends_its_wait() {
+    let marker = Scratch::new("codemode-cancel-marker");
+    let mut server = codemode_server();
+    let code = format!(
+        "await tools.write({{path:{},content:'started'}}); while (true) {{}}",
+        json!(marker.to_string_lossy())
+    );
+    server.next_id += 1;
+    let request_id = server.next_id;
+    server.send(json!({"jsonrpc":"2.0","id":request_id,"method":"tools/call","params":{"name":"codemode","arguments":{"code":code,"waitMs":60000}}}));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "script did not create its marker"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":request_id,"reason":"test cancellation"}}));
+    // rmcp may drop a cancelled response; list observes the task after cancellation.
+    let (listed, _) = server.ok(json!({"action":"list"}));
+    let script = listed["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["kind"] == "codemode")
+        .unwrap();
+    assert_eq!(script["state"], "running", "{listed}");
+    server.ok(json!({"action":"kill","taskId":script["taskId"]}));
+}
+
+#[test]
+fn codemode_script_admission_limit_is_released_after_kill() {
+    let mut server = codemode_server();
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let result = code_result(&mut server, json!({"code":"while (true) {}", "waitMs":0}));
+        assert_eq!(result["isError"], false, "{result}");
+        ids.push(
+            result["structuredContent"]["taskId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let rejected = code_result(&mut server, json!({"code":"return 1", "waitMs":0}));
+    assert_eq!(rejected["isError"], true, "{rejected}");
+    let (listed, _) = server.ok(json!({"action":"list"}));
+    assert_eq!(listed["tasks"].as_array().unwrap().len(), 4, "{listed}");
+    for id in ids {
+        server.ok(json!({"action":"kill", "taskId":id}));
+    }
+    let next = code_result(&mut server, json!({"code":"return 'room again'"}));
+    assert_eq!(next["structuredContent"]["exitCode"], 0, "{next}");
+}
+
+#[test]
+fn codemode_images_follow_each_readers_cursor_even_when_text_is_truncated() {
+    let mut server = codemode_server();
+    let code = format!(
+        "for(let i=0;i<6;i++) image({}); text('tail');",
+        json!(image_data_url(8, 6))
+    );
+    let result = code_result(
+        &mut server,
+        json!({"code":code,"truncate":"tail","maxBytes":100}),
+    );
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert_eq!(image_count(&result), 4, "{result}");
+    assert_eq!(
+        result["structuredContent"]["codemode"]["imagesAttached"], 4,
+        "{result}"
+    );
+    let omitted = result["structuredContent"]["codemode"]["imagesNotAttached"]
+        .as_array()
+        .unwrap();
+    assert_eq!(omitted.len(), 2, "{result}");
+    assert_eq!(omitted[0]["reason"], "budget", "{result}");
+    let path = omitted[0]["path"].as_str().unwrap();
+    let read = server.request(
+        "tools/call",
+        json!({"name":"read","arguments":{"path":path}}),
+    );
+    assert_eq!(image_count(&read["result"]), 1, "{read}");
+    let handle = result["structuredContent"]["taskId"].as_str().unwrap();
+    let poll = server.request(
+        "tools/call",
+        json!({"name":"exec","arguments":{"action":"poll","taskId":handle,"waitMs":0}}),
+    );
+    assert_eq!(image_count(&poll["result"]), 0, "{poll}");
+    let fresh = server.request("tools/call", json!({"name":"exec","arguments":{"action":"poll","taskId":bare_id(handle),"waitMs":0,"raw":true,"truncate":"none"}}));
+    assert_eq!(image_count(&fresh["result"]), 4, "{fresh}");
+}
+
+#[test]
+fn codemode_images_resize_and_survive_structured_only_output() {
+    let mut server = Server::start_with(|command| {
+        command
+            .env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_OUTPUT_MODE", "structured");
+    });
+    let code = format!("image({});", json!(image_data_url(2400, 6)));
+    let result = code_result(&mut server, json!({"code":code}));
+    assert_eq!(image_count(&result), 1, "{result}");
+    let block = result["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "image")
+        .unwrap();
+    let data = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        block["data"].as_str().unwrap(),
+    )
+    .unwrap();
+    let image = image::load_from_memory(&data).unwrap();
+    assert!(
+        image.width() <= 2000 && image.height() <= 2000,
+        "{}x{}",
+        image.width(),
+        image.height()
+    );
+    assert!(!code_text(&result).contains("[image 1:"), "{result}");
+    assert!(
+        result["structuredContent"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("[image 1:"),
+        "{result}"
+    );
+}
+
+#[test]
+fn codemode_nested_calls_do_not_consume_other_tasks_background_notifications() {
+    let mut server = codemode_server();
+    let (task, _) = server.ok(json!({
+        "action":"start", "command":"read -r reply", "loginShell":false, "waitMs":0
+    }));
+    let other = task["taskId"].as_str().unwrap().to_owned();
+    let code = format!(
+        "await tools.exec({{action:'poll',taskId:{},input:'done\\n',waitMs:10000}}); await tools.exec({{action:'list'}}); text('done');",
+        json!(other)
+    );
+    let result = code_result(&mut server, json!({"code":code}));
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(
+        code_text(&result).contains(bare_id(&other)) && code_text(&result).contains("Background:"),
+        "{result}"
+    );
 }

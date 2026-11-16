@@ -32,6 +32,7 @@ struct Fixture {
     public_url: Option<String>,
     /// `FASTEXEC_YOLO` passed to this fixture's commands when a case sets one.
     yolo: Option<String>,
+    codemode: Option<String>,
     /// An explicitly chosen launch directory for path-alias regression tests.
     cwd: Option<PathBuf>,
     /// The turn this fixture holds until it ends: held, never read.
@@ -65,6 +66,11 @@ impl Fixture {
         self
     }
 
+    fn with_codemode(mut self, value: &str) -> Fixture {
+        self.codemode = Some(value.to_owned());
+        self
+    }
+
     /// A fixture with its runtime directory, and no daemon yet: the shape of a start that is
     /// expected to be refused.
     fn bare(tag: &str) -> Fixture {
@@ -93,6 +99,7 @@ impl Fixture {
             pid: std::cell::Cell::new(None),
             public_url: None,
             yolo: None,
+            codemode: None,
             cwd: None,
             starting,
         }
@@ -136,6 +143,10 @@ impl Fixture {
         match &self.yolo {
             Some(value) => command.env("FASTEXEC_YOLO", value),
             None => command.env_remove("FASTEXEC_YOLO"),
+        };
+        match &self.codemode {
+            Some(value) => command.env("FASTEXEC_CODEMODE", value),
+            None => command.env_remove("FASTEXEC_CODEMODE"),
         };
         command
     }
@@ -609,7 +620,6 @@ impl Client {
     }
 }
 
-/// Sends one request with a method, a target and headers of the test's own choosing.
 /// Sends one request with a method, a target and headers of the test's own choosing.
 fn send(addr: SocketAddr, method: &str, target: &str, headers: &str, body: &[u8]) -> Response {
     let mut request = Vec::new();
@@ -2447,10 +2457,86 @@ fn yolo_overrides_all_five_http_tools_and_rejects_invalid_values() {
     let status = fixture
         .command(&["daemon", "status"])
         .env_remove("FASTEXEC_YOLO")
+        .env_remove("FASTEXEC_CODEMODE")
         .output()
         .unwrap();
     assert!(
         String::from_utf8_lossy(&status.stdout).starts_with("No fastexec daemon"),
         "{status:?}"
     );
+}
+
+#[test]
+fn codemode_http_runs_nested_tools_and_attaches_images() {
+    let mut fixture = Fixture::bare("codemode")
+        .with_codemode("true")
+        .with_yolo("true");
+    let image =
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 6, image::Rgb([7, 8, 9])));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(fixture.runtime.join("shot.png"), &png).unwrap();
+    fixture.cwd = Some(fixture.runtime.clone());
+    fixture.start();
+    let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
+    let listed = modern.modern("tools/list", json!({}));
+    let tool = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "codemode")
+        .unwrap();
+    assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
+    assert_eq!(tool["annotations"]["destructiveHint"], false, "{tool}");
+    let code = "const result = await tools.exec({action:'start',command:'printf http-codemode',loginShell:false}); text(result.structuredContent.output); image(await tools.read({path:'shot.png'}));";
+    let result = modern.modern(
+        "tools/call",
+        json!({"name":"codemode","arguments":{"code":code}}),
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("http-codemode"),
+        "{result}"
+    );
+    let block = result["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "image")
+        .unwrap();
+    assert_eq!(
+        block["data"],
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png),
+        "{result}"
+    );
+    let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
+    legacy.initialize();
+    let result = legacy.call_tool("codemode", json!({"code":"return 'legacy-codemode'"}));
+    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("legacy-codemode"),
+        "{result}"
+    );
+}
+
+#[test]
+fn codemode_http_rejects_invalid_startup_values() {
+    let fixture = Fixture::bare("codemode-invalid").with_codemode("bogus");
+    for action in [
+        ["daemon", "start", "--http", "127.0.0.1:0"],
+        ["daemon", "run", "--http", "127.0.0.1:0"],
+    ] {
+        let (code, out, err) = fixture.run(&action);
+        assert_eq!(code, 1, "{out}{err}");
+        assert!(err.contains("invalid FASTEXEC_CODEMODE"), "{err}");
+    }
 }

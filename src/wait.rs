@@ -184,7 +184,7 @@ pub fn mark(
 /// processes counts as running until they end.
 fn ended(task: &Task, root_reported: bool, conditions: bool) -> Option<WaitEnd> {
     let (code, held_past_exit) = task.root_end()?;
-    let waits_past_exit = conditions && code == 0 && held_past_exit;
+    let waits_past_exit = conditions && code == Some(0) && held_past_exit;
     if !root_reported && !waits_past_exit {
         return Some(WaitEnd::TaskEnded);
     }

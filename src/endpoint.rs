@@ -303,7 +303,8 @@ impl Endpoint {
         id: u64,
         request_id: &str,
     ) -> CallToolResult {
-        if tool == "exec" {
+        if tool == "exec" || tool == "codemode" {
+            let action = if tool == "codemode" { tool } else { action };
             return error(format!(
                 "The connection to the fastexec daemon (epoch {}) closed during {action} call {id} (request {request_id}, session {}); the operation may have run. Use action list to check.",
                 link.epoch, self.session
