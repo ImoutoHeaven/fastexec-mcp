@@ -281,16 +281,7 @@ impl Daemon {
             let daemon = Arc::clone(&self);
             let stopped = self.stopped.clone();
             tokio::spawn(async move {
-                http::serve(
-                    http.listener,
-                    http.digests,
-                    daemon,
-                    http.render,
-                    http.launch,
-                    http.public_root,
-                    stopped,
-                )
-                .await;
+                http::serve(http, daemon, stopped).await;
             });
         }
         let mut tick = interval(self.config.tick);
@@ -1098,6 +1089,13 @@ async fn serve_daemon(
             return 1;
         }
     };
+    let yolo = match crate::yolo() {
+        Ok(yolo) => yolo,
+        Err(message) => {
+            eprintln!("fastexec: {message}");
+            return 1;
+        }
+    };
     // The launch context is captured before the daemon leaves its starting directory, so HTTP
     // sessions keep that directory as the one a task starts in.
     let (http_addr, http, config) = match http {
@@ -1151,6 +1149,7 @@ async fn serve_daemon(
                     listener,
                     digests,
                     render,
+                    yolo,
                     launch,
                     public_root,
                 }),

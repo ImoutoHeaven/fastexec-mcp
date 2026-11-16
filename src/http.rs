@@ -49,6 +49,8 @@ pub struct Http {
     pub digests: Vec<[u8; 32]>,
     /// How results are rendered for the sessions this listener serves.
     pub render: Render,
+    /// Whether all tools are advertised as read-only via `FASTEXEC_YOLO`.
+    pub yolo: bool,
     /// What the sessions this listener serves inherit: captured before the daemon leaves the
     /// directory it was started in.
     pub launch: Arc<LaunchContext>,
@@ -199,16 +201,16 @@ fn authority_port(authority: &str) -> Result<Option<&str>, &'static str> {
 /// A body can fail while it streams, which a transfer of a large file must be able to say.
 type Reply = Response<BoxBody<Bytes, std::io::Error>>;
 
-/// Serves MCP over Streamable HTTP on `listener` until the daemon stops.
-pub async fn serve(
-    listener: TcpListener,
-    digests: Vec<[u8; 32]>,
-    daemon: Arc<Daemon>,
-    render: Render,
-    launch: Arc<LaunchContext>,
-    public_root: Option<Arc<str>>,
-    stopped: CancellationToken,
-) {
+/// Serves MCP over Streamable HTTP on `http.listener` until the daemon stops.
+pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) {
+    let Http {
+        listener,
+        digests,
+        render,
+        yolo,
+        launch,
+        public_root,
+    } = http;
     // The factory makes a server for each legacy session or inline-lifecycle request.
     let service = Arc::clone(&daemon.service());
     // One table for this listener: the factory hands it to every session, so a URL a session
@@ -236,6 +238,7 @@ pub async fn serve(
                 &launch,
                 Some(Arc::clone(&table)),
                 public_root.clone(),
+                yolo,
             );
             server.principals = Some(Arc::clone(&principals));
             Ok(server)

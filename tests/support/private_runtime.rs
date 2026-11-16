@@ -12,6 +12,7 @@ pub fn create_private_runtime(path: &std::path::Path) {
         .env_remove("FASTEXEC_DAEMON")
         .env_remove("FASTEXEC_OUTPUT_MODE")
         .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+        .env_remove("FASTEXEC_YOLO")
         .stdin(std::process::Stdio::null())
         .output()
         .expect("the binary creates the fixture's private runtime root");

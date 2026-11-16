@@ -30,6 +30,8 @@ struct Fixture {
     /// The public root this fixture's daemon is started with, when a case names one. It is set on
     /// this fixture's own commands only: no case changes the environment of the test process.
     public_url: Option<String>,
+    /// `FASTEXEC_YOLO` passed to this fixture's commands when a case sets one.
+    yolo: Option<String>,
     /// An explicitly chosen launch directory for path-alias regression tests.
     cwd: Option<PathBuf>,
     /// The turn this fixture holds until it ends: held, never read.
@@ -55,6 +57,11 @@ impl Fixture {
     /// listener has it.
     fn with_public_url(mut self, root: &str) -> Fixture {
         self.public_url = Some(root.to_owned());
+        self
+    }
+
+    fn with_yolo(mut self, value: &str) -> Fixture {
+        self.yolo = Some(value.to_owned());
         self
     }
 
@@ -85,6 +92,7 @@ impl Fixture {
             tokens: vec![random_token()],
             pid: std::cell::Cell::new(None),
             public_url: None,
+            yolo: None,
             cwd: None,
             starting,
         }
@@ -124,6 +132,10 @@ impl Fixture {
         match &self.public_url {
             Some(root) => command.env("FASTEXEC_PUBLIC_URL", root),
             None => command.env_remove("FASTEXEC_PUBLIC_URL"),
+        };
+        match &self.yolo {
+            Some(value) => command.env("FASTEXEC_YOLO", value),
+            None => command.env_remove("FASTEXEC_YOLO"),
         };
         command
     }
@@ -2345,4 +2357,100 @@ fn freebsd_fixture_fallback_cleanup_owns_its_daemon() {
         &fixture.runtime.join("bin")
     ));
     assert!(!support::freebsd::is_alive(pid));
+}
+
+#[test]
+fn yolo_overrides_all_five_http_tools_and_rejects_invalid_values() {
+    let defaults = [
+        (
+            "edit",
+            json!({"title": "Edit file", "destructiveHint": true, "idempotentHint": false}),
+        ),
+        (
+            "exec",
+            json!({"title": "Run bash command", "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true}),
+        ),
+        ("read", json!({"title": "Read file", "readOnlyHint": true})),
+        (
+            "transfer",
+            json!({"title": "Transfer file", "destructiveHint": true, "openWorldHint": true}),
+        ),
+        (
+            "write",
+            json!({"title": "Write file", "destructiveHint": true, "idempotentHint": false}),
+        ),
+    ];
+
+    {
+        let fixture = Fixture::new("yolo-off");
+        let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
+        let modern_listed = modern.modern("tools/list", json!({}));
+        let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
+        legacy.initialize();
+        let legacy_listed =
+            legacy.send(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list"}));
+        let legacy_tools = legacy_listed.answer(99)["result"]["tools"].clone();
+
+        for tools_value in [&modern_listed["tools"], &legacy_tools] {
+            let tools = tools_value.as_array().unwrap();
+            assert_eq!(tools.len(), 5, "{tools_value}");
+            for (name, expected) in &defaults {
+                let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
+                assert_eq!(&tool["annotations"], expected, "default {name}: {tool}");
+            }
+        }
+    }
+
+    {
+        let mut fixture = Fixture::bare("yolo-on").with_yolo("true");
+        fixture.start();
+        let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
+        let modern_listed = modern.modern("tools/list", json!({}));
+        let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
+        legacy.initialize();
+        let legacy_listed =
+            legacy.send(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list"}));
+        let legacy_tools = legacy_listed.answer(99)["result"]["tools"].clone();
+
+        for tools_value in [&modern_listed["tools"], &legacy_tools] {
+            let tools = tools_value.as_array().unwrap();
+            assert_eq!(tools.len(), 5, "{tools_value}");
+            for (name, expected) in &defaults {
+                let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
+                assert_eq!(
+                    tool["annotations"],
+                    json!({
+                        "title": expected["title"],
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": false,
+                        "openWorldHint": false,
+                    }),
+                    "yolo=true {name}: {tool}"
+                );
+            }
+        }
+    }
+
+    let fixture = Fixture::bare("yolo-bad").with_yolo("bogus");
+    for action in [
+        ["daemon", "start", "--http", "127.0.0.1:0"],
+        ["daemon", "run", "--http", "127.0.0.1:0"],
+    ] {
+        let (code, out, err) = fixture.run(&action);
+        assert_eq!(code, 1, "{action:?}: {out}{err}");
+        assert!(
+            err.contains("invalid FASTEXEC_YOLO \"bogus\"; expected true or false"),
+            "{action:?}: {err:?}"
+        );
+    }
+    let status = fixture
+        .command(&["daemon", "status"])
+        .env_remove("FASTEXEC_YOLO")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&status.stdout).starts_with("No fastexec daemon"),
+        "{status:?}"
+    );
 }

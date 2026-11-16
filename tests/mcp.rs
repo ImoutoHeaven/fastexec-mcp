@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "freebsd")]
+#[cfg(any(windows, target_os = "freebsd"))]
 #[path = "support/private_runtime.rs"]
 mod private_runtime;
 
@@ -49,6 +49,7 @@ impl Server {
             .env_remove("FASTEXEC_NAMESPACE")
             .env_remove("FASTEXEC_TEST_RUNTIME_DIR")
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_YOLO")
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
             .env_remove("FASTEXEC_TEST_NONE_LIMIT");
         configure(&mut command);
@@ -480,6 +481,9 @@ fn output_modes_place_start_and_poll_body_without_losing_metadata() {
     assert_eq!(distinct.len(), first_ids.len(), "{first_ids:?}");
 
     let result = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+        .env_remove("FASTEXEC_OUTPUT_MODE")
+        .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+        .env_remove("FASTEXEC_YOLO")
         .env("FASTEXEC_OUTPUT_MODE", "bogus")
         .output()
         .unwrap();
@@ -487,7 +491,14 @@ fn output_modes_place_start_and_poll_body_without_losing_metadata() {
         !result.status.success(),
         "an invalid mode must fail at startup"
     );
-    assert!(String::from_utf8_lossy(&result.stderr).contains("FASTEXEC_OUTPUT_MODE"));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr
+            .contains("invalid FASTEXEC_OUTPUT_MODE \"bogus\"; expected text, both, or structured")
+            && !stderr.contains("Ok(")
+            && !stderr.contains("Err("),
+        "{stderr:?}"
+    );
 }
 
 #[test]
@@ -550,6 +561,7 @@ fn structured_content_can_be_disabled_for_every_action() {
     }
 
     let result = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+        .env_remove("FASTEXEC_YOLO")
         .env("FASTEXEC_OUTPUT_MODE", "text")
         .env("FASTEXEC_STRUCTURED_CONTENT", "bogus")
         .output()
@@ -558,7 +570,13 @@ fn structured_content_can_be_disabled_for_every_action() {
         !result.status.success(),
         "an invalid switch must fail at startup"
     );
-    assert!(String::from_utf8_lossy(&result.stderr).contains("FASTEXEC_STRUCTURED_CONTENT"));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("invalid FASTEXEC_STRUCTURED_CONTENT \"bogus\"; expected true or false")
+            && !stderr.contains("Ok(")
+            && !stderr.contains("Err("),
+        "{stderr:?}"
+    );
 }
 
 #[test]
@@ -4038,7 +4056,7 @@ fn long_wait_sends_progress_and_cancellation_leaves_the_task_running() {
 #[test]
 fn a_task_cannot_start_a_daemon_and_says_so() {
     let runtime = Scratch::new("daemon-in-task");
-    std::fs::create_dir_all(&*runtime).unwrap();
+    private_runtime::create_private_runtime(&runtime);
     let namespace = format!("mcp{}", std::process::id());
     let exe = env!("CARGO_BIN_EXE_fastexec");
     // Armed before the start, so a daemon that was started by accident is stopped even when an
@@ -4079,6 +4097,7 @@ fn daemon_command(exe: &str, runtime: &std::path::Path, namespace: &str, action:
         .args(["daemon", action])
         .env("FASTEXEC_TEST_RUNTIME_DIR", runtime)
         .env("FASTEXEC_NAMESPACE", namespace)
+        .env_remove("FASTEXEC_YOLO")
         .stdin(Stdio::null());
     command
 }
@@ -4883,6 +4902,100 @@ fn fresh_reader_notice_survives_kill_and_fits_every_result_mode() {
         assert!(
             text.len() <= 100 && !text.contains("new reader"),
             "{mode}: {text}"
+        );
+    }
+}
+
+#[test]
+fn yolo_overrides_stdio_tool_annotations_and_rejects_invalid_values() {
+    let defaults = [
+        (
+            "edit",
+            json!({"title": "Edit file", "destructiveHint": true, "idempotentHint": false}),
+        ),
+        (
+            "exec",
+            json!({"title": "Run bash command", "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true}),
+        ),
+        ("read", json!({"title": "Read file", "readOnlyHint": true})),
+        (
+            "write",
+            json!({"title": "Write file", "destructiveHint": true, "idempotentHint": false}),
+        ),
+    ];
+    for setting in [None, Some("false")] {
+        let mut server = Server::start_with(|command| {
+            if let Some(value) = setting {
+                command.env("FASTEXEC_YOLO", value);
+            }
+        });
+        let listed = server.request("tools/list", json!({}));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4, "{listed}");
+        for (name, expected) in &defaults {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == *name)
+                .unwrap_or_else(|| panic!("missing {name} in {listed}"));
+            assert_eq!(&tool["annotations"], expected, "{setting:?} {name}: {tool}");
+        }
+    }
+
+    let mut yolo = Server::start_with(|command| {
+        command.env("FASTEXEC_YOLO", "true");
+    });
+    let listed = yolo.request("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 4, "{listed}");
+    for (name, expected) in &defaults {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == *name)
+            .unwrap_or_else(|| panic!("missing {name} in {listed}"));
+        assert_eq!(
+            tool["annotations"],
+            json!({
+                "title": expected["title"],
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false,
+            }),
+            "yolo=true {name}: {tool}"
+        );
+    }
+
+    let mut invalid: Vec<std::ffi::OsString> = ["", "on", "off", "1", "0", "bogus"]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        invalid.push(std::ffi::OsString::from_vec(vec![0xff]));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        invalid.push(std::ffi::OsString::from_wide(&[0xD800]));
+    }
+    for bad in invalid {
+        let output = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+            .env_remove("FASTEXEC_DAEMON")
+            .env_remove("FASTEXEC_OUTPUT_MODE")
+            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env("FASTEXEC_YOLO", &bad)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{bad:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("fastexec: invalid FASTEXEC_YOLO ")
+                && stderr.contains("; expected true or false")
+                && !stderr.contains("Ok(")
+                && !stderr.contains("Err("),
+            "{bad:?}: {stderr:?}"
         );
     }
 }

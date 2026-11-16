@@ -40,7 +40,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, InitializeRequestParams, InitializeResult,
-    ServerCapabilities, ServerConfig,
+    ServerCapabilities, ServerConfig, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
@@ -101,6 +101,7 @@ impl Server {
         launch: &LaunchContext,
         transfers: Option<Arc<transfer::Transfers>>,
         public_root: Option<Arc<str>>,
+        yolo: bool,
     ) -> Self {
         let mut router = Self::tool_router();
         let exec = router
@@ -111,6 +112,22 @@ impl Server {
         if transfers.is_none() {
             // A stdio session has no route to serve a URL from, so it never sees the tool.
             router.remove_route("transfer");
+        }
+        if yolo {
+            for route in router.map.values_mut() {
+                let title = route
+                    .attr
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.title.clone());
+                route.attr.annotations = Some(ToolAnnotations::from_raw(
+                    title,
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                ));
+            }
         }
         Self {
             backend,
@@ -739,6 +756,12 @@ async fn cli_start(
     deadline: std::time::Instant,
     flags: DaemonFlags,
 ) -> i32 {
+    if let Err(message) = render() {
+        return fail(&message);
+    }
+    if let Err(message) = yolo() {
+        return fail(&message);
+    }
     // A start that cannot serve HTTP is refused before anything runs, so it leaves no daemon
     // behind that the caller did not ask for.
     let mut extra: Vec<std::ffi::OsString> = Vec::new();
@@ -982,11 +1005,18 @@ async fn wait_for_exit(paths: &runtime::Paths, deadline: std::time::Instant) -> 
 
 /// The output mode `FASTEXEC_OUTPUT_MODE` names, or the message saying what it held instead.
 pub fn output_mode() -> Result<service::OutputMode, String> {
-    match std::env::var("FASTEXEC_OUTPUT_MODE").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("text") => Ok(service::OutputMode::Text),
-        Ok("both") => Ok(service::OutputMode::Both),
-        Ok("structured") => Ok(service::OutputMode::Structured),
-        value => Err(format!(
+    output_mode_of(std::env::var_os("FASTEXEC_OUTPUT_MODE").as_deref())
+}
+
+fn output_mode_of(value: Option<&std::ffi::OsStr>) -> Result<service::OutputMode, String> {
+    let Some(value) = value else {
+        return Ok(service::OutputMode::Text);
+    };
+    match value.to_str() {
+        Some("text") => Ok(service::OutputMode::Text),
+        Some("both") => Ok(service::OutputMode::Both),
+        Some("structured") => Ok(service::OutputMode::Structured),
+        _ => Err(format!(
             "invalid FASTEXEC_OUTPUT_MODE {value:?}; expected text, both, or structured"
         )),
     }
@@ -994,13 +1024,11 @@ pub fn output_mode() -> Result<service::OutputMode, String> {
 
 /// What `FASTEXEC_STRUCTURED_CONTENT` asks for, or the message saying what it held instead.
 pub fn structured_content() -> Result<bool, String> {
-    match std::env::var("FASTEXEC_STRUCTURED_CONTENT").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("true") => Ok(true),
-        Ok("false") => Ok(false),
-        value => Err(format!(
-            "invalid FASTEXEC_STRUCTURED_CONTENT {value:?}; expected true or false"
-        )),
-    }
+    parse_bool_env(
+        "FASTEXEC_STRUCTURED_CONTENT",
+        std::env::var_os("FASTEXEC_STRUCTURED_CONTENT").as_deref(),
+        true,
+    )
 }
 
 /// How this process renders results: both settings, or the message naming the one that is wrong.
@@ -1009,6 +1037,30 @@ pub fn render() -> Result<Render, String> {
         output_mode: output_mode()?,
         structured_content: structured_content()?,
     })
+}
+
+/// What `FASTEXEC_YOLO` asks for, or the message saying what it held instead.
+pub fn yolo() -> Result<bool, String> {
+    parse_bool_env(
+        "FASTEXEC_YOLO",
+        std::env::var_os("FASTEXEC_YOLO").as_deref(),
+        false,
+    )
+}
+
+fn parse_bool_env(
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+    default: bool,
+) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    match value.to_str() {
+        Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        _ => Err(format!("invalid {name} {value:?}; expected true or false")),
+    }
 }
 
 /// The tokens a `--http` daemon admits, separated by ASCII whitespace. Diagnostics name
@@ -1071,6 +1123,13 @@ async fn serve() {
             std::process::exit(1);
         }
     };
+    let yolo = match yolo() {
+        Ok(yolo) => yolo,
+        Err(message) => {
+            eprintln!("fastexec: {message}");
+            std::process::exit(1);
+        }
+    };
     // Captured once, at startup: the client's own environment is the server's own here.
     let launch = match LaunchContext::current() {
         Ok(launch) => Arc::new(launch),
@@ -1119,7 +1178,7 @@ async fn serve() {
         };
         (backend, Some(tasks))
     };
-    let server = Server::new(backend, &launch, None, None);
+    let server = Server::new(backend, &launch, None, None, yolo);
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
         inner: tokio::io::stdin(),
@@ -1287,5 +1346,84 @@ mod http_token_tests {
         .unwrap_err();
         assert!(error.contains("token 2"), "{error}");
         assert!(!error.contains("abcdef"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod yolo_tests {
+    use super::{output_mode_of, parse_bool_env};
+    use crate::service::OutputMode;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn valid_and_invalid_values_match_contract() {
+        assert_eq!(parse_bool_env("FASTEXEC_YOLO", None, false), Ok(false));
+        assert_eq!(
+            parse_bool_env("FASTEXEC_YOLO", Some(OsStr::new("false")), false),
+            Ok(false)
+        );
+        assert_eq!(
+            parse_bool_env("FASTEXEC_YOLO", Some(OsStr::new("true")), false),
+            Ok(true)
+        );
+        assert_eq!(
+            parse_bool_env("FASTEXEC_STRUCTURED_CONTENT", None, true),
+            Ok(true)
+        );
+        assert_eq!(output_mode_of(None), Ok(OutputMode::Text));
+        assert_eq!(
+            output_mode_of(Some(OsStr::new("both"))),
+            Ok(OutputMode::Both)
+        );
+        for bad in ["", "on", "off", "1", "0", "TRUE", "True", " true "] {
+            let error = parse_bool_env("FASTEXEC_YOLO", Some(OsStr::new(bad)), false).unwrap_err();
+            assert_eq!(
+                error,
+                format!("invalid FASTEXEC_YOLO {bad:?}; expected true or false")
+            );
+            let mode_error = output_mode_of(Some(OsStr::new(bad))).unwrap_err();
+            assert_eq!(
+                mode_error,
+                format!("invalid FASTEXEC_OUTPUT_MODE {bad:?}; expected text, both, or structured")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_value_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = OsStr::from_bytes(b"\xff");
+        let error = parse_bool_env("FASTEXEC_YOLO", Some(bad), false).unwrap_err();
+        assert!(
+            error.starts_with("invalid FASTEXEC_YOLO ")
+                && error.ends_with("; expected true or false"),
+            "{error}"
+        );
+        let mode_error = output_mode_of(Some(bad)).unwrap_err();
+        assert!(
+            mode_error.starts_with("invalid FASTEXEC_OUTPUT_MODE ")
+                && mode_error.ends_with("; expected text, both, or structured"),
+            "{mode_error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unpaired_surrogate_value_is_refused() {
+        use std::os::windows::ffi::OsStringExt;
+        let value = std::ffi::OsString::from_wide(&[0xD800]);
+        let error = parse_bool_env("FASTEXEC_YOLO", Some(&value), false).unwrap_err();
+        assert!(
+            error.starts_with("invalid FASTEXEC_YOLO ")
+                && error.ends_with("; expected true or false"),
+            "{error}"
+        );
+        let mode_error = output_mode_of(Some(&value)).unwrap_err();
+        assert!(
+            mode_error.starts_with("invalid FASTEXEC_OUTPUT_MODE ")
+                && mode_error.ends_with("; expected text, both, or structured"),
+            "{mode_error}"
+        );
     }
 }

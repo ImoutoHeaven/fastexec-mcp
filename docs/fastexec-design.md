@@ -190,6 +190,15 @@ startup; invalid values exit with status `1`. They shape `exec` results:
 every tool call to the namespace's daemon (section 6). The value is read at
 startup; an invalid value exits with status `1`.
 
+### `FASTEXEC_YOLO`
+
+`"false"` (default) keeps each tool's default MCP `annotations` hints.
+`"true"` sets `readOnlyHint: true`, `destructiveHint: false`,
+`idempotentHint: false`, and `openWorldHint: false` on every exposed tool
+while keeping each tool's `title`. The value is read at startup by the MCP
+server process (stdio, daemon endpoint, and HTTP daemon); an invalid value
+exits with status `1`.
+
 A nonzero command `exitCode` is a normal result (`ok: true`). Operational
 failures set `isError` and `ok: false`; schema-decoding errors may have no
 `structuredContent`.

@@ -75,6 +75,10 @@ impl Fixture {
             .args(args)
             .env("FASTEXEC_TEST_RUNTIME_DIR", &self.runtime)
             .env("FASTEXEC_NAMESPACE", &self.namespace)
+            .env_remove("FASTEXEC_DAEMON")
+            .env_remove("FASTEXEC_OUTPUT_MODE")
+            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_YOLO")
             .stdin(std::process::Stdio::null());
         if let Some(tmpdir) = &self.tmpdir {
             command
@@ -274,14 +278,16 @@ impl Endpoint {
     /// Starts an endpoint after `configure` adjusts its launch, such as its environment.
     fn start_with(fixture: &Fixture, configure: impl FnOnce(&mut Command)) -> Endpoint {
         let mut command = fixture.command(&[]);
-        configure(&mut command);
         command
             // The endpoint's own settings are the defaults here: a host's environment must not
             // change what these tests read.
             .env_remove("FASTEXEC_OUTPUT_MODE")
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_YOLO")
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
-            .env_remove("FASTEXEC_TEST_NONE_LIMIT")
+            .env_remove("FASTEXEC_TEST_NONE_LIMIT");
+        configure(&mut command);
+        command
             .env("FASTEXEC_DAEMON", "on")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1714,4 +1720,162 @@ fn freebsd_fixture_fallback_cleanup_owns_its_daemon() {
     assert!(!fixture.owns_process(std::process::id()));
     assert!(fixture.end_own_daemon(pid));
     assert!(!is_alive(pid));
+}
+
+#[test]
+fn two_endpoints_on_one_daemon_keep_independent_yolo_annotations() {
+    let fixture = Fixture::new("yolo-endpoints");
+    let mut yolo = Endpoint::start_with(&fixture, |command| {
+        command.env("FASTEXEC_YOLO", "true");
+    });
+    let listed = yolo.request("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 4, "{listed}");
+    for (name, title) in [
+        ("edit", "Edit file"),
+        ("exec", "Run bash command"),
+        ("read", "Read file"),
+        ("write", "Write file"),
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(
+            tool["annotations"],
+            json!({
+                "title": title,
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false,
+            }),
+            "{tool}"
+        );
+    }
+
+    // Auto-starting the daemon under FASTEXEC_YOLO=true succeeds and shares tasks with plain endpoints.
+    let (started, text, error) =
+        yolo.call(json!({"action": "start", "command": "true", "waitMs": 10000}));
+    assert!(!error, "{text}");
+    let bare = started["taskId"]
+        .as_str()
+        .unwrap()
+        .split_once('.')
+        .unwrap()
+        .0
+        .to_owned();
+
+    let mut plain = Endpoint::start(&fixture);
+    let (listed_tasks, text, error) = plain.call(json!({"action": "list"}));
+    assert!(!error, "{text}");
+    assert!(
+        listed_tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["taskId"] == bare),
+        "{listed_tasks}"
+    );
+    let listed = plain.request("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    for (name, expected) in [
+        (
+            "edit",
+            json!({"title": "Edit file", "destructiveHint": true, "idempotentHint": false}),
+        ),
+        (
+            "exec",
+            json!({"title": "Run bash command", "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true}),
+        ),
+        ("read", json!({"title": "Read file", "readOnlyHint": true})),
+        (
+            "write",
+            json!({"title": "Write file", "destructiveHint": true, "idempotentHint": false}),
+        ),
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool["annotations"], expected, "{tool}");
+    }
+    plain.close();
+    yolo.close();
+}
+
+#[test]
+fn invalid_yolo_refuses_start_without_blocking_status_or_stop() {
+    let fixture = Fixture::new("yolo-invalid");
+    for (var, bad, expected) in [
+        (
+            "FASTEXEC_YOLO",
+            "on",
+            "invalid FASTEXEC_YOLO \"on\"; expected true or false",
+        ),
+        (
+            "FASTEXEC_OUTPUT_MODE",
+            "bogus",
+            "invalid FASTEXEC_OUTPUT_MODE \"bogus\"; expected text, both, or structured",
+        ),
+        (
+            "FASTEXEC_STRUCTURED_CONTENT",
+            "bogus",
+            "invalid FASTEXEC_STRUCTURED_CONTENT \"bogus\"; expected true or false",
+        ),
+    ] {
+        let output = fixture
+            .command(&["daemon", "start"])
+            .env(var, bad)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{var}={bad}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{var}={bad}: {stderr:?}");
+    }
+    let endpoint_output = fixture
+        .command(&[])
+        .env("FASTEXEC_DAEMON", "on")
+        .env("FASTEXEC_YOLO", "on")
+        .output()
+        .unwrap();
+    assert_eq!(endpoint_output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&endpoint_output.stderr)
+            .contains("invalid FASTEXEC_YOLO \"on\"; expected true or false")
+    );
+
+    for action in ["status", "stop"] {
+        let output = fixture
+            .command(&["daemon", action])
+            .env("FASTEXEC_YOLO", "on")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{action}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with("No fastexec daemon"),
+            "{action} unexpectedly saw a daemon: {stdout:?}"
+        );
+    }
+
+    let (code, out, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let status = fixture
+        .command(&["daemon", "status"])
+        .env("FASTEXEC_YOLO", "bogus")
+        .output()
+        .unwrap();
+    assert_eq!(status.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("pid "),
+        "{status:?}"
+    );
+    let stop = fixture
+        .command(&["daemon", "stop"])
+        .env("FASTEXEC_YOLO", "bogus")
+        .output()
+        .unwrap();
+    assert_eq!(stop.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&stop.stdout).contains("Stopped"),
+        "{stop:?}"
+    );
+    let (code, out, err) = fixture.run(&["daemon", "status"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.starts_with("No fastexec daemon"), "{out}");
 }
