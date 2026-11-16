@@ -1963,7 +1963,13 @@ impl Task {
             capture_error: out.capture_error.clone(),
             input_warning: lock(&self.input_warning).clone(),
             input_error: lock(&self.input_error).clone(),
-            kill_error: lock(&self.kill_error).clone(),
+            // A kill can record an error after the ender confirms completion. Only an
+            // unconfirmed tree can still need a retry.
+            kill_error: if tree_done {
+                None
+            } else {
+                lock(&self.kill_error).clone()
+            },
             leftovers: end.map(|end| end.leftovers).unwrap_or_default(),
             kept: held_past_exit && !tree_done,
             tree_ended: held_past_exit && tree_done,
@@ -3587,6 +3593,42 @@ mod script_tests {
                 .unwrap();
         });
         assert_eq!(task.snapshot().exit_code, Some(0));
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn snapshots_hide_cleanup_errors_only_after_confirmed_tree_end() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let (task, _, _) = tasks
+            .start_script(
+                ScriptArgs {
+                    code: "while (true) {}".into(),
+                    ..script_args(&tasks)
+                },
+                &session,
+                "1234".into(),
+            )
+            .unwrap();
+        for error in [
+            "descendants remain after SIGKILL; the task host stays alive",
+            "task host disconnected; tree cleanup is unconfirmed",
+        ] {
+            *lock(&task.kill_error) = Some(error.into());
+            assert_eq!(task.snapshot().kill_error.as_deref(), Some(error));
+        }
+        // End the root without clearing the recorded error through Task::kill.
+        task.root.kill().unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        assert!(lock(&task.kill_error).is_some());
+        assert!(task.snapshot().kill_error.is_none());
+        // A concurrent kill may store its earlier failure after completion was confirmed.
+        *lock(&task.kill_error) = Some("late cleanup error".into());
+        assert!(task.snapshot().kill_error.is_none());
         tasks.shutdown();
     }
 

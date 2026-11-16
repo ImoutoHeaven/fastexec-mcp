@@ -1928,15 +1928,28 @@ fn kill_and_root_exit_end_the_whole_process_tree() {
         assert!(text.len() <= 100, "{} bytes: {text}", text.len());
 
         let command = format!("{} echo started", heartbeat(leaked_bash));
-        let (out, text) =
+        let (mut out, mut text) =
             server.ok(json!({"action": "start", "command": command, "pty": pty, "waitMs": 60000}));
         assert_eq!(out["state"], "exited", "pty={pty}");
-        assert!(
-            text.contains("ended with bash: ") && text.contains("keepTree: true"),
-            "the result names what bash left (pty={pty}): {text}"
-        );
         assert!(!out["leftovers"].as_array().unwrap().is_empty(), "{text}");
-        assert_eq!(out["keptRunning"], false);
+        if out["keptRunning"] == json!(true) {
+            // A signalled process may outlast the bounded kill check on a loaded machine.
+            // Poll for automatic cleanup; a second kill would hide a leaked descendant.
+            (out, text) = server.ok(json!({
+                "action": "poll", "taskId": out["taskId"], "waitMs": 60000,
+            }));
+            assert_eq!(out["waitEndedBy"]["condition"], "tree_ended", "{text}");
+        }
+        assert!(
+            (text.contains("ended with bash: ") && text.contains("keepTree: true"))
+                || text.contains("kept processes ended"),
+            "the result names what bash left or confirms its later cleanup (pty={pty}): {text}"
+        );
+        assert_eq!(out["state"], "exited", "{text}");
+        assert_eq!(out["exitCode"], 0, "{text}");
+        assert_eq!(out["keptRunning"], false, "{text}");
+        assert_eq!(out["held"], json!([]), "{text}");
+        assert!(out["killError"].is_null(), "{text}");
         assert_stops_growing(leaked);
     }
 }
