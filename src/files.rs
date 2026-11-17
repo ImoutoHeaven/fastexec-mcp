@@ -1904,8 +1904,9 @@ struct EditSource {
 
 impl EditSource {
     fn read(path: PathBuf) -> io::Result<Self> {
+        // A canonicalizer can discard directory requirements that the native open enforces.
+        let (mut file, _) = open_regular(&path)?;
         let target = std::fs::canonicalize(&path)?;
-        let (mut file, _) = open_regular(&target)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         let content = String::from_utf8(bytes)
@@ -1924,20 +1925,20 @@ impl EditSource {
 
     fn verify_target(&self, current: Option<&File>) -> io::Result<()> {
         let current = current.ok_or_else(Self::changed)?;
+        let (named, _) = open_regular(&self.path)?;
         if std::fs::canonicalize(&self.path)? != self.target {
             return Err(Self::changed());
         }
         #[cfg(unix)]
-        {
+        let identity = |file: &File| {
             use std::os::unix::fs::MetadataExt;
-            let before = self.file.metadata()?;
-            let now = current.metadata()?;
-            if before.dev() != now.dev() || before.ino() != now.ino() {
-                return Err(Self::changed());
-            }
-        }
+            file.metadata()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+        };
         #[cfg(windows)]
-        if windows_file_identity(&self.file)? != windows_file_identity(current)? {
+        let identity = windows_file_identity;
+        let original = identity(&self.file)?;
+        if original != identity(current)? || original != identity(&named)? {
             return Err(Self::changed());
         }
         Ok(())
@@ -3798,8 +3799,18 @@ mod tests {
             let link = scratch.0.join("link");
             std::os::unix::fs::symlink(&name, &link).unwrap();
             for requested in [&name[..], "link"] {
-                assert!(whole(requested, &launch, false).is_err());
-                assert!(change(requested, &[("original", "bad")], &launch).is_err());
+                assert!(
+                    whole(requested, &launch, false).is_err(),
+                    "{name}: {requested}"
+                );
+                assert!(
+                    change(requested, &[("original", "bad")], &launch).is_err(),
+                    "{name}: {requested}"
+                );
+                assert!(
+                    crate::service::validate_cwd(requested, &launch).is_err(),
+                    "{name}: {requested}"
+                );
                 assert!(
                     write_text(
                         &WriteRequest {
@@ -3816,8 +3827,20 @@ mod tests {
                 std::fs::read_link(&link).unwrap().as_os_str(),
                 Path::new(&name).as_os_str()
             );
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink("target", &link).unwrap();
+            let opened = EditSource::read(link.clone()).unwrap();
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&name, &link).unwrap();
+            assert!(opened.save(b"bad").is_err(), "{name}");
+            assert_eq!(std::fs::read(&original).unwrap(), b"original");
             std::fs::remove_file(link).unwrap();
         }
+        let sibling = scratch.file("sibling.txt", b"keep sibling");
+        let invalid = "target/../sibling.txt";
+        assert!(whole(invalid, &launch, false).is_err());
+        assert!(change(invalid, &[("keep sibling", "bad")], &launch).is_err());
+        assert_eq!(std::fs::read(sibling).unwrap(), b"keep sibling");
     }
 
     #[test]

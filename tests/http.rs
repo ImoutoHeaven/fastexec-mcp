@@ -2643,7 +2643,13 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
 
     let bad_parent = client.call_tool("transfer", json!({"path": "sub/existing.bin/child"}));
     assert_eq!(bad_parent["isError"], true, "{bad_parent}");
-    for path in ["missing/..", "missing/", "missing/."] {
+    for path in [
+        "missing/..",
+        "missing/",
+        "missing/.",
+        "sub/existing.bin/",
+        "sub/existing.bin/.",
+    ] {
         let result = client.call_tool("transfer", json!({"path": path}));
         assert_eq!(result["isError"], true, "{path}: {result}");
     }
@@ -2653,6 +2659,17 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
     {
         use std::os::unix::fs::symlink;
 
+        let file_link = cwd_dir.join("sub/file-link");
+        for suffix in ["/", "/."] {
+            symlink(format!("existing.bin{suffix}"), &file_link).unwrap();
+            let result = client.call_tool("transfer", json!({"path": "sub/file-link"}));
+            assert_eq!(result["isError"], true, "symlink with {suffix}: {result}");
+            std::fs::remove_file(&file_link).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(cwd_dir.join("sub/existing.bin")).unwrap(),
+            b"hello-bytes"
+        );
         let link = cwd_dir.join("upload-link");
         symlink("new/nested/target", &link).unwrap();
         let result = client.call_tool("transfer", json!({"path": "upload-link"}));
