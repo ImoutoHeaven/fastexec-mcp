@@ -684,13 +684,11 @@ async fn prepare_upload(admitted: &Admitted, offset: u64) -> Result<UploadFile, 
         Presence::Failed => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         Presence::Missing if offset > 0 => return Err(StatusCode::CONFLICT),
         Presence::Missing => {
-            let parent = path.parent().map(Path::to_path_buf);
-            if let Some(parent) = parent
-                && !parent.as_os_str().is_empty()
-                && tokio::fs::create_dir_all(&parent).await.is_err()
-            {
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
+            let requested = path.clone();
+            tokio::task::spawn_blocking(move || crate::files::create_target_parents(&requested))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
         Presence::File(_) => {}
     }

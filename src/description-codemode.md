@@ -25,6 +25,7 @@ branching on tool results, or filtering bulky output before returning it to cont
 - image(value) takes an attached image read, an image block { type: "image", data, mimeType }, or
   a data URL, saves the image beside the log, and appends an [image N: path] line. A result
   carries at most 4 images and 4718592 base64 bytes and lists the others with their paths.
+  Nested exec poll and kill expose attached blocks in codemode.images.
 - The call waits like exec start (waitMs, returnWhen with outputContains or quietMs, killAfterMs,
   truncate, maxBytes) and returns a task handle: continue with exec poll, stop with exec kill. An
   uncaught error ends the task with exit 1 and a "Script error:" line.

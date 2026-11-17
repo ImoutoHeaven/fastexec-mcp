@@ -34,9 +34,7 @@ const DEFAULT_MAX_BYTES: u64 = 16 * 1024;
 const MAX_BYTES_RANGE: std::ops::RangeInclusive<u64> = 100..=1024 * 1024;
 const DEFAULT_LIST_LIMIT: u64 = 20;
 const LIST_LIMIT_RANGE: std::ops::RangeInclusive<u64> = 1..=500;
-/// Room in `maxBytes` for the omission marker, the encoding note, and separators.
-const NOTES_RESERVE: usize = 260;
-/// Smallest window body, so a long status line still leaves room for some output.
+/// Screen reads only need stream decoding diagnostics and the updated cursor.
 const MIN_BODY_BUDGET: usize = 256;
 /// Largest background footer; bounded results give it at most a quarter of `maxBytes`.
 const FOOTER_LIMIT: usize = 512;
@@ -72,7 +70,7 @@ pub enum ListState {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Request {
-    /// start: run a command. poll: send input and/or wait, then read unseen output. kill: terminate a task's process tree and return unseen output. list: this session's or server's tasks. transcript: a PTY task's output as a terminal shows it, from the first line no earlier transcript returned, then the pending lines still on screen.
+    /// start runs bash. poll accepts input, waits and returns unseen output. kill ends the tree and returns unseen output. list shows tasks. transcript returns new PTY scrollback and the current screen.
     pub action: Action,
     /// start: the bash command line. NUL bytes (U+0000) are rejected before execution.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,10 +84,10 @@ pub struct Request {
     /// start: login shell, bash -lc, so profile-managed tools resolve (default true). false runs bash --noprofile --norc -c.
     #[serde(skip_serializing_if = "Option::is_none")]
     login_shell: Option<bool>,
-    /// start: kill the task's whole process tree this many ms after launch, whatever the waits and polls, kept processes included; 0 or omitted means no limit.
+    /// start: kill the entire tree, including kept processes, this many ms after launch. Zero or omitted disables it.
     #[serde(skip_serializing_if = "Option::is_none")]
     kill_after_ms: Option<u64>,
-    /// start: keep the processes the command leaves running when its bash exits, such as a server a CLI starts for itself (adb, Gradle daemon), until kill on this task or the end of the tasks' owner (the session in the default mode, the daemon with FASTEXEC_DAEMON=on) (default false: they end with bash).
+    /// start: keep descendants after bash exits until kill, killAfterMs or owner shutdown (session or daemon). By default they end with bash.
     #[serde(skip_serializing_if = "Option::is_none")]
     keep_tree: Option<bool>,
     /// poll, kill, transcript: a reader handle (<taskId>.<reader>) to continue, or a bare task ID to attach a new reader from the retained log's beginning.
@@ -101,24 +99,24 @@ pub struct Request {
     /// poll, PTY only: keys pressed after `input` is written, in array order, e.g. ["Enter"] or ["Escape", ":", "q", "Enter"]. One key per item, named as in tmux send-keys: Enter, Tab, BTab, Escape, Space, BSpace, Up, Down, Left, Right, Home, End, PageUp/PgUp/PPage, PageDown/PgDn/NPage, Insert/IC, Delete/DC, F1-F12, KP0-KP9, KP/, KP*, KP-, KP+, KP., KPEnter, [NUL]-[US] for C0 controls, 0xHH for a code point, or one character; prefixes C- (Ctrl), M- (Meta/Alt), S- (Shift) combine, as in C-c, M-x, C-M-a, S-Up, and ^c means C-c. Names ignore case. Arrow and keypad keys follow the program's cursor and keypad modes. An unknown name, or a modifier the key cannot carry (C-Enter, S-a) in the program's mode when the poll starts, is an error before anything is sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     keys: Option<Vec<String>>,
-    /// poll, with keys: pause before each key, the first one after input included, 0-2000 ms (default 150); 0 writes input and keys at once. Programs that time keystrokes to detect pastes, such as Codex, read a key sent right after text as part of the paste; programs with an escape timeout read Escape and the next key as one Alt key unless the pause exceeds it (often 500).
+    /// poll: delay before each key, including the first after input, 0-2000 ms (default 150). Zero sends input and keys together. To separate Escape from the next key, exceed the program's escape timeout (often 500 ms).
     #[schemars(range(min = 0, max = 2000))]
     #[serde(skip_serializing_if = "Option::is_none")]
     key_delay_ms: Option<u64>,
     /// start, pipe only: false keeps stdin open for poll input (default: stdin closes after input, and is empty without it). poll: true closes stdin after input.
     #[serde(skip_serializing_if = "Option::is_none")]
     eof: Option<bool>,
-    /// start, poll: how long to wait at most, 0-240000 ms; the cap returns each call within a 5-minute prompt-cache lifetime, so poll again to wait longer. kill ignores it.
+    /// start, poll: wait up to 240000 ms per call. Poll again for longer. Ignored by kill.
     #[schemars(range(min = 0, max = 240000))]
     #[serde(skip_serializing_if = "Option::is_none")]
     wait_ms: Option<u64>,
-    /// start, poll: end the wait early when any condition holds; the task keeps running. Texts are literal and case-sensitive, 1-16 per condition, each 1-4096 bytes without line breaks. waitMs stays the longest wait and defaults to 30000 with returnWhen.
+    /// start, poll: any match returns; the task continues. Text conditions take 1-16 case-sensitive literals, 1-4096 bytes each, without line breaks. waitMs defaults to 30000.
     #[serde(skip_serializing_if = "Option::is_none")]
     return_when: Option<wait::ReturnWhen>,
-    /// start, poll, kill, list, transcript: output window mode (default head_tail; transcript defaults to tail).
+    /// Window placement for all actions. Default head_tail, or tail for transcript.
     #[serde(skip_serializing_if = "Option::is_none")]
     truncate: Option<Truncate>,
-    /// start, poll, kill, list, transcript: byte budget of the result, 100-1048576 (default 16384); errors and correctness warnings stay whole even beyond this budget. Not with truncate "none".
+    /// Result budget in bytes, 100-1048576 (default 16384). Errors and correctness warnings stay whole. Not with truncate "none".
     #[schemars(range(min = 100, max = 1048576))]
     #[serde(skip_serializing_if = "Option::is_none")]
     max_bytes: Option<u64>,
@@ -162,6 +160,20 @@ pub(crate) struct View {
     screen: bool,
     /// The call set `returnWhen`.
     conditions: bool,
+}
+
+impl View {
+    /// Keep the largest possible body until layout knows the fitted status and footer.
+    fn window_budget(&self) -> usize {
+        match self.truncate {
+            Truncate::None => none_limit(),
+            _ => self.max_bytes,
+        }
+    }
+
+    fn text_budget(&self, warnings: &str) -> Option<usize> {
+        (self.truncate != Truncate::None).then(|| self.max_bytes.saturating_sub(warnings.len()))
+    }
 }
 
 /// [`NONE_LIMIT`]; debug builds take a smaller one from `FASTEXEC_TEST_NONE_LIMIT`, so tests
@@ -793,7 +805,8 @@ impl Service {
                     (None, None) => None,
                     (cols_axis, rows_axis) => Some((cols_axis, rows_axis)),
                 };
-                let input = request.input.as_deref().unwrap_or_default().as_bytes();
+                let input = request.input.as_deref().map(str::as_bytes);
+                let input_bytes = input.unwrap_or_default();
                 let names = request.keys.as_deref().unwrap_or_default();
                 let parsed = names
                     .iter()
@@ -824,7 +837,7 @@ impl Service {
                 // the limit holds for each burst: a mode declared during the call can encode the
                 // same keys longer than the modes the first pass read.
                 let encode = |task: &Task| -> Result<Vec<u8>, String> {
-                    let mut data = input.to_vec();
+                    let mut data = input_bytes.to_vec();
                     if !names.is_empty() {
                         let modes = task.modes()?;
                         for (name, key) in names.iter().zip(parsed.iter().copied()) {
@@ -863,12 +876,11 @@ impl Service {
                     if axes.is_some() && !names.is_empty() {
                         data = encode(&task)?;
                     }
-                    task.send(Some(&data), flag(request.eof), &call.cancel)
-                        .await?;
+                    let burst = (input.is_some() || !data.is_empty()).then_some(data.as_slice());
+                    task.send(burst, flag(request.eof), &call.cancel).await?;
                 } else {
-                    task.send(Some(input), flag(request.eof), &call.cancel)
-                        .await?;
-                    press(&task, input, names, parsed, delay, &call.cancel).await?;
+                    task.send(input, flag(request.eof), &call.cancel).await?;
+                    press(&task, input_bytes, names, parsed, delay, &call.cancel).await?;
                 }
                 drop(gate);
                 let interacts = request.input.is_some() || request.keys.is_some() || axes.is_some();
@@ -920,9 +932,13 @@ impl Service {
                     )
                 })?;
                 let (mut done, mut tree_done) = (task.done(), task.tree_done());
-                let finished = async move {
+                let mut activity = task.activity();
+                let finished = async {
                     let _ = done.wait_for(|done| *done).await;
                     let _ = tree_done.wait_for(|done| *done).await;
+                    while !task.output_closed() {
+                        let _ = activity.changed().await;
+                    }
                 };
                 tokio::select! {
                     biased;
@@ -1021,7 +1037,7 @@ impl Service {
         &self,
         session: &'a Session,
         id: &str,
-        cap: usize,
+        budget: Option<usize>,
         nested: bool,
     ) -> (
         Option<(String, Vec<tasks::Shown>)>,
@@ -1030,6 +1046,7 @@ impl Service {
         if nested {
             (None, crate::session::OutsideClaim::none())
         } else {
+            let cap = budget.map_or(FOOTER_LIMIT, |n| FOOTER_LIMIT.min(n / 4));
             self.tasks.background(session, id, cap)
         }
     }
@@ -1094,7 +1111,8 @@ impl Service {
                 "warnings": task_warnings(snapshot),
                 "cols": size.map(|(cols, _)| cols), "rows": size.map(|(_, rows)| rows),
                 "elapsedMs": snapshot.elapsed.as_millis() as u64, "command": command, "logPath": log_path,
-                "lifetimeExpired": snapshot.expired, "keepTree": task.keep, "keptRunning": snapshot.kept,
+                "lifetimeExpired": snapshot.expired, "forcedEnd": snapshot.forced_end,
+                "keepTree": task.keep, "keptRunning": snapshot.kept,
                 "held": members_json(&snapshot.held),
                 "leftovers": members_json(&snapshot.leftovers), "killError": snapshot.kill_error,
                 "owner": task.owner,
@@ -1108,27 +1126,20 @@ impl Service {
                 selected.len()
             )
         });
-        let line_budget = match (&showing_note, view.truncate) {
-            (Some(note), mode) if mode != Truncate::None => {
-                view.max_bytes.saturating_sub(note.len() + 1)
-            }
-            _ => view.max_bytes,
-        };
-        let (kept, mut text) = if lines.is_empty() {
+        let structured = json!({
+            "ok": true, "action": "list", "tasks": entries, "totalCount": total_count, "warnings": warnings,
+        });
+        let mut suffix = warning_text(&structured["warnings"]);
+        if let Some(note) = showing_note {
+            suffix.push('\n');
+            suffix.push_str(&note);
+        }
+        let line_budget = view.window_budget().saturating_sub(suffix.len());
+        let (kept, text) = if lines.is_empty() {
             (Vec::new(), "No tasks.".to_string())
         } else {
             fit_lines(&lines, view.truncate, line_budget)
         };
-        if let Some(mut note) = showing_note {
-            if view.truncate != Truncate::None && text.len() + 1 + note.len() > view.max_bytes {
-                let room = view.max_bytes.saturating_sub(text.len() + 1);
-                output::cut_to(&mut note, room + 1);
-            }
-            if !note.is_empty() {
-                text.push('\n');
-                text.push_str(&note);
-            }
-        }
         // Direct calls deliver the text window; nested calls deliver every selected task.
         let delivered = if view.nested {
             (0..selected.len()).collect()
@@ -1142,16 +1153,7 @@ impl Service {
                 entry.mark_keeps_reported(snapshot);
             }
         }
-        success(
-            text,
-            json!({
-                "ok": true,
-                "action": "list",
-                "tasks": entries,
-                "totalCount": total_count,
-                "warnings": warnings,
-            }),
-        )
+        success(text, structured, &suffix)
     }
 }
 
@@ -1159,52 +1161,46 @@ impl Service {
 /// one marker line where lines were left out. Returns the indexes of the lines shown and the
 /// text.
 fn fit_lines(lines: &[String], truncate: Truncate, budget: usize) -> (Vec<usize>, String) {
-    let all = || ((0..lines.len()).collect(), lines.join("\n"));
-    // `truncate: "none"` returns whole rows up to the none cap, and the marker line names the
-    // rows left out, exactly as the bounded modes do.
-    let budget = if truncate == Truncate::None {
-        none_limit()
-    } else {
-        budget
-    };
     if lines.iter().map(|line| line.len() + 1).sum::<usize>() <= budget + 1 {
-        return all();
+        return ((0..lines.len()).collect(), lines.join("\n"));
     }
     let marker =
         |omitted: usize| format!("... [{omitted} tasks omitted; raise maxBytes to see them] ...");
-    let last = lines.len() - 1;
-    let order: Vec<usize> = match truncate {
-        Truncate::Head => (0..=last).collect(),
-        Truncate::Tail => (0..=last).rev().collect(),
-        _ => (0..=last / 2).flat_map(|i| [i, last - i]).collect(),
-    };
-    // Room for the marker at its longest, with the newlines around it.
-    let mut room = budget.saturating_sub(marker(lines.len()).len() + 2);
-    let mut kept = Vec::new();
-    for index in order {
-        if kept.contains(&index) {
-            continue;
-        }
-        if lines[index].len() + 1 > room {
-            break;
-        }
-        room -= lines[index].len() + 1;
-        kept.push(index);
-    }
-    kept.sort_unstable();
-    let mut text: Vec<String> = Vec::new();
-    for index in 0..=last {
-        if kept.contains(&index) {
-            text.push(lines[index].clone());
-        } else if index == 0 || kept.contains(&(index - 1)) {
-            let mut note = marker(lines.len() - kept.len());
-            if kept.is_empty() && note.len() > budget {
-                output::cut_to(&mut note, budget + 1);
+    let mut room = budget.saturating_sub(marker(lines.len()).len());
+    let mut head = 0;
+    let mut tail = lines.len();
+    let mut want_head = truncate != Truncate::Tail;
+    let mut want_tail = truncate != Truncate::Head;
+    while head < tail && (want_head || want_tail) {
+        if want_head {
+            let cost = lines[head].len() + 1;
+            if cost <= room {
+                head += 1;
+                room -= cost;
+            } else {
+                want_head = false;
             }
-            text.push(note);
+        }
+        if want_tail && head < tail {
+            let cost = lines[tail - 1].len() + 1;
+            if cost <= room {
+                tail -= 1;
+                room -= cost;
+            } else {
+                want_tail = false;
+            }
         }
     }
-    (kept, text.join("\n"))
+    let mut note = marker(tail - head);
+    output::cut_to(&mut note, budget + 1);
+    let text = lines[..head]
+        .iter()
+        .chain([&note])
+        .chain(&lines[tail..])
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    ((0..head).chain(tail..lines.len()).collect(), text)
 }
 
 /// Writes each key on its own after `input`, pausing `delay` after the program's stdin has
@@ -1315,15 +1311,17 @@ fn report(
     claim.consume();
 }
 
-fn kill_pending_note(task: &Task, snapshot: &Snapshot) -> &'static str {
-    if snapshot.state == "running" || snapshot.kept {
-        if task.is_script() {
-            " · the script did not end within 5 s; poll later to confirm"
+fn kill_pending_note(task: &Task, snapshot: &Snapshot) -> Option<&'static str> {
+    if snapshot.state == "running" || snapshot.kept || !*task.tree_done().borrow() {
+        Some(if task.is_script() {
+            "the script did not end within 5 s; poll later to confirm"
         } else {
-            " · the tree did not exit within 5 s; poll later to confirm"
-        }
+            "the tree did not exit within 5 s; poll later to confirm"
+        })
+    } else if snapshot.output_open {
+        Some("output did not close within 5 s; poll later to confirm")
     } else {
-        ""
+        None
     }
 }
 
@@ -1367,41 +1365,12 @@ impl Service {
         }
         let reader = Arc::clone(&task);
         let encoding = view.encoding.unwrap_or(task.encoding);
-        let footer_cap = match view.truncate {
-            Truncate::None => FOOTER_LIMIT,
-            _ => FOOTER_LIMIT.min(view.max_bytes / 4),
-        };
         // The state is taken before the read: a finished state means output reached EOF (or
-        // stayed open, which the status line notes), so the window below holds all of it. The
-        // status line reserves room with `log` included and drops it later when complete.
+        // stayed open, which the status line notes), so the window below holds all of it.
         let before = task.snapshot_held();
-        let extra_note_before = match &ended {
-            Some(ended) => ended.note(view.conditions),
-            None => kill_pending_note(&task, &before).to_owned(),
-        };
         let clean = !task.is_script();
         let line_cut = !view.nested && !task.is_script() && view.truncate != Truncate::None;
-        let fresh_len = if task_reader.is_fresh() {
-            NEW_READER_NOTE.len()
-        } else {
-            0
-        };
-        let reserved = if line_cut {
-            status_line(&self.tasks, &task, &before, &task_reader, true).len()
-                + extra_note_before.len()
-                + NOTES_RESERVE
-                + fresh_len
-        } else {
-            let need_log = needs_log_in_status(&before, 0, None);
-            status_line(&self.tasks, &task, &before, &task_reader, need_log).len()
-                + extra_note_before.len()
-                + 2
-                + fresh_len
-        };
-        let budget = match view.truncate {
-            Truncate::None => none_limit(),
-            _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
-        };
+        let budget = view.window_budget();
         let (window, images, read) = tokio::task::spawn_blocking(move || {
             let mut read = StagedRead::new(state);
             let start = read.state.cursor;
@@ -1441,19 +1410,24 @@ impl Service {
             input_error: after.input_error,
             ..before
         };
-        let extra_note = match &ended {
-            Some(ended) => ended.note(view.conditions),
-            None => kill_pending_note(&task, &snapshot).to_owned(),
-        };
-        let mut status_with_log = status_line(&self.tasks, &task, &snapshot, &task_reader, true);
-        status_with_log.push_str(&extra_note);
-        let mut status_no_log = status_line(&self.tasks, &task, &snapshot, &task_reader, false);
-        status_no_log.push_str(&extra_note);
-        let mut structured = task_json(&self.tasks, action, &task, &snapshot, &task_reader);
+        let script = script_report(&self.tasks, &task);
+        let mut status_with_log =
+            status_line(&task, &snapshot, &task_reader, true, script.as_ref());
+        let mut status_no_log = status_line(&task, &snapshot, &task_reader, false, script.as_ref());
+        let mut structured = task_json(action, &task, &snapshot, &task_reader);
         if let Some(ended) = &ended {
+            let note = ended.note(view.conditions);
+            status_with_log.push_str(&note);
+            status_no_log.push_str(&note);
             structured["waitEndedBy"] = ended.json();
+        } else if let Some(note) = kill_pending_note(&task, &snapshot) {
+            structured["warnings"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(note));
         }
-        if task.is_script() {
+        if let Some(report) = script {
+            structured["codemode"] = report.value;
             structured["codemode"]["imagesAttached"] = json!(images.content.len());
             structured["codemode"]["imagesNotAttached"] = json!(images.omitted);
             structured["warnings"]
@@ -1461,7 +1435,10 @@ impl Service {
                 .unwrap()
                 .extend(images.warnings.into_iter().map(Value::String));
         }
-        let (background, claim) = self.background(session, &task.id, footer_cap, view.nested);
+        add_encoding_warning(&mut structured, &window);
+        let warnings = warning_text(&structured["warnings"]);
+        let budget = view.text_budget(&warnings);
+        let (background, claim) = self.background(session, &task.id, budget, view.nested);
         let footer = background
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
@@ -1473,11 +1450,11 @@ impl Service {
             &snapshot,
             task_reader.is_fresh(),
             &footer,
-            &view,
+            budget,
             "(no new output)",
             &mut structured,
         );
-        let mut result = success(text, structured);
+        let mut result = success(text, structured, &warnings);
         result.content.extend(images.content);
         let state = read.commit();
         task_reader.mark_delivered();
@@ -1522,42 +1499,17 @@ impl Service {
         let transcript = transcript?;
         let pending_lines = transcript.pending.matches('\n').count() as u64;
         let total = transcript.lines + pending_lines;
-        let footer_cap = match view.truncate {
-            Truncate::None => FOOTER_LIMIT,
-            _ => FOOTER_LIMIT.min(view.max_bytes / 4),
-        };
         let shown_transcript_path = files::display_path(&transcript.path);
         let transcript_note = format!(
             " · transcript {total} lines, final through {}; this read starts at line {} · {shown_transcript_path}",
             transcript.lines, transcript.first_line,
         );
-        let mut status_with_log = status_line(&self.tasks, &task, &snapshot, &task_reader, true);
+        let mut status_with_log = status_line(&task, &snapshot, &task_reader, true, None);
         status_with_log.push_str(&transcript_note);
-        let mut status_no_log = status_line(&self.tasks, &task, &snapshot, &task_reader, false);
+        let mut status_no_log = status_line(&task, &snapshot, &task_reader, false, None);
         status_no_log.push_str(&transcript_note);
         let line_cut = !view.nested && view.truncate != Truncate::None;
-        let fresh_len = if task_reader.is_fresh() {
-            NEW_READER_NOTE.len()
-        } else {
-            0
-        };
-        let budget = match view.truncate {
-            Truncate::None => none_limit(),
-            _ if line_cut => view
-                .max_bytes
-                .saturating_sub(status_with_log.len() + NOTES_RESERVE + fresh_len)
-                .max(MIN_BODY_BUDGET),
-            _ => {
-                let base_status = if needs_log_in_status(&snapshot, 0, None) {
-                    &status_with_log
-                } else {
-                    &status_no_log
-                };
-                view.max_bytes
-                    .saturating_sub(base_status.len() + 2 + fresh_len)
-                    .max(MIN_BODY_BUDGET)
-            }
-        };
+        let budget = view.window_budget();
         let spec = WindowSpec {
             truncate: view.truncate,
             budget,
@@ -1567,13 +1519,7 @@ impl Service {
             encoding: encoding_rs::UTF_8,
             source: "transcript",
         };
-        let mut structured = task_json(
-            &self.tasks,
-            Action::Transcript,
-            &task,
-            &snapshot,
-            &task_reader,
-        );
+        let mut structured = task_json(Action::Transcript, &task, &snapshot, &task_reader);
         structured["transcriptPath"] = json!(shown_transcript_path);
         structured["transcriptLines"] = json!(total);
         structured["finalLines"] = json!(transcript.lines);
@@ -1647,7 +1593,10 @@ impl Service {
         .await
         .map_err(|error| format!("Internal failure while reading: {error}."))?;
         let window = window?;
-        let (background, claim) = self.background(session, &task.id, footer_cap, view.nested);
+        add_encoding_warning(&mut structured, &window);
+        let warnings = warning_text(&structured["warnings"]);
+        let budget = view.text_budget(&warnings);
+        let (background, claim) = self.background(session, &task.id, budget, view.nested);
         let footer = background
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
@@ -1659,11 +1608,11 @@ impl Service {
             &snapshot,
             task_reader.is_fresh(),
             &footer,
-            &view,
+            budget,
             "(no transcript lines since the last read)",
             &mut structured,
         );
-        let result = success(text, structured);
+        let result = success(text, structured, &warnings);
         let state = read.commit();
         task_reader.mark_delivered();
         report(
@@ -1693,11 +1642,33 @@ impl Service {
         snapshot: &Snapshot,
         fresh: bool,
         footer: &str,
-        view: &View,
+        budget: Option<usize>,
         empty: &str,
         structured: &mut Value,
     ) -> String {
-        let (output, cut_lines, omitted, status, actual_room) = if view.truncate == Truncate::None {
+        let (output, cut_lines, omitted, status, actual_room) = if let Some(max_bytes) = budget {
+            let mut no_log = status_no_log;
+            fit_status(&mut no_log, max_bytes, footer.len(), fresh);
+            let room_no_log = max_bytes.saturating_sub(no_log.len() + 2 + footer.len());
+            if !needs_log_in_status(snapshot, 0, None) {
+                let (out_no_log, cuts_no_log, omit_no_log) = window.fit(room_no_log);
+                if cuts_no_log == 0 && omit_no_log.is_none() {
+                    (out_no_log, 0, None, no_log, room_no_log)
+                } else {
+                    fit_status(&mut status_with_log, max_bytes, footer.len(), fresh);
+                    let room_with_log =
+                        max_bytes.saturating_sub(status_with_log.len() + 2 + footer.len());
+                    let (output, cut_lines, omitted) = window.fit(room_with_log);
+                    (output, cut_lines, omitted, status_with_log, room_with_log)
+                }
+            } else {
+                fit_status(&mut status_with_log, max_bytes, footer.len(), fresh);
+                let room_with_log =
+                    max_bytes.saturating_sub(status_with_log.len() + 2 + footer.len());
+                let (output, cut_lines, omitted) = window.fit(room_with_log);
+                (output, cut_lines, omitted, status_with_log, room_with_log)
+            }
+        } else {
             let (output, cut_lines, omitted) = window.fit(usize::MAX);
             let mut status = if needs_log_in_status(snapshot, cut_lines, omitted) {
                 status_with_log
@@ -1708,29 +1679,9 @@ impl Service {
                 status.push_str(NEW_READER_NOTE);
             }
             (output, cut_lines, omitted, status, usize::MAX)
-        } else {
-            let mut no_log = status_no_log;
-            fit_status(&mut no_log, view.max_bytes, footer.len(), fresh);
-            let room_no_log = view.max_bytes - no_log.len() - 2 - footer.len();
-            if !needs_log_in_status(snapshot, 0, None) {
-                let (out_no_log, cuts_no_log, omit_no_log) = window.fit(room_no_log);
-                if cuts_no_log == 0 && omit_no_log.is_none() {
-                    (out_no_log, 0, None, no_log, room_no_log)
-                } else {
-                    fit_status(&mut status_with_log, view.max_bytes, footer.len(), fresh);
-                    let room_with_log = view.max_bytes - status_with_log.len() - 2 - footer.len();
-                    let (output, cut_lines, omitted) = window.fit(room_with_log);
-                    (output, cut_lines, omitted, status_with_log, room_with_log)
-                }
-            } else {
-                fit_status(&mut status_with_log, view.max_bytes, footer.len(), fresh);
-                let room_with_log = view.max_bytes - status_with_log.len() - 2 - footer.len();
-                let (output, cut_lines, omitted) = window.fit(room_with_log);
-                (output, cut_lines, omitted, status_with_log, room_with_log)
-            }
         };
         // A small maxBytes may leave no room for the placeholder.
-        let body = if output.is_empty() {
+        let body = if window.is_empty() {
             if empty.len() <= actual_room {
                 empty
             } else {
@@ -1744,7 +1695,8 @@ impl Service {
         } else {
             format!("{body}\n\n{status}{footer}")
         };
-        add_window(structured, window, omitted);
+        structured["omittedLines"] = json!(omitted.map_or(0, |(first, last)| last - first + 1));
+        structured["omittedRange"] = json!(omitted.map(|(first, last)| [first, last]));
         if render.output_mode != OutputMode::Text {
             structured["output"] = json!(output);
         }
@@ -1790,12 +1742,11 @@ impl Service {
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
         let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
-        let (background, claim) = self.background(
-            session,
-            &task.id,
-            FOOTER_LIMIT.min(view.max_bytes / 4),
-            view.nested,
-        );
+        let mut structured = task_json(action, &task, &snapshot, &task_reader);
+        add_encoding_warning(&mut structured, &window);
+        let warnings = warning_text(&structured["warnings"]);
+        let max_bytes = view.max_bytes.saturating_sub(warnings.len());
+        let (background, claim) = self.background(session, &task.id, Some(max_bytes), view.nested);
         let footer = background
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
@@ -1806,17 +1757,20 @@ impl Service {
             screen.cols,
             screen.rows_count
         );
-        let mut status_with_log = status_line(&self.tasks, &task, &snapshot, &task_reader, true);
-        status_with_log.push_str(&screen_note);
-        fit_status(
-            &mut status_with_log,
-            view.max_bytes,
-            footer.len(),
-            task_reader.is_fresh(),
-        );
-        let room = view.max_bytes - status_with_log.len() - 2 - footer.len();
-        let mut omitted = 0;
+        let fitted_status = |include_log| {
+            let mut status = status_line(&task, &snapshot, &task_reader, include_log, None);
+            status.push_str(&screen_note);
+            fit_status(&mut status, max_bytes, footer.len(), task_reader.is_fresh());
+            status
+        };
         let mut body = screen.rows.join("\n");
+        let need_log = needs_log_in_status(&snapshot, 0, None);
+        let mut status = fitted_status(need_log);
+        if !need_log && body.len() + status.len() + 2 + footer.len() > max_bytes {
+            status = fitted_status(true);
+        }
+        let room = max_bytes.saturating_sub(status.len() + 2 + footer.len());
+        let mut omitted = 0;
         while body.len() > room && omitted < screen.rows.len() {
             omitted += 1;
             body = format!(
@@ -1826,16 +1780,7 @@ impl Service {
         }
         // cut_to keeps budget - 1 bytes; the separators are already outside `room`.
         output::cut_to(&mut body, room + 1);
-        let status = if needs_log_in_status(&snapshot, 0, None) {
-            status_with_log
-        } else {
-            let mut s = status_line(&self.tasks, &task, &snapshot, &task_reader, false);
-            s.push_str(&screen_note);
-            fit_status(&mut s, view.max_bytes, footer.len(), task_reader.is_fresh());
-            s
-        };
-        let actual_room = view.max_bytes - status.len() - 2 - footer.len();
-        let shown = if body.is_empty() && actual_room >= "(blank screen)".len() {
+        let shown = if body.is_empty() && room >= "(blank screen)".len() {
             "(blank screen)"
         } else {
             &body
@@ -1845,17 +1790,15 @@ impl Service {
         } else {
             format!("{shown}\n\n{status}{footer}")
         };
-        let mut structured = task_json(&self.tasks, action, &task, &snapshot, &task_reader);
         structured["waitEndedBy"] = ended.json();
         structured["cols"] = json!(screen.cols);
         structured["rows"] = json!(screen.rows_count);
         structured["cursor"] = json!([row, col]);
         structured["omittedRows"] = json!(omitted);
-        add_encoding_warning(&mut structured, &window);
         if render.output_mode != OutputMode::Text {
             structured["output"] = json!(body);
         }
-        let result = success(text, structured);
+        let result = success(text, structured, &warnings);
         let state = read.commit();
         task_reader.mark_delivered();
         report(
@@ -1887,7 +1830,10 @@ fn fit_status(status: &mut String, max_bytes: usize, reserved: usize, fresh: boo
     if prefix > room {
         let (state, handle) = status[..prefix].split_once("] ").expect("a status prefix");
         let state = state.split_ascii_whitespace().next().expect("a task state");
-        *status = format!("{state}] {handle}");
+        let compact = format!("{state}] {handle}");
+        if compact.len() <= room {
+            *status = compact;
+        }
     }
     let prefix = status_prefix(status);
     let budget = (max_bytes / 2).max(prefix + output::MARK.len()).min(room);
@@ -1898,17 +1844,17 @@ fn fit_status(status: &mut String, max_bytes: usize, reserved: usize, fresh: boo
             output::cut_to(status, budget + 1);
         }
     }
-    // Even the longest task ID and compact state fit with a capped footer at maxBytes=100.
-    debug_assert!(status.len() <= room);
+    // Warnings may leave less space than the mandatory handle.
+    debug_assert!(status.len() <= room || status.len() == status_prefix(status));
     status.push_str(notice);
 }
 
 fn status_line(
-    tasks: &Tasks,
     task: &Task,
     snapshot: &Snapshot,
     reader: &Reader,
     include_log: bool,
+    script: Option<&ScriptReport>,
 ) -> String {
     let state = match snapshot.exit_code {
         Some(code) if snapshot.state == "exited" => format!("exited {code}"),
@@ -1947,7 +1893,7 @@ fn status_line(
     if snapshot.forced_end {
         line.push_str(" · root forced after 5 s exit grace");
     }
-    if let Some(report) = script_report(tasks, task) {
+    if let Some(report) = script {
         if snapshot.state == "killed" {
             line.push_str(&format!(
                 " · cancelled {} pending call(s) only; ",
@@ -2076,10 +2022,11 @@ fn script_report(tasks: &Tasks, task: &Task) -> Option<ScriptReport> {
                 .ok()
                 .and_then(|(id, _)| tasks.find(id));
             let state = task.as_ref().map_or("unknown", |task| {
-                if task.is_running() || task.keeps_processes() {
+                let snapshot = task.snapshot();
+                if snapshot.state == "running" || snapshot.kept {
                     running.push(handle.clone());
                 }
-                task.snapshot().state
+                snapshot.state
             });
             json!({"taskId": handle, "state": state})
         })
@@ -2107,14 +2054,8 @@ fn task_handles(handles: &[String]) -> String {
     text
 }
 
-fn task_json(
-    tasks: &Tasks,
-    action: Action,
-    task: &Task,
-    snapshot: &Snapshot,
-    reader: &Reader,
-) -> Value {
-    let mut value = json!({
+fn task_json(action: Action, task: &Task, snapshot: &Snapshot, reader: &Reader) -> Value {
+    json!({
         "ok": task_io_ok(snapshot),
         "action": if task.is_script() && action == Action::Start { "codemode" } else { action_name(action) },
         "kind": if task.is_script() { "codemode" } else { "bash" },
@@ -2140,11 +2081,7 @@ fn task_json(
         "keptRunning": snapshot.kept,
         "held": members_json(&snapshot.held),
         "killError": snapshot.kill_error,
-    });
-    if let Some(report) = script_report(tasks, task) {
-        value["codemode"] = report.value;
-    }
-    value
+    })
 }
 
 fn task_io_ok(snapshot: &Snapshot) -> bool {
@@ -2212,12 +2149,6 @@ fn members_json(members: &[process::Member]) -> Value {
             .map(|member| json!({"pid": member.pid, "name": member.name}))
             .collect::<Vec<_>>()
     )
-}
-
-fn add_window(value: &mut Value, window: &Window, omitted: Option<(u64, u64)>) {
-    value["omittedLines"] = json!(omitted.map_or(0, |(first, last)| last - first + 1));
-    value["omittedRange"] = json!(omitted.map(|(first, last)| [first, last]));
-    add_encoding_warning(value, window);
 }
 
 fn add_encoding_warning(value: &mut Value, window: &Window) {
@@ -2324,20 +2255,23 @@ fn prune_task_diagnostics(value: &mut Value) {
     }
 }
 
-fn success(mut text: String, mut structured: Value) -> CallToolResult {
-    // Completeness and delivery warnings stay whole, like tool errors, beyond maxBytes.
-    if let Some(warnings) = structured["warnings"].as_array() {
-        let warnings = warnings
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|warning| format!("Warning: {warning}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !warnings.is_empty() {
-            text.push_str("\n\n");
-            text.push_str(&warnings);
+/// The leading blank line and every warning prefix count towards a bounded result.
+fn warning_text(warnings: &Value) -> String {
+    let mut text = String::new();
+    if let Some(warnings) = warnings.as_array() {
+        for warning in warnings.iter().filter_map(Value::as_str) {
+            if text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("\nWarning: ");
+            text.push_str(warning);
         }
     }
+    text
+}
+
+fn success(mut text: String, mut structured: Value, suffix: &str) -> CallToolResult {
+    text.push_str(suffix);
     let is_err = structured["ok"] == false;
     prune_task_diagnostics(&mut structured);
     let content = vec![ContentBlock::text(text)];
@@ -2776,6 +2710,7 @@ mod tests {
                     let window = builder.finish();
                     let mut structured = json!({ "ok": task_io_ok(&snapshot), "warnings": warnings,
                         "exitCode": snapshot.exit_code, "outputIncomplete": output_incomplete(&snapshot) });
+                    let warnings_text = warning_text(&structured["warnings"]);
                     let text = service.layout(
                         render,
                         &window,
@@ -2784,11 +2719,11 @@ mod tests {
                         &snapshot,
                         false,
                         "",
-                        &view,
+                        view.text_budget(&warnings_text),
                         "(no new output)",
                         &mut structured,
                     );
-                    let result = suppress(success(text, structured), render);
+                    let result = suppress(success(text, structured, &warnings_text), render);
                     let value = serde_json::to_value(result).unwrap();
                     assert_eq!(value["isError"], true);
                     let text = value["content"][0]["text"].as_str().unwrap();
@@ -2965,7 +2900,7 @@ mod tests {
                 rendering.mark_reported(&snapshot);
                 reporting.mark_reported(&snapshot);
                 drop(state);
-                Ok(success(String::new(), Value::Null))
+                Ok(success(String::new(), Value::Null, ""))
             })
             .await
         });
@@ -3000,7 +2935,7 @@ mod tests {
             let state = read.commit();
             reader.mark_delivered();
             drop(state);
-            Ok(success(output, Value::Null))
+            Ok(success(output, Value::Null, ""))
         })
         .await
         .unwrap();
@@ -3018,11 +2953,25 @@ mod tests {
         cancel.cancel();
         let result = read_result(&cancel, async {
             reader.mark_delivered();
-            Ok(success(String::new(), Value::Null))
+            Ok(success(String::new(), Value::Null, ""))
         })
         .await;
         assert!(result.is_err());
         assert!(reader.is_fresh());
+    }
+
+    #[test]
+    fn a_large_list_row_does_not_hide_the_opposite_end() {
+        for (rows, want, omitted_at_start) in [
+            (vec!["x".repeat(200), "short".into()], 1, true),
+            (vec!["short".into(), "x".repeat(200)], 0, false),
+        ] {
+            let (indexes, text) = fit_lines(&rows, Truncate::HeadTail, 100);
+            assert_eq!(indexes, [want]);
+            assert_eq!(text.starts_with("... [1 task"), omitted_at_start);
+            assert!(text.contains("short"));
+            assert!(text.len() <= 100);
+        }
     }
 
     #[test]

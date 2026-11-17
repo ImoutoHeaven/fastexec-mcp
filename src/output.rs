@@ -289,6 +289,10 @@ pub struct Window {
 }
 
 impl Window {
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.omitted.is_none()
+    }
+
     fn marker(&self, omitted: Option<(u64, u64)>) -> String {
         omitted.map_or(String::new(), |(first, last)| {
             let count = last - first + 1;
@@ -383,6 +387,11 @@ impl Window {
             builder.omitted = all;
         } else {
             for line in &self.lines {
+                // The original gap already closed the head. Promoting a later tail line back
+                // into the head could leave a shown line inside the new omitted range.
+                if self.omitted.is_some_and(|(first, _)| line.number > first) {
+                    builder.head_open = false;
+                }
                 builder.place(line.clone());
             }
         }
@@ -404,6 +413,48 @@ fn merge_omitted(range: &mut Option<(u64, u64)>, first: u64, last: u64) {
     }));
 }
 
+/// A large program-facing line is decoded in chunks. Only its UTF-8 prefix is retained;
+/// the full decoded length accounts for transcoding, invalid bytes and trailing padding.
+struct DecodedLine {
+    decoder: encoding_rs::Decoder,
+    prefix: String,
+    bytes: usize,
+    had_errors: bool,
+}
+
+impl DecodedLine {
+    fn new(encoding: &'static Encoding) -> Self {
+        Self {
+            decoder: encoding.new_decoder_without_bom_handling(),
+            prefix: String::new(),
+            bytes: 0,
+            had_errors: false,
+        }
+    }
+
+    fn push(&mut self, mut input: &[u8], last: bool, budget: usize) {
+        let mut output = [0; 4096];
+        loop {
+            let (state, read, written, errors) =
+                self.decoder.decode_to_utf8(input, &mut output, last);
+            self.had_errors |= errors;
+            if self.prefix.len() == self.bytes && self.bytes < budget {
+                let chunk = std::str::from_utf8(&output[..written]).expect("decoder emits UTF-8");
+                let mut keep = written.min(budget - self.bytes);
+                while !chunk.is_char_boundary(keep) {
+                    keep -= 1;
+                }
+                self.prefix.push_str(&chunk[..keep]);
+            }
+            self.bytes += written;
+            input = &input[read..];
+            if state == encoding_rs::CoderResult::InputEmpty {
+                break;
+            }
+        }
+    }
+}
+
 /// Turns a byte range of the log into a bounded window. Feed chunks, then call `finish`.
 pub struct WindowBuilder<'a> {
     spec: WindowSpec,
@@ -412,6 +463,8 @@ pub struct WindowBuilder<'a> {
     newlines: u64,
     line: Vec<u8>,
     line_overflow: usize,
+    decoded: Option<DecodedLine>,
+    trailing_spaces: usize,
     line_started: bool,
     head: Vec<Line>,
     head_bytes: usize,
@@ -432,6 +485,8 @@ impl<'a> WindowBuilder<'a> {
             newlines: 0,
             line: Vec::new(),
             line_overflow: 0,
+            decoded: None,
+            trailing_spaces: 0,
             line_started: false,
             head: Vec::new(),
             head_bytes: 0,
@@ -474,17 +529,26 @@ impl<'a> WindowBuilder<'a> {
         if clear {
             self.line.clear();
             self.line_overflow = 0;
+            self.decoded = None;
+            self.trailing_spaces = 0;
         }
         match step {
             Step::Nothing => {}
-            Step::Append => self.append(byte),
+            Step::Append => {
+                self.trailing_spaces = if byte == b' ' {
+                    self.trailing_spaces + 1
+                } else {
+                    0
+                };
+                self.append(byte);
+            }
             Step::Control => self.line_started = true,
             Step::EndLine => self.end_line(true),
             Step::SwallowedLf => self.newlines += 1,
         }
     }
 
-    /// The bytes one line may keep: 64 KiB for per-line-cut windows, or the window's body budget.
+    /// The direct per-line cap is in raw bytes. Program-facing lines use the UTF-8 body budget.
     fn line_limit(&self) -> usize {
         if self.spec.line_cut {
             LINE_BYTES_LIMIT
@@ -495,7 +559,13 @@ impl<'a> WindowBuilder<'a> {
 
     fn append(&mut self, byte: u8) {
         self.line_started = true;
-        if self.line.len() < self.line_limit() {
+        if !self.spec.line_cut && self.line.len() == 8192 {
+            self.decoded
+                .get_or_insert_with(|| DecodedLine::new(self.spec.encoding))
+                .push(&self.line, false, self.spec.budget);
+            self.line.clear();
+        }
+        if !self.spec.line_cut || self.line.len() < LINE_BYTES_LIMIT {
             self.line.push(byte);
         } else {
             self.line_overflow += 1;
@@ -513,32 +583,35 @@ impl<'a> WindowBuilder<'a> {
         if std::mem::take(&mut self.cleaner.continued) && bytes.is_empty() && overflow == 0 {
             return;
         }
-        let mut dropped = overflow;
-        if overflow > 0 {
-            // A clipped prefix can end inside a character, and decoding it would report an
-            // error the output does not have; only that unfinished tail is dropped. Bytes
-            // that are genuinely invalid elsewhere stay, so their error still shows.
-            let suffix = if self.spec.encoding == encoding_rs::UTF_8 {
+        let trailing_spaces = std::mem::take(&mut self.trailing_spaces);
+        let limit = self.line_limit();
+        let (mut text, mut dropped, had_errors) = if let Some(mut decoded) = self.decoded.take() {
+            decoded.push(&bytes, true, limit);
+            let dropped = decoded.bytes - decoded.prefix.len();
+            (decoded.prefix, dropped, decoded.had_errors)
+        } else {
+            // A direct bash window retains a raw byte prefix. Do not turn a character split
+            // at the fixed cap into a false encoding error.
+            let suffix = if overflow == 0 {
+                0
+            } else if self.spec.encoding == encoding_rs::UTF_8 {
                 incomplete_utf8_suffix(&bytes)
             } else {
                 incomplete_legacy_suffix(&bytes, self.spec.encoding)
             };
-            if suffix > 0 {
-                bytes.truncate(bytes.len() - suffix);
-                dropped += suffix;
-            }
-        }
-        let (decoded, had_errors) = self.spec.encoding.decode_without_bom_handling(&bytes);
+            bytes.truncate(bytes.len() - suffix);
+            let (decoded, errors) = self.spec.encoding.decode_without_bom_handling(&bytes);
+            (decoded.into_owned(), overflow + suffix, errors)
+        };
         if had_errors {
             self.bad_lines += 1;
         }
-        let mut text = decoded.into_owned();
-        let limit = self.line_limit();
+        // Spaces before omitted text are significant. Trim only the actual end of the line,
+        // including terminal padding beyond the retained prefix.
+        let stored_padding = trailing_spaces.saturating_sub(dropped);
+        text.truncate(text.len() - stored_padding);
+        dropped = dropped.saturating_sub(trailing_spaces);
         let mut cut = dropped > 0;
-        if self.spec.clean && !self.spec.raw {
-            // Terminals (ConPTY in particular) pad lines with spaces.
-            text.truncate(text.trim_end_matches(' ').len());
-        }
         if self.spec.line_cut && !self.spec.raw {
             let chars = text.chars().count();
             if chars > LINE_CHARS_LIMIT {
@@ -553,7 +626,8 @@ impl<'a> WindowBuilder<'a> {
                 ));
             }
         }
-        let raw_uncut = (!self.spec.line_cut).then(|| (text.clone(), dropped));
+        let raw_uncut = (!self.spec.line_cut && (dropped != 0 || text.len() > limit))
+            .then(|| (text.clone(), dropped));
         if self.spec.line_cut {
             if dropped > 0 {
                 text.push_str(&format!(
@@ -598,17 +672,15 @@ impl<'a> WindowBuilder<'a> {
                 Truncate::None | Truncate::Head => (total, 0),
                 Truncate::Tail => (0, total),
                 Truncate::HeadTail => {
-                    let first_len = self.head.first().map_or_else(
-                        || {
-                            line.raw_uncut
-                                .as_ref()
-                                .filter(|(_, dropped)| *dropped == 0)
-                                .map_or(line.text.len(), |(prefix, _)| prefix.len())
-                        },
-                        |first| first.text.len(),
-                    ) + 1;
-                    let head = (total / 10).max(first_len.min(total));
-                    (head, total - head)
+                    let first = self.head.first().unwrap_or(&line);
+                    let first_cost = if first.cut {
+                        total
+                    } else {
+                        first.text.len() + 1
+                    };
+                    let head = (total / 10).max(first_cost.min(total));
+                    // Once the head closes, the tail can use every byte the head did not use.
+                    (head, total - self.head_bytes)
                 }
             }
         };
@@ -784,7 +856,7 @@ fn cut_line_to_budget(text: &mut String, limit: usize, already_dropped: usize) {
     let budget_label = brief_bytes(limit);
     let max_dropped = already_dropped + text.len();
     let max_marker = format!(" … [line cut at {budget_label}; {max_dropped} more bytes]");
-    if limit <= max_marker.len() {
+    if limit < max_marker.len() {
         let _ = cut_to(text, limit.saturating_add(1));
         return;
     }
@@ -843,37 +915,38 @@ pub const MARK: &str = " … [cut]";
 
 /// Length of an incomplete UTF-8 sequence at the end of `tail` (the last 1..=3 bytes).
 pub fn incomplete_utf8_suffix(tail: &[u8]) -> usize {
-    for back in 1..=tail.len().min(3) {
-        let byte = tail[tail.len() - back];
-        if byte & 0xc0 == 0x80 {
-            continue; // continuation byte; keep looking for the lead byte
-        }
-        let needed = match byte {
-            0xc0..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf7 => 4,
-            _ => return 0,
-        };
-        return if back < needed { back } else { 0 };
+    let suffix = &tail[tail.len().saturating_sub(3)..];
+    let Some(lead) = suffix.iter().rposition(|&b| b & 0xc0 != 0x80) else {
+        return 0;
+    };
+    let candidate = &suffix[lead..];
+    match std::str::from_utf8(candidate) {
+        Err(error) if error.error_len().is_none() => candidate.len(),
+        _ => 0,
     }
-    0
 }
 
-/// Length of an unfinished `encoding` character at the end of `line`, which starts on a
-/// character boundary: the 1..=3 trailing bytes whose removal lets the rest decode cleanly.
-/// A line with an invalid sequence elsewhere reports 0, so its replacement shows at once.
+/// Bytes still held by the decoder at a live window boundary. Earlier malformed sequences
+/// were already emitted as replacements and do not affect a later unfinished character.
 pub fn incomplete_legacy_suffix(line: &[u8], encoding: &'static encoding_rs::Encoding) -> usize {
-    let decodes = |bytes: &[u8]| {
-        encoding
-            .decode_without_bom_handling_and_without_replacement(bytes)
-            .is_some()
-    };
-    if decodes(line) {
-        return 0;
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut buffer = [0; 4096];
+    let mut input = line;
+    loop {
+        let (result, consumed, _, _) = decoder.decode_to_utf8(input, &mut buffer, false);
+        input = &input[consumed..];
+        if result == encoding_rs::CoderResult::InputEmpty {
+            break;
+        }
     }
-    (1..=line.len().min(3))
-        .find(|&back| decodes(&line[..line.len() - back]))
-        .unwrap_or(0)
+    // Flushing now can only fail on the incomplete suffix.
+    match decoder
+        .decode_to_utf8_without_replacement(&[], &mut buffer, true)
+        .0
+    {
+        encoding_rs::DecoderResult::Malformed(len, _) => usize::from(len),
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -1144,6 +1217,36 @@ mod tests {
     }
 
     #[test]
+    fn live_windows_hold_only_prefixes_that_more_bytes_can_complete() {
+        for invalid in [
+            &[0xc0][..],
+            &[0xf5],
+            &[0xe0, 0x80],
+            &[0xf4, 0x90],
+            &[0xed, 0xa0],
+        ] {
+            assert_eq!(incomplete_utf8_suffix(invalid), 0, "{invalid:x?}");
+        }
+        assert_eq!(incomplete_utf8_suffix(&[0xff, 0xf0, 0x90]), 2);
+        assert_eq!(incomplete_legacy_suffix(&[0xff], encoding_rs::BIG5), 0);
+        assert_eq!(
+            incomplete_legacy_suffix(&[0xff, 0xa4], encoding_rs::BIG5),
+            1
+        );
+        for len in 1..4 {
+            let prefix = [0xff, 0x81, 0x30, 0x81, 0x30];
+            assert_eq!(
+                incomplete_legacy_suffix(&prefix[..=len], encoding_rs::GB18030),
+                len
+            );
+        }
+        assert_eq!(
+            incomplete_legacy_suffix(&[0x81, 0x30, 0x81, 0x30], encoding_rs::GB18030),
+            0
+        );
+    }
+
+    #[test]
     fn a_none_window_stops_at_its_cap_and_reports_the_rest() {
         let lines: Vec<u8> = (0..40)
             .flat_map(|line| format!("line {line:02}\n").into_bytes())
@@ -1269,6 +1372,78 @@ mod tests {
     }
 
     #[test]
+    fn cleaned_and_transcoded_windows_count_omitted_display_bytes() {
+        let budget = 250;
+        let build = |input: &[u8], raw: bool, encoding| {
+            let mut cleaner = Cleaner::default();
+            let mut window = WindowBuilder::new(
+                WindowSpec {
+                    truncate: Truncate::HeadTail,
+                    budget,
+                    raw,
+                    clean: true,
+                    line_cut: false,
+                    encoding,
+                    source: "log",
+                },
+                &mut cleaner,
+                1,
+            );
+            window.push(input);
+            window.finish()
+        };
+        for count in [500, 16000] {
+            let mut padded = b"AB".to_vec();
+            padded.resize(2 + count, b' ');
+            assert_eq!(
+                build(&padded, false, encoding_rs::UTF_8).fit(budget),
+                ("AB".into(), 0, None)
+            );
+
+            padded.push(b'Z');
+            let mut single_byte = vec![0xe9; count];
+            single_byte.push(b'Z');
+            for (line, raw, encoding, shown) in [
+                (
+                    &padded,
+                    false,
+                    encoding_rs::UTF_8,
+                    String::from_utf8(padded.clone()).unwrap(),
+                ),
+                (
+                    &single_byte,
+                    true,
+                    encoding_rs::WINDOWS_1252,
+                    format!("{}Z", "é".repeat(count)),
+                ),
+            ] {
+                let out = build(line, raw, encoding);
+                for room in [budget, 148] {
+                    let (text, cuts, omitted) = out.fit(room);
+                    let (kept, marker) = text.split_once(" … [").unwrap();
+                    assert!(shown.starts_with(kept));
+                    assert!(kept.len() + 50 > room, "{text}");
+                    assert_eq!(
+                        marker,
+                        format!(
+                            "line cut at {room} bytes; {} more bytes]",
+                            shown.len() - kept.len()
+                        )
+                    );
+                    assert_eq!((cuts, omitted), (1, None));
+                }
+            }
+        }
+
+        // A large decoded line can end before the raw boundary when the terminal rewrites it.
+        let reset = format!("{}\rOK  \n", "x".repeat(16000));
+        assert_eq!(
+            build(reset.as_bytes(), false, encoding_rs::UTF_8).fit(budget),
+            ("OK".into(), 0, None)
+        );
+    }
+
+    #[test]
     fn uncleaned_uncut_windows_preserve_bytes_whole_lines_and_utf8_boundaries() {
         let build = |chunks: &[&[u8]], truncate: Truncate, budget: usize| {
             let mut cleaner = Cleaner::default();
@@ -1311,6 +1486,24 @@ mod tests {
         assert!(!rendered.contains(&second_500));
         assert_eq!(cuts, 0);
         assert_eq!(omitted, Some((2, 2)));
+
+        // The tail gets unused head space. An uneven result that fits in full is never clipped.
+        let whole = format!("x\n{}\ny", "Z".repeat(996));
+        let out = build(&[whole.as_bytes()], Truncate::HeadTail, 1000);
+        assert_eq!(out.fit(1000), (whole, 0, None));
+
+        let separated = format!(
+            "line1\n{}\nline3\n{}\nline5",
+            "x".repeat(2000),
+            "M".repeat(850)
+        );
+        let out = build(&[separated.as_bytes()], Truncate::HeadTail, 1000);
+        let (refit, _, omitted) = out.fit(800);
+        assert_eq!(omitted, Some((2, 4)), "{refit}");
+        assert!(
+            !refit.contains("line3") && refit.starts_with("line1\n") && refit.ends_with("\nline5"),
+            "{refit}"
+        );
 
         // Exact-budget single line stays whole (no off-by-one premature cut) across all modes.
         let exact_180 = format!("{}\n", "E".repeat(180));

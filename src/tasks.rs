@@ -763,15 +763,20 @@ impl Tasks {
             let mut total_count = 0usize;
             let mut selected = Vec::with_capacity(limit.min(registry.tasks.len()));
             let mut consider = |task: &Arc<Task>| {
-                let snapshot = task.snapshot();
-                let active = snapshot.state == "running" || snapshot.kept;
-                if active_filter.is_some_and(|want_active| want_active != active) {
-                    return;
-                }
-                total_count += 1;
-                if selected.len() < limit {
-                    selected.push((Arc::clone(task), snapshot));
-                }
+                let (end, tree_done) = {
+                    let end = lock(&task.end);
+                    let tree_done = *task.tree_done.borrow();
+                    let active = end.as_ref().is_none_or(|end| end.kept && !tree_done);
+                    if active_filter.is_some_and(|want| want != active) {
+                        return;
+                    }
+                    total_count += 1;
+                    if selected.len() == limit {
+                        return;
+                    }
+                    (end.clone(), tree_done)
+                };
+                selected.push((Arc::clone(task), task.snapshot_at(end, tree_done)));
             };
             if all_scope {
                 for task in registry.tasks.iter().rev() {
@@ -2194,6 +2199,10 @@ impl Task {
     pub fn snapshot(&self) -> Snapshot {
         let end = lock(&self.end).clone();
         let tree_done = *self.tree_done.borrow();
+        self.snapshot_at(end, tree_done)
+    }
+
+    fn snapshot_at(&self, end: Option<Final>, tree_done: bool) -> Snapshot {
         let held_past_exit = end.as_ref().is_some_and(|end| end.kept);
         let out = lock(&self.out);
         Snapshot {
@@ -2472,7 +2481,8 @@ impl Task {
         input: Option<&[u8]>,
         eof: bool,
     ) -> Result<Option<oneshot::Receiver<Result<(), String>>>, String> {
-        let data = input.filter(|bytes| !bytes.is_empty());
+        // A pipe write, including an explicit empty string, requires writable stdin.
+        let data = input.filter(|bytes| !self.pty || !bytes.is_empty());
         if eof && self.pty {
             return Err("EOF_UNSUPPORTED_IN_PTY: a PTY has no stdin half-close. Press Ctrl-D with keys: [\"C-d\"], or kill the task.".into());
         }
@@ -2514,6 +2524,9 @@ impl Task {
                 ),
             };
         };
+        if bytes.is_empty() && !eof {
+            return Ok(None);
+        }
         if !self.admit(bytes.len()) {
             return Err("INPUT_BACKPRESSURE: 1 MiB of earlier input is still waiting for the program to read it. Poll for output, then retry.".into());
         }

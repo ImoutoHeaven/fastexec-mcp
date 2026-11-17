@@ -124,7 +124,9 @@ text(file.text);
 `text`, `console.log/info/warn/error/debug`, and a returned value write to the
 task log. `image(await tools.read({path: "shot.png"}))` saves and returns an
 image. A result carries at most four images and 4718592 base64 bytes; warnings
-name saved images that can be read separately.
+name saved images that can be read separately. A nested `exec poll` or `kill`
+that receives images exposes the blocks in `result.codemode.images`. Pass a
+block to `image()` to include it in the outer script's result.
 
 `codemode` accepts `cwd`, `waitMs`, `returnWhen` with `outputContains` or `quietMs`,
 `killAfterMs`, `truncate`, and `maxBytes`. When `cwd` is set, nested `exec`
@@ -177,9 +179,10 @@ The existing total task and log limits also apply. See
 
 ## Key Constraints
 
-- **Wait window vs. process deadline**: `waitMs` (`0–240000` ms on direct calls;
-  unbounded by default on nested `codemode` `exec` calls without `returnWhen` or
-  input) bounds only how long the current `start` or `poll` call waits. If
+- **Wait window and process deadline**. Direct `start` and `poll` calls accept
+  `waitMs` from 0 to 240000 ms. Nested calls accept longer waits and default to
+  waiting until completion. `returnWhen` sets a 30 s default. Without it,
+  a poll that sends input, presses keys, or resizes the PTY defaults to 2 s. If
   `waitMs` elapses, `returnWhen` matches, or the call is cancelled, the task
   keeps running. Use `killAfterMs` on `start` or `action: "kill"` to bound or
   stop the process tree.

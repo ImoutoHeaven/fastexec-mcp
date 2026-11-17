@@ -1626,6 +1626,19 @@ fn a_named_root_wins_over_the_host_and_keeps_its_prefix() {
 }
 
 #[test]
+fn requesting_http_on_a_daemon_without_it_releases_the_cli_session() {
+    let fixture = Fixture::bare("http-start-conflict");
+    let (code, out, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (code, _, err) = fixture.run(&["daemon", "start", "--http", "127.0.0.1:0"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("HTTP off"), "{err}");
+    let (code, status, err) = fixture.run(&["daemon", "status"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(status.lines().any(|line| line == "sessions 0"), "{status}");
+}
+
+#[test]
 fn a_second_start_with_another_root_keeps_the_root_the_daemon_has() {
     let first = "https://first.example/mac/";
     let mut fixture = Fixture::bare("root-kept").with_public_url(first);
@@ -2630,9 +2643,37 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
 
     let bad_parent = client.call_tool("transfer", json!({"path": "sub/existing.bin/child"}));
     assert_eq!(bad_parent["isError"], true, "{bad_parent}");
+    for path in ["missing/..", "missing/", "missing/."] {
+        let result = client.call_tool("transfer", json!({"path": path}));
+        assert_eq!(result["isError"], true, "{path}: {result}");
+    }
+    assert!(!cwd_dir.join("missing").exists());
 
     #[cfg(unix)]
     {
+        use std::os::unix::fs::symlink;
+
+        let link = cwd_dir.join("upload-link");
+        symlink("new/nested/target", &link).unwrap();
+        let result = client.call_tool("transfer", json!({"path": "upload-link"}));
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["bytes"], Value::Null);
+        assert!(!cwd_dir.join("new").exists());
+        let target = target_of(result["structuredContent"]["url"].as_str().unwrap());
+        assert_eq!(
+            send(fixture.addr, "PUT", &target, "", b"uploaded").status,
+            200
+        );
+        assert_eq!(std::fs::read(&link).unwrap(), b"uploaded");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("new/nested/target")
+        );
+
+        symlink("absent-directory", cwd_dir.join("directory-link")).unwrap();
+        let result = client.call_tool("transfer", json!({"path": "directory-link/upload"}));
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(!cwd_dir.join("absent-directory").exists());
         std::fs::create_dir_all(cwd_dir.join("real_t/inner")).unwrap();
         std::fs::create_dir_all(cwd_dir.join("base_t")).unwrap();
         std::fs::write(cwd_dir.join("real_t/xfer.bin"), b"real-target-15b").unwrap();
@@ -2730,18 +2771,25 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
         }
     }
 
-    let ok_1m = c1.call_tool(
-        "exec",
-        json!({"action": "start", "loginShell": false, "command": "wc -c", "input": "\n".repeat(1 << 20)}),
-    );
-    assert_eq!(ok_1m["isError"], false, "{ok_1m}");
-    assert!(
-        ok_1m["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("1048576"),
-        "{ok_1m}"
-    );
+    for unit in ["x", "\n", "é"] {
+        let result = c1.call_tool(
+            "exec",
+            json!({
+                "action": "start", "loginShell": false, "command": "wc -c",
+                "input": unit.repeat((1 << 20) / unit.len())
+            }),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .any(|line| line.trim() == "1048576"),
+            "{result}"
+        );
+    }
 
     let too_big_len = json!({
         "jsonrpc": "2.0",
@@ -2759,6 +2807,8 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
     );
     let resp_413 = exchange(fixture.addr, req_head.as_bytes());
     assert_eq!(resp_413.status, 413, "{}", resp_413.body);
+    let listed = c1.call_tool("exec", json!({"action": "list"}));
+    assert_eq!(listed["structuredContent"]["totalCount"], 3, "{listed}");
 
     let started = c1.call_tool(
         "exec",

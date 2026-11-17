@@ -21,6 +21,8 @@ pub struct LaunchContext {
     /// The directory a task starts in when its request names none.
     pub cwd: PathBuf,
     pub env: Vec<(OsString, OsString)>,
+    /// The directory that anchors a relative home even after a codemode call changes its cwd.
+    session_cwd: PathBuf,
     /// GNU bash for this context, found on first use and reused by every task of the session. A
     /// lookup that fails is retried by the next task.
     bash: OnceLock<PathBuf>,
@@ -29,6 +31,7 @@ pub struct LaunchContext {
 impl LaunchContext {
     pub fn new(cwd: PathBuf, env: Vec<(OsString, OsString)>) -> Self {
         Self {
+            session_cwd: cwd.clone(),
             cwd,
             env,
             bash: OnceLock::new(),
@@ -52,6 +55,7 @@ impl LaunchContext {
         Self {
             cwd,
             env: self.env.clone(),
+            session_cwd: self.session_cwd.clone(),
             bash,
         }
     }
@@ -72,9 +76,15 @@ impl LaunchContext {
             .map(|(_, value)| value.as_os_str())
     }
 
+    /// The absolute home directory for file tools and the Host description.
+    pub fn home(&self) -> Option<PathBuf> {
+        self.env_home()
+            .and_then(|path| crate::files::resolve_from(&path, &self.session_cwd).ok())
+    }
+
     /// The home directory this context's environment names: `USERPROFILE`, else `HOMEDRIVE` with
     /// `HOMEPATH`, else `HOME` on Windows, and `HOME` on Unix. An empty value is a missing one.
-    pub fn home(&self) -> Option<PathBuf> {
+    fn env_home(&self) -> Option<PathBuf> {
         let value = |name: &str| self.var(name).filter(|value| !value.is_empty());
         if cfg!(windows) {
             if let Some(profile) = value("USERPROFILE") {
@@ -206,10 +216,9 @@ pub fn parse_handle(handle: &str) -> Result<(&str, Option<&str>), String> {
         return Ok((handle, None));
     };
     if id.is_empty() || key.len() != 4 || !key.bytes().all(|byte| ALPHABET.contains(&byte)) {
-        return Err(
-            "taskId must be a bare task ID or <taskId>.<reader>, with 4 Crockford base32 reader characters."
-                .into(),
-        );
+        return Err(format!(
+            "Unknown taskId {handle:?}. Use a bare task ID or <taskId>.<reader>, with 4 Crockford base32 reader characters."
+        ));
     }
     Ok((id, Some(key)))
 }
@@ -385,11 +394,9 @@ mod tests {
         for invalid in [
             "a.b.abcd", ".abcd", "a.abc", "a.abcde", "a.ABCD", "a.ilou", "a.abç",
         ] {
-            assert!(
-                parse_handle(invalid)
-                    .unwrap_err()
-                    .contains("<taskId>.<reader>")
-            );
+            let message = parse_handle(invalid).unwrap_err();
+            assert!(message.contains("Unknown taskId"), "{message}");
+            assert!(message.contains("<taskId>.<reader>"), "{message}");
         }
     }
 
@@ -594,8 +601,9 @@ mod tests {
                 ("HOME", "/home/third"),
             ]);
             assert_eq!(pair.home().unwrap(), PathBuf::from(r"D:\Users\pair"));
-            let half = context(&[("HOMEDRIVE", "D:"), ("HOME", "/home/third")]);
-            assert_eq!(half.home().unwrap(), PathBuf::from("/home/third"));
+            let half = context(&[("HOMEDRIVE", "D:"), ("HOME", "/d/home/third")]);
+            assert_eq!(half.home().unwrap(), PathBuf::from(r"D:\home\third"));
+            assert_eq!(context(&[("HOME", "/home/third")]).home(), None);
         } else {
             assert_eq!(
                 context(&[("HOME", "/home/me"), ("USERPROFILE", "/ignored")]).home(),

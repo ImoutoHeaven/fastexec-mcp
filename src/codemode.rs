@@ -44,20 +44,20 @@ pub struct Request {
     /// Working directory for nested exec (when it omits cwd) and relative paths in read, write, and edit. Omit for the session's default working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// start, poll: how long to wait at most, 0-240000 ms; the cap returns each call within a 5-minute prompt-cache lifetime, so poll again to wait longer. kill ignores it.
+    /// start, poll: wait up to 240000 ms per call. Poll again for longer. Ignored by kill.
     #[schemars(range(min = 0, max = 240000))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
-    /// start, poll: end the wait early when any condition holds; the task keeps running. Texts are literal and case-sensitive, 1-16 per condition, each 1-4096 bytes without line breaks. waitMs stays the longest wait and defaults to 30000 with returnWhen.
+    /// start, poll: any match returns; the task continues. Text conditions take 1-16 case-sensitive literals, 1-4096 bytes each, without line breaks. waitMs defaults to 30000.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_when: Option<ReturnWhen>,
-    /// start: kill the task's whole process tree this many ms after launch, whatever the waits and polls, kept processes included; 0 or omitted means no limit.
+    /// start: kill the entire tree, including kept processes, this many ms after launch. Zero or omitted disables it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kill_after_ms: Option<u64>,
-    /// start, poll, kill, list, transcript: output window mode (default head_tail; transcript defaults to tail).
+    /// Window placement for all actions. Default head_tail, or tail for transcript.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncate: Option<Truncate>,
-    /// start, poll, kill, list, transcript: byte budget of the result, 100-1048576 (default 16384); errors and correctness warnings stay whole even beyond this budget. Not with truncate "none".
+    /// Result budget in bytes, 100-1048576 (default 16384). Errors and correctness warnings stay whole. Not with truncate "none".
     #[schemars(range(min = 100, max = 1048576))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
@@ -66,9 +66,9 @@ pub struct Request {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReturnWhen {
-    /// Unseen output has a line containing one of the texts: cleaned for bash, unchanged for codemode. Text before a carriage-return rewrite counts. For line-oriented programs; TUI redraws repeat old text.
+    /// Match a substring within one unseen line, including text before carriage-return rewrites. Bash lines are cleaned. Codemode lines are unchanged.
     pub output_contains: Option<Vec<String>>,
-    /// No output for this many ms, 10-60000, counted from the last output or the start of the wait, whichever is later; the wait starts after input and keys.
+    /// 10-60000 ms of silence, counted from wait start (after input and keys) or the latest output, whichever is later.
     #[schemars(range(min = 10, max = 60000))]
     pub quiet_ms: Option<u64>,
 }
@@ -555,36 +555,25 @@ fn nested_envelope(result: rmcp::model::CallToolResult) -> serde_json::Value {
     if map.remove("ok") == Some(serde_json::Value::Bool(false)) {
         ok = false;
     }
-    if map.get("kind").and_then(serde_json::Value::as_str) == Some("image") {
-        match map.get("attached") {
-            Some(serde_json::Value::Bool(true)) => {
-                if let Some(images) = serde_json::to_value(&result.content)
-                    .ok()
-                    .and_then(|v| v.as_array().cloned())
-                    && let Some(block) = images.into_iter().find(|b| b["type"] == "image")
-                {
-                    map.insert(
-                        "image".into(),
-                        json!({
-                            "type": "image",
-                            "data": block["data"],
-                            "mimeType": block["mimeType"],
-                        }),
-                    );
-                }
+    let mut images = result.content.iter().filter_map(|block| {
+        let image = block.as_image()?;
+        Some(json!({"type": "image", "data": image.data, "mimeType": image.mime_type}))
+    });
+    match map.get("kind").and_then(serde_json::Value::as_str) {
+        Some("image") => {
+            if let Some(image) = images.next() {
+                map.insert("image".into(), image);
+            } else if let Some(note) = result.content.first().and_then(|block| block.as_text()) {
+                map.insert("note".into(), json!(note.text));
             }
-            Some(serde_json::Value::Bool(false)) => {
-                if let Some(note) = result
-                    .content
-                    .first()
-                    .and_then(|block| block.as_text())
-                    .map(|t| t.text.clone())
-                {
-                    map.insert("note".into(), json!(note));
-                }
-            }
-            _ => {}
         }
+        Some("codemode") => {
+            let blocks: Vec<_> = images.collect();
+            if !blocks.is_empty() {
+                map.entry("codemode").or_insert_with(|| json!({}))["images"] = blocks.into();
+            }
+        }
+        _ => {}
     }
     json!({ "ok": ok, "value": map })
 }
@@ -2161,6 +2150,19 @@ mod tests {
         assert!(path.is_file());
         let output = std::fs::read_to_string(&task.log_path).unwrap();
         assert!(output.contains("image/png, 1x1"), "{output}");
+        for action in ["poll", "kill"] {
+            let (status, log) = fixture.result(&format!(r#"
+                const r = await tools.exec({{action: {action:?}, taskId: {id:?}}});
+                if (r.codemode.images.length !== r.codemode.imagesAttached) throw Error("image count");
+                const block = r.codemode.images[0];
+                if (block.data !== {data:?} || block.mimeType !== "image/png") throw Error("image data");
+                image(block);
+                const next = await tools.exec({{action: "poll", taskId: r.taskId}});
+                if (next.codemode?.images) throw Error("image delivered twice");
+            "#, id = task.id)).await;
+            assert_eq!(status.exit_code, Some(0), "{action}: {log}");
+            assert!(log.contains("image/png, 1x1"), "{action}: {log}");
+        }
         let (state, output) = fixture
             .result(&format!(
                 "for(let i=0;i<65;i++) image({});",

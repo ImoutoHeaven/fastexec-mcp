@@ -16,7 +16,7 @@ struct Server {
     stdin: Option<ChildStdin>,
     lines: Receiver<Value>,
     next_id: u64,
-    notifications: Vec<Value>,
+    pending_messages: Vec<Value>,
     /// The IDs of the tasks `start` calls began, in order.
     started: Vec<String>,
 }
@@ -103,7 +103,7 @@ impl Server {
             stdin,
             lines,
             next_id: 0,
-            notifications: Vec::new(),
+            pending_messages: Vec::new(),
             started: Vec::new(),
         };
         server.request(
@@ -128,6 +128,13 @@ impl Server {
     }
 
     fn response(&mut self, id: u64) -> Value {
+        if let Some(index) = self
+            .pending_messages
+            .iter()
+            .position(|message| message["id"].as_u64() == Some(id))
+        {
+            return self.pending_messages.remove(index);
+        }
         // A failure bound, not a wait: it stays well above the largest wait a request asks the
         // server for, so a slow machine is a slow answer rather than a client timeout.
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -151,7 +158,7 @@ impl Server {
             if message["id"] == json!(id) {
                 return message;
             }
-            self.notifications.push(message);
+            self.pending_messages.push(message);
         }
     }
 
@@ -2028,6 +2035,12 @@ fn finished_script_case(write_status: &str, expected: i32) {
     assert_eq!(out["state"], "exited", "{text}");
     assert_eq!(out["exitCode"], expected, "{text}");
     assert_eq!(out["forcedEnd"], true, "{text}");
+    let (listed, _) = server.ok(json!({"action": "list", "limit": 1}));
+    assert_eq!(
+        listed["tasks"][0]["taskId"],
+        bare_id(out["taskId"].as_str().unwrap())
+    );
+    assert_eq!(listed["tasks"][0]["forcedEnd"], true, "{listed}");
     assert!(
         elapsed < Duration::from_secs(12),
         "the grace ended the root within its bound: {elapsed:?}"
@@ -5991,8 +6004,25 @@ return 'returned-early';
     }
 }
 
+fn schema_description_words(node: &Value) -> usize {
+    match node {
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| {
+                if key == "description" {
+                    value.as_str().unwrap().split_whitespace().count()
+                } else {
+                    schema_description_words(value)
+                }
+            })
+            .sum(),
+        Value::Array(items) => items.iter().map(schema_description_words).sum(),
+        _ => 0,
+    }
+}
+
 #[test]
-fn server_instructions_advertise_codemode_only_when_enabled() {
+fn server_instructions_and_tool_descriptions_stay_within_their_word_budget() {
     let mut disabled = Server::start();
     let init_off = disabled.request(
         "initialize",
@@ -6011,6 +6041,30 @@ fn server_instructions_advertise_codemode_only_when_enabled() {
         instructions_on.contains("codemode") && instructions_on.contains("Prefer codemode"),
         "{instructions_on}"
     );
+
+    // v0.3.0 stdio totals, excluding the host line, whose paths may contain spaces.
+    let platform_words = if cfg!(windows) {
+        59
+    } else if cfg!(target_os = "macos") {
+        69
+    } else {
+        0
+    };
+    for (server, instructions, baseline) in [
+        (&mut disabled, instructions_off, 2233),
+        (&mut enabled, instructions_on, 2987),
+    ] {
+        let listed = server.request("tools/list", json!({}));
+        let mut words = instructions.split_whitespace().count();
+        for tool in listed["result"]["tools"].as_array().unwrap() {
+            let text = tool["description"].as_str().unwrap();
+            let text = text.split_once("\n\nHost: ").map_or(text, |(body, _)| body);
+            words +=
+                text.split_whitespace().count() + schema_description_words(&tool["inputSchema"]);
+        }
+        let limit = baseline + platform_words;
+        assert!(words <= limit, "{words} advertised words exceed {limit}");
+    }
 }
 
 #[test]
@@ -6290,10 +6344,11 @@ fn pipe_start_stdin_defaults_to_eof_delivers_1mib_and_warns_on_early_close() {
         "action": "start",
         "loginShell": false,
         "cwd": bash_dir,
-        "command": "if command -v rg >/dev/null 2>&1; then rg needle_token; else grep zzz; fi",
+        "command": "if command -v rg >/dev/null 2>&1; then rg --no-filename needle_token; else [[ ! -p /dev/stdin ]] && grep needle_token sample.txt; fi",
         "waitMs": 5000
     }));
-    assert_eq!(grep_out["state"], "exited", "{grep_text}");
+    assert_eq!(grep_out["exitCode"], 0, "{grep_text}");
+    assert_eq!(grep_out["output"], "needle_token", "{grep_out}");
 
     let (sorted, sorted_text) = server.ok(json!({
         "action": "start",
@@ -6357,13 +6412,17 @@ fn pipe_start_stdin_defaults_to_eof_delivers_1mib_and_warns_on_early_close() {
         &mut server,
         json!({
             "code": r#"
-                const ok = await tools.exec({
-                    action: "start",
-                    loginShell: false,
-                    command: "wc -c",
-                    input: "\0".repeat(1048576)
-                });
-                if (ok.output.trim() !== "1048576") throw new Error("wc: " + ok.output);
+                for (const unit of ["x", "\n", "é", "\0"]) {
+                    const ok = await tools.exec({
+                        action: "start",
+                        loginShell: false,
+                        command: "wc -c",
+                        input: unit.repeat(unit === "é" ? 524288 : 1048576)
+                    });
+                    if (ok.exitCode !== 0 || ok.output.trim() !== "1048576")
+                        throw new Error("wc: " + ok.output);
+                }
+                const before = (await tools.exec({action: "list"})).totalCount;
                 let refused = false;
                 try {
                     await tools.exec({
@@ -6376,6 +6435,8 @@ fn pipe_start_stdin_defaults_to_eof_delivers_1mib_and_warns_on_early_close() {
                     if (e.name === "ToolError") refused = true;
                 }
                 if (!refused) throw new Error("expected ToolError for >1 MiB");
+                const after = (await tools.exec({action: "list"})).totalCount;
+                if (after !== before) throw new Error("refused start created a task");
                 return "nested-1mib-ok";
             "#
         }),
@@ -6456,6 +6517,113 @@ fn pipe_start_stdin_defaults_to_eof_delivers_1mib_and_warns_on_early_close() {
 }
 
 #[test]
+fn completed_screen_and_empty_codemode_lines_follow_the_rendered_body() {
+    let mut server = codemode_server();
+    let (screen, text) = server.ok(json!({
+        "action":"start", "command":"printf %0220d 0", "loginShell":false,
+        "pty":true, "cols":90, "rows":5, "screen":true, "maxBytes":360
+    }));
+    assert!(screen.get("omittedRows").is_none(), "{text}");
+    assert_eq!(
+        screen["output"].as_str().unwrap().matches('0').count(),
+        220,
+        "{text}"
+    );
+    assert!(!text.contains(" · log "), "{text}");
+    assert!(text.len() <= 360, "{text}");
+
+    let blank = code_result(&mut server, json!({"code":"text('')"}));
+    assert!(
+        code_text(&blank).starts_with("\n\n["),
+        "{}",
+        code_text(&blank)
+    );
+    let (_, next) =
+        server.ok(json!({"action":"poll","taskId":blank["structuredContent"]["taskId"]}));
+    assert!(next.starts_with("(no new output)"), "{next}");
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_stream_and_transcript_fit_the_status_after_a_long_log_path_is_shortened() {
+    let scratch = Scratch::new("long-window-path");
+    let mut dir = scratch.to_path_buf();
+    for _ in 0..6 {
+        dir.push("x".repeat(110));
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::start_with(|command| {
+        command
+            .env("TMPDIR", &dir)
+            .env("FASTEXEC_OUTPUT_MODE", "both")
+            .env("FASTEXEC_CODEMODE", "true");
+    });
+    let result = code_result(
+        &mut server,
+        json!({
+            "code": r#"
+            const task = await tools.exec({
+                action: "start", command: "printf '%0400d\\n' 1; sleep 30", loginShell: false,
+                pty: true, cols: 500, rows: 5, maxBytes: 1000, returnWhen: {outputContains: ["0000"]}
+            });
+            const transcript = await tools.exec({action: "transcript", taskId: task.taskId, maxBytes: 1000});
+            await tools.exec({action: "kill", taskId: task.taskId});
+            return [task.output, transcript.output];
+        "#
+        }),
+    );
+    let bodies: Vec<String> =
+        serde_json::from_str(result["structuredContent"]["output"].as_str().unwrap())
+            .unwrap_or_else(|_| panic!("{result}"));
+    let expected = format!("{:0400}", 1);
+    assert_eq!(bodies[0], expected);
+    assert!(bodies[1].lines().any(|line| line == expected), "{bodies:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn kill_waits_for_output_closure_and_reports_unconfirmed_capture() {
+    let mut server = codemode_server();
+    let (start, _) = server.ok(json!({
+        "action":"start", "loginShell":false, "eof":false,
+        "command":"printf 'ready %s\\n' \"$BASHPID\"; read -r done",
+        "returnWhen":{"outputContains":["ready "]}
+    }));
+    let pid: u32 = start["output"]
+        .as_str()
+        .unwrap()
+        .trim()
+        .strip_prefix("ready ")
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Hold one writer independently of the completed tree to control when capture reaches EOF.
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!("/proc/{pid}/fd/1"))
+        .unwrap();
+    let id = &start["taskId"];
+    let (exited, _) = server
+        .ok(json!({"action":"poll", "taskId":id, "input":"done\n", "eof":true, "waitMs":10000}));
+    assert_eq!(exited["state"], "exited", "{exited}");
+    assert_eq!(exited["outputOpen"], true, "{exited}");
+
+    let (pending, text) = server.ok(json!({"action":"kill", "taskId":id, "maxBytes":100}));
+    assert_eq!(pending["outputOpen"], true, "{pending}");
+    assert!(text.contains("output did not close within 5 s"), "{text}");
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        writeln!(writer, "late-output").unwrap();
+    });
+    let (ended, text) = server.ok(json!({"action":"kill", "taskId":id}));
+    closer.join().unwrap();
+    assert!(ended.get("outputOpen").is_none(), "{text}");
+    assert_eq!(ended["output"], "late-output", "{text}");
+    let (after, _) = server.ok(json!({"action":"poll", "taskId":id}));
+    assert_eq!(after["output"], "");
+}
+
+#[test]
 fn kill_delivers_unseen_output_gates_concurrent_polls_and_attaches_codemode_images() {
     let mut server = codemode_server();
 
@@ -6513,8 +6681,11 @@ fn kill_delivers_unseen_output_gates_concurrent_polls_and_attaches_codemode_imag
         "method": "tools/call",
         "params": {"name": "exec", "arguments": {"action": "kill", "taskId": &conc_id}}
     }));
-    let r1 = server.response(poll_req);
+    // A JSON-RPC client may await either reply first.
     let r2 = server.response(kill_req);
+    let r1 = server.response(poll_req);
+    assert_eq!(r1["result"]["isError"], false, "{r1}");
+    assert_eq!(r2["result"]["isError"], false, "{r2}");
     let out1 = r1["result"]["structuredContent"]["output"]
         .as_str()
         .unwrap_or_default();
@@ -6846,6 +7017,22 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
         "command": "head -c 5",
         "input": "w".repeat(1 << 20)
     }));
+    let (with_warning, text) = server.ok(json!({"action": "list", "limit": 1}));
+    assert!(text.contains("Warning:"), "{text}");
+    assert!(
+        text.ends_with(&format!(
+            "Showing 1 of {} tasks; raise limit to see more.",
+            with_warning["totalCount"]
+        )),
+        "{text}"
+    );
+    let budget = text.len() - 1;
+    let (_, bounded) = server.ok(json!({"action":"list", "limit":1, "maxBytes":budget}));
+    assert!(
+        bounded.len() <= budget && bounded.contains("Warning:"),
+        "{bounded}"
+    );
+    assert!(bounded.ends_with("raise limit to see more."), "{bounded}");
     let _ = server.ok(json!({"action": "start", "loginShell": false, "command": "true"}));
     let (latest_only, latest_only_text) = server.ok(json!({"action": "list", "limit": 1}));
     assert!(

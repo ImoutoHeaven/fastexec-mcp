@@ -563,6 +563,11 @@ fn inspect_transfer_target(
     path: &std::path::Path,
     shown_path: &str,
 ) -> Result<Option<u64>, String> {
+    let failed = |error: std::io::Error| {
+        format!(
+            "Cannot transfer {shown_path}: {error}. Pack directories with tar through exec first."
+        )
+    };
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
         Ok(metadata) if metadata.is_dir() => Err(format!(
@@ -572,31 +577,36 @@ fn inspect_transfer_target(
             "Cannot transfer {shown_path}: it is not a regular file; pack directories or special files with tar through exec first."
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            for ancestor in path.ancestors().skip(1) {
+            let target = files::write_target(path).map_err(failed)?;
+            for ancestor in target.ancestors().skip(1) {
                 if ancestor.as_os_str().is_empty() {
                     break;
                 }
-                match std::fs::metadata(ancestor) {
+                match std::fs::symlink_metadata(ancestor) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(failed(error)),
                     Ok(metadata) if metadata.is_dir() => break,
-                    Ok(_) => {
-                        return Err(format!(
-                            "Cannot transfer {shown_path}: {} is not a directory.",
-                            files::display_path(ancestor)
-                        ));
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => {
-                        return Err(format!(
-                            "Cannot transfer {shown_path}: {err}. Pack directories with tar through exec first."
-                        ));
-                    }
+                    Ok(metadata) if metadata.is_symlink() => match std::fs::metadata(ancestor) {
+                        Ok(target) if target.is_dir() => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(format!(
+                                "Cannot transfer {shown_path}: {} is a dangling directory link. Create its target before uploading.",
+                                files::display_path(ancestor)
+                            ));
+                        }
+                        Err(error) => return Err(failed(error)),
+                        Ok(_) => {}
+                    },
+                    Ok(_) => {}
                 }
+                return Err(format!(
+                    "Cannot transfer {shown_path}: {} is not a directory.",
+                    files::display_path(ancestor)
+                ));
             }
             Ok(None)
         }
-        Err(error) => Err(format!(
-            "Cannot transfer {shown_path}: {error}. Pack directories with tar through exec first."
-        )),
+        Err(error) => Err(failed(error)),
     }
 }
 
@@ -950,65 +960,44 @@ With no arguments, fastexec serves MCP over stdio.";
 /// The hidden `daemon` subcommand: the daemon process itself, and the CLI that starts, inspects,
 /// and stops one.
 fn daemon_main(args: &[std::ffi::OsString]) -> i32 {
-    let action = args
-        .first()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    match action.as_str() {
+    let Some((action, arguments)) = args.split_first() else {
+        return daemon_usage_error("expected a daemon subcommand");
+    };
+    let action = action.to_string_lossy();
+    let options = match action.as_ref() {
         "serve" => {
-            let (Some(namespace), Some(build)) = (args.get(1), args.get(2)) else {
+            let Some(options) = arguments.get(2..) else {
                 eprintln!(
                     "fastexec: usage: fastexec daemon serve <namespace> <build> [--http <addr>] [--idle-exit on|off]"
                 );
                 return 2;
             };
-            let flags = match daemon_flags(&args[3..]) {
-                Ok(flags) => flags,
-                Err(message) => return fail(&message),
-            };
-            daemon::serve_process(
-                namespace.to_string_lossy().into_owned(),
-                build.to_string_lossy().into_owned(),
-                flags.http,
-                flags.idle_exit.unwrap_or_default(),
-                false,
-            )
+            options
         }
-        // The daemon in this process, in the foreground, until it is stopped: the supervisor that
-        // started it owns its lifetime, so it never detaches and never reuses a running daemon.
-        "run" => {
-            let flags = match daemon_flags(&args[1..]) {
-                Ok(flags) => flags,
-                Err(message) => return fail(&message),
-            };
-            // A foreground daemon serves until it is stopped, so there is no idleness to exit on.
-            if flags.idle_exit.is_some() {
-                return fail(DAEMON_USAGE);
+        "start" | "run" | "status" | "stop" => arguments,
+        _ => return daemon_usage_error(&format!("unknown argument {action}")),
+    };
+    let flags = match daemon_flags(&action, options) {
+        Ok(flags) => flags,
+        Err(message) => return daemon_usage_error(&message),
+    };
+    match action.as_ref() {
+        "serve" => daemon::serve_process(
+            arguments[0].to_string_lossy().into_owned(),
+            arguments[1].to_string_lossy().into_owned(),
+            flags.http,
+            flags.idle_exit.unwrap_or_default(),
+            false,
+        ),
+        "run" => cli_run(flags),
+        _ => match tokio::runtime::Runtime::new() {
+            Ok(runtime) => {
+                let code = runtime.block_on(cli(&action, flags));
+                // A start worker abandoned at the deadline must not delay the CLI's exit.
+                std::process::exit(code);
             }
-            cli_run(flags)
-        }
-        "start" | "status" | "stop" => {
-            let flags = match daemon_flags(&args[1..]) {
-                Ok(flags) => flags,
-                Err(message) => return fail(&message),
-            };
-            if (flags.http.is_some() || flags.idle_exit.is_some()) && action != "start" {
-                return fail(DAEMON_USAGE);
-            }
-            match tokio::runtime::Runtime::new() {
-                Ok(runtime) => {
-                    let code = runtime.block_on(cli(&action, flags));
-                    // Exit here rather than through the runtime's drop, which would wait for a
-                    // start worker the deadline abandoned.
-                    std::process::exit(code);
-                }
-                Err(error) => fail(&format!("cannot start the runtime: {error}")),
-            }
-        }
-        _ => {
-            eprintln!("fastexec: {DAEMON_USAGE}");
-            2
-        }
+            Err(error) => fail(&format!("cannot start the runtime: {error}")),
+        },
     }
 }
 
@@ -1020,26 +1009,45 @@ struct DaemonFlags {
     idle_exit: Option<bool>,
 }
 
-fn daemon_flags(args: &[std::ffi::OsString]) -> Result<DaemonFlags, String> {
+fn daemon_flags(action: &str, args: &[std::ffi::OsString]) -> Result<DaemonFlags, String> {
     let mut flags = DaemonFlags::default();
-    let (pairs, rest) = args.as_chunks::<2>();
-    for pair in pairs {
-        if pair[0] == "--http" && flags.http.is_none() {
-            flags.http = Some(pair[1].to_string_lossy().into_owned());
-        } else if pair[0] == "--idle-exit" && flags.idle_exit.is_none() {
-            flags.idle_exit = Some(match pair[1].to_str() {
-                Some("on") => true,
-                Some("off") => false,
-                _ => return Err("--idle-exit must be on or off".to_owned()),
-            });
-        } else {
-            return Err(DAEMON_USAGE.to_owned());
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        match flag.to_str() {
+            Some("--http")
+                if matches!(action, "start" | "run" | "serve") && flags.http.is_none() =>
+            {
+                let value = args
+                    .next()
+                    .ok_or("--http needs an address (host:port)")?
+                    .to_string_lossy();
+                parse_http_addr(&value)?;
+                flags.http = Some(value.into_owned());
+            }
+            Some("--idle-exit")
+                if matches!(action, "start" | "serve") && flags.idle_exit.is_none() =>
+            {
+                let value = args.next().ok_or("--idle-exit needs on or off")?;
+                flags.idle_exit = Some(match value.to_str() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => {
+                        return Err(format!(
+                            "--idle-exit {} must be on or off",
+                            value.to_string_lossy()
+                        ));
+                    }
+                });
+            }
+            _ => return Err(format!("unknown argument {}", flag.to_string_lossy())),
         }
     }
-    if !rest.is_empty() {
-        return Err(DAEMON_USAGE.to_owned());
-    }
     Ok(flags)
+}
+
+fn daemon_usage_error(message: &str) -> i32 {
+    eprintln!("fastexec: {message}\n{DAEMON_USAGE}");
+    2
 }
 
 fn fail(message: &str) -> i32 {
@@ -1162,15 +1170,15 @@ async fn cli_start(
         Ok(status) => status,
         Err(message) => return fail(&message),
     };
+    if let Err(message) = within(deadline, bye(&mut client)).await {
+        return fail(&message);
+    }
     // A daemon that was already running keeps the answer it had: one that serves HTTP is used as
     // it is, and one that does not cannot be turned into one without a stop.
     if flags.http.is_some() && status.http.is_none() {
         return fail(&format!(
             "a daemon already runs for this namespace (epoch {epoch}, HTTP off); stop it first"
         ));
-    }
-    if let Err(message) = within(deadline, bye(&mut client)).await {
-        return fail(&message);
     }
     match &status.http {
         Some(addr) => println!(
@@ -1468,12 +1476,16 @@ fn http_tokens(value: Option<&std::ffi::OsStr>) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
+fn parse_http_addr(value: &str) -> Result<std::net::SocketAddr, String> {
+    value
+        .parse()
+        .map_err(|_| format!("--http {value} is not an address (host:port)"))
+}
+
 /// The address a `--http` argument names, refused when it is outside loopback and serving there
 /// was not allowed.
 pub fn http_addr(value: &str) -> Result<std::net::SocketAddr, String> {
-    let addr: std::net::SocketAddr = value
-        .parse()
-        .map_err(|_| format!("--http {value} is not an address (host:port)"))?;
+    let addr = parse_http_addr(value)?;
     if !addr.ip().is_loopback() && !http::remote_allowed() {
         return Err(format!(
             "--http {value} is not a loopback address; set FASTEXEC_HTTP_ALLOW_REMOTE=1 only behind a TLS-terminating proxy"
@@ -1640,6 +1652,7 @@ mod daemon_flag_tests {
 
     fn parse(args: &[&str]) -> Result<DaemonFlags, String> {
         daemon_flags(
+            "start",
             &args
                 .iter()
                 .map(std::ffi::OsString::from)
@@ -1904,7 +1917,7 @@ mod portable_schema_tests {
     }
 
     #[tokio::test]
-    async fn every_advertised_tool_schema_is_portable_and_preserves_types_in_gemini_web() {
+    async fn every_tool_schema_is_portable_and_preserves_types_in_a_modeled_gemini_conversion() {
         let tasks = Tasks::new(Limits::OFF).unwrap();
         let launch = Arc::new(LaunchContext::current().unwrap());
         let backend = Backend::Local {

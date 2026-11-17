@@ -1134,7 +1134,7 @@ fn a_lost_call_after_a_daemon_stop_is_reported_and_the_next_call_starts_a_daemon
 }
 
 #[test]
-fn a_call_over_one_mib_is_refused_before_it_reaches_a_daemon() {
+fn a_call_over_three_mib_is_refused_before_it_reaches_a_daemon() {
     let fixture = Fixture::new("e2e-limit");
     let mut endpoint = Endpoint::start(&fixture);
     let command = "x".repeat((3 << 20) + 1024);
@@ -1666,11 +1666,64 @@ fn a_foreground_daemon_announces_readiness_and_a_status_finds_it() {
 }
 
 #[test]
+fn daemon_usage_errors_name_the_offending_argument() {
+    let fixture = Fixture::new("cli-usage");
+    for (args, expected) in [
+        (&["daemon"][..], "expected a daemon subcommand"),
+        (&["daemon", "extra"], "unknown argument extra"),
+        (&["daemon", "status", "extra"], "unknown argument extra"),
+        (
+            &["daemon", "stop", "--http", "127.0.0.1:1"],
+            "unknown argument --http",
+        ),
+        (
+            &["daemon", "start", "--extra", "value"],
+            "unknown argument --extra",
+        ),
+        (
+            &["daemon", "start", "--http"],
+            "--http needs an address (host:port)",
+        ),
+        (
+            &["daemon", "start", "--http", "typo"],
+            "--http typo is not an address (host:port)",
+        ),
+        (
+            &["daemon", "start", "--idle-exit", "maybe"],
+            "--idle-exit maybe must be on or off",
+        ),
+        (
+            &["daemon", "start", "--idle-exit", "on", "--idle-exit", "off"],
+            "unknown argument --idle-exit",
+        ),
+    ] {
+        let (code, out, err) = fixture.run(args);
+        assert_eq!(code, 2, "{args:?}: {err}");
+        assert!(out.is_empty(), "{args:?}: {out}");
+        let mut lines = err.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            format!("fastexec: {expected}"),
+            "{args:?}"
+        );
+        assert!(
+            lines.next().unwrap().starts_with("usage: fastexec daemon"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
 fn daemon_run_refuses_an_idle_exit() {
     let fixture = Fixture::new("fg-idle");
     for value in ["on", "off"] {
         let (code, err) = run_refused(&fixture, &["--idle-exit", value]);
-        assert_eq!(code, 1, "--idle-exit {value}: {err}");
+        assert_eq!(code, 2, "--idle-exit {value}: {err}");
+        assert_eq!(
+            err.lines().next(),
+            Some("fastexec: unknown argument --idle-exit"),
+            "{err}"
+        );
         assert!(err.contains("usage: fastexec daemon"), "{err}");
         assert!(err.contains("run [--http <addr>]"), "{err}");
     }
@@ -2110,15 +2163,20 @@ fn daemon_ipc_accepts_1mib_escaped_input_refuses_over_3mib_and_matches_stdio_sch
         );
     }
 
-    let (wc_sc, wc_text, wc_err) = daemon_ep.call(json!({
-        "action": "start",
-        "loginShell": false,
-        "command": "wc -c",
-        "input": "\n".repeat(1 << 20)
-    }));
-    assert!(!wc_err, "{wc_text}");
-    assert_eq!(wc_sc["exitCode"], 0, "{wc_text}");
-    assert!(wc_text.contains("1048576"), "{wc_text}");
+    for unit in ["x", "\n", "é"] {
+        let (wc_sc, wc_text, wc_err) = daemon_ep.call(json!({
+            "action": "start",
+            "loginShell": false,
+            "command": "wc -c",
+            "input": unit.repeat((1 << 20) / unit.len())
+        }));
+        assert!(!wc_err, "{wc_text}");
+        assert_eq!(wc_sc["exitCode"], 0, "{wc_text}");
+        assert!(
+            wc_text.lines().any(|line| line.trim() == "1048576"),
+            "{wc_text}"
+        );
+    }
 
     let big_file = fixture.runtime.join("near-1mib.txt");
     let (_, w_text, w_err) = daemon_ep.file(
@@ -2135,6 +2193,9 @@ fn daemon_ipc_accepts_1mib_escaped_input_refuses_over_3mib_and_matches_stdio_sch
         "input": "\0".repeat(1 << 20)
     }));
     assert!(nul_err && nul_text.contains("3 MiB"), "{nul_text}");
+    let (listed, text, err) = daemon_ep.call(json!({"action": "list"}));
+    assert!(!err, "{text}");
+    assert_eq!(listed["totalCount"], 3, "{listed}");
 }
 
 #[test]

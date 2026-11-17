@@ -82,11 +82,11 @@ execution, naming `exec` actions in lowercase.
     at `2000` characters (`64` KiB with `raw: true`), reporting `cutLines`.
     Outer `codemode` results skip cleaning, and both outer `codemode` and nested
     `exec` results skip fixed line-length limits: lines stay whole unless a
-    single line exceeds
-    the call's byte budget (`maxBytes` or the `4` MiB `none` cap), in which case
-    the prefix and ` … [line cut at <budget>; <n> more bytes]` fit the budget
-    together on a UTF-8 boundary, and `head_tail` reserves enough head share to
-    keep the first fitting line whole.
+    single line exceeds the body budget (`maxBytes` after layout, or `4` MiB
+    with `none`). The prefix and ` … [line cut at <budget>; <n> more bytes]`
+    share that budget. The count measures omitted UTF-8 bytes after decoding
+    and any requested output cleaning. `head_tail` keeps a fitting first line
+    whole and gives the tail the space the head actually leaves.
   - `encoding`: Any ASCII-compatible WHATWG label (such as `"utf-8"`, `"big5"`,
     `"gbk"`; UTF-16 is rejected). On `start`, sets the task default; on `poll`,
     overrides for that call.
@@ -120,10 +120,10 @@ A script is a task with `kind: "codemode"`. The start result has
 `action: "codemode"`; later `exec poll`, `kill`, and `list` use the same task
 and reader handles (`kill` also attaches pending `image()` outputs in the
 committed cursor range). A list command is `[codemode] <code>`, flattened and
-truncated like bash commands. Scripts reject non-false `input`, `eof: true`,
-`keys`, `keyDelayMs`, resize, `screen: true`, `raw: true`, `encoding`, and
-`transcript` requests (`null` and `false` are ignored). The script has no
-terminal and no process tree of its own.
+truncated like bash commands. A script poll rejects `input` (including an empty
+string), `keys`, `keyDelayMs`, resize, `encoding`, and true values for `eof`,
+`screen`, or `raw`. Optional fields accept `null`. Scripts have no terminal
+or process tree and reject `transcript` requests.
 
 The VM uses synchronous rquickjs 0.14.0 on a dedicated thread, with 128 MiB
 of VM memory, a 512 KiB JavaScript stack, and a 2 MiB thread stack. A local
@@ -208,8 +208,10 @@ registered before the marker is written, so a concurrent reader cannot miss it.
 
 A response selects images whose marker endings fall within its committed
 reader cursor range, even when the text window omits those lines. Each reader
-gets an image at most once. The content blocks follow text in log order,
-with at most four images and 4718592 base64 bytes per result. The counters
+gets an image at most once. Direct results place the image blocks after the
+text in log order. Nested `exec poll` and `kill` put the same blocks in
+`result.codemode.images` when images are attached. Both forms carry at most
+four images and 4718592 base64 bytes per result. The fields
 `codemode.imagesAttached` and `codemode.imagesNotAttached` explain attachment;
 the latter contains `{index, path, reason}` with `budget`, `log_dropped`, or
 `evicted`; an evicted entry omits its unavailable path. Budget warnings

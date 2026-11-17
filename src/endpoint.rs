@@ -182,11 +182,12 @@ impl Endpoint {
             }) => Some(written),
         };
         if !matches!(written, Some(Ok(Ok(())))) {
-            lock(&link.pending).remove(&id);
             self.close(&link);
-            return self.lost(&link, tool, &action, id, &request_id);
         }
+        // Closing drops all pending senders. A complete result sent before EOF wins even
+        // if the reader has already closed the link by the time the caller resumes.
         tokio::select! {
+            biased;
             answer = answer => match answer {
                 Ok(result) => result,
                 // The reader dropped the entry, so the link is gone.
@@ -207,7 +208,6 @@ impl Endpoint {
                 }
                 error("Cancelled; the task keeps running.")
             }
-            _ = link.closed.cancelled() => self.lost(&link, tool, &action, id, &request_id),
         }
     }
 
@@ -499,12 +499,14 @@ mod tests {
         }
     }
 
+    const TEST_EPOCH: &str = "eeeeeeee";
+
     fn welcome(identity: &runtime::Identity) -> ToEndpoint {
         ToEndpoint::Welcome {
             protocol: ipc::PROTOCOL,
             namespace: identity.namespace.clone(),
             build: identity.build.clone(),
-            epoch: "e".repeat(26),
+            epoch: TEST_EPOCH.to_owned(),
         }
     }
 
@@ -546,7 +548,7 @@ mod tests {
             drop(client);
             let _ = timeout(Duration::from_secs(30), server).await;
             match expected {
-                None => assert_eq!(answer.unwrap(), "e".repeat(26)),
+                None => assert_eq!(answer.unwrap(), TEST_EPOCH),
                 Some(text) => {
                     let message = answer.unwrap_err();
                     assert!(message.contains(text), "{message}");
@@ -586,7 +588,7 @@ mod tests {
         let (identity, paths, mut listener, _target) = test_daemon("cancel");
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = Arc::clone(&seen);
-        let answering = identity.clone();
+        let welcome = welcome(&identity);
         let peer = tokio::spawn(async move {
             let Ok(mut conn) = listener.accept().await else {
                 return;
@@ -595,12 +597,6 @@ mod tests {
                 ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await
             else {
                 return;
-            };
-            let welcome = ToEndpoint::Welcome {
-                protocol: ipc::PROTOCOL,
-                namespace: answering.namespace.clone(),
-                build: answering.build.clone(),
-                epoch: "e".repeat(26),
             };
             if ipc::write_frame(&mut conn, &welcome).await.is_err() {
                 return;
@@ -683,7 +679,7 @@ mod tests {
         let (identity, paths, mut listener, _target) = test_daemon("retry");
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = Arc::clone(&seen);
-        let answering = identity.clone();
+        let welcome = welcome(&identity);
         let peer = tokio::spawn(async move {
             // The first connection is refused before any Welcome.
             let Ok(mut first) = listener.accept().await else {
@@ -709,12 +705,6 @@ mod tests {
             {
                 observed.lock().unwrap().push(format!("hello {connection}"));
             }
-            let welcome = ToEndpoint::Welcome {
-                protocol: ipc::PROTOCOL,
-                namespace: answering.namespace.clone(),
-                build: answering.build.clone(),
-                epoch: "e".repeat(26),
-            };
             if ipc::write_frame(&mut second, &welcome).await.is_err() {
                 return;
             }
@@ -771,6 +761,64 @@ mod tests {
             ]
         );
     }
+
+    #[tokio::test]
+    async fn a_complete_result_survives_the_connection_ending() {
+        let (identity, paths, mut listener, _target) = test_daemon("last-result");
+        let welcome = welcome(&identity);
+        let (seen, request_arrived) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let hello = ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                .await
+                .unwrap();
+            assert!(matches!(hello, Some(ToDaemon::Hello { .. })));
+            ipc::write_frame(&mut conn, &welcome).await.unwrap();
+            let Some(ToDaemon::Call { id, .. }) = ipc::read_frame(&mut conn, ipc::REQUEST_LIMIT)
+                .await
+                .unwrap()
+            else {
+                panic!("expected a call");
+            };
+            seen.send(()).unwrap();
+            let result = CallToolResult::success(vec![ContentBlock::text("confirmed")]);
+            ipc::write_frame(&mut conn, &ToEndpoint::Result { id, result })
+                .await
+                .unwrap();
+        });
+
+        let endpoint = Endpoint::for_test(identity, paths);
+        let link = endpoint
+            .link("test", std::time::Instant::now() + runtime::START_WAIT)
+            .await
+            .unwrap();
+        let call = endpoint.call(
+            "exec",
+            serde_json::json!({"action": "list"}),
+            "1".to_owned(),
+            "test",
+            CancellationToken::new(),
+            None,
+        );
+        tokio::pin!(call);
+        // Only resume the caller after the reader has processed both the Result and EOF.
+        timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                biased;
+                seen = request_arrived => seen.unwrap(),
+                _ = &mut call => panic!("the call ended before the peer received it"),
+            }
+        })
+        .await
+        .expect("the daemon received the call");
+        timeout(Duration::from_secs(10), link.closed.cancelled())
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(10), call).await.unwrap();
+        assert_eq!(result.content[0].as_text().unwrap().text, "confirmed");
+        finish(peer).await;
+    }
+
     /// A call queued behind a busy writer must let go of a link that has ended, rather than
     /// write a fresh frame onto a stream that may hold half of one.
     #[tokio::test]
@@ -778,7 +826,7 @@ mod tests {
         let (identity, paths, mut listener, _target) = test_daemon("queued");
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = Arc::clone(&seen);
-        let answering = identity.clone();
+        let welcome = welcome(&identity);
         let peer = tokio::spawn(async move {
             let Ok(mut conn) = listener.accept().await else {
                 return;
@@ -787,12 +835,6 @@ mod tests {
                 ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await
             else {
                 return;
-            };
-            let welcome = ToEndpoint::Welcome {
-                protocol: ipc::PROTOCOL,
-                namespace: answering.namespace.clone(),
-                build: answering.build.clone(),
-                epoch: "e".repeat(26),
             };
             if ipc::write_frame(&mut conn, &welcome).await.is_err() {
                 return;
@@ -852,8 +894,7 @@ mod tests {
             result.content[0].as_text().map(|text| text.text.clone()),
             Some(format!(
                 "The connection to the fastexec daemon (epoch {}) closed during list call 1 (request 1, session {}); the operation may have run. Use action list to check.",
-                "e".repeat(26),
-                endpoint.session
+                TEST_EPOCH, endpoint.session
             ))
         );
         drop(busy);
@@ -875,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn a_lost_file_tool_call_names_its_tool_and_no_action_list() {
         let (identity, paths, mut listener, _target) = test_daemon("lost-files");
-        let answering = identity.clone();
+        let welcome = welcome(&identity);
         let peer = tokio::spawn(async move {
             let Ok(mut conn) = listener.accept().await else {
                 return;
@@ -884,12 +925,6 @@ mod tests {
                 ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await
             else {
                 return;
-            };
-            let welcome = ToEndpoint::Welcome {
-                protocol: ipc::PROTOCOL,
-                namespace: answering.namespace.clone(),
-                build: answering.build.clone(),
-                epoch: "e".repeat(26),
             };
             if ipc::write_frame(&mut conn, &welcome).await.is_err() {
                 return;
@@ -948,8 +983,7 @@ mod tests {
             text,
             format!(
                 "The connection to the fastexec daemon (epoch {}) closed during read call 1 (request 1, session {}); the call may or may not have run.",
-                "e".repeat(26),
-                endpoint.session
+                TEST_EPOCH, endpoint.session
             )
         );
         assert!(!text.contains("action list"), "{text}");

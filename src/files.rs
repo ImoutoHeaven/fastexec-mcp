@@ -276,10 +276,12 @@ fn format_windows_display(raw: &str) -> String {
     if raw.len() >= 8 && raw.as_bytes()[..8].eq_ignore_ascii_case(b"\\\\?\\UNC\\") {
         return format!("//{}", raw[8..].replace('\\', "/"));
     }
-    let mut shown = match raw.strip_prefix("\\\\?\\") {
-        Some(rest) => rest.replace('\\', "/"),
-        None => raw.replace('\\', "/"),
-    };
+    let drive_path = raw.strip_prefix("\\\\?\\").filter(|rest| {
+        rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && rest.as_bytes().get(1..3) == Some(b":\\")
+    });
+    // Volume GUID paths have no drive-letter equivalent; //?/Volume{...}/... round-trips.
+    let mut shown = drive_path.unwrap_or(raw).replace('\\', "/");
     if shown.as_bytes().get(1) == Some(&b':') && shown.as_bytes()[0].is_ascii_lowercase() {
         let upper = (shown.as_bytes()[0] as char).to_ascii_uppercase();
         shown.replace_range(..1, &upper.to_string());
@@ -316,6 +318,17 @@ fn git_bash_drive_path(path: &str) -> Option<String> {
     None
 }
 
+/// A final separator or dot requires a directory even when the preceding component is a file.
+fn ends_in_directory(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    matches!(
+        bytes
+            .rsplit(|&b| std::path::is_separator(char::from(b)))
+            .next(),
+        Some(b"" | b"." | b"..")
+    )
+}
+
 /// Rebuilds paths without `PathBuf::push`, which folds `..` on Windows verbatim paths.
 fn clean_components(path: &Path) -> PathBuf {
     use std::path::Component;
@@ -340,6 +353,12 @@ fn clean_components(path: &Path) -> PathBuf {
     if out.is_empty() {
         PathBuf::from(".")
     } else {
+        if separator
+            && ends_in_directory(path)
+            && !matches!(path.components().next_back(), Some(Component::ParentDir))
+        {
+            out.push(std::path::MAIN_SEPARATOR_STR);
+        }
         PathBuf::from(out)
     }
 }
@@ -403,10 +422,16 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
         }
         return Ok(append_path(&home()?, relative));
     }
+    resolve_from(Path::new(path), &launch.cwd)
+}
+
+/// Resolves a native or Git Bash path against a fixed base, without tilde expansion.
+pub(crate) fn resolve_from(path: &Path, base: &Path) -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
-        let rewritten = git_bash_drive_path(path);
-        let candidate = Path::new(rewritten.as_deref().unwrap_or(path));
+        let rewritten = path.to_str().and_then(git_bash_drive_path);
+        let candidate = rewritten.as_deref().map_or(path, Path::new);
+        let shown = path.to_string_lossy();
         let mut comps = candidate.components();
         let first = comps.next();
         let second = comps.next();
@@ -416,26 +441,21 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
                     && second != Some(std::path::Component::RootDir)
                 {
                     Err(format!(
-                        "Cannot resolve {path}: drive-relative paths such as C:file depend on a per-drive current directory; pass C:/... or a relative path."
+                        "Cannot resolve {shown}: drive-relative paths such as C:file depend on a per-drive current directory; pass C:/... or a relative path."
                     ))
                 } else {
                     Ok(clean_components(candidate))
                 }
             }
             (Some(std::path::Component::RootDir), _) => Err(format!(
-                "Cannot resolve {path}: driveless paths such as /tmp name Git Bash locations on Windows; pass C:/... or /c/..., or convert it with cygpath -m."
+                "Cannot resolve {shown}: driveless paths such as /tmp name Git Bash locations on Windows; pass C:/... or /c/..., or convert it with cygpath -m."
             )),
-            _ => Ok(append_path(&launch.cwd, candidate)),
+            _ => Ok(append_path(base, candidate)),
         }
     }
     #[cfg(not(windows))]
     {
-        let named = Path::new(path);
-        if named.is_absolute() {
-            Ok(clean_components(named))
-        } else {
-            Ok(append_path(&launch.cwd, named))
-        }
+        Ok(append_path(base, path))
     }
 }
 
@@ -798,8 +818,9 @@ impl Window {
 
         if line_too_long {
             shown_lines = 0;
+            let shell_path = shown_path.replace('\'', "'\\''");
             notices.push(format!(
-                "[Line {start_display} is {}, exceeds {} limit. Use exec: sed -n '{start_display}p' {shown_path} | head -c {}]",
+                "[Line {start_display} is {}, exceeds {} limit. Use exec: sed -n '{start_display}p' '{shell_path}' | head -c {}]",
                 format_size(self.first_line_bytes),
                 format_size(limits.max_bytes),
                 limits.max_bytes
@@ -973,27 +994,46 @@ fn write_text(request: &WriteRequest, launch: &LaunchContext) -> Result<(String,
     let resolved = resolve(&request.path, launch)?;
     let shown_path = display_path(&resolved);
     let _guard = lock();
-    let target =
-        write_target(&resolved).map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
-    if let Some(parent) = target.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
-    }
+    let target = create_target_parents(&resolved)
+        .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
     save_target(target, request.content.as_bytes(), None)
         .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
     Ok((format!("Successfully wrote to {shown_path}"), shown_path))
 }
 
+/// Creates the final target's parent directories for a write or an initial upload.
+pub(crate) fn create_target_parents(path: &Path) -> io::Result<PathBuf> {
+    let target = write_target(path)?;
+    if let Some(parent) = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(target)
+}
+
 /// Follows a final-component symlink without replacing the link itself, including a dangling
 /// link whose target can be created. Parent-directory symlinks keep their normal filesystem
 /// meaning. A finite walk also refuses cycles before any file is changed.
-fn write_target(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn write_target(path: &Path) -> io::Result<PathBuf> {
     let mut target = path.to_path_buf();
-    for _ in 0..=40 {
+    for depth in 0..=40 {
+        if ends_in_directory(&target) {
+            return Err(io::Error::other(
+                "the path requires a directory, not a regular file",
+            ));
+        }
         match std::fs::symlink_metadata(&target) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
+                // Walking the final links individually would reset the OS's whole-path
+                // traversal limit on each step, including links in parent directories.
+                if depth == 0
+                    && let Err(error) = std::fs::metadata(path)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(error);
+                }
                 let link = std::fs::read_link(&target)?;
                 target = if link.is_absolute() {
                     link
@@ -2249,28 +2289,19 @@ fn apply_edits(
         };
 
         if let Some(&exact_at) = exact_starts.first() {
-            if fuzzy_count > 1 {
-                let lines = fuzzy_starts.iter().map(|&pos| line_at_fuzzy(pos)).collect();
-                problems[index] = Some(EntryProblem::Ambiguous {
-                    count: fuzzy_count,
-                    lines,
-                });
-                continue;
-            }
-            if !same_form
-                && fuzzy_count == 1
-                && let Some(fuzzy_span) = map
-                    .get_or_init(|| FuzzyMap::new(&normalized.text))
-                    .as_ref()
-                    .and_then(|m| m.span(fuzzy_starts[0], fuzzy_starts[0] + needle.len()))
-                && let Some((offset, len)) =
-                    FuzzyMap::new(old).and_then(|m| m.span(0, needle.len()))
-                && fuzzy_span != (exact_at + offset, len)
-            {
-                let mut pair = [exact_at, fuzzy_span.0];
-                pair.sort_unstable();
-                let lines = pair.iter().map(|&at| line_at_norm(at)).collect();
-                problems[index] = Some(EntryProblem::Ambiguous { count: 2, lines });
+            let separate = fuzzy_count > 0
+                && !same_form
+                && !exact_survives_fuzzy(&normalized.text, exact_at, old.len(), &needle);
+            let count = fuzzy_count + usize::from(separate);
+            if count > 1 {
+                let mut lines: Vec<_> =
+                    fuzzy_starts.iter().map(|&pos| line_at_fuzzy(pos)).collect();
+                if separate {
+                    let line = line_at_norm(exact_at);
+                    lines.insert(lines.partition_point(|&other| other < line), line);
+                    lines.truncate(MAX_REPORTED_ITEMS);
+                }
+                problems[index] = Some(EntryProblem::Ambiguous { count, lines });
                 continue;
             }
             let (raw_at, raw_end) = (
@@ -2436,6 +2467,79 @@ fn apply_edits(
         fuzzy_flags[edit.index] = edit.fuzzy;
     }
     Ok((replaced, starts, fuzzy_flags))
+}
+
+/// Normalization can absorb the sole exact match into an adjacent character (e + acute → é).
+/// Count it separately when its source units contribute none of the fuzzy copies.
+fn exact_survives_fuzzy(text: &str, at: usize, len: usize, needle: &str) -> bool {
+    let after = at + len;
+    let bytes = text.as_bytes();
+    // A following ASCII character cannot combine backwards across a boundary.
+    if (at == 0 || bytes[at].is_ascii() || bytes[at - 1] == b'\n')
+        && (after == bytes.len() || bytes[after].is_ascii())
+    {
+        return true;
+    }
+    // ASCII starts a new normalization unit. Keep a graphic character or newline on the
+    // right so the enclosing line's trailing-whitespace rule is also preserved.
+    let start = bytes[..=at].iter().rposition(u8::is_ascii).unwrap_or(0);
+    let end = bytes[after..]
+        .iter()
+        .position(|&b| b.is_ascii_graphic() || b == b'\n')
+        .map_or(text.len(), |pos| after + pos + 1);
+    let context = &text[start..end];
+    let mut normalized: Vec<_> = context.nfkc().map(|ch| (ch, true)).collect();
+    // Both strings have the same canonically ordered compatibility decomposition. Pairing
+    // those characters identifies every source byte range contributing to each NFKC character,
+    // including a mark that reorders past another before it composes with the starter.
+    let sources = tagged_nfkd(
+        context
+            .char_indices()
+            .map(|(pos, ch)| (ch, (at - start..after - start).contains(&pos))),
+    );
+    let outputs = tagged_nfkd(
+        normalized
+            .iter()
+            .enumerate()
+            .map(|(index, &(ch, _))| (ch, index)),
+    );
+    debug_assert_eq!(sources.len(), outputs.len());
+    for ((source, inside), (output, index)) in sources.into_iter().zip(outputs) {
+        debug_assert_eq!(source, output);
+        normalized[index].1 &= inside;
+    }
+    let mut owned = String::new();
+    for line in normalized.split_inclusive(|&(ch, _)| ch == '\n') {
+        let newline = line.last().filter(|&&(ch, _)| ch == '\n');
+        let body = &line[..line.len() - usize::from(newline.is_some())];
+        let kept = body
+            .iter()
+            .rposition(|&(ch, _)| !is_js_whitespace(ch))
+            .map_or(0, |pos| pos + 1);
+        for &(ch, inside) in body[..kept].iter().chain(newline) {
+            if inside {
+                owned.push(mapped_character(ch));
+            } else {
+                if owned.contains(needle) {
+                    return true;
+                }
+                owned.clear();
+            }
+        }
+    }
+    owned.contains(needle)
+}
+
+/// NFKD with a source label carried through decomposition and stable canonical ordering.
+fn tagged_nfkd<T: Copy>(chars: impl Iterator<Item = (char, T)>) -> Vec<(char, T)> {
+    let mut parts = Vec::new();
+    for (ch, tag) in chars {
+        unicode_normalization::char::decompose_compatible(ch, |part| parts.push((part, tag)));
+    }
+    for marks in parts.split_mut(|&(ch, _)| canonical_combining_class(ch) == 0) {
+        marks.sort_by_key(|&(ch, _)| canonical_combining_class(ch));
+    }
+    parts
 }
 
 /// Counts overlapping occurrences in one pass, retaining only the starts a report can show.
@@ -2878,6 +2982,19 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_home_stays_anchored_to_the_session_directory() {
+        let scratch = Scratch::new("relative-home");
+        let launch = context(&scratch.0, Path::new("local-home"));
+        let nested = launch.with_cwd(scratch.0.join("other"));
+        let file = scratch.file("local-home/notes", b"session home");
+        let home = scratch.0.join("local-home");
+        assert_eq!(nested.home().as_deref(), Some(home.as_path()));
+        assert!(crate::host_line(&nested).contains(&format!(" · home {} · ", display_path(&home))));
+        assert_eq!(resolve("~/notes", &nested).unwrap(), file);
+        assert_eq!(whole("~/notes", &nested, false).unwrap(), "session home");
+    }
+
+    #[test]
     fn home_expansion_keeps_repeated_separators_under_home() {
         let scratch = Scratch::new("home-separators");
         let home = scratch.0.join("home");
@@ -3092,7 +3209,7 @@ mod tests {
         assert_eq!(
             whole(&path, &launch, false).unwrap(),
             format!(
-                "[Line 1 is 50.0KB, exceeds 50.0KB limit. Use exec: sed -n '1p' {path} | head -c {MAX_BYTES}]"
+                "[Line 1 is 50.0KB, exceeds 50.0KB limit. Use exec: sed -n '1p' '{path}' | head -c {MAX_BYTES}]"
             )
         );
         let nested_huge = read_text(
@@ -3152,11 +3269,31 @@ mod tests {
         assert_eq!(
             too_long.text,
             format!(
-                "[Line 1 is 1.0MB, exceeds 1.0MB limit. Use exec: sed -n '1p' {over_nested_path} | head -c {NESTED_MAX_BYTES}]"
+                "[Line 1 is 1.0MB, exceeds 1.0MB limit. Use exec: sed -n '1p' '{over_nested_path}' | head -c {NESTED_MAX_BYTES}]"
             )
         );
         assert_eq!(too_long.structured["lineTooLong"], true);
         assert_eq!(too_long.structured["shownLines"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_long_line_hint_reads_paths_with_spaces_and_quotes() {
+        let scratch = Scratch::new("quoted-line");
+        let launch = context(&scratch.0, &scratch.0);
+        let body = "a".repeat(MAX_BYTES as usize + 100);
+        let path = scratch.file("O'Reilly notes.txt", body.as_bytes());
+        let answer = whole(path.to_str().unwrap(), &launch, false).unwrap();
+        let (_, command) = answer.split_once("Use exec: ").unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", command.strip_suffix(']').unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+        assert_eq!(output.stdout, body.as_bytes()[..MAX_BYTES as usize]);
     }
 
     #[test]
@@ -3277,7 +3414,7 @@ mod tests {
         assert_eq!(
             whole(&straddle_path, &launch, false).unwrap(),
             format!(
-                "[Line 1 is 50.0KB, exceeds 50.0KB limit. Use exec: sed -n '1p' {straddle_path} | head -c {MAX_BYTES}]"
+                "[Line 1 is 50.0KB, exceeds 50.0KB limit. Use exec: sed -n '1p' '{straddle_path}' | head -c {MAX_BYTES}]"
             )
         );
     }
@@ -3647,6 +3784,39 @@ mod tests {
                     .file_type()
                     .is_symlink()
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_only_spellings_never_overwrite_regular_files() {
+        let scratch = Scratch::new("directory-suffix");
+        let launch = context(&scratch.0, &scratch.0);
+        let original = scratch.file("target", b"original");
+        for suffix in ["/", "/."] {
+            let name = format!("target{suffix}");
+            let link = scratch.0.join("link");
+            std::os::unix::fs::symlink(&name, &link).unwrap();
+            for requested in [&name[..], "link"] {
+                assert!(whole(requested, &launch, false).is_err());
+                assert!(change(requested, &[("original", "bad")], &launch).is_err());
+                assert!(
+                    write_text(
+                        &WriteRequest {
+                            path: requested.into(),
+                            content: "bad".into()
+                        },
+                        &launch
+                    )
+                    .is_err()
+                );
+            }
+            assert_eq!(std::fs::read(&original).unwrap(), b"original");
+            assert_eq!(
+                std::fs::read_link(&link).unwrap().as_os_str(),
+                Path::new(&name).as_os_str()
+            );
+            std::fs::remove_file(link).unwrap();
         }
     }
 
@@ -5435,7 +5605,89 @@ mod tests {
     }
 
     #[test]
+    fn edit_counts_exact_matches_absorbed_by_normalization_and_partial_fuzzy_copies() {
+        let request = EditRequest {
+            path: "sources.txt".into(),
+            edits: vec![Edit {
+                old_text: "e".into(),
+                new_text: "E".into(),
+            }],
+        };
+        for (sample, lines) in [
+            ("e\u{301}\nｅ\nｅ\n", vec![1, 2, 3]),
+            ("e\u{301} ｅ ｅ", vec![1, 1, 1]),
+            ("ｅ\ne\u{301}\nｅ\n", vec![1, 2, 3]),
+            ("e\u{301}\n⒠", vec![1, 2]), // A fuzzy start inside the expansion "(e)".
+        ] {
+            let failure = apply_edits(sample, &request, "sources.txt")
+                .unwrap_err()
+                .1
+                .unwrap();
+            assert_eq!(failure["failures"][0]["lines"], json!(lines), "{sample:?}");
+        }
+        let same_line = format!("e\u{301} ｅ Z{}\u{0323}\n", "\u{301}".repeat(36));
+        let failure = apply_edits(&same_line, &request, "sources.txt")
+            .unwrap_err()
+            .1
+            .unwrap();
+        assert_eq!(failure["failures"][0]["lines"], json!([1, 1]));
+        let mark_request = EditRequest {
+            path: "marks.txt".into(),
+            edits: vec![Edit {
+                old_text: "\u{301}".into(),
+                new_text: "X".into(),
+            }],
+        };
+        let failure = apply_edits("a\u{301}\u{341}", &mark_request, "marks.txt")
+            .unwrap_err()
+            .1
+            .unwrap();
+        assert_eq!(failure["failures"][0]["lines"], json!([1, 1]));
+        // A mark that moved past a different mark still comes from the exact span.
+        assert_eq!(
+            apply_edits("q\u{301}\u{327}", &mark_request, "marks.txt")
+                .unwrap()
+                .0,
+            "qX\u{327}"
+        );
+        let trimmed_request = EditRequest {
+            path: "trim.txt".into(),
+            edits: vec![Edit {
+                old_text: "é ".into(),
+                new_text: "E".into(),
+            }],
+        };
+        assert_eq!(
+            apply_edits("é \u{301}!", &trimmed_request, "trim.txt")
+                .unwrap()
+                .0,
+            "E\u{301}!"
+        );
+        let sample = format!("e\u{301}\n{}", "ｅ\n".repeat(23));
+        let failure = apply_edits(&sample, &request, "sources.txt")
+            .unwrap_err()
+            .1
+            .unwrap();
+        assert_eq!(
+            failure["failures"][0]["lines"],
+            json!((1..=20).collect::<Vec<_>>())
+        );
+        assert_eq!(failure["failures"][0]["more"], 4);
+    }
+
+    #[test]
     fn windows_display_and_git_bash_drive_helpers_format_every_form() {
+        let volume = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\dir\file";
+        let shown = format_windows_display(volume);
+        assert_eq!(git_bash_drive_path(&shown).as_deref(), Some(volume));
+        #[cfg(windows)]
+        {
+            let launch = context(Path::new(r"C:\cwd"), Path::new(r"C:\home"));
+            assert_eq!(
+                resolve(&shown, &launch).unwrap().as_os_str(),
+                resolve(volume, &launch).unwrap().as_os_str()
+            );
+        }
         assert_eq!(git_bash_drive_path("/c"), Some("C:/".into()));
         assert_eq!(
             git_bash_drive_path("/d/work/a.txt"),
@@ -5489,15 +5741,20 @@ mod tests {
             &launch,
         )
         .unwrap();
-        let error = write_text(
-            &WriteRequest {
-                path: "link41".into(),
-                content: "wrong\n".into(),
-            },
-            &launch,
-        )
-        .unwrap_err();
-        assert!(error.contains("too many symbolic links"), "{error}");
+        symlink(".", scratch.0.join("alias")).unwrap();
+        for path in ["link41", "alias/link40"] {
+            let native = std::fs::metadata(scratch.0.join(path)).unwrap_err();
+            assert_eq!(native.raw_os_error(), Some(libc::ELOOP));
+            let error = write_text(
+                &WriteRequest {
+                    path: path.into(),
+                    content: "wrong\n".into(),
+                },
+                &launch,
+            )
+            .unwrap_err();
+            assert!(error.contains(&native.to_string()), "{error}");
+        }
         assert_eq!(scratch.read("target"), b"after\n");
         assert!(
             std::fs::symlink_metadata(scratch.0.join("link40"))

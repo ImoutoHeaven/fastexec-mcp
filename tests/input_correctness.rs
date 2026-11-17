@@ -137,6 +137,40 @@ fn pipe_input_is_confirmed_and_limit_rejection_delivers_nothing() {
     );
 }
 
+#[test]
+fn empty_poll_input_requires_an_open_pipe_and_eof_alone_is_idempotent() {
+    let mut server = Server::start();
+    let open = server.task(json!({
+        "action": "start", "command": "wc -c", "eof": false, "waitMs": 0
+    }));
+    let empty = server.exec(json!({"action": "poll", "taskId": open, "input": "", "waitMs": 0}));
+    assert_ne!(empty["isError"], true, "{empty}");
+    let closed = server.exec(json!({
+        "action": "poll", "taskId": open, "input": "", "eof": true, "waitMs": 10_000
+    }));
+    assert_eq!(closed["structuredContent"]["exitCode"], 0, "{closed}");
+    assert!(
+        text(&closed).lines().any(|line| line.trim() == "0"),
+        "{closed}"
+    );
+
+    let null = server.task(json!({"action": "start", "command": "cat", "waitMs": 10_000}));
+    for id in [open, null] {
+        for eof in [false, true] {
+            let mut poll = json!({"action": "poll", "taskId": id, "waitMs": 0});
+            if eof {
+                poll["eof"] = json!(true);
+            }
+            let no_input = server.exec(poll.clone());
+            assert_ne!(no_input["isError"], true, "{no_input}");
+            poll["input"] = json!("");
+            let refused = server.exec(poll);
+            assert_eq!(refused["isError"], true, "{refused}");
+            assert!(text(&refused).contains("eof: false"), "{refused}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn the_first_write_to_closed_stdin_reports_the_writer_error() {

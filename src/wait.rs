@@ -27,7 +27,7 @@ const NOTE_CHARS: usize = 60;
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReturnWhen {
-    /// Unseen output has a line containing one of the texts: cleaned for bash, unchanged for codemode. Text before a carriage-return rewrite counts. For line-oriented programs; TUI redraws repeat old text.
+    /// Match a substring within one unseen line, including text before carriage-return rewrites. Bash lines are cleaned. Codemode lines are unchanged.
     output_contains: Option<Vec<String>>,
     /// PTY only: a row of the screen contains one of the texts now.
     screen_contains: Option<Vec<String>>,
@@ -35,7 +35,7 @@ pub struct ReturnWhen {
     screen_appears: Option<Vec<String>>,
     /// PTY only: one of the texts, on the screen before this call's input or during the wait, no longer is, such as a TUI's busy indicator.
     screen_gone: Option<Vec<String>>,
-    /// No output for this many ms, 10-60000, counted from the last output or the start of the wait, whichever is later; the wait starts after input and keys.
+    /// 10-60000 ms of silence, counted from wait start (after input and keys) or the latest output, whichever is later.
     #[schemars(range(min = 10, max = 60000))]
     quiet_ms: Option<u64>,
 }
