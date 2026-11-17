@@ -1082,6 +1082,13 @@ fn edit_refuses_ambiguity_hidden_by_normalization() {
         edits.push(json!({"oldText": old, "newText": new}));
         let (text, error) = server.file("edit", json!({"path": "case.txt", "edits": edits}));
         assert!(error, "{content:?} / {old:?}: {text}");
+        #[cfg(unix)]
+        let shown = std::fs::canonicalize(&*dir)
+            .unwrap()
+            .join("case.txt")
+            .display()
+            .to_string();
+        #[cfg(windows)]
         let shown = path.to_string_lossy().replace('\\', "/");
         let target = if batch { "edits[1]" } else { "edits[0]" };
         assert!(
@@ -1116,6 +1123,13 @@ fn edit_allows_a_unique_exact_match_changed_by_normalization() {
             "edit",
             json!({"path": "case.txt", "edits": [{"oldText": old, "newText": new}]}),
         );
+        #[cfg(unix)]
+        let shown = std::fs::canonicalize(&*dir)
+            .unwrap()
+            .join("case.txt")
+            .display()
+            .to_string();
+        #[cfg(windows)]
         let shown = path.to_string_lossy().replace('\\', "/");
         assert!(!error, "{content:?} / {old:?}: {text}");
         assert_eq!(
@@ -1133,8 +1147,15 @@ fn file_tools_round_trip_through_the_servers_directory() {
     let mut server = Server::start_with(|command| {
         command.current_dir(&*dir);
     });
-    let shown_note = dir.join("notes/a.txt").to_string_lossy().replace('\\', "/");
-    let shown_missing = dir
+    #[cfg(unix)]
+    let base_dir = std::fs::canonicalize(&*dir).unwrap();
+    #[cfg(windows)]
+    let base_dir = dir.to_path_buf();
+    let shown_note = base_dir
+        .join("notes/a.txt")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let shown_missing = base_dir
         .join("notes/missing.txt")
         .to_string_lossy()
         .replace('\\', "/");

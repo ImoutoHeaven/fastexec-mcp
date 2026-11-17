@@ -2720,7 +2720,7 @@ mod tests {
         }
 
         fn path(&self, name: &str) -> String {
-            self.0.join(name).display().to_string()
+            display_path(&self.0.join(name))
         }
     }
 

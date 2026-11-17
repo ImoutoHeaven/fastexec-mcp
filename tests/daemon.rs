@@ -1209,8 +1209,15 @@ fn file_tools_run_in_the_endpoints_directory_and_not_the_daemons() {
     let mut endpoint = Endpoint::start_with(&fixture, |command| {
         command.current_dir(&dir);
     });
-    let expected_note = dir.join("notes/a.txt").to_string_lossy().replace('\\', "/");
-    let expected_missing = dir
+    #[cfg(unix)]
+    let base_dir = std::fs::canonicalize(&dir).unwrap();
+    #[cfg(windows)]
+    let base_dir = dir.clone();
+    let expected_note = base_dir
+        .join("notes/a.txt")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let expected_missing = base_dir
         .join("notes/missing.txt")
         .to_string_lossy()
         .replace('\\', "/");
