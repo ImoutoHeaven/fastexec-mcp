@@ -345,8 +345,21 @@ fn clean_components(path: &Path) -> PathBuf {
 }
 
 /// Joins without folding parent components, including when the base is a verbatim Windows path.
-fn append_path(base: &Path, relative: &Path) -> PathBuf {
-    let mut joined = base.as_os_str().to_owned();
+fn append_path(base: &Path, path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    if path.is_absolute() || matches!(path.components().next(), Some(Component::Prefix(_))) {
+        return clean_components(path);
+    }
+    // A Windows root-relative target replaces the directory but keeps the drive or UNC prefix.
+    let mut joined = if path.has_root() {
+        match base.components().next() {
+            Some(Component::Prefix(prefix)) => prefix.as_os_str().to_owned(),
+            _ => std::ffi::OsString::new(),
+        }
+    } else {
+        base.as_os_str().to_owned()
+    };
     if !joined.is_empty()
         && !joined
             .as_encoded_bytes()
@@ -355,8 +368,8 @@ fn append_path(base: &Path, relative: &Path) -> PathBuf {
     {
         joined.push(std::path::MAIN_SEPARATOR_STR);
     }
-    // Parse the relative part before appending so Windows also accepts its forward slashes.
-    joined.push(clean_components(relative));
+    // Parse the appended part first so Windows also accepts its forward slashes.
+    joined.push(clean_components(path));
     clean_components(Path::new(&joined))
 }
 
@@ -375,20 +388,23 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
     if path == "~" {
         return Ok(clean_components(&home()?));
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return Ok(append_path(
-            &home()?,
-            Path::new(rest.trim_start_matches(std::path::is_separator)),
-        ));
+    let home_tail = path.strip_prefix("~/");
+    #[cfg(windows)]
+    let home_tail = home_tail.or_else(|| path.strip_prefix("~\\"));
+    if let Some(rest) = home_tail {
+        let relative = Path::new(rest.trim_start_matches(std::path::is_separator));
+        if matches!(
+            relative.components().next(),
+            Some(std::path::Component::Prefix(_))
+        ) {
+            return Err(format!(
+                "Cannot resolve {path}: the path after ~ must be relative to the home directory, without a Windows path prefix."
+            ));
+        }
+        return Ok(append_path(&home()?, relative));
     }
     #[cfg(windows)]
     {
-        if let Some(rest) = path.strip_prefix("~\\") {
-            return Ok(append_path(
-                &home()?,
-                Path::new(rest.trim_start_matches(std::path::is_separator)),
-            ));
-        }
         let rewritten = git_bash_drive_path(path);
         let candidate = Path::new(rewritten.as_deref().unwrap_or(path));
         let mut comps = candidate.components();
@@ -2890,6 +2906,39 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn home_expansion_refuses_windows_prefixes_after_separators() {
+        let launch = context(Path::new(r"C:\cwd"), Path::new(r"D:\home"));
+        for input in [
+            "~/C:notes.txt",
+            "~/D:/value",
+            "~//C:notes.txt",
+            "~///D:/value",
+            r"~\C:notes.txt",
+            r"~\\D:\value",
+            r"~\/C:notes.txt",
+        ] {
+            let error = resolve(input, &launch).unwrap_err();
+            assert!(
+                error.contains("the path after ~ must be relative to the home directory"),
+                "{input}: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_expansion_keeps_colons_in_unix_file_names() {
+        let launch = context(Path::new("/cwd"), Path::new("/home/test"));
+        for input in ["C:notes.txt", "D:/value"] {
+            assert_eq!(
+                resolve(&format!("~/{input}"), &launch).unwrap(),
+                Path::new("/home/test").join(input)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn verbatim_paths_keep_parent_components_when_resolved_and_appended() {
         for base in [r"\\?\C:\base", r"\\?\UNC\server\share\base"] {
             let launch = context(Path::new(base), Path::new(base));
@@ -2910,6 +2959,38 @@ mod tests {
                 append_path(&parent, Path::new("staged")),
                 PathBuf::from(format!(r"{base}\link\..\staged"))
             );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn appending_windows_paths_preserves_roots_and_parent_components() {
+        for (base, prefix) in [
+            (r"C:\base\dir", r"C:"),
+            (r"\\?\C:\base\dir", r"\\?\C:"),
+            (r"\\server\share\base\dir", r"\\server\share"),
+            (r"\\?\UNC\server\share\base\dir", r"\\?\UNC\server\share"),
+        ] {
+            for rooted in [r"\other\link\..\value", "/other/link/../value"] {
+                assert_eq!(
+                    append_path(Path::new(base), Path::new(rooted)),
+                    PathBuf::from(format!(r"{prefix}\other\link\..\value")),
+                    "{base} + {rooted}"
+                );
+            }
+            for replacement in [
+                r"D:\other\link\..\value",
+                r"\\?\D:\other\link\..\value",
+                r"\\other\share\link\..\value",
+                r"\\?\UNC\other\share\link\..\value",
+                r"D:link\..\value",
+            ] {
+                assert_eq!(
+                    append_path(Path::new(base), Path::new(replacement)),
+                    PathBuf::from(replacement),
+                    "{base} + {replacement}"
+                );
+            }
         }
     }
 
@@ -3403,7 +3484,21 @@ mod tests {
             &launch,
         )
         .unwrap();
-        assert_eq!(std::fs::read(target).unwrap(), b"after");
+        assert_eq!(std::fs::read(&target).unwrap(), b"after");
+        change("link.txt", &[("after", "edited")], &launch).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"edited");
+        // Recreating a dangling root-relative target must still leave the link in place.
+        std::fs::remove_file(&target).unwrap();
+        write_text(
+            &WriteRequest {
+                path: display_path(&link),
+                content: "created".into(),
+            },
+            &launch,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"created");
+        assert_eq!(std::fs::read(&link).unwrap(), b"created");
         assert!(
             std::fs::symlink_metadata(link)
                 .unwrap()
