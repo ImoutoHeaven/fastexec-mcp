@@ -1023,7 +1023,10 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     function format(value) {
         let isErr = false;
         try { isErr = value instanceof ErrorCtor; } catch {}
-        if (isErr || (value !== null && typeof value === "object" && objectToString(value) === "[object Error]")) {
+        if (!isErr && value !== null && typeof value === "object") {
+            try { isErr = objectToString(value) === "[object Error]"; } catch {}
+        }
+        if (isErr) {
             let name = "Error";
             let message = "";
             let stack = "";
@@ -1329,6 +1332,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
                 ignoreBOM,
                 doNotFlush: false,
                 bomSeen: false,
+                pending: undefined,
                 cp: 0,
                 seen: 0,
                 needed: 0,
@@ -1360,7 +1364,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
                 throw new TypeErrorCtor("TextDecoder decode options must be an object.");
             }
             const stream = Boolean(options && options.stream);
-            const bytes = asByteView(input);
+            let bytes = asByteView(input);
             const reset = () => {
                 s.cp = 0;
                 s.seen = 0;
@@ -1371,10 +1375,30 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             if (!s.doNotFlush) {
                 reset();
                 s.bomSeen = false;
+                s.pending = undefined;
             }
             s.doNotFlush = stream;
+            if (s.pending !== undefined) {
+                const head = s.pending;
+                const headLen = taByteLength(head);
+                const tailLen = taByteLength(bytes);
+                const joined = new Uint8ArrayCtor(headLen + tailLen);
+                for (let i = 0; i < headLen; i++) joined[i] = head[i];
+                for (let i = 0; i < tailLen; i++) joined[headLen + i] = bytes[i];
+                bytes = joined;
+                s.pending = undefined;
+            }
             let bomSeen = s.bomSeen;
             const len = taByteLength(bytes);
+            const fail = start => {
+                // Fatal streaming errors leave unread input queued for the next decode.
+                if (stream && start < len) {
+                    const pending = new Uint8ArrayCtor(len - start);
+                    for (let i = start; i < len; i++) pending[i - start] = bytes[i];
+                    s.pending = pending;
+                }
+                throw new TypeErrorCtor("The encoded data was not valid utf-8.");
+            };
             let out = "";
             let unitCount = 0;
             const pushUnit = unit => {
@@ -1417,15 +1441,13 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
                         s.cp = byte & 0x07;
                     } else if (s.fatal) {
                         reset();
-                        throw new TypeErrorCtor("The encoded data was not valid utf-8.");
+                        fail(i + 1);
                     } else {
                         emit(0xFFFD);
                     }
                 } else if (byte < s.lower || byte > s.upper) {
                     reset();
-                    if (s.fatal) {
-                        throw new TypeErrorCtor("The encoded data was not valid utf-8.");
-                    }
+                    if (s.fatal) fail(i);
                     emit(0xFFFD);
                     i--;
                 } else {
@@ -1442,9 +1464,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             }
             if (!stream && s.needed !== 0) {
                 reset();
-                if (s.fatal) {
-                    throw new TypeErrorCtor("The encoded data was not valid utf-8.");
-                }
+                if (s.fatal) fail(len);
                 emit(0xFFFD);
             }
             s.bomSeen = bomSeen;
@@ -1709,6 +1729,19 @@ mod tests {
         for (code, expected) in [
             ("return 'last'", "last\n"),
             ("return undefined", ""),
+            (
+                r#"
+                const value = {
+                    value: 42,
+                    get [Symbol.toStringTag]() { throw new Error("tag unavailable"); },
+                };
+                console.log(value);
+                value.self = value;
+                console.log(value);
+                return "done";
+                "#,
+                "{\"value\":42}\n[unprintable]\ndone\n",
+            ),
             (
                 "text('before'); try { exit(); } catch(e) { text('caught'); } text('after');",
                 "before\n",
@@ -2236,6 +2269,57 @@ mod tests {
         let (state, output) = fixture.result(code).await;
         assert_eq!(state.exit_code, Some(0), "{output}");
         assert_eq!(output, "codec-ok\n");
+    }
+
+    #[tokio::test]
+    async fn text_decoder_retains_unread_input_after_fatal_stream_errors() {
+        let fixture = Fixture::new();
+        let code = r#"
+            const decoder = () => new TextDecoder("utf-8", { fatal: true });
+            const rejects = (dec, bytes, stream = true) => {
+                try { dec.decode(bytes, { stream }); }
+                catch (error) { if (error instanceof TypeError) return; throw error; }
+                throw new Error("expected invalid UTF-8");
+            };
+            const retained = decoder();
+            const source = new Uint8Array([0xFF, 0x61]);
+            rejects(retained, source);
+            source[1] = 0x7A;
+            if (retained.decode(new Uint8Array([0x62]), { stream: true }) !== "ab") {
+                throw new Error("unread bytes must be copied and precede the next input");
+            }
+            const restored = decoder();
+            rejects(restored, new Uint8Array([0xE2, 0x41, 0x42]));
+            if (restored.decode() !== "AB") throw new Error("invalid continuation must be restored");
+            const repeated = decoder();
+            rejects(repeated, new Uint8Array([0xE2, 0xFF, 0x41]));
+            rejects(repeated, new Uint8Array(0));
+            if (repeated.decode(new Uint8Array([0x42])) !== "AB") {
+                throw new Error("successive errors must consume only the offending sequence");
+            }
+            for (const prior of ["", "X"]) {
+                const bom = decoder();
+                if (prior) bom.decode(new Uint8Array([0x58]), { stream: true });
+                rejects(bom, new Uint8Array([0x41, 0xFF, 0xEF, 0xBB, 0xBF, 0x42]));
+                if (bom.decode() !== (prior ? "\uFEFFB" : "B")) {
+                    throw new Error("failed output must not change BOM state");
+                }
+            }
+            const reset = decoder();
+            rejects(reset, new Uint8Array([0xFF, 0x61]), false);
+            if (reset.decode(new Uint8Array([0x62])) !== "b") {
+                throw new Error("non-streaming failure must reset the input queue");
+            }
+            rejects(reset, new Uint8Array([0xFF, 0xE2]));
+            rejects(reset, new Uint8Array(0), false);
+            if (reset.decode(new Uint8Array([0x41])) !== "A") {
+                throw new Error("failed flush must reset the decoder");
+            }
+            return "queue-ok";
+        "#;
+        let (state, output) = fixture.result(code).await;
+        assert_eq!(state.exit_code, Some(0), "{output}");
+        assert_eq!(output, "queue-ok\n");
     }
 
     #[tokio::test]
