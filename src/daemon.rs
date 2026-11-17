@@ -1624,7 +1624,9 @@ mod tests {
         let second = start(&mut other, 1, "printf other").await;
         let second_id = second["taskId"].as_str().expect("a task ID").to_owned();
 
-        client.send(&call(2, json!({"action": "list"}))).await;
+        client
+            .send(&call(2, json!({"action": "list", "scope": "all"})))
+            .await;
         let list = client.result(2).await;
         let entries = json_of(&list)["tasks"].clone();
         let entries = entries.as_array().expect("a task list");

@@ -1654,8 +1654,8 @@ fn finish_tree(
         task.hold_unconfirmed_tree();
     } else {
         *lock(&task.input) = None;
-        task.writer_done.wait_until(Instant::now() + DRAIN_CAP);
         *lock(&task.pty_control) = None;
+        task.writer_done.wait_until(Instant::now() + DRAIN_CAP);
         let _ = std::fs::remove_file(script);
         if let Some(status) = exit_status {
             let _ = std::fs::remove_file(status);

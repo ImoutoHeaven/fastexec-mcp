@@ -3015,9 +3015,10 @@ mod tests {
         let scratch = Scratch::new("lossy");
         let launch = context(&scratch.0, &scratch.0);
         let directory = scratch.0.display().to_string();
+        let shown_dir = display_path(&scratch.0);
         assert_eq!(
             whole(&directory, &launch, false).unwrap_err(),
-            format!("Cannot read {directory}: it is not a regular file.")
+            format!("Cannot read {shown_dir}: it is not a regular file.")
         );
         scratch.file("bad.txt", b"ok\n\xffbad\n");
         let path = scratch.path("bad.txt");
@@ -4062,7 +4063,7 @@ mod tests {
         let recovery = recovery.into_inner();
         assert_eq!(std::fs::read(&recovery).unwrap(), b"original");
         assert!(
-            error.to_string().contains(recovery.to_str().unwrap()),
+            error.to_string().contains(&display_path(&recovery)),
             "{error}"
         );
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
@@ -4088,7 +4089,7 @@ mod tests {
         let recovery = recovery.into_inner();
         assert_eq!(std::fs::read(&recovery).unwrap(), b"original");
         assert!(
-            error.to_string().contains(recovery.to_str().unwrap()),
+            error.to_string().contains(&display_path(&recovery)),
             "{error}"
         );
     }

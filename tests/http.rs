@@ -1461,7 +1461,10 @@ fn file_tools_round_trip_over_http_and_name_transfer_for_a_binary() {
     assert_eq!(written["isError"], json!(false), "{written}");
     assert_eq!(
         written["content"][0]["text"],
-        json!(format!("Successfully wrote to {}", path.display()))
+        json!(format!(
+            "Successfully wrote to {}",
+            written["structuredContent"]["path"].as_str().unwrap()
+        ))
     );
     let read = client.call_tool("read", json!({"path": path.display().to_string()}));
     assert_eq!(read["isError"], json!(false), "{read}");
@@ -2671,29 +2674,21 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
         "{ok_1m}"
     );
 
-    let too_big_body = json!({
+    let too_big_len = json!({
         "jsonrpc": "2.0",
         "id": 99,
         "method": "tools/call",
         "params": {"name": "exec", "arguments": {"action": "start", "command": "cat", "input": "\0".repeat(1 << 20)}}
     })
-    .to_string();
-    let mut raw_stream = TcpStream::connect(fixture.addr).unwrap();
-    raw_stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    .to_string()
+    .len();
     let req_head = format!(
-        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAuthorization: Bearer {}\r\nMcp-Session-Id: {}\r\n\r\n",
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {too_big_len}\r\nConnection: close\r\nAuthorization: Bearer {}\r\nMcp-Session-Id: {}\r\n\r\n",
         fixture.addr,
-        too_big_body.len(),
         c1.token,
         c1.session.as_deref().unwrap()
     );
-    let _ = raw_stream.write_all(req_head.as_bytes());
-    let _ = raw_stream.write_all(too_big_body.as_bytes());
-    let mut resp_bytes = Vec::new();
-    raw_stream.read_to_end(&mut resp_bytes).unwrap();
-    let resp_413 = parse(&resp_bytes);
+    let resp_413 = exchange(fixture.addr, req_head.as_bytes());
     assert_eq!(resp_413.status, 413, "{}", resp_413.body);
 
     let started = c1.call_tool(

@@ -6704,7 +6704,7 @@ fn windows_git_bash_drive_paths_and_forward_slash_reports() {
         "cwd": &git_bash_dir,
         "command": "cat hello.txt"
     }));
-    assert_eq!(ran["output"], "win-ok\n", "{ran}");
+    assert_eq!(ran["output"], "win-ok", "{ran}");
     assert!(!ran["logPath"].as_str().unwrap().contains('\\'), "{ran}");
 
     let (root_drive, _) = server.ok(json!({
