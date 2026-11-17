@@ -632,31 +632,41 @@ fn rewrite_schema_node(
     };
     obj.remove("$schema");
 
-    if let Some(serde_json::Value::Array(items)) = obj.get("anyOf")
-        && items.len() == 2
-        && items.iter().any(is_null_schema)
-        && let Some(non_null) = items.iter().find(|item| !is_null_schema(item)).cloned()
-    {
-        obj.remove("anyOf");
-        if let serde_json::Value::Object(inner) = non_null {
-            for (key, value) in inner {
-                obj.entry(key).or_insert(value);
+    loop {
+        let mut progressed = false;
+        if let Some(serde_json::Value::String(reference)) = obj.remove("$ref") {
+            let name = reference
+                .strip_prefix("#/$defs/")
+                .or_else(|| reference.strip_prefix("#/definitions/"))
+                .unwrap_or(&reference);
+            if let Some(serde_json::Value::Object(mut target)) = defs.get(name).cloned() {
+                if obj.contains_key("description") {
+                    target.remove("description");
+                }
+                for (key, value) in target {
+                    obj.entry(key).or_insert(value);
+                }
+                progressed = true;
             }
         }
-    }
-
-    while let Some(serde_json::Value::String(reference)) = obj.remove("$ref") {
-        let name = reference
-            .strip_prefix("#/$defs/")
-            .or_else(|| reference.strip_prefix("#/definitions/"))
-            .unwrap_or(&reference);
-        if let Some(serde_json::Value::Object(mut target)) = defs.get(name).cloned() {
-            if obj.contains_key("description") {
-                target.remove("description");
+        if let Some(serde_json::Value::Array(items)) = obj.get("anyOf")
+            && items.len() == 2
+            && items.iter().any(is_null_schema)
+            && let Some(non_null) = items.iter().find(|item| !is_null_schema(item)).cloned()
+        {
+            obj.remove("anyOf");
+            if let serde_json::Value::Object(mut inner) = non_null {
+                if obj.contains_key("description") {
+                    inner.remove("description");
+                }
+                for (key, value) in inner {
+                    obj.entry(key).or_insert(value);
+                }
             }
-            for (key, value) in target {
-                obj.entry(key).or_insert(value);
-            }
+            progressed = true;
+        }
+        if !progressed {
+            break;
         }
     }
 
@@ -721,17 +731,27 @@ fn rewrite_schema_node(
         obj.remove("format");
     }
 
-    for value in obj.values_mut() {
+    for (key, value) in &mut obj {
         let taken = std::mem::take(value);
-        *value = match taken {
-            serde_json::Value::Object(_) => rewrite_schema_node(taken, defs),
-            serde_json::Value::Array(items) => serde_json::Value::Array(
+        *value = match (key.as_str(), taken) {
+            (
+                "properties" | "patternProperties" | "dependentSchemas",
+                serde_json::Value::Object(map),
+            ) => serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(prop, schema)| (prop, rewrite_schema_node(schema, defs)))
+                    .collect(),
+            ),
+            (_, serde_json::Value::Object(sub)) => {
+                rewrite_schema_node(serde_json::Value::Object(sub), defs)
+            }
+            ("items" | "prefixItems", serde_json::Value::Array(items)) => serde_json::Value::Array(
                 items
                     .into_iter()
                     .map(|item| rewrite_schema_node(item, defs))
                     .collect(),
             ),
-            other => other,
+            (_, other) => other,
         };
     }
     serde_json::Value::Object(obj)
@@ -1841,6 +1861,11 @@ mod portable_schema_tests {
             "anyOf",
             "oneOf",
             "allOf",
+            "not",
+            "prefixItems",
+            "additionalItems",
+            "patternProperties",
+            "dependentSchemas",
             "format",
         ] {
             assert!(
@@ -1934,10 +1959,23 @@ mod portable_schema_tests {
             edit_g["properties"]["edits"]["items"]["properties"]["oldText"]["type"],
             json!("STRING")
         );
+        for shared in ["waitMs", "killAfterMs", "truncate", "maxBytes"] {
+            assert_eq!(
+                code_s["properties"][shared], exec_s["properties"][shared],
+                "codemode.{shared} diverged from exec.{shared}"
+            );
+        }
         assert_eq!(
-            code_s["properties"]["maxBytes"],
-            exec_s["properties"]["maxBytes"]
+            code_s["properties"]["returnWhen"]["description"],
+            exec_s["properties"]["returnWhen"]["description"]
         );
+        for rw_field in ["outputContains", "quietMs"] {
+            assert_eq!(
+                code_s["properties"]["returnWhen"]["properties"][rw_field],
+                exec_s["properties"]["returnWhen"]["properties"][rw_field],
+                "returnWhen.{rw_field} diverged"
+            );
+        }
         assert!(
             exec_s["properties"]["maxBytes"]["description"]
                 .as_str()
@@ -1945,5 +1983,38 @@ mod portable_schema_tests {
                 .ends_with("Not with truncate \"none\".")
         );
         assert!(code_s["properties"].get("raw").is_none());
+
+        // Chained $ref -> nullable anyOf -> oneOf inside $defs flattens cleanly while
+        // preserving property names such as "format" and "type" inside `properties`.
+        let tricky = portable_schema(json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {
+                "Mode": {
+                    "oneOf": [
+                        {"const": "fast", "description": "quick"},
+                        {"const": "full", "description": "complete"}
+                    ]
+                },
+                "NullableMode": {
+                    "anyOf": [{"$ref": "#/$defs/Mode"}, {"type": "null"}]
+                }
+            },
+            "type": "object",
+            "properties": {
+                "mode": {"description": "Run mode.", "$ref": "#/$defs/NullableMode"},
+                "format": {"type": ["string", "null"], "description": "Output format."}
+            }
+        }));
+        let tricky_g = gemini_convert(&tricky);
+        assert_portable_and_gemini_typed("tricky", &tricky, &tricky_g);
+        assert_eq!(
+            tricky["properties"]["mode"]["enum"],
+            json!(["fast", "full"])
+        );
+        assert_eq!(
+            tricky["properties"]["mode"]["description"],
+            json!("Run mode. fast: quick full: complete")
+        );
+        assert_eq!(tricky["properties"]["format"]["type"], json!("string"));
     }
 }

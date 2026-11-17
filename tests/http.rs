@@ -2631,6 +2631,19 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
     let bad_parent = client.call_tool("transfer", json!({"path": "sub/existing.bin/child"}));
     assert_eq!(bad_parent["isError"], true, "{bad_parent}");
 
+    #[cfg(unix)]
+    {
+        std::fs::create_dir_all(cwd_dir.join("real_t/inner")).unwrap();
+        std::fs::create_dir_all(cwd_dir.join("base_t")).unwrap();
+        std::fs::write(cwd_dir.join("real_t/xfer.bin"), b"real-target-15b").unwrap();
+        std::fs::write(cwd_dir.join("base_t/xfer.bin"), b"wrong").unwrap();
+        std::os::unix::fs::symlink(cwd_dir.join("real_t/inner"), cwd_dir.join("base_t/link"))
+            .unwrap();
+        let sym_xfer = client.call_tool("transfer", json!({"path": "base_t/link/../xfer.bin"}));
+        assert_eq!(sym_xfer["isError"], false, "{sym_xfer}");
+        assert_eq!(sym_xfer["structuredContent"]["bytes"], 15, "{sym_xfer}");
+    }
+
     let _ = std::fs::remove_dir_all(&cwd_dir);
 }
 
@@ -2653,10 +2666,66 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
         .unwrap()
         .clone();
     assert_eq!(tools.len(), 6, "{tools:?}");
+    let mut stdio_child = std::process::Command::new(env!("CARGO_BIN_EXE_fastexec"))
+        .env("FASTEXEC_DAEMON", "off")
+        .env("FASTEXEC_CODEMODE", "true")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let stdin = stdio_child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}})
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    let mut stdio_tools = Vec::new();
+    {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdio_child.stdout.take().unwrap());
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(msg) = serde_json::from_str::<Value>(&line)
+                && msg["id"] == 2
+            {
+                stdio_tools = msg["result"]["tools"].as_array().unwrap().clone();
+                break;
+            }
+        }
+    }
+    drop(stdio_child.stdin.take());
+    let _ = stdio_child.wait();
+    assert_eq!(stdio_tools.len(), 5, "{stdio_tools:?}");
+    for st in &stdio_tools {
+        let name = st["name"].as_str().unwrap();
+        let ht = tools.iter().find(|t| t["name"] == name).unwrap();
+        assert_eq!(
+            ht["inputSchema"], st["inputSchema"],
+            "HTTP vs stdio schema mismatch on {name}"
+        );
+    }
     for t in &tools {
         let schema = &t["inputSchema"];
         assert_eq!(schema["type"], "object", "{t}");
-        for forbidden in ["oneOf", "anyOf", "allOf", "not"] {
+        for forbidden in [
+            "$ref", "$defs", "$schema", "oneOf", "anyOf", "allOf", "not", "format",
+        ] {
             assert!(schema.get(forbidden).is_none(), "root {forbidden} in {t}");
         }
     }

@@ -5957,6 +5957,56 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
     let parsed: Value = serde_json::from_str(body.trim()).expect("whole JSON line parses");
     assert_eq!(parsed["payload"].as_str().unwrap().len(), 10_000);
 
+    // P0-1 + P2-2: An 800-byte JSON line fits whole inside maxBytes: 1000 without NOTES_RESERVE
+    // shaving it down or forcing ` · log ` into the status line; tight budgets refit cleanly.
+    let near_cap = code_result(
+        &mut server,
+        json!({
+            "code": "return { nearCap: 'q'.repeat(780) };",
+            "maxBytes": 1000
+        }),
+    );
+    let near_text = code_text(&near_cap);
+    assert!(
+        near_text.len() <= 1000,
+        "len={} {near_text}",
+        near_text.len()
+    );
+    assert!(
+        near_cap["structuredContent"].get("cutLines").is_none(),
+        "{near_cap}"
+    );
+    assert!(!near_text.contains(" · log "), "{near_text}");
+    let parsed_near: Value = serde_json::from_str(
+        near_cap["structuredContent"]["output"]
+            .as_str()
+            .unwrap()
+            .trim(),
+    )
+    .expect("near-cap JSON parses whole");
+    assert_eq!(parsed_near["nearCap"].as_str().unwrap().len(), 780);
+
+    for tight in [100_u64, 150, 220, 320] {
+        let tight_res = code_result(
+            &mut server,
+            json!({
+                "code": "return 'T'.repeat(2000);",
+                "maxBytes": tight
+            }),
+        );
+        let tight_text = code_text(&tight_res);
+        assert!(
+            tight_text.len() <= tight as usize,
+            "tight={tight} len={}: {tight_text}",
+            tight_text.len()
+        );
+        let tight_body = tight_res["structuredContent"]["output"].as_str().unwrap();
+        assert!(
+            !tight_body.contains(" … [cut]") && tight_body.matches("line cut at ").count() <= 1,
+            "double-cut marker at tight={tight}: {tight_body}"
+        );
+    }
+
     // P0-1: Over-maxBytes single line cuts within budget, sets cutLines: 1, and names log for recovery.
     let over_budget = code_result(
         &mut server,
@@ -6270,6 +6320,22 @@ fn pipe_start_stdin_defaults_to_eof_delivers_1mib_and_warns_on_early_close() {
         warn.starts_with("stdin closed after ") && warn.ends_with(" of 1048576 bytes"),
         "{warn}"
     );
+    let (early_open, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "head -c 10",
+        "input": "z".repeat(1 << 20),
+        "eof": false,
+        "waitMs": 0
+    }));
+    let early_open_id = early_open["taskId"].as_str().unwrap().to_owned();
+    let (eof_after_bp, _) = server.ok(json!({
+        "action": "poll",
+        "taskId": early_open_id,
+        "eof": true,
+        "waitMs": 5000
+    }));
+    assert!(eof_after_bp.get("inputError").is_none(), "{eof_after_bp}");
 
     let unread_t0 = Instant::now();
     let (unread, _) = server.ok(json!({
@@ -6500,14 +6566,76 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
         std::fs::create_dir_all(real_a.join("inner")).unwrap();
         std::fs::create_dir_all(&real_b).unwrap();
         std::fs::write(real_a.join("sibling.txt"), "via-symlink-parent\n").unwrap();
+        std::fs::write(real_b.join("sibling.txt"), "lexical-wrong-target\n").unwrap();
         std::os::unix::fs::symlink(real_a.join("inner"), real_b.join("link")).unwrap();
-        let via_link = server.request(
+        let sym_file = real_b
+            .join("link/../sibling.txt")
+            .to_string_lossy()
+            .into_owned();
+        let sym_dir = real_b.join("link/..").to_string_lossy().into_owned();
+
+        let via_read = server.request(
             "tools/call",
-            json!({"name": "read", "arguments": {"path": real_b.join("link/../sibling.txt").to_string_lossy()}}),
+            json!({"name": "read", "arguments": {"path": &sym_file}}),
         );
         assert_eq!(
-            via_link["result"]["structuredContent"]["text"], "via-symlink-parent\n",
-            "{via_link}"
+            via_read["result"]["structuredContent"]["text"], "via-symlink-parent\n",
+            "{via_read}"
+        );
+
+        let via_edit = server.request(
+            "tools/call",
+            json!({
+                "name": "edit",
+                "arguments": {
+                    "path": &sym_file,
+                    "edits": [{"oldText": "via-symlink-parent", "newText": "edited-via-symlink"}]
+                }
+            }),
+        );
+        assert_eq!(via_edit["result"]["isError"], false, "{via_edit}");
+        assert_eq!(
+            std::fs::read_to_string(real_a.join("sibling.txt")).unwrap(),
+            "edited-via-symlink\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real_b.join("sibling.txt")).unwrap(),
+            "lexical-wrong-target\n"
+        );
+
+        let sym_written = real_b
+            .join("link/../created.txt")
+            .to_string_lossy()
+            .into_owned();
+        let via_write = server.request(
+            "tools/call",
+            json!({"name": "write", "arguments": {"path": &sym_written, "content": "created-in-real-a\n"}}),
+        );
+        assert_eq!(via_write["result"]["isError"], false, "{via_write}");
+        assert_eq!(
+            std::fs::read_to_string(real_a.join("created.txt")).unwrap(),
+            "created-in-real-a\n"
+        );
+        assert!(!real_b.join("created.txt").exists());
+
+        let (via_cwd, _) = server.ok(json!({
+            "action": "start",
+            "loginShell": false,
+            "cwd": &sym_dir,
+            "command": "cat sibling.txt"
+        }));
+        assert_eq!(via_cwd["output"], "edited-via-symlink", "{via_cwd}");
+
+        let via_cm_cwd = code_result(
+            &mut server,
+            json!({
+                "cwd": &sym_dir,
+                "code": "const r = await tools.read({path: 'sibling.txt'}); return r.text.trim();"
+            }),
+        );
+        assert_eq!(
+            via_cm_cwd["structuredContent"]["output"], "edited-via-symlink",
+            "{via_cm_cwd}"
         );
     }
 
@@ -6613,6 +6741,97 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
     assert_eq!(list_lim["tasks"].as_array().unwrap().len(), 2, "{list_lim}");
     assert!(list_lim["totalCount"].as_u64().unwrap() >= 3, "{list_lim}");
     assert!(list_lim_text.contains("Showing 2 of "), "{list_lim_text}");
+
+    // P1-6: keepTree task after root exit counts as state "active" until killed.
+    let (kt_out, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "keepTree": true,
+        "command": "sleep 30 </dev/null >/dev/null 2>&1 &"
+    }));
+    let kt_handle = kt_out["taskId"].as_str().unwrap().to_owned();
+    let kt_bare = bare_id(&kt_handle).to_owned();
+    let (active_with_kt, _) = server.ok(json!({"action": "list", "state": "active"}));
+    assert!(
+        active_with_kt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["taskId"] == kt_bare && t["keptRunning"] == true),
+        "{active_with_kt}"
+    );
+    server.ok(json!({"action": "kill", "taskId": &kt_handle}));
+
+    // P1-6: A warning on an older unselected task stays out when limit excludes it.
+    let _ = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "head -c 5",
+        "input": "w".repeat(1 << 20)
+    }));
+    let _ = server.ok(json!({"action": "start", "loginShell": false, "command": "true"}));
+    let (latest_only, latest_only_text) = server.ok(json!({"action": "list", "limit": 1}));
+    assert!(
+        latest_only.get("warnings").is_none() && !latest_only_text.contains("Warning:"),
+        "{latest_only} / {latest_only_text}"
+    );
+
+    // P1-6: Tiny maxBytes on direct list leaves undelivered background notices due; nested list
+    // marks script-owned tasks it delivers.
+    let (due_bg, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "sleep 0.15; exit 4",
+        "waitMs": 10
+    }));
+    let due_bare = bare_id(due_bg["taskId"].as_str().unwrap()).to_owned();
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = server.ok(json!({"action": "list", "maxBytes": 100}));
+    let (_, after_tiny_list) =
+        server.ok(json!({"action": "start", "loginShell": false, "command": "true"}));
+    assert!(
+        after_tiny_list.contains(&due_bare),
+        "tiny maxBytes list should leave {due_bare} due: {after_tiny_list}"
+    );
+
+    let nested_marks = code_result(
+        &mut server,
+        json!({
+            "code": r#"
+                const bg = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    command: "sleep 0.1; exit 5",
+                    waitMs: 0
+                });
+                const waiter = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    command: "sleep 0.25"
+                });
+                const listed = await tools.exec({ action: "list", limit: 5 });
+                const bare = bg.taskId.split(".")[0];
+                if (!listed.tasks.some(t => t.taskId === bare && t.exitCode === 5)) {
+                    throw new Error("nested list missed bg: " + JSON.stringify(listed));
+                }
+                return bare;
+            "#
+        }),
+    );
+    let nested_bare = nested_marks["structuredContent"]["output"]
+        .as_str()
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert!(
+        !code_text(&nested_marks)
+            .lines()
+            .last()
+            .unwrap()
+            .contains(&nested_bare),
+        "nested list should mark delivered script-owned task {nested_bare}: {}",
+        code_text(&nested_marks)
+    );
 
     server.ok(json!({"action": "kill", "taskId": run_id}));
 

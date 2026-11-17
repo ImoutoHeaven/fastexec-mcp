@@ -230,6 +230,22 @@ struct Line {
     text: String,
     /// The line lost part of its text to a per-line limit or the budget.
     cut: bool,
+    /// For `!line_cut` windows, the decoded prefix before any budget-cut marker and the byte
+    /// count dropped after it, so `Window::fit` can re-cut cleanly for a tighter `room`
+    /// without cutting an earlier marker.
+    raw_uncut: Option<(String, usize)>,
+}
+
+impl Line {
+    fn recut_to_budget(&mut self, limit: usize) {
+        let (raw_prefix, raw_dropped) = match &self.raw_uncut {
+            Some((prefix, dropped)) => (prefix.clone(), *dropped),
+            None => (std::mem::take(&mut self.text), 0),
+        };
+        self.text = raw_prefix;
+        self.cut = true;
+        cut_line_to_budget(&mut self.text, limit, raw_dropped);
+    }
 }
 
 pub struct WindowSpec {
@@ -250,6 +266,8 @@ pub struct Window {
     truncate: Truncate,
     clean: bool,
     line_cut: bool,
+    /// Budget at which a `!line_cut` line was cut, so `fit` refreshes the marker when `room` shrinks.
+    cut_budget: Option<usize>,
     source: &'static str,
     /// Inclusive line range left out of the window.
     pub omitted: Option<(u64, u64)>,
@@ -284,7 +302,7 @@ impl Window {
     /// Fits the final body using the requested ends, returning its actual omitted range.
     pub fn fit(&self, room: usize) -> (String, u64, Option<(u64, u64)>) {
         let full = self.render(&self.marker(self.omitted));
-        if full.0.len() <= room {
+        if full.0.len() <= room && (self.line_cut || self.cut_budget.is_none_or(|b| b <= room)) {
             return full;
         }
         let mut cleaner = Cleaner::default();
@@ -340,10 +358,16 @@ impl Window {
         } else {
             0
         };
-        builder.spec.budget = if marker_room == 0 {
-            room.saturating_add(1)
+        builder.spec.budget = if self.line_cut {
+            if marker_room == 0 {
+                room.saturating_add(1)
+            } else {
+                room - marker_room
+            }
+        } else if marker_room == 0 {
+            room
         } else {
-            room - marker_room
+            (room - marker_room).saturating_sub(1)
         };
         if room == 0 {
             builder.omitted = all;
@@ -455,10 +479,7 @@ impl<'a> WindowBuilder<'a> {
         if self.spec.line_cut {
             LINE_BYTES_LIMIT
         } else {
-            match self.spec.truncate {
-                Truncate::None => self.spec.budget,
-                _ => self.spec.budget.saturating_sub(1),
-            }
+            self.spec.budget
         }
     }
 
@@ -522,6 +543,7 @@ impl<'a> WindowBuilder<'a> {
                 ));
             }
         }
+        let raw_uncut = (!self.spec.line_cut).then(|| (text.clone(), dropped));
         if self.spec.line_cut {
             if dropped > 0 {
                 text.push_str(&format!(
@@ -535,29 +557,136 @@ impl<'a> WindowBuilder<'a> {
             cut = true;
             cut_line_to_budget(&mut text, limit, dropped);
         }
-        self.place(Line { number, text, cut });
+        self.place(Line {
+            number,
+            text,
+            cut,
+            raw_uncut,
+        });
     }
 
     fn place(&mut self, mut line: Line) {
-        let (head_budget, tail_budget) = match self.spec.truncate {
-            // A `None` window stores whole lines up to its cap and reports the rest as omitted,
-            // so nothing is buffered past it.
-            Truncate::None => (self.spec.budget.saturating_add(1), 0),
-            Truncate::Head => (self.spec.budget, 0),
-            Truncate::Tail => (0, self.spec.budget),
-            Truncate::HeadTail => {
-                // Keep both ends at small budgets; when per-line cuts are disabled, a first line
-                // that fits the body budget may take up to all of it without being cut.
-                let first = self.head.first().unwrap_or(&line).text.len() + 1;
-                let max_first = if self.spec.line_cut {
-                    self.spec.budget / 2
-                } else {
-                    self.spec.budget
-                };
-                let head = (self.spec.budget / 10).max(first.min(max_first));
-                (head, self.spec.budget - head)
+        let (head_budget, tail_budget) = if self.spec.line_cut {
+            match self.spec.truncate {
+                // A `None` window stores whole lines up to its cap and reports the rest as omitted,
+                // so nothing is buffered past it.
+                Truncate::None => (self.spec.budget.saturating_add(1), 0),
+                Truncate::Head => (self.spec.budget, 0),
+                Truncate::Tail => (0, self.spec.budget),
+                Truncate::HeadTail => {
+                    let first = self.head.first().unwrap_or(&line).text.len() + 1;
+                    let head = (self.spec.budget / 10).max(first.min(self.spec.budget / 2));
+                    (head, self.spec.budget - head)
+                }
+            }
+        } else {
+            // Joined `k` lines occupy `sum(len + 1) - 1 <= budget` iff `sum(len + 1) <= budget + 1`.
+            // When per-line cuts are disabled, a first line that fits the body budget may take up to
+            // all of it without being cut.
+            let total = self.spec.budget.saturating_add(1);
+            match self.spec.truncate {
+                Truncate::None | Truncate::Head => (total, 0),
+                Truncate::Tail => (0, total),
+                Truncate::HeadTail => {
+                    let first_len = self.head.first().map_or_else(
+                        || {
+                            line.raw_uncut
+                                .as_ref()
+                                .filter(|(_, dropped)| *dropped == 0)
+                                .map_or(line.text.len(), |(prefix, _)| prefix.len())
+                        },
+                        |first| first.text.len(),
+                    ) + 1;
+                    let head = (total / 10).max(first_len.min(total));
+                    (head, total - head)
+                }
             }
         };
+        if !self.spec.line_cut {
+            let fits_whole_in = |budget: usize, line: &Line| -> bool {
+                match &line.raw_uncut {
+                    Some((prefix, 0)) => prefix.len() < budget,
+                    Some(_) => false,
+                    None => !line.cut && line.text.len() < budget,
+                }
+            };
+            let restore_whole = |line: &mut Line| {
+                if let Some((prefix, 0)) = &line.raw_uncut {
+                    line.text = prefix.clone();
+                    line.cut = false;
+                }
+            };
+            if self.head_open {
+                if fits_whole_in(head_budget, &line) {
+                    restore_whole(&mut line);
+                    let cost = line.text.len() + 1;
+                    if self.head_bytes + cost <= head_budget {
+                        self.head_bytes += cost;
+                        self.head.push(line);
+                        return;
+                    }
+                }
+                self.head_open = false;
+                if self.head.is_empty() && head_budget > 1 && self.spec.truncate != Truncate::Tail {
+                    if self.spec.truncate != Truncate::None {
+                        line.recut_to_budget(head_budget - 1);
+                    }
+                    if line.cut && line.text.is_empty() {
+                        merge_omitted(&mut self.omitted, line.number, line.number);
+                        return;
+                    }
+                    self.head_bytes += line.text.len() + 1;
+                    self.head.push(line);
+                    return;
+                }
+            }
+            if self.spec.truncate == Truncate::Tail {
+                // An earlier oversized tail line is replaced whole as soon as a later line follows.
+                if self.tail.front().is_some_and(|front| front.cut) {
+                    while let Some(dropped) = self.tail.pop_front() {
+                        merge_omitted(&mut self.omitted, dropped.number, dropped.number);
+                    }
+                    self.tail_bytes = 0;
+                }
+                if !fits_whole_in(tail_budget, &line) {
+                    if tail_budget <= 1 {
+                        merge_omitted(&mut self.omitted, line.number, line.number);
+                        return;
+                    }
+                    line.recut_to_budget(tail_budget - 1);
+                    if line.text.is_empty() {
+                        merge_omitted(&mut self.omitted, line.number, line.number);
+                        return;
+                    }
+                    while let Some(dropped) = self.tail.pop_front() {
+                        merge_omitted(&mut self.omitted, dropped.number, dropped.number);
+                    }
+                    self.tail_bytes = line.text.len() + 1;
+                    self.tail.push_back(line);
+                    return;
+                }
+                restore_whole(&mut line);
+            } else if !fits_whole_in(tail_budget, &line) {
+                while let Some(dropped) = self.tail.pop_front() {
+                    merge_omitted(&mut self.omitted, dropped.number, dropped.number);
+                }
+                self.tail_bytes = 0;
+                merge_omitted(&mut self.omitted, line.number, line.number);
+                return;
+            } else {
+                restore_whole(&mut line);
+            }
+            self.tail_bytes += line.text.len() + 1;
+            self.tail.push_back(line);
+            while self.tail_bytes > tail_budget {
+                let Some(dropped) = self.tail.pop_front() else {
+                    break;
+                };
+                self.tail_bytes -= dropped.text.len() + 1;
+                merge_omitted(&mut self.omitted, dropped.number, dropped.number);
+            }
+            return;
+        }
         let cost = line.text.len() + 1;
         if self.head_open {
             if self.head_bytes + cost <= head_budget {
@@ -571,12 +700,7 @@ impl<'a> WindowBuilder<'a> {
             if self.head.is_empty() && head_budget > 1 && self.spec.truncate != Truncate::Tail {
                 // A `None` line is already bounded by the cap, with the note that says so.
                 if self.spec.truncate != Truncate::None {
-                    if self.spec.line_cut || line.cut {
-                        line.cut |= cut_to(&mut line.text, head_budget);
-                    } else {
-                        line.cut = true;
-                        cut_line_to_budget(&mut line.text, head_budget - 1, 0);
-                    }
+                    line.cut |= cut_to(&mut line.text, head_budget);
                 }
                 if line.cut && line.text.is_empty() {
                     merge_omitted(&mut self.omitted, line.number, line.number);
@@ -587,44 +711,12 @@ impl<'a> WindowBuilder<'a> {
                 return;
             }
         }
-        if self.spec.line_cut {
-            if line.text.len() + 1 > tail_budget && tail_budget > 0 {
-                line.cut |= cut_to(&mut line.text, tail_budget);
-            }
-            if line.cut && line.text.is_empty() {
-                merge_omitted(&mut self.omitted, line.number, line.number);
-                return;
-            }
-        } else if self.spec.truncate == Truncate::Tail {
-            // An earlier oversized tail line is replaced whole as soon as a later line follows.
-            if self.tail.front().is_some_and(|front| front.cut) {
-                while let Some(dropped) = self.tail.pop_front() {
-                    merge_omitted(&mut self.omitted, dropped.number, dropped.number);
-                }
-                self.tail_bytes = 0;
-            }
-            if line.text.len() + 1 > tail_budget {
-                if tail_budget <= 1 {
-                    merge_omitted(&mut self.omitted, line.number, line.number);
-                    return;
-                }
-                if line.cut {
-                    let _ = cut_to(&mut line.text, tail_budget);
-                } else {
-                    line.cut = true;
-                    cut_line_to_budget(&mut line.text, tail_budget - 1, 0);
-                }
-                if line.text.is_empty() {
-                    merge_omitted(&mut self.omitted, line.number, line.number);
-                    return;
-                }
-                while let Some(dropped) = self.tail.pop_front() {
-                    merge_omitted(&mut self.omitted, dropped.number, dropped.number);
-                }
-                self.tail_bytes = line.text.len() + 1;
-                self.tail.push_back(line);
-                return;
-            }
+        if line.text.len() + 1 > tail_budget && tail_budget > 0 {
+            line.cut |= cut_to(&mut line.text, tail_budget);
+        }
+        if line.cut && line.text.is_empty() {
+            merge_omitted(&mut self.omitted, line.number, line.number);
+            return;
         }
         self.tail_bytes += line.text.len() + 1;
         self.tail.push_back(line);
@@ -649,11 +741,14 @@ impl<'a> WindowBuilder<'a> {
         }
         let mut lines = self.head;
         lines.extend(self.tail);
+        let cut_budget =
+            (!self.spec.line_cut && lines.iter().any(|line| line.cut)).then_some(self.spec.budget);
         Window {
             lines,
             truncate: self.spec.truncate,
             clean: self.spec.clean,
             line_cut: self.spec.line_cut,
+            cut_budget,
             source: self.spec.source,
             omitted: self.omitted,
             bad_lines: self.bad_lines,
@@ -1187,6 +1282,56 @@ mod tests {
         assert_eq!(cuts, 0);
         assert_eq!(omitted, Some((2, 2)));
 
+        // Exact-budget single line stays whole (no off-by-one premature cut) across all modes.
+        let exact_180 = format!("{}\n", "E".repeat(180));
+        for mode in [
+            Truncate::Head,
+            Truncate::Tail,
+            Truncate::HeadTail,
+            Truncate::None,
+        ] {
+            let out = build(&[exact_180.as_bytes()], mode, 180);
+            let (rendered, cuts, omitted) = out.fit(180);
+            assert_eq!(rendered.len(), 180, "{mode:?}");
+            assert_eq!(cuts, 0, "{mode:?}: {rendered}");
+            assert_eq!(omitted, None, "{mode:?}");
+        }
+
+        // HeadTail omits an oversized middle line while keeping fitting head and tail whole.
+        let sandwiched = format!("header\n{}\nfooter\n", "M".repeat(5_000));
+        let out = build(&[sandwiched.as_bytes()], Truncate::HeadTail, 200);
+        let (rendered, cuts, omitted) = out.fit(200);
+        assert!(
+            rendered.starts_with("header\n") && rendered.ends_with("\nfooter"),
+            "{rendered}"
+        );
+        assert_eq!(cuts, 0, "{rendered}");
+        assert_eq!(omitted, Some((2, 2)));
+
+        // Refitting an already budget-cut line to a tighter room re-cuts from the raw prefix
+        // instead of slicing inside the earlier marker or appending a second " … [cut]".
+        let over_300 = format!("{}\n", "R".repeat(300));
+        for mode in [Truncate::Head, Truncate::Tail, Truncate::HeadTail] {
+            let out = build(&[over_300.as_bytes()], mode, 256);
+            for room in [245_usize, 200, 120] {
+                let (refit, cuts, _) = out.fit(room);
+                assert_eq!(refit.len(), room, "{mode:?} room={room}: {refit}");
+                assert_eq!(cuts, 1, "{mode:?} room={room}");
+                assert!(
+                    refit.contains(&format!(" … [line cut at {room} bytes; ")),
+                    "{mode:?} room={room}: {refit}"
+                );
+                assert_eq!(refit.matches("line cut at ").count(), 1, "{refit}");
+                assert!(!refit.contains(" … [cut]"), "double-cut marker in {refit}");
+                let kept_r = refit.bytes().take_while(|&b| b == b'R').count();
+                let expected_dropped = 300 - kept_r;
+                assert!(
+                    refit.ends_with(&format!("{expected_dropped} more bytes]")),
+                    "{mode:?} room={room}: {refit}"
+                );
+            }
+        }
+
         // A line longer than the budget fits with its marker inside the budget across all
         // modes and never splits a multi-byte UTF-8 character.
         let multi = format!("{}\n", "🚀中".repeat(200));
@@ -1208,6 +1353,7 @@ mod tests {
             for room in 1..=200 {
                 let (refit, _, _) = out.fit(room);
                 assert!(refit.len() <= room, "{mode:?} room={room}: {}", refit.len());
+                assert!(refit.matches("line cut at ").count() <= 1, "{refit}");
             }
         }
     }

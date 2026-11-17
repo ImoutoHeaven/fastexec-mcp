@@ -1393,21 +1393,31 @@ impl Service {
             Some(ended) => ended.note(view.conditions),
             None => kill_pending_note(&task, &before).to_owned(),
         };
-        let reserved = status_line(&self.tasks, &task, &before, &task_reader, true).len()
-            + extra_note_before.len()
-            + NOTES_RESERVE
-            + footer.len()
-            + if task_reader.is_fresh() {
-                NEW_READER_NOTE.len()
-            } else {
-                0
-            };
+        let clean = !task.is_script();
+        let line_cut = !view.nested && !task.is_script() && view.truncate != Truncate::None;
+        let fresh_len = if task_reader.is_fresh() {
+            NEW_READER_NOTE.len()
+        } else {
+            0
+        };
+        let reserved = if line_cut {
+            status_line(&self.tasks, &task, &before, &task_reader, true).len()
+                + extra_note_before.len()
+                + NOTES_RESERVE
+                + footer.len()
+                + fresh_len
+        } else {
+            let need_log = needs_log_in_status(&before, 0, None);
+            status_line(&self.tasks, &task, &before, &task_reader, need_log).len()
+                + extra_note_before.len()
+                + 2
+                + footer.len()
+                + fresh_len
+        };
         let budget = match view.truncate {
             Truncate::None => none_limit(),
             _ => view.max_bytes.saturating_sub(reserved).max(MIN_BODY_BUDGET),
         };
-        let clean = !task.is_script();
-        let line_cut = !view.nested && !task.is_script() && view.truncate != Truncate::None;
         let (window, images, read) = tokio::task::spawn_blocking(move || {
             let mut read = StagedRead::new(state);
             let start = read.state.cursor;
@@ -1541,28 +1551,35 @@ impl Service {
         status_with_log.push_str(&transcript_note);
         let mut status_no_log = status_line(&self.tasks, &task, &snapshot, &task_reader, false);
         status_no_log.push_str(&transcript_note);
+        let line_cut = !view.nested && view.truncate != Truncate::None;
+        let fresh_len = if task_reader.is_fresh() {
+            NEW_READER_NOTE.len()
+        } else {
+            0
+        };
         let budget = match view.truncate {
             Truncate::None => none_limit(),
-            _ => view
+            _ if line_cut => view
                 .max_bytes
-                .saturating_sub(
-                    status_with_log.len()
-                        + NOTES_RESERVE
-                        + footer.len()
-                        + if task_reader.is_fresh() {
-                            NEW_READER_NOTE.len()
-                        } else {
-                            0
-                        },
-                )
+                .saturating_sub(status_with_log.len() + NOTES_RESERVE + footer.len() + fresh_len)
                 .max(MIN_BODY_BUDGET),
+            _ => {
+                let base_status = if needs_log_in_status(&snapshot, 0, None) {
+                    &status_with_log
+                } else {
+                    &status_no_log
+                };
+                view.max_bytes
+                    .saturating_sub(base_status.len() + 2 + footer.len() + fresh_len)
+                    .max(MIN_BODY_BUDGET)
+            }
         };
         let spec = WindowSpec {
             truncate: view.truncate,
             budget,
             raw: false,
             clean: true,
-            line_cut: !view.nested && view.truncate != Truncate::None,
+            line_cut,
             encoding: encoding_rs::UTF_8,
             source: "transcript",
         };
@@ -1692,35 +1709,37 @@ impl Service {
         empty: &str,
         structured: &mut Value,
     ) -> String {
-        let room = if view.truncate == Truncate::None {
-            usize::MAX
-        } else {
-            fit_status(&mut status_with_log, view.max_bytes, footer.len(), fresh);
-            view.max_bytes - status_with_log.len() - 2 - footer.len()
-        };
-        let (output, cut_lines, omitted) = window.fit(room);
-        let show_log = needs_log_in_status(snapshot, cut_lines, omitted);
-        let mut status = if show_log {
-            if view.truncate == Truncate::None && fresh {
-                status_with_log.push_str(NEW_READER_NOTE);
+        let (output, cut_lines, omitted, status, actual_room) = if view.truncate == Truncate::None {
+            let (output, cut_lines, omitted) = window.fit(usize::MAX);
+            let mut status = if needs_log_in_status(snapshot, cut_lines, omitted) {
+                status_with_log
+            } else {
+                status_no_log
+            };
+            if fresh {
+                status.push_str(NEW_READER_NOTE);
             }
-            status_with_log
+            (output, cut_lines, omitted, status, usize::MAX)
         } else {
-            let mut s = status_no_log;
-            if view.truncate == Truncate::None {
-                if fresh {
-                    s.push_str(NEW_READER_NOTE);
+            let mut no_log = status_no_log;
+            fit_status(&mut no_log, view.max_bytes, footer.len(), fresh);
+            let room_no_log = view.max_bytes - no_log.len() - 2 - footer.len();
+            if !needs_log_in_status(snapshot, 0, None) {
+                let (out_no_log, cuts_no_log, omit_no_log) = window.fit(room_no_log);
+                if cuts_no_log == 0 && omit_no_log.is_none() {
+                    (out_no_log, 0, None, no_log, room_no_log)
+                } else {
+                    fit_status(&mut status_with_log, view.max_bytes, footer.len(), fresh);
+                    let room_with_log = view.max_bytes - status_with_log.len() - 2 - footer.len();
+                    let (output, cut_lines, omitted) = window.fit(room_with_log);
+                    (output, cut_lines, omitted, status_with_log, room_with_log)
                 }
             } else {
-                fit_status(&mut s, view.max_bytes, footer.len(), fresh);
+                fit_status(&mut status_with_log, view.max_bytes, footer.len(), fresh);
+                let room_with_log = view.max_bytes - status_with_log.len() - 2 - footer.len();
+                let (output, cut_lines, omitted) = window.fit(room_with_log);
+                (output, cut_lines, omitted, status_with_log, room_with_log)
             }
-            s
-        };
-        let _ = &mut status;
-        let actual_room = if view.truncate == Truncate::None {
-            usize::MAX
-        } else {
-            view.max_bytes - status.len() - 2 - footer.len()
         };
         // A small maxBytes may leave no room for the placeholder.
         let body = if output.is_empty() {
@@ -2903,7 +2922,7 @@ mod tests {
         let footer = "\n(999999 tasks; use list.)";
         assert_eq!(footer.len(), 26);
         for digits in [1, 13] {
-            let handle = format!("{}-{}.abcd", "0".repeat(26), "z".repeat(digits));
+            let handle = format!("{}-{}.abcd", "0".repeat(8), "z".repeat(digits));
             for state in [
                 "running",
                 "exited 255",

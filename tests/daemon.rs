@@ -2151,6 +2151,28 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
     let id1 = Endpoint::task_id(&t1, &t1_text);
     let id2 = Endpoint::task_id(&t2, &t2_text);
 
+    let mut ep_cm = Endpoint::start_with(&fixture, |cmd| {
+        cmd.env("FASTEXEC_CODEMODE", "true");
+    });
+    let nested_first = ep_cm.request(
+        "tools/call",
+        json!({
+            "name": "codemode",
+            "arguments": {
+                "code": "await tools.exec({action: 'start', loginShell: false, command: 'true'}); return 'ok';"
+            }
+        }),
+    );
+    let nested_outer_text = nested_first["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        nested_outer_text.contains(
+            "(Background: 2 tasks running outside this session; use list with scope \"all\".)"
+        ),
+        "nested exec inside codemode must not swallow outer session's first outside-task notice: {nested_outer_text}"
+    );
+
     let (_, tiny_text, tiny_err) = ep_b.call(json!({
         "action": "start",
         "loginShell": false,
@@ -2188,7 +2210,7 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
     let (sess_list, _, _) = ep_b.call(json!({"action": "list"}));
     assert_eq!(sess_list["totalCount"], 3, "{sess_list}");
     let (all_list, _, _) = ep_b.call(json!({"action": "list", "scope": "all"}));
-    assert_eq!(all_list["totalCount"], 5, "{all_list}");
+    assert_eq!(all_list["totalCount"], 7, "{all_list}");
 
     // Stale 8-char base32 epoch in daemon mode reports an earlier daemon; malformed ID says Unknown taskId.
     let (_, stale_text, stale_err) = ep_b.call(json!({"action": "poll", "taskId": "01234567-9z"}));
@@ -2203,6 +2225,23 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
             && !bad_text.contains("earlier fastexec daemon"),
         "{bad_text}"
     );
+
+    // Closing ep_b sends Bye (dropping its session); a newly connected session starts fresh and shows the count again.
+    drop(ep_b);
+    let mut ep_c = Endpoint::start(&fixture);
+    let (_, fresh_text, fresh_err) = ep_c.call(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "true"
+    }));
+    assert!(
+        !fresh_err
+            && fresh_text.contains(
+                "(Background: 2 tasks running outside this session; use list with scope \"all\".)"
+            ),
+        "{fresh_text}"
+    );
+    drop(ep_c);
 
     ep_a.call(json!({"action": "kill", "taskId": id1}));
     ep_a.call(json!({"action": "kill", "taskId": id2}));

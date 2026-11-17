@@ -27,7 +27,7 @@ execution, naming `exec` actions in lowercase.
 
 | Action | Allowed Parameters | Summary |
 | --- | --- | --- |
-| `start` | `command`, `cwd`, `pty`, `loginShell`, `input`, `eof`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Rejects NUL bytes in `command` before execution, then spawns it in GNU bash and waits up to `waitMs` (default `30000`, range `0–240000` on direct calls; unbounded by default without `returnWhen` in nested `codemode` calls). Pipe mode defaults stdin to `/dev/null`, writes `input` (`<= 1` MiB UTF-8) and closes stdin unless `eof: false`, or keeps stdin open with `eof: false`; PTY mode rejects `input` and `eof` on `start` and defaults size to `120×30`. |
+| `start` | `command`, `cwd`, `pty`, `loginShell`, `input`, `eof`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Rejects NUL bytes in `command` before execution, then spawns it in GNU bash and waits up to `waitMs` (default `30000`, range `0–240000` on direct calls; unbounded by default without `returnWhen` in nested `codemode` calls). Pipe mode defaults stdin to `/dev/null`, writes `input` (`<= 1` MiB UTF-8) and closes stdin unless `eof: false`, or keeps stdin open with `eof: false`; PTY mode rejects `input` and `eof: true` on `start` (`eof: false` is a no-op) and defaults size to `120×30`. |
 | `poll` | `taskId`, `cols`, `rows`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Resizes the terminal (PTY only), writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only, idempotent when already closed), waits (`2000` ms with a resize, `input`, or `keys` and no `returnWhen`; `30000` ms on direct calls or with `returnWhen`; unbounded by default on nested `codemode` waits without `returnWhen` or input), and returns unseen output. |
 | `kill` | `taskId`, `truncate`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns unseen output through the reader gate without `waitEndedBy` (`head_tail` default on direct calls; uncut `none` window up to `4` MiB on nested calls). On a finished `keepTree` task, ends held processes while keeping the root exit result. |
 | `list` | `scope`, `state`, `limit`, `truncate`, `maxBytes` | Lists bare task IDs newest first filtered by `scope` (`"session"` default or `"all"`), `state` (`"active"` or `"finished"`; omitted lists both), and `limit` (`1–500`, default `20`), reporting `totalCount` before `limit`; creates no readers and marks only delivered entries. |
@@ -108,9 +108,10 @@ guidance in server `instructions`. Its required `code` is an async
 function body with top-level `await` and `return`, up to 256 KiB of UTF-8,
 nonempty after trimming and without NUL bytes. Unknown parameters are refused.
 It shares `exec start`'s directory, wait, and output options except `raw`:
-`cwd`, `waitMs`, `killAfterMs`, `truncate` (default `none` up to `maxBytes`,
-cutting only lines over budget), `maxBytes`, and `returnWhen`
-(`outputContains`, `quietMs`). Schema-decoding failures return a tool error
+`cwd`, `waitMs`, `killAfterMs`, `truncate` (default `head_tail`, keeping lines
+uncut up to `maxBytes`; `none` returns whole lines up to `4` MiB and cannot
+combine with `maxBytes`), `maxBytes`, and `returnWhen` (`outputContains`,
+`quietMs`). Schema-decoding failures return a tool error
 without `structuredContent`; parameter validation and admission failures return
 `isError: true` with `structuredContent` (`ok: false`, `action: "codemode"`)
 without creating a task.
@@ -151,11 +152,12 @@ validation, file, and integrity failures reject with `ToolError` (`name:
 output, ...}` (keeping lines uncut up to `maxBytes` or the `4` MiB default `none`
 window, and waiting with no `waitMs` ceiling unless `waitMs`, `returnWhen`, or
 input/resize/keys supplies one); text `read` returns up to `50000` lines and
-`1` MiB per call as `{path, text, truncated, nextOffset?, startLine, endLine,
-shownLines, totalLines, lineTooLong?, lossy?}`; image `read` returns `{path,
-attached: true, image, mimeType, bytes, originalBytes, resized}` or `{path,
-attached: false, note}` (`image()` throws `TypeError` with `note` when
-`attached` is `false`); `write` returns `{path, bytes}`; and `edit` returns
+`1` MiB per call as `{kind: "text", path, text, startLine, endLine, shownLines,
+totalLines, truncated, nextOffset, lineTooLong, lossy}`; image `read` returns
+`{kind: "image", path, mimeType, attached: true, originalWidth, originalHeight,
+width, height, image: {type: "image", data, mimeType}}` or `{kind: "image",
+path, mimeType, attached: false, originalWidth, originalHeight, width, height,
+note}` (`image()` throws `TypeError` with `note` when `attached` is `false`); `write` returns `{path, bytes}`; and `edit` returns
 `{path, replacements, edits}`. Eight nested calls run at once, with
 1024 queued calls; additional calls reject with RangeError. Pending tool
 arguments and results have a separate 128 MiB budget per script; exceeding it
@@ -403,19 +405,20 @@ omitted on final serialization unless noted as always-present below.
   close (`BrokenPipe` or Windows pipe-closed codes `109`/`232`/`233`) sets
   `inputWarning: "stdin closed after N of M bytes"` with `ok: true`, whereas
   other initial write failures or any `poll` write failure set `ok: false` and
-  `inputError`; the writer joins within the `5` s capture drain before final
-  state publication. Output capture or log write failures also set `ok: false`
-  and `isError: true` while preserving `exitCode` and captured output. Warnings
-  stay whole regardless of `maxBytes`.
-- **Background footer**: Appended to `start`, `poll`, `kill`, and `transcript`
-  results (up to `512` bytes and `maxBytes / 4`) naming up to three other tasks
-  this session has addressed, using bare task IDs. HTTP clients sharing a token
-  share this scope. Running tasks (or tasks holding processes) outside this
-  session appear **at most once per session** as `1 task running outside this
-  session; use list with scope "all".` or `<n> tasks running outside this
-  session; use list with scope "all".`; the session flag is consumed only when
-  a delivered response actually renders that clause (never on cancelled calls or
-  tiny budgets that drop it). A footer marks only session tasks it names; `list`
+  `inputError`; the writer joins within the `2` s post-tree output drain before
+  final state publication. Output capture or log write failures also set
+  `ok: false` and `isError: true` while preserving `exitCode` and captured
+  output. Warnings stay whole regardless of `maxBytes`.
+- **Background footer**: Appended to `start`, `poll`, `kill`, `transcript`, and
+  `codemode` results (up to `512` bytes and `maxBytes / 4`) naming up to three
+  other tasks this session has addressed, using bare task IDs. HTTP clients
+  sharing a token share this scope. Running tasks (or tasks holding processes)
+  outside this session appear **at most once per session** as `1 task running
+  outside this session; use list with scope "all".` or `<n> tasks running
+  outside this session; use list with scope "all".`; the session flag is
+  consumed atomically when a delivered response shows that clause or when the
+  session's first committed footer-bearing result finds no outside tasks (never
+  on nested calls, cancelled calls, or tiny budgets that drop a non-zero count). A footer marks only session tasks it names; `list`
   marks only shown tasks' existing session entries.
 
 ## 3. Logs, Terminal Emulator, and Transcript Spool
@@ -620,7 +623,8 @@ omitted on final serialization unless noted as always-present below.
   absent daemon is started, and one that is there but does not answer in time is
   reported instead. A call whose connection fails after it was sent returns an
   error naming the call, request ID, session, and daemon epoch — the action for
-  `exec`, the tool for `read`, `write`, and `edit` — and is not replayed.
+  `exec`, the tool for `codemode`, `read`, `write`, and `edit` — and is not
+  replayed.
   `list` shows each task's owner and, for a call through this endpoint, the
   session and call ID that started it; both are null for a task started in the
   default mode or over HTTP.
@@ -638,7 +642,7 @@ omitted on final serialization unless noted as always-present below.
   owner-only DACL that rejects remote clients, or a Unix socket at
   `ns/<namespace>/sock` when that path fits in `100` bytes, else at
   `/tmp/fastexec-<uid>/<namespace>.sock`. Frames are length-prefixed JSON, and a
-  call names its tool (`exec`, `read`, `write`, `edit`). The endpoint refuses a
+  call names its tool (`exec`, `codemode`, `read`, `write`, `edit`). The endpoint refuses a
   call whose serialized arguments pass `3` MiB before writing it (sizing for up
   to `1` MiB of JSON-escaped `start` `input`), a request frame
   is at most `4` MiB (a `Hello` carries the endpoint's environment), a response

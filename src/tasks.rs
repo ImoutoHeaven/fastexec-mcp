@@ -82,7 +82,7 @@ pub struct Tasks {
     dir: PathBuf,
     /// Arms `killAfterMs`: the deadline belongs to the Core, not to the starting request.
     handle: Handle,
-    /// This server's ID epoch: 128 bits from the OS random source as 26 Crockford base32
+    /// This server's ID epoch: 40 bits from the OS random source as 8 Crockford base32
     /// characters. Every task ID starts with it, so an ID from another server is told apart.
     epoch: String,
     /// The counter value of the next ID; IDs never repeat within an epoch.
@@ -278,34 +278,42 @@ impl Workers {
                 for message in job.received {
                     let total = message.bytes.len();
                     let mut written = 0usize;
-                    let write_res: std::io::Result<()> = match input.as_mut() {
-                        None => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-                        Some(writer) => (|| {
-                            while written < total {
-                                match writer.write(&message.bytes[written..]) {
-                                    Ok(0) => {
-                                        return Err(std::io::Error::new(
-                                            std::io::ErrorKind::WriteZero,
-                                            "write returned 0 bytes",
-                                        ));
+                    let write_res: std::io::Result<()> = if total == 0 {
+                        Ok(())
+                    } else {
+                        match input.as_mut() {
+                            None => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                            Some(writer) => (|| {
+                                while written < total {
+                                    match writer.write(&message.bytes[written..]) {
+                                        Ok(0) => {
+                                            return Err(std::io::Error::new(
+                                                std::io::ErrorKind::WriteZero,
+                                                "write returned 0 bytes",
+                                            ));
+                                        }
+                                        Ok(count) => written += count,
+                                        Err(err)
+                                            if err.kind() == std::io::ErrorKind::Interrupted =>
+                                        {
+                                            continue;
+                                        }
+                                        Err(err) => return Err(err),
                                     }
-                                    Ok(count) => written += count,
-                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                                        continue;
-                                    }
-                                    Err(err) => return Err(err),
                                 }
-                            }
-                            loop {
-                                match writer.flush() {
-                                    Ok(()) => return Ok(()),
-                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                                        continue;
+                                loop {
+                                    match writer.flush() {
+                                        Ok(()) => return Ok(()),
+                                        Err(err)
+                                            if err.kind() == std::io::ErrorKind::Interrupted =>
+                                        {
+                                            continue;
+                                        }
+                                        Err(err) => return Err(err),
                                     }
-                                    Err(err) => return Err(err),
                                 }
-                            }
-                        })(),
+                            })(),
+                        }
                     };
                     job.task.queued.fetch_sub(total, Ordering::SeqCst);
                     let delivered = match write_res {
@@ -834,10 +842,14 @@ impl Tasks {
         let Some(limit) = kill_after_ms.filter(|&limit| limit > 0) else {
             return;
         };
+        let Some(deadline) = tokio::time::Instant::now().checked_add(Duration::from_millis(limit))
+        else {
+            return;
+        };
         let (expiring, mut done) = (Arc::clone(task), task.tree_done());
         self.handle.spawn(async move {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(limit)) => expiring.expire(),
+                _ = tokio::time::sleep_until(deadline) => expiring.expire(),
                 _ = done.wait_for(|done| *done) => {}
             }
         });
@@ -2002,6 +2014,13 @@ impl Task {
         }
         drop(end);
         self.activity.send_replace(());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_io_errors(&self, capture_error: Option<&str>, log_error: Option<&str>) {
+        let mut out = lock(&self.out);
+        out.capture_error = capture_error.map(str::to_owned);
+        out.log_error = log_error.map(str::to_owned);
     }
 
     pub fn is_script(&self) -> bool {
@@ -4115,6 +4134,93 @@ mod script_tests {
         assert!(!first.exists() && !second.exists());
         assert!(task.images_between(0, 20, 0).is_empty());
         assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn eof_only_poll_after_initial_broken_pipe_stays_idempotent_and_huge_deadline_is_safe() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let mut args = script_args(&tasks);
+        args.kill_after_ms = Some(u64::MAX);
+        let (task, _, _) = tasks.start_script(args, &session, "r001".into()).unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        assert_eq!(task.snapshot().exit_code, Some(0));
+
+        // Deterministic race: initial input hits BrokenPipe while an empty-bytes eof: true
+        // message is already queued behind it in the same writer channel.
+        let workers = Workers::new(true).unwrap();
+        let (pipe_reader, pipe_writer) = std::io::pipe().unwrap();
+        drop(pipe_reader);
+        let (input_tx, input_rx) = mpsc::channel();
+        let payload = vec![b'x'; 4096];
+        task.queued.store(payload.len(), Ordering::SeqCst);
+        *lock(&task.input) = Some(input_tx.clone());
+        input_tx
+            .send(Input {
+                bytes: payload,
+                eof: false,
+                initial: true,
+                done: None,
+            })
+            .unwrap();
+        let (eof_done_tx, eof_done_rx) = oneshot::channel();
+        input_tx
+            .send(Input {
+                bytes: Vec::new(),
+                eof: true,
+                initial: false,
+                done: Some(eof_done_tx),
+            })
+            .unwrap();
+        drop(input_tx);
+        let done_sig = WriterDone::new(false);
+        workers
+            .input
+            .unwrap()
+            .send(InputWork {
+                task: Arc::clone(&task),
+                input: Box::new(pipe_writer),
+                received: input_rx,
+                done_signal: Arc::clone(&done_sig),
+            })
+            .unwrap();
+        let eof_res = runtime.block_on(eof_done_rx).unwrap();
+        assert_eq!(
+            eof_res,
+            Ok(()),
+            "idempotent eof close after BrokenPipe failed"
+        );
+        done_sig.wait_until(Instant::now() + Duration::from_secs(2));
+        let snap = task.snapshot();
+        assert!(
+            snap.input_warning.as_deref().is_some_and(
+                |w| w.starts_with("stdin closed after ") && w.ends_with(" of 4096 bytes")
+            ),
+            "{:?}",
+            snap.input_warning
+        );
+        assert!(snap.input_error.is_none(), "{:?}", snap.input_error);
+
+        // Concurrent claim_outside admits at most one claimant; release restores it; consume seals it.
+        let fresh_session = Session::new(
+            "fresh".into(),
+            "fresh".into(),
+            Arc::new(LaunchContext::current().unwrap()),
+        );
+        let mut c1 = fresh_session.claim_outside();
+        let c2 = fresh_session.claim_outside();
+        assert!(c1.is_claimed() && !c2.is_claimed());
+        c1.release();
+        let c3 = fresh_session.claim_outside();
+        assert!(c3.is_claimed());
+        c3.consume();
+        assert!(!fresh_session.claim_outside().is_claimed());
+
         tasks.shutdown();
     }
 }

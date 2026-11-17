@@ -2561,6 +2561,52 @@ mod tests {
         assert_eq!(state.exit_code, Some(0), "{output}");
         assert!(output.contains("helpers-ok"), "{output}");
 
+        // End-to-end JS ToolError on injected captureError and logError: non-empty message
+        // built from diagnostics and full report (output, exitCode, diagnostic) in err.result,
+        // plus 1025th queued call (8 active + 1024 queued + 1 = 1033) rejecting with RangeError.
+        let seeded = fixture.start("text('partial-out'); throw new Error('boom');", None);
+        complete(&seeded).await;
+        seeded.inject_io_errors(Some("pty pipe lost"), Some("disk full"));
+        let seeded_id = seeded.id.clone();
+        let (io_state, io_out) = fixture
+            .result(&format!(
+                r#"
+                let caught = null;
+                try {{
+                    await tools.exec({{action: "poll", taskId: {seeded_id:?}, waitMs: 0}});
+                }} catch (e) {{
+                    caught = e;
+                }}
+                if (!caught || caught.name !== "ToolError" || caught.tool !== "exec") {{
+                    throw new Error("expected ToolError: " + String(caught));
+                }}
+                if (!caught.message.includes("output capture failed: pty pipe lost") ||
+                    !caught.message.includes("log write failed: disk full")) {{
+                    throw new Error("unexpected ToolError.message: " + caught.message);
+                }}
+                if (caught.result.exitCode !== 1 ||
+                    !caught.result.output.startsWith("partial-out\n") ||
+                    caught.result.captureError !== "pty pipe lost" ||
+                    caught.result.logError !== "disk full") {{
+                    throw new Error("unexpected ToolError.result: " + JSON.stringify(caught.result));
+                }}
+
+                const settled = await Promise.allSettled(
+                    Array.from({{length: 1033}}, () => tools.read({{path: "ok.png"}}))
+                );
+                const rangeErrors = settled.filter(
+                    s => s.status === "rejected" && s.reason instanceof RangeError
+                );
+                if (rangeErrors.length !== 1) {{
+                    throw new Error("expected 1 RangeError at 1025th queued call, got " + rangeErrors.length);
+                }}
+                return "io-and-queue-ok";
+                "#
+            ))
+            .await;
+        assert_eq!(io_state.exit_code, Some(0), "{io_out}");
+        assert!(io_out.contains("io-and-queue-ok"), "{io_out}");
+
         // Integrity failure without top-level `error` builds ToolError.message from inputError
         // and preserves output, exitCode, and diagnostics in ToolError.result.
         let mut synth =
