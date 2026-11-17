@@ -2611,7 +2611,7 @@ fn state_of(pid: u32) -> String {
 }
 
 /// Waits, bounded, for a probe to answer.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn wait_until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
