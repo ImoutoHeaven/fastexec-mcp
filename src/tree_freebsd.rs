@@ -61,14 +61,91 @@ fn control<T>(pid: libc::pid_t, command: libc::c_int, data: &mut T) -> io::Resul
     Ok(())
 }
 
-fn status(host: libc::pid_t) -> io::Result<ReaperStatus> {
-    let mut status = ReaperStatus::default();
-    control(host, libc::PROC_REAP_STATUS, &mut status)?;
-    // A dead host must never redirect an operation to its ancestor's reaper.
-    if status.flags & OWNED == 0 || status.reaper != host {
-        return Err(io::Error::other("the task host no longer owns its reaper"));
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostExit {
+    /// Not a child of this process or still running outside `exit1()`.
+    Running,
+    /// Exited normally with code 0 after `waitpid(-1)` reached `ECHILD`.
+    Clean,
+    /// Terminated by signal or non-zero exit status.
+    Abnormal,
+}
+
+enum HostReaper {
+    Active(ReaperStatus),
+    CleanExit,
+    Gone(io::Error),
+}
+
+/// Peeks at an unreaped direct child `host` with `WNOWAIT` so `Child::reap` still reaps it.
+/// When `PROC_REAP_STATUS` observed `OWNED == 0`, `host` is inside `exit1()` clearing its reaper
+/// microseconds before `PRS_ZOMBIE` becomes visible to `waitid`, so `wait_for_zombie` polls briefly.
+fn host_exit(host: libc::pid_t, wait_for_zombie: bool) -> HostExit {
+    let attempts = if wait_for_zombie { 50 } else { 1 };
+    for attempt in 0..attempts {
+        // SAFETY: zeroed siginfo_t is valid for waitid; WNOWAIT leaves the zombie unreaped.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                host as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc == 0 {
+            if info.si_pid == host {
+                return if info.si_code == libc::CLD_EXITED && info.si_status == 0 {
+                    HostExit::Clean
+                } else {
+                    HostExit::Abnormal
+                };
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            return HostExit::Running;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return HostExit::Running;
     }
-    Ok(status)
+    HostExit::Running
+}
+
+fn host_status(host: libc::pid_t) -> io::Result<HostReaper> {
+    let mut status = ReaperStatus::default();
+    match control(host, libc::PROC_REAP_STATUS, &mut status) {
+        Ok(()) if status.flags & OWNED != 0 && status.reaper == host => {
+            Ok(HostReaper::Active(status))
+        }
+        // A dead or exiting host must never redirect an operation to its ancestor's reaper.
+        Ok(()) => match host_exit(host, true) {
+            HostExit::Clean => Ok(HostReaper::CleanExit),
+            HostExit::Abnormal => Ok(HostReaper::Gone(io::Error::other(
+                "the task host exited abnormally",
+            ))),
+            HostExit::Running => Err(io::Error::other("the task host no longer owns its reaper")),
+        },
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => match host_exit(host, false) {
+            HostExit::Clean => Ok(HostReaper::CleanExit),
+            HostExit::Abnormal | HostExit::Running => Ok(HostReaper::Gone(error)),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn nested_status(reaper: libc::pid_t) -> io::Result<Option<ReaperStatus>> {
+    let mut status = ReaperStatus::default();
+    match control(reaper, libc::PROC_REAP_STATUS, &mut status) {
+        Ok(()) if status.flags & OWNED != 0 && status.reaper == reaper => Ok(Some(status)),
+        Ok(()) => Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub enum KillResult {
@@ -81,13 +158,13 @@ pub enum KillResult {
 /// Kernel-selected descendants include nested reapers; signal delivery does not prove completion.
 pub fn kill(host: libc::pid_t) -> io::Result<KillResult> {
     for _ in 0..40 {
-        match status(host) {
-            Ok(status) if status.descendants == 0 => return Ok(KillResult::EmptyHost),
-            Ok(_) => {}
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
-                return Ok(KillResult::HostGone);
+        match host_status(host)? {
+            HostReaper::Active(status) if status.descendants == 0 => {
+                return Ok(KillResult::EmptyHost);
             }
-            Err(error) => return Err(error),
+            HostReaper::Active(_) => {}
+            HostReaper::CleanExit => return Ok(KillResult::EmptyHost),
+            HostReaper::Gone(_) => return Ok(KillResult::HostGone),
         }
         let mut request = ReaperKill {
             signal: libc::SIGKILL,
@@ -98,8 +175,8 @@ pub fn kill(host: libc::pid_t) -> io::Result<KillResult> {
             padding: [0; 15],
         };
         match control(host, libc::PROC_REAP_KILL, &mut request) {
-            // Some kernels also use ESRCH when signal permission hides every target. Only
-            // the next STATUS query, never this return code, proves the reaper is empty.
+            // Some kernels also use ESRCH when signal permission hides every target, or when the
+            // host exited after status was read. Only the next host_status query proves why.
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
             result => result?,
         }
@@ -120,8 +197,13 @@ pub fn kill(host: libc::pid_t) -> io::Result<KillResult> {
     ))
 }
 
-fn descendants(host: libc::pid_t) -> io::Result<Vec<ReaperPid>> {
-    let mut count = status(host)?.descendants.saturating_add(16);
+/// Returns `Ok(None)` when `reaper` exited or released its reaper before/during `GETPIDS`, so
+/// `GETPIDS` results that may have redirected to an ancestor reaper are discarded and retried.
+fn descendants(
+    reaper: libc::pid_t,
+    initial_descendants: u32,
+) -> io::Result<Option<Vec<ReaperPid>>> {
+    let mut count = initial_descendants.saturating_add(16);
     // A full array can hide a concurrent fork: grow and retry instead of reporting an incomplete tree.
     for _ in 0..8 {
         let mut pids = vec![ReaperPid::default(); count as usize];
@@ -130,10 +212,19 @@ fn descendants(host: libc::pid_t) -> io::Result<Vec<ReaperPid>> {
             padding: [0; 15],
             pids: pids.as_mut_ptr(),
         };
-        control(host, libc::PROC_REAP_GETPIDS, &mut request)?;
+        match control(reaper, libc::PROC_REAP_GETPIDS, &mut request) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        // Re-verify reaper ownership after GETPIDS: if reaper entered exit1() mid-call, GETPIDS
+        // could have read its ancestor reaper instead of its own table.
+        if nested_status(reaper)?.is_none() {
+            return Ok(None);
+        }
         if let Some(end) = pids.iter().position(|pid| pid.flags & VALID == 0) {
             pids.truncate(end);
-            return Ok(pids);
+            return Ok(Some(pids));
         }
         count = count
             .checked_mul(2)
@@ -172,43 +263,60 @@ fn info(pid: libc::pid_t) -> io::Result<Option<libc::kinfo_proc>> {
 }
 
 pub fn members(host: libc::pid_t) -> io::Result<Vec<Member>> {
-    let mut pending = vec![host];
-    let mut seen = std::collections::HashSet::new();
-    let mut members = Vec::new();
-    while let Some(reaper) = pending.pop() {
-        for pid in descendants(reaper)? {
-            if !seen.insert(pid.pid) {
-                continue;
-            }
-            let name = match info(pid.pid) {
-                Ok(Some(info)) => {
-                    if info.ki_stat == libc::SZOMB {
-                        continue;
-                    }
-                    let bytes: Vec<u8> = info
-                        .ki_comm
-                        .iter()
-                        .take_while(|byte| **byte != 0)
-                        .map(|byte| *byte as u8)
-                        .collect();
-                    String::from_utf8_lossy(&bytes).into_owned()
-                }
-                Ok(None) => continue,
-                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
-                // A process hidden by credential policy is still owned and must stay visible as held.
-                Err(_) => "unknown".into(),
+    'scan: for _ in 0..8 {
+        let root = match host_status(host)? {
+            HostReaper::Active(status) => status,
+            HostReaper::CleanExit => return Ok(Vec::new()),
+            HostReaper::Gone(error) => return Err(error),
+        };
+        let mut pending = vec![(host, root.descendants)];
+        let mut seen = std::collections::HashSet::new();
+        let mut members = Vec::new();
+        while let Some((reaper, initial_descendants)) = pending.pop() {
+            let Some(pids) = descendants(reaper, initial_descendants)? else {
+                // Either host exited mid-query (re-checked via host_status on the next pass) or a
+                // nested reaper exited and reparented its children to host.
+                continue 'scan;
             };
-            members.push(Member {
-                pid: pid.pid as u32,
-                name,
-            });
-            if pid.flags & REAPER != 0 {
-                pending.push(pid.pid);
+            for pid in pids {
+                if !seen.insert(pid.pid) {
+                    continue;
+                }
+                let name = match info(pid.pid) {
+                    Ok(Some(info)) => {
+                        if info.ki_stat == libc::SZOMB {
+                            continue;
+                        }
+                        let bytes: Vec<u8> = info
+                            .ki_comm
+                            .iter()
+                            .take_while(|byte| **byte != 0)
+                            .map(|byte| *byte as u8)
+                            .collect();
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    }
+                    Ok(None) => continue,
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+                    // A process hidden by credential policy is still owned and must stay visible as held.
+                    Err(_) => "unknown".into(),
+                };
+                members.push(Member {
+                    pid: pid.pid as u32,
+                    name,
+                });
+                if pid.flags & REAPER != 0
+                    && let Some(sub) = nested_status(pid.pid)?
+                {
+                    pending.push((pid.pid, sub.descendants));
+                }
             }
         }
+        members.sort_by_key(|member| member.pid);
+        return Ok(members);
     }
-    members.sort_by_key(|member| member.pid);
-    Ok(members)
+    Err(io::Error::other(
+        "process tree changed during every membership query",
+    ))
 }
 
 #[cfg(test)]
@@ -224,5 +332,36 @@ mod tests {
             64 + std::mem::size_of::<*mut ReaperPid>()
         );
         assert_eq!(std::mem::size_of::<ReaperKill>(), 80);
+    }
+
+    #[test]
+    fn unreaped_clean_exit_reports_empty_tree_while_signal_exit_stays_unconfirmed() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let mut clean = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut eof = Vec::new();
+        clean.stdout.take().unwrap().read_to_end(&mut eof).unwrap();
+        let clean_pid = clean.id() as libc::pid_t;
+        assert!(matches!(host_exit(clean_pid, true), HostExit::Clean));
+        assert!(members(clean_pid).unwrap().is_empty());
+        assert!(matches!(kill(clean_pid).unwrap(), KillResult::EmptyHost));
+        assert!(clean.wait().unwrap().success());
+
+        let mut killed = Command::new("/bin/sh")
+            .args(["-c", "kill -KILL $$"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        killed.stdout.take().unwrap().read_to_end(&mut eof).unwrap();
+        let killed_pid = killed.id() as libc::pid_t;
+        assert!(matches!(host_exit(killed_pid, true), HostExit::Abnormal));
+        assert!(members(killed_pid).is_err());
+        assert!(matches!(kill(killed_pid).unwrap(), KillResult::HostGone));
+        assert!(!killed.wait().unwrap().success());
     }
 }
