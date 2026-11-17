@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 int main(int argc, char **argv) {
-    if (argc != 3 || procctl(P_PID, 0, PROC_REAP_ACQUIRE, NULL) != 0)
+    if ((argc != 3 && argc != 4) || procctl(P_PID, 0, PROC_REAP_ACQUIRE, NULL) != 0)
         return 1;
     alarm(60);
     pid_t child = fork();
@@ -29,6 +29,14 @@ int main(int argc, char **argv) {
             fputs("x\n", beat);
             fclose(beat);
             usleep(100000);
+        }
+        return 0;
+    }
+    if (argc == 4) {
+        while (access(argv[3], F_OK) != 0) {
+            if (errno != ENOENT)
+                return 7;
+            usleep(1000);
         }
         return 0;
     }

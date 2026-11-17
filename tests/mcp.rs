@@ -3272,8 +3272,6 @@ fn freebsd_nested_reapers_keep_detached_descendants_owned() {
     std::fs::create_dir(&*dir).unwrap();
     let source = dir.join("reaper.c");
     let fixture = dir.join("reaper");
-    let beat = dir.join("beat");
-    let mark = dir.join("pids");
     std::fs::write(&source, include_str!("fixtures/freebsd-reaper.c")).unwrap();
     assert!(
         Command::new("cc")
@@ -3285,30 +3283,58 @@ fn freebsd_nested_reapers_keep_detached_descendants_owned() {
             .success(),
         "the nested reaper fixture did not compile"
     );
-    let mut server = Server::start();
-    let (out, text) = server.ok(json!({
-        "action": "start", "keepTree": true, "waitMs": 10000,
-        "command": format!("'{}' '{}' '{}' & echo started",
-            fixture.display(), beat.display(), mark.display()),
-    }));
-    assert_eq!(out["keptRunning"], true, "{text}");
-    wait_for_heartbeat(&beat);
-    let pids: Vec<u64> = std::fs::read_to_string(mark)
-        .unwrap()
-        .split_whitespace()
-        .map(|pid| pid.parse().unwrap())
-        .collect();
-    assert_eq!(pids.len(), 2);
-    let (list, text) = server.ok(json!({"action": "list"}));
-    let held = list["tasks"][0]["held"].as_array().unwrap();
-    for pid in pids {
-        assert!(
-            held.iter().any(|member| member["pid"] == pid),
-            "the nested reaper member {pid} was lost: {text}"
-        );
+    for handover in [false, true] {
+        let beat = dir.join(format!("beat-{handover}"));
+        let mark = dir.join(format!("pids-{handover}"));
+        let release = dir.join("release");
+        let release_arg = if handover {
+            format!(" '{}'", release.display())
+        } else {
+            String::new()
+        };
+        let mut server = Server::start();
+        let (out, text) = server.ok(json!({
+            "action": "start", "keepTree": true, "waitMs": 10000,
+            "command": format!("'{}' '{}' '{}'{release_arg} & echo started",
+                fixture.display(), beat.display(), mark.display()),
+        }));
+        assert_eq!(out["keptRunning"], true, "{text}");
+        wait_for_heartbeat(&beat);
+        let pids: Vec<u64> = std::fs::read_to_string(mark)
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2);
+        let (list, text) = server.ok(json!({"action": "list"}));
+        let held = list["tasks"][0]["held"].as_array().unwrap();
+        for &pid in &pids {
+            assert!(
+                held.iter().any(|member| member["pid"] == pid),
+                "the nested reaper member {pid} was lost: {text}"
+            );
+        }
+        if handover {
+            std::fs::write(release, b"exit").unwrap();
+            wait_until(
+                "the nested reaper naturally hands its child to the host",
+                || {
+                    let (list, _) = server.ok(json!({"action": "list"}));
+                    let held = list["tasks"][0]["held"].as_array().unwrap();
+                    (list["tasks"][0]["keptRunning"] == true
+                        && held.len() == 1
+                        && held[0]["pid"] == pids[1])
+                        .then_some(())
+                },
+            );
+            let before = file_len(&beat);
+            wait_until("the handed-over child still writes", || {
+                (file_len(&beat) > before).then_some(())
+            });
+        }
+        server.ok(json!({"action": "kill", "taskId": server.id(1), "waitMs": 5000}));
+        assert_stops_growing(&beat);
     }
-    server.ok(json!({"action": "kill", "taskId": server.id(1), "waitMs": 5000}));
-    assert_stops_growing(&beat);
 }
 
 /// A process the server may not signal, as one sudo runs as root, stays held and reported. The

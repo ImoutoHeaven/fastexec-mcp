@@ -285,6 +285,9 @@ pub fn members(host: libc::pid_t) -> io::Result<Vec<Member>> {
                 let name = match info(pid.pid) {
                     Ok(Some(info)) => {
                         if info.ki_stat == libc::SZOMB {
+                            if pid.flags & REAPER != 0 {
+                                continue 'scan;
+                            }
                             continue;
                         }
                         let bytes: Vec<u8> = info
@@ -295,8 +298,18 @@ pub fn members(host: libc::pid_t) -> io::Result<Vec<Member>> {
                             .collect();
                         String::from_utf8_lossy(&bytes).into_owned()
                     }
-                    Ok(None) => continue,
-                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+                    Ok(None) => {
+                        if pid.flags & REAPER != 0 {
+                            continue 'scan;
+                        }
+                        continue;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                        if pid.flags & REAPER != 0 {
+                            continue 'scan;
+                        }
+                        continue;
+                    }
                     // A process hidden by credential policy is still owned and must stay visible as held.
                     Err(_) => "unknown".into(),
                 };
@@ -304,9 +317,11 @@ pub fn members(host: libc::pid_t) -> io::Result<Vec<Member>> {
                     pid: pid.pid as u32,
                     name,
                 });
-                if pid.flags & REAPER != 0
-                    && let Some(sub) = nested_status(pid.pid)?
-                {
+                if pid.flags & REAPER != 0 {
+                    // Its children may now belong to host, outside the earlier GETPIDS snapshot.
+                    let Some(sub) = nested_status(pid.pid)? else {
+                        continue 'scan;
+                    };
                     pending.push((pid.pid, sub.descendants));
                 }
             }
