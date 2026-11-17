@@ -5692,6 +5692,12 @@ fn file_tools_paginate_via_structured_content_and_honor_output_modes() {
         .map(|line| format!("line-{line:04}-payload-text\n"))
         .collect();
     std::fs::write(dir.join("big.txt"), &big).unwrap();
+    let huge_multi: String = (1..=12_000)
+        .map(|line| format!("row-{line:05}-{}\n", "x".repeat(90)))
+        .collect();
+    std::fs::write(dir.join("huge-multi.txt"), &huge_multi).unwrap();
+    let long_single = format!("{{\"blob\":\"{}\"}}\n", "y".repeat(80 * 1024));
+    std::fs::write(dir.join("long-single.jsonl"), &long_single).unwrap();
 
     let mut server = Server::start_with(|command| {
         command
@@ -5700,11 +5706,24 @@ fn file_tools_paginate_via_structured_content_and_honor_output_modes() {
             .env("FASTEXEC_OUTPUT_MODE", "both");
     });
     let code = r#"
+const single = await tools.read({path:'big.txt'});
+if (single.isError || single.structuredContent.truncated !== false || single.structuredContent.shownLines !== 2500) {
+  throw new Error('2500-line file must fit in one nested read window');
+}
+const jsonl = await tools.read({path:'long-single.jsonl'});
+if (jsonl.isError || jsonl.structuredContent.lineTooLong !== false || JSON.parse(jsonl.structuredContent.text).blob.length !== 80 * 1024) {
+  throw new Error('nested read must accept >50 KiB single lines up to 1 MiB');
+}
+const utf8 = "你好，fastexec 🚀";
+const encoded = new TextEncoder().encode(utf8);
+const roundtrip = new TextDecoder().decode(encoded);
+if (roundtrip !== utf8) throw new Error('TextEncoder/TextDecoder roundtrip failed');
+
 let offset = 1;
 let pages = 0;
 const parts = [];
 while (offset !== null) {
-  const page = await tools.read({path:'big.txt', offset});
+  const page = await tools.read({path:'huge-multi.txt', offset});
   if (page.isError) throw new Error('read failed');
   if (page.structuredContent.text.includes('[Showing lines')) {
     throw new Error('truncation notice leaked into structuredContent.text');
@@ -5714,16 +5733,17 @@ while (offset !== null) {
   offset = page.structuredContent.nextOffset;
 }
 const joined = parts.join('\n');
-return {pages, bytes: joined.length};
+return {singleBytes: single.structuredContent.text.length, pages, bytes: joined.length};
 "#;
     let result = code_result(&mut server, json!({"code":code}));
     assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
     let summary: Value =
         serde_json::from_str(result["structuredContent"]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(summary["singleBytes"].as_u64().unwrap(), big.len() as u64);
     assert!(summary["pages"].as_u64().unwrap() >= 2, "{summary}");
-    assert_eq!(summary["bytes"].as_u64().unwrap(), big.len() as u64);
+    assert_eq!(summary["bytes"].as_u64().unwrap(), huge_multi.len() as u64);
 
-    // Direct MCP structured-only mode keeps file bodies in structuredContent.text only.
+    // Direct MCP structured-only mode keeps the 2000-line / 50 KiB cap and places text in structuredContent.text only.
     let mut structured_only = Server::start_with(|command| {
         command
             .current_dir(&*dir)

@@ -4,20 +4,24 @@ branching on tool results, or filtering bulky output before returning it to cont
 
 - code is the body of an async function: top-level await and return work. Pass cwd (an existing
   absolute directory) to set the default working directory for nested exec starts and relative
-  paths in read, write, and edit. There are no modules, Node APIs, timers, file system, or
-  network; the script reaches the host only through tools.
+  paths in read, write, and edit. UTF-8 TextEncoder and TextDecoder are available alongside
+  atob and btoa. There are no modules, Node APIs, timers, file system, or network; the script
+  reaches the host only through tools.
 - tools.exec(args), tools.read(args), tools.write(args), and tools.edit(args) take the same
   arguments as those tools and resolve to { content, structuredContent, isError }, including
   parameter validation and operational failures (isError: true, structuredContent.ok: false);
   only malformed argument schemas or unknown tools reject with TypeError, and concurrency or
-  bridge limits reject with RangeError. Await concurrent calls with Promise.all or
-  Promise.allSettled so an early rejection is never left unhandled across another await.
+  bridge limits reject with RangeError. Pass loginShell: false to tools.exec for fast
+  non-interactive commands (such as find or git) that do not need shell profile setup. Await
+  concurrent calls with Promise.all or Promise.allSettled so an early rejection is never left
+  unhandled across another await.
 - Nested calls always include structuredContent: exec start, poll, and transcript place clean
-  output without the status line in structuredContent.output; text reads place clean file text
-  without truncation or UTF-8 notices in structuredContent.text alongside truncated, nextOffset,
-  startLine, endLine, shownLines, totalLines, lineTooLong, and lossy; image reads put an image
-  block { type: "image", data, mimeType } in content and metadata in structuredContent; write
-  sets { ok, path, bytes } and edit sets { ok, path, replacements, edits }.
+  output without the status line in structuredContent.output; text reads return up to 50000
+  lines or 1 MiB per call and place clean file text without truncation or UTF-8 notices in
+  structuredContent.text alongside truncated, nextOffset, startLine, endLine, shownLines,
+  totalLines, lineTooLong, and lossy; image reads put an image block { type: "image", data,
+  mimeType } in content and metadata in structuredContent; write sets { ok, path, bytes } and
+  edit sets { ok, path, replacements, edits }.
 - text(value) appends a line: strings as they are, other values as JSON. console.log, info,
   warn, error, and debug append their arguments joined by spaces. Lines reach the task log as
   they are written; a returned value is appended last; exit() ends the script successfully.

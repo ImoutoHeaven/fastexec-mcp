@@ -112,22 +112,24 @@ limit. The VM, output reader and capture workers are prepared before admission
 is published; a failed preparation returns its capacity and files.
 
 The script globals are `tools.exec/read/write/edit`, `text`, `console`,
-`image`, and `exit`. There are no modules, Node APIs, timers, store/load,
+`image`, `exit`, and UTF-8 `TextEncoder`/`TextDecoder` (alongside QuickJS's
+built-in `atob`/`btoa`). There are no modules, Node APIs, timers, store/load,
 network or direct filesystem APIs. `text` appends strings as-is and other
 values as JSON. Console methods join formatted arguments with spaces and
 show Error stacks. A non-undefined return value is appended last. `exit()`
 ends successfully even inside a try/catch. Each script owns its globals;
-bridge functions bind the built-ins they depend on before user code runs.
+bridge and codec functions bind the built-ins they depend on before user code runs.
 
 Nested calls resolve to `{content, structuredContent, isError}`, with a
 boolean `isError`. Schema-invalid argument shapes and unknown tools reject with
 `TypeError`; validation and operational failures across `exec`, `read`, `write`,
 and `edit` resolve with `isError: true` and `structuredContent.ok: false`.
 Nested calls use `both` output mode with structured content enabled: `exec`
-places clean output in `structuredContent.output`, text `read` places clean file
-text without truncation or UTF-8 notices in `structuredContent.text` alongside
-`truncated` and `nextOffset`, `write` reports `{ok, path, bytes}`, and `edit`
-reports `{ok, path, replacements, edits}`. Eight nested calls run at once, with
+places clean output in `structuredContent.output`, text `read` returns up to
+`50000` lines and `1` MiB per call (instead of the direct tool's `2000` lines
+and `50` KiB) and places clean file text without truncation or UTF-8 notices in
+`structuredContent.text` alongside `truncated` and `nextOffset`, `write`
+reports `{ok, path, bytes}`, and `edit` reports `{ok, path, replacements, edits}`. Eight nested calls run at once, with
 1024 queued calls; additional calls reject with RangeError. Pending tool
 arguments and results have a separate 128 MiB budget per script; exceeding it
 rejects the call with RangeError. A completed result that cannot fit rejects
@@ -187,7 +189,8 @@ retirement remove image files and reclaim their quota along with logs.
 
 ### File Tools
 
-- **`read`**: Shows up to `2000` lines and `50` KiB of a text file, with
+- **`read`**: Shows up to `2000` lines and `50` KiB of a text file (`50000`
+  lines and `1` MiB when called from `codemode`), with
   `offset` (1-indexed line) and `limit` (lines) selecting a window. A
   recognized image (JPEG, PNG, GIF, WebP) comes back inline, up to
   `2000`×`2000` pixels and `4718592` bytes of base64; a BMP is re-encoded as

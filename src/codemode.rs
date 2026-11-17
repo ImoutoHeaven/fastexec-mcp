@@ -493,7 +493,7 @@ impl Host {
                         result = async move {
                             match request {
                                 ToolCall::Read(request) => {
-                                    files::read(request, launch, http, nested_render).await
+                                    files::read_nested(request, launch, http, nested_render).await
                                 }
                                 ToolCall::Write(request) => {
                                     files::write(request, launch, nested_render).await
@@ -915,6 +915,51 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     const TypeErrorCtor = TypeError;
     const RangeErrorCtor = RangeError;
     const StringCtor = String;
+    const Uint8ArrayCtor = Uint8Array;
+    const Uint16ArrayCtor = Uint16Array;
+    const ArrayBufferCtor = ArrayBuffer;
+    const DataViewCtor = DataView;
+    const SharedArrayBufferCtor = typeof SharedArrayBuffer === "function" ? SharedArrayBuffer : undefined;
+    const TypedArrayProto = Object.getPrototypeOf(Uint8ArrayCtor.prototype);
+    const taTag = Function.prototype.call.bind(
+        Object.getOwnPropertyDescriptor(TypedArrayProto, Symbol.toStringTag).get
+    );
+    const taBuffer = Function.prototype.call.bind(
+        Object.getOwnPropertyDescriptor(TypedArrayProto, "buffer").get
+    );
+    const taByteOffset = Function.prototype.call.bind(
+        Object.getOwnPropertyDescriptor(TypedArrayProto, "byteOffset").get
+    );
+    const taByteLength = Function.prototype.call.bind(
+        Object.getOwnPropertyDescriptor(TypedArrayProto, "byteLength").get
+    );
+    const dvBuffer = Function.prototype.call.bind(
+        Object.getOwnPropertyDescriptor(DataViewCtor.prototype, "buffer").get
+    );
+    const dvByteOffset = Function.prototype.call.bind(
+        Object.getOwnPropertyDescriptor(DataViewCtor.prototype, "byteOffset").get
+    );
+    const dvByteLength = Function.prototype.call.bind(
+        Object.getOwnPropertyDescriptor(DataViewCtor.prototype, "byteLength").get
+    );
+    const abByteLength = Function.prototype.call.bind(
+        Object.getOwnPropertyDescriptor(ArrayBufferCtor.prototype, "byteLength").get
+    );
+    const sabByteLength = SharedArrayBufferCtor
+        ? Function.prototype.call.bind(
+            Object.getOwnPropertyDescriptor(SharedArrayBufferCtor.prototype, "byteLength").get
+        )
+        : undefined;
+    const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+    const fromCharCode = String.fromCharCode;
+    const reflectApply = Reflect.apply;
+    const arrayJoin = Function.prototype.call.bind(Array.prototype.join);
+    const weakSetAdd = Function.prototype.call.bind(WeakSet.prototype.add);
+    const weakSetHas = Function.prototype.call.bind(WeakSet.prototype.has);
+    const weakMapSet = Function.prototype.call.bind(WeakMap.prototype.set);
+    const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get);
+    const defineProperty = Object.defineProperty;
+    const toStringTag = Symbol.toStringTag;
     const isArray = Array.isArray;
     const pending = new Map();
     let waiting = 0;
@@ -988,6 +1033,334 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         // QuickJS's interrupt is uncatchable, including inside a script's try/catch.
         while (true) {}
     }
+
+    const encoders = new WeakSet();
+    class TextEncoder {
+        constructor() {
+            weakSetAdd(encoders, this);
+        }
+        get encoding() {
+            if (!weakSetHas(encoders, this)) throw new TypeErrorCtor("Illegal invocation");
+            return "utf-8";
+        }
+        encode(input = "") {
+            if (!weakSetHas(encoders, this)) throw new TypeErrorCtor("Illegal invocation");
+            const str = input === undefined ? "" : "" + input;
+            const len = str.length;
+            let total = 0;
+            for (let i = 0; i < len; i++) {
+                const c = charCodeAt(str, i);
+                if (c < 0x80) total += 1;
+                else if (c < 0x800) total += 2;
+                else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
+                    const d = charCodeAt(str, i + 1);
+                    if (d >= 0xDC00 && d <= 0xDFFF) { total += 4; i++; }
+                    else total += 3;
+                } else total += 3;
+            }
+            const out = new Uint8ArrayCtor(total);
+            let pos = 0;
+            for (let i = 0; i < len; i++) {
+                const c = charCodeAt(str, i);
+                if (c < 0x80) {
+                    out[pos++] = c;
+                } else if (c < 0x800) {
+                    out[pos++] = 0xC0 | (c >> 6);
+                    out[pos++] = 0x80 | (c & 0x3F);
+                } else if (c >= 0xD800 && c <= 0xDFFF) {
+                    if (c <= 0xDBFF && i + 1 < len) {
+                        const d = charCodeAt(str, i + 1);
+                        if (d >= 0xDC00 && d <= 0xDFFF) {
+                            const cp = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+                            out[pos++] = 0xF0 | (cp >> 18);
+                            out[pos++] = 0x80 | ((cp >> 12) & 0x3F);
+                            out[pos++] = 0x80 | ((cp >> 6) & 0x3F);
+                            out[pos++] = 0x80 | (cp & 0x3F);
+                            i++;
+                            continue;
+                        }
+                    }
+                    out[pos++] = 0xEF;
+                    out[pos++] = 0xBF;
+                    out[pos++] = 0xBD;
+                } else {
+                    out[pos++] = 0xE0 | (c >> 12);
+                    out[pos++] = 0x80 | ((c >> 6) & 0x3F);
+                    out[pos++] = 0x80 | (c & 0x3F);
+                }
+            }
+            return out;
+        }
+        encodeInto(source, destination) {
+            if (!weakSetHas(encoders, this)) throw new TypeErrorCtor("Illegal invocation");
+            const str = "" + source;
+            if (destination === null || typeof destination !== "object" || taTag(destination) !== "Uint8Array") {
+                throw new TypeErrorCtor("TextEncoder.encodeInto destination must be a Uint8Array.");
+            }
+            const cap = taByteLength(destination);
+            const len = str.length;
+            let read = 0;
+            let written = 0;
+            while (read < len) {
+                const c = charCodeAt(str, read);
+                if (c < 0x80) {
+                    if (written + 1 > cap) break;
+                    destination[written++] = c;
+                    read++;
+                } else if (c < 0x800) {
+                    if (written + 2 > cap) break;
+                    destination[written++] = 0xC0 | (c >> 6);
+                    destination[written++] = 0x80 | (c & 0x3F);
+                    read++;
+                } else if (c >= 0xD800 && c <= 0xDFFF) {
+                    if (c <= 0xDBFF && read + 1 < len) {
+                        const d = charCodeAt(str, read + 1);
+                        if (d >= 0xDC00 && d <= 0xDFFF) {
+                            if (written + 4 > cap) break;
+                            const cp = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+                            destination[written++] = 0xF0 | (cp >> 18);
+                            destination[written++] = 0x80 | ((cp >> 12) & 0x3F);
+                            destination[written++] = 0x80 | ((cp >> 6) & 0x3F);
+                            destination[written++] = 0x80 | (cp & 0x3F);
+                            read += 2;
+                            continue;
+                        }
+                    }
+                    if (written + 3 > cap) break;
+                    destination[written++] = 0xEF;
+                    destination[written++] = 0xBF;
+                    destination[written++] = 0xBD;
+                    read++;
+                } else {
+                    if (written + 3 > cap) break;
+                    destination[written++] = 0xE0 | (c >> 12);
+                    destination[written++] = 0x80 | ((c >> 6) & 0x3F);
+                    destination[written++] = 0x80 | (c & 0x3F);
+                    read++;
+                }
+            }
+            return { read, written };
+        }
+    }
+    defineProperty(TextEncoder.prototype, toStringTag, { value: "TextEncoder", configurable: true });
+
+    function asciiLabel(raw) {
+        const str = "" + raw;
+        let start = 0;
+        let end = str.length;
+        while (start < end) {
+            const c = charCodeAt(str, start);
+            if (c === 0x09 || c === 0x0A || c === 0x0C || c === 0x0D || c === 0x20) start++;
+            else break;
+        }
+        while (end > start) {
+            const c = charCodeAt(str, end - 1);
+            if (c === 0x09 || c === 0x0A || c === 0x0C || c === 0x0D || c === 0x20) end--;
+            else break;
+        }
+        let out = "";
+        for (let i = start; i < end; i++) {
+            const c = charCodeAt(str, i);
+            if (c > 0x7F) return "";
+            out += c >= 0x41 && c <= 0x5A ? fromCharCode(c + 0x20) : fromCharCode(c);
+        }
+        return out;
+    }
+
+    function isUtf8Label(label) {
+        return (
+            label === "utf-8" ||
+            label === "utf8" ||
+            label === "unicode-1-1-utf-8" ||
+            label === "unicode11utf8" ||
+            label === "unicode20utf8" ||
+            label === "x-unicode20utf8"
+        );
+    }
+
+    function asByteView(input) {
+        if (input === undefined) return new Uint8ArrayCtor(0);
+        if (input !== null && typeof input === "object") {
+            if (taTag(input) !== undefined) {
+                return new Uint8ArrayCtor(taBuffer(input), taByteOffset(input), taByteLength(input));
+            }
+            let dvBuf;
+            let isDv = false;
+            try { dvBuf = dvBuffer(input); isDv = true; } catch {}
+            if (isDv) {
+                return new Uint8ArrayCtor(dvBuf, dvByteOffset(input), dvByteLength(input));
+            }
+            let isAb = false;
+            try { abByteLength(input); isAb = true; } catch {}
+            if (isAb) return new Uint8ArrayCtor(input);
+            if (sabByteLength) {
+                let isSab = false;
+                try { sabByteLength(input); isSab = true; } catch {}
+                if (isSab) return new Uint8ArrayCtor(input);
+            }
+        }
+        throw new TypeErrorCtor("TextDecoder.decode input must be an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView.");
+    }
+
+    const decoders = new WeakMap();
+    class TextDecoder {
+        constructor(label = "utf-8", options = undefined) {
+            if (label !== undefined) {
+                const normalized = asciiLabel(label);
+                if (!isUtf8Label(normalized)) {
+                    throw new RangeErrorCtor("TextDecoder only supports utf-8 encoding.");
+                }
+            }
+            if (options !== undefined && options !== null && typeof options !== "object" && typeof options !== "function") {
+                throw new TypeErrorCtor("TextDecoder options must be an object.");
+            }
+            weakMapSet(decoders, this, {
+                fatal: Boolean(options && options.fatal),
+                ignoreBOM: Boolean(options && options.ignoreBOM),
+                bomSeen: false,
+                cp: 0,
+                seen: 0,
+                needed: 0,
+                lower: 0x80,
+                upper: 0xBF,
+            });
+        }
+        get encoding() {
+            if (!weakMapGet(decoders, this)) throw new TypeErrorCtor("Illegal invocation");
+            return "utf-8";
+        }
+        get fatal() {
+            const s = weakMapGet(decoders, this);
+            if (!s) throw new TypeErrorCtor("Illegal invocation");
+            return s.fatal;
+        }
+        get ignoreBOM() {
+            const s = weakMapGet(decoders, this);
+            if (!s) throw new TypeErrorCtor("Illegal invocation");
+            return s.ignoreBOM;
+        }
+        decode(input = undefined, options = undefined) {
+            const s = weakMapGet(decoders, this);
+            if (!s) throw new TypeErrorCtor("Illegal invocation");
+            // Validate input first per WebIDL argument order, then read options, then materialize
+            // the byte view so a getter in options that detaches the buffer still rejects cleanly.
+            if (input !== undefined) asByteView(input);
+            if (options !== undefined && options !== null && typeof options !== "object" && typeof options !== "function") {
+                throw new TypeErrorCtor("TextDecoder decode options must be an object.");
+            }
+            const stream = Boolean(options && options.stream);
+            const bytes = asByteView(input);
+            const len = taByteLength(bytes);
+            const parts = [];
+            let partCount = 0;
+            const unitsBuf = new ArrayBufferCtor(2052);
+            const units = new Uint16ArrayCtor(unitsBuf);
+            let unitCount = 0;
+            const flush = () => {
+                const view = unitCount === 1026 ? units : new Uint16ArrayCtor(unitsBuf, 0, unitCount);
+                defineProperty(parts, partCount++, {
+                    value: reflectApply(fromCharCode, null, view),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                });
+                unitCount = 0;
+            };
+            const emit = scalar => {
+                if (!s.bomSeen) {
+                    s.bomSeen = true;
+                    if (!s.ignoreBOM && scalar === 0xFEFF) return;
+                }
+                if (scalar <= 0xFFFF) {
+                    units[unitCount++] = scalar;
+                } else {
+                    const offset = scalar - 0x10000;
+                    units[unitCount++] = 0xD800 + (offset >> 10);
+                    units[unitCount++] = 0xDC00 + (offset & 0x3FF);
+                }
+                if (unitCount >= 1024) flush();
+            };
+            const reset = () => {
+                s.cp = 0;
+                s.seen = 0;
+                s.needed = 0;
+                s.lower = 0x80;
+                s.upper = 0xBF;
+            };
+            for (let i = 0; i < len; i++) {
+                const byte = bytes[i];
+                if (s.needed === 0) {
+                    if (byte <= 0x7F) {
+                        emit(byte);
+                    } else if (byte >= 0xC2 && byte <= 0xDF) {
+                        s.needed = 1;
+                        s.cp = byte & 0x1F;
+                    } else if (byte >= 0xE0 && byte <= 0xEF) {
+                        if (byte === 0xE0) s.lower = 0xA0;
+                        else if (byte === 0xED) s.upper = 0x9F;
+                        s.needed = 2;
+                        s.cp = byte & 0x0F;
+                    } else if (byte >= 0xF0 && byte <= 0xF4) {
+                        if (byte === 0xF0) s.lower = 0x90;
+                        else if (byte === 0xF4) s.upper = 0x8F;
+                        s.needed = 3;
+                        s.cp = byte & 0x07;
+                    } else if (s.fatal) {
+                        reset();
+                        s.bomSeen = false;
+                        throw new TypeErrorCtor("The encoded data was not valid utf-8.");
+                    } else {
+                        emit(0xFFFD);
+                    }
+                } else if (byte < s.lower || byte > s.upper) {
+                    reset();
+                    if (s.fatal) {
+                        s.bomSeen = false;
+                        throw new TypeErrorCtor("The encoded data was not valid utf-8.");
+                    }
+                    emit(0xFFFD);
+                    i--;
+                } else {
+                    s.lower = 0x80;
+                    s.upper = 0xBF;
+                    s.cp = (s.cp << 6) | (byte & 0x3F);
+                    s.seen++;
+                    if (s.seen === s.needed) {
+                        const scalar = s.cp;
+                        reset();
+                        emit(scalar);
+                    }
+                }
+            }
+            if (!stream) {
+                if (s.needed !== 0) {
+                    reset();
+                    if (s.fatal) {
+                        s.bomSeen = false;
+                        throw new TypeErrorCtor("The encoded data was not valid utf-8.");
+                    }
+                    emit(0xFFFD);
+                }
+                s.bomSeen = false;
+            }
+            if (unitCount > 0) flush();
+            return partCount === 0 ? "" : partCount === 1 ? parts[0] : arrayJoin(parts, "");
+        }
+    }
+    defineProperty(TextDecoder.prototype, toStringTag, { value: "TextDecoder", configurable: true });
+
+    defineProperty(globalThis, "TextEncoder", {
+        value: TextEncoder,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
+    defineProperty(globalThis, "TextDecoder", {
+        value: TextDecoder,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
     globalThis.tools = tools;
     globalThis.console = console;
     globalThis.text = text;
@@ -1449,5 +1822,161 @@ mod tests {
         assert_eq!(state.exit_code, Some(1), "{output}");
         assert!(output.contains("RangeError"));
         assert!(output.contains("64 images"));
+    }
+
+    #[tokio::test]
+    async fn text_encoder_and_decoder_handle_utf8_streams_surrogates_bom_and_tampered_builtins() {
+        let fixture = Fixture::new();
+        let code = r#"
+            const enc = new TextEncoder();
+            if (enc.encoding !== "utf-8" || Object.prototype.toString.call(enc) !== "[object TextEncoder]") {
+                throw new Error("encoder metadata");
+            }
+            if (enc.encode().length !== 0) throw new Error("empty encode");
+
+            // Round-trip UTF-8 + base64 for CJK and Astral plane characters.
+            const sample = "你好，fastexec 🚀 café";
+            const encoded = enc.encode(sample);
+            let binary = "";
+            for (let i = 0; i < encoded.length; i++) binary += String.fromCharCode(encoded[i]);
+            const b64 = btoa(binary);
+            const raw = atob(b64);
+            const restoredBytes = Uint8Array.from(raw, c => c.charCodeAt(0));
+            const dec = new TextDecoder("  UTF-8\t\n");
+            if (dec.encoding !== "utf-8" || dec.fatal !== false || dec.ignoreBOM !== false) {
+                throw new Error("decoder metadata");
+            }
+            if (dec.decode(restoredBytes) !== sample) throw new Error("utf8 base64 roundtrip");
+
+            // Lone high/low surrogates become U+FFFD without corrupting neighbors or pairs.
+            for (const [bad, expected] of [
+                ["\uD800", "\uFFFD"],
+                ["A\uD800B", "A\uFFFDB"],
+                ["\uDC00X", "\uFFFDX"],
+                ["\uD800\uD83D\uDE80", "\uFFFD🚀"],
+            ]) {
+                if (dec.decode(enc.encode(bad)) !== expected) {
+                    throw new Error("surrogate mismatch: " + expected);
+                }
+            }
+
+            // encodeInto never writes partial multi-byte sequences when capacity runs short.
+            const target = new Uint8Array(5);
+            const step1 = enc.encodeInto("a🚀b", target);
+            if (step1.read !== 3 || step1.written !== 5 || dec.decode(target) !== "a🚀") {
+                throw new Error("encodeInto pair fit: " + JSON.stringify(step1));
+            }
+            const tight = new Uint8Array(4);
+            const step2 = enc.encodeInto("a🚀", tight);
+            if (step2.read !== 1 || step2.written !== 1 || tight[0] !== 0x61) {
+                throw new Error("encodeInto stopped before 4-byte pair: " + JSON.stringify(step2));
+            }
+
+            // Subarray views, DataView, ArrayBuffer, BOM stripping, ignoreBOM, and streaming splits.
+            const padded = new Uint8Array([0x99, 0xEF, 0xBB, 0xBF, 0xE4, 0xBD, 0xA0, 0xE5, 0xA5, 0xBD, 0x88]);
+            const sub = padded.subarray(1, 10);
+            if (dec.decode(sub) !== "你好") throw new Error("default BOM strip on subarray");
+            if (dec.decode(sub) !== "你好") throw new Error("second non-stream decode must also strip BOM");
+            const keepBom = new TextDecoder("utf8", { ignoreBOM: true });
+            if (keepBom.decode(new DataView(padded.buffer, 1, 9)) !== "\uFEFF你好") {
+                throw new Error("ignoreBOM DataView");
+            }
+
+            // Split BOM and 4-byte emoji across 1-byte streaming chunks; keep mid-stream U+FEFF.
+            const streamBytes = new Uint8Array([
+                0xEF, 0xBB, 0xBF,
+                0xF0, 0x9F, 0x9A, 0x80,
+                0xEF, 0xBB, 0xBF
+            ]);
+            const streamDec = new TextDecoder();
+            let streamed = "";
+            streamed += streamDec.decode(new Uint8Array(0), { stream: true });
+            for (let i = 0; i < streamBytes.length; i++) {
+                streamed += streamDec.decode(streamBytes.subarray(i, i + 1), { stream: true });
+            }
+            streamed += streamDec.decode();
+            if (streamed !== "🚀\uFEFF") throw new Error("streaming decode: " + JSON.stringify(streamed));
+
+            // WHATWG maximal subpart replacement and fatal mode.
+            if (dec.decode(new Uint8Array([0xE2, 0x82, 0x41])) !== "\uFFFDA") {
+                throw new Error("maximal subpart truncated 3-byte");
+            }
+            if (dec.decode(new Uint8Array([0xF0, 0x80, 0x80, 0x41])) !== "\uFFFD\uFFFD\uFFFDA") {
+                throw new Error("maximal subpart overlong 4-byte");
+            }
+            if (dec.decode(new Uint8Array([0xED, 0xA0, 0x80])) !== "\uFFFD\uFFFD\uFFFD") {
+                throw new Error("CESU-8 surrogate rejected");
+            }
+            const fatalDec = new TextDecoder("utf-8", { fatal: true });
+            for (const invalid of [
+                new Uint8Array([0xFF]),
+                new Uint8Array([0xE2, 0x82]),
+                new Uint8Array([0xED, 0xA0, 0x80]),
+            ]) {
+                let threw = false;
+                try { fatalDec.decode(invalid); } catch (e) { if (e instanceof TypeError) threw = true; }
+                if (!threw) throw new Error("fatal decoder accepted invalid bytes");
+            }
+
+            // Unsupported labels and invalid arguments reject with RangeError / TypeError.
+            let badLabel = false;
+            try { new TextDecoder("latin1"); } catch (e) { if (e instanceof RangeError) badLabel = true; }
+            if (!badLabel) throw new Error("latin1 should fail");
+            for (const call of [
+                () => TextEncoder(),
+                () => TextDecoder(),
+                () => enc.encodeInto("a", new Int8Array(4)),
+                () => dec.decode("not-bytes"),
+                () => TextEncoder.prototype.encode("a"),
+                () => TextDecoder.prototype.decode(new Uint8Array(0)),
+            ]) {
+                let rejected = false;
+                try { call(); } catch (e) { if (e instanceof TypeError) rejected = true; }
+                if (!rejected) throw new Error("expected TypeError");
+            }
+
+            // Survives prototype mutation of Object, Array, String, and WeakMap.
+            Object.defineProperty(Object.prototype, 0, { set() { throw new Error("patched Object[0]"); }, configurable: true });
+            Array.prototype.push = Array.prototype.join = () => { throw new Error("patched Array"); };
+            String.prototype.charCodeAt = String.prototype.slice = () => { throw new Error("patched String"); };
+            WeakMap.prototype.get = WeakSet.prototype.has = () => { throw new Error("patched Weak"); };
+            const big = "中🚀a".repeat(600);
+            if (dec.decode(enc.encode(big)) !== big) throw new Error("failed after prototype mutation");
+            delete Object.prototype[0];
+            return "codec-ok";
+        "#;
+        let (state, output) = fixture.result(code).await;
+        assert_eq!(state.exit_code, Some(0), "{output}");
+        assert_eq!(output, "codec-ok\n");
+    }
+
+    #[tokio::test]
+    async fn nested_read_uses_the_one_mib_window_and_reads_long_lines() {
+        let fixture = Fixture::new();
+        let long_line = format!("{{\"payload\":\"{}\"}}\n", "x".repeat(120 * 1024));
+        std::fs::write(fixture.dir.join("long.jsonl"), &long_line).unwrap();
+        let many_lines: String = (1..=3500).map(|i| format!("row-{i}\n")).collect();
+        std::fs::write(fixture.dir.join("rows.txt"), &many_lines).unwrap();
+        let (state, output) = fixture
+            .result(
+                r#"
+                const [longRes, rowsRes] = await Promise.all([
+                    tools.read({path: "long.jsonl"}),
+                    tools.read({path: "rows.txt"}),
+                ]);
+                if (longRes.isError || longRes.structuredContent.truncated || longRes.structuredContent.lineTooLong) {
+                    throw new Error("long line truncated");
+                }
+                const parsed = JSON.parse(longRes.structuredContent.text);
+                if (parsed.payload.length !== 120 * 1024) throw new Error("payload length");
+                if (rowsRes.isError || rowsRes.structuredContent.truncated || rowsRes.structuredContent.shownLines !== 3500) {
+                    throw new Error("rows truncated: " + JSON.stringify(rowsRes.structuredContent));
+                }
+                return "nested-window-ok";
+            "#,
+            )
+            .await;
+        assert_eq!(state.exit_code, Some(0), "{output}");
+        assert_eq!(output, "nested-window-ok\n");
     }
 }

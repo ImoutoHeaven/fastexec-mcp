@@ -131,8 +131,10 @@ name saved images that can be read separately.
 starts (unless they pass their own `cwd`) and relative paths in `read`, `write`,
 and `edit` resolve against it. Continue with `exec poll`,
 stop with `exec kill`, and inspect with `exec list`. A script has no terminal
-or input. JavaScript has no Node APIs, modules, timers, filesystem or network
-access; host operations go through `tools`.
+or input. UTF-8 `TextEncoder` and `TextDecoder` are available alongside `atob`
+and `btoa`; JavaScript has no Node APIs, modules, timers, filesystem or network
+access, and host operations go through `tools` (pass `loginShell: false` to
+`tools.exec` for fast non-interactive commands that need no profile setup).
 
 Stopping a script cancels its pending tool calls. Bash tasks it already
 started continue running, and the result lists their handles for `exec kill`.
@@ -152,8 +154,9 @@ only `true` or `false`; invalid values stop startup.
 An endpoint's environment decides whether it advertises codemode, even when
 its daemon was started without it. HTTP uses the daemon's startup setting.
 Nested calls always include `structuredContent` (`exec` sets `output`, text
-`read` sets clean `text` plus `truncated` and `nextOffset`, `write` sets `bytes`,
-and `edit` sets `edits`) so scripts work with any outer output setting.
+`read` returns up to `50000` lines or `1` MiB per call and sets clean `text`
+plus `truncated` and `nextOffset`, `write` sets `bytes`, and `edit` sets
+`edits`) so scripts work with any outer output setting.
 
 Each script has 128 MiB of VM memory, eight tool calls in flight with up to
 1024 queued, a separate 128 MiB budget for pending tool arguments and results,

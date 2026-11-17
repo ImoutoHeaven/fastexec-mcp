@@ -20,15 +20,39 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::canonical_combining_class;
 
-/// The most lines a result shows.
+/// The most lines a direct result shows.
 const MAX_LINES: u64 = 2000;
-/// The most bytes a result shows.
+/// The most bytes a direct result shows.
 const MAX_BYTES: u64 = 50 * 1024;
-/// How much of one line is kept while it is read: a line that fits whole, and one byte more, so a
-/// longer line is known not to fit.
-const KEEP: usize = MAX_BYTES as usize + 1;
+/// The most lines a nested codemode read shows.
+const NESTED_MAX_LINES: u64 = 50_000;
+/// The most bytes a nested codemode read shows.
+const NESTED_MAX_BYTES: u64 = 1024 * 1024;
 /// How much of a file is sniffed before deciding whether it is text.
 const SNIFF: usize = 8 * 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReadLimits {
+    max_lines: u64,
+    max_bytes: u64,
+}
+
+impl ReadLimits {
+    pub(crate) const DIRECT: Self = Self {
+        max_lines: MAX_LINES,
+        max_bytes: MAX_BYTES,
+    };
+    pub(crate) const NESTED: Self = Self {
+        max_lines: NESTED_MAX_LINES,
+        max_bytes: NESTED_MAX_BYTES,
+    };
+
+    /// How much of one line is kept while it is read: a line that fits whole, and one byte more,
+    /// so a longer line is known not to fit.
+    const fn keep(self) -> usize {
+        self.max_bytes as usize + 1
+    }
+}
 
 /// The one lock that serializes write and edit, so a read-modify-write cannot interleave with
 /// another one. It is held for the whole blocking operation, never across an await.
@@ -113,13 +137,34 @@ pub async fn read(
     http: bool,
     render: Render,
 ) -> CallToolResult {
+    read_with_limits(request, launch, http, render, ReadLimits::DIRECT).await
+}
+
+/// Reads one file for an in-process codemode script, with the larger nested window.
+pub(crate) async fn read_nested(
+    request: ReadRequest,
+    launch: Arc<LaunchContext>,
+    http: bool,
+    render: Render,
+) -> CallToolResult {
+    read_with_limits(request, launch, http, render, ReadLimits::NESTED).await
+}
+
+async fn read_with_limits(
+    request: ReadRequest,
+    launch: Arc<LaunchContext>,
+    http: bool,
+    render: Render,
+    limits: ReadLimits,
+) -> CallToolResult {
     let effective = render.effective();
-    let result = match tokio::task::spawn_blocking(move || read_text(&request, &launch, http)).await
-    {
-        Ok(Ok(outcome)) => outcome.into_result(effective),
-        Ok(Err(message)) => failed(message),
-        Err(error) => failed(format!("the file operation did not finish: {error}")),
-    };
+    let result =
+        match tokio::task::spawn_blocking(move || read_text(&request, &launch, http, limits)).await
+        {
+            Ok(Ok(outcome)) => outcome.into_result(effective),
+            Ok(Err(message)) => failed(message),
+            Err(error) => failed(format!("the file operation did not finish: {error}")),
+        };
     service::suppress(result, effective)
 }
 
@@ -238,7 +283,12 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
 }
 
 /// The text of one file, cut to the window and the limits a result may show.
-fn read_text(request: &ReadRequest, launch: &LaunchContext, http: bool) -> Result<Outcome, String> {
+fn read_text(
+    request: &ReadRequest,
+    launch: &LaunchContext,
+    http: bool,
+    limits: ReadLimits,
+) -> Result<Outcome, String> {
     let resolved = resolve(&request.path, launch)?;
     let (mut file, metadata) = open_regular(&resolved)
         .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
@@ -289,7 +339,7 @@ fn read_text(request: &ReadRequest, launch: &LaunchContext, http: bool) -> Resul
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
     let source = Source::new(BufReader::new(file));
-    Ok(Window::scan(source, request)?.render(request))
+    Ok(Window::scan(source, request, limits)?.render(request, limits))
 }
 
 /// Both text readers reject special files before reading any data. The initial check avoids
@@ -360,8 +410,8 @@ impl Source {
         }
     }
 
-    /// The next line as decoded text, keeping at most `KEEP` bytes of it; `None` after the last.
-    fn kept(&mut self) -> Result<Option<Line>, String> {
+    /// The next line as decoded text, keeping at most `keep` bytes of it; `None` after the last.
+    fn kept(&mut self, keep: usize) -> Result<Option<Line>, String> {
         if self.done {
             return Ok(None);
         }
@@ -369,20 +419,20 @@ impl Source {
         loop {
             if let Some(at) = self.pending.find('\n') {
                 let lossy = self.marks.iter().any(|mark| *mark < at);
-                line.push(&self.pending[..at], lossy);
+                line.push(&self.pending[..at], lossy, keep);
                 self.take(at + 1);
                 return Ok(Some(line));
             }
             // No line end here, so all of it belongs to this line.
             let text = std::mem::take(&mut self.pending);
             let lossy = !self.marks.is_empty();
-            line.push(&text, lossy);
+            line.push(&text, lossy, keep);
             self.marks.clear();
             if self.fill()? {
                 // The end: the flushed unfinished character is the rest of this line.
                 let text = std::mem::take(&mut self.pending);
                 let lossy = !self.marks.is_empty();
-                line.push(&text, lossy);
+                line.push(&text, lossy, keep);
                 self.marks.clear();
                 self.done = true;
                 return Ok(Some(line));
@@ -510,20 +560,21 @@ struct Window {
 
 impl Window {
     /// Streams the file, keeping only the lines the result may show and counting the rest.
-    fn scan(mut source: Source, request: &ReadRequest) -> Result<Self, String> {
+    fn scan(mut source: Source, request: &ReadRequest, limits: ReadLimits) -> Result<Self, String> {
         let start = request.offset.map_or(0, |offset| offset.saturating_sub(1));
         let end = request
             .limit
             .map_or(u64::MAX, |limit| start.saturating_add(limit));
+        let keep = limits.keep();
         let mut window = Self::default();
         let mut deciding = true;
         loop {
             let in_window = window.total_lines >= start && window.total_lines < end;
             if in_window && deciding {
-                let Some(line) = source.kept()? else {
+                let Some(line) = source.kept(keep)? else {
                     break;
                 };
-                window.take_line(&line, &mut deciding);
+                window.take_line(&line, &mut deciding, limits);
             } else {
                 let Some(length) = source.skipped()? else {
                     break;
@@ -543,7 +594,7 @@ impl Window {
     }
 
     /// Records a kept line: its counts, and its bytes when it fits the budget.
-    fn take_line(&mut self, line: &Line, deciding: &mut bool) {
+    fn take_line(&mut self, line: &Line, deciding: &mut bool, limits: ReadLimits) {
         self.total_lines += 1;
         let bytes = line.length + u64::from(self.window_lines > 0);
         self.window_lines += 1;
@@ -555,7 +606,7 @@ impl Window {
         // A line too large to show is still a line that was decoded, so its replacement
         // characters are known and reported.
         self.lossy |= line.lossy;
-        if self.window_bytes > MAX_BYTES {
+        if self.window_bytes > limits.max_bytes {
             self.tripped_at = Some(self.window_lines);
             *deciding = false;
             return;
@@ -565,7 +616,7 @@ impl Window {
         }
         self.content.push_str(&line.text);
         self.shown_lines += 1;
-        if self.shown_lines >= MAX_LINES {
+        if self.shown_lines >= limits.max_lines {
             *deciding = false;
         }
     }
@@ -608,13 +659,14 @@ impl Window {
 
     /// The result text and structured metadata: the window, cut to the budget, with the notice
     /// that says how to see more.
-    fn render(&self, request: &ReadRequest) -> Outcome {
+    fn render(&self, request: &ReadRequest, limits: ReadLimits) -> Outcome {
         let start = request.offset.map_or(0, |offset| offset.saturating_sub(1));
         let start_display = start + 1;
         let trailing = self.trailing_element();
         let shown = self.shown_lines - u64::from(trailing && self.shown_lines == self.window_lines);
-        let budget_truncated = self.content_lines() > MAX_LINES || self.window_bytes > MAX_BYTES;
-        let line_too_long = budget_truncated && self.first_line_bytes > MAX_BYTES;
+        let budget_truncated =
+            self.content_lines() > limits.max_lines || self.window_bytes > limits.max_bytes;
+        let line_too_long = budget_truncated && self.first_line_bytes > limits.max_bytes;
         let mut body = String::new();
         let mut notices = Vec::new();
         let mut truncated = budget_truncated;
@@ -624,10 +676,11 @@ impl Window {
         if line_too_long {
             shown_lines = 0;
             notices.push(format!(
-                "[Line {start_display} is {}, exceeds {} limit. Use exec: sed -n '{start_display}p' {} | head -c {MAX_BYTES}]",
+                "[Line {start_display} is {}, exceeds {} limit. Use exec: sed -n '{start_display}p' {} | head -c {}]",
                 format_size(self.first_line_bytes),
-                format_size(MAX_BYTES),
-                request.path
+                format_size(limits.max_bytes),
+                request.path,
+                limits.max_bytes
             ));
         } else if budget_truncated {
             shown_lines = shown;
@@ -639,7 +692,7 @@ impl Window {
                 notices.push(format!(
                     "[Showing lines {start_display}-{end_display} of {} ({} limit). Use offset={next} to continue.]",
                     self.total_lines,
-                    format_size(MAX_BYTES)
+                    format_size(limits.max_bytes)
                 ));
             } else {
                 notices.push(format!(
@@ -711,7 +764,7 @@ impl Window {
 /// One line while it is read: its whole decoded length, and the bytes of it that are kept.
 #[derive(Default)]
 struct Line {
-    /// The decoded bytes of the line, up to `KEEP`.
+    /// The decoded bytes of the line, up to the window's `keep` ceiling.
     text: String,
     /// The line's whole length in decoded bytes.
     length: u64,
@@ -720,17 +773,17 @@ struct Line {
 }
 
 impl Line {
-    /// Adds decoded text, keeping at most `KEEP` bytes of it.
-    fn push(&mut self, bytes: &str, lossy: bool) {
+    /// Adds decoded text, keeping at most `keep` bytes of it.
+    fn push(&mut self, bytes: &str, lossy: bool, keep: usize) {
         if bytes.is_empty() {
             return;
         }
         self.length += bytes.len() as u64;
         self.lossy |= lossy;
-        if self.text.len() >= KEEP {
+        if self.text.len() >= keep {
             return;
         }
-        let room = KEEP - self.text.len();
+        let room = keep - self.text.len();
         let take = bytes.len().min(room);
         // A character cut by the cap leaves this line over the budget, so it is never shown and
         // the whole character is dropped rather than half of it kept.
@@ -2466,6 +2519,7 @@ mod tests {
             },
             launch,
             http,
+            ReadLimits::DIRECT,
         )
         .map(|outcome| outcome.text)
     }
@@ -2484,6 +2538,7 @@ mod tests {
             },
             launch,
             false,
+            ReadLimits::DIRECT,
         )
         .map(|outcome| outcome.text)
     }
@@ -2580,6 +2635,7 @@ mod tests {
                 },
                 &launch,
                 false,
+                ReadLimits::DIRECT,
             )
             .unwrap();
             assert_eq!(outcome.body.as_deref(), Some(body));
@@ -2596,6 +2652,7 @@ mod tests {
             },
             &launch,
             false,
+            ReadLimits::DIRECT,
         )
         .unwrap();
         assert_eq!(empty.structured["shownLines"], 0);
@@ -2640,6 +2697,68 @@ mod tests {
                 "[Line 1 is 50.0KB, exceeds 50.0KB limit. Use exec: sed -n '1p' {path} | head -c {MAX_BYTES}]"
             )
         );
+        let nested_huge = read_text(
+            &ReadRequest {
+                path: path.clone(),
+                offset: None,
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::NESTED,
+        )
+        .unwrap();
+        assert_eq!(nested_huge.body.as_deref(), Some(huge.as_str()));
+        assert_eq!(nested_huge.structured["truncated"], false);
+        assert_eq!(nested_huge.structured["lineTooLong"], false);
+        assert_eq!(nested_huge.structured["shownLines"], 1);
+
+        let nested_many: String = (1..=50_005).map(|line| format!("n{line}\n")).collect();
+        scratch.file("nested-many.txt", nested_many.as_bytes());
+        let nested_many_path = scratch.path("nested-many.txt");
+        let nested_page = read_text(
+            &ReadRequest {
+                path: nested_many_path,
+                offset: None,
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::NESTED,
+        )
+        .unwrap();
+        assert!(
+            nested_page
+                .text
+                .ends_with("[Showing lines 1-50000 of 50006. Use offset=50001 to continue.]"),
+            "{}",
+            &nested_page.text[nested_page.text.len().saturating_sub(128)..]
+        );
+        assert_eq!(nested_page.structured["shownLines"], 50_000);
+        assert_eq!(nested_page.structured["nextOffset"], 50_001);
+
+        let over_nested = format!("{}\n", "z".repeat(NESTED_MAX_BYTES as usize + 1));
+        scratch.file("over-nested.txt", over_nested.as_bytes());
+        let over_nested_path = scratch.path("over-nested.txt");
+        let too_long = read_text(
+            &ReadRequest {
+                path: over_nested_path.clone(),
+                offset: None,
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::NESTED,
+        )
+        .unwrap();
+        assert_eq!(
+            too_long.text,
+            format!(
+                "[Line 1 is 1.0MB, exceeds 1.0MB limit. Use exec: sed -n '1p' {over_nested_path} | head -c {NESTED_MAX_BYTES}]"
+            )
+        );
+        assert_eq!(too_long.structured["lineTooLong"], true);
+        assert_eq!(too_long.structured["shownLines"], 0);
     }
 
     #[test]
@@ -4537,6 +4656,7 @@ mod tests {
             },
             &launch,
             false,
+            ReadLimits::DIRECT,
         )
         .unwrap();
         assert_eq!(outcome.text, "Read image file [image/png]");
@@ -4569,6 +4689,7 @@ mod tests {
             },
             &launch,
             false,
+            ReadLimits::DIRECT,
         )
         .err()
         .expect("an animated PNG is not an image a model reads");
