@@ -642,13 +642,23 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
 }
 
 fn describe<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
+    use rquickjs::{Coerced, FromJs};
+    let prop = |object: &Object<'js>, key: &str| -> Option<String> {
+        match object.get::<_, Option<Coerced<String>>>(key) {
+            Ok(value) => value.map(|coerced| coerced.0),
+            Err(error) => {
+                if error.is_exception() {
+                    let _ = ctx.catch();
+                }
+                None
+            }
+        }
+    };
     if let Some(exception) = value.as_exception() {
-        let name = exception
-            .as_object()
-            .get::<_, String>("name")
-            .unwrap_or_else(|_| "Error".into());
-        let message = exception.message().unwrap_or_default();
-        let stack = exception.stack().unwrap_or_default();
+        let object = exception.as_object();
+        let name = prop(object, "name").unwrap_or_else(|| "Error".into());
+        let message = prop(object, "message").unwrap_or_default();
+        let stack = prop(object, "stack").unwrap_or_default();
         let mut text = format!("{name}: {message}");
         for line in stack
             .lines()
@@ -659,11 +669,33 @@ fn describe<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
         }
         text
     } else {
-        use rquickjs::FromJs;
-        rquickjs::Coerced::<String>::from_js(ctx, value)
-            .map(|value| value.0)
-            .unwrap_or_else(|_| "The script threw a value that cannot be described.".into())
+        Coerced::<String>::from_js(ctx, value).map_or_else(
+            |error| {
+                if error.is_exception() {
+                    let _ = ctx.catch();
+                }
+                "The script threw a value that cannot be described.".into()
+            },
+            |value| value.0,
+        )
     }
+}
+
+fn is_js_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
 }
 
 fn js_error(ctx: &Ctx<'_>, error: rquickjs::Error) -> String {
@@ -756,8 +788,9 @@ fn run_vm(
                         "A script may emit at most 64 images.",
                     ));
                 }
+                let cleaned: String = data.chars().filter(|ch| !is_js_whitespace(*ch)).collect();
                 let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(data)
+                    .decode(cleaned)
                     .map_err(|_| {
                         Exception::throw_type(&ctx, "The image data is not valid base64.")
                     })?;
@@ -817,7 +850,7 @@ fn run_vm(
             let mut options = EvalOptions::default();
             options.filename = Some("codemode.js".into());
             let function: Function = ctx
-                .eval_with_options(format!("(async (tools, console) => {{{code}\n}})"), options)
+                .eval_with_options(format!("(async () => {{{code}\n}})"), options)
                 .map_err(|error| js_error(&ctx, error))?;
             let run: Function = api.get("run").map_err(|error| js_error(&ctx, error))?;
             run.call::<_, ()>((function,))
@@ -916,7 +949,6 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     const RangeErrorCtor = RangeError;
     const StringCtor = String;
     const Uint8ArrayCtor = Uint8Array;
-    const Uint16ArrayCtor = Uint16Array;
     const ArrayBufferCtor = ArrayBuffer;
     const DataViewCtor = DataView;
     const SharedArrayBufferCtor = typeof SharedArrayBuffer === "function" ? SharedArrayBuffer : undefined;
@@ -945,12 +977,24 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     const abByteLength = Function.prototype.call.bind(
         Object.getOwnPropertyDescriptor(ArrayBufferCtor.prototype, "byteLength").get
     );
+    const abDetachedDesc = Object.getOwnPropertyDescriptor(ArrayBufferCtor.prototype, "detached");
+    const abDetached = abDetachedDesc && abDetachedDesc.get
+        ? Function.prototype.call.bind(abDetachedDesc.get)
+        : undefined;
+    const abImmutableDesc = Object.getOwnPropertyDescriptor(ArrayBufferCtor.prototype, "immutable");
+    const abImmutable = abImmutableDesc && abImmutableDesc.get
+        ? Function.prototype.call.bind(abImmutableDesc.get)
+        : undefined;
     const sabByteLength = SharedArrayBufferCtor
         ? Function.prototype.call.bind(
             Object.getOwnPropertyDescriptor(SharedArrayBufferCtor.prototype, "byteLength").get
         )
         : undefined;
+    const objectToString = Function.prototype.call.bind(Object.prototype.toString);
     const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+    const stringIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
+    const stringSlice = Function.prototype.call.bind(String.prototype.slice);
+    const stringToLowerCase = Function.prototype.call.bind(String.prototype.toLowerCase);
     const fromCharCode = String.fromCharCode;
     const reflectApply = Reflect.apply;
     const arrayJoin = Function.prototype.call.bind(Array.prototype.join);
@@ -966,20 +1010,35 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     let state = 0;
     let failure;
 
+    function safeString(value) {
+        try { return StringCtor(value); }
+        catch {
+            try { return objectToString(value); }
+            catch { return "[unprintable]"; }
+        }
+    }
     function text(value) {
         const json = typeof value === "string" ? value : stringify(value);
         __write(json === undefined ? "undefined" : json);
     }
     function format(value) {
-        if (value instanceof ErrorCtor) {
-            const head = StringCtor(value.name) + ": " + StringCtor(value.message);
-            return value.stack ? head + "\n" + StringCtor(value.stack) : head;
+        let isErr = false;
+        try { isErr = value instanceof ErrorCtor; } catch {}
+        if (isErr || (value !== null && typeof value === "object" && objectToString(value) === "[object Error]")) {
+            let name = "Error";
+            let message = "";
+            let stack = "";
+            try { if (value.name !== undefined) name = safeString(value.name); } catch {}
+            try { if (value.message !== undefined) message = safeString(value.message); } catch {}
+            try { if (value.stack) stack = safeString(value.stack); } catch {}
+            const head = name + ": " + message;
+            return stack ? head + "\n" + stack : head;
         }
         if (typeof value === "string" || typeof value === "number") return StringCtor(value);
         try {
             const json = stringify(value);
-            return json === undefined ? StringCtor(value) : json;
-        } catch { return StringCtor(value); }
+            return json === undefined ? safeString(value) : json;
+        } catch { return safeString(value); }
     }
     const console = {};
     for (const level of ["log", "info", "warn", "error", "debug"]) {
@@ -1004,12 +1063,21 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         });
     }
     const tools = new Proxy(members, {
+        __proto__: null,
         get(object, name) {
             if (typeof name !== "string") return undefined;
             if (name === "exec" || name === "read" || name === "write" || name === "edit") return object[name];
             throw new TypeErrorCtor("tools." + name + " does not exist. Available: exec, read, write, edit.");
         }
     });
+    function extractDataUrlBase64(value) {
+        if (value.length < 13) return undefined;
+        if (stringToLowerCase(stringSlice(value, 0, 5)) !== "data:") return undefined;
+        const comma = stringIndexOf(value, ",", 5);
+        if (comma < 12) return undefined;
+        if (stringToLowerCase(stringSlice(value, comma - 7, comma)) !== ";base64") return undefined;
+        return stringSlice(value, comma + 1);
+    }
     function image(value) {
         if (value && typeof value === "object" && isArray(value.content)) {
             let found;
@@ -1022,11 +1090,10 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         if (value && typeof value === "object" && value.type === "image" && typeof value.data === "string") {
             data = value.data;
         } else if (typeof value === "string") {
-            const match = /^data:[^,]*;base64,([\s\S]*)$/i.exec(value);
-            if (match) data = match[1];
+            data = extractDataUrlBase64(value);
         }
         if (typeof data !== "string") throw new TypeErrorCtor("image expects an image block, a base64 data URL, or a tool result containing an image block.");
-        __image(data.replace(/\s+/g, ""));
+        __image(data);
     }
     function exit() {
         __exit();
@@ -1045,7 +1112,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         }
         encode(input = "") {
             if (!weakSetHas(encoders, this)) throw new TypeErrorCtor("Illegal invocation");
-            const str = input === undefined ? "" : "" + input;
+            const str = input === undefined ? "" : `${input}`;
             const len = str.length;
             let total = 0;
             for (let i = 0; i < len; i++) {
@@ -1093,9 +1160,18 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         }
         encodeInto(source, destination) {
             if (!weakSetHas(encoders, this)) throw new TypeErrorCtor("Illegal invocation");
-            const str = "" + source;
+            if (arguments.length < 2) {
+                throw new TypeErrorCtor("TextEncoder.encodeInto requires 2 arguments.");
+            }
+            const str = `${source}`;
             if (destination === null || typeof destination !== "object" || taTag(destination) !== "Uint8Array") {
                 throw new TypeErrorCtor("TextEncoder.encodeInto destination must be a Uint8Array.");
+            }
+            if (abImmutable) {
+                const buf = taBuffer(destination);
+                let ro = false;
+                try { ro = abImmutable(buf); } catch {}
+                if (ro) throw new TypeErrorCtor("TextEncoder.encodeInto destination buffer is immutable.");
             }
             const cap = taByteLength(destination);
             const len = str.length;
@@ -1142,10 +1218,14 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             return { read, written };
         }
     }
-    defineProperty(TextEncoder.prototype, toStringTag, { value: "TextEncoder", configurable: true });
+    defineProperty(TextEncoder.prototype, toStringTag, {
+        __proto__: null,
+        value: "TextEncoder",
+        configurable: true,
+    });
 
     function asciiLabel(raw) {
-        const str = "" + raw;
+        const str = `${raw}`;
         let start = 0;
         let end = str.length;
         while (start < end) {
@@ -1178,26 +1258,55 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         );
     }
 
+    function isDetached(buf) {
+        if (!abDetached) return false;
+        try { return abDetached(buf); } catch { return false; }
+    }
+
+    function isBufferSource(input) {
+        if (input === undefined) return true;
+        if (input === null || typeof input !== "object") return false;
+        if (taTag(input) !== undefined) return true;
+        try { dvBuffer(input); return true; } catch {}
+        try { abByteLength(input); return true; } catch {}
+        if (sabByteLength) {
+            try { sabByteLength(input); return true; } catch {}
+        }
+        return false;
+    }
+
     function asByteView(input) {
         if (input === undefined) return new Uint8ArrayCtor(0);
-        if (input !== null && typeof input === "object") {
-            if (taTag(input) !== undefined) {
-                return new Uint8ArrayCtor(taBuffer(input), taByteOffset(input), taByteLength(input));
+        if (taTag(input) !== undefined) {
+            const buf = taBuffer(input);
+            if (isDetached(buf)) return new Uint8ArrayCtor(0);
+            const len = taByteLength(input);
+            return len === 0 ? new Uint8ArrayCtor(0) : new Uint8ArrayCtor(buf, taByteOffset(input), len);
+        }
+        let dvBuf;
+        let isDv = false;
+        try { dvBuf = dvBuffer(input); isDv = true; } catch {}
+        if (isDv) {
+            if (isDetached(dvBuf)) return new Uint8ArrayCtor(0);
+            let off = 0;
+            let len = 0;
+            try {
+                off = dvByteOffset(input);
+                len = dvByteLength(input);
+            } catch {
+                return new Uint8ArrayCtor(0);
             }
-            let dvBuf;
-            let isDv = false;
-            try { dvBuf = dvBuffer(input); isDv = true; } catch {}
-            if (isDv) {
-                return new Uint8ArrayCtor(dvBuf, dvByteOffset(input), dvByteLength(input));
-            }
-            let isAb = false;
-            try { abByteLength(input); isAb = true; } catch {}
-            if (isAb) return new Uint8ArrayCtor(input);
-            if (sabByteLength) {
-                let isSab = false;
-                try { sabByteLength(input); isSab = true; } catch {}
-                if (isSab) return new Uint8ArrayCtor(input);
-            }
+            return len === 0 ? new Uint8ArrayCtor(0) : new Uint8ArrayCtor(dvBuf, off, len);
+        }
+        let isAb = false;
+        try { abByteLength(input); isAb = true; } catch {}
+        if (isAb) {
+            return isDetached(input) ? new Uint8ArrayCtor(0) : new Uint8ArrayCtor(input);
+        }
+        if (sabByteLength) {
+            let isSab = false;
+            try { sabByteLength(input); isSab = true; } catch {}
+            if (isSab) return new Uint8ArrayCtor(input);
         }
         throw new TypeErrorCtor("TextDecoder.decode input must be an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView.");
     }
@@ -1205,18 +1314,19 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     const decoders = new WeakMap();
     class TextDecoder {
         constructor(label = "utf-8", options = undefined) {
-            if (label !== undefined) {
-                const normalized = asciiLabel(label);
-                if (!isUtf8Label(normalized)) {
-                    throw new RangeErrorCtor("TextDecoder only supports utf-8 encoding.");
-                }
-            }
+            const normalized = label === undefined ? "utf-8" : asciiLabel(label);
             if (options !== undefined && options !== null && typeof options !== "object" && typeof options !== "function") {
                 throw new TypeErrorCtor("TextDecoder options must be an object.");
             }
+            const fatal = Boolean(options && options.fatal);
+            const ignoreBOM = Boolean(options && options.ignoreBOM);
+            if (!isUtf8Label(normalized)) {
+                throw new RangeErrorCtor("TextDecoder only supports utf-8 encoding.");
+            }
             weakMapSet(decoders, this, {
-                fatal: Boolean(options && options.fatal),
-                ignoreBOM: Boolean(options && options.ignoreBOM),
+                fatal,
+                ignoreBOM,
+                doNotFlush: false,
                 bomSeen: false,
                 cp: 0,
                 seen: 0,
@@ -1242,50 +1352,66 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         decode(input = undefined, options = undefined) {
             const s = weakMapGet(decoders, this);
             if (!s) throw new TypeErrorCtor("Illegal invocation");
-            // Validate input first per WebIDL argument order, then read options, then materialize
-            // the byte view so a getter in options that detaches the buffer still rejects cleanly.
-            if (input !== undefined) asByteView(input);
+            if (!isBufferSource(input)) {
+                throw new TypeErrorCtor("TextDecoder.decode input must be an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView.");
+            }
             if (options !== undefined && options !== null && typeof options !== "object" && typeof options !== "function") {
                 throw new TypeErrorCtor("TextDecoder decode options must be an object.");
             }
             const stream = Boolean(options && options.stream);
             const bytes = asByteView(input);
-            const len = taByteLength(bytes);
-            const parts = [];
-            let partCount = 0;
-            const unitsBuf = new ArrayBufferCtor(2052);
-            const units = new Uint16ArrayCtor(unitsBuf);
-            let unitCount = 0;
-            const flush = () => {
-                const view = unitCount === 1026 ? units : new Uint16ArrayCtor(unitsBuf, 0, unitCount);
-                defineProperty(parts, partCount++, {
-                    value: reflectApply(fromCharCode, null, view),
-                    writable: true,
-                    enumerable: true,
-                    configurable: true,
-                });
-                unitCount = 0;
-            };
-            const emit = scalar => {
-                if (!s.bomSeen) {
-                    s.bomSeen = true;
-                    if (!s.ignoreBOM && scalar === 0xFEFF) return;
-                }
-                if (scalar <= 0xFFFF) {
-                    units[unitCount++] = scalar;
-                } else {
-                    const offset = scalar - 0x10000;
-                    units[unitCount++] = 0xD800 + (offset >> 10);
-                    units[unitCount++] = 0xDC00 + (offset & 0x3FF);
-                }
-                if (unitCount >= 1024) flush();
-            };
             const reset = () => {
                 s.cp = 0;
                 s.seen = 0;
                 s.needed = 0;
                 s.lower = 0x80;
                 s.upper = 0xBF;
+            };
+            if (!s.doNotFlush) {
+                reset();
+                s.bomSeen = false;
+            }
+            s.doNotFlush = stream;
+            let bomSeen = s.bomSeen;
+            const len = taByteLength(bytes);
+            const parts = [];
+            let partCount = 0;
+            const units = [];
+            let unitCount = 0;
+            const propDesc = {
+                __proto__: null,
+                value: 0,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            };
+            const pushUnit = unit => {
+                if (unitCount < units.length) {
+                    units[unitCount++] = unit;
+                } else {
+                    propDesc.value = unit;
+                    defineProperty(units, unitCount++, propDesc);
+                }
+            };
+            const flush = () => {
+                if (units.length > unitCount) units.length = unitCount;
+                propDesc.value = reflectApply(fromCharCode, null, units);
+                defineProperty(parts, partCount++, propDesc);
+                unitCount = 0;
+            };
+            const emit = scalar => {
+                if (!bomSeen) {
+                    bomSeen = true;
+                    if (!s.ignoreBOM && scalar === 0xFEFF) return;
+                }
+                if (scalar <= 0xFFFF) {
+                    pushUnit(scalar);
+                } else {
+                    const offset = scalar - 0x10000;
+                    pushUnit(0xD800 + (offset >> 10));
+                    pushUnit(0xDC00 + (offset & 0x3FF));
+                }
+                if (unitCount >= 1024) flush();
             };
             for (let i = 0; i < len; i++) {
                 const byte = bytes[i];
@@ -1307,7 +1433,6 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
                         s.cp = byte & 0x07;
                     } else if (s.fatal) {
                         reset();
-                        s.bomSeen = false;
                         throw new TypeErrorCtor("The encoded data was not valid utf-8.");
                     } else {
                         emit(0xFFFD);
@@ -1315,7 +1440,6 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
                 } else if (byte < s.lower || byte > s.upper) {
                     reset();
                     if (s.fatal) {
-                        s.bomSeen = false;
                         throw new TypeErrorCtor("The encoded data was not valid utf-8.");
                     }
                     emit(0xFFFD);
@@ -1332,30 +1456,33 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
                     }
                 }
             }
-            if (!stream) {
-                if (s.needed !== 0) {
-                    reset();
-                    if (s.fatal) {
-                        s.bomSeen = false;
-                        throw new TypeErrorCtor("The encoded data was not valid utf-8.");
-                    }
-                    emit(0xFFFD);
+            if (!stream && s.needed !== 0) {
+                reset();
+                if (s.fatal) {
+                    throw new TypeErrorCtor("The encoded data was not valid utf-8.");
                 }
-                s.bomSeen = false;
+                emit(0xFFFD);
             }
+            s.bomSeen = bomSeen;
             if (unitCount > 0) flush();
             return partCount === 0 ? "" : partCount === 1 ? parts[0] : arrayJoin(parts, "");
         }
     }
-    defineProperty(TextDecoder.prototype, toStringTag, { value: "TextDecoder", configurable: true });
+    defineProperty(TextDecoder.prototype, toStringTag, {
+        __proto__: null,
+        value: "TextDecoder",
+        configurable: true,
+    });
 
     defineProperty(globalThis, "TextEncoder", {
+        __proto__: null,
         value: TextEncoder,
         writable: true,
         enumerable: false,
         configurable: true,
     });
     defineProperty(globalThis, "TextDecoder", {
+        __proto__: null,
         value: TextDecoder,
         writable: true,
         enumerable: false,
@@ -1368,7 +1495,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     globalThis.exit = exit;
     return {
         run(fn) {
-            then(fn(tools, console), value => {
+            then(fn(), value => {
                 try { if (value !== undefined) text(value); state = 1; }
                 catch (error) { failure = error; state = 2; }
             }, error => { failure = error; state = 2; });
@@ -1600,6 +1727,26 @@ mod tests {
                 "text('before'); try { exit(); } catch(e) { text('caught'); } text('after');",
                 "before\n",
             ),
+            (
+                r#"
+                const tools = globalThis.tools;
+                const console = globalThis.console;
+                const cyc = Object.create(null);
+                cyc.self = cyc;
+                const big = Object.create(null);
+                big.n = 1n;
+                Object.defineProperty(Error, Symbol.hasInstance, {
+                    value() { throw new Error('broken instanceof'); },
+                    configurable: true,
+                });
+                const oddErr = new TypeError('bad');
+                oddErr.name = Object.create(null);
+                oddErr.stack = '';
+                console.log(cyc, big, Symbol('tag'), oddErr);
+                return typeof tools.read;
+                "#,
+                "[object Object] [object Object] Symbol(tag) [object Object]: bad\nfunction\n",
+            ),
         ] {
             let (state, output) = fixture.result(code).await;
             assert_eq!(state.exit_code, Some(0), "{output}");
@@ -1630,6 +1777,31 @@ mod tests {
         let (state, output) = fixture.result("const promise = Promise.reject(new Error('handled')); await null; promise.catch(() => {}); return 'ok';").await;
         assert_eq!(state.exit_code, Some(0), "{output}");
         assert_eq!(output, "ok\n");
+
+        for (code, expected) in [
+            ("throw Symbol('boom')", "cannot be described"),
+            ("throw Object.create(null)", "cannot be described"),
+            (
+                "const e = new Error('msg'); Object.defineProperty(e, 'name', {get(){throw 1}}); Object.defineProperty(e, 'stack', {value: Symbol('s')}); throw e;",
+                "Error: msg",
+            ),
+        ] {
+            let (state, output) = fixture.result(code).await;
+            assert_eq!(state.exit_code, Some(1), "{output}");
+            assert!(output.contains(expected), "{output}");
+        }
+        let rt = Runtime::new().unwrap();
+        let ctx = Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let val: Value = ctx
+                .eval("const e = new Error(); Object.defineProperty(e, 'name', {get(){throw 1}}); Object.defineProperty(e, 'message', {get(){throw 2}}); Object.defineProperty(e, 'stack', {get(){throw 3}}); e")
+                .unwrap();
+            assert_eq!(describe(&ctx, val), "Error: ");
+            assert!(!ctx.has_exception());
+            let sym: Value = ctx.eval("Symbol('x')").unwrap();
+            assert!(describe(&ctx, sym).contains("cannot be described"));
+            assert!(!ctx.has_exception());
+        });
     }
 
     #[tokio::test]
@@ -1800,10 +1972,15 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         let data = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+        let spaced = format!(
+            "DATA:IMAGE/JPEG;BASE64,\n  {}\r\n\t\u{feff}{}",
+            &data[..8],
+            &data[8..]
+        );
         let task = fixture.start(
             &format!(
-                "image({});",
-                json!(format!("data:image/jpeg;base64,{data}"))
+                "RegExp.prototype.exec = String.prototype.replace = () => {{ throw new Error('patched'); }}; image({});",
+                json!(spaced)
             ),
             None,
         );
@@ -1918,6 +2095,102 @@ mod tests {
                 if (!threw) throw new Error("fatal decoder accepted invalid bytes");
             }
 
+            // Streaming fatal error keeps doNotFlush and bomSeen per WHATWG Encoding § 7.2,
+            // while an early fatal error before serializing does not prematurely mark bomSeen.
+            const fatalStream = new TextDecoder("utf-8", { fatal: true });
+            if (fatalStream.decode(new Uint8Array([0xEF, 0xBB, 0xBF, 0x41]), { stream: true }) !== "A") {
+                throw new Error("initial BOM strip in fatal stream");
+            }
+            let midStreamThrew = false;
+            try { fatalStream.decode(new Uint8Array([0xFF]), { stream: true }); }
+            catch (e) { if (e instanceof TypeError) midStreamThrew = true; }
+            if (!midStreamThrew) throw new Error("expected mid-stream TypeError");
+            if (fatalStream.decode(new Uint8Array([0xEF, 0xBB, 0xBF, 0x42]), { stream: true }) !== "\uFEFFB") {
+                throw new Error("mid-stream U+FEFF after fatal error must be preserved");
+            }
+            if (fatalStream.decode() !== "") throw new Error("stream flush");
+            if (fatalStream.decode(new Uint8Array([0xEF, 0xBB, 0xBF, 0x43])) !== "C") {
+                throw new Error("new stream after flush must strip leading BOM again");
+            }
+
+            const earlyFatal = new TextDecoder("utf-8", { fatal: true });
+            let earlyThrew = false;
+            try { earlyFatal.decode(new Uint8Array([0x41, 0xFF]), { stream: true }); }
+            catch (e) { if (e instanceof TypeError) earlyThrew = true; }
+            if (!earlyThrew) throw new Error("expected early TypeError");
+            if (earlyFatal.decode(new Uint8Array([0xEF, 0xBB, 0xBF, 0x42]), { stream: true }) !== "B") {
+                throw new Error("failed first chunk must not commit bomSeen");
+            }
+
+            // WebIDL ToString coercion (.toString() before .valueOf()) and argument validation order.
+            const labelObj = { valueOf() { return 123; }, toString() { return "utf-8"; } };
+            const strObj = { valueOf() { return 456; }, toString() { return "ok"; } };
+            const coercedDec = new TextDecoder(labelObj);
+            if (coercedDec.decode(enc.encode(strObj)) !== "ok") {
+                throw new Error("ToString coercion order");
+            }
+            const intoBuf = new Uint8Array(4);
+            if (enc.encodeInto(strObj, intoBuf).written !== 2 || dec.decode(intoBuf.subarray(0, 2)) !== "ok") {
+                throw new Error("encodeInto ToString coercion");
+            }
+            let optsBeforeLabel = false;
+            try { new TextDecoder("latin1", "bad-options"); }
+            catch (e) { if (e instanceof TypeError) optsBeforeLabel = true; }
+            if (!optsBeforeLabel) throw new Error("options TypeError must precede label RangeError");
+            let inputBeforeOpts = false;
+            try {
+                dec.decode("not-bytes", { get stream() { throw new Error("options accessed too early"); } });
+            } catch (e) {
+                if (e instanceof TypeError) inputBeforeOpts = true;
+            }
+            if (!inputBeforeOpts) throw new Error("input TypeError must precede options getter");
+
+            // Detached, mid-call detached, shrunk/grown Resizable ArrayBuffer, and immutable ArrayBuffer.
+            const detAb = new Uint8Array([0x61, 0x62]).buffer;
+            const detTa = new Uint8Array(detAb);
+            const detDv = new DataView(detAb);
+            detAb.transfer();
+            if (dec.decode(detAb) !== "" || dec.decode(detTa) !== "" || dec.decode(detDv) !== "") {
+                throw new Error("detached BufferSource must decode as empty");
+            }
+            const detInto = enc.encodeInto("abc", detTa);
+            if (detInto.read !== 0 || detInto.written !== 0) {
+                throw new Error("detached encodeInto must return 0/0");
+            }
+            const midAb = new Uint8Array([0x61, 0x62]).buffer;
+            const midTa = new Uint8Array(midAb);
+            if (dec.decode(midTa, { get stream() { midAb.transfer(); return false; } }) !== "") {
+                throw new Error("mid-call detach must decode as empty");
+            }
+            const rab = new ArrayBuffer(8, { maxByteLength: 16 });
+            const oobTa = new Uint8Array(rab, 4, 4);
+            const oobDv = new DataView(rab, 4, 4);
+            const trackTa = new Uint8Array(rab);
+            rab.resize(2);
+            if (dec.decode(oobTa) !== "" || dec.decode(oobDv) !== "") {
+                throw new Error("OOB RAB views must decode as empty");
+            }
+            const oobInto = enc.encodeInto("abc", oobTa);
+            if (oobInto.read !== 0 || oobInto.written !== 0) {
+                throw new Error("OOB RAB encodeInto must return 0/0");
+            }
+            rab.resize(6);
+            if (enc.encodeInto("hello!", trackTa).written !== 6 || dec.decode(trackTa) !== "hello!") {
+                throw new Error("grown RAB tracking view failed");
+            }
+            if (typeof ArrayBuffer.prototype.transferToImmutable === "function") {
+                const immAb = enc.encode("immutable-ok").buffer.transferToImmutable();
+                const immTa = new Uint8Array(immAb);
+                if (dec.decode(immAb) !== "immutable-ok" || dec.decode(immTa) !== "immutable-ok") {
+                    throw new Error("immutable ArrayBuffer decode failed");
+                }
+                for (const s of ["", "x"]) {
+                    let immRejected = false;
+                    try { enc.encodeInto(s, immTa); } catch (e) { if (e instanceof TypeError) immRejected = true; }
+                    if (!immRejected) throw new Error("immutable ArrayBuffer encodeInto must reject");
+                }
+            }
+
             // Unsupported labels and invalid arguments reject with RangeError / TypeError.
             let badLabel = false;
             try { new TextDecoder("latin1"); } catch (e) { if (e instanceof RangeError) badLabel = true; }
@@ -1925,7 +2198,12 @@ mod tests {
             for (const call of [
                 () => TextEncoder(),
                 () => TextDecoder(),
+                () => enc.encode(Symbol("s")),
+                () => enc.encodeInto(),
+                () => enc.encodeInto("a"),
+                () => enc.encodeInto(Symbol("s"), new Uint8Array(4)),
                 () => enc.encodeInto("a", new Int8Array(4)),
+                () => new TextDecoder(Symbol("s")),
                 () => dec.decode("not-bytes"),
                 () => TextEncoder.prototype.encode("a"),
                 () => TextDecoder.prototype.decode(new Uint8Array(0)),
@@ -1935,14 +2213,30 @@ mod tests {
                 if (!rejected) throw new Error("expected TypeError");
             }
 
-            // Survives prototype mutation of Object, Array, String, and WeakMap.
-            Object.defineProperty(Object.prototype, 0, { set() { throw new Error("patched Object[0]"); }, configurable: true });
+            // Survives prototype mutation of Object (including get/set and [0]), TypedArray, Array, String, and WeakMap,
+            // and handles >1 MiB multi-chunk payloads within the nested read window scale.
+            const taProto = Object.getPrototypeOf(Uint8Array.prototype);
+            const origTaLen = Object.getOwnPropertyDescriptor(taProto, "length");
+            Object.defineProperty(taProto, "length", { __proto__: null, get() { throw new Error("patched TA length"); }, configurable: true });
+            Object.defineProperty(Object.prototype, 0, { __proto__: null, set() { throw new Error("patched Object[0]"); }, configurable: true });
+            Object.defineProperty(Object.prototype, "get", { __proto__: null, value() { throw new Error("patched desc get"); }, configurable: true });
+            Object.defineProperty(Object.prototype, "set", { __proto__: null, value() { throw new Error("patched desc set"); }, configurable: true });
             Array.prototype.push = Array.prototype.join = () => { throw new Error("patched Array"); };
             String.prototype.charCodeAt = String.prototype.slice = () => { throw new Error("patched String"); };
             WeakMap.prototype.get = WeakSet.prototype.has = () => { throw new Error("patched Weak"); };
-            const big = "中🚀a".repeat(600);
-            if (dec.decode(enc.encode(big)) !== big) throw new Error("failed after prototype mutation");
+            const big = "中🚀a".repeat(150000);
+            const bigBytes = enc.encode(big);
+            if (bigBytes.byteLength <= 1024 * 1024 || dec.decode(bigBytes) !== big) {
+                throw new Error("failed >1 MiB roundtrip after prototype mutation");
+            }
+            const scratch = new Uint8Array(16);
+            if (enc.encodeInto("中🚀", scratch).written !== 7 || dec.decode(scratch.subarray(0, 7)) !== "中🚀") {
+                throw new Error("encodeInto failed under prototype mutation");
+            }
             delete Object.prototype[0];
+            delete Object.prototype.get;
+            delete Object.prototype.set;
+            Object.defineProperty(taProto, "length", origTaLen);
             return "codec-ok";
         "#;
         let (state, output) = fixture.result(code).await;
