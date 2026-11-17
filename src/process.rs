@@ -233,24 +233,24 @@ impl Child {
     pub fn wait_tree(&mut self, tree: &Tree) -> bool {
         let _ = std::io::copy(&mut self.status, &mut std::io::sink());
         self.reap(tree);
-        *lock(&tree.ended)
+        *lock(&tree.state) == TreeState::Complete
     }
 
-    /// Reaps the host once it has exited, which the end of its status pipe shows. The tree is
-    /// settled first under the lock `kill` holds: Linux marks it ended, while macOS requires the
-    /// host's final confirmation. No later request may signal a PID released for reuse.
+    /// Reaps the host under the lock held by tree queries. Only a clean reaper exit, or the
+    /// macOS host's explicit confirmation, proves completion; either outcome releases the PID.
     fn reap(&mut self, tree: &Tree) -> i32 {
-        let mut ended = lock(&tree.ended);
+        let mut state = lock(&tree.state);
         #[cfg(target_os = "macos")]
-        {
-            // Drain the host's final confirmation before releasing its PID for reuse.
-            *ended = tree.control.finish();
-        }
+        let confirmed = tree.control.finish();
+        let status = self.host.wait();
         #[cfg(not(target_os = "macos"))]
-        {
-            *ended = true;
-        }
-        self.host.wait().map_or(1, |status| {
+        let confirmed = status.as_ref().is_ok_and(|status| status.success());
+        *state = if confirmed {
+            TreeState::Complete
+        } else {
+            TreeState::Unconfirmed
+        };
+        status.map_or(1, |status| {
             use std::os::unix::process::ExitStatusExt;
             status
                 .signal()
@@ -468,8 +468,13 @@ pub(crate) fn bash_args(launch: &Launch<'_>) -> Vec<OsString> {
         vec!["--noprofile".into(), "--norc".into()]
     };
     match launch.script {
-        // msys passes a native path through cleanly only with forward slashes.
-        Some(script) => args.push(script.to_string_lossy().replace('\\', "/").into()),
+        Some(script) => {
+            // MSYS needs forward slashes; Unix paths must retain their native bytes.
+            #[cfg(windows)]
+            args.push(script.to_string_lossy().replace('\\', "/").into());
+            #[cfg(unix)]
+            args.push(script.as_os_str().to_owned());
+        }
         None => {
             args.push("-c".into());
             args.push(launch.command.into());
@@ -705,6 +710,12 @@ fn spawn_host_args(
             Ok(())
         });
     }
+    // Prepare every fallible PTY copy before bash can run or its host needs a waiter.
+    let input = master
+        .as_ref()
+        .map(|master| master.try_clone())
+        .transpose()?;
+    let pty = master.as_ref().map(PtyControl::new).transpose()?;
     let mut host = command.spawn()?;
     // The command and these ends hold copies the host has; dropping them lets the output and the
     // status pipe reach EOF when the tree ends.
@@ -713,20 +724,15 @@ fn spawn_host_args(
     #[cfg(target_os = "macos")]
     drop(control_host);
     finish_host_startup(&mut host, &mut status)?;
-    // Past the spawn, an error drops the lifeline, and the host ends the tree.
-    let input: Box<dyn Write + Send> = match &master {
-        Some(master) => Box::new(master.try_clone()?),
+    let input: Box<dyn Write + Send> = match input {
+        Some(master) => Box::new(master),
         None => Box::new(host.stdin.take().expect("stdin is piped")),
-    };
-    let pty = match &master {
-        Some(master) => Some(PtyControl::new(master)?),
-        None => None,
     };
     let tree = Tree {
         #[cfg(not(target_os = "macos"))]
         host: host.id() as i32,
         _lifeline: lifeline,
-        ended: std::sync::Mutex::new(false),
+        state: std::sync::Mutex::new(TreeState::Active),
         #[cfg(target_os = "macos")]
         control: crate::tree_macos::Client::new(control, host.id() as i32),
     };
@@ -779,6 +785,36 @@ mod startup_tests {
     use std::os::unix::process::CommandExt;
 
     #[test]
+    fn script_arguments_preserve_unix_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let script = std::path::PathBuf::from(OsString::from_vec(
+            b"/tmp/native\\path-\xff/task.sh".to_vec(),
+        ));
+        let context = LaunchContext::new("/".into(), Vec::new());
+        let launch = Launch {
+            bash: Path::new("/bin/bash"),
+            command: "",
+            script: Some(&script),
+            cwd: Path::new("/"),
+            env: &context,
+            login: false,
+            pty: false,
+            cols: PTY_COLS,
+            rows: PTY_ROWS,
+            exit_status: None,
+        };
+        assert_eq!(
+            bash_args(&launch),
+            vec![
+                OsString::from("--noprofile"),
+                OsString::from("--norc"),
+                script.into_os_string()
+            ]
+        );
+    }
+
+    #[test]
     fn a_failed_startup_ends_commands_in_the_reserved_host_group() {
         let mut command = Command::new("/bin/sh");
         command
@@ -820,6 +856,57 @@ mod startup_tests {
     }
 }
 
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod host_end_tests {
+    use super::*;
+
+    #[test]
+    fn reaped_hosts_confirm_only_clean_exits_and_never_resume_tree_queries() {
+        for (command, code, complete) in [
+            ("exit 0", 0, true),
+            ("exit 23", 23, false),
+            ("kill -TERM $$", 143, false),
+        ] {
+            let host = Command::new("/bin/sh")
+                .args(["-c", command])
+                .spawn()
+                .unwrap();
+            let (status, status_writer) = std::io::pipe().unwrap();
+            drop(status_writer);
+            let (_lifeline_reader, lifeline) = std::io::pipe().unwrap();
+            let tree = Tree {
+                host: host.id() as i32,
+                _lifeline: lifeline,
+                state: std::sync::Mutex::new(TreeState::Active),
+            };
+            let mut child = Child {
+                host,
+                status,
+                master: None,
+            };
+            assert_eq!(child.reap(&tree), code);
+            assert_eq!(child.wait_tree(&tree), complete);
+            assert_eq!(
+                *lock(&tree.state),
+                if complete {
+                    TreeState::Complete
+                } else {
+                    TreeState::Unconfirmed
+                }
+            );
+            for _ in 0..2 {
+                if complete {
+                    assert!(tree.members().unwrap().is_empty());
+                    tree.kill().unwrap();
+                } else {
+                    assert!(tree.members().is_none());
+                    assert!(tree.kill().unwrap_err().to_string().contains("unconfirmed"));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -851,6 +938,15 @@ mod refusing_control_tests {
     }
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeState {
+    Active,
+    Complete,
+    /// The host was reaped without confirming completion; its PID may already be reused.
+    Unconfirmed,
+}
+
 /// The process tree of one task.
 pub struct Tree {
     #[cfg(windows)]
@@ -863,9 +959,9 @@ pub struct Tree {
     /// dies, makes the host end the tree, as closing a kill-on-close job does on Windows.
     #[cfg(unix)]
     _lifeline: std::io::PipeWriter,
-    /// Set after confirmed tree completion, before releasing the host's PID for reuse.
+    /// Whether the host still reserves its PID and, after reaping, confirmed completion.
     #[cfg(unix)]
-    ended: std::sync::Mutex<bool>,
+    state: std::sync::Mutex<TreeState>,
     /// The host's control socket: macOS asks the host which processes the tree holds, so no
     /// membership list or signal target lives here.
     #[cfg(target_os = "macos")]
@@ -890,21 +986,26 @@ impl Tree {
             }
             Ok(())
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         {
-            let ended = lock(&self.ended);
-            if *ended {
-                return Ok(());
+            let state = lock(&self.state);
+            match *state {
+                TreeState::Complete => return Ok(()),
+                TreeState::Unconfirmed => {
+                    return Err(std::io::Error::other(
+                        "task host disconnected; tree cleanup is unconfirmed",
+                    ));
+                }
+                TreeState::Active => {}
             }
-            self.control.kill()
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let ended = lock(&self.ended);
-            if *ended {
-                return Ok(());
+            #[cfg(target_os = "macos")]
+            {
+                self.control.kill()
             }
-            kill_tree(self.host)
+            #[cfg(not(target_os = "macos"))]
+            {
+                kill_tree(self.host)
+            }
         }
     }
 
@@ -917,21 +1018,17 @@ impl Tree {
             use std::os::windows::io::AsRawHandle;
             Some(windows::job_members(self.job.as_raw_handle()))
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         {
-            let ended = lock(&self.ended);
-            if *ended {
-                return Some(Vec::new());
+            let state = lock(&self.state);
+            match *state {
+                TreeState::Complete => return Some(Vec::new()),
+                TreeState::Unconfirmed => return None,
+                TreeState::Active => {}
             }
-            // The host is still unreaped, so its number is reserved: a request that waits wakes
-            // it, and one it never answers is `None`, which says nothing about the tree.
-            self.control.members()
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let ended = lock(&self.ended);
-            if *ended {
-                return Some(Vec::new());
+            #[cfg(target_os = "macos")]
+            {
+                self.control.members()
             }
             #[cfg(target_os = "freebsd")]
             {
@@ -941,7 +1038,7 @@ impl Tree {
             {
                 crate::tree_linux::members(self.host).ok()
             }
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
             {
                 Some(unix_members(self.host))
             }

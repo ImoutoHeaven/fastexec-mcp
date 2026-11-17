@@ -666,7 +666,7 @@ impl Tasks {
         let running = registry
             .tasks
             .iter()
-            .filter(|task| task.is_running() || task.keeps_processes())
+            .filter(|task| !task.is_finished())
             .count();
         let limit = self.limits.max_running;
         if running + registry.pending >= limit {
@@ -1062,11 +1062,11 @@ impl Tasks {
     /// older ones. Runs at each completion under the registry guard that shows its end, so the
     /// task that just finished always stays and no client sees the cap exceeded.
     fn retire_finished(&self, registry: &mut Registry) {
-        // A task that keeps processes stays, so kill can still reach them.
+        // Root exit alone cannot retire a task whose ender has not confirmed completion.
         let mut finished: Vec<(Instant, String)> = registry
             .tasks
             .iter()
-            .filter(|task| !task.keeps_processes())
+            .filter(|task| task.is_finished())
             .filter_map(|task| task.ended_at().map(|at| (at, task.id.clone())))
             .collect();
         let keep = self.limits.max_finished;
@@ -1088,7 +1088,7 @@ impl Tasks {
     }
 
     /// Removes every finished task that ended at least `finished_ttl` before `now`, deleting its
-    /// log as `retire_finished` does. A task that keeps processes is not finished, so it stays.
+    /// log as `retire_finished` does. Pending or unconfirmed tree completion keeps the task.
     pub fn expire_finished(&self, now: Instant) {
         let Some(ttl) = self.limits.finished_ttl else {
             return;
@@ -1099,7 +1099,7 @@ impl Tasks {
             let mut registry = lock(&self.registry);
             let mut expired = Vec::new();
             registry.tasks.retain(|task| {
-                let gone = !task.keeps_processes()
+                let gone = task.is_finished()
                     && task
                         .ended_at()
                         .is_some_and(|ended| now.saturating_duration_since(ended) >= ttl);
@@ -1144,7 +1144,7 @@ impl Tasks {
     }
 
     /// Reserves log space under the total limit, evicting the oldest finished logs if needed.
-    /// A task that keeps processes is not finished: they may still write to its log.
+    /// A tree whose completion is pending or unconfirmed may still write to its log.
     fn reserve(&self, bytes: u64) -> bool {
         if self.log_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes <= self.log_limit {
             return true;
@@ -1152,7 +1152,7 @@ impl Tasks {
         let mut candidates: Vec<(Instant, Arc<Task>)> = lock(&self.registry)
             .tasks
             .iter()
-            .filter(|task| !task.is_running() && !task.keeps_processes())
+            .filter(|task| task.is_finished())
             .filter_map(|task| task.ended_at().map(|at| (at, Arc::clone(task))))
             .collect();
         // The log that ended earliest goes first, as retire_finished removes it: registry order
@@ -1402,7 +1402,7 @@ fn wait_task(job: WaitWork) {
         task.root.members()
     };
     let mut leftovers = listed.clone().unwrap_or_default();
-    let mut kept = task.keep && !leftovers.is_empty();
+    let mut kept = task.keep && listed.as_ref().is_none_or(|members| !members.is_empty());
     let kill_error = if kept {
         None
     } else {
@@ -1424,7 +1424,7 @@ fn wait_task(job: WaitWork) {
         .unwrap_or_else(|_| unreachable!("prepared ender stopped"));
     let output_open = drain(&task, &eof, kept);
     let mut registry = lock(&shared.registry);
-    *lock(&task.end) = Some(Final {
+    task.publish_end(Final {
         exit_code: Some(exit_code),
         killed,
         expired,
@@ -1448,9 +1448,7 @@ fn finish_tree(
 ) {
     let tree_ended = child.wait_tree(task.root.process());
     if !tree_ended {
-        *lock(&task.kill_error) =
-            Some("task host disconnected; tree cleanup is unconfirmed".into());
-        task.activity.send_replace(());
+        task.hold_unconfirmed_tree();
     } else {
         *lock(&task.input) = None;
         *lock(&task.pty_control) = None;
@@ -1776,6 +1774,24 @@ fn capture(
 }
 
 impl Task {
+    /// The ender may discover host loss before or after the root's result is published.
+    fn publish_end(&self, mut final_state: Final) {
+        let mut end = lock(&self.end);
+        final_state.kept |= lock(&self.kill_error).is_some();
+        *end = Some(final_state);
+    }
+
+    fn hold_unconfirmed_tree(&self) {
+        let mut end = lock(&self.end);
+        *lock(&self.kill_error) =
+            Some("task host disconnected; tree cleanup is unconfirmed".into());
+        if let Some(end) = end.as_mut() {
+            end.kept = true;
+        }
+        drop(end);
+        self.activity.send_replace(());
+    }
+
     pub fn is_script(&self) -> bool {
         matches!(self.root, Root::Script(_))
     }
@@ -1824,6 +1840,10 @@ impl Task {
 
     pub fn is_running(&self) -> bool {
         lock(&self.end).is_none()
+    }
+
+    fn is_finished(&self) -> bool {
+        lock(&self.end).is_some() && *self.tree_done.borrow()
     }
 
     /// When the task finished: its root, or the processes it held past the root's exit if they
@@ -2288,13 +2308,17 @@ impl Task {
     pub fn kill(&self) -> std::io::Result<()> {
         if self.is_running() {
             self.kill_requested.store(true, Ordering::SeqCst);
-        } else if !self.keeps_processes() {
+        } else if self.is_finished() {
             return Ok(());
         }
         // Recorded for a running task too: its root may have exited already, with the waiter
         // past its own kill.
         let killed = self.root.kill();
-        *lock(&self.kill_error) = killed.as_ref().err().map(|error| error.to_string());
+        if let Err(error) = &killed {
+            *lock(&self.kill_error) = Some(error.to_string());
+        }
+        // Only confirmed tree completion clears an earlier cleanup failure: a successful
+        // kill can return before the ender records host loss, then resume after that record.
         killed
     }
 
@@ -3634,6 +3658,113 @@ mod script_tests {
         // A concurrent kill may store its earlier failure after completion was confirmed.
         *lock(&task.kill_error) = Some("late cleanup error".into());
         assert!(task.snapshot().kill_error.is_none());
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn host_loss_holds_the_task_before_or_after_the_root_result() {
+        let (runtime, tasks, session) = fixture(Limits {
+            max_running: 1,
+            ..Limits::OFF
+        });
+        let (task, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "1234".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        for before_root_result in [true, false] {
+            *lock(&task.end) = None;
+            *lock(&task.kill_error) = None;
+            task.tree_done.send_replace(false);
+            if before_root_result {
+                task.hold_unconfirmed_tree();
+                task.kill().unwrap();
+            }
+            task.publish_end(Final {
+                exit_code: Some(0),
+                killed: false,
+                expired: false,
+                forced_end: false,
+                elapsed: Duration::ZERO,
+                output_open: false,
+                leftovers: Vec::new(),
+                kept: false,
+            });
+            if !before_root_result {
+                task.hold_unconfirmed_tree();
+                task.kill().unwrap();
+            }
+            let snapshot = task.snapshot();
+            assert!(snapshot.kept);
+            assert!(!snapshot.tree_ended);
+            assert!(snapshot.kill_error.unwrap().contains("unconfirmed"));
+            assert_eq!(task.root_end(), Some((Some(0), true)));
+            assert!(task.keeps_processes());
+            assert!(tasks.admit(false).err().unwrap().contains("TOO_MANY_TASKS"));
+        }
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn pending_tree_confirmation_blocks_retirement_expiry_eviction_and_admission() {
+        let (runtime, tasks, session) = fixture(Limits {
+            max_running: 2,
+            max_finished: 1,
+            finished_ttl: Some(Duration::ZERO),
+            ..Limits::OFF
+        });
+        let wait = |task: &Task| {
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+        };
+        let (pending, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "1234".into())
+            .unwrap();
+        wait(&pending);
+        pending.tree_done.send_replace(false);
+        assert!(!pending.is_running() && !pending.keeps_processes());
+        assert!(!pending.is_finished());
+
+        let (finished, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "5678".into())
+            .unwrap();
+        wait(&finished);
+        assert!(
+            tasks.find(&pending.id).is_some(),
+            "pending trees do not retire"
+        );
+        assert!(!pending.evicted());
+
+        let (_, admitted) = tasks.admit(false).unwrap();
+        assert!(tasks.admit(false).err().unwrap().contains("TOO_MANY_TASKS"));
+        drop(admitted);
+
+        tasks.expire_finished(Instant::now());
+        assert!(tasks.find(&finished.id).is_none());
+        assert!(
+            tasks.find(&pending.id).is_some(),
+            "pending trees do not expire"
+        );
+        assert!(!tasks.reserve(tasks.log_limit + 1));
+        assert!(
+            !pending.evicted(),
+            "log pressure must preserve a pending tree"
+        );
+        assert!(pending.log_path.exists());
+
+        pending.tree_done.send_replace(true);
+        assert!(pending.is_finished());
+        tasks.expire_finished(Instant::now());
+        assert!(tasks.find(&pending.id).is_none());
+        assert!(pending.evicted());
         tasks.shutdown();
     }
 
