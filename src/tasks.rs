@@ -214,14 +214,11 @@ struct InputWork {
 }
 
 fn is_broken_pipe(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::BrokenPipe {
-        return true;
-    }
     #[cfg(windows)]
     if matches!(error.raw_os_error(), Some(109 | 232 | 233)) {
         return true;
     }
-    false
+    error.kind() == std::io::ErrorKind::BrokenPipe
 }
 
 struct WaitWork {

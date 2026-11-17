@@ -937,6 +937,7 @@ mod tests {
             env: &context,
             login: false,
             pty: true,
+            pipe_stdin: false,
             cols: crate::process::PTY_COLS,
             rows: crate::process::PTY_ROWS,
             exit_status: None,

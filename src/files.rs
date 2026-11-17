@@ -361,7 +361,7 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
         let mut comps = candidate.components();
         let first = comps.next();
         let second = comps.next();
-        return match (first, second) {
+        match (first, second) {
             (Some(std::path::Component::Prefix(prefix)), second) => {
                 if matches!(prefix.kind(), std::path::Prefix::Disk(_))
                     && second != Some(std::path::Component::RootDir)
@@ -377,7 +377,7 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
                 "Cannot resolve {path}: driveless paths such as /tmp name Git Bash locations on Windows; pass C:/... or /c/..., or convert it with cygpath -m."
             )),
             _ => Ok(clean_components(&launch.cwd.join(candidate))),
-        };
+        }
     }
     #[cfg(not(windows))]
     {
