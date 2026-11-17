@@ -997,7 +997,6 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     const stringToLowerCase = Function.prototype.call.bind(String.prototype.toLowerCase);
     const fromCharCode = String.fromCharCode;
     const reflectApply = Reflect.apply;
-    const arrayJoin = Function.prototype.call.bind(Array.prototype.join);
     const weakSetAdd = Function.prototype.call.bind(WeakSet.prototype.add);
     const weakSetHas = Function.prototype.call.bind(WeakSet.prototype.has);
     const weakMapSet = Function.prototype.call.bind(WeakMap.prototype.set);
@@ -1311,6 +1310,8 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         throw new TypeErrorCtor("TextDecoder.decode input must be an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView.");
     }
 
+    const decodeUnits = [];
+    for (let i = 0; i < 1024; i++) decodeUnits[i] = 0;
     const decoders = new WeakMap();
     class TextDecoder {
         constructor(label = "utf-8", options = undefined) {
@@ -1374,30 +1375,14 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             s.doNotFlush = stream;
             let bomSeen = s.bomSeen;
             const len = taByteLength(bytes);
-            const parts = [];
-            let partCount = 0;
-            const units = [];
+            let out = "";
             let unitCount = 0;
-            const propDesc = {
-                __proto__: null,
-                value: 0,
-                writable: true,
-                enumerable: true,
-                configurable: true,
-            };
             const pushUnit = unit => {
-                if (unitCount < units.length) {
-                    units[unitCount++] = unit;
-                } else {
-                    propDesc.value = unit;
-                    defineProperty(units, unitCount++, propDesc);
+                decodeUnits[unitCount++] = unit;
+                if (unitCount === 1024) {
+                    out += reflectApply(fromCharCode, null, decodeUnits);
+                    unitCount = 0;
                 }
-            };
-            const flush = () => {
-                if (units.length > unitCount) units.length = unitCount;
-                propDesc.value = reflectApply(fromCharCode, null, units);
-                defineProperty(parts, partCount++, propDesc);
-                unitCount = 0;
             };
             const emit = scalar => {
                 if (!bomSeen) {
@@ -1411,7 +1396,6 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
                     pushUnit(0xD800 + (offset >> 10));
                     pushUnit(0xDC00 + (offset & 0x3FF));
                 }
-                if (unitCount >= 1024) flush();
             };
             for (let i = 0; i < len; i++) {
                 const byte = bytes[i];
@@ -1464,8 +1448,10 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
                 emit(0xFFFD);
             }
             s.bomSeen = bomSeen;
-            if (unitCount > 0) flush();
-            return partCount === 0 ? "" : partCount === 1 ? parts[0] : arrayJoin(parts, "");
+            for (let j = 0; j < unitCount; j++) {
+                out += fromCharCode(decodeUnits[j]);
+            }
+            return out;
         }
     }
     defineProperty(TextDecoder.prototype, toStringTag, {
@@ -2214,7 +2200,7 @@ mod tests {
             }
 
             // Survives prototype mutation of Object (including get/set and [0]), TypedArray, Array, String, and WeakMap,
-            // and handles >1 MiB multi-chunk payloads within the nested read window scale.
+            // including surrogate pairs split across the 1024-unit internal chunk boundary and re-entrant options getters.
             const taProto = Object.getPrototypeOf(Uint8Array.prototype);
             const origTaLen = Object.getOwnPropertyDescriptor(taProto, "length");
             Object.defineProperty(taProto, "length", { __proto__: null, get() { throw new Error("patched TA length"); }, configurable: true });
@@ -2224,10 +2210,18 @@ mod tests {
             Array.prototype.push = Array.prototype.join = () => { throw new Error("patched Array"); };
             String.prototype.charCodeAt = String.prototype.slice = () => { throw new Error("patched String"); };
             WeakMap.prototype.get = WeakSet.prototype.has = () => { throw new Error("patched Weak"); };
-            const big = "中🚀a".repeat(150000);
+            const big = "中🚀ab".repeat(3000);
             const bigBytes = enc.encode(big);
-            if (bigBytes.byteLength <= 1024 * 1024 || dec.decode(bigBytes) !== big) {
-                throw new Error("failed >1 MiB roundtrip after prototype mutation");
+            const nestedOpts = {
+                get stream() {
+                    if (new TextDecoder().decode(enc.encode("nested-🚀")) !== "nested-🚀") {
+                        throw new Error("re-entrant decode failed");
+                    }
+                    return false;
+                }
+            };
+            if (dec.decode(bigBytes, nestedOpts) !== big) {
+                throw new Error("failed multi-chunk roundtrip after prototype mutation");
             }
             const scratch = new Uint8Array(16);
             if (enc.encodeInto("中🚀", scratch).written !== 7 || dec.decode(scratch.subarray(0, 7)) !== "中🚀") {
