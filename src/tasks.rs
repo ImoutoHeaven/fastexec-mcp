@@ -1652,16 +1652,20 @@ fn finish_tree(
     let tree_ended = child.wait_tree(task.root.process());
     if !tree_ended {
         task.hold_unconfirmed_tree();
+        drop(child);
     } else {
         *lock(&task.input) = None;
         *lock(&task.pty_control) = None;
+        // Drop child before waiting on writer_done: on Windows ConPTY, Child::Pty holds an
+        // Arc<Terminal>, and ClosePseudoConsole only closes the output pipe (releasing
+        // capture's answer sender) once every Arc<Terminal> is dropped.
+        drop(child);
         task.writer_done.wait_until(Instant::now() + DRAIN_CAP);
         let _ = std::fs::remove_file(script);
         if let Some(status) = exit_status {
             let _ = std::fs::remove_file(status);
         }
     }
-    drop(child);
     let mut registry = lock(&shared.registry);
     if tree_ended {
         let _ = task.tree_ended_at.set(Instant::now());
