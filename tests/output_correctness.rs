@@ -272,7 +272,7 @@ fn encoding_warnings_survive_every_mode_and_small_output_budget() {
 
             // ConPTY can normalize invalid program bytes; corrupt the retained files instead.
             let started = server.exec(json!({"action": "start", "pty": true,
-                "command": "printf 'ADATA\\n'", "waitMs": 10000}));
+                "command": "printf 'ADATA\\n'; seq 1 200", "maxBytes": 300, "waitMs": 10000}));
             assert_ne!(started["isError"], true, "{}", text(&started));
             let (handle, path) = task_location(&started, structured);
             let task_id = handle.split_once('.').unwrap().0;

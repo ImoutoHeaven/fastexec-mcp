@@ -237,6 +237,8 @@ pub struct WindowSpec {
     /// Byte budget for the window body.
     pub budget: usize,
     pub raw: bool,
+    pub clean: bool,
+    pub line_cut: bool,
     pub encoding: &'static Encoding,
     /// What the line numbers count, named in the omission marker: "log" or "transcript".
     pub source: &'static str,
@@ -246,6 +248,8 @@ pub struct Window {
     /// Candidate lines retain their source numbers so final fitting can account for omissions.
     lines: Vec<Line>,
     truncate: Truncate,
+    clean: bool,
+    line_cut: bool,
     source: &'static str,
     /// Inclusive line range left out of the window.
     pub omitted: Option<(u64, u64)>,
@@ -293,6 +297,8 @@ impl Window {
                 },
                 budget: 0,
                 raw: true,
+                clean: self.clean,
+                line_cut: self.line_cut,
                 encoding: encoding_rs::UTF_8,
                 source: self.source,
             },
@@ -323,6 +329,14 @@ impl Window {
             marker_limit
         } else if room >= 3_usize.saturating_add(content) {
             3
+        } else if !self.line_cut && self.truncate == Truncate::HeadTail && self.lines.len() > 1 {
+            if room >= marker_limit.saturating_add(first) {
+                marker_limit
+            } else if room >= 3_usize.saturating_add(first) {
+                3
+            } else {
+                0
+            }
         } else {
             0
         };
@@ -397,7 +411,13 @@ impl<'a> WindowBuilder<'a> {
 
     pub fn push(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            if self.spec.raw {
+            if !self.spec.clean {
+                if byte == b'\n' {
+                    self.end_line(true);
+                } else {
+                    self.append(byte);
+                }
+            } else if self.spec.raw {
                 self.raw_byte(byte);
             } else {
                 self.clean_byte(byte);
@@ -430,11 +450,15 @@ impl<'a> WindowBuilder<'a> {
         }
     }
 
-    /// The bytes one line may keep: 64 KiB, or a `Truncate::None` window's whole cap.
+    /// The bytes one line may keep: 64 KiB for per-line-cut windows, or the window's body budget.
     fn line_limit(&self) -> usize {
-        match self.spec.truncate {
-            Truncate::None => self.spec.budget,
-            _ => LINE_BYTES_LIMIT,
+        if self.spec.line_cut {
+            LINE_BYTES_LIMIT
+        } else {
+            match self.spec.truncate {
+                Truncate::None => self.spec.budget,
+                _ => self.spec.budget.saturating_sub(1),
+            }
         }
     }
 
@@ -480,11 +504,11 @@ impl<'a> WindowBuilder<'a> {
         let mut text = decoded.into_owned();
         let limit = self.line_limit();
         let mut cut = dropped > 0;
-        if !self.spec.raw {
+        if self.spec.clean && !self.spec.raw {
             // Terminals (ConPTY in particular) pad lines with spaces.
             text.truncate(text.trim_end_matches(' ').len());
         }
-        if !self.spec.raw && self.spec.truncate != Truncate::None {
+        if self.spec.line_cut && !self.spec.raw {
             let chars = text.chars().count();
             if chars > LINE_CHARS_LIMIT {
                 cut = true;
@@ -498,22 +522,18 @@ impl<'a> WindowBuilder<'a> {
                 ));
             }
         }
-        // Decoded text can be longer than its source bytes, so a `None` window's cap is
-        // enforced on the text too, on a character boundary.
-        if self.spec.truncate == Truncate::None && text.len() > limit {
-            let mut end = limit;
-            while !text.is_char_boundary(end) {
-                end -= 1;
+        if self.spec.line_cut {
+            if dropped > 0 {
+                text.push_str(&format!(
+                    " … [line cut at {}; {dropped} more bytes]",
+                    brief_bytes(limit)
+                ));
             }
-            dropped += text.len() - end;
-            text.truncate(end);
+        } else if dropped > 0 || text.len() > limit {
+            // Decoded text can also exceed limit when invalid bytes expand to U+FFFD; fit the
+            // kept prefix and the cut marker within limit together on a character boundary.
             cut = true;
-        }
-        if dropped > 0 {
-            text.push_str(&format!(
-                " … [line cut at {}; {dropped} more bytes]",
-                brief_bytes(limit)
-            ));
+            cut_line_to_budget(&mut text, limit, dropped);
         }
         self.place(Line { number, text, cut });
     }
@@ -522,14 +542,19 @@ impl<'a> WindowBuilder<'a> {
         let (head_budget, tail_budget) = match self.spec.truncate {
             // A `None` window stores whole lines up to its cap and reports the rest as omitted,
             // so nothing is buffered past it.
-            Truncate::None => (self.line_limit(), 0),
+            Truncate::None => (self.spec.budget.saturating_add(1), 0),
             Truncate::Head => (self.spec.budget, 0),
             Truncate::Tail => (0, self.spec.budget),
             Truncate::HeadTail => {
-                // Keep both ends at small budgets, instead of spending less than one line on
-                // the head even when the first and last lines fit together.
+                // Keep both ends at small budgets; when per-line cuts are disabled, a first line
+                // that fits the body budget may take up to all of it without being cut.
                 let first = self.head.first().unwrap_or(&line).text.len() + 1;
-                let head = (self.spec.budget / 10).max(first.min(self.spec.budget / 2));
+                let max_first = if self.spec.line_cut {
+                    self.spec.budget / 2
+                } else {
+                    self.spec.budget
+                };
+                let head = (self.spec.budget / 10).max(first.min(max_first));
                 (head, self.spec.budget - head)
             }
         };
@@ -546,7 +571,12 @@ impl<'a> WindowBuilder<'a> {
             if self.head.is_empty() && head_budget > 1 && self.spec.truncate != Truncate::Tail {
                 // A `None` line is already bounded by the cap, with the note that says so.
                 if self.spec.truncate != Truncate::None {
-                    line.cut |= cut_to(&mut line.text, head_budget);
+                    if self.spec.line_cut || line.cut {
+                        line.cut |= cut_to(&mut line.text, head_budget);
+                    } else {
+                        line.cut = true;
+                        cut_line_to_budget(&mut line.text, head_budget - 1, 0);
+                    }
                 }
                 if line.cut && line.text.is_empty() {
                     merge_omitted(&mut self.omitted, line.number, line.number);
@@ -557,12 +587,44 @@ impl<'a> WindowBuilder<'a> {
                 return;
             }
         }
-        if line.text.len() + 1 > tail_budget && tail_budget > 0 {
-            line.cut |= cut_to(&mut line.text, tail_budget);
-        }
-        if line.cut && line.text.is_empty() {
-            merge_omitted(&mut self.omitted, line.number, line.number);
-            return;
+        if self.spec.line_cut {
+            if line.text.len() + 1 > tail_budget && tail_budget > 0 {
+                line.cut |= cut_to(&mut line.text, tail_budget);
+            }
+            if line.cut && line.text.is_empty() {
+                merge_omitted(&mut self.omitted, line.number, line.number);
+                return;
+            }
+        } else if self.spec.truncate == Truncate::Tail {
+            // An earlier oversized tail line is replaced whole as soon as a later line follows.
+            if self.tail.front().is_some_and(|front| front.cut) {
+                while let Some(dropped) = self.tail.pop_front() {
+                    merge_omitted(&mut self.omitted, dropped.number, dropped.number);
+                }
+                self.tail_bytes = 0;
+            }
+            if line.text.len() + 1 > tail_budget {
+                if tail_budget <= 1 {
+                    merge_omitted(&mut self.omitted, line.number, line.number);
+                    return;
+                }
+                if line.cut {
+                    let _ = cut_to(&mut line.text, tail_budget);
+                } else {
+                    line.cut = true;
+                    cut_line_to_budget(&mut line.text, tail_budget - 1, 0);
+                }
+                if line.text.is_empty() {
+                    merge_omitted(&mut self.omitted, line.number, line.number);
+                    return;
+                }
+                while let Some(dropped) = self.tail.pop_front() {
+                    merge_omitted(&mut self.omitted, dropped.number, dropped.number);
+                }
+                self.tail_bytes = line.text.len() + 1;
+                self.tail.push_back(line);
+                return;
+            }
         }
         self.tail_bytes += line.text.len() + 1;
         self.tail.push_back(line);
@@ -578,7 +640,7 @@ impl<'a> WindowBuilder<'a> {
     pub fn finish(mut self) -> Window {
         if self.line_started || !self.line.is_empty() {
             // The unterminated last line is shown now; a trailing CR may still pair with a LF.
-            if self.cleaner.pending_cr {
+            if self.spec.clean && self.cleaner.pending_cr {
                 self.cleaner.pending_cr = false;
                 self.cleaner.swallow_lf = true;
             }
@@ -590,6 +652,8 @@ impl<'a> WindowBuilder<'a> {
         Window {
             lines,
             truncate: self.spec.truncate,
+            clean: self.spec.clean,
+            line_cut: self.spec.line_cut,
             source: self.spec.source,
             omitted: self.omitted,
             bad_lines: self.bad_lines,
@@ -606,6 +670,41 @@ fn brief_bytes(bytes: usize) -> String {
     } else {
         format!("{bytes} bytes")
     }
+}
+
+/// Cuts `text` on a character boundary so `text` and its `… [line cut at <budget>; <n> more
+/// bytes]` marker fit within `limit` bytes together, falling back to `cut_to` when `limit` is too
+/// small to hold the full marker.
+fn cut_line_to_budget(text: &mut String, limit: usize, already_dropped: usize) {
+    let budget_label = brief_bytes(limit);
+    let max_dropped = already_dropped + text.len();
+    let max_marker = format!(" … [line cut at {budget_label}; {max_dropped} more bytes]");
+    if limit <= max_marker.len() {
+        let _ = cut_to(text, limit.saturating_add(1));
+        return;
+    }
+    let mut keep = (limit - max_marker.len()).min(text.len());
+    while !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let dropped = already_dropped + (text.len() - keep);
+    let mut marker = format!(" … [line cut at {budget_label}; {dropped} more bytes]");
+    if marker.len() < max_marker.len() {
+        let mut alt_keep = (limit - marker.len()).min(text.len());
+        while !text.is_char_boundary(alt_keep) {
+            alt_keep -= 1;
+        }
+        if alt_keep > keep {
+            let alt_dropped = already_dropped + (text.len() - alt_keep);
+            let alt_marker = format!(" … [line cut at {budget_label}; {alt_dropped} more bytes]");
+            if alt_keep + alt_marker.len() <= limit {
+                keep = alt_keep;
+                marker = alt_marker;
+            }
+        }
+    }
+    text.truncate(keep);
+    text.push_str(&marker);
 }
 
 /// Shortens `text` to at most `budget - 1` bytes, with a cut marker when it fits, on a char
@@ -689,6 +788,8 @@ mod tests {
             truncate,
             budget,
             raw,
+            clean: true,
+            line_cut: truncate != Truncate::None,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -755,6 +856,8 @@ mod tests {
             truncate: Truncate::None,
             budget: UNBOUNDED,
             raw,
+            clean: true,
+            line_cut: false,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -773,6 +876,8 @@ mod tests {
             truncate: Truncate::None,
             budget: UNBOUNDED,
             raw,
+            clean: true,
+            line_cut: false,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -831,6 +936,8 @@ mod tests {
             truncate: Truncate::None,
             budget: UNBOUNDED,
             raw: false,
+            clean: true,
+            line_cut: false,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -922,25 +1029,29 @@ mod tests {
         assert!(!shown.contains("line 20"), "{shown}");
         assert!(shown.len() <= 100 + 64, "{} bytes: {shown}", shown.len());
 
-        // A line longer than the whole cap shows its beginning, cut, and says how much is gone.
+        // A line longer than the whole cap shows its beginning, cut so line + marker fit the cap.
         let long = format!("{}\n", "x".repeat(200));
         let out = window(&[long.as_bytes()], Truncate::None, 100, false);
         let shown = text(&out);
+        assert_eq!(shown.len(), 100, "{shown}");
         assert!(
-            shown.contains("line cut at 100 bytes; 100 more bytes"),
+            shown.contains("line cut at 100 bytes; 144 more bytes"),
             "{shown}"
         );
         assert!(out.omitted.is_none(), "{shown}");
 
         // A valid multibyte line crossing the cap stays valid: the unfinished character at the
-        // cut is dropped rather than decoded into a false encoding error.
+        // cut is dropped rather than decoded into a false encoding error, and line + marker fit.
         let mut multibyte = "中".repeat(400).into_bytes();
         multibyte.push(0x0a);
         let out = window(&[&multibyte], Truncate::None, 100, false);
         assert_eq!(out.bad_lines, 0);
         let shown = text(&out);
-        assert!(shown.contains("line cut at 100 bytes"), "{shown}");
-        assert!(shown.len() <= 100 + 64, "{} bytes: {shown}", shown.len());
+        assert!(
+            shown.contains("line cut at 100 bytes; 1146 more bytes"),
+            "{shown}"
+        );
+        assert!(shown.len() <= 100, "{} bytes: {shown}", shown.len());
 
         // Bytes that are invalid on their own decode to 3-byte replacement characters: the cap
         // holds on the text too, and the error is still reported.
@@ -949,7 +1060,7 @@ mod tests {
         let out = window(&[&invalid], Truncate::None, 100, false);
         let shown = text(&out);
         assert!(shown.contains("line cut at 100 bytes"), "{shown}");
-        assert!(shown.len() <= 100 + 64, "{} bytes: {shown}", shown.len());
+        assert!(shown.len() <= 100, "{} bytes: {shown}", shown.len());
         assert_eq!(out.bad_lines, 1);
     }
 
@@ -1030,5 +1141,74 @@ mod tests {
         let (fitted, cut_lines, _) = out.fit(500);
         assert!(fitted.len() <= 500 && fitted.ends_with("tail"), "{fitted}");
         assert_eq!(cut_lines, 1, "a line cut twice still counts once");
+    }
+
+    #[test]
+    fn uncleaned_uncut_windows_preserve_bytes_whole_lines_and_utf8_boundaries() {
+        let build = |chunks: &[&[u8]], truncate: Truncate, budget: usize| {
+            let mut cleaner = Cleaner::default();
+            let mut b = WindowBuilder::new(
+                WindowSpec {
+                    truncate,
+                    budget,
+                    raw: false,
+                    clean: false,
+                    line_cut: false,
+                    encoding: encoding_rs::UTF_8,
+                    source: "log",
+                },
+                &mut cleaner,
+                1,
+            );
+            for chunk in chunks {
+                b.push(chunk);
+            }
+            b.finish()
+        };
+
+        // P0-1: no ANSI stripping, CR collapsing, trailing-space trim, or 2000-char cut.
+        let raw_sample = format!("first\rsecond  \n\x1b[32m{}\x1b[0m  \n", "a".repeat(10_000));
+        let out = build(&[raw_sample.as_bytes()], Truncate::HeadTail, 16_384);
+        let (rendered, cuts, omitted) = out.fit(16_384);
+        assert_eq!(cuts, 0);
+        assert_eq!(omitted, None);
+        assert_eq!(format!("{rendered}\n"), raw_sample);
+
+        // Placement: a first line between half and all of the budget stays whole; non-fitting
+        // later lines are omitted whole rather than clipped.
+        let first_800 = "J".repeat(800);
+        let second_500 = "K".repeat(500);
+        let two = format!("{first_800}\n{second_500}\n");
+        let out = build(&[two.as_bytes()], Truncate::HeadTail, 1000);
+        let (rendered, cuts, omitted) = out.fit(950);
+        assert!(rendered.len() <= 950, "{}", rendered.len());
+        assert!(rendered.starts_with(&first_800), "{rendered}");
+        assert!(!rendered.contains(&second_500));
+        assert_eq!(cuts, 0);
+        assert_eq!(omitted, Some((2, 2)));
+
+        // A line longer than the budget fits with its marker inside the budget across all
+        // modes and never splits a multi-byte UTF-8 character.
+        let multi = format!("{}\n", "🚀中".repeat(200));
+        for mode in [
+            Truncate::Head,
+            Truncate::Tail,
+            Truncate::HeadTail,
+            Truncate::None,
+        ] {
+            let out = build(&[multi.as_bytes()], mode, 180);
+            let (rendered, cuts, _) = out.fit(180);
+            assert!(
+                rendered.len() <= 180,
+                "{mode:?}: {} > 180: {rendered}",
+                rendered.len()
+            );
+            assert_eq!(cuts, 1, "{mode:?}");
+            assert!(rendered.contains("line cut at "), "{mode:?}: {rendered}");
+            for room in 1..=200 {
+                let (refit, _, _) = out.fit(room);
+                assert!(refit.len() <= room, "{mode:?} room={room}: {}", refit.len());
+            }
+        }
     }
 }

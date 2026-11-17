@@ -482,7 +482,7 @@ fn a_daemon_starts_is_reported_and_stops() {
     let (code, out, err) = fixture.run(&["daemon", "start"]);
     assert_eq!(code, 0, "start failed: {err}");
     let epoch = fixture.epoch_of(&out);
-    assert_eq!(epoch.len(), 26, "{epoch}");
+    assert_eq!(epoch.len(), 8, "{epoch}");
     // The namespace is the 16 hex characters the identity hashes the scope into.
     let namespace = out
         .split_whitespace()
@@ -749,7 +749,7 @@ fn a_long_runtime_path_falls_back_to_a_short_socket() {
     let (code, out, err) = probe.run(&["daemon", "start"]);
     assert_eq!(code, 0, "start failed: {err}");
     let epoch = probe.epoch_of(&out);
-    assert_eq!(epoch.len(), 26, "{out:?}");
+    assert_eq!(epoch.len(), 8, "{out:?}");
     // The daemon is reachable over the fallback socket, under the same long temporary directory.
     let (code, status, err) = probe.run(&["daemon", "status"]);
     assert_eq!(code, 0, "status failed: {err}");
@@ -905,7 +905,7 @@ fn a_pending_watch_sees_another_sessions_resize() {
     );
     std::thread::sleep(Duration::from_millis(200));
     let mut second = Endpoint::start(&fixture);
-    let (_, listed, error) = second.call(json!({"action": "list"}));
+    let (_, listed, error) = second.call(json!({"action": "list", "scope": "all"}));
     assert!(!error, "{listed}");
     assert!(listed.contains(" pty 20x30"), "{listed}");
     let (_, text, error) = second.call(json!({
@@ -1009,6 +1009,7 @@ fn two_endpoints_read_one_task_through_independent_cursors() {
     let (started, text, error) = first.call(json!({
         "action": "start",
         "command": "IFS= read -r line; printf 'x%sy\\n' \"$line\"; sleep 60",
+        "eof": false,
         "waitMs": 0
     }));
     assert!(!error, "{text}");
@@ -1136,14 +1137,14 @@ fn a_lost_call_after_a_daemon_stop_is_reported_and_the_next_call_starts_a_daemon
 fn a_call_over_one_mib_is_refused_before_it_reaches_a_daemon() {
     let fixture = Fixture::new("e2e-limit");
     let mut endpoint = Endpoint::start(&fixture);
-    let command = "x".repeat(2 << 20);
+    let command = "x".repeat((3 << 20) + 1024);
     let (_, text, error) = endpoint.call(json!({
         "action": "start",
         "command": command,
         "waitMs": 0
     }));
     assert!(error, "{text}");
-    assert!(text.contains("calls are limited to 1 MiB"), "{text}");
+    assert!(text.contains("calls are limited to 3 MiB"), "{text}");
     // Nothing was sent, so nothing started a daemon.
     let (code, out, err) = fixture.run(&["daemon", "status"]);
     assert_eq!(code, 0, "status failed: {err}");
@@ -1208,12 +1209,17 @@ fn file_tools_run_in_the_endpoints_directory_and_not_the_daemons() {
     let mut endpoint = Endpoint::start_with(&fixture, |command| {
         command.current_dir(&dir);
     });
+    let expected_note = dir.join("notes/a.txt").to_string_lossy().replace('\\', "/");
+    let expected_missing = dir
+        .join("notes/missing.txt")
+        .to_string_lossy()
+        .replace('\\', "/");
     let (_, written, error) = endpoint.file(
         "write",
         json!({"path": "notes/a.txt", "content": "one\ntwo\n"}),
     );
     assert!(!error, "{written}");
-    assert_eq!(written, "Successfully wrote to notes/a.txt");
+    assert_eq!(written, format!("Successfully wrote to {expected_note}"));
     assert_eq!(
         std::fs::read(dir.join("notes/a.txt")).unwrap(),
         b"one\ntwo\n"
@@ -1228,7 +1234,7 @@ fn file_tools_run_in_the_endpoints_directory_and_not_the_daemons() {
     assert!(!error, "{edited}");
     assert_eq!(
         edited,
-        "Successfully replaced 1 block(s) in notes/a.txt.\nedits[0]: line 2"
+        format!("Successfully replaced 1 block(s) in {expected_note}.\nedits[0]: line 2")
     );
     let (_, read, _) = endpoint.file("read", json!({"path": "notes/a.txt"}));
     assert_eq!(read, "one\nTWO\n");
@@ -1236,7 +1242,7 @@ fn file_tools_run_in_the_endpoints_directory_and_not_the_daemons() {
     let (_, text, error) = endpoint.file("read", json!({"path": "notes/missing.txt"}));
     assert!(error, "{text}");
     assert!(
-        text.starts_with("Cannot read notes/missing.txt: "),
+        text.starts_with(&format!("Cannot read {expected_missing}: ")),
         "{text}"
     );
     endpoint.close();
@@ -1779,7 +1785,7 @@ fn two_endpoints_on_one_daemon_keep_independent_yolo_annotations() {
         .to_owned();
 
     let mut plain = Endpoint::start(&fixture);
-    let (listed_tasks, text, error) = plain.call(json!({"action": "list"}));
+    let (listed_tasks, text, error) = plain.call(json!({"action": "list", "scope": "all"}));
     assert!(!error, "{text}");
     assert!(
         listed_tasks["tasks"]
@@ -1944,7 +1950,7 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
     assert_eq!(read_img["structuredContent"]["kind"], "image", "{read_img}");
     assert_eq!(read_img["structuredContent"]["width"], 8, "{read_img}");
     let result = enabled.request("tools/call", json!({"name":"codemode","arguments":{
-        "code":"image(await tools.read({path:'shot.png'})); const child = await tools.exec({action:'start',command:'printf nested',loginShell:false}); text(child.structuredContent.taskId); return child.structuredContent.output;"
+        "code":"image(await tools.read({path:'shot.png'})); const child = await tools.exec({action:'start',command:'printf nested',loginShell:false}); text(child.taskId); return child.output;"
     }}))["result"].clone();
     assert_eq!(result["isError"], false, "{result}");
     assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
@@ -2021,4 +2027,176 @@ fn invalid_codemode_is_rejected_by_daemon_start_and_run() {
         String::from_utf8_lossy(&output.stdout).starts_with("No fastexec daemon"),
         "{output:?}"
     );
+}
+
+#[test]
+fn daemon_ipc_accepts_1mib_escaped_input_refuses_over_3mib_and_matches_stdio_schemas() {
+    let fixture = Fixture::new("ipc-3mib-and-schemas");
+    let mut daemon_ep = Endpoint::start_with(&fixture, |cmd| {
+        cmd.env("FASTEXEC_CODEMODE", "true");
+    });
+
+    let daemon_tools = daemon_ep.request("tools/list", json!({}))["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let mut stdio_child = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+        .env("FASTEXEC_DAEMON", "off")
+        .env("FASTEXEC_CODEMODE", "true")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdio_reader = BufReader::new(stdio_child.stdout.take().unwrap());
+    let mut read_reply = |want_id: u64| -> Value {
+        loop {
+            let mut line = String::new();
+            assert!(
+                stdio_reader.read_line(&mut line).unwrap() > 0,
+                "stdio EOF before id {want_id}"
+            );
+            if let Ok(msg) = serde_json::from_str::<Value>(&line)
+                && msg["id"] == want_id
+            {
+                return msg;
+            }
+        }
+    };
+    {
+        let stdin = stdio_child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}})
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    let _ = read_reply(1);
+    {
+        let stdin = stdio_child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    let list_msg = read_reply(2);
+    drop(stdio_child.stdin.take());
+    let _ = stdio_child.wait();
+    let stdio_tools = list_msg["result"]["tools"].as_array().unwrap();
+    assert_eq!(daemon_tools.len(), stdio_tools.len());
+    for s_tool in stdio_tools {
+        let name = s_tool["name"].as_str().unwrap();
+        let d_tool = daemon_tools.iter().find(|t| t["name"] == name).unwrap();
+        assert_eq!(
+            d_tool["inputSchema"], s_tool["inputSchema"],
+            "schema mismatch on {name}"
+        );
+    }
+
+    let (wc_sc, wc_text, wc_err) = daemon_ep.call(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "wc -c",
+        "input": "\n".repeat(1 << 20)
+    }));
+    assert!(!wc_err, "{wc_text}");
+    assert_eq!(wc_sc["exitCode"], 0, "{wc_text}");
+    assert!(wc_text.contains("1048576"), "{wc_text}");
+
+    let big_file = fixture.runtime.join("near-1mib.txt");
+    let (_, w_text, w_err) = daemon_ep.file(
+        "write",
+        json!({"path": big_file.to_string_lossy(), "content": "\n".repeat(900_000)}),
+    );
+    assert!(!w_err, "{w_text}");
+    assert_eq!(std::fs::metadata(&big_file).unwrap().len(), 900_000);
+
+    let (_, nul_text, nul_err) = daemon_ep.call(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "cat",
+        "input": "\0".repeat(1 << 20)
+    }));
+    assert!(nul_err && nul_text.contains("3 MiB"), "{nul_text}");
+}
+
+#[test]
+fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_budget() {
+    let fixture = Fixture::new("outside-footer-once");
+    let mut ep_a = Endpoint::start(&fixture);
+    let mut ep_b = Endpoint::start(&fixture);
+
+    let (t1, t1_text, e1) = ep_a
+        .call(json!({"action": "start", "loginShell": false, "command": "sleep 30", "waitMs": 50}));
+    let (t2, t2_text, e2) = ep_a
+        .call(json!({"action": "start", "loginShell": false, "command": "sleep 30", "waitMs": 50}));
+    assert!(!e1 && !e2);
+    let id1 = Endpoint::task_id(&t1, &t1_text);
+    let id2 = Endpoint::task_id(&t2, &t2_text);
+
+    let (_, tiny_text, tiny_err) = ep_b.call(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "true",
+        "maxBytes": 100
+    }));
+    assert!(
+        !tiny_err && !tiny_text.contains("outside this session"),
+        "{tiny_text}"
+    );
+
+    let (_, first_text, first_err) = ep_b.call(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "true"
+    }));
+    assert!(
+        !first_err
+            && first_text.contains(
+                "(Background: 2 tasks running outside this session; use list with scope \"all\".)"
+            ),
+        "{first_text}"
+    );
+
+    let (_, second_text, second_err) = ep_b.call(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "true"
+    }));
+    assert!(
+        !second_err && !second_text.contains("outside this session"),
+        "{second_text}"
+    );
+
+    let (sess_list, _, _) = ep_b.call(json!({"action": "list"}));
+    assert_eq!(sess_list["totalCount"], 3, "{sess_list}");
+    let (all_list, _, _) = ep_b.call(json!({"action": "list", "scope": "all"}));
+    assert_eq!(all_list["totalCount"], 5, "{all_list}");
+
+    // Stale 8-char base32 epoch in daemon mode reports an earlier daemon; malformed ID says Unknown taskId.
+    let (_, stale_text, stale_err) = ep_b.call(json!({"action": "poll", "taskId": "01234567-9z"}));
+    assert!(
+        stale_err && stale_text.contains("earlier fastexec daemon"),
+        "{stale_text}"
+    );
+    let (_, bad_text, bad_err) = ep_b.call(json!({"action": "poll", "taskId": "foo-bar"}));
+    assert!(
+        bad_err
+            && bad_text.contains("Unknown taskId")
+            && !bad_text.contains("earlier fastexec daemon"),
+        "{bad_text}"
+    );
+
+    ep_a.call(json!({"action": "kill", "taskId": id1}));
+    ep_a.call(json!({"action": "kill", "taskId": id2}));
 }

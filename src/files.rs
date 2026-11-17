@@ -207,13 +207,12 @@ pub async fn write(
     render: Render,
 ) -> CallToolResult {
     let effective = render.effective();
-    let path = request.path.clone();
     let bytes = request.content.len();
     let outcome = tokio::task::spawn_blocking(move || write_text(&request, &launch)).await;
-    let result =
-        finished(outcome.map(|res| {
-            res.map(|text| (text, json!({ "ok": true, "path": path, "bytes": bytes })))
-        }));
+    let result = finished(outcome.map(|res| {
+        res.map(|(text, path)| (text, json!({ "ok": true, "path": path, "bytes": bytes })))
+            .map_err(|msg| (msg, None))
+    }));
     service::suppress(result, effective)
 }
 
@@ -229,17 +228,22 @@ pub async fn edit(
     service::suppress(result, effective)
 }
 
+type BlockingOutcome = Result<(String, Value), (String, Option<Value>)>;
+
 /// A blocking operation's answer: its text and structured metadata, or its message as an error.
-fn finished(
-    outcome: Result<Result<(String, Value), String>, tokio::task::JoinError>,
-) -> CallToolResult {
+fn finished(outcome: Result<BlockingOutcome, tokio::task::JoinError>) -> CallToolResult {
     match outcome {
         Ok(Ok((text, structured))) => {
             let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
             result.structured_content = Some(structured);
             result
         }
-        Ok(Err(message)) => failed(message),
+        Ok(Err((message, Some(structured)))) => {
+            let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
+            result.structured_content = Some(structured);
+            result
+        }
+        Ok(Err((message, None))) => failed(message),
         Err(error) => failed(format!("the file operation did not finish: {error}")),
     }
 }
@@ -254,31 +258,135 @@ fn schema_failed(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
-/// The path a request names: `~` and `~/` expand to the launch context's home, a relative path
-/// joins its working directory, and an absolute path is used as it is.
+/// Formats a path for tool output and `structuredContent`: forward slashes on Windows, stripping
+/// verbatim `\\?\` prefixes and turning `\\server\share` into `//server/share`.
+pub fn display_path(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format_windows_display(&path.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn format_windows_display(raw: &str) -> String {
+    if raw.len() >= 8 && raw.as_bytes()[..8].eq_ignore_ascii_case(b"\\\\?\\UNC\\") {
+        return format!("//{}", raw[8..].replace('\\', "/"));
+    }
+    let mut shown = match raw.strip_prefix("\\\\?\\") {
+        Some(rest) => rest.replace('\\', "/"),
+        None => raw.replace('\\', "/"),
+    };
+    if shown.as_bytes().get(1) == Some(&b':') && shown.as_bytes()[0].is_ascii_lowercase() {
+        let upper = (shown.as_bytes()[0] as char).to_ascii_uppercase();
+        shown.replace_range(..1, &upper.to_string());
+    }
+    shown
+}
+
+/// Rewrites Git Bash `/<letter>` and `/<letter>/...` drive paths to `<LETTER>:/...`, and
+/// forward-slash UNC `//server/share...` paths to `\\server\share...` so `std::path::Path`
+/// parses `Component::Prefix(Prefix::UNC)` on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn git_bash_drive_path(path: &str) -> Option<String> {
+    if path.starts_with("//") && !path.starts_with("///") {
+        let rest = &path[2..];
+        if let Some((server, after)) = rest.split_once('/')
+            && !server.is_empty()
+        {
+            let share = after.split('/').next().unwrap_or_default();
+            if !share.is_empty() {
+                return Some(format!("\\\\{}", rest.replace('/', "\\")));
+            }
+        }
+    }
+    let bytes = path.as_bytes();
+    if bytes.first() == Some(&b'/') && bytes.len() >= 2 && bytes[1].is_ascii_alphabetic() {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        if bytes.len() == 2 {
+            return Some(format!("{drive}:/"));
+        }
+        if bytes[2] == b'/' {
+            return Some(format!("{drive}:/{}", &path[3..]));
+        }
+    }
+    None
+}
+
+/// Rebuilds `path` from its components, removing `.` and repeated separators while keeping `..`
+/// so the kernel resolves symlinks naturally without lexical `..` collapsing or canonicalization.
+fn clean_components(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Resolves a path parameter against `launch`: expands `~`, maps Git Bash `/c/...` drive roots on
+/// Windows, refuses driveless rooted and drive-relative Windows paths, joins relative paths onto
+/// `launch.cwd`, and removes `.` and repeated separators while leaving `..` to the filesystem.
 pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
+    if path.is_empty() {
+        return Err("Path must not be empty.".into());
+    }
     let home = || {
         launch
             .home()
             .ok_or_else(|| format!("Cannot expand ~ in {path}: the home directory is unknown."))
     };
     if path == "~" {
-        return home();
+        return Ok(clean_components(&home()?));
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        return Ok(home()?.join(rest));
+        return Ok(clean_components(&home()?.join(rest)));
     }
     #[cfg(windows)]
     {
         if let Some(rest) = path.strip_prefix("~\\") {
-            return Ok(home()?.join(rest));
+            return Ok(clean_components(&home()?.join(rest)));
         }
+        let rewritten = git_bash_drive_path(path);
+        let candidate = Path::new(rewritten.as_deref().unwrap_or(path));
+        let mut comps = candidate.components();
+        let first = comps.next();
+        let second = comps.next();
+        return match (first, second) {
+            (Some(std::path::Component::Prefix(prefix)), second) => {
+                if matches!(prefix.kind(), std::path::Prefix::Disk(_))
+                    && second != Some(std::path::Component::RootDir)
+                {
+                    Err(format!(
+                        "Cannot resolve {path}: drive-relative paths such as C:file depend on a per-drive current directory; pass C:/... or a relative path."
+                    ))
+                } else {
+                    Ok(clean_components(candidate))
+                }
+            }
+            (Some(std::path::Component::RootDir), _) => Err(format!(
+                "Cannot resolve {path}: driveless paths such as /tmp name Git Bash locations on Windows; pass C:/... or /c/..., or convert it with cygpath -m."
+            )),
+            _ => Ok(clean_components(&launch.cwd.join(candidate))),
+        };
     }
-    let named = PathBuf::from(path);
-    if named.is_absolute() {
-        Ok(named)
-    } else {
-        Ok(launch.cwd.join(named))
+    #[cfg(not(windows))]
+    {
+        let named = Path::new(path);
+        if named.is_absolute() {
+            Ok(clean_components(named))
+        } else {
+            Ok(clean_components(&launch.cwd.join(named)))
+        }
     }
 }
 
@@ -290,16 +398,17 @@ fn read_text(
     limits: ReadLimits,
 ) -> Result<Outcome, String> {
     let resolved = resolve(&request.path, launch)?;
-    let (mut file, metadata) = open_regular(&resolved)
-        .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
+    let shown_path = display_path(&resolved);
+    let (mut file, metadata) =
+        open_regular(&resolved).map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
     let mut sniff = vec![0u8; SNIFF];
     let sniffed = read_upto(&mut file, &mut sniff)
-        .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
+        .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
     if let Some(mime) = images::detect(&sniff[..sniffed]) {
         // The encoded image is read within the ceiling the decoder allocates under, so a file
         // far larger than any inline image is never loaded.
         let bytes = images::read_encoded(&mut file, metadata.len())
-            .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
+            .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
         let processed = match bytes {
             Some(bytes) => images::process(bytes, mime),
             None => images::oversized(mime),
@@ -308,7 +417,7 @@ fn read_text(
         let structured = json!({
             "ok": true,
             "kind": "image",
-            "path": request.path,
+            "path": shown_path,
             "mimeType": processed.mime,
             "attached": attached,
             "originalWidth": processed.original_width,
@@ -331,15 +440,17 @@ fn read_text(
             " Inspect it with exec."
         };
         return Err(format!(
-            "{} is a binary file ({} bytes).{hint}",
-            request.path,
+            "{shown_path} is a binary file ({} bytes).{hint}",
             metadata.len()
         ));
     }
+    if request.offset == Some(0) {
+        return Err("offset must be at least 1 (line numbers are 1-indexed).".into());
+    }
     file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("Cannot read {}: {error}.", request.path))?;
+        .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
     let source = Source::new(BufReader::new(file));
-    Ok(Window::scan(source, request, limits)?.render(request, limits))
+    Ok(Window::scan(source, request, limits)?.render(request, &shown_path, limits))
 }
 
 /// Both text readers reject special files before reading any data. The initial check avoids
@@ -410,7 +521,8 @@ impl Source {
         }
     }
 
-    /// The next line as decoded text, keeping at most `keep` bytes of it; `None` after the last.
+    /// The next line with its `\n` terminator when present, keeping at most `keep` bytes of it;
+    /// `None` after the last line (including right after a final `\n` at EOF).
     fn kept(&mut self, keep: usize) -> Result<Option<Line>, String> {
         if self.done {
             return Ok(None);
@@ -418,9 +530,10 @@ impl Source {
         let mut line = Line::default();
         loop {
             if let Some(at) = self.pending.find('\n') {
-                let lossy = self.marks.iter().any(|mark| *mark < at);
-                line.push(&self.pending[..at], lossy, keep);
-                self.take(at + 1);
+                let end = at + 1;
+                let lossy = self.marks.iter().any(|mark| *mark < end);
+                line.push(&self.pending[..end], lossy, keep);
+                self.take(end);
                 return Ok(Some(line));
             }
             // No line end here, so all of it belongs to this line.
@@ -435,25 +548,21 @@ impl Source {
                 line.push(&text, lossy, keep);
                 self.marks.clear();
                 self.done = true;
-                return Ok(Some(line));
+                return Ok((line.length > 0).then_some(line));
             }
         }
     }
 
-    /// The next line, looked at only for its end; `None` after the last.
+    /// The next line's byte length (including its `\n` terminator); `None` after the last.
     fn skipped(&mut self) -> Result<Option<u64>, String> {
         if self.done {
             return Ok(None);
         }
-        // A line already decoded in `pending` ends this one, and the unfinished character the
-        // decoder holds comes after every byte in `pending`, so it is no part of this line.
         if let Some(at) = self.pending.find('\n') {
-            let length = self.pending[..at].len() as u64;
-            self.take(at + 1);
-            return Ok(Some(length));
+            let end = at + 1;
+            self.take(end);
+            return Ok(Some(end as u64));
         }
-        // No line end in `pending`, so all of it belongs to this line, and so does the
-        // unfinished character after it: its bytes are already read and would otherwise be lost.
         let mut length = self.pending.len() as u64 + self.carry.len() as u64;
         self.pending.clear();
         self.marks.clear();
@@ -469,11 +578,11 @@ impl Source {
             };
             if read == 0 {
                 self.done = true;
-                return Ok(Some(length));
+                return Ok((length > 0).then_some(length));
             }
             match end {
                 Some(at) => {
-                    length += at as u64;
+                    length += (at + 1) as u64;
                     self.reader.consume(at + 1);
                     return Ok(Some(length));
                 }
@@ -536,12 +645,11 @@ impl Source {
 /// The selected lines of a file: the text a result may show, and the counts its notices need.
 #[derive(Default)]
 struct Window {
-    /// The shown lines joined by `\n`, exactly as they were decoded, with no `\n` of its own
-    /// after the last one.
+    /// The shown lines concatenated as decoded, keeping their terminators intact.
     content: String,
     /// Whether decoding a kept line replaced bytes with U+FFFD.
     lossy: bool,
-    /// Lines in the file: one more than its `\n` bytes.
+    /// Real lines in the file (`\n`-ended segments plus a non-empty final segment).
     total_lines: u64,
     /// The first selected line's length in decoded bytes, for the too-long notice.
     first_line_bytes: u64,
@@ -550,12 +658,8 @@ struct Window {
     window_bytes: u64,
     /// Lines of the selected content that fit the budget.
     shown_lines: u64,
-    /// Whether the last selected line was empty.
-    last_line_empty: bool,
-    /// Whether the selected window reaches the file's final split element.
-    at_eof: bool,
-    /// The selected line that was refused for its size, rather than the line budget running out.
-    tripped_at: Option<u64>,
+    /// Whether truncation stopped because a line exceeded the byte budget.
+    stopped_on_bytes: bool,
 }
 
 impl Window {
@@ -582,11 +686,10 @@ impl Window {
                 window.skip_line(in_window, length);
             }
         }
-        window.at_eof = end >= window.total_lines;
-        if start >= window.total_lines {
+        if start > 0 && start >= window.total_lines {
             return Err(format!(
                 "Offset {} is beyond end of file ({} lines total)",
-                request.offset.unwrap_or(0),
+                request.offset.unwrap_or(1),
                 window.total_lines
             ));
         }
@@ -596,10 +699,8 @@ impl Window {
     /// Records a kept line: its counts, and its bytes when it fits the budget.
     fn take_line(&mut self, line: &Line, deciding: &mut bool, limits: ReadLimits) {
         self.total_lines += 1;
-        let bytes = line.length + u64::from(self.window_lines > 0);
         self.window_lines += 1;
-        self.window_bytes += bytes;
-        self.last_line_empty = line.length == 0;
+        self.window_bytes += line.length;
         if self.window_lines == 1 {
             self.first_line_bytes = line.length;
         }
@@ -607,12 +708,9 @@ impl Window {
         // characters are known and reported.
         self.lossy |= line.lossy;
         if self.window_bytes > limits.max_bytes {
-            self.tripped_at = Some(self.window_lines);
+            self.stopped_on_bytes = true;
             *deciding = false;
             return;
-        }
-        if self.shown_lines > 0 {
-            self.content.push('\n');
         }
         self.content.push_str(&line.text);
         self.shown_lines += 1;
@@ -627,45 +725,21 @@ impl Window {
         if !in_window {
             return;
         }
-        // The byte total still grows: the truncation compares it against its budget, and the
-        // empty element a final newline adds is a byte of the selected content too.
-        self.window_bytes += length + u64::from(self.window_lines > 0);
+        self.window_bytes += length;
         self.window_lines += 1;
-        self.last_line_empty = length == 0;
         if self.window_lines == 1 {
             self.first_line_bytes = length;
         }
     }
 
-    /// Whether the selected content ends with the empty element a final `\n` adds, which the
-    /// truncation does not count as a line.
-    fn trailing_element(&self) -> bool {
-        self.window_lines > 0 && self.last_line_empty && self.at_eof
-    }
-
-    /// The lines of the selected content, counted the way the truncation counts them.
-    fn content_lines(&self) -> u64 {
-        self.window_lines - u64::from(self.trailing_element())
-    }
-
-    /// Whether the truncation stopped on a line's size. The empty element a final newline adds
-    /// is not a line the truncation counts, so it cannot be the one that stopped it.
-    fn stopped_on_bytes(&self) -> bool {
-        match self.tripped_at {
-            Some(at) if at == self.window_lines && self.trailing_element() => false,
-            at => at.is_some(),
-        }
-    }
-
     /// The result text and structured metadata: the window, cut to the budget, with the notice
     /// that says how to see more.
-    fn render(&self, request: &ReadRequest, limits: ReadLimits) -> Outcome {
+    fn render(&self, request: &ReadRequest, shown_path: &str, limits: ReadLimits) -> Outcome {
         let start = request.offset.map_or(0, |offset| offset.saturating_sub(1));
         let start_display = start + 1;
-        let trailing = self.trailing_element();
-        let shown = self.shown_lines - u64::from(trailing && self.shown_lines == self.window_lines);
+        let shown = self.shown_lines;
         let budget_truncated =
-            self.content_lines() > limits.max_lines || self.window_bytes > limits.max_bytes;
+            self.window_lines > limits.max_lines || self.window_bytes > limits.max_bytes;
         let line_too_long = budget_truncated && self.first_line_bytes > limits.max_bytes;
         let mut body = String::new();
         let mut notices = Vec::new();
@@ -676,10 +750,9 @@ impl Window {
         if line_too_long {
             shown_lines = 0;
             notices.push(format!(
-                "[Line {start_display} is {}, exceeds {} limit. Use exec: sed -n '{start_display}p' {} | head -c {}]",
+                "[Line {start_display} is {}, exceeds {} limit. Use exec: sed -n '{start_display}p' {shown_path} | head -c {}]",
                 format_size(self.first_line_bytes),
                 format_size(limits.max_bytes),
-                request.path,
                 limits.max_bytes
             ));
         } else if budget_truncated {
@@ -688,7 +761,7 @@ impl Window {
             let next = end_display + 1;
             next_offset = Some(next);
             body.push_str(&self.content);
-            if self.stopped_on_bytes() {
+            if self.stopped_on_bytes {
                 notices.push(format!(
                     "[Showing lines {start_display}-{end_display} of {} ({} limit). Use offset={next} to continue.]",
                     self.total_lines,
@@ -703,11 +776,6 @@ impl Window {
         } else {
             shown_lines = shown;
             body.push_str(&self.content);
-            // The selected content keeps the file's final newline, even when the line budget
-            // stopped the scan right before the empty line that newline adds.
-            if trailing && self.shown_lines != self.window_lines {
-                body.push('\n');
-            }
             if let Some(limit) = request.limit {
                 let selected_end = start.saturating_add(limit);
                 if selected_end < self.total_lines {
@@ -725,15 +793,17 @@ impl Window {
             notices.push("[Invalid UTF-8 was replaced with U+FFFD.]".to_owned());
         }
         let notice_block = notices.join("\n\n");
-        let text = if line_too_long {
+        let text = if line_too_long || body.is_empty() {
             notice_block.clone()
         } else if notice_block.is_empty() {
             body.clone()
+        } else if body.ends_with('\n') {
+            format!("{body}\n{notice_block}")
         } else {
             format!("{body}\n\n{notice_block}")
         };
         let notice = if notice_block.is_empty() {
-            format!("[read] {} · {shown_lines} lines", request.path)
+            format!("[read] {shown_path} · {shown_lines} lines")
         } else {
             notice_block
         };
@@ -741,7 +811,7 @@ impl Window {
         let structured = json!({
             "ok": true,
             "kind": "text",
-            "path": request.path,
+            "path": shown_path,
             "startLine": start_display,
             "endLine": end_line,
             "shownLines": shown_lines,
@@ -850,20 +920,21 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Writes one file, creating its parent directories and keeping an existing file's permissions.
-fn write_text(request: &WriteRequest, launch: &LaunchContext) -> Result<String, String> {
+fn write_text(request: &WriteRequest, launch: &LaunchContext) -> Result<(String, String), String> {
     let resolved = resolve(&request.path, launch)?;
+    let shown_path = display_path(&resolved);
     let _guard = lock();
-    let target = write_target(&resolved)
-        .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
+    let target =
+        write_target(&resolved).map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
     if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
-            .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
+            .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
     }
     save_target(target, request.content.as_bytes(), None)
-        .map_err(|error| format!("Cannot write {}: {error}.", request.path))?;
-    Ok(format!("Successfully wrote to {}", request.path))
+        .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
+    Ok((format!("Successfully wrote to {shown_path}"), shown_path))
 }
 
 /// Follows a final-component symlink without replacing the link itself, including a dangling
@@ -1580,8 +1651,8 @@ fn replace_with_backup(
                 error.kind(),
                 format!(
                     "could not replace {} ({error}) or restore it ({restore_error}); the original file is preserved at {}",
-                    target.display(),
-                    backup.path.display()
+                    display_path(target),
+                    display_path(&backup.path)
                 ),
             )),
         },
@@ -1942,43 +2013,64 @@ struct Matched<'a> {
     new_text: &'a str,
 }
 
+const MAX_REPORTED_ITEMS: usize = 20;
+
+enum EntryProblem {
+    Ambiguous { count: usize, lines: Vec<usize> },
+    NotFound,
+}
+
 /// Applies every edit to one file: exact matches first, and the fuzzy form when any edit needs it.
-fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> Result<(String, Value), String> {
+fn edit_outcome(
+    request: &EditRequest,
+    launch: &LaunchContext,
+) -> Result<(String, Value), (String, Option<Value>)> {
     if request.edits.is_empty() {
-        return Err(
+        return Err((
             "Edit tool input is invalid. edits must contain at least one replacement.".to_owned(),
-        );
+            None,
+        ));
     }
-    let resolved = resolve(&request.path, launch)?;
+    for (index, edit) in request.edits.iter().enumerate() {
+        if normalize_to_lf(&edit.old_text).is_empty() {
+            return Err((format!("edits[{index}].oldText must not be empty."), None));
+        }
+    }
+    let resolved = resolve(&request.path, launch).map_err(|msg| (msg, None))?;
+    let shown_path = display_path(&resolved);
     let _guard = lock();
     let source = EditSource::read(resolved)
-        .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
-    let (mut written, lines) = apply_edits(&source.content, request, &request.path)?;
+        .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
+    let (mut written, mut starts, fuzzy_flags) =
+        apply_edits(&source.content, request, &shown_path)?;
     if source.content.starts_with('\u{feff}') && !written.starts_with('\u{feff}') {
         written.insert(0, '\u{feff}');
+        for start in &mut starts {
+            *start += '\u{feff}'.len_utf8();
+        }
     }
     if written == source.content {
-        return Err(no_change(&request.path, request.edits.len()));
+        return Err(edit_no_change(&shown_path));
     }
     source
         .save(written.as_bytes())
-        .map_err(|error| format!("Could not edit file: {}. {error}.", request.path))?;
+        .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
     let mut text = format!(
-        "Successfully replaced {} block(s) in {}.",
+        "Successfully replaced {} block(s) in {shown_path}.",
         request.edits.len(),
-        request.path
     );
-    let mut edits = Vec::with_capacity(lines.len());
-    for (index, (line, fuzzy)) in lines.iter().enumerate() {
+    let mut edits = Vec::with_capacity(request.edits.len());
+    for (index, (&at, &fuzzy)) in starts.iter().zip(&fuzzy_flags).enumerate() {
+        let line = 1 + line_breaks(&written[..at]);
         text.push_str(&format!("\nedits[{index}]: line {line}"));
-        if *fuzzy {
+        if fuzzy {
             text.push_str(" (fuzzy match)");
         }
         edits.push(json!({ "line": line, "fuzzy": fuzzy }));
     }
     let structured = json!({
         "ok": true,
-        "path": request.path,
+        "path": shown_path,
         "replacements": request.edits.len(),
         "edits": edits,
     });
@@ -1987,19 +2079,44 @@ fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> Result<(String
 
 #[cfg(test)]
 fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, String> {
-    edit_outcome(request, launch).map(|(text, _)| text)
+    edit_outcome(request, launch)
+        .map(|(text, _)| text)
+        .map_err(|(msg, _)| msg)
 }
 
-/// Matches in LF-normalized text but replaces the corresponding original byte ranges. Bytes
-/// outside those ranges, including mixed line endings, stay untouched.
+fn edit_no_change(path: &str) -> (String, Option<Value>) {
+    let error = format!(
+        "Cannot edit {path}; nothing was changed: the replacement produced identical content."
+    );
+    let structured = json!({
+        "ok": false,
+        "error": error,
+        "path": path,
+        "failures": [],
+    });
+    (error, Some(structured))
+}
+
+/// Matches in LF-normalized text, collects every entry failure (ambiguous, not_found, overlap),
+/// and replaces the corresponding original byte ranges when every entry succeeds.
+#[allow(clippy::type_complexity)]
 fn apply_edits(
     content: &str,
     request: &EditRequest,
     path: &str,
-) -> Result<(String, Vec<(usize, bool)>), String> {
+) -> Result<(String, Vec<usize>, Vec<bool>), (String, Option<Value>)> {
     let total = request.edits.len();
     let normalized = LfText::new(content);
     let ending = detect_line_ending(content);
+    let raw_newlines: Vec<usize> = content
+        .bytes()
+        .enumerate()
+        .filter_map(|(i, b)| (b == b'\n').then_some(i))
+        .collect();
+    let line_at_raw = |raw_pos: usize| 1 + raw_newlines.partition_point(|&nl| nl < raw_pos);
+    let line_at_norm = |norm_pos: usize| line_at_raw(normalized.original(norm_pos));
+
+    let mut lazy_fuzzy: Option<(String, Vec<usize>, Option<FuzzyMap>)> = None;
     let edits: Vec<(String, String)> = request
         .edits
         .iter()
@@ -2010,124 +2127,274 @@ fn apply_edits(
             )
         })
         .collect();
-    for (index, (old, _)) in edits.iter().enumerate() {
-        if old.is_empty() {
-            return Err(format!("edits[{index}].oldText must not be empty."));
-        }
-    }
     let inserted: Vec<String> = edits
         .iter()
         .map(|(_, new)| restore_line_endings(new, ending))
         .collect();
-    // Fuzzy matching first maps back to normalized bytes; the newline map then names the
-    // original bytes, including both bytes of a CRLF when the match includes that newline.
+
+    let mut problems: Vec<Option<EntryProblem>> = (0..total).map(|_| None).collect();
     let mut matched: Vec<Matched<'_>> = Vec::new();
+    let mut fuzzy_flags = vec![false; total];
+
     for (index, (old, new)) in edits.iter().enumerate() {
-        let Some((at, len, fuzzy)) = find_span(&normalized.text, old) else {
-            return Err(not_found(path, index, total));
-        };
-        let count = occurrences(&normalized.text, old);
-        if count > 1 {
-            return Err(duplicate(path, index, total, count));
+        let exact_starts = starts_positions(&normalized.text, old);
+        if exact_starts.len() > 1 {
+            let lines = exact_starts.iter().map(|&at| line_at_norm(at)).collect();
+            problems[index] = Some(EntryProblem::Ambiguous {
+                count: exact_starts.len(),
+                lines,
+            });
+            continue;
         }
+        let needle = normalize_for_fuzzy_match(old);
+        if needle.is_empty() {
+            if let Some(&at) = exact_starts.first() {
+                let (raw_at, raw_end) =
+                    (normalized.original(at), normalized.original(at + old.len()));
+                let new_text = if normalized.text[at..at + old.len()] == *new {
+                    &content[raw_at..raw_end]
+                } else {
+                    &inserted[index]
+                };
+                matched.push(Matched {
+                    index,
+                    at: raw_at,
+                    len: raw_end - raw_at,
+                    fuzzy: false,
+                    new_text,
+                });
+            } else {
+                problems[index] = Some(EntryProblem::NotFound);
+            }
+            continue;
+        }
+
+        let (haystack, haystack_newlines, map) = lazy_fuzzy.get_or_insert_with(|| {
+            let h = normalize_for_fuzzy_match(&normalized.text);
+            // Every `\n` in `normalized.text` maps 1-to-1 in order to `h`; keep only those
+            // that came from a real `\n` (or `\r\n`) rather than a lone `\r` in `content`.
+            let norm_real_flags: Vec<bool> = normalized
+                .text
+                .bytes()
+                .enumerate()
+                .filter(|&(_, b)| b == b'\n')
+                .map(|(norm_pos, _)| {
+                    let raw = normalized.original(norm_pos);
+                    content.as_bytes().get(raw) == Some(&b'\n')
+                        || content.as_bytes().get(raw..raw + 2) == Some(b"\r\n")
+                })
+                .collect();
+            let nls = h
+                .bytes()
+                .enumerate()
+                .filter(|&(_, b)| b == b'\n')
+                .zip(norm_real_flags)
+                .filter_map(|((i, _), is_real)| is_real.then_some(i))
+                .collect();
+            let m = FuzzyMap::new(&normalized.text);
+            (h, nls, m)
+        });
+        let line_at_fuzzy =
+            |fuzzy_pos: usize| 1 + haystack_newlines.partition_point(|&nl| nl < fuzzy_pos);
+
+        let fuzzy_starts = if *haystack == normalized.text && needle == *old {
+            exact_starts.clone()
+        } else {
+            starts_positions(haystack, &needle)
+        };
+
+        if let Some(&exact_at) = exact_starts.first() {
+            if fuzzy_starts.len() > 1 {
+                let lines = fuzzy_starts.iter().map(|&pos| line_at_fuzzy(pos)).collect();
+                problems[index] = Some(EntryProblem::Ambiguous {
+                    count: fuzzy_starts.len(),
+                    lines,
+                });
+                continue;
+            }
+            if fuzzy_starts.len() == 1
+                && let Some(fuzzy_span) = map
+                    .as_ref()
+                    .and_then(|m| m.span(fuzzy_starts[0], fuzzy_starts[0] + needle.len()))
+                && let Some((offset, len)) =
+                    FuzzyMap::new(old).and_then(|m| m.span(0, needle.len()))
+                && fuzzy_span != (exact_at + offset, len)
+            {
+                let mut pair = [exact_at, fuzzy_span.0];
+                pair.sort_unstable();
+                let lines = pair.iter().map(|&at| line_at_norm(at)).collect();
+                problems[index] = Some(EntryProblem::Ambiguous { count: 2, lines });
+                continue;
+            }
+            let (raw_at, raw_end) = (
+                normalized.original(exact_at),
+                normalized.original(exact_at + old.len()),
+            );
+            let new_text = if normalized.text[exact_at..exact_at + old.len()] == *new {
+                &content[raw_at..raw_end]
+            } else {
+                &inserted[index]
+            };
+            matched.push(Matched {
+                index,
+                at: raw_at,
+                len: raw_end - raw_at,
+                fuzzy: false,
+                new_text,
+            });
+            continue;
+        }
+
+        if fuzzy_starts.is_empty() {
+            problems[index] = Some(EntryProblem::NotFound);
+            continue;
+        }
+        if fuzzy_starts.len() > 1 {
+            let lines = fuzzy_starts.iter().map(|&pos| line_at_fuzzy(pos)).collect();
+            problems[index] = Some(EntryProblem::Ambiguous {
+                count: fuzzy_starts.len(),
+                lines,
+            });
+            continue;
+        }
+        let Some((at, len)) = map
+            .as_ref()
+            .and_then(|m| m.span(fuzzy_starts[0], fuzzy_starts[0] + needle.len()))
+        else {
+            problems[index] = Some(EntryProblem::NotFound);
+            continue;
+        };
         let (raw_at, raw_end) = (normalized.original(at), normalized.original(at + len));
-        // An unchanged block must not normalize its own mixed newlines as a side effect.
         let new_text = if normalized.text[at..at + len] == *new {
             &content[raw_at..raw_end]
         } else {
             &inserted[index]
         };
+        fuzzy_flags[index] = true;
         matched.push(Matched {
             index,
             at: raw_at,
             len: raw_end - raw_at,
-            fuzzy,
+            fuzzy: true,
             new_text,
         });
     }
-    matched.sort_by_key(|edit| edit.at);
-    for pair in matched.windows(2) {
-        if pair[0].at + pair[0].len > pair[1].at {
-            return Err(format!(
-                "edits[{}] and edits[{}] overlap in {path}. Merge them into one edit or target disjoint regions.",
-                pair[0].index, pair[1].index
-            ));
+
+    matched.sort_by_key(|edit| (edit.at, edit.index));
+    let mut overlaps: Vec<Vec<usize>> = vec![Vec::new(); total];
+    for i in 0..matched.len() {
+        let end_i = matched[i].at + matched[i].len;
+        for later in &matched[i + 1..] {
+            if later.at >= end_i {
+                break;
+            }
+            overlaps[matched[i].index].push(later.index);
+            overlaps[later.index].push(matched[i].index);
         }
     }
+    for partners in &mut overlaps {
+        partners.sort_unstable();
+        partners.dedup();
+    }
+
+    if problems.iter().any(Option::is_some) || overlaps.iter().any(|p| !p.is_empty()) {
+        let mut bullets = Vec::new();
+        let mut failures = Vec::new();
+        for index in 0..total {
+            if let Some(problem) = &problems[index] {
+                match problem {
+                    EntryProblem::Ambiguous { count, lines } => {
+                        let shown = &lines[..lines.len().min(MAX_REPORTED_ITEMS)];
+                        let more = lines.len().saturating_sub(MAX_REPORTED_ITEMS);
+                        let list = shown
+                            .iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let extra = if more > 0 {
+                            format!(" (and {more} more)")
+                        } else {
+                            String::new()
+                        };
+                        bullets.push(format!(
+                            "- edits[{index}]: oldText occurs {count} times, starting at lines {list}{extra}; add surrounding text to make it unique."
+                        ));
+                        let mut item = json!({
+                            "index": index,
+                            "problem": "ambiguous",
+                            "lines": shown,
+                        });
+                        if more > 0 {
+                            item["more"] = json!(more);
+                        }
+                        failures.push(item);
+                    }
+                    EntryProblem::NotFound => {
+                        bullets.push(format!(
+                            "- edits[{index}]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
+                        ));
+                        failures.push(json!({
+                            "index": index,
+                            "problem": "not_found",
+                        }));
+                    }
+                }
+            } else if !overlaps[index].is_empty() {
+                let partners = &overlaps[index];
+                let shown = &partners[..partners.len().min(MAX_REPORTED_ITEMS)];
+                let more = partners.len().saturating_sub(MAX_REPORTED_ITEMS);
+                let labels = shown
+                    .iter()
+                    .map(|partner| format!("edits[{partner}]"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let extra = if more > 0 {
+                    format!(" (and {more} more)")
+                } else {
+                    String::new()
+                };
+                bullets.push(format!(
+                    "- edits[{index}] overlaps {labels}{extra}; merge them into one edit or target disjoint regions."
+                ));
+                let mut item = json!({
+                    "index": index,
+                    "problem": "overlap",
+                    "with": shown,
+                });
+                if more > 0 {
+                    item["more"] = json!(more);
+                }
+                failures.push(item);
+            }
+        }
+        let error = format!(
+            "Cannot edit {path}; nothing was changed:\n{}",
+            bullets.join("\n")
+        );
+        let structured = json!({
+            "ok": false,
+            "error": error,
+            "path": path,
+            "failures": failures,
+        });
+        return Err((error, Some(structured)));
+    }
+
     let (replaced, starts) = replace(content, &matched);
     if replaced == content {
-        return Err(no_change(path, total));
+        return Err(edit_no_change(path));
     }
-    let mut lines = vec![(0usize, false); total];
     for edit in &matched {
-        let at = starts[edit.index];
-        lines[edit.index] = (1 + line_breaks(&replaced[..at]), edit.fuzzy);
+        fuzzy_flags[edit.index] = edit.fuzzy;
     }
-    Ok((replaced, lines))
+    Ok((replaced, starts, fuzzy_flags))
 }
 
-/// Finds `old` in `content`: as it is first, then through the fuzzy form, answering with the span
-/// of `content` the edit replaces and whether only the fuzzy form matched.
-fn find_span(content: &str, old: &str) -> Option<(usize, usize, bool)> {
-    if let Some(at) = content.find(old) {
-        return Some((at, old.len(), false));
-    }
-    let (at, len) = fuzzy_span(content, old)?;
-    Some((at, len, true))
-}
-
-/// Maps the first match in the fuzzy form of `content` back to the bytes of `content` it stands for.
-fn fuzzy_span(content: &str, old: &str) -> Option<(usize, usize)> {
-    let needle = normalize_for_fuzzy_match(old);
-    if needle.is_empty() {
-        // A target without a character of its own is no target: it would match everywhere.
-        return None;
-    }
-    let haystack = normalize_for_fuzzy_match(content);
-    let at = haystack.find(&needle)?;
-    FuzzyMap::new(content)?.span(at, at + needle.len())
-}
-
-/// Counts exact duplicates first, then fuzzy copies; both counts include overlapping starts.
-fn occurrences(content: &str, old: &str) -> usize {
-    let exact = starts_in(content, old);
-    // Normalization can compose across the target's boundary and erase exact candidates.
-    if exact > 1 {
-        return exact;
-    }
-    let needle = normalize_for_fuzzy_match(old);
-    if needle.is_empty() {
-        // A target that normalizes to nothing is counted as the content spells it.
-        return exact;
-    }
-    let haystack = normalize_for_fuzzy_match(content);
-    if haystack == content && needle == old {
-        return exact;
-    }
-    let count = starts_in(&haystack, &needle);
-    // Trim can shorten the exact target's fuzzy span; compare its mapped form.
-    if exact == 1
-        && count == 1
-        && let Some(exact_at) = content.find(old)
-        && let Some(fuzzy_at) = haystack.find(&needle)
-        && let Some(fuzzy_span) =
-            FuzzyMap::new(content).and_then(|map| map.span(fuzzy_at, fuzzy_at + needle.len()))
-        && let Some((offset, len)) = FuzzyMap::new(old).and_then(|map| map.span(0, needle.len()))
-        && fuzzy_span != (exact_at + offset, len)
-    {
-        return 2;
-    }
-    exact.max(count)
-}
-
-/// How many starts `needle` has in `haystack`, counting overlapping occurrences in one pass.
-///
-/// A match of a nonempty UTF-8 needle in UTF-8 text always starts on a character boundary, because
-/// a lead byte is never a continuation byte, so the bytes need no boundary check.
-fn starts_in(haystack: &str, needle: &str) -> usize {
+/// All starting byte offsets of `needle` in `haystack`, counting overlapping occurrences in one pass.
+fn starts_positions(haystack: &str, needle: &str) -> Vec<usize> {
     let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
     if needle.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let mut table = vec![0usize; needle.len()];
     let mut matched = 0;
@@ -2140,9 +2407,9 @@ fn starts_in(haystack: &str, needle: &str) -> usize {
         }
         table[at] = matched;
     }
-    let mut count = 0;
+    let mut positions = Vec::new();
     matched = 0;
-    for byte in haystack {
+    for (idx, byte) in haystack.iter().enumerate() {
         while matched > 0 && *byte != needle[matched] {
             matched = table[matched - 1];
         }
@@ -2150,44 +2417,11 @@ fn starts_in(haystack: &str, needle: &str) -> usize {
             matched += 1;
         }
         if matched == needle.len() {
-            count += 1;
+            positions.push(idx + 1 - needle.len());
             matched = table[matched - 1];
         }
     }
-    count
-}
-
-fn not_found(path: &str, index: usize, total: usize) -> String {
-    if total == 1 {
-        "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
-            .replace("{path}", path)
-    } else {
-        format!(
-            "Could not find edits[{index}] in {path}. The oldText must match exactly including all whitespace and newlines."
-        )
-    }
-}
-
-fn duplicate(path: &str, index: usize, total: usize, count: usize) -> String {
-    if total == 1 {
-        format!(
-            "Found {count} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
-        )
-    } else {
-        format!(
-            "Found {count} occurrences of edits[{index}] in {path}. Each oldText must be unique. Please provide more context to make it unique."
-        )
-    }
-}
-
-fn no_change(path: &str, total: usize) -> String {
-    if total == 1 {
-        format!(
-            "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
-        )
-    } else {
-        format!("No changes made to {path}. The replacements produced identical content.")
-    }
+    positions
 }
 
 /// Applies matches to `content`, answering with the new content and each edit's start in it.
@@ -2230,12 +2464,9 @@ impl LfText {
     }
 }
 
-/// Counts CRLF as one line break, along with individual CR and LF.
+/// Counts `\n` line breaks, matching `read`'s line numbering (lone `\r` is ordinary content).
 fn line_breaks(text: &str) -> usize {
-    text.bytes()
-        .filter(|&byte| byte == b'\r' || byte == b'\n')
-        .count()
-        - text.matches("\r\n").count()
+    text.bytes().filter(|&byte| byte == b'\n').count()
 }
 
 /// The first line ending is the convention used only for inserted text.
@@ -2603,21 +2834,21 @@ mod tests {
         scratch.file("ten.txt", text.as_bytes());
         let launch = context(&scratch.0, &scratch.0);
         let path = scratch.path("ten.txt");
-        // Ten lines and the empty one after the final newline: eleven in all.
+        // Ten terminated lines are ten real lines, with terminators kept intact.
         assert_eq!(whole(&path, &launch, false).unwrap(), text);
         assert_eq!(
             window(&path, Some(2), Some(3), &launch).unwrap(),
-            "line 2\nline 3\nline 4\n\n[7 more lines in file. Use offset=5 to continue.]"
+            "line 2\nline 3\nline 4\n\n[6 more lines in file. Use offset=5 to continue.]"
         );
         // A limit of zero shows nothing and still says where the rest is.
         assert_eq!(
             window(&path, None, Some(0), &launch).unwrap(),
-            "\n\n[11 more lines in file. Use offset=1 to continue.]"
+            "[10 more lines in file. Use offset=1 to continue.]"
         );
-        assert_eq!(window(&path, Some(11), None, &launch).unwrap(), "");
+        assert_eq!(window(&path, Some(10), None, &launch).unwrap(), "line 10\n");
         assert_eq!(
-            window(&path, Some(12), None, &launch).unwrap_err(),
-            "Offset 12 is beyond end of file (11 lines total)"
+            window(&path, Some(11), None, &launch).unwrap_err(),
+            "Offset 11 is beyond end of file (10 lines total)"
         );
     }
 
@@ -2626,7 +2857,7 @@ mod tests {
         let scratch = Scratch::new("selected-empty-lines");
         let launch = context(&scratch.0, &scratch.0);
         scratch.file("three.txt", b"a\n\nb");
-        for (offset, limit, body, shown, end) in [(1, 2, "a\n", 2, 2), (2, 1, "", 1, 2)] {
+        for (offset, limit, body, shown, end) in [(1, 2, "a\n\n", 2, 2), (2, 1, "\n", 1, 2)] {
             let outcome = read_text(
                 &ReadRequest {
                     path: scratch.path("three.txt"),
@@ -2668,7 +2899,7 @@ mod tests {
         let path = scratch.path("many.txt");
         let text = whole(&path, &launch, false).unwrap();
         assert!(
-            text.ends_with("[Showing lines 1-2000 of 2501. Use offset=2001 to continue.]"),
+            text.ends_with("[Showing lines 1-2000 of 2500. Use offset=2001 to continue.]"),
             "{text}"
         );
         assert!(text.starts_with("line 1\nline 2\n"), "{text}");
@@ -2682,7 +2913,7 @@ mod tests {
         let text = whole(&path, &launch, false).unwrap();
         assert!(
             text.ends_with(
-                "[Showing lines 1-853 of 901 (50.0KB limit). Use offset=854 to continue.]"
+                "[Showing lines 1-853 of 900 (50.0KB limit). Use offset=854 to continue.]"
             ),
             "{text}"
         );
@@ -2730,7 +2961,7 @@ mod tests {
         assert!(
             nested_page
                 .text
-                .ends_with("[Showing lines 1-50000 of 50006. Use offset=50001 to continue.]"),
+                .ends_with("[Showing lines 1-50000 of 50005. Use offset=50001 to continue.]"),
             "{}",
             &nested_page.text[nested_page.text.len().saturating_sub(128)..]
         );
@@ -2792,7 +3023,7 @@ mod tests {
         let path = scratch.path("bad.txt");
         assert_eq!(
             whole(&path, &launch, false).unwrap(),
-            "ok\n\u{fffd}bad\n\n\n[Invalid UTF-8 was replaced with U+FFFD.]"
+            "ok\n\u{fffd}bad\n\n[Invalid UTF-8 was replaced with U+FFFD.]"
         );
         let missing = scratch.path("missing.txt");
         let message = whole(&missing, &launch, false).unwrap_err();
@@ -2863,13 +3094,23 @@ mod tests {
     fn read_names_a_first_line_at_the_byte_limit_as_a_line_count() {
         let scratch = Scratch::new("at-limit");
         let launch = context(&scratch.0, &scratch.0);
-        // Exactly the budget, then the newline: the line fits, so the notice counts lines.
-        let line = "z".repeat(MAX_BYTES as usize);
-        scratch.file("at.txt", format!("{line}\n").as_bytes());
-        let path = scratch.path("at.txt");
+        // A line whose terminator brings it to MAX_BYTES fits; a second line triggers the notice.
+        let line = "z".repeat(MAX_BYTES as usize - 1);
+        scratch.file("at.txt", format!("{line}\nsecond\n").as_bytes());
+        let path = display_path(&scratch.0.join("at.txt"));
         assert_eq!(
             whole(&path, &launch, false).unwrap(),
-            format!("{line}\n\n[Showing lines 1-1 of 2. Use offset=2 to continue.]")
+            format!("{line}\n\n[Showing lines 1-1 of 2 (50.0KB limit). Use offset=2 to continue.]")
+        );
+        // A terminator straddling MAX_BYTES pushes line 1 to MAX_BYTES + 1 bytes -> lineTooLong.
+        let straddle = "z".repeat(MAX_BYTES as usize);
+        scratch.file("straddle.txt", format!("{straddle}\n").as_bytes());
+        let straddle_path = display_path(&scratch.0.join("straddle.txt"));
+        assert_eq!(
+            whole(&straddle_path, &launch, false).unwrap(),
+            format!(
+                "[Line 1 is 50.0KB, exceeds 50.0KB limit. Use exec: sed -n '1p' {straddle_path} | head -c {MAX_BYTES}]"
+            )
         );
     }
 
@@ -2899,25 +3140,32 @@ mod tests {
     fn edit_counts_a_whitespace_needle_as_the_content_spells_it() {
         let scratch = Scratch::new("blank-needle");
         let launch = context(&scratch.0, &scratch.0);
+        let shown_a = display_path(&scratch.0.join("a.txt"));
+        let shown_b = display_path(&scratch.0.join("b.txt"));
+        let shown_c = display_path(&scratch.0.join("c.txt"));
         // A unique blank is a real target, and it is counted where the content spells it.
         scratch.file("a.txt", b"a b");
         assert_eq!(
             change("a.txt", &[(" ", "X")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1"
+            format!("Successfully replaced 1 block(s) in {shown_a}.\nedits[0]: line 1")
         );
         assert_eq!(scratch.read("a.txt"), b"aXb");
         // Two blanks are two candidates.
         scratch.file("c.txt", b"a b c");
         assert_eq!(
             change("c.txt", &[(" ", "X")], &launch).unwrap_err(),
-            "Found 2 occurrences of the text in c.txt. The text must be unique. Please provide more context to make it unique."
+            format!(
+                "Cannot edit {shown_c}; nothing was changed:\n- edits[0]: oldText occurs 2 times, starting at lines 1, 1; add surrounding text to make it unique."
+            )
         );
         assert_eq!(scratch.read("c.txt"), b"a b c");
         // A blank the content does not have is not a target at all.
         scratch.file("b.txt", "\u{1f600}\u{1f600}".as_bytes());
         assert_eq!(
             change("b.txt", &[("\u{3000}", "X")], &launch).unwrap_err(),
-            "Could not find the exact text in b.txt. The old text must match exactly including all whitespace and newlines."
+            format!(
+                "Cannot edit {shown_b}; nothing was changed:\n- edits[0]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
+            )
         );
         assert_eq!(scratch.read("b.txt"), "\u{1f600}\u{1f600}".as_bytes());
     }
@@ -2926,7 +3174,7 @@ mod tests {
     fn write_creates_parents_and_overwrites_in_place() {
         let scratch = Scratch::new("write");
         let launch = context(&scratch.0, &scratch.0);
-        let written = write_text(
+        let (written, shown) = write_text(
             &WriteRequest {
                 path: "deep/er/file.txt".to_owned(),
                 content: "first".to_owned(),
@@ -2934,7 +3182,8 @@ mod tests {
             &launch,
         )
         .unwrap();
-        assert_eq!(written, "Successfully wrote to deep/er/file.txt");
+        assert_eq!(shown, display_path(&scratch.0.join("deep/er/file.txt")));
+        assert_eq!(written, format!("Successfully wrote to {shown}"));
         assert_eq!(scratch.read("deep/er/file.txt"), b"first");
         write_text(
             &WriteRequest {
@@ -2979,7 +3228,7 @@ mod tests {
         )
         .unwrap();
         assert!(reply.contains("edits[0]: line 2"), "{reply}");
-        assert!(reply.contains("edits[1]: line 5"), "{reply}");
+        assert!(reply.contains("edits[1]: line 4"), "{reply}");
         assert_eq!(
             scratch.read("mixed.txt"),
             "é\r\n新\r\nvalue\rtail\r\nEND\n".as_bytes()
@@ -4011,7 +4260,7 @@ mod tests {
         );
         scratch.file("cr.txt", b"one\rtwo\rthree\r");
         let answer = change("cr.txt", &[("two", "TWO")], &launch).unwrap();
-        assert!(answer.ends_with("line 2"), "{answer}");
+        assert!(answer.ends_with("line 1"), "{answer}");
         assert_eq!(scratch.read("cr.txt"), b"one\rTWO\rthree\r");
     }
 
@@ -4078,6 +4327,7 @@ mod tests {
                 },
                 &launch,
             )
+            .map(|(text, _)| text)
         } else {
             change(
                 &path.display().to_string(),
@@ -4107,10 +4357,11 @@ mod tests {
     fn edit_replaces_exact_text_and_names_the_line() {
         let scratch = Scratch::new("exact");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         scratch.file("a.txt", b"one\ntwo\nthree\n");
         assert_eq!(
             change("a.txt", &[("two", "TWO")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 2"
+            format!("Successfully replaced 1 block(s) in {shown}.\nedits[0]: line 2")
         );
         assert_eq!(scratch.read("a.txt"), b"one\nTWO\nthree\n");
     }
@@ -4119,10 +4370,13 @@ mod tests {
     fn edit_reports_a_later_edits_line_after_an_earlier_one_adds_lines() {
         let scratch = Scratch::new("shift");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         scratch.file("a.txt", b"1\n2\n3\n4\n");
         assert_eq!(
             change("a.txt", &[("2", "2\n2b\n2c"), ("4", "4x")], &launch).unwrap(),
-            "Successfully replaced 2 block(s) in a.txt.\nedits[0]: line 2\nedits[1]: line 6"
+            format!(
+                "Successfully replaced 2 block(s) in {shown}.\nedits[0]: line 2\nedits[1]: line 6"
+            )
         );
         assert_eq!(scratch.read("a.txt"), b"1\n2\n2b\n2c\n3\n4x\n");
     }
@@ -4131,6 +4385,9 @@ mod tests {
     fn edit_refuses_input_it_cannot_apply() {
         let scratch = Scratch::new("refuse");
         let launch = context(&scratch.0, &scratch.0);
+        let shown_a = display_path(&scratch.0.join("a.txt"));
+        let shown_u = display_path(&scratch.0.join("u.txt"));
+        let shown_b = display_path(&scratch.0.join("b.txt"));
         scratch.file("a.txt", b"x\nx\n");
         assert_eq!(
             change("a.txt", &[], &launch).unwrap_err(),
@@ -4142,29 +4399,41 @@ mod tests {
         );
         assert_eq!(
             change("a.txt", &[("zzz", "y")], &launch).unwrap_err(),
-            "Could not find the exact text in a.txt. The old text must match exactly including all whitespace and newlines."
+            format!(
+                "Cannot edit {shown_a}; nothing was changed:\n- edits[0]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
+            )
         );
         assert_eq!(
             change("a.txt", &[("zzz", "y"), ("qqq", "z")], &launch).unwrap_err(),
-            "Could not find edits[0] in a.txt. The oldText must match exactly including all whitespace and newlines."
+            format!(
+                "Cannot edit {shown_a}; nothing was changed:\n- edits[0]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces.\n- edits[1]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
+            )
         );
         assert_eq!(
             change("a.txt", &[("x", "y")], &launch).unwrap_err(),
-            "Found 2 occurrences of the text in a.txt. The text must be unique. Please provide more context to make it unique."
+            format!(
+                "Cannot edit {shown_a}; nothing was changed:\n- edits[0]: oldText occurs 2 times, starting at lines 1, 2; add surrounding text to make it unique."
+            )
         );
         assert_eq!(
             change("a.txt", &[("x", "y"), ("x", "z")], &launch).unwrap_err(),
-            "Found 2 occurrences of edits[0] in a.txt. Each oldText must be unique. Please provide more context to make it unique."
+            format!(
+                "Cannot edit {shown_a}; nothing was changed:\n- edits[0]: oldText occurs 2 times, starting at lines 1, 2; add surrounding text to make it unique.\n- edits[1]: oldText occurs 2 times, starting at lines 1, 2; add surrounding text to make it unique."
+            )
         );
         scratch.file("u.txt", b"unique\n");
         assert_eq!(
             change("u.txt", &[("unique", "unique")], &launch).unwrap_err(),
-            "No changes made to u.txt. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+            format!(
+                "Cannot edit {shown_u}; nothing was changed: the replacement produced identical content."
+            )
         );
         scratch.file("b.txt", b"abc\n");
         assert_eq!(
             change("b.txt", &[("ab", "X"), ("bc", "Y")], &launch).unwrap_err(),
-            "edits[0] and edits[1] overlap in b.txt. Merge them into one edit or target disjoint regions."
+            format!(
+                "Cannot edit {shown_b}; nothing was changed:\n- edits[0] overlaps edits[1]; merge them into one edit or target disjoint regions.\n- edits[1] overlaps edits[0]; merge them into one edit or target disjoint regions."
+            )
         );
         // Nothing above wrote anything.
         assert_eq!(scratch.read("a.txt"), b"x\nx\n");
@@ -4220,13 +4489,14 @@ mod tests {
     fn edit_matches_a_typographic_copy_and_keeps_the_bytes_around_it() {
         let scratch = Scratch::new("fuzzy");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         scratch.file(
             "a.txt",
             "note: \u{201c}keep\u{201d} it\u{2019}s here   \nsecond line\n".as_bytes(),
         );
         assert_eq!(
             change("a.txt", &[("it's here", "it's fine")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
+            format!("Successfully replaced 1 block(s) in {shown}.\nedits[0]: line 1 (fuzzy match)")
         );
         // Only the matched bytes change: the quotes before them and the trailing whitespace stay.
         assert_eq!(
@@ -4239,12 +4509,13 @@ mod tests {
     fn edit_changes_only_the_bytes_a_fuzzy_match_names() {
         let scratch = Scratch::new("fuzzy-json");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("case.json"));
         let original =
             "{\"quote\":\"She said \u{201c}hello\u{201d}\",\"author\":\"O\u{2019}Reilly\"}";
         scratch.file("case.json", original.as_bytes());
         assert_eq!(
             change("case.json", &[("O'Reilly", "Publisher")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in case.json.\nedits[0]: line 1 (fuzzy match)"
+            format!("Successfully replaced 1 block(s) in {shown}.\nedits[0]: line 1 (fuzzy match)")
         );
         let edited = scratch.read("case.json");
         assert_eq!(
@@ -4260,6 +4531,7 @@ mod tests {
     fn edit_keeps_an_exact_edits_line_while_another_edit_needs_normalizing() {
         let scratch = Scratch::new("fuzzy-mixed");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         scratch.file(
             "a.txt",
             "label = \"\u{2460}\"; enabled = false\nname = \u{201c}old\u{201d}   \n".as_bytes(),
@@ -4271,7 +4543,9 @@ mod tests {
                 &launch
             )
             .unwrap(),
-            "Successfully replaced 2 block(s) in a.txt.\nedits[0]: line 1\nedits[1]: line 2 (fuzzy match)"
+            format!(
+                "Successfully replaced 2 block(s) in {shown}.\nedits[0]: line 1\nedits[1]: line 2 (fuzzy match)"
+            )
         );
         assert_eq!(
             scratch.read("a.txt"),
@@ -4283,22 +4557,31 @@ mod tests {
     fn edit_refuses_a_needle_with_two_overlapping_starts() {
         let scratch = Scratch::new("overlap");
         let launch = context(&scratch.0, &scratch.0);
+        let shown_a = display_path(&scratch.0.join("a.txt"));
+        let shown_b = display_path(&scratch.0.join("b.txt"));
+        let shown_c = display_path(&scratch.0.join("c.txt"));
         scratch.file("a.txt", b"banana\n");
         assert_eq!(
             change("a.txt", &[("ana", "X")], &launch).unwrap_err(),
-            "Found 2 occurrences of the text in a.txt. The text must be unique. Please provide more context to make it unique."
+            format!(
+                "Cannot edit {shown_a}; nothing was changed:\n- edits[0]: oldText occurs 2 times, starting at lines 1, 1; add surrounding text to make it unique."
+            )
         );
         assert_eq!(scratch.read("a.txt"), b"banana\n");
         scratch.file("b.txt", b"aaaa\n");
         assert_eq!(
             change("b.txt", &[("aaa", "X")], &launch).unwrap_err(),
-            "Found 2 occurrences of the text in b.txt. The text must be unique. Please provide more context to make it unique."
+            format!(
+                "Cannot edit {shown_b}; nothing was changed:\n- edits[0]: oldText occurs 2 times, starting at lines 1, 1; add surrounding text to make it unique."
+            )
         );
         assert_eq!(scratch.read("b.txt"), b"aaaa\n");
         scratch.file("c.txt", "\u{e9}\u{e9}\u{e9}\n".as_bytes());
         assert_eq!(
             change("c.txt", &[("\u{e9}\u{e9}", "X")], &launch).unwrap_err(),
-            "Found 2 occurrences of the text in c.txt. The text must be unique. Please provide more context to make it unique."
+            format!(
+                "Cannot edit {shown_c}; nothing was changed:\n- edits[0]: oldText occurs 2 times, starting at lines 1, 1; add surrounding text to make it unique."
+            )
         );
         assert_eq!(scratch.read("c.txt"), "\u{e9}\u{e9}\u{e9}\n".as_bytes());
     }
@@ -4307,29 +4590,35 @@ mod tests {
     fn edit_replaces_a_whitespace_only_target() {
         let scratch = Scratch::new("whitespace");
         let launch = context(&scratch.0, &scratch.0);
+        let shown_tab = display_path(&scratch.0.join("tab.txt"));
+        let shown_space = display_path(&scratch.0.join("space.txt"));
+        let shown_indent = display_path(&scratch.0.join("indent.txt"));
+        let shown_none = display_path(&scratch.0.join("none.txt"));
         scratch.file("tab.txt", b"if x:\n\tfoo()\n");
         assert_eq!(
             change("tab.txt", &[("\t", "    ")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in tab.txt.\nedits[0]: line 2"
+            format!("Successfully replaced 1 block(s) in {shown_tab}.\nedits[0]: line 2")
         );
         assert_eq!(scratch.read("tab.txt"), b"if x:\n    foo()\n");
         scratch.file("space.txt", b"foo bar\n");
         assert_eq!(
             change("space.txt", &[(" ", "_")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in space.txt.\nedits[0]: line 1"
+            format!("Successfully replaced 1 block(s) in {shown_space}.\nedits[0]: line 1")
         );
         assert_eq!(scratch.read("space.txt"), b"foo_bar\n");
         scratch.file("indent.txt", b"if x:\n    foo()\n");
         assert_eq!(
             change("indent.txt", &[("    ", "\t")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in indent.txt.\nedits[0]: line 2"
+            format!("Successfully replaced 1 block(s) in {shown_indent}.\nedits[0]: line 2")
         );
         assert_eq!(scratch.read("indent.txt"), b"if x:\n\tfoo()\n");
         // A target the content does not hold writes nothing.
         scratch.file("none.txt", b"ab\n");
         assert_eq!(
             change("none.txt", &[(" ", "X")], &launch).unwrap_err(),
-            "Could not find the exact text in none.txt. The old text must match exactly including all whitespace and newlines."
+            format!(
+                "Cannot edit {shown_none}; nothing was changed:\n- edits[0]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
+            )
         );
         assert_eq!(scratch.read("none.txt"), b"ab\n");
     }
@@ -4338,18 +4627,21 @@ mod tests {
     fn edit_refuses_a_fuzzy_match_that_ends_inside_a_unit() {
         let scratch = Scratch::new("unit-end");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         // NFKC turns the ligature into two characters, so a match that ends between them names no
         // bytes of the content.
         scratch.file("a.txt", "\u{2019}\u{fb00}tail\n".as_bytes());
         assert_eq!(
             change("a.txt", &[("'f", "X")], &launch).unwrap_err(),
-            "Could not find the exact text in a.txt. The old text must match exactly including all whitespace and newlines."
+            format!(
+                "Cannot edit {shown}; nothing was changed:\n- edits[0]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
+            )
         );
         assert_eq!(scratch.read("a.txt"), "\u{2019}\u{fb00}tail\n".as_bytes());
         // A match that covers whole units names them all and replaces them.
         assert_eq!(
             change("a.txt", &[("'ff", "'ff")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
+            format!("Successfully replaced 1 block(s) in {shown}.\nedits[0]: line 1 (fuzzy match)")
         );
         assert_eq!(scratch.read("a.txt"), b"'fftail\n");
     }
@@ -4358,12 +4650,15 @@ mod tests {
     fn edit_matches_a_line_end_that_lost_trailing_whitespace() {
         let scratch = Scratch::new("trimmed-line-end");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         // The match ends on the newline the trim kept, so the removed spaces stay outside it and
         // the edit after it keeps its line.
         scratch.file("a.txt", "it\u{2019}s   \nnext\nmore\n".as_bytes());
         assert_eq!(
             change("a.txt", &[("it's\n", "X"), ("more", "MORE")], &launch).unwrap(),
-            "Successfully replaced 2 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)\nedits[1]: line 2"
+            format!(
+                "Successfully replaced 2 block(s) in {shown}.\nedits[0]: line 1 (fuzzy match)\nedits[1]: line 2"
+            )
         );
         assert_eq!(scratch.read("a.txt"), b"Xnext\nMORE\n");
     }
@@ -4372,18 +4667,24 @@ mod tests {
     fn edit_matches_from_a_line_end_that_lost_trailing_whitespace() {
         let scratch = Scratch::new("trimmed-line-start");
         let launch = context(&scratch.0, &scratch.0);
+        let shown_a = display_path(&scratch.0.join("a.txt"));
+        let shown_b = display_path(&scratch.0.join("b.txt"));
         // The match starts on the newline the trim kept, so the removed spaces stay before it.
         scratch.file("a.txt", "a   \n\u{201c}b\u{201d}".as_bytes());
         assert_eq!(
             change("a.txt", &[("\n\"b\"", "X")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
+            format!(
+                "Successfully replaced 1 block(s) in {shown_a}.\nedits[0]: line 1 (fuzzy match)"
+            )
         );
         assert_eq!(scratch.read("a.txt"), b"a   X");
         // A match that keeps the newline keeps it where it was.
         scratch.file("b.txt", "a   \n\u{201c}b\u{201d}\n".as_bytes());
         assert_eq!(
             change("b.txt", &[("\n\"b\"", "\nB")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in b.txt.\nedits[0]: line 1 (fuzzy match)"
+            format!(
+                "Successfully replaced 1 block(s) in {shown_b}.\nedits[0]: line 1 (fuzzy match)"
+            )
         );
         assert_eq!(scratch.read("b.txt"), b"a   \nB\n");
     }
@@ -4392,6 +4693,7 @@ mod tests {
     fn edit_refuses_a_run_longer_than_a_unit_holds_promptly() {
         let scratch = Scratch::new("long-run");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         // A run of reordering non-starters longer than one unit may hold: the units no longer
         // reproduce the whole-file form, so the edit is refused instead of guessed.
         let content = format!("{}\nit\u{2019}s\n", "\u{0f73}".repeat(8192));
@@ -4399,7 +4701,9 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             change("a.txt", &[("it's", "X")], &launch).unwrap_err(),
-            "Could not find the exact text in a.txt. The old text must match exactly including all whitespace and newlines."
+            format!(
+                "Cannot edit {shown}; nothing was changed:\n- edits[0]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
+            )
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -4410,7 +4714,7 @@ mod tests {
         // An exact edit of the same file still applies.
         assert_eq!(
             change("a.txt", &[("\nit\u{2019}s\n", "\nit's\n")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1"
+            format!("Successfully replaced 1 block(s) in {shown}.\nedits[0]: line 1")
         );
     }
 
@@ -4418,10 +4722,11 @@ mod tests {
     fn edit_matches_across_a_short_combining_run() {
         let scratch = Scratch::new("short-run");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         scratch.file("a.txt", "cafe\u{301} \u{201c}x\u{201d}\n".as_bytes());
         assert_eq!(
             change("a.txt", &[("caf\u{e9} \"x\"", "caf\u{e9} \"y\"")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
+            format!("Successfully replaced 1 block(s) in {shown}.\nedits[0]: line 1 (fuzzy match)")
         );
         assert_eq!(scratch.read("a.txt"), "caf\u{e9} \"y\"\n".as_bytes());
     }
@@ -4460,6 +4765,10 @@ mod tests {
     fn edit_matches_a_mark_that_reorders_inside_its_unit() {
         let scratch = Scratch::new("reorder");
         let launch = context(&scratch.0, &scratch.0);
+        let shown_a = display_path(&scratch.0.join("a.txt"));
+        let shown_b = display_path(&scratch.0.join("b.txt"));
+        let shown_c = display_path(&scratch.0.join("c.txt"));
+        let shown_d = display_path(&scratch.0.join("d.txt"));
         // A cedilla between a base and an acute is below the acute's combining class, so the whole
         // run is one unit and an edit elsewhere in the file still matches.
         scratch.file(
@@ -4468,7 +4777,9 @@ mod tests {
         );
         assert_eq!(
             change("a.txt", &[("O'Reilly", "Publisher")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in a.txt.\nedits[0]: line 1 (fuzzy match)"
+            format!(
+                "Successfully replaced 1 block(s) in {shown_a}.\nedits[0]: line 1 (fuzzy match)"
+            )
         );
         assert_eq!(
             scratch.read("a.txt"),
@@ -4478,7 +4789,9 @@ mod tests {
         scratch.file("b.txt", "note = a\u{327}\u{301}\n".as_bytes());
         assert_eq!(
             change("b.txt", &[("\u{e1}\u{327}", "X")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in b.txt.\nedits[0]: line 1 (fuzzy match)"
+            format!(
+                "Successfully replaced 1 block(s) in {shown_b}.\nedits[0]: line 1 (fuzzy match)"
+            )
         );
         assert_eq!(scratch.read("b.txt"), b"note = X\n");
         // The same for marks that reorder without composing, as in vocalized Arabic.
@@ -4488,7 +4801,9 @@ mod tests {
         );
         assert_eq!(
             change("c.txt", &[("\"hello\"", "\"world\"")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in c.txt.\nedits[0]: line 1 (fuzzy match)"
+            format!(
+                "Successfully replaced 1 block(s) in {shown_c}.\nedits[0]: line 1 (fuzzy match)"
+            )
         );
         assert_eq!(
             scratch.read("c.txt"),
@@ -4497,7 +4812,9 @@ mod tests {
         scratch.file("d.txt", "word = \u{628}\u{650}\u{651}\u{64e}\n".as_bytes());
         assert_eq!(
             change("d.txt", &[("\u{628}\u{64e}\u{650}\u{651}", "X")], &launch).unwrap(),
-            "Successfully replaced 1 block(s) in d.txt.\nedits[0]: line 1 (fuzzy match)"
+            format!(
+                "Successfully replaced 1 block(s) in {shown_d}.\nedits[0]: line 1 (fuzzy match)"
+            )
         );
         assert_eq!(scratch.read("d.txt"), b"word = X\n");
     }
@@ -4506,13 +4823,16 @@ mod tests {
     fn edit_counts_overlapping_starts_in_one_pass() {
         let scratch = Scratch::new("overlap-cost");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         let content = "a".repeat(131_072);
         scratch.file("a.txt", content.as_bytes());
         let needle = "a".repeat(65_536);
         let started = Instant::now();
         assert_eq!(
             change("a.txt", &[(needle.as_str(), "X")], &launch).unwrap_err(),
-            "Found 65537 occurrences of the text in a.txt. The text must be unique. Please provide more context to make it unique."
+            format!(
+                "Cannot edit {shown}; nothing was changed:\n- edits[0]: oldText occurs 65537 times, starting at lines 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 (and 65517 more); add surrounding text to make it unique."
+            )
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -4526,10 +4846,13 @@ mod tests {
     fn edit_refuses_a_file_that_is_not_utf8() {
         let scratch = Scratch::new("not-utf8");
         let launch = context(&scratch.0, &scratch.0);
+        let shown = display_path(&scratch.0.join("a.txt"));
         scratch.file("a.txt", b"one\n\xfftwo\n");
         assert_eq!(
             change("a.txt", &[("two", "TWO")], &launch).unwrap_err(),
-            "Could not edit file: a.txt. the file is not valid UTF-8; edit it with exec."
+            format!(
+                "Could not edit file: {shown}. the file is not valid UTF-8; edit it with exec."
+            )
         );
     }
 
@@ -4589,21 +4912,23 @@ mod tests {
     fn read_counts_the_final_separator_against_the_byte_budget() {
         let scratch = Scratch::new("separator");
         let launch = context(&scratch.0, &scratch.0);
-        // 2000 lines of exactly 51200 bytes together, then the newline that takes the selected
-        // content one byte over the budget.
+        // 1999 lines of 25 bytes (49975 bytes) plus a 2000th line of 1226 bytes (1225 'z' + LF)
+        // total 51201 bytes: line 2000's terminator puts it 1 byte over the 50KB budget.
         let mut text = String::new();
         for _ in 0..1999 {
             text.push_str(&"y".repeat(24));
             text.push('\n');
         }
+        let shown_prefix = text.clone();
         text.push_str(&"z".repeat(1225));
         text.push('\n');
         scratch.file("at-cap.txt", text.as_bytes());
         let path = scratch.path("at-cap.txt");
-        let body = text.trim_end_matches('\n').to_owned();
         assert_eq!(
             whole(&path, &launch, false).unwrap(),
-            format!("{body}\n\n[Showing lines 1-2000 of 2001. Use offset=2001 to continue.]")
+            format!(
+                "{shown_prefix}\n[Showing lines 1-1999 of 2000 (50.0KB limit). Use offset=2000 to continue.]"
+            )
         );
     }
     #[test]
@@ -4619,8 +4944,8 @@ mod tests {
         assert_eq!(
             window(&path, None, Some(2001), &launch).unwrap(),
             format!(
-                "{}\n\n[Showing lines 1-2000 of 2002. Use offset=2001 to continue.]",
-                "x\n".repeat(2000).trim_end_matches('\n')
+                "{}\n[Showing lines 1-2000 of 2002. Use offset=2001 to continue.]",
+                "x\n".repeat(2000)
             )
         );
     }
@@ -4694,5 +5019,233 @@ mod tests {
         .err()
         .expect("an animated PNG is not an image a model reads");
         assert!(message.contains("is a binary file"), "{message}");
+    }
+
+    #[test]
+    fn read_real_line_table_pagination_and_empty_offsets() {
+        let scratch = Scratch::new("p1-2-table");
+        let launch = context(&scratch.0, &scratch.0);
+        for (idx, (sample, expected_total)) in [
+            ("", 0_u64),
+            ("a", 1),
+            ("a\n", 1),
+            ("a\nb", 2),
+            ("a\n\n", 2),
+            ("a\r\nb\r\n", 2),
+            ("a\rb\r", 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("case-{idx}.txt");
+            scratch.file(&name, sample.as_bytes());
+            let out = read_text(
+                &ReadRequest {
+                    path: name.clone(),
+                    offset: Some(1),
+                    limit: None,
+                },
+                &launch,
+                false,
+                ReadLimits::DIRECT,
+            )
+            .unwrap();
+            assert_eq!(out.structured["totalLines"], expected_total, "{sample:?}");
+            assert_eq!(out.body.as_deref(), Some(sample), "{sample:?}");
+            assert_eq!(out.structured["truncated"], false, "{sample:?}");
+            if expected_total == 0 {
+                assert_eq!(out.structured["shownLines"], 0);
+                assert!(out.structured["endLine"].is_null());
+            } else {
+                let mut joined = String::new();
+                let mut next = Some(1_u64);
+                let mut pages = 0_u64;
+                while let Some(off) = next {
+                    let page = read_text(
+                        &ReadRequest {
+                            path: name.clone(),
+                            offset: Some(off),
+                            limit: Some(1),
+                        },
+                        &launch,
+                        false,
+                        ReadLimits::DIRECT,
+                    )
+                    .unwrap();
+                    joined.push_str(page.body.as_deref().unwrap());
+                    next = page.structured["nextOffset"].as_u64();
+                    pages += 1;
+                }
+                assert_eq!(pages, expected_total, "{sample:?}");
+                assert_eq!(joined, sample, "{sample:?}");
+            }
+        }
+        scratch.file("empty.txt", b"");
+        assert!(window("empty.txt", Some(0), None, &launch).is_err());
+        assert_eq!(window("empty.txt", Some(1), None, &launch).unwrap(), "");
+        assert_eq!(
+            window("empty.txt", Some(2), None, &launch).unwrap_err(),
+            "Offset 2 is beyond end of file (0 lines total)"
+        );
+    }
+
+    #[test]
+    fn edit_collects_all_failures_containment_overlaps_nfkc_cr_lines_and_caps() {
+        let scratch = Scratch::new("p1-3-failures");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file("mix.txt", b"dup\ndup\nabcdef\n");
+        let err = edit_outcome(
+            &EditRequest {
+                path: "mix.txt".into(),
+                edits: vec![
+                    Edit {
+                        old_text: "dup".into(),
+                        new_text: "D".into(),
+                    },
+                    Edit {
+                        old_text: "missing".into(),
+                        new_text: "M".into(),
+                    },
+                    Edit {
+                        old_text: "abcdef".into(),
+                        new_text: "X".into(),
+                    },
+                    Edit {
+                        old_text: "bc".into(),
+                        new_text: "Y".into(),
+                    },
+                    Edit {
+                        old_text: "ef".into(),
+                        new_text: "Z".into(),
+                    },
+                ],
+            },
+            &launch,
+        )
+        .unwrap_err()
+        .1
+        .unwrap();
+        assert_eq!(
+            err["failures"],
+            json!([
+                {"index": 0, "problem": "ambiguous", "lines": [1, 2]},
+                {"index": 1, "problem": "not_found"},
+                {"index": 2, "problem": "overlap", "with": [3, 4]},
+                {"index": 3, "problem": "overlap", "with": [2]},
+                {"index": 4, "problem": "overlap", "with": [2]},
+            ])
+        );
+        assert_eq!(scratch.read("mix.txt"), b"dup\ndup\nabcdef\n");
+
+        scratch.file("nfkc.txt", "a\rf\n\u{fb00}\rb\n".as_bytes());
+        let nfkc_err = edit_outcome(
+            &EditRequest {
+                path: "nfkc.txt".into(),
+                edits: vec![Edit {
+                    old_text: "f".into(),
+                    new_text: "F".into(),
+                }],
+            },
+            &launch,
+        )
+        .unwrap_err()
+        .1
+        .unwrap();
+        assert_eq!(
+            nfkc_err["failures"],
+            json!([{"index": 0, "problem": "ambiguous", "lines": [1, 2, 2]}])
+        );
+
+        let alphabet: String = (0..25).map(|i| format!("tok{i:02} ")).collect();
+        scratch.file("many-ov.txt", alphabet.as_bytes());
+        let mut ov_edits = vec![Edit {
+            old_text: alphabet.clone(),
+            new_text: "ALL".into(),
+        }];
+        for i in 0..22 {
+            ov_edits.push(Edit {
+                old_text: format!("tok{i:02}"),
+                new_text: "T".into(),
+            });
+        }
+        let ov_err = edit_outcome(
+            &EditRequest {
+                path: "many-ov.txt".into(),
+                edits: ov_edits,
+            },
+            &launch,
+        )
+        .unwrap_err()
+        .1
+        .unwrap();
+        assert_eq!(ov_err["failures"][0]["with"].as_array().unwrap().len(), 20);
+        assert_eq!(ov_err["failures"][0]["more"], 2);
+    }
+
+    #[test]
+    fn windows_display_and_git_bash_drive_helpers_format_every_form() {
+        assert_eq!(git_bash_drive_path("/c"), Some("C:/".into()));
+        assert_eq!(
+            git_bash_drive_path("/d/work/a.txt"),
+            Some("D:/work/a.txt".into())
+        );
+        assert_eq!(git_bash_drive_path("/tmp/x"), None);
+        assert_eq!(
+            git_bash_drive_path("//srv/share/dir/a.txt"),
+            Some(r"\\srv\share\dir\a.txt".into())
+        );
+        assert_eq!(git_bash_drive_path("///tmp"), None);
+        assert_eq!(
+            format_windows_display(r"c:\Users\Eden\file.txt"),
+            "C:/Users/Eden/file.txt"
+        );
+        assert_eq!(
+            format_windows_display(r"\\?\c:\Users\file.txt"),
+            "C:/Users/file.txt"
+        );
+        assert_eq!(
+            format_windows_display(r"\\server\share\dir\f"),
+            "//server/share/dir/f"
+        );
+        assert_eq!(
+            format_windows_display(r"\\?\UNC\server\share\dir\f"),
+            "//server/share/dir/f"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_keeps_dotdot_for_kernel_symlink_traversal() {
+        use std::os::unix::fs::symlink;
+        let scratch = Scratch::new("symlink-dotdot");
+        std::fs::create_dir_all(scratch.0.join("base")).unwrap();
+        std::fs::create_dir_all(scratch.0.join("target/sub")).unwrap();
+        std::fs::write(scratch.0.join("base/value"), b"wrong-base\n").unwrap();
+        std::fs::write(scratch.0.join("target/value"), b"right-target\n").unwrap();
+        symlink("../target/sub", scratch.0.join("base/link")).unwrap();
+        let launch = context(&scratch.0, &scratch.0);
+        let resolved = resolve("./base//link/../value", &launch).unwrap();
+        assert!(
+            resolved.to_string_lossy().ends_with("base/link/../value"),
+            "{resolved:?}"
+        );
+        assert_eq!(
+            whole("./base/link/../value", &launch, false).unwrap(),
+            "right-target\n"
+        );
+        change(
+            "./base/link/../value",
+            &[("right-target", "updated-target")],
+            &launch,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(scratch.0.join("target/value")).unwrap(),
+            b"updated-target\n"
+        );
+        assert_eq!(
+            std::fs::read(scratch.0.join("base/value")).unwrap(),
+            b"wrong-base\n"
+        );
     }
 }

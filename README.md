@@ -117,8 +117,8 @@ const [run, file] = await Promise.all([
   tools.exec({action: "start", command: "printf ready", loginShell: false}),
   tools.read({path: "README.md", limit: 5})
 ]);
-text(run.structuredContent.output);
-text(file.structuredContent.text);
+text(run.output);
+text(file.text);
 ```
 
 `text`, `console.log/info/warn/error/debug`, and a returned value write to the
@@ -127,11 +127,12 @@ image. A result carries at most four images and 4718592 base64 bytes; warnings
 name saved images that can be read separately.
 
 `codemode` accepts `cwd`, `waitMs`, `returnWhen` with `outputContains` or `quietMs`,
-`killAfterMs`, `truncate`, `maxBytes`, and `raw`. When `cwd` is set, nested `exec`
+`killAfterMs`, `truncate`, and `maxBytes`. When `cwd` is set, nested `exec`
 starts (unless they pass their own `cwd`) and relative paths in `read`, `write`,
 and `edit` resolve against it. Continue with `exec poll`,
 stop with `exec kill`, and inspect with `exec list`. A script has no terminal
-or input. UTF-8 `TextEncoder` and `TextDecoder` are available alongside `atob`
+or input. `sh.quote(value)` single-quotes strings and finite numbers for POSIX
+bash, and UTF-8 `TextEncoder` and `TextDecoder` are available alongside `atob`
 and `btoa`; JavaScript has no Node APIs, modules, timers, filesystem or network
 access, and host operations go through `tools` (pass `loginShell: false` to
 `tools.exec` for fast non-interactive commands that need no profile setup).
@@ -153,10 +154,15 @@ bound the script's lifetime.
 only `true` or `false`; invalid values stop startup.
 An endpoint's environment decides whether it advertises codemode, even when
 its daemon was started without it. HTTP uses the daemon's startup setting.
-Nested calls always include `structuredContent` (`exec` sets `output`, text
-`read` returns up to `50000` lines or `1` MiB per call and sets clean `text`
-plus `truncated` and `nextOffset`, `write` sets `bytes`, and `edit` sets
-`edits`) so scripts work with any outer output setting.
+Nested calls resolve directly to unwrapped structured objects regardless of the
+outer output setting (`exec` returns `{output, exitCode, state, ...}` with
+uncut lines up to its byte budget and no default `waitMs` ceiling, text `read`
+returns up to `50000` lines or `1` MiB per call with `{path, text, truncated,
+nextOffset, startLine, endLine, shownLines, totalLines}`, image `read` returns
+`{path, attached, ...}`, `write` returns `{path, bytes}`, and `edit` returns
+`{path, replacements, edits}`). Validation, file, and integrity errors reject
+with `ToolError` (`{tool, result}`), while non-zero command exit codes
+resolve normally.
 
 Each script has 128 MiB of VM memory, eight tool calls in flight with up to
 1024 queued, a separate 128 MiB budget for pending tool arguments and results,
@@ -171,10 +177,12 @@ The existing total task and log limits also apply. See
 
 ## Key Constraints
 
-- **Wait window vs. process deadline**: `waitMs` (`0–240000` ms) bounds only how
-  long the current `start` or `poll` call waits. If `waitMs` elapses,
-  `returnWhen` matches, or the call is cancelled, the task keeps running. Use
-  `killAfterMs` on `start` or `action: "kill"` to bound or stop the process tree.
+- **Wait window vs. process deadline**: `waitMs` (`0–240000` ms on direct calls;
+  unbounded by default on nested `codemode` `exec` calls without `returnWhen` or
+  input) bounds only how long the current `start` or `poll` call waits. If
+  `waitMs` elapses, `returnWhen` matches, or the call is cancelled, the task
+  keeps running. Use `killAfterMs` on `start` or `action: "kill"` to bound or
+  stop the process tree.
 - **Owned process trees**: Tasks inherit server permissions, without a
   sandbox. Every `start` runs a fresh bash (`cd` and exports do not persist).
   Processes left behind when root bash exits are killed
@@ -184,9 +192,12 @@ The existing total task and log limits also apply. See
   daemon, outlive sessions, and are visible to every session; they end by exit,
   `kill`, `killAfterMs`, or `fastexec daemon stop`, and finished tasks stay
   listable for up to 24 h.
-- **Pipe stdin vs. PTY keys**: Pipe-mode stdin stays open until `eof: true` or
-  exit (pass `< /dev/null` when stdin is unused). In PTY mode (`pty: true`),
-  send text with `input` and terminal keys (such as `"Enter"` or `"C-c"`) with `keys`.
+- **Pipe stdin vs. PTY keys**: Pipe-mode `start` connects stdin to `/dev/null`
+  by default so tools like `rg` or `cat` never hang waiting on unused stdin;
+  pass `input` (up to `1` MiB on `start`, closing stdin afterwards unless
+  `eof: false`) or `eof: false` to stream follow-up `poll` input (`<= 16` KiB
+  per poll). In PTY mode (`pty: true`), send text with `input` on `poll` and
+  terminal keys (such as `"Enter"` or `"C-c"`) with `keys`.
 - **Data integrity feedback**: Invalid or oversized requests are rejected. Input
   writes are acknowledged; a failed or unconfirmed write returns an error and
   may have partially taken effect. Canonical PTY input warns that long lines can
@@ -199,8 +210,12 @@ The existing total task and log limits also apply. See
   `input`, `keys`). Task output is written to log files (up to `64` MiB per
   task), and PTY transcripts record terminal-rendered screen text, including
   echoed input.
-- **Windows path conversion**: Git Bash rewrites POSIX-shaped arguments (`/c`,
-  `/tmp/x`) for native Windows binaries; prefix commands with `MSYS_NO_PATHCONV=1`.
+- **Windows paths and path conversion**: Tool `cwd` and `path` fields accept
+  relative paths, `~`, `C:/...`, `C:\...`, and Git Bash drive paths (`/c`,
+  `/c/...`), refuse driveless POSIX paths like `/tmp/x` (use `cygpath -m` when
+  needed), and always report forward slashes. Inside bash commands, Git Bash
+  rewrites POSIX-shaped arguments for native Windows binaries unless prefixed
+  with `MSYS_NO_PATHCONV=1`.
 
 ## Shared daemon (`FASTEXEC_DAEMON=on`)
 
@@ -256,8 +271,9 @@ and duplicate tokens are refused. Every `/mcp` request carries one of them.
 Modern MCP clients use `server/discover` and sessionless requests. Each token
 has its own session for the listener's lifetime, with owner labels `http-t1`,
 `http-t2`, and so on in configuration order. Clients sharing a token share
-background notices. Other clients' running tasks appear as a count in the
-footer; `list` shows all tasks with their owner labels. Legacy clients retain
+background notices. Other clients' running tasks appear once per session in the
+footer; `list` defaults to the current session and accepts `scope: "all"` to
+show all tasks with their owner labels. Legacy clients retain
 their client-named sessions through the `initialize` handshake.
 
 A `start` result's `taskId` is a reader handle, `<taskId>.<reader>`. Poll with
@@ -365,9 +381,12 @@ Cloudflare reaches the daemon through a named tunnel; Quick Tunnels do not
 support server-sent events. Plan limits are in
 [Cloudflare's connection limits](https://developers.cloudflare.com/fundamentals/reference/connection-limits/).
 
-`transfer` publishes one file at a URL that serves it to `curl`, valid until 10
-minutes pass unused. A proxy that limits request size still carries a large file
-in parts, one at a time; the tool description has the recipe.
+`transfer` publishes one regular file at a URL that serves it to `curl`,
+returning its resolved `path` and current `bytes` (`null` when the file does not
+exist yet) and staying valid until 10 minutes pass unused. Directories are
+refused (pack them with `tar` via `exec` first). A proxy that limits request
+size still carries a large file in parts, one at a time; the tool description
+has the recipe.
 
 ## Testing, Reference, and License
 

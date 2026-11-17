@@ -41,30 +41,35 @@ const STALLED: &str = "The script is waiting on a promise that can never settle:
 pub struct Request {
     /// Body of an async JavaScript function, up to 256 KiB. Top-level await and return work.
     pub code: String,
-    /// Absolute working directory for nested exec (when it omits cwd) and relative paths in read, write, and edit. Omit for the session's default working directory.
+    /// Working directory for nested exec (when it omits cwd) and relative paths in read, write, and edit. Omit for the session's default working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Wait up to this many ms for output or completion, 0-240000; default 30000.
+    /// start, poll: how long to wait at most, 0-240000 ms; the cap returns each call within a 5-minute prompt-cache lifetime, so poll again to wait longer. kill ignores it.
+    #[schemars(range(min = 0, max = 240000))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
-    /// Return when output contains a marker or has been quiet for a while.
+    /// start, poll: end the wait early when any condition holds; the task keeps running. Texts are literal and case-sensitive, 1-16 per condition, each 1-4096 bytes without line breaks. waitMs stays the longest wait and defaults to 30000 with returnWhen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_when: Option<ReturnWhen>,
-    /// Stop the script after this many ms; omitted or 0 means no deadline.
+    /// start: kill the task's whole process tree this many ms after launch, whatever the waits and polls, kept processes included; 0 or omitted means no limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kill_after_ms: Option<u64>,
+    /// start, poll, kill, list, transcript: output window mode (default head_tail; transcript defaults to tail).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncate: Option<Truncate>,
+    /// start, poll, kill, list, transcript: byte budget of the result, 100-1048576 (default 16384); errors and correctness warnings stay whole even beyond this budget. Not with truncate "none".
+    #[schemars(range(min = 100, max = 1048576))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_bytes: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw: Option<bool>,
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReturnWhen {
+    /// Unseen output, cleaned as results show it, has a line containing one of the texts; text a carriage return later rewrites counts. For line-oriented programs: a TUI's redraws repeat old text.
     pub output_contains: Option<Vec<String>>,
+    /// No output for this many ms, 10-60000, counted from the last output or the start of the wait, whichever is later; the wait starts after input and keys.
+    #[schemars(range(min = 10, max = 60000))]
     pub quiet_ms: Option<u64>,
 }
 
@@ -81,7 +86,10 @@ impl Request {
     }
 }
 
-pub fn validate(request: &Request) -> Result<(), String> {
+pub fn validate(
+    request: &Request,
+    launch: &LaunchContext,
+) -> Result<(service::Request, Option<std::path::PathBuf>), String> {
     if request.code.trim().is_empty() {
         return Err("code must contain JavaScript.".into());
     }
@@ -91,10 +99,13 @@ pub fn validate(request: &Request) -> Result<(), String> {
     if request.code.contains('\0') {
         return Err("code must not contain NUL bytes; use a JavaScript \\0 escape.".into());
     }
-    if let Some(dir) = &request.cwd {
-        service::validate_cwd(dir)?;
-    }
-    service::validate(&request.as_exec()?).map(|_| ())
+    let resolved_cwd = match &request.cwd {
+        Some(dir) => Some(service::validate_cwd(dir, launch)?),
+        None => None,
+    };
+    let start = request.as_exec()?;
+    service::validate(&start, false)?;
+    Ok((start, resolved_cwd))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -436,7 +447,7 @@ impl Host {
         };
         if let ToolCall::Exec(request) = &request
             && request.action == service::Action::Start
-            && service::validate(request).is_ok()
+            && service::validate(request, true).is_ok()
         {
             if self.starts >= MAX_STARTS {
                 lock(&self.script.0.report).remove(id);
@@ -455,7 +466,7 @@ impl Host {
         let call_id = self.call_id;
         let cancel = script.0.cancel.child_token();
         let nested_render = Render {
-            output_mode: OutputMode::Both,
+            output_mode: OutputMode::Structured,
             structured_content: true,
         };
         self.runtime.spawn(async move {
@@ -507,12 +518,8 @@ impl Host {
                     }
                 }
             };
-            let mut value =
-                json!({ "content": result.content, "isError": result.is_error.unwrap_or(false) });
-            if let Some(structured) = result.structured_content {
-                value["structuredContent"] = structured;
-            }
-            let mut outcome = match serde_json::to_string(&value) {
+            let envelope = nested_envelope(result);
+            let mut outcome = match serde_json::to_string(&envelope) {
                 Ok(value) => Outcome::Value(value),
                 Err(error) => Outcome::Error(error.to_string()),
             };
@@ -527,6 +534,59 @@ impl Host {
         });
         Ok(id)
     }
+}
+
+fn nested_envelope(result: rmcp::model::CallToolResult) -> serde_json::Value {
+    let mut ok = !result.is_error.unwrap_or(false);
+    let mut map = match result.structured_content {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => {
+            let text = result
+                .content
+                .first()
+                .and_then(|block| block.as_text())
+                .map_or_else(|| "Tool operation failed.".to_owned(), |t| t.text.clone());
+            let mut fallback = serde_json::Map::new();
+            fallback.insert("error".into(), json!(text));
+            ok = false;
+            fallback
+        }
+    };
+    if map.remove("ok") == Some(serde_json::Value::Bool(false)) {
+        ok = false;
+    }
+    if map.get("kind").and_then(serde_json::Value::as_str) == Some("image") {
+        match map.get("attached") {
+            Some(serde_json::Value::Bool(true)) => {
+                if let Some(images) = serde_json::to_value(&result.content)
+                    .ok()
+                    .and_then(|v| v.as_array().cloned())
+                    && let Some(block) = images.into_iter().find(|b| b["type"] == "image")
+                {
+                    map.insert(
+                        "image".into(),
+                        json!({
+                            "type": "image",
+                            "data": block["data"],
+                            "mimeType": block["mimeType"],
+                        }),
+                    );
+                }
+            }
+            Some(serde_json::Value::Bool(false)) => {
+                if let Some(note) = result
+                    .content
+                    .first()
+                    .and_then(|block| block.as_text())
+                    .map(|t| t.text.clone())
+                {
+                    map.insert("note".into(), json!(note));
+                }
+            }
+            _ => {}
+        }
+    }
+    json!({ "ok": ok, "value": map })
 }
 
 fn pending_text(calls: &[CallInfo]) -> String {
@@ -808,7 +868,7 @@ fn run_vm(
                 let path = task.image_path(index, &inline.mime);
                 let mut marker = format!(
                     "[image {index}: {} ({}, {}x{}, {} bytes)]",
-                    path.display(),
+                    files::display_path(&path),
                     inline.mime,
                     inline.width,
                     inline.height,
@@ -1002,6 +1062,9 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     const weakMapSet = Function.prototype.call.bind(WeakMap.prototype.set);
     const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get);
     const defineProperty = Object.defineProperty;
+    const objectFreeze = Object.freeze;
+    const numberIsFinite = Number.isFinite;
+    const arrayJoin = Function.prototype.call.bind(Array.prototype.join);
     const toStringTag = Symbol.toStringTag;
     const isArray = Array.isArray;
     const pending = new Map();
@@ -1050,6 +1113,49 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             __write(line);
         };
     }
+    function toolErrorMessage(value) {
+        if (value && typeof value === "object") {
+            if (typeof value.error === "string" && value.error.length > 0) return value.error;
+            const parts = [];
+            if (typeof value.inputError === "string" && value.inputError.length > 0) {
+                parts[parts.length] = value.inputError;
+            }
+            if (typeof value.captureError === "string" && value.captureError.length > 0) {
+                parts[parts.length] = "output capture failed: " + value.captureError;
+            }
+            if (typeof value.logError === "string" && value.logError.length > 0) {
+                parts[parts.length] = "log write failed: " + value.logError;
+            }
+            if (parts.length > 0) return arrayJoin(parts, "; ");
+        }
+        return "Tool operation failed.";
+    }
+    class ToolError extends ErrorCtor {
+        constructor(tool, result) {
+            super(toolErrorMessage(result));
+            defineProperty(this, "name", {
+                __proto__: null,
+                value: "ToolError",
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            });
+            defineProperty(this, "tool", {
+                __proto__: null,
+                value: tool,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            });
+            defineProperty(this, "result", {
+                __proto__: null,
+                value: result,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            });
+        }
+    }
     const members = Object.create(null);
     for (const name of ["exec", "read", "write", "edit"]) {
         members[name] = args => new PromiseCtor((resolve, reject) => {
@@ -1059,7 +1165,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             }
             try {
                 const id = __call(name, stringify(args));
-                set(pending, id, { resolve, reject });
+                set(pending, id, { resolve, reject, tool: name });
                 waiting++;
             } catch (error) { reject(error); }
         });
@@ -1072,6 +1178,35 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             throw new TypeErrorCtor("tools." + name + " does not exist. Available: exec, read, write, edit.");
         }
     });
+    function quote(value) {
+        let str;
+        if (typeof value === "string") {
+            str = value;
+        } else if (typeof value === "number") {
+            if (!numberIsFinite(value)) {
+                throw new TypeErrorCtor("sh.quote requires a string or finite number.");
+            }
+            str = StringCtor(value);
+        } else {
+            throw new TypeErrorCtor("sh.quote requires a string or finite number.");
+        }
+        if (stringIndexOf(str, "\0") !== -1) {
+            throw new TypeErrorCtor("sh.quote string must not contain NUL (U+0000).");
+        }
+        let out = "'";
+        let start = 0;
+        while (true) {
+            const at = stringIndexOf(str, "'", start);
+            if (at === -1) {
+                out += start === 0 ? str : stringSlice(str, start);
+                break;
+            }
+            out += stringSlice(str, start, at) + "'\\''";
+            start = at + 1;
+        }
+        return out + "'";
+    }
+    const sh = objectFreeze({ quote });
     function extractDataUrlBase64(value) {
         if (value.length < 13) return undefined;
         if (stringToLowerCase(stringSlice(value, 0, 5)) !== "data:") return undefined;
@@ -1081,12 +1216,16 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         return stringSlice(value, comma + 1);
     }
     function image(value) {
-        if (value && typeof value === "object" && isArray(value.content)) {
-            let found;
-            for (let i = 0; i < value.content.length; i++) {
-                if (value.content[i] && value.content[i].type === "image") { found = value.content[i]; break; }
+        if (value && typeof value === "object" && value.kind === "image") {
+            if (value.attached === false) {
+                const note = typeof value.note === "string" && value.note.length > 0
+                    ? value.note
+                    : "The image could not be attached.";
+                throw new TypeErrorCtor(note);
             }
-            value = found;
+            if (value.attached === true && value.image && typeof value.image === "object") {
+                value = value.image;
+            }
         }
         let data;
         if (value && typeof value === "object" && value.type === "image" && typeof value.data === "string") {
@@ -1094,7 +1233,9 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         } else if (typeof value === "string") {
             data = extractDataUrlBase64(value);
         }
-        if (typeof data !== "string") throw new TypeErrorCtor("image expects an image block, a base64 data URL, or a tool result containing an image block.");
+        if (typeof data !== "string") {
+            throw new TypeErrorCtor("image expects an attached image read result, an image block, or a base64 data URL.");
+        }
         __image(data);
     }
     function exit() {
@@ -1495,6 +1636,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         configurable: true,
     });
     globalThis.tools = tools;
+    globalThis.sh = sh;
     globalThis.console = console;
     globalThis.text = text;
     globalThis.image = image;
@@ -1512,7 +1654,13 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             remove(pending, id);
             waiting--;
             if (!ok) { entry.reject(range ? new RangeErrorCtor(payload) : new ErrorCtor(payload)); return; }
-            try { entry.resolve(parse(payload)); } catch (error) { entry.reject(error); }
+            let envelope;
+            try { envelope = parse(payload); } catch (error) { entry.reject(error); return; }
+            if (envelope.ok) {
+                entry.resolve(envelope.value);
+            } else {
+                entry.reject(new ToolError(entry.tool, envelope.value));
+            }
         },
         status() { return state || (waiting ? 0 : 3); },
         failure() { return failure; }
@@ -1687,16 +1835,18 @@ mod tests {
 
     #[test]
     fn validates_code_and_only_script_options() {
+        let launch = LaunchContext::current().unwrap();
         for code in ["", " \n\t", "text('\0')"] {
             let request: Request = serde_json::from_value(json!({"code": code})).unwrap();
-            assert!(validate(&request).is_err());
+            assert!(validate(&request, &launch).is_err());
         }
         let request: Request =
             serde_json::from_value(json!({"code": "x".repeat(MAX_CODE + 1)})).unwrap();
-        assert!(validate(&request).unwrap_err().contains("256 KiB"));
+        assert!(validate(&request, &launch).unwrap_err().contains("256 KiB"));
         for extra in [
-            json!({"cwd":"relative/dir"}),
+            json!({"cwd":"definitely-missing-relative-dir-fastexec"}),
             json!({"pty":true}),
+            json!({"raw":true}),
             json!({"waitMs":240001}),
             json!({"returnWhen":{"screenContains":["x"]}}),
         ] {
@@ -1706,15 +1856,15 @@ mod tests {
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
             assert!(
-                serde_json::from_value::<Request>(value).map_or(true, |r| validate(&r).is_err())
+                serde_json::from_value::<Request>(value)
+                    .map_or(true, |r| validate(&r, &launch).is_err())
             );
         }
-        let dir = std::env::temp_dir();
         let request: Request = serde_json::from_value(
-            json!({"code":"return '\\0'", "cwd": dir, "waitMs":0, "killAfterMs":0}),
+            json!({"code":"return '\\0'", "cwd": ".", "waitMs":0, "killAfterMs":0}),
         )
         .unwrap();
-        assert!(validate(&request).is_ok());
+        assert!(validate(&request, &launch).is_ok());
     }
 
     #[tokio::test]
@@ -1828,16 +1978,18 @@ mod tests {
         let fixture = Fixture::new();
         let code = r#"
             const write = await tools.write({path:'fixture.txt',content:'old\n'});
-            if (write.isError !== false || write.structuredContent.ok !== true || write.structuredContent.bytes !== 4) throw new Error('write shape');
+            if ('ok' in write || 'structuredContent' in write || write.bytes !== 4 || !write.path.endsWith('/fixture.txt')) throw new Error('write shape');
             const edit = await tools.edit({path:'fixture.txt',edits:[{oldText:'old',newText:'new'}]});
-            if (edit.isError || edit.structuredContent.ok !== true || edit.structuredContent.edits[0].line !== 1) throw new Error('edit failed');
-            const missing = await tools.read({path:'missing.txt'});
-            if (missing.isError !== true || missing.structuredContent.ok !== false) throw new Error('missing file must resolve');
-            const badExec = await tools.exec({action:'start',command:''});
-            if (badExec.isError !== true || badExec.structuredContent.ok !== false || badExec.structuredContent.action !== 'start') throw new Error('empty exec must resolve as error');
+            if ('ok' in edit || edit.replacements !== 1 || edit.edits[0].line !== 1) throw new Error('edit failed');
+            let missingErr = null;
+            try { await tools.read({path:'missing.txt'}); } catch (e) { missingErr = e; }
+            if (!missingErr || missingErr.name !== 'ToolError' || missingErr.tool !== 'read' || typeof missingErr.result?.error !== 'string') throw new Error('missing file must reject with ToolError');
+            let badExecErr = null;
+            try { await tools.exec({action:'start',command:''}); } catch (e) { badExecErr = e; }
+            if (!badExecErr || badExecErr.name !== 'ToolError' || badExecErr.tool !== 'exec' || badExecErr.result?.action !== 'start') throw new Error('empty exec must reject with ToolError');
             for (const args of [null, [], 'x', {path:'fixture.txt',surprise:true}]) {
                 let rejected = false;
-                try { await tools.read(args); } catch (e) { rejected = true; }
+                try { await tools.read(args); } catch (e) { if (e instanceof TypeError) rejected = true; }
                 if (!rejected) throw new Error('invalid arguments resolved');
             }
             for (const args of [null, {action:'bogus'}, {action:'list',surprise:true}]) {
@@ -1848,7 +2000,7 @@ mod tests {
             try { tools.codemode({code:'return 1'}); throw new Error('unknown tool accepted'); }
             catch(e) { if (!(e instanceof TypeError)) throw e; }
             const results = await Promise.all(Array.from({length:20}, () => tools.read({path:'fixture.txt'})));
-            if (results.some(r => r.isError || r.structuredContent.text !== 'new\n' || r.structuredContent.truncated !== false)) throw new Error('queued read failed');
+            if (results.some(r => 'ok' in r || r.text !== 'new\n' || r.truncated !== false || r.totalLines !== 1)) throw new Error('queued read failed');
             text(results.length);
         "#;
         let (state, output) = fixture.result(code).await;
@@ -1871,7 +2023,7 @@ mod tests {
             Promise.prototype.then = () => { throw Error('patched then'); };
             Function.prototype.call = Function.prototype.bind = () => { throw Error('patched function'); };
             const result = await promise;
-            text({ok: !result.isError});
+            text({ok: result.text === 'kept' && !('ok' in result)});
             return 'done';
         "#).await;
         assert_eq!(state.exit_code, Some(0), "{output}");
@@ -2336,13 +2488,13 @@ mod tests {
                     tools.read({path: "long.jsonl"}),
                     tools.read({path: "rows.txt"}),
                 ]);
-                if (longRes.isError || longRes.structuredContent.truncated || longRes.structuredContent.lineTooLong) {
+                if (longRes.truncated || longRes.lineTooLong) {
                     throw new Error("long line truncated");
                 }
-                const parsed = JSON.parse(longRes.structuredContent.text);
+                const parsed = JSON.parse(longRes.text);
                 if (parsed.payload.length !== 120 * 1024) throw new Error("payload length");
-                if (rowsRes.isError || rowsRes.structuredContent.truncated || rowsRes.structuredContent.shownLines !== 3500) {
-                    throw new Error("rows truncated: " + JSON.stringify(rowsRes.structuredContent));
+                if (rowsRes.truncated || rowsRes.shownLines !== 3500 || rowsRes.totalLines !== 3500) {
+                    throw new Error("rows truncated: " + JSON.stringify(rowsRes));
                 }
                 return "nested-window-ok";
             "#,
@@ -2350,5 +2502,86 @@ mod tests {
             .await;
         assert_eq!(state.exit_code, Some(0), "{output}");
         assert_eq!(output, "nested-window-ok\n");
+    }
+
+    #[tokio::test]
+    async fn sh_quote_image_notes_queue_cap_and_integrity_tool_errors() {
+        let fixture = Fixture::new();
+        // Create a small PNG and an oversized >10 MiB fake PNG header for note-only read.
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            4,
+            4,
+            image::Rgb([1, 2, 3]),
+        ));
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(fixture.dir.join("ok.png"), &png).unwrap();
+        let mut huge = png[..32].to_vec();
+        huge.resize(11 * 1024 * 1024, 0);
+        std::fs::write(fixture.dir.join("huge.png"), &huge).unwrap();
+
+        let (state, output) = fixture
+            .result(
+                r#"
+                if (!Object.isFrozen(sh) || typeof sh.quote !== "function") {
+                    throw new Error("sh not frozen");
+                }
+                const cases = [
+                    ["", "''"],
+                    ["hello world", "'hello world'"],
+                    ["it's $HOME `id` \\ \n", "'it'\\''s $HOME `id` \\ \n'"],
+                    [42, "'42'"],
+                    [-3.5, "'-3.5'"],
+                ];
+                for (const [inp, exp] of cases) {
+                    const got = sh.quote(inp);
+                    if (got !== exp) throw new Error("sh.quote mismatch: " + got + " !== " + exp);
+                }
+                for (const bad of [null, undefined, true, {}, [], NaN, Infinity, -Infinity, "a\0b", Symbol("x")]) {
+                    let threw = false;
+                    try { sh.quote(bad); } catch (e) { if (e instanceof TypeError) threw = true; }
+                    if (!threw) throw new Error("expected TypeError for " + String(bad));
+                }
+                const okImg = await tools.read({path: "ok.png"});
+                image(okImg);
+                const bigImg = await tools.read({path: "huge.png"});
+                if (bigImg.attached !== false || typeof bigImg.note !== "string" || !bigImg.note.includes("Image omitted")) {
+                    throw new Error("bigImg shape: " + JSON.stringify(bigImg));
+                }
+                let noteThrown = false;
+                try { image(bigImg); } catch (e) {
+                    if (e instanceof TypeError && e.message === bigImg.note) noteThrown = true;
+                }
+                if (!noteThrown) throw new Error("expected image(bigImg) to throw bigImg.note");
+                return "helpers-ok";
+                "#,
+            )
+            .await;
+        assert_eq!(state.exit_code, Some(0), "{output}");
+        assert!(output.contains("helpers-ok"), "{output}");
+
+        // Integrity failure without top-level `error` builds ToolError.message from inputError
+        // and preserves output, exitCode, and diagnostics in ToolError.result.
+        let mut synth =
+            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text("status")]);
+        synth.structured_content = Some(json!({
+            "ok": false,
+            "action": "poll",
+            "taskId": "abcdefgh-1.2345",
+            "state": "exited",
+            "exitCode": 0,
+            "output": "captured-before-err",
+            "inputError": "INPUT_WRITE_FAILED: broken pipe",
+        }));
+        let parsed = nested_envelope(synth);
+        assert_eq!(parsed["ok"], false);
+        assert!(parsed["value"].get("ok").is_none());
+        assert_eq!(parsed["value"]["output"], "captured-before-err");
+        assert_eq!(parsed["value"]["exitCode"], 0);
+        assert_eq!(
+            parsed["value"]["inputError"],
+            "INPUT_WRITE_FAILED: broken pipe"
+        );
     }
 }

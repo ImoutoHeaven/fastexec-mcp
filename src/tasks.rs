@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{oneshot, watch};
@@ -143,9 +143,48 @@ struct OutputWorkers {
     capture: mpsc::Sender<CaptureWork>,
 }
 
+struct WriterDone(Mutex<bool>, Condvar);
+
+impl WriterDone {
+    fn new(done: bool) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(done), Condvar::new()))
+    }
+
+    fn finish(&self) {
+        *lock(&self.0) = true;
+        self.1.notify_all();
+    }
+
+    fn wait_until(&self, deadline: Instant) {
+        let mut done = lock(&self.0);
+        while !*done {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let (guard, timeout) = self
+                .1
+                .wait_timeout(done, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            done = guard;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+    }
+}
+
+struct WriterDoneGuard(Arc<WriterDone>);
+
+impl Drop for WriterDoneGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
 struct Workers {
     output: OutputWorkers,
-    input: mpsc::Sender<InputWork>,
+    input: Option<mpsc::Sender<InputWork>>,
     waiter: mpsc::Sender<WaitWork>,
     ender: mpsc::Sender<EndWork>,
 }
@@ -171,6 +210,18 @@ struct InputWork {
     task: Arc<Task>,
     input: Box<dyn Write + Send>,
     received: mpsc::Receiver<Input>,
+    done_signal: Arc<WriterDone>,
+}
+
+fn is_broken_pipe(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(109 | 232 | 233)) {
+        return true;
+    }
+    false
 }
 
 struct WaitWork {
@@ -221,36 +272,78 @@ impl OutputWorkers {
 }
 
 impl Workers {
-    fn new() -> std::io::Result<Self> {
-        Ok(Self {
-            output: OutputWorkers::new()?,
-            input: worker("fastexec-input", |job: InputWork| {
+    fn new(with_input: bool) -> std::io::Result<Self> {
+        let output = OutputWorkers::new()?;
+        let input = if with_input {
+            Some(worker("fastexec-input", |job: InputWork| {
+                let _guard = WriterDoneGuard(job.done_signal);
                 let mut input = Some(job.input);
                 for message in job.received {
-                    let delivered = input
-                        .as_mut()
-                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-                        .and_then(|input| {
-                            input.write_all(&message.bytes).and_then(|()| input.flush())
-                        })
-                        .map_err(|error| {
-                            format!("INPUT_WRITE_FAILED: stdin is closed or unwritable: {error}; the input may have been partially delivered.")
-                        });
-                    job.task
-                        .queued
-                        .fetch_sub(message.bytes.len(), Ordering::SeqCst);
-                    if let Err(error) = &delivered {
-                        *lock(&job.task.input_error) = Some(error.clone());
-                        *lock(&job.task.input) = None;
-                    }
-                    if message.eof || delivered.is_err() {
+                    let total = message.bytes.len();
+                    let mut written = 0usize;
+                    let write_res: std::io::Result<()> = match input.as_mut() {
+                        None => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                        Some(writer) => (|| {
+                            while written < total {
+                                match writer.write(&message.bytes[written..]) {
+                                    Ok(0) => {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::WriteZero,
+                                            "write returned 0 bytes",
+                                        ));
+                                    }
+                                    Ok(count) => written += count,
+                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                                        continue;
+                                    }
+                                    Err(err) => return Err(err),
+                                }
+                            }
+                            loop {
+                                match writer.flush() {
+                                    Ok(()) => return Ok(()),
+                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                                        continue;
+                                    }
+                                    Err(err) => return Err(err),
+                                }
+                            }
+                        })(),
+                    };
+                    job.task.queued.fetch_sub(total, Ordering::SeqCst);
+                    let delivered = match write_res {
+                        Ok(()) => Ok(()),
+                        Err(error) if message.initial && is_broken_pipe(&error) => {
+                            *lock(&job.task.input_warning) =
+                                Some(format!("stdin closed after {written} of {total} bytes"));
+                            *lock(&job.task.input) = None;
+                            drop(input.take());
+                            Ok(())
+                        }
+                        Err(error) => {
+                            let msg = format!(
+                                "INPUT_WRITE_FAILED: stdin is closed or unwritable: {error}; the input may have been partially delivered."
+                            );
+                            *lock(&job.task.input_error) = Some(msg.clone());
+                            *lock(&job.task.input) = None;
+                            drop(input.take());
+                            Err(msg)
+                        }
+                    };
+                    if message.eof {
                         drop(input.take());
                     }
                     if let Some(done) = message.done {
                         let _ = done.send(delivered);
                     }
                 }
-            })?,
+            })?)
+        } else {
+            None
+        };
+        Ok(Self {
+            output,
+            input,
             waiter: worker("fastexec-wait", wait_task)?,
             ender: worker("fastexec-end", |job: EndWork| {
                 finish_tree(
@@ -297,9 +390,21 @@ pub fn random_chars(digits: usize) -> std::io::Result<String> {
     Ok(out[26 - digits..].into())
 }
 
-/// A fresh 128-bit epoch from the OS random source: 26 characters, the top two bits zero.
+/// A fresh 40-bit epoch from the OS random source: 8 Crockford base32 characters.
 fn new_epoch() -> std::io::Result<String> {
-    random_chars(26)
+    random_chars(8)
+}
+
+/// Whether `id` has the bare task ID shape `<8-char base32 epoch>-<base32 counter>`.
+pub fn is_valid_task_id(id: &str) -> bool {
+    let Some((epoch, counter)) = id.split_once('-') else {
+        return false;
+    };
+    epoch.len() == 8
+        && !counter.is_empty()
+        && counter.len() <= 13
+        && epoch.bytes().all(|byte| ALPHABET.contains(&byte))
+        && counter.bytes().all(|byte| ALPHABET.contains(&byte))
 }
 
 /// The error a transcript read returns for a task whose files the total log limit evicted.
@@ -376,6 +481,7 @@ pub struct Task {
     /// Signals each captured output chunk and each synchronized update its timeout ends.
     activity: watch::Sender<()>,
     input: Mutex<Option<mpsc::Sender<Input>>>,
+    writer_done: Arc<WriterDone>,
     input_warning: Mutex<Option<String>>,
     input_error: Mutex<Option<String>>,
     queued: AtomicUsize,
@@ -490,6 +596,7 @@ struct Final {
 struct Input {
     bytes: Vec<u8>,
     eof: bool,
+    initial: bool,
     done: Option<oneshot::Sender<Result<(), String>>>,
 }
 
@@ -533,6 +640,8 @@ pub struct StartArgs {
     pub rows: u16,
     pub login: bool,
     pub keep: bool,
+    pub input: Option<String>,
+    pub eof: Option<bool>,
     pub encoding: &'static Encoding,
     /// `killAfterMs`: end the task's tree this many ms after launch; 0 or None means no limit.
     pub kill_after_ms: Option<u64>,
@@ -632,28 +741,50 @@ impl Tasks {
         lock(&self.registry).tasks.iter().rev().cloned().collect()
     }
 
-    /// Every task with the state a client sees. Both are read under the registry guard, so a
-    /// list either runs before a completion's end is visible or after its retirement: nothing
-    /// can show an end that the cap has not accounted for.
-    pub fn listed(&self) -> Vec<(Arc<Task>, Snapshot)> {
-        // The registry guard covers the state a list reads together with membership in it. The
-        // processes a task holds are asked for after the guard is dropped, so a host that cannot
-        // answer at once never blocks an admission, a list, or a retirement.
-        let mut entries: Vec<(Arc<Task>, Snapshot)> = {
+    /// Tasks matching `all_scope` and `active_filter` (`Some(true)` = active, `Some(false)` =
+    /// finished, `None` = both), newest first, truncated to `limit`, along with `totalCount`.
+    /// Filtering and counting run under the registry-then-session lock order; held-process
+    /// inspection runs after the lock only for the selected tasks.
+    pub fn listed(
+        &self,
+        session: &Session,
+        all_scope: bool,
+        active_filter: Option<bool>,
+        limit: usize,
+    ) -> (usize, Vec<(Arc<Task>, Snapshot)>) {
+        let (total_count, mut selected) = {
             let registry = lock(&self.registry);
-            registry
-                .tasks
-                .iter()
-                .rev()
-                .map(|task| (Arc::clone(task), task.snapshot()))
-                .collect()
+            let touched = session.touched(&registry.tasks);
+            let mut total_count = 0usize;
+            let mut selected = Vec::with_capacity(limit.min(registry.tasks.len()));
+            let mut consider = |task: &Arc<Task>| {
+                let snapshot = task.snapshot();
+                let active = snapshot.state == "running" || snapshot.kept;
+                if active_filter.is_some_and(|want_active| want_active != active) {
+                    return;
+                }
+                total_count += 1;
+                if selected.len() < limit {
+                    selected.push((Arc::clone(task), snapshot));
+                }
+            };
+            if all_scope {
+                for task in registry.tasks.iter().rev() {
+                    consider(task);
+                }
+            } else {
+                for (task, _) in &touched {
+                    consider(task);
+                }
+            }
+            (total_count, selected)
         };
-        for (task, snapshot) in &mut entries {
+        for (task, snapshot) in &mut selected {
             if snapshot.kept {
                 snapshot.held = task.root.members().unwrap_or_default();
             }
         }
-        entries
+        (total_count, selected)
     }
 
     /// Takes a place against [`Limits::max_running`] and the next task ID. The guard gives the
@@ -724,10 +855,23 @@ impl Tasks {
         let kill_after_ms = args.kill_after_ms;
         // Admission holds a place against the running limit, so the bash lookup, the file
         // creation, and the spawn below all run without the registry lock.
+        let (pipe_stdin, initial_input, keep_stdin_open) = if args.pty {
+            (true, None, true)
+        } else {
+            let close_after = args.eof != Some(false);
+            match args.input {
+                None if close_after => (false, None, false),
+                None => (true, None, true),
+                Some(text) if text.is_empty() && close_after => (true, None, false),
+                Some(text) if text.is_empty() => (true, None, true),
+                Some(text) => (true, Some((text.into_bytes(), close_after)), !close_after),
+            }
+        };
+        let need_input_worker = args.pty || keep_stdin_open || initial_input.is_some();
         let (id, mut pending) = self.admit(false)?;
         let bash = args.launch.bash()?.to_path_buf();
-        let workers =
-            Workers::new().map_err(|error| format!("Cannot prepare the task workers: {error}."))?;
+        let workers = Workers::new(need_input_worker)
+            .map_err(|error| format!("Cannot prepare the task workers: {error}."))?;
         let log_path = self.dir.join(format!("{id}.log"));
         let log = private_file(&log_path)
             .map_err(|error| format!("Cannot create the task log: {error}."))?;
@@ -760,11 +904,12 @@ impl Tasks {
             env: &args.launch,
             login: args.login,
             pty: args.pty,
+            pipe_stdin,
             cols: args.cols,
             rows: args.rows,
             exit_status: exit_status.as_deref(),
         };
-        let spawned = match process::spawn(&launch) {
+        let mut spawned = match process::spawn(&launch) {
             Ok(spawned) => spawned,
             Err(error) => {
                 let _ = std::fs::remove_file(&log_path);
@@ -772,7 +917,24 @@ impl Tasks {
                 return Err(format!("Cannot start the command: {error}."));
             }
         };
+        if !need_input_worker {
+            // Explicit empty pipe (`input: ""`) closes its write end immediately here.
+            drop(spawned.input.take());
+        }
         let (input_tx, input_rx) = mpsc::channel();
+        let mut initial_queued = 0usize;
+        if let Some((bytes, eof)) = initial_input {
+            initial_queued = bytes.len();
+            input_tx
+                .send(Input {
+                    bytes,
+                    eof,
+                    initial: true,
+                    done: None,
+                })
+                .expect("input_rx is held in this frame");
+        }
+        let writer_done = WriterDone::new(!need_input_worker);
         let terminal = args.pty.then(|| {
             let mut spool = Spool {
                 file: None,
@@ -812,10 +974,11 @@ impl Tasks {
             end: Mutex::new(None),
             done: watch::Sender::new(false),
             activity: watch::Sender::new(()),
-            input: Mutex::new(Some(input_tx.clone())),
+            input: Mutex::new(keep_stdin_open.then(|| input_tx.clone())),
+            writer_done: Arc::clone(&writer_done),
             input_warning: Mutex::new(None),
             input_error: Mutex::new(None),
-            queued: AtomicUsize::new(0),
+            queued: AtomicUsize::new(initial_queued),
             input_gate: tokio::sync::Mutex::new(()),
             terminal,
             size: Mutex::new((args.cols, args.rows)),
@@ -861,14 +1024,17 @@ impl Tasks {
                 eof: eof_tx,
             })
             .unwrap_or_else(|_| unreachable!("prepared capture worker stopped"));
-        workers
-            .input
-            .send(InputWork {
-                task: Arc::clone(&task),
-                input: spawned.input,
-                received: input_rx,
-            })
-            .unwrap_or_else(|_| unreachable!("prepared input worker stopped"));
+        drop(input_tx);
+        if let Some(input_worker) = workers.input {
+            input_worker
+                .send(InputWork {
+                    task: Arc::clone(&task),
+                    input: spawned.input.expect("input worker requires piped stdin"),
+                    received: input_rx,
+                    done_signal: writer_done,
+                })
+                .unwrap_or_else(|_| unreachable!("prepared input worker stopped"));
+        }
         workers
             .waiter
             .send(WaitWork {
@@ -920,6 +1086,7 @@ impl Tasks {
             done: watch::Sender::new(false),
             activity: watch::Sender::new(()),
             input: Mutex::new(None),
+            writer_done: WriterDone::new(true),
             input_warning: Mutex::new(None),
             input_error: Mutex::new(None),
             queued: AtomicUsize::new(0),
@@ -1213,25 +1380,34 @@ impl Tasks {
         session.touched(&registry.tasks);
     }
 
-    /// Returns the bounded notice and only the tasks actually named in it.
-    pub fn background(
+    /// Returns the bounded notice, only the tasks actually named in it, and this call's
+    /// once-per-session outside-task reservation (released automatically unless committed).
+    pub fn background<'a>(
         &self,
-        session: &Session,
+        session: &'a Session,
         exclude: &str,
         cap: usize,
-    ) -> Option<(String, Vec<Shown>)> {
+    ) -> (
+        Option<(String, Vec<Shown>)>,
+        crate::session::OutsideClaim<'a>,
+    ) {
+        let mut claim = session.claim_outside();
         // Registry and session locks are taken together, in that order, so a task that starts
         // meanwhile cannot be pruned as retired; both are released before any snapshot.
         let (touched, others) = {
             let registry = lock(&self.registry);
             let touched = session.touched(&registry.tasks);
-            let own: HashSet<_> = touched.iter().map(|(task, _)| task.id.as_str()).collect();
-            let others: Vec<_> = registry
-                .tasks
-                .iter()
-                .filter(|task| task.id != exclude && !own.contains(task.id.as_str()))
-                .cloned()
-                .collect();
+            let others: Vec<_> = if claim.is_claimed() {
+                let own: HashSet<_> = touched.iter().map(|(task, _)| task.id.as_str()).collect();
+                registry
+                    .tasks
+                    .iter()
+                    .filter(|task| task.id != exclude && !own.contains(task.id.as_str()))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             (touched, others)
         };
         let others = others
@@ -1241,16 +1417,6 @@ impl Tasks {
                 snapshot.state == "running" || snapshot.kept
             })
             .count();
-        let others_text = match others {
-            0 => String::new(),
-            1 => "1 other running".into(),
-            n => format!("{n} others running"),
-        };
-        let others_clause = if others == 0 {
-            String::new()
-        } else {
-            format!("; {others_text}")
-        };
         // Rank 0: failed or expired; 1: other finished, or held processes ended; 2: running or
         // holding processes. Newest first within a rank.
         #[derive(PartialEq)]
@@ -1290,7 +1456,7 @@ impl Tasks {
             })
             .collect();
         if entries.is_empty() && others == 0 {
-            return None;
+            return (None, claim);
         }
         entries.sort_by_key(|(rank, ..)| *rank);
         let count = |rank: u8| entries.iter().filter(|entry| entry.0 == rank).count();
@@ -1313,14 +1479,14 @@ impl Tasks {
             }
         }
         let counts = counts.join(", ");
-        let shown_tasks = |shown: usize| {
+        let shown_tasks = |shown: usize| -> Vec<Shown> {
             entries[..shown]
                 .iter()
                 .map(|(_, _, task, snapshot)| (Arc::clone(task), snapshot.clone()))
                 .collect()
         };
-        for shown in (1..=entries.len().min(3)).rev() {
-            let named: Vec<String> = entries[..shown]
+        let format_named = |shown: usize| -> Vec<String> {
+            entries[..shown]
                 .iter()
                 .map(|(_, notice, task, snapshot)| {
                     let id = &task.id;
@@ -1338,7 +1504,6 @@ impl Tasks {
                                 _ if snapshot.expired => "killed by killAfterMs".into(),
                                 _ => "killed".into(),
                             };
-                            // The notice marks the end of the held processes shown too.
                             let tree = if snapshot.tree_ended {
                                 " and its kept processes ended"
                             } else {
@@ -1348,35 +1513,69 @@ impl Tasks {
                         }
                     }
                 })
-                .collect();
-            let rest = entries.len() - shown;
-            let line = match (rest, others) {
-                (0, 0) => format!("(Background: {}.)", named.join(", ")),
-                (0, _) => format!(
-                    "(Background: {}; {others_text}; use list.)",
-                    named.join(", ")
-                ),
-                _ => format!(
-                    "(Background: {}; {rest} more; {counts}{others_clause}; use list.)",
-                    named.join(", ")
-                ),
+                .collect()
+        };
+        if others > 0 {
+            let outside_text = if others == 1 {
+                "1 task running outside this session".to_owned()
+            } else {
+                format!("{others} tasks running outside this session")
+            };
+            for shown in (1..=entries.len().min(3)).rev() {
+                let named = format_named(shown);
+                let rest = entries.len() - shown;
+                let line = if rest == 0 {
+                    format!(
+                        "(Background: {}; {outside_text}; use list with scope \"all\".)",
+                        named.join(", ")
+                    )
+                } else {
+                    format!(
+                        "(Background: {}; {rest} more; {counts}; {outside_text}; use list with scope \"all\".)",
+                        named.join(", ")
+                    )
+                };
+                if line.len() <= cap {
+                    return (Some((line, shown_tasks(shown))), claim);
+                }
+            }
+            let line = if entries.is_empty() {
+                format!("(Background: {outside_text}; use list with scope \"all\".)")
+            } else {
+                format!("(Background: {counts}; {outside_text}; use list with scope \"all\".)")
             };
             if line.len() <= cap {
-                return Some((line, shown_tasks(shown)));
+                return (Some((line, Vec::new())), claim);
+            }
+            // The budget could not fit the outside-task count: leave the slot for a later call.
+            claim.release();
+        }
+        if entries.is_empty() {
+            return (None, claim);
+        }
+        for shown in (1..=entries.len().min(3)).rev() {
+            let named = format_named(shown);
+            let rest = entries.len() - shown;
+            let line = if rest == 0 {
+                format!("(Background: {}.)", named.join(", "))
+            } else {
+                format!(
+                    "(Background: {}; {rest} more; {counts}; use list.)",
+                    named.join(", ")
+                )
+            };
+            if line.len() <= cap {
+                return (Some((line, shown_tasks(shown))), claim);
             }
         }
-        let line = if entries.is_empty() {
-            format!("(Background: {others_text}; use list.)")
-        } else {
-            format!("(Background: {counts}{others_clause}; use list.)")
-        };
+        let line = format!("(Background: {counts}; use list.)");
         if line.len() <= cap {
-            return Some((line, Vec::new()));
+            return (Some((line, Vec::new())), claim);
         }
-        let total = entries.len() + others;
+        let total = entries.len();
         let plural = if total == 1 { "" } else { "s" };
         let line = format!("({total} task{plural}; use list.)");
-        (line.len() <= cap).then(|| (line, Vec::new()))
+        ((line.len() <= cap).then(|| (line, Vec::new())), claim)
     }
 }
 
@@ -1413,6 +1612,9 @@ fn wait_task(job: WaitWork) {
         leftovers = task.root.members().unwrap_or(leftovers);
         *lock(&task.kill_error) = kill_error;
     }
+    if !kept {
+        *lock(&task.input) = None;
+    }
     ender
         .send(EndWork {
             shared: Arc::clone(&shared),
@@ -1422,7 +1624,11 @@ fn wait_task(job: WaitWork) {
             exit_status,
         })
         .unwrap_or_else(|_| unreachable!("prepared ender stopped"));
-    let output_open = drain(&task, &eof, kept);
+    let drain_deadline = Instant::now() + DRAIN_CAP;
+    let output_open = drain_until(&task, &eof, kept, drain_deadline);
+    if !kept {
+        task.writer_done.wait_until(drain_deadline);
+    }
     let mut registry = lock(&shared.registry);
     task.publish_end(Final {
         exit_code: Some(exit_code),
@@ -1451,6 +1657,7 @@ fn finish_tree(
         task.hold_unconfirmed_tree();
     } else {
         *lock(&task.input) = None;
+        task.writer_done.wait_until(Instant::now() + DRAIN_CAP);
         *lock(&task.pty_control) = None;
         let _ = std::fs::remove_file(script);
         if let Some(status) = exit_status {
@@ -1536,7 +1743,10 @@ impl Spool {
 /// open. With kept processes, which may hold it open for good, the wait also ends once the
 /// output pauses for [`KEPT_PAUSE`].
 fn drain(task: &Task, eof: &mpsc::Receiver<()>, kept: bool) -> bool {
-    let deadline = Instant::now() + DRAIN_CAP;
+    drain_until(task, eof, kept, Instant::now() + DRAIN_CAP)
+}
+
+fn drain_until(task: &Task, eof: &mpsc::Receiver<()>, kept: bool, deadline: Instant) -> bool {
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -1623,6 +1833,7 @@ fn answer_program(task: &Task, answer: &mpsc::Sender<Input>, reply: Vec<u8>) {
         && let Err(error) = answer.send(Input {
             bytes: reply,
             eof: false,
+            initial: false,
             done: None,
         })
     {
@@ -2276,9 +2487,11 @@ impl Task {
             return match data {
                 None => Ok(None), // closing a closed stdin is a no-op
                 Some(_) if self.is_running() => Err(
-                    "stdin is closed (eof was sent or the program closed it); the input was not delivered.".into(),
+                    "stdin is closed (pipe tasks default to /dev/null and close stdin after start input; start with eof: false to keep stdin open for poll input); the input was not delivered.".into(),
                 ),
-                Some(_) => Err("The task has exited; the input was not delivered.".into()),
+                Some(_) => Err(
+                    "The task has exited and stdin is closed (start pipe tasks with eof: false to keep stdin open while running); the input was not delivered.".into(),
+                ),
             };
         };
         if !self.admit(bytes.len()) {
@@ -2289,13 +2502,14 @@ impl Task {
             .send(Input {
                 bytes: bytes.to_vec(),
                 eof,
+                initial: false,
                 done: Some(done),
             })
             .is_err()
         {
             self.queued.fetch_sub(bytes.len(), Ordering::SeqCst);
             *sender = None;
-            return Err("stdin is closed; the input was not delivered.".into());
+            return Err("stdin is closed (start pipe tasks with eof: false to keep stdin open for poll input); the input was not delivered.".into());
         }
         if eof {
             *sender = None;
@@ -2332,24 +2546,33 @@ impl Task {
 
     /// Returns the output after the session's cursor, up to `until` when given, as a window,
     /// and advances that cursor past it.
+    #[allow(clippy::too_many_arguments)]
     pub fn read_window(
         &self,
         state: &mut ReadState,
         truncate: Truncate,
         budget: usize,
         raw: bool,
+        clean: bool,
+        line_cut: bool,
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> std::io::Result<Window> {
         if lock(&self.out).evicted {
-            return Ok(self.read_evicted(state, truncate, budget, raw, encoding, until));
+            return Ok(self.read_evicted(
+                state, truncate, budget, raw, clean, line_cut, encoding, until,
+            ));
         }
-        match self.read_stored(state, truncate, budget, raw, encoding, until) {
+        match self.read_stored(
+            state, truncate, budget, raw, clean, line_cut, encoding, until,
+        ) {
             Ok(window) => Ok(window),
             Err(_) if lock(&self.out).evicted => {
                 // Eviction deleted the log between the flags above and the read. The window is
                 // empty either way, so the half-read state is simply not committed.
-                Ok(self.read_evicted(state, truncate, budget, raw, encoding, until))
+                Ok(self.read_evicted(
+                    state, truncate, budget, raw, clean, line_cut, encoding, until,
+                ))
             }
             Err(error) => Err(error),
         }
@@ -2358,12 +2581,15 @@ impl Task {
     /// The window of an evicted task: an empty one. The cursor moves past the bytes that are
     /// gone, so the next read starts where this one would have ended; the eviction itself is
     /// reported by the snapshot, not by inventing an omitted line range.
+    #[allow(clippy::too_many_arguments)]
     fn read_evicted(
         &self,
         state: &mut ReadState,
         truncate: Truncate,
         budget: usize,
         raw: bool,
+        clean: bool,
+        line_cut: bool,
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> Window {
@@ -2374,6 +2600,8 @@ impl Task {
             truncate,
             budget,
             raw,
+            clean,
+            line_cut,
             encoding,
             source: "log",
         };
@@ -2382,12 +2610,15 @@ impl Task {
         window
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_stored(
         &self,
         state: &mut ReadState,
         truncate: Truncate,
         budget: usize,
         raw: bool,
+        clean: bool,
+        line_cut: bool,
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> std::io::Result<Window> {
@@ -2409,6 +2640,8 @@ impl Task {
             truncate,
             budget,
             raw,
+            clean,
+            line_cut,
             encoding,
             source: "log",
         };
@@ -2775,11 +3008,24 @@ mod ids {
     use super::*;
 
     #[test]
-    fn epoch_is_26_crockford_characters_and_differs_between_servers() {
+    fn epoch_is_8_crockford_characters_and_differs_between_servers() {
         let epoch = new_epoch().unwrap();
-        assert_eq!(epoch.len(), 26, "{epoch}");
+        assert_eq!(epoch.len(), 8, "{epoch}");
         assert!(epoch.bytes().all(|b| ALPHABET.contains(&b)), "{epoch}");
         assert_ne!(epoch, new_epoch().unwrap());
+        assert!(is_valid_task_id(&task_id(&epoch, 1)));
+        assert!(is_valid_task_id(&task_id(&epoch, u64::MAX)));
+        for malformed in [
+            "",
+            "t1",
+            "foo-bar",
+            "7yfh1xz-1",
+            "7yfh1xz30-1",
+            "7yfh1xz3-",
+            "7yfh1xz3-1.abcd",
+        ] {
+            assert!(!is_valid_task_id(malformed), "{malformed}");
+        }
     }
 
     #[test]
@@ -2870,6 +3116,8 @@ mod tests {
             rows: process::PTY_ROWS,
             login: false,
             keep: false,
+            input: None,
+            eof: None,
             encoding: encoding_rs::UTF_8,
             kill_after_ms: None,
             owner: "test-client".into(),
@@ -3096,6 +3344,7 @@ mod tests {
             &tasks,
             StartArgs {
                 command: "read -r line; printf '%s' \"$line\"".into(),
+                eof: Some(false),
                 ..start_args()
             },
         )
@@ -3145,6 +3394,8 @@ mod tests {
                 Truncate::None,
                 4096,
                 false,
+                true,
+                false,
                 encoding_rs::UTF_8,
                 None,
             )
@@ -3160,6 +3411,8 @@ mod tests {
                 Truncate::None,
                 4096,
                 false,
+                true,
+                false,
                 encoding_rs::UTF_8,
                 None,
             )
@@ -3173,6 +3426,8 @@ mod tests {
                 Truncate::Tail,
                 1024,
                 false,
+                true,
+                true,
                 encoding_rs::BIG5,
                 None,
             )
@@ -3291,7 +3546,7 @@ mod tests {
         // The ender retires the task just after it publishes the end: the registry lets go.
         let id = task.id.clone();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while tasks.listed().iter().any(|(task, _)| task.id == id) {
+        while tasks.all().iter().any(|task| task.id == id) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the finished task stays in the registry"
@@ -3517,6 +3772,8 @@ mod tests {
                     Truncate::Tail,
                     1024,
                     false,
+                    true,
+                    true,
                     encoding_rs::UTF_8,
                     None,
                 )
@@ -3838,17 +4095,19 @@ mod script_tests {
             let second = service.call_json(request, call()).await;
             let second = second.structured_content.unwrap();
             assert!(
-                second["codemode"]["imagesNotAttached"]
-                    .as_array()
-                    .unwrap()
-                    .is_empty()
+                second
+                    .get("codemode")
+                    .and_then(|cm| cm.get("imagesNotAttached"))
+                    .is_none()
             );
             assert!(
-                second["warnings"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|warning| !warning.as_str().unwrap().contains("image(s) not attached"))
+                second
+                    .get("warnings")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(|warnings| warnings.iter().all(|warning| !warning
+                        .as_str()
+                        .unwrap()
+                        .contains("image(s) not attached")))
             );
         });
         tasks.evict_log(&task);

@@ -89,7 +89,8 @@ jobs:
       - name: smoke test
         run: |
           request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
-          reply="$(printf '%s\n' "$request" | env -u FASTEXEC_DAEMON "$BIN")"
+          initialized='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+          reply="$(printf '%s\n%s\n' "$request" "$initialized" | env -u FASTEXEC_DAEMON "$BIN")"
           echo "$reply"
           grep -F "\"serverInfo\":{\"name\":\"fastexec\",\"version\":\"$VERSION\"}" <<< "$reply"
 

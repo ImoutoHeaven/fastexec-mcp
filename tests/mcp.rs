@@ -42,7 +42,15 @@ impl Server {
 
     /// Starts the server after `configure` adjusts its launch, such as its environment.
     fn start_with(configure: impl FnOnce(&mut Command)) -> Server {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        Server::start_bin(
+            std::path::Path::new(env!("CARGO_BIN_EXE_fastexec")),
+            configure,
+        )
+    }
+
+    /// Starts the server from `executable`, such as a world-reachable copy for dropped-uid tests.
+    fn start_bin(executable: &std::path::Path, configure: impl FnOnce(&mut Command)) -> Server {
+        let mut command = Command::new(executable);
         command
             .env_remove("FASTEXEC_OUTPUT_MODE")
             .env_remove("FASTEXEC_DAEMON")
@@ -383,7 +391,7 @@ fn a_server_restores_waitable_child_statuses_before_starting_tasks() {
         }));
         let (ended, text) = server.ok(json!({"action": "kill", "taskId": out["taskId"]}));
         assert_eq!(ended["state"], "killed", "{text}");
-        assert_eq!(ended["leftovers"], json!([]), "{text}");
+        assert!(ended.get("leftovers").is_none(), "{text}");
     }
 }
 
@@ -394,7 +402,7 @@ fn short_command_returns_its_final_result_in_one_call() {
         server.ok(json!({"action": "start", "command": "echo hello; echo oops >&2; exit 3"}));
     assert_eq!(out["state"], "exited");
     assert_eq!(out["exitCode"], 3);
-    assert_eq!(out["leftovers"], json!([]), "{text}");
+    assert!(out.get("leftovers").is_none(), "{text}");
     assert!(
         text.starts_with(&format!("hello\noops\n\n[exited 3] {}", server.id(1))),
         "{text}"
@@ -446,7 +454,7 @@ fn output_modes_place_start_and_poll_body_without_losing_metadata() {
         assert!(std::path::Path::new(out["logPath"].as_str().unwrap()).exists());
 
         server.ok(json!({
-            "action": "start", "command": "read -r line; printf '%s\\n' \"$line\"", "waitMs": 0
+            "action": "start", "eof": false, "command": "read -r line; printf '%s\\n' \"$line\"", "waitMs": 0
         }));
         let (out, text) = server.ok(json!({
             "action": "poll", "taskId": server.id(2), "input": "MODE_POLL\n", "eof": true, "waitMs": 10000
@@ -529,7 +537,7 @@ fn structured_content_can_be_disabled_for_every_action() {
         );
         check(
             &mut server,
-            json!({"action": "start", "command": "read -r line; printf '%s\\n' \"$line\"", "waitMs": 0}),
+            json!({"action": "start", "eof": false, "command": "read -r line; printf '%s\\n' \"$line\"", "waitMs": 0}),
             "[running] ",
             false,
         );
@@ -609,9 +617,9 @@ fn kill_after_ms_bounds_task_lifetime_independently_of_waits() {
             (
                 out["state"].as_str(),
                 out["exitCode"].as_i64(),
-                &out["lifetimeExpired"]
+                out.get("lifetimeExpired")
             ),
-            (Some("exited"), Some(4), &json!(false)),
+            (Some("exited"), Some(4), None),
             "killAfterMs={limit}: {text}"
         );
     }
@@ -834,7 +842,7 @@ fn a_hundred_byte_result_keeps_the_whole_task_handle() {
         .unwrap_or_else(|| panic!("no task ID in {text:?}"))
         .to_string();
     let (task, reader) = id.split_once('.').expect("a reader handle");
-    assert_eq!(task.len(), 28, "the whole task ID survives: {text:?}");
+    assert_eq!(task.len(), 10, "the whole task ID survives: {text:?}");
     assert_eq!(reader.len(), 4, "the whole reader key survives: {text:?}");
     let (_, listed) = server.ok(json!({"action": "list"}));
     assert!(
@@ -923,7 +931,7 @@ fn none_truncate_stops_at_its_cap_and_names_the_log() {
         "truncate": "none",
         "waitMs": 30000,
     }));
-    assert_eq!(out["encodingErrors"], 0, "{out}");
+    assert!(out.get("encodingErrors").is_none(), "{out}");
 }
 
 #[test]
@@ -1074,9 +1082,10 @@ fn edit_refuses_ambiguity_hidden_by_normalization() {
         edits.push(json!({"oldText": old, "newText": new}));
         let (text, error) = server.file("edit", json!({"path": "case.txt", "edits": edits}));
         assert!(error, "{content:?} / {old:?}: {text}");
-        let target = if batch { "edits[1]" } else { "the text" };
+        let shown = path.to_string_lossy().replace('\\', "/");
+        let target = if batch { "edits[1]" } else { "edits[0]" };
         assert!(
-            text.starts_with(&format!("Found 2 occurrences of {target} in case.txt.")),
+            text.starts_with(&format!("Cannot edit {shown}; nothing was changed:\n- {target}: oldText occurs 2 times, starting at lines ")),
             "{text}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
@@ -1107,10 +1116,11 @@ fn edit_allows_a_unique_exact_match_changed_by_normalization() {
             "edit",
             json!({"path": "case.txt", "edits": [{"oldText": old, "newText": new}]}),
         );
+        let shown = path.to_string_lossy().replace('\\', "/");
         assert!(!error, "{content:?} / {old:?}: {text}");
         assert_eq!(
             text,
-            "Successfully replaced 1 block(s) in case.txt.\nedits[0]: line 1"
+            format!("Successfully replaced 1 block(s) in {shown}.\nedits[0]: line 1")
         );
         assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
     }
@@ -1123,12 +1133,17 @@ fn file_tools_round_trip_through_the_servers_directory() {
     let mut server = Server::start_with(|command| {
         command.current_dir(&*dir);
     });
+    let shown_note = dir.join("notes/a.txt").to_string_lossy().replace('\\', "/");
+    let shown_missing = dir
+        .join("notes/missing.txt")
+        .to_string_lossy()
+        .replace('\\', "/");
     let (text, error) = server.file(
         "write",
         json!({"path": "notes/a.txt", "content": "one\ntwo\n"}),
     );
     assert!(!error, "{text}");
-    assert_eq!(text, "Successfully wrote to notes/a.txt");
+    assert_eq!(text, format!("Successfully wrote to {shown_note}"));
     let (text, error) = server.file("read", json!({"path": "notes/a.txt"}));
     assert!(!error, "{text}");
     assert_eq!(text, "one\ntwo\n");
@@ -1139,7 +1154,7 @@ fn file_tools_round_trip_through_the_servers_directory() {
     assert!(!error, "{text}");
     assert_eq!(
         text,
-        "Successfully replaced 1 block(s) in notes/a.txt.\nedits[0]: line 2"
+        format!("Successfully replaced 1 block(s) in {shown_note}.\nedits[0]: line 2")
     );
     let (text, _) = server.file("read", json!({"path": "notes/a.txt"}));
     assert_eq!(text, "one\nTWO\n");
@@ -1152,7 +1167,7 @@ fn file_tools_round_trip_through_the_servers_directory() {
     let (text, error) = server.file("read", json!({"path": "notes/missing.txt"}));
     assert!(error, "{text}");
     assert!(
-        text.starts_with("Cannot read notes/missing.txt: "),
+        text.starts_with(&format!("Cannot read {shown_missing}: ")),
         "{text}"
     );
 }
@@ -1228,7 +1243,7 @@ fn pipe_input_arrives_verbatim_and_eof_closes_stdin() {
     let mut server = Server::start_with(|command| {
         command.env_remove("FASTEXEC_BASH");
     });
-    server.ok(json!({"action": "start", "command": "while IFS= read -r l || [ -n \"$l\" ]; do echo \"got:$l\"; done; echo end", "waitMs": 0}));
+    server.ok(json!({"action": "start", "eof": false, "command": "while IFS= read -r l || [ -n \"$l\" ]; do echo \"got:$l\"; done; echo end", "waitMs": 0}));
     let (_, text) = server.ok(json!({"action": "poll", "taskId": server.id(1), "input": "a b\n", "waitMs": 30000, "returnWhen": {"outputContains": ["got:a b"]}}));
     assert!(text.starts_with("got:a b\n"), "{text}");
     let (out, text) = server
@@ -1245,7 +1260,7 @@ fn pipe_input_arrives_verbatim_and_eof_closes_stdin() {
     );
 
     // A program that closes its stdin refuses later input instead of queueing it.
-    let (_, text) = server.ok(json!({"action": "start", "command": "exec 0<&-; echo stdin-closed; sleep 30", "waitMs": 30000, "returnWhen": {"outputContains": ["stdin-closed"]}}));
+    let (_, text) = server.ok(json!({"action": "start", "eof": false, "command": "exec 0<&-; echo stdin-closed; sleep 30", "waitMs": 30000, "returnWhen": {"outputContains": ["stdin-closed"]}}));
     assert!(text.starts_with("stdin-closed\n"), "{text}");
     let (_, text, is_error) = server
         .call(json!({"action": "poll", "taskId": server.id(2), "input": "x\n", "waitMs": 50}));
@@ -1947,9 +1962,9 @@ fn kill_and_root_exit_end_the_whole_process_tree() {
         );
         assert_eq!(out["state"], "exited", "{text}");
         assert_eq!(out["exitCode"], 0, "{text}");
-        assert_eq!(out["keptRunning"], false, "{text}");
-        assert_eq!(out["held"], json!([]), "{text}");
-        assert!(out["killError"].is_null(), "{text}");
+        assert!(out.get("keptRunning").is_none(), "{text}");
+        assert!(out.get("held").is_none(), "{text}");
+        assert!(out.get("killError").is_none(), "{text}");
         assert_stops_growing(leaked);
     }
 }
@@ -2038,7 +2053,7 @@ fn root_only_case(invoker: &str) {
     let elapsed = started.elapsed();
     assert_eq!(out["state"], "exited", "{text}");
     assert_eq!(out["exitCode"], 0, "{text}");
-    assert_eq!(out["forcedEnd"], false, "{text}");
+    assert!(out.get("forcedEnd").is_none(), "{text}");
     assert!(
         elapsed >= Duration::from_secs(12),
         "the root was not ended early: {elapsed:?}"
@@ -2071,7 +2086,7 @@ fn a_startup_exit_trap_keeps_its_own_cleanup() {
         "loginShell": false, "waitMs": 10000}));
     assert_eq!(out["state"], "exited", "{text}");
     assert_eq!(out["exitCode"], 0, "{text}");
-    assert_eq!(out["forcedEnd"], false, "{text}");
+    assert!(out.get("forcedEnd").is_none(), "{text}");
     assert!(
         marker.exists(),
         "the startup file's own EXIT cleanup ran: {marker:?} {text}"
@@ -2092,8 +2107,12 @@ fn kept_stdin_stays_open_after_root_exit(pty: bool) {
     let command = format!(
         "(while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done; echo input-ended) <{source} & echo ready"
     );
-    let (out, text) = server.ok(json!({"action": "start", "command": command,
-        "pty": pty, "keepTree": true, "loginShell": false, "waitMs": 10000}));
+    let mut start_args = json!({"action": "start", "command": command,
+        "pty": pty, "keepTree": true, "loginShell": false, "waitMs": 10000});
+    if !pty {
+        start_args["eof"] = json!(false);
+    }
+    let (out, text) = server.ok(start_args);
     assert_eq!(out["state"], "exited", "{text}");
     assert_eq!(out["keptRunning"], true, "{text}");
     let id = out["taskId"].clone();
@@ -2108,7 +2127,7 @@ fn kept_stdin_stays_open_after_root_exit(pty: bool) {
     };
     let (out, text) = server.ok(finish);
     assert!(text.contains("input-ended"), "{text}");
-    assert_eq!(out["keptRunning"], false, "{text}");
+    assert!(out.get("keptRunning").is_none(), "{text}");
     let (_, text, failed) = server.call(json!({"action": "poll", "taskId": id,
         "input": "late\n", "waitMs": 0}));
     assert!(failed && text.contains("exited"), "{text}");
@@ -2159,8 +2178,8 @@ fn keep_tree_keeps_what_bash_leaves_until_kill_or_deadline() {
             out["state"], "exited",
             "kill keeps the root's result: {text}"
         );
-        assert_eq!(out["keptRunning"], false, "{text}");
-        assert_eq!(out["held"], json!([]), "{text}");
+        assert!(out.get("keptRunning").is_none(), "{text}");
+        assert!(out.get("held").is_none(), "{text}");
         assert!(text.contains("kept processes ended"), "{text}");
         assert_stops_growing(kept);
 
@@ -2180,13 +2199,13 @@ fn keep_tree_keeps_what_bash_leaves_until_kill_or_deadline() {
                 "killAfterMs ends the kept processes: {text}"
             );
             assert_eq!(out["exitCode"], 0, "and keeps the root's result: {text}");
-            assert_eq!(out["keptRunning"], false, "{text}");
-            assert_eq!(out["held"], json!([]), "{text}");
+            assert!(out.get("keptRunning").is_none(), "{text}");
+            assert!(out.get("held").is_none(), "{text}");
         } else {
             // Two valid outcomes: the root had already exited 0 and the deadline then reached
             // the kept processes (the flag stays false, as `expire` only records a running
             // root), or the deadline killed the root itself.
-            assert_eq!(out["held"], json!([]), "{text}");
+            assert!(out.get("held").is_none(), "{text}");
             if out["lifetimeExpired"] == json!(true) {
                 assert_eq!(out["state"], "killed", "pty={pty}: {text}");
             } else {
@@ -2197,11 +2216,11 @@ fn keep_tree_keeps_what_bash_leaves_until_kill_or_deadline() {
         assert_stops_growing(expiring);
     }
     let (out, text) = server.ok(json!({"action": "start", "command": "true", "keepTree": true}));
-    assert_eq!(
-        out["keptRunning"], false,
+    assert!(
+        out.get("keptRunning").is_none(),
         "nothing left, nothing kept: {text}"
     );
-    assert_eq!(out["leftovers"], json!([]));
+    assert!(out.get("leftovers").is_none());
 }
 
 /// The total log limit evicts finished logs only: a task that keeps processes keeps its log and
@@ -2292,7 +2311,7 @@ fn retirement_counts_kept_processes_ending_as_finishing() {
     server.ok(json!({"action": "kill", "taskId": kept}));
     // The kill ends the tree, so the task is finished now and the cap applies to it: it stays,
     // and the earliest finisher goes.
-    let (out, _) = server.ok(json!({"action": "list"}));
+    let (out, _) = server.ok(json!({"action": "list", "limit": 100}));
     let tasks = out["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 64, "{out}");
     let listed = |id: &str| tasks.iter().any(|task| task["taskId"] == bare_id(id));
@@ -2308,7 +2327,7 @@ fn retirement_counts_kept_processes_ending_as_finishing() {
     // Retirement follows the result that shows the completion.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let (out, _) = server.ok(json!({"action": "list"}));
+        let (out, _) = server.ok(json!({"action": "list", "limit": 100}));
         let tasks = out["tasks"].as_array().unwrap();
         if tasks.len() == 64 {
             let listed = |id: &str| tasks.iter().any(|task| task["taskId"] == bare_id(id));
@@ -2367,7 +2386,7 @@ fn waits_on_kept_processes_last_until_they_end_or_a_condition_holds() {
     assert!(text.starts_with("late"), "{text}");
     let (out, text) = server.ok(json!({"action": "poll", "taskId": id, "waitMs": 20000}));
     assert_eq!(out["waitEndedBy"]["condition"], "tree_ended", "{text}");
-    assert_eq!(out["keptRunning"], false, "{text}");
+    assert!(out.get("keptRunning").is_none(), "{text}");
     assert!(text.contains("kept processes ended"), "{text}");
     let (out, _) = server.ok(json!({"action": "poll", "taskId": id, "waitMs": 20000}));
     assert_eq!(
@@ -2896,9 +2915,8 @@ fn a_stopped_host_is_woken_for_a_list_and_a_kill() {
         "the kill waited on a stopped host: {text}"
     );
     let (list, listing) = server.ok(json!({"action": "list"}));
-    assert_eq!(
-        list["tasks"][0]["held"],
-        json!([]),
+    assert!(
+        list["tasks"][0].get("held").is_none(),
         "the stopped tree ended: {listing}"
     );
 }
@@ -3220,9 +3238,9 @@ fn freebsd_a_continuous_pty_writer_does_not_delay_the_kept_roots_status() {
         "action": "kill", "taskId": out["taskId"], "waitMs": 5000,
     }));
     assert_eq!(out["exitCode"], 23, "{text}");
-    assert_eq!(out["keptRunning"], false, "{text}");
-    assert_eq!(out["held"], json!([]), "{text}");
-    assert!(out["killError"].is_null(), "{text}");
+    assert!(out.get("keptRunning").is_none(), "{text}");
+    assert!(out.get("held").is_none(), "{text}");
+    assert!(out.get("killError").is_none(), "{text}");
 }
 
 /// A host killed externally no longer has a reaper, but its unreaped PID still reserves its group.
@@ -3235,7 +3253,7 @@ fn freebsd_a_dead_host_still_cleans_up_its_reserved_process_group() {
         "(for i in {{1..200}}; do printf x >> '{beat_bash}'; sleep 0.1; done) & while [ ! -s '{beat_bash}' ]; do sleep 0.01; done; read -r gate; kill -KILL \"$PPID\"; sleep 20"
     );
     let (out, _) = server.ok(json!({
-        "action": "start", "command": command, "waitMs": 0,
+        "action": "start", "eof": false, "command": command, "waitMs": 0,
     }));
     // Start has observed READY before the command is allowed to kill its host.
     let (out, text) = server.ok(json!({
@@ -3576,7 +3594,12 @@ int main(int argc, char **argv) {
         assert!(beats.iter().chain(&stops).all(|path| !path.exists()));
     }
     let fixture = format!("$'{}'", escaped(&fixture));
-    let mut server = Server::start_with(|command| {
+    // Copy fastexec into the 0755 scratch directory so uid 65534 can execute it even when
+    // the repository checkout resides under a mode-0700 home directory such as /root.
+    let unprivileged_bin = scratch.join("fastexec-bin");
+    std::fs::copy(env!("CARGO_BIN_EXE_fastexec"), &unprivileged_bin).unwrap();
+    std::fs::set_permissions(&unprivileged_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut server = Server::start_bin(&unprivileged_bin, |command| {
         command
             .uid(65534)
             .gid(65534)
@@ -3622,7 +3645,7 @@ int main(int argc, char **argv) {
     // At the root's exit. The heartbeat is written only after becoming root: a fixed delay
     // could let bash end while its scheduled child was still an unprivileged exec candidate.
     let command = format!("{fixture} exit & read -r ready; echo started");
-    server.ok(json!({"action": "start", "command": command, "waitMs": 0}));
+    server.ok(json!({"action": "start", "eof": false, "command": command, "waitMs": 0}));
     wait_for_heartbeat(&beats[0]);
     let (out, text) = server.ok(json!({
         "action": "poll", "taskId": server.id(1), "input": "ready\n", "waitMs": 10000
@@ -3732,7 +3755,7 @@ fn closing_the_server_ends_running_tasks_and_removes_logs() {
 #[test]
 fn finishing_after_many_short_tasks_keeps_its_own_output() {
     let mut server = Server::start();
-    server.ok(json!({"action": "start", "command": "read -r x; echo final-$x", "waitMs": 0}));
+    server.ok(json!({"action": "start", "eof": false, "command": "read -r x; echo final-$x", "waitMs": 0}));
     for _ in 0..65 {
         server.ok(json!({"action": "start", "command": "true"}));
     }
@@ -3740,7 +3763,7 @@ fn finishing_after_many_short_tasks_keeps_its_own_output() {
         .ok(json!({"action": "poll", "taskId": server.id(1), "input": "ok\n", "waitMs": 10000}));
     assert_eq!(out["state"], "exited");
     assert!(text.starts_with("final-ok\n"), "{text}");
-    let (out, _) = server.ok(json!({"action": "list"}));
+    let (out, _) = server.ok(json!({"action": "list", "limit": 100}));
     let tasks = out["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 64, "{out}");
     let kept = |id: &str| tasks.iter().any(|task| task["taskId"] == bare_id(id));
@@ -3787,7 +3810,7 @@ fn output_window_respects_max_bytes_and_points_at_the_log() {
     );
     let (out, text) =
         server.ok(json!({"action": "start", "command": "seq 1 5000", "truncate": "none"}));
-    assert_eq!(out["omittedLines"], 0);
+    assert!(out.get("omittedLines").is_none());
     assert_eq!(
         text.lines()
             .filter(|line| line.parse::<u32>().is_ok())
@@ -3803,14 +3826,20 @@ fn output_window_respects_max_bytes_and_points_at_the_log() {
     let (out, text) =
         server.ok(json!({"action": "start", "command": line(3000), "truncate": "none"}));
     assert_eq!(
-        (text.split_once("\n\n").unwrap().0.len(), &out["cutLines"]),
-        (3000, &json!(0))
+        (
+            text.split_once("\n\n").unwrap().0.len(),
+            out.get("cutLines")
+        ),
+        (3000, None)
     );
     let (out, text) = server
         .ok(json!({"action": "start", "command": line(70000), "truncate": "none", "raw": true}));
     assert_eq!(
-        (text.split_once("\n\n").unwrap().0.len(), &out["cutLines"]),
-        (70000, &json!(0))
+        (
+            text.split_once("\n\n").unwrap().0.len(),
+            out.get("cutLines")
+        ),
+        (70000, None)
     );
 
     // Small budgets leave out a placeholder that does not fit beside the status and footer.
@@ -3858,7 +3887,7 @@ fn an_exited_result_holds_output_written_while_its_window_was_read() {
         let command = format!(
             "head -c 16000000 /dev/zero | tr '\\0' x; read -r go; sleep {delay}; printf '\\nFINAL_MARKER\\n'"
         );
-        let (out, _) = server.ok(json!({"action": "start", "command": command, "loginShell": false, "waitMs": 0, "maxBytes": 1024}));
+        let (out, _) = server.ok(json!({"action": "start", "eof": false, "command": command, "loginShell": false, "waitMs": 0, "maxBytes": 1024}));
         let id = out["taskId"].clone();
         let log = PathBuf::from(out["logPath"].as_str().unwrap());
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -3939,7 +3968,7 @@ fn encoding_decodes_legacy_output_and_long_commands_run_from_a_script() {
         let (marker, marker_bash) = scratch(&format!("lead-{encoding}-{}", prefix.len()));
         let command =
             format!("{prefix}printf '{lead}'; touch {marker_bash}; read -r x; printf '{trail}\\n'");
-        let (out, _) = server.ok(json!({"action": "start", "command": command, "encoding": encoding, "loginShell": false, "waitMs": 0}));
+        let (out, _) = server.ok(json!({"action": "start", "eof": false, "command": command, "encoding": encoding, "loginShell": false, "waitMs": 0}));
         wait_for_file(&marker);
         std::thread::sleep(Duration::from_millis(300));
         let (_, text) = server.ok(json!({"action": "poll", "taskId": out["taskId"], "waitMs": 0}));
@@ -4854,7 +4883,7 @@ fn editing_a_fifo_returns_an_error_without_blocking_other_file_tools() {
 fn reader_handles_keep_independent_cursors_with_bare_id_attaches() {
     let mut server = Server::start();
     let (started, text) = server.ok(json!({
-        "action": "start", "command": "printf 'reader-first\\n'; IFS= read -r line; printf 'reader-second:%s\\n' \"$line\"",
+        "action": "start", "eof": false, "command": "printf 'reader-first\\n'; IFS= read -r line; printf 'reader-second:%s\\n' \"$line\"",
         "loginShell": false, "waitMs": 10000,
         "returnWhen": {"outputContains": ["reader-first"]}
     }));
@@ -4916,28 +4945,46 @@ fn fresh_reader_notice_survives_kill_and_fits_every_result_mode() {
             "returnWhen": {"outputContains": ["reader-ready"]}
         }));
         assert!(!text.contains("new reader"), "{mode}: {text}");
+        let bare = bare_id(started["taskId"].as_str().unwrap()).to_owned();
         let (killed, text) = server.ok(json!({
-            "action": "kill", "taskId": bare_id(started["taskId"].as_str().unwrap()), "maxBytes": 100
+            "action": "kill", "taskId": bare, "maxBytes": 100
         }));
-        let handle = killed["taskId"].as_str().unwrap().to_owned();
+        let kill_handle = killed["taskId"].as_str().unwrap().to_owned();
+        // P1-4: kill on a bare taskId delivers unseen output and carries the new-reader notice.
         assert!(
-            text.len() <= 100 && text.contains(&handle) && !text.contains("new reader"),
+            text.len() <= 100 && text.contains(&kill_handle) && text.contains(" · new reader"),
             "{mode}: {text}"
         );
+        assert!(
+            text.lines()
+                .last()
+                .unwrap()
+                .ends_with("(1 task; use list.)"),
+            "{mode}: {text}"
+        );
+        let (_, after_kill) = server.ok(json!({
+            "action": "poll", "taskId": kill_handle, "maxBytes": 100, "waitMs": 0
+        }));
+        assert!(
+            after_kill.len() <= 100 && !after_kill.contains("new reader"),
+            "{mode}: {after_kill}"
+        );
+        // A fresh bare attach into poll/screen/transcript also carries new reader once within 100B.
         let mut request = if mode == "transcript" {
-            json!({"action": "transcript", "taskId": handle, "maxBytes": 100})
+            json!({"action": "transcript", "taskId": bare, "maxBytes": 100})
         } else {
-            json!({"action": "poll", "taskId": handle, "maxBytes": 100, "waitMs": 0})
+            json!({"action": "poll", "taskId": bare, "maxBytes": 100, "waitMs": 0})
         };
         if mode == "screen" {
             request["screen"] = json!(true);
         }
         let (result, text) = server.ok(request.clone());
-        assert_eq!(result["taskId"], handle);
+        let handle = result["taskId"].as_str().unwrap().to_owned();
         assert!(
             text.len() <= 100 && text.contains(&handle) && text.contains(" · new reader"),
             "{mode}: {text}"
         );
+        request["taskId"] = json!(handle);
         assert!(
             text.lines()
                 .last()
@@ -5142,7 +5189,7 @@ fn codemode_requires_explicit_enable_and_respects_yolo() {
         );
         assert_eq!(
             tool["inputSchema"]["properties"]["cwd"]["type"],
-            json!(["string", "null"]),
+            json!("string"),
             "{tool}"
         );
         assert!(
@@ -5210,7 +5257,7 @@ fn codemode_invalid_arguments_do_not_create_tasks() {
     for args in [
         json!({"code":"  "}),
         json!({"code":"x\0y"}),
-        json!({"code":"return 1", "cwd":"relative/path"}),
+        json!({"code":"return 1", "cwd":"definitely-missing-relative-path"}),
         json!({"code":"return 1", "cwd":"/nonexistent-fastexec-dir-xyz"}),
         json!({"code":"return 1", "waitMs":240001}),
         json!({"code":"return 1", "returnWhen":{}}),
@@ -5294,18 +5341,18 @@ fn codemode_nested_results_keep_their_shape_under_outer_render_settings() {
         let code = r#"
 const written = await tools.write({path:'note.txt', content:'alpha\nbeta\n'});
 const edited = await tools.edit({path:'note.txt', edits:[{oldText:'beta', newText:'BETA'}]});
-const [command, file, absent] = await Promise.all([
+const [command, file, absentOutcome] = await Promise.all([
   tools.exec({action:'start', command:'printf nested-output', loginShell:false}),
-  tools.read({path:'note.txt'}), tools.read({path:'absent.txt'})
+  tools.read({path:'note.txt'}),
+  tools.read({path:'absent.txt'}).then(() => null, e => e)
 ]);
-if (written.isError !== false || edited.isError !== false || command.isError !== false || absent.isError !== true) throw new Error('isError shape');
-if (written.structuredContent.ok !== true || written.structuredContent.bytes !== 11) throw new Error('write structured shape');
-if (edited.structuredContent.ok !== true || edited.structuredContent.replacements !== 1 || edited.structuredContent.edits[0].line !== 2) throw new Error('edit structured shape');
-if (command.structuredContent.output !== 'nested-output' || !command.content[0].text.includes('nested-output')) throw new Error('exec shape');
-if (file.structuredContent.ok !== true || file.structuredContent.text !== 'alpha\nBETA\n' || file.structuredContent.truncated !== false || file.structuredContent.nextOffset !== null || file.content[0].text !== 'alpha\nBETA\n') throw new Error('file shape');
-if (absent.structuredContent.ok !== false || typeof absent.structuredContent.error !== 'string') throw new Error('absent shape');
+if ('ok' in written || 'structuredContent' in written || written.bytes !== 11) throw new Error('write shape');
+if ('ok' in edited || edited.replacements !== 1 || edited.edits[0].line !== 2) throw new Error('edit shape');
+if ('ok' in command || 'content' in command || command.output !== 'nested-output') throw new Error('exec shape');
+if ('ok' in file || file.text !== 'alpha\nBETA\n' || file.truncated !== false || file.nextOffset !== null || file.totalLines !== 2) throw new Error('file shape');
+if (!absentOutcome || absentOutcome.name !== 'ToolError' || absentOutcome.tool !== 'read' || typeof absentOutcome.result?.error !== 'string') throw new Error('absent shape');
 const reads = await Promise.all(Array.from({length:20}, () => tools.read({path:'note.txt'})));
-if (reads.length !== 20 || reads.some(r => r.isError || r.structuredContent.text !== 'alpha\nBETA\n')) throw new Error('queued reads');
+if (reads.length !== 20 || reads.some(r => 'ok' in r || r.text !== 'alpha\nBETA\n')) throw new Error('queued reads');
 text('nested-ok');
 "#;
         let result = code_result(&mut server, json!({"code":code}));
@@ -5343,20 +5390,25 @@ for (const call of [
   () => tools.codemode({code:'return 1'})
 ]) { try { await call(); } catch (e) { if (e instanceof TypeError) rejected++; } }
 if (rejected !== 5) throw new Error('invalid calls resolved: ' + rejected);
-for (const bad of [
-  await tools.exec({action:'start'}),
-  await tools.exec({action:'start', command:''}),
-  await tools.exec({action:'start', command:'true', waitMs:240001}),
-  await tools.edit({path:'x', edits:[]})
+for (const call of [
+  () => tools.exec({action:'start'}),
+  () => tools.exec({action:'start', command:''}),
+  () => tools.exec({action:'start', command:'true', maxBytes:99}),
+  () => tools.edit({path:'x', edits:[]})
 ]) {
-  if (bad.isError !== true || bad.structuredContent.ok !== false) throw new Error('validation failure did not resolve uniformly');
+  let err = null;
+  try { await call(); } catch (e) { err = e; }
+  if (!err || err.name !== 'ToolError' || typeof err.result?.error !== 'string') throw new Error('validation failure did not reject with ToolError');
 }
+const longWait = await tools.exec({action:'start', command:'true', waitMs:600000, loginShell:false});
+if (longWait.exitCode !== 0) throw new Error('nested waitMs > 240000 must succeed');
 const pending = tools.read({path:'a-file-that-does-not-exist'});
 Map.prototype.get = Map.prototype.set = Map.prototype.delete = () => { throw new Error('changed Map'); };
 Promise.prototype.then = () => { throw new Error('changed Promise'); };
 JSON.parse = JSON.stringify = () => { throw new Error('changed JSON'); };
-const result = await pending;
-if (result.isError !== true) throw new Error('missing file did not resolve');
+let missingErr = null;
+try { await pending; } catch (e) { missingErr = e; }
+if (!missingErr || missingErr.name !== 'ToolError') throw new Error('missing file did not reject with ToolError');
 text('settled');
 "#;
     let result = code_result(&mut server, json!({"code":code}));
@@ -5370,7 +5422,7 @@ fn codemode_kill_reports_pending_calls_and_leaves_started_tasks_running() {
     let result = code_result(
         &mut server,
         json!({
-            "code":"const child = await tools.exec({action:'start',command:'sleep 30',waitMs:0,loginShell:false}); text('child=' + child.structuredContent.taskId); const waiting = tools.exec({action:'poll',taskId:child.structuredContent.taskId,waitMs:60000}); text('waiting'); await waiting;",
+            "code":"const child = await tools.exec({action:'start',command:'sleep 30',waitMs:0,loginShell:false}); text('child=' + child.taskId); const waiting = tools.exec({action:'poll',taskId:child.taskId}); text('waiting'); await waiting;",
             "waitMs":10000, "returnWhen":{"outputContains":["waiting"]}
         }),
     );
@@ -5384,14 +5436,17 @@ fn codemode_kill_reports_pending_calls_and_leaves_started_tasks_running() {
         .find_map(|line| line.strip_prefix("child="))
         .unwrap()
         .to_owned();
+    let (_, ok_text, ok_err) = server.call(json!({"action":"poll", "taskId":script, "waitMs":0, "eof":false, "screen":false, "raw":false}));
+    assert!(!ok_err, "{ok_text}");
     for extra in [
         json!({"input":"x"}),
-        json!({"eof":false}),
+        json!({"eof":true}),
         json!({"keys":["Enter"]}),
         json!({"keyDelayMs":0}),
         json!({"cols":80}),
         json!({"rows":24}),
-        json!({"screen":false}),
+        json!({"screen":true}),
+        json!({"raw":true}),
         json!({"encoding":"utf-8"}),
         json!({"returnWhen":{"screenContains":["x"]}}),
         json!({"returnWhen":{"screenAppears":["x"]}}),
@@ -5558,7 +5613,7 @@ fn codemode_images_follow_each_readers_cursor_even_when_text_is_truncated() {
         json!({"name":"exec","arguments":{"action":"poll","taskId":handle,"waitMs":0}}),
     );
     assert_eq!(image_count(&poll["result"]), 0, "{poll}");
-    let fresh = server.request("tools/call", json!({"name":"exec","arguments":{"action":"poll","taskId":bare_id(handle),"waitMs":0,"raw":true,"truncate":"none"}}));
+    let fresh = server.request("tools/call", json!({"name":"exec","arguments":{"action":"poll","taskId":bare_id(handle),"waitMs":0,"truncate":"none"}}));
     assert_eq!(image_count(&fresh["result"]), 4, "{fresh}");
 }
 
@@ -5604,7 +5659,7 @@ fn codemode_images_resize_and_survive_structured_only_output() {
 fn codemode_nested_calls_do_not_consume_other_tasks_background_notifications() {
     let mut server = codemode_server();
     let (task, _) = server.ok(json!({
-        "action":"start", "command":"read -r reply", "loginShell":false, "waitMs":0
+        "action":"start", "eof":false, "command":"read -r reply", "loginShell":false, "waitMs":0
     }));
     let other = task["taskId"].as_str().unwrap().to_owned();
     let code = format!(
@@ -5629,7 +5684,7 @@ for (let i = 0; i < 6; i++) {
     command: i % 2 === 0 ? `printf ok-${i}` : `exit ${i}`,
     loginShell: false,
   });
-  if (res.isError || res.structuredContent.state !== 'exited') throw new Error('helper failed');
+  if (res.state !== 'exited') throw new Error('helper failed');
 }
 const delayed = await tools.exec({
   action: 'start',
@@ -5639,10 +5694,9 @@ const delayed = await tools.exec({
 });
 const polled = await tools.exec({
   action: 'poll',
-  taskId: delayed.structuredContent.taskId,
-  waitMs: 10000,
+  taskId: delayed.taskId,
 });
-if (polled.structuredContent.exitCode !== 3) throw new Error('delayed helper exit');
+if (polled.exitCode !== 3) throw new Error('delayed helper exit');
 return 'clean';
 "#;
     let result = code_result(&mut server, json!({"code":code}));
@@ -5682,8 +5736,8 @@ const [readBack, runInner, runOuter] = await Promise.all([
   tools.exec({{action:'start', command:'printf inner-ok > from-exec.txt', loginShell:false}}),
   tools.exec({{action:'start', command:'printf outer-ok > from-override.txt', cwd:{}, loginShell:false}}),
 ]);
-if (runInner.isError || runOuter.isError) throw new Error('nested exec failed');
-return {{ file: readBack.structuredContent.text }};
+if (runInner.exitCode !== 0 || runOuter.exitCode !== 0) throw new Error('nested exec failed');
+return {{ file: readBack.text }};
 "#,
         json!(outer.to_string_lossy())
     );
@@ -5733,11 +5787,11 @@ fn file_tools_paginate_via_structured_content_and_honor_output_modes() {
     });
     let code = r#"
 const single = await tools.read({path:'big.txt'});
-if (single.isError || single.structuredContent.truncated !== false || single.structuredContent.shownLines !== 2500) {
+if (single.truncated !== false || single.shownLines !== 2500 || single.totalLines !== 2500) {
   throw new Error('2500-line file must fit in one nested read window');
 }
 const jsonl = await tools.read({path:'long-single.jsonl'});
-if (jsonl.isError || jsonl.structuredContent.lineTooLong !== false || JSON.parse(jsonl.structuredContent.text).blob.length !== 80 * 1024) {
+if (jsonl.lineTooLong !== false || JSON.parse(jsonl.text).blob.length !== 80 * 1024) {
   throw new Error('nested read must accept >50 KiB single lines up to 1 MiB');
 }
 const utf8 = "你好，fastexec 🚀";
@@ -5750,16 +5804,15 @@ let pages = 0;
 const parts = [];
 while (offset !== null) {
   const page = await tools.read({path:'huge-multi.txt', offset});
-  if (page.isError) throw new Error('read failed');
-  if (page.structuredContent.text.includes('[Showing lines')) {
-    throw new Error('truncation notice leaked into structuredContent.text');
+  if (page.text.includes('[Showing lines')) {
+    throw new Error('truncation notice leaked into text');
   }
-  parts.push(page.structuredContent.text);
+  parts.push(page.text);
   pages++;
-  offset = page.structuredContent.nextOffset;
+  offset = page.nextOffset;
 }
-const joined = parts.join('\n');
-return {singleBytes: single.structuredContent.text.length, pages, bytes: joined.length};
+const joined = parts.join('');
+return {singleBytes: single.text.length, pages, bytes: joined.length};
 "#;
     let result = code_result(&mut server, json!({"code":code}));
     assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
@@ -5819,8 +5872,8 @@ return 'returned-early';
     let reported: std::collections::HashSet<String> =
         result["structuredContent"]["codemode"]["startedTasks"]
             .as_array()
-            .unwrap()
-            .iter()
+            .into_iter()
+            .flatten()
             .map(|entry| bare_id(entry["taskId"].as_str().unwrap()).to_owned())
             .collect();
     let (listed, _) = server.ok(json!({"action":"list"}));
@@ -5860,4 +5913,810 @@ fn server_instructions_advertise_codemode_only_when_enabled() {
         instructions_on.contains("codemode") && instructions_on.contains("Prefer codemode"),
         "{instructions_on}"
     );
+}
+
+#[test]
+fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
+    let mut server = codemode_server();
+
+    // P0-1: 10,000-char JSON line stays whole and parses cleanly.
+    let big_json = code_result(
+        &mut server,
+        json!({
+            "code": "return { payload: 'x'.repeat(10000), ok: 1 };",
+            "maxBytes": 16384
+        }),
+    );
+    assert_eq!(big_json["structuredContent"]["exitCode"], 0, "{big_json}");
+    assert!(
+        big_json["structuredContent"].get("cutLines").is_none(),
+        "{big_json}"
+    );
+    let body = big_json["structuredContent"]["output"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(body.trim()).expect("whole JSON line parses");
+    assert_eq!(parsed["payload"].as_str().unwrap().len(), 10_000);
+
+    // P0-1: Over-maxBytes single line cuts within budget, sets cutLines: 1, and names log for recovery.
+    let over_budget = code_result(
+        &mut server,
+        json!({
+            "code": "return 'z'.repeat(10000);",
+            "maxBytes": 2048
+        }),
+    );
+    let over_text = code_text(&over_budget);
+    assert!(
+        over_text.len() <= 2048,
+        "len={} {over_text}",
+        over_text.len()
+    );
+    assert!(over_text.contains(" … [line cut at "), "{over_text}");
+    assert!(over_text.contains(" · log "), "{over_text}");
+    assert_eq!(
+        over_budget["structuredContent"]["cutLines"], 1,
+        "{over_budget}"
+    );
+    let log_path = over_budget["structuredContent"]["logPath"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(log_path).unwrap().trim().len(),
+        10_000
+    );
+
+    // P0-1: CR and trailing spaces + ANSI sequences are preserved verbatim in codemode output.
+    let raw_kept = code_result(
+        &mut server,
+        json!({
+            "code": "text('first\\rsecond  '); text('\\x1b[31mred\\x1b[0m  ');"
+        }),
+    );
+    let raw_out = raw_kept["structuredContent"]["output"].as_str().unwrap();
+    assert_eq!(raw_out, "first\rsecond  \n\x1b[31mred\x1b[0m  ");
+
+    // P0-2, P0-3, P2-8: nested uncut lines, >240s waitMs, input 2s poll default, >4 MiB log recovery,
+    // nested transcript maxBytes-only tail default, and sh.quote bash round-trip.
+    let nested = code_result(
+        &mut server,
+        json!({
+            "code": r#"
+                const wide = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    command: "awk 'BEGIN { s = sprintf(\"%5000s\", \"\"); gsub(/ /, \"w\", s); print s; for (i = 1; i <= 3000; i++) print i }'"
+                });
+                if ("cutLines" in wide || "omittedRange" in wide) throw new Error("unexpected cut/omit: " + JSON.stringify(wide));
+                const wLines = wide.output.trimEnd().split("\n");
+                if (wLines.length !== 3001 || wLines[0].length !== 5000 || wLines[3000] !== "3000") {
+                    throw new Error("wide mismatch: len=" + wLines.length + " first=" + wLines[0].length);
+                }
+
+                const hiWait = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    waitMs: 600000,
+                    command: "printf fast"
+                });
+                if (hiWait.output !== "fast") throw new Error("hiWait: " + JSON.stringify(hiWait));
+
+                const openCat = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    eof: false,
+                    waitMs: 50,
+                    command: "cat"
+                });
+                const t0 = Date.now();
+                const polled = await tools.exec({
+                    action: "poll",
+                    taskId: openCat.taskId,
+                    input: "echoed\n"
+                });
+                const dt = Date.now() - t0;
+                await tools.exec({ action: "kill", taskId: openCat.taskId });
+                if (polled.state !== "running" || polled.output !== "echoed" || dt < 1500 || dt > 12000) {
+                    throw new Error("poll timing/output: dt=" + dt + " " + JSON.stringify(polled));
+                }
+
+                const single4m = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    command: "awk 'BEGIN { s = sprintf(\"%1000s\", \"\"); gsub(/ /, \"x\", s); for (i = 0; i < 4200; i++) printf \"%s\", s; printf \"\\n\" }'"
+                });
+                if (single4m.cutLines !== 1) throw new Error("single4m: " + JSON.stringify(single4m));
+                const afterSingle = await tools.exec({ action: "poll", taskId: single4m.taskId, waitMs: 0 });
+                if (afterSingle.output !== "") throw new Error("expected empty follow-up poll");
+
+                const many4m = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    command: "awk 'BEGIN { s = sprintf(\"%1023s\", \"\"); gsub(/ /, \"y\", s); for (i = 1; i <= 4100; i++) print i \":\" s }'"
+                });
+                if (!Array.isArray(many4m.omittedRange) || many4m.omittedRange[1] !== 4100) {
+                    throw new Error("many4m omittedRange: " + JSON.stringify(many4m.omittedRange));
+                }
+                const recovered = await tools.read({
+                    path: many4m.logPath,
+                    offset: many4m.omittedRange[0],
+                    limit: 50
+                });
+                if (!recovered.text.includes("4100:")) throw new Error("log recovery missed 4100");
+
+                const ptyRun = await tools.exec({
+                    action: "start",
+                    pty: true,
+                    loginShell: false,
+                    command: "awk 'BEGIN { for (i = 1; i <= 200; i++) printf \"line-%03d-padding-text\\n\", i }'"
+                });
+                const tr = await tools.exec({
+                    action: "transcript",
+                    taskId: ptyRun.taskId,
+                    maxBytes: 400
+                });
+                if (!tr.output.includes("line-200-padding-text") || tr.output.includes("line-001-padding-text")) {
+                    throw new Error("transcript did not tail: " + tr.output);
+                }
+
+                const tricky = "space 'quote' $HOME `uname` \\ \n end";
+                const rt = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    raw: true,
+                    command: "printf '%s' " + sh.quote(tricky)
+                });
+                if (rt.output !== tricky) throw new Error("sh.quote mismatch: " + JSON.stringify(rt.output));
+                return "all-nested-checks-ok";
+            "#
+        }),
+    );
+    assert_eq!(nested["structuredContent"]["exitCode"], 0, "{nested}");
+    assert!(
+        nested["structuredContent"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("all-nested-checks-ok"),
+        "{nested}"
+    );
+
+    // P0-2: Unbounded nested wait over 30s resolves without nested poll while outer waitMs returns a handle.
+    let started_long = code_result(
+        &mut server,
+        json!({
+            "code": r#"
+                const r = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    command: "sleep 31; printf after-thirty-seconds"
+                });
+                if (r.state !== "exited" || r.output !== "after-thirty-seconds") {
+                    throw new Error("unexpected nested wait end: " + JSON.stringify(r));
+                }
+                return "long-wait-resolved";
+            "#,
+            "waitMs": 300
+        }),
+    );
+    assert_eq!(
+        started_long["structuredContent"]["state"], "running",
+        "{started_long}"
+    );
+    let script_handle = started_long["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (polled_long, polled_text) = server.ok(json!({
+        "action": "poll",
+        "taskId": script_handle,
+        "waitMs": 45000
+    }));
+    assert_eq!(polled_long["state"], "exited", "{polled_text}");
+    assert_eq!(polled_long["exitCode"], 0, "{polled_text}");
+    assert!(polled_text.contains("long-wait-resolved"), "{polled_text}");
+}
+
+#[test]
+fn pipe_start_stdin_defaults_to_eof_delivers_1mib_and_warns_on_early_close() {
+    let (dir_guard, bash_dir) = scratch("pipe-stdin-p04");
+    std::fs::create_dir_all(&*dir_guard).unwrap();
+    std::fs::write(dir_guard.join("sample.txt"), "needle_token\nother\n").unwrap();
+    let mut server = codemode_server();
+
+    let (cat_out, cat_text) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "cat",
+        "waitMs": 5000
+    }));
+    assert_eq!(cat_out["state"], "exited", "{cat_text}");
+    assert_eq!(cat_out["exitCode"], 0, "{cat_text}");
+    assert!(
+        !cat_text.contains(" · log "),
+        "clean exit status omits log segment: {cat_text}"
+    );
+    assert!(
+        cat_out["logPath"].is_string(),
+        "structuredContent.logPath stays present: {cat_out}"
+    );
+
+    let (grep_out, grep_text) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "cwd": bash_dir,
+        "command": "if command -v rg >/dev/null 2>&1; then rg needle_token; else grep zzz; fi",
+        "waitMs": 5000
+    }));
+    assert_eq!(grep_out["state"], "exited", "{grep_text}");
+
+    let (sorted, sorted_text) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "sort -r",
+        "input": "a\nb\n"
+    }));
+    assert_eq!(sorted["exitCode"], 0, "{sorted_text}");
+    assert_eq!(sorted["output"], "b\na", "{sorted}");
+
+    let (empty_in, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "cat",
+        "input": ""
+    }));
+    assert_eq!(empty_in["exitCode"], 0, "{empty_in}");
+
+    let (sleep_null, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "sleep 5",
+        "waitMs": 50
+    }));
+    let null_id = sleep_null["taskId"].as_str().unwrap().to_owned();
+    server.ok(json!({"action": "poll", "taskId": &null_id, "eof": true, "waitMs": 0}));
+    let (_, err_text, is_err) = server.call(json!({
+        "action": "poll",
+        "taskId": &null_id,
+        "input": "hello\n",
+        "waitMs": 0
+    }));
+    assert!(is_err && err_text.contains("eof: false"), "{err_text}");
+    server.ok(json!({"action": "kill", "taskId": &null_id}));
+
+    for payload in [
+        "x".repeat(1 << 20),
+        "\n".repeat(1 << 20),
+        "é".repeat(512 * 1024),
+        "\0".repeat(1 << 20),
+    ] {
+        assert_eq!(payload.len(), 1 << 20);
+        let (wc, wc_text) = server.ok(json!({
+            "action": "start",
+            "loginShell": false,
+            "command": "wc -c",
+            "input": payload
+        }));
+        assert_eq!(wc["exitCode"], 0, "{wc_text}");
+        assert_eq!(wc["output"].as_str().unwrap().trim(), "1048576", "{wc}");
+    }
+    let (_, over_text, over_err) = server.call(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "cat",
+        "input": "a".repeat((1 << 20) + 1)
+    }));
+    assert!(over_err && over_text.contains("1 MiB"), "{over_text}");
+
+    let nested_1m = code_result(
+        &mut server,
+        json!({
+            "code": r#"
+                const ok = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    command: "wc -c",
+                    input: "\0".repeat(1048576)
+                });
+                if (ok.output.trim() !== "1048576") throw new Error("wc: " + ok.output);
+                let refused = false;
+                try {
+                    await tools.exec({
+                        action: "start",
+                        loginShell: false,
+                        command: "cat",
+                        input: "a".repeat(1048577)
+                    });
+                } catch (e) {
+                    if (e.name === "ToolError") refused = true;
+                }
+                if (!refused) throw new Error("expected ToolError for >1 MiB");
+                return "nested-1mib-ok";
+            "#
+        }),
+    );
+    assert_eq!(nested_1m["structuredContent"]["exitCode"], 0, "{nested_1m}");
+
+    let (early_close, early_text) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "head -c 10",
+        "input": "abcdefghij".repeat(104_858)[..(1 << 20)].to_owned()
+    }));
+    assert_eq!(early_close["ok"], true, "{early_text}");
+    assert_eq!(early_close["output"], "abcdefghij", "{early_close}");
+    let warn = early_close["inputWarning"]
+        .as_str()
+        .expect("inputWarning set on broken pipe");
+    assert!(
+        warn.starts_with("stdin closed after ") && warn.ends_with(" of 1048576 bytes"),
+        "{warn}"
+    );
+
+    let unread_t0 = Instant::now();
+    let (unread, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "sleep 30",
+        "input": "q".repeat(1 << 20),
+        "eof": false,
+        "waitMs": 150
+    }));
+    assert_eq!(unread["state"], "running", "{unread}");
+    assert!(unread_t0.elapsed() < Duration::from_secs(5));
+    let unread_id = unread["taskId"].as_str().unwrap().to_owned();
+    let (killed_unread, _) = server.ok(json!({"action": "kill", "taskId": unread_id}));
+    assert_eq!(killed_unread["state"], "killed", "{killed_unread}");
+
+    let (ord_start, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "cat",
+        "input": "first-line\n",
+        "eof": false,
+        "waitMs": 0
+    }));
+    let ord_id = ord_start["taskId"].as_str().unwrap().to_owned();
+    let mut parts = Vec::new();
+    if let Some(s) = ord_start["output"].as_str().filter(|s| !s.is_empty()) {
+        parts.push(s.to_owned());
+    }
+    let (ord_poll, _) = server.ok(json!({
+        "action": "poll",
+        "taskId": ord_id,
+        "input": "second-line\n",
+        "eof": true,
+        "waitMs": 5000
+    }));
+    if let Some(s) = ord_poll["output"].as_str().filter(|s| !s.is_empty()) {
+        parts.push(s.to_owned());
+    }
+    assert_eq!(parts.join("\n"), "first-line\nsecond-line");
+}
+
+#[test]
+fn kill_delivers_unseen_output_gates_concurrent_polls_and_attaches_codemode_images() {
+    let mut server = codemode_server();
+
+    let (started, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "printf 'first\\n'; sleep 0.3; printf 'after-start-before-kill\\n'; sleep 60",
+        "waitMs": 100
+    }));
+    let handle = started["taskId"].as_str().unwrap().to_owned();
+    let bare = bare_id(&handle).to_owned();
+    std::thread::sleep(Duration::from_millis(500));
+    let (killed, kill_text) = server.ok(json!({"action": "kill", "taskId": &handle}));
+    assert_eq!(killed["state"], "killed", "{kill_text}");
+    assert!(killed.get("waitEndedBy").is_none(), "{killed}");
+    let combined = format!(
+        "{}{}",
+        started["output"].as_str().unwrap_or_default(),
+        killed["output"].as_str().unwrap_or_default()
+    );
+    assert!(combined.contains("after-start-before-kill"), "{combined}");
+    let (after_kill, _) = server.ok(json!({"action": "poll", "taskId": &handle, "waitMs": 0}));
+    assert_eq!(after_kill["output"], "", "{after_kill}");
+
+    let (bare_kill, bare_kill_text) = server.ok(json!({"action": "kill", "taskId": &bare}));
+    assert!(
+        bare_kill["output"].as_str().unwrap().contains("first"),
+        "{bare_kill}"
+    );
+    assert!(bare_kill_text.contains("new reader"), "{bare_kill_text}");
+
+    let (conc_start, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "printf 'ready\\n'; sleep 0.2; printf 'before-concurrent-kill\\n'; sleep 60",
+        "returnWhen": {"outputContains": ["ready"]},
+        "waitMs": 5000
+    }));
+    let conc_id = conc_start["taskId"].as_str().unwrap().to_owned();
+    std::thread::sleep(Duration::from_millis(400));
+    server.next_id += 1;
+    let poll_req = server.next_id;
+    server.send(json!({
+        "jsonrpc": "2.0",
+        "id": poll_req,
+        "method": "tools/call",
+        "params": {"name": "exec", "arguments": {"action": "poll", "taskId": &conc_id, "waitMs": 30000}}
+    }));
+    std::thread::sleep(Duration::from_millis(100));
+    server.next_id += 1;
+    let kill_req = server.next_id;
+    server.send(json!({
+        "jsonrpc": "2.0",
+        "id": kill_req,
+        "method": "tools/call",
+        "params": {"name": "exec", "arguments": {"action": "kill", "taskId": &conc_id}}
+    }));
+    let r1 = server.response(poll_req);
+    let r2 = server.response(kill_req);
+    let out1 = r1["result"]["structuredContent"]["output"]
+        .as_str()
+        .unwrap_or_default();
+    let out2 = r2["result"]["structuredContent"]["output"]
+        .as_str()
+        .unwrap_or_default();
+    let merged = format!("{out1}{out2}");
+    assert_eq!(
+        merged.matches("before-concurrent-kill").count(),
+        1,
+        "expected output conserved once across poll+kill: out1={out1:?} out2={out2:?}"
+    );
+
+    let url = image_data_url(4, 4);
+    let img_script = code_result(
+        &mut server,
+        json!({
+            "code": format!(
+                "image({url:?}); await tools.exec({{action:'start', loginShell:false, command:'sleep 30'}});"
+            ),
+            "waitMs": 200
+        }),
+    );
+    let cm_handle = img_script["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let child_tasks: Vec<String> = img_script["structuredContent"]["codemode"]["startedTasks"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t["taskId"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let already_attached = image_count(&img_script);
+    let kill_reply = server.request(
+        "tools/call",
+        json!({"name": "exec", "arguments": {"action": "kill", "taskId": cm_handle}}),
+    );
+    let kill_attached = image_count(&kill_reply["result"]);
+    assert_eq!(
+        already_attached + kill_attached,
+        1,
+        "{img_script} / {kill_reply}"
+    );
+    for child in child_tasks {
+        let _ = server.call(json!({"action": "kill", "taskId": child}));
+    }
+}
+
+#[test]
+fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
+    let (root, _) = scratch("p1-p2-contracts");
+    let home_dir = root.join("home");
+    let work_dir = root.join("work");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(work_dir.join("sub")).unwrap();
+
+    let mut server = Server::start_with(|cmd| {
+        cmd.current_dir(&work_dir)
+            .env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_OUTPUT_MODE", "both")
+            .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir);
+    });
+
+    let w_rel = server.request(
+        "tools/call",
+        json!({"name": "write", "arguments": {"path": "sub/empty.txt", "content": ""}}),
+    );
+    let w_path = w_rel["result"]["structuredContent"]["path"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !w_path.contains('\\') && w_path.ends_with("/sub/empty.txt"),
+        "{w_path}"
+    );
+
+    let r_empty = server.request(
+        "tools/call",
+        json!({"name": "read", "arguments": {"path": "sub/empty.txt", "offset": 1}}),
+    );
+    let r_sc = &r_empty["result"]["structuredContent"];
+    assert_eq!(r_sc["totalLines"], 0, "{r_empty}");
+    assert_eq!(r_sc["startLine"], 1, "{r_empty}");
+    assert!(r_sc["endLine"].is_null(), "{r_empty}");
+    assert_eq!(r_sc["shownLines"], 0, "{r_empty}");
+    assert_eq!(r_sc["text"], "", "{r_empty}");
+
+    server.request(
+        "tools/call",
+        json!({"name": "write", "arguments": {"path": "~/tilde.txt", "content": "alpha\r\nbeta"}}),
+    );
+    assert_eq!(
+        std::fs::read_to_string(home_dir.join("tilde.txt")).unwrap(),
+        "alpha\r\nbeta"
+    );
+    let r_tilde = server.request(
+        "tools/call",
+        json!({"name": "read", "arguments": {"path": "~/tilde.txt"}}),
+    );
+    assert_eq!(
+        r_tilde["result"]["structuredContent"]["totalLines"], 2,
+        "{r_tilde}"
+    );
+    assert_eq!(
+        r_tilde["result"]["structuredContent"]["text"], "alpha\r\nbeta",
+        "{r_tilde}"
+    );
+
+    let r_lim0 = server.request(
+        "tools/call",
+        json!({"name": "read", "arguments": {"path": "~/tilde.txt", "limit": 0}}),
+    );
+    let lim0_text = r_lim0["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !lim0_text.starts_with('\n'),
+        "no leading blank lines on empty body: {lim0_text:?}"
+    );
+
+    #[cfg(unix)]
+    {
+        let real_a = root.join("real_a");
+        let real_b = root.join("real_b");
+        std::fs::create_dir_all(real_a.join("inner")).unwrap();
+        std::fs::create_dir_all(&real_b).unwrap();
+        std::fs::write(real_a.join("sibling.txt"), "via-symlink-parent\n").unwrap();
+        std::os::unix::fs::symlink(real_a.join("inner"), real_b.join("link")).unwrap();
+        let via_link = server.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": real_b.join("link/../sibling.txt").to_string_lossy()}}),
+        );
+        assert_eq!(
+            via_link["result"]["structuredContent"]["text"], "via-symlink-parent\n",
+            "{via_link}"
+        );
+    }
+
+    server.request(
+        "tools/call",
+        json!({"name": "write", "arguments": {"path": "sub/edit.txt", "content": "L1 start\nL2 mid\nL3 end\ndup\ndup\nkeep\n"}}),
+    );
+    let bad_edit = server.request(
+        "tools/call",
+        json!({
+            "name": "edit",
+            "arguments": {
+                "path": "sub/edit.txt",
+                "edits": [
+                    {"oldText": "L1 start\nL2 mid\nL3 end\n", "newText": "SPAN0\n"},
+                    {"oldText": "L1 start", "newText": "SPAN1"},
+                    {"oldText": "L3 end", "newText": "SPAN2"},
+                    {"oldText": "missing-token", "newText": "x"},
+                    {"oldText": "dup", "newText": "DUP"},
+                    {"oldText": "keep", "newText": "keep"}
+                ]
+            }
+        }),
+    );
+    assert_eq!(bad_edit["result"]["isError"], true, "{bad_edit}");
+    let failures = bad_edit["result"]["structuredContent"]["failures"]
+        .as_array()
+        .unwrap();
+    let problems: Vec<&str> = failures
+        .iter()
+        .filter_map(|f| f["problem"].as_str())
+        .collect();
+    assert!(problems.contains(&"not_found"), "{failures:?}");
+    assert!(problems.contains(&"ambiguous"), "{failures:?}");
+    assert!(
+        failures
+            .iter()
+            .any(|f| f["problem"] == "overlap" && f["index"] == 0 && f["with"] == json!([1, 2])),
+        "expected containment overlap [1, 2] on entry 0: {failures:?}"
+    );
+    let noop_edit = server.request(
+        "tools/call",
+        json!({
+            "name": "edit",
+            "arguments": {
+                "path": "sub/edit.txt",
+                "edits": [{"oldText": "keep", "newText": "keep"}]
+            }
+        }),
+    );
+    assert_eq!(noop_edit["result"]["isError"], true, "{noop_edit}");
+    assert_eq!(
+        noop_edit["result"]["structuredContent"]["failures"],
+        json!([]),
+        "{noop_edit}"
+    );
+
+    let (t_ok, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "true",
+        "eof": false,
+        "raw": false,
+        "screen": false,
+        "waitMs": null
+    }));
+    let bare_t = bare_id(t_ok["taskId"].as_str().unwrap());
+    let (epoch, _seq) = bare_t.split_once('-').expect("epoch-seq");
+    assert_eq!(epoch.len(), 8, "8-char Crockford base32 epoch: {bare_t}");
+
+    let (t_run, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "sleep 30",
+        "waitMs": 50
+    }));
+    let run_id = t_run["taskId"].as_str().unwrap().to_owned();
+    let (t_kill, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "command": "sleep 30",
+        "waitMs": 50
+    }));
+    server.ok(json!({"action": "kill", "taskId": t_kill["taskId"]}));
+
+    let (list_active, _) = server.ok(json!({
+        "action": "list",
+        "state": "active",
+        "raw": false,
+        "eof": null
+    }));
+    assert_eq!(list_active["totalCount"], 1, "{list_active}");
+    let (list_finished, _) = server.ok(json!({
+        "action": "list",
+        "state": "finished"
+    }));
+    assert!(
+        list_finished["totalCount"].as_u64().unwrap() >= 2,
+        "{list_finished}"
+    );
+
+    let (list_lim, list_lim_text) = server.ok(json!({"action": "list", "limit": 2}));
+    assert_eq!(list_lim["tasks"].as_array().unwrap().len(), 2, "{list_lim}");
+    assert!(list_lim["totalCount"].as_u64().unwrap() >= 3, "{list_lim}");
+    assert!(list_lim_text.contains("Showing 2 of "), "{list_lim_text}");
+
+    server.ok(json!({"action": "kill", "taskId": run_id}));
+
+    let (_, bad_id_msg, bad_id_err) = server.call(json!({"action": "poll", "taskId": "BAD_ID!"}));
+    assert!(
+        bad_id_err && bad_id_msg.contains("Unknown taskId"),
+        "{bad_id_msg}"
+    );
+
+    let (_, true_msg, true_err) = server.call(json!({"action": "list", "eof": true}));
+    assert!(
+        true_err && true_msg.contains("action list; remove it."),
+        "{true_msg}"
+    );
+
+    let (pty_scr, _) = server.ok(json!({
+        "action": "start",
+        "pty": true,
+        "loginShell": false,
+        "command": "printf hi",
+        "screen": true,
+        "raw": false
+    }));
+    assert!(pty_scr["cursor"].is_array(), "{pty_scr}");
+
+    let cm_done = code_result(&mut server, json!({"code": "return 'cm-ok';"}));
+    let cm_id = cm_done["structuredContent"]["taskId"].as_str().unwrap();
+    server.ok(json!({
+        "action": "poll",
+        "taskId": cm_id,
+        "eof": false,
+        "screen": false,
+        "raw": false,
+        "input": null
+    }));
+
+    let bin = env!("CARGO_BIN_EXE_fastexec");
+    for flag in ["--version", "-V"] {
+        let out = Command::new(bin).arg(flag).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flag}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).starts_with("fastexec "),
+            "{out:?}"
+        );
+    }
+    for flag in ["--help", "-h"] {
+        let out = Command::new(bin).arg(flag).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flag}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("daemon"),
+            "{out:?}"
+        );
+    }
+    for bad_args in [
+        &["bogus"][..],
+        &["--version", "extra"][..],
+        &["--help", "extra"][..],
+    ] {
+        let out = Command::new(bin).args(bad_args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{bad_args:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unknown argument"),
+            "{out:?}"
+        );
+    }
+    let eof_stdio = Command::new(bin).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(eof_stdio.status.code(), Some(1), "{eof_stdio:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_git_bash_drive_paths_and_forward_slash_reports() {
+    let (root, _) = scratch("win-paths-p15");
+    let spaced = root.join("dir with spaces");
+    std::fs::create_dir_all(&spaced).unwrap();
+    let native = spaced.to_string_lossy().replace('\\', "/");
+    let (drive, rest) = native.split_once(":/").expect("Windows drive letter");
+    let git_bash_dir = format!("/{}/{rest}", drive.to_ascii_lowercase());
+    let git_bash_file = format!("{git_bash_dir}/hello.txt");
+
+    let mut server = codemode_server();
+    let listed = server.request("tools/list", json!({}));
+    let exec_desc = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "exec")
+        .unwrap()["description"]
+        .as_str()
+        .unwrap();
+    let host_line = exec_desc.lines().last().unwrap();
+    assert!(
+        !host_line.contains('\\'),
+        "Host line has backslash: {host_line}"
+    );
+
+    let w = server.request(
+        "tools/call",
+        json!({"name": "write", "arguments": {"path": &git_bash_file, "content": "win-ok\n"}}),
+    );
+    let reported = w["result"]["structuredContent"]["path"].as_str().unwrap();
+    assert!(
+        !reported.contains('\\') && reported.ends_with("/dir with spaces/hello.txt"),
+        "{reported}"
+    );
+
+    let (ran, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "cwd": &git_bash_dir,
+        "command": "cat hello.txt"
+    }));
+    assert_eq!(ran["output"], "win-ok\n", "{ran}");
+    assert!(!ran["logPath"].as_str().unwrap().contains('\\'), "{ran}");
+
+    let (root_drive, _) = server.ok(json!({
+        "action": "start",
+        "loginShell": false,
+        "cwd": format!("/{}", drive.to_ascii_lowercase()),
+        "command": "pwd"
+    }));
+    assert_eq!(root_drive["exitCode"], 0, "{root_drive}");
+
+    let (tmp_msg, tmp_err) = server.file("read", json!({"path": "/tmp/x"}));
+    assert!(tmp_err && tmp_msg.contains("cygpath -m"), "{tmp_msg}");
+    let (rel_msg, rel_err) = server.file("read", json!({"path": format!("{drive}:relative.txt")}));
+    assert!(rel_err, "{rel_msg}");
 }

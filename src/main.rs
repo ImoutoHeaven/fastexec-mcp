@@ -150,6 +150,12 @@ impl Server {
                 ));
             }
         }
+        for route in router.map.values_mut() {
+            let raw = serde_json::Value::Object((*route.attr.input_schema).clone());
+            if let serde_json::Value::Object(portable) = portable_schema(raw) {
+                route.attr.input_schema = Arc::new(portable);
+            }
+        }
         let instructions = server_instructions(backend.daemon_owned(), codemode);
         Self {
             backend,
@@ -236,12 +242,8 @@ fn exec_description(launch: &LaunchContext, codemode: bool) -> String {
         description.push_str("\n\n");
         description.push_str(include_str!("description-windows.md").trim_end());
     }
-    if cfg!(target_os = "macos") {
-        description.push_str("\n\n");
-        description.push_str(include_str!("description-macos.md").trim_end());
-    }
     if codemode {
-        description.push_str("\n\npoll, kill, and list also take codemode tasks. A codemode task takes no input, eof, keys,\nresize, screen, encoding, or transcript; killing it cancels only the calls the script is\nawaiting, and the tasks it started keep running.");
+        description.push_str("\n\npoll, kill, and list also take codemode tasks. A codemode task takes no input, eof, keys,\nresize, screen, raw, encoding, or transcript; killing it cancels only the calls the script is\nawaiting, and the tasks it started keep running.");
     }
     description.push_str("\n\nHost: ");
     description.push_str(&host_line(launch));
@@ -263,12 +265,12 @@ fn host_line(launch: &LaunchContext) -> String {
         .unwrap_or_else(|| "unknown".to_owned());
     let home = launch
         .home()
-        .map_or_else(|| "unknown".to_owned(), |home| home.display().to_string());
+        .map_or_else(|| "unknown".to_owned(), |home| files::display_path(&home));
     format!(
         "{} {} · {hostname} · user {user} · home {home} · default cwd {}",
         std::env::consts::OS,
         std::env::consts::ARCH,
-        launch.cwd.display()
+        files::display_path(&launch.cwd)
     )
 }
 
@@ -530,14 +532,209 @@ impl Server {
             Ok(path) => path,
             Err(message) => return fail(message),
         };
+        let shown_path = files::display_path(&path);
+        let bytes = match inspect_transfer_target(&path, &shown_path) {
+            Ok(bytes) => bytes,
+            Err(message) => return fail(message),
+        };
         let url = match transfer_url(path, table, &context, self.public_root.as_deref()) {
             Ok(url) => url,
             Err(message) => return fail(message),
         };
-        let mut result = CallToolResult::success(vec![ContentBlock::text(url.clone())]);
-        result.structured_content = Some(serde_json::json!({ "ok": true, "url": url }));
+        let text = match bytes {
+            Some(size) => format!("{url}\n{shown_path} · {size} bytes"),
+            None => format!("{url}\n{shown_path} · does not exist yet; a PUT creates it"),
+        };
+        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+        result.structured_content = Some(serde_json::json!({
+            "ok": true,
+            "url": url,
+            "path": shown_path,
+            "bytes": bytes,
+        }));
         service::suppress(result, effective)
     }
+}
+
+/// Verifies that `path` is either an existing regular file (returning its byte size) or a
+/// not-yet-existing path under accessible directory ancestors (`None`). Directories, special
+/// files, and permission or I/O errors fail with a tar hint.
+fn inspect_transfer_target(
+    path: &std::path::Path,
+    shown_path: &str,
+) -> Result<Option<u64>, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "Cannot transfer {shown_path}: it is a directory; pack it with tar through exec first."
+        )),
+        Ok(_) => Err(format!(
+            "Cannot transfer {shown_path}: it is not a regular file; pack directories or special files with tar through exec first."
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for ancestor in path.ancestors().skip(1) {
+                if ancestor.as_os_str().is_empty() {
+                    break;
+                }
+                match std::fs::metadata(ancestor) {
+                    Ok(metadata) if metadata.is_dir() => break,
+                    Ok(_) => {
+                        return Err(format!(
+                            "Cannot transfer {shown_path}: {} is not a directory.",
+                            files::display_path(ancestor)
+                        ));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(format!(
+                            "Cannot transfer {shown_path}: {err}. Pack directories with tar through exec first."
+                        ));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        Err(error) => Err(format!(
+            "Cannot transfer {shown_path}: {error}. Pack directories with tar through exec first."
+        )),
+    }
+}
+
+fn is_null_schema(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|obj| obj.len() == 1 && obj.get("type") == Some(&serde_json::json!("null")))
+}
+
+/// Rewrites a schemars-generated JSON Schema into the portable subset understood across MCP
+/// clients: no `$ref`, `$defs`, `$schema`, `anyOf`, `oneOf`, array `type`, or non-standard `format`.
+pub(crate) fn portable_schema(mut schema: serde_json::Value) -> serde_json::Value {
+    let defs = schema
+        .as_object_mut()
+        .and_then(|root| {
+            root.remove("$schema");
+            root.remove("$defs").or_else(|| root.remove("definitions"))
+        })
+        .and_then(|value| match value {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    rewrite_schema_node(schema, &defs)
+}
+
+fn rewrite_schema_node(
+    node: serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let serde_json::Value::Object(mut obj) = node else {
+        return node;
+    };
+    obj.remove("$schema");
+
+    if let Some(serde_json::Value::Array(items)) = obj.get("anyOf")
+        && items.len() == 2
+        && items.iter().any(is_null_schema)
+        && let Some(non_null) = items.iter().find(|item| !is_null_schema(item)).cloned()
+    {
+        obj.remove("anyOf");
+        if let serde_json::Value::Object(inner) = non_null {
+            for (key, value) in inner {
+                obj.entry(key).or_insert(value);
+            }
+        }
+    }
+
+    while let Some(serde_json::Value::String(reference)) = obj.remove("$ref") {
+        let name = reference
+            .strip_prefix("#/$defs/")
+            .or_else(|| reference.strip_prefix("#/definitions/"))
+            .unwrap_or(&reference);
+        if let Some(serde_json::Value::Object(mut target)) = defs.get(name).cloned() {
+            if obj.contains_key("description") {
+                target.remove("description");
+            }
+            for (key, value) in target {
+                obj.entry(key).or_insert(value);
+            }
+        }
+    }
+
+    if let Some(serde_json::Value::Array(variants)) = obj.get("oneOf")
+        && !variants.is_empty()
+        && variants
+            .iter()
+            .all(|v| v.get("const").and_then(serde_json::Value::as_str).is_some())
+    {
+        let Some(serde_json::Value::Array(variants)) = obj.remove("oneOf") else {
+            unreachable!();
+        };
+        let mut values = Vec::with_capacity(variants.len());
+        let mut notes = Vec::new();
+        for variant in variants {
+            let val = variant["const"].as_str().unwrap().to_owned();
+            if let Some(desc) = variant
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+            {
+                notes.push(format!("{val}: {desc}"));
+            }
+            values.push(serde_json::Value::String(val));
+        }
+        obj.insert("type".into(), serde_json::Value::String("string".into()));
+        obj.insert("enum".into(), serde_json::Value::Array(values));
+        if !notes.is_empty() {
+            let suffix = notes.join(" ");
+            let merged = match obj.get("description").and_then(serde_json::Value::as_str) {
+                Some(existing) if !existing.is_empty() => format!("{existing} {suffix}"),
+                _ => suffix,
+            };
+            obj.insert("description".into(), serde_json::Value::String(merged));
+        }
+    }
+
+    if let Some(serde_json::Value::Array(types)) = obj.get("type")
+        && types.len() == 2
+        && types.iter().any(|t| t.as_str() == Some("null"))
+        && let Some(non_null) = types.iter().find(|t| t.as_str() != Some("null")).cloned()
+    {
+        obj.insert("type".into(), non_null);
+    }
+
+    if let Some(serde_json::Value::String(fmt)) = obj.get("format")
+        && matches!(
+            fmt.as_str(),
+            "uint"
+                | "uint8"
+                | "uint16"
+                | "uint32"
+                | "uint64"
+                | "int"
+                | "int8"
+                | "int16"
+                | "int32"
+                | "int64"
+                | "float"
+                | "double"
+        )
+    {
+        obj.remove("format");
+    }
+
+    for value in obj.values_mut() {
+        let taken = std::mem::take(value);
+        *value = match taken {
+            serde_json::Value::Object(_) => rewrite_schema_node(taken, defs),
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| rewrite_schema_node(item, defs))
+                    .collect(),
+            ),
+            other => other,
+        };
+    }
+    serde_json::Value::Object(obj)
 }
 
 /// The URL a transfer publishes: the public root the daemon was started with, or else this
@@ -692,8 +889,43 @@ fn main() {
     if args.first().is_some_and(|arg| arg == "daemon") {
         std::process::exit(daemon_main(&args[1..]));
     }
-    serve();
+    match args.as_slice() {
+        [] => serve(),
+        [arg] if arg == "--version" || arg == "-V" => {
+            println!("fastexec {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        [arg] if arg == "--help" || arg == "-h" => {
+            println!("{CLI_USAGE}");
+            std::process::exit(0);
+        }
+        [first, extra, ..]
+            if first == "--version" || first == "-V" || first == "--help" || first == "-h" =>
+        {
+            eprintln!(
+                "fastexec: unknown argument {}\n{CLI_USAGE}",
+                extra.to_string_lossy()
+            );
+            std::process::exit(2);
+        }
+        [unknown, ..] => {
+            eprintln!(
+                "fastexec: unknown argument {}\n{CLI_USAGE}",
+                unknown.to_string_lossy()
+            );
+            std::process::exit(2);
+        }
+    }
 }
+
+const CLI_USAGE: &str = "\
+usage: fastexec [--help | --version]
+       fastexec daemon start [--http <addr>] [--idle-exit on|off]
+       fastexec daemon run [--http <addr>]
+       fastexec daemon status
+       fastexec daemon stop
+
+With no arguments, fastexec serves MCP over stdio.";
 
 /// The hidden `daemon` subcommand: the daemon process itself, and the CLI that starts, inspects,
 /// and stops one.
@@ -1316,6 +1548,7 @@ async fn serve() {
         served = server.serve((stdin, tokio::io::stdout())) => Some(served),
         _ = &mut signal => None,
     };
+    let mut exit_code = 0;
     match served {
         Some(Ok(service)) => {
             // Stdin EOF ends the session at once; rmcp would first drain in-flight waits.
@@ -1325,7 +1558,10 @@ async fn serve() {
                 _ = &mut signal => {}
             }
         }
-        Some(Err(error)) => eprintln!("fastexec: MCP initialization failed: {error}"),
+        Some(Err(error)) => {
+            eprintln!("fastexec: MCP initialization failed: {error}");
+            exit_code = 1;
+        }
         None => {}
     }
     match &backend {
@@ -1338,7 +1574,7 @@ async fn serve() {
             }
         }
     }
-    std::process::exit(0);
+    std::process::exit(exit_code);
 }
 
 /// Stdin wrapper that reports EOF: the host closing stdin is the MCP stdio shutdown signal.
@@ -1548,5 +1784,166 @@ mod yolo_tests {
                 && mode_error.ends_with("; expected text, both, or structured"),
             "{mode_error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod portable_schema_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// Simulates Gemini web's MCP JSON Schema -> OpenAPI 3.0 declaration converter.
+    fn gemini_convert(node: &Value) -> Value {
+        let Some(obj) = node.as_object() else {
+            return json!({});
+        };
+        let mut out = serde_json::Map::new();
+        if let Some(desc) = obj.get("description") {
+            out.insert("description".into(), desc.clone());
+        }
+        if let Some(ty) = obj.get("type").and_then(Value::as_str) {
+            out.insert("type".into(), json!(ty.to_ascii_uppercase()));
+        }
+        if let Some(en) = obj.get("enum") {
+            out.insert("enum".into(), en.clone());
+        }
+        if let Some(req) = obj.get("required") {
+            out.insert("required".into(), req.clone());
+        }
+        if let Some(items) = obj.get("items") {
+            out.insert("items".into(), gemini_convert(items));
+        }
+        if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+            let mut converted = serde_json::Map::new();
+            for (k, v) in props {
+                converted.insert(k.clone(), gemini_convert(v));
+            }
+            out.insert("properties".into(), Value::Object(converted));
+        }
+        if let Some(any_of) = obj.get("anyOf").and_then(Value::as_array) {
+            out.insert(
+                "any_of".into(),
+                Value::Array(any_of.iter().map(gemini_convert).collect()),
+            );
+        }
+        Value::Object(out)
+    }
+
+    fn assert_portable_and_gemini_typed(path: &str, schema: &Value, gemini: &Value) {
+        let obj = schema
+            .as_object()
+            .unwrap_or_else(|| panic!("{path}: not an object"));
+        for forbidden in [
+            "$ref",
+            "$defs",
+            "definitions",
+            "$schema",
+            "anyOf",
+            "oneOf",
+            "allOf",
+            "format",
+        ] {
+            assert!(
+                !obj.contains_key(forbidden),
+                "{path} still contains {forbidden}: {schema}"
+            );
+        }
+        assert!(
+            obj.get("type").and_then(Value::as_str).is_some(),
+            "{path} lacks scalar string type: {schema}"
+        );
+        assert!(
+            gemini.get("type").and_then(Value::as_str).is_some(),
+            "{path} lost its type under Gemini conversion: {gemini}"
+        );
+        if let Some(en) = obj.get("enum") {
+            assert_eq!(
+                obj.get("type"),
+                Some(&json!("string")),
+                "{path}: enum must be string"
+            );
+            assert_eq!(gemini.get("enum"), Some(en), "{path}: Gemini lost enum");
+        }
+        if let Some(items) = obj.get("items") {
+            assert_portable_and_gemini_typed(&format!("{path}.items"), items, &gemini["items"]);
+        }
+        if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+            for (k, v) in props {
+                assert_portable_and_gemini_typed(
+                    &format!("{path}.{k}"),
+                    v,
+                    &gemini["properties"][k],
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_advertised_tool_schema_is_portable_and_preserves_types_in_gemini_web() {
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let launch = Arc::new(LaunchContext::current().unwrap());
+        let backend = Backend::Local {
+            service: Arc::new(Service::new(tasks, true)),
+            render: Render {
+                output_mode: service::OutputMode::Text,
+                structured_content: true,
+            },
+            session: Arc::new(OnceLock::new()),
+            launch: Arc::clone(&launch),
+            daemon: true,
+        };
+        let transfers = Some(Arc::new(transfer::Transfers::new()));
+        let server = Server::new(backend, &launch, transfers, None, false, true);
+        let tools = server.router.list_all();
+        assert_eq!(tools.len(), 6);
+        let mut by_name = std::collections::HashMap::new();
+        for tool in tools {
+            let schema = Value::Object((*tool.input_schema).clone());
+            let gemini = gemini_convert(&schema);
+            assert_portable_and_gemini_typed(&tool.name, &schema, &gemini);
+            assert_eq!(
+                schema["additionalProperties"],
+                json!(false),
+                "{}",
+                tool.name
+            );
+            assert!(
+                !tool
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("libproc")
+            );
+            by_name.insert(tool.name.into_owned(), (schema, gemini));
+        }
+        let (exec_s, exec_g) = &by_name["exec"];
+        let (code_s, _) = &by_name["codemode"];
+        let (edit_s, edit_g) = &by_name["edit"];
+        assert_eq!(
+            exec_s["properties"]["action"]["enum"],
+            json!(["start", "poll", "kill", "list", "transcript"])
+        );
+        assert_eq!(exec_g["properties"]["action"]["type"], json!("STRING"));
+        assert_eq!(
+            exec_g["properties"]["action"]["enum"],
+            json!(["start", "poll", "kill", "list", "transcript"])
+        );
+        assert!(edit_s["properties"]["edits"]["items"]["properties"]["oldText"].is_object());
+        assert!(edit_s["properties"]["edits"]["items"]["properties"]["newText"].is_object());
+        assert_eq!(
+            edit_g["properties"]["edits"]["items"]["properties"]["oldText"]["type"],
+            json!("STRING")
+        );
+        assert_eq!(
+            code_s["properties"]["maxBytes"],
+            exec_s["properties"]["maxBytes"]
+        );
+        assert!(
+            exec_s["properties"]["maxBytes"]["description"]
+                .as_str()
+                .unwrap()
+                .ends_with("Not with truncate \"none\".")
+        );
+        assert!(code_s["properties"].get("raw").is_none());
     }
 }

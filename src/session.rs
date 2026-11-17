@@ -5,7 +5,7 @@ use crate::tasks::{ALPHABET, Snapshot, Task, pids, random_chars};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -112,12 +112,63 @@ fn name_matches(key: &OsStr, name: &str) -> bool {
     }
 }
 
+const OUTSIDE_UNSEEN: u8 = 0;
+const OUTSIDE_CLAIMED: u8 = 1;
+const OUTSIDE_CONSUMED: u8 = 2;
+
+/// Reservation for showing or settling a session's once-per-session outside-task count.
+/// Dropping an uncommitted claim releases it so cancelled or budget-clipped calls leave it due.
+pub struct OutsideClaim<'a> {
+    state: Option<&'a AtomicU8>,
+    claimed: bool,
+}
+
+impl<'a> OutsideClaim<'a> {
+    pub fn none() -> Self {
+        Self {
+            state: None,
+            claimed: false,
+        }
+    }
+
+    pub fn is_claimed(&self) -> bool {
+        self.claimed
+    }
+
+    /// Releases the reservation without consuming it when the footer budget could not fit it.
+    pub fn release(&mut self) {
+        if self.claimed
+            && let Some(state) = self.state
+        {
+            state.store(OUTSIDE_UNSEEN, Ordering::Release);
+            self.claimed = false;
+        }
+    }
+
+    /// Consumes the once-per-session slot once the result carrying (or checking) it commits.
+    pub fn consume(mut self) {
+        if self.claimed
+            && let Some(state) = self.state
+        {
+            state.store(OUTSIDE_CONSUMED, Ordering::Release);
+            self.claimed = false;
+        }
+    }
+}
+
+impl Drop for OutsideClaim<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// A session's task entries and background-notice scope.
 pub struct Session {
     pub id: String,
     pub label: String,
     pub launch: Arc<LaunchContext>,
     tasks: Mutex<HashMap<String, Arc<TaskEntry>>>,
+    outside_state: AtomicU8,
 }
 
 impl Session {
@@ -127,7 +178,25 @@ impl Session {
             label,
             launch,
             tasks: Mutex::default(),
+            outside_state: AtomicU8::new(OUTSIDE_UNSEEN),
         })
+    }
+
+    /// Claims the once-per-session outside-task count slot if no committed or in-flight call holds it.
+    pub fn claim_outside(&self) -> OutsideClaim<'_> {
+        let claimed = self
+            .outside_state
+            .compare_exchange(
+                OUTSIDE_UNSEEN,
+                OUTSIDE_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        OutsideClaim {
+            state: Some(&self.outside_state),
+            claimed,
+        }
     }
 
     pub fn entry(&self, task: &Task) -> Arc<TaskEntry> {

@@ -26,6 +26,8 @@ pub struct Launch<'a> {
     pub env: &'a LaunchContext,
     pub login: bool,
     pub pty: bool,
+    /// Whether a pipe task gets a writable stdin pipe rather than `/dev/null` (`NUL`).
+    pub pipe_stdin: bool,
     /// The terminal's size: columns, then screen rows.
     pub cols: u16,
     pub rows: u16,
@@ -37,7 +39,7 @@ pub struct Launch<'a> {
 pub struct Spawned {
     pub child: Child,
     pub output: Box<dyn Read + Send>,
-    pub input: Box<dyn Write + Send>,
+    pub input: Option<Box<dyn Write + Send>>,
     pub tree: Tree,
     /// A PTY task's size control, which resizes the terminal the program is on.
     pub pty: Option<PtyControl>,
@@ -327,6 +329,7 @@ pub(crate) fn bash_version(
         env: context,
         login: false,
         pty: false,
+        pipe_stdin: false,
         cols: PTY_COLS,
         rows: PTY_ROWS,
         exit_status: None,
@@ -578,7 +581,11 @@ fn spawn_pipe_args(
         .envs(launch.env.env.iter().map(|(name, value)| (name, value)))
         .envs(environment(launch))
         .current_dir(launch.cwd)
-        .stdin(Stdio::piped())
+        .stdin(if launch.pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(writer.try_clone()?)
         .stderr(writer)
         .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
@@ -600,7 +607,9 @@ fn spawn_pipe_args(
             return Err(error);
         }
     };
-    let input = Box::new(child.stdin.take().expect("stdin is piped"));
+    let input = launch.pipe_stdin.then(|| -> Box<dyn Write + Send> {
+        Box::new(child.stdin.take().expect("stdin is piped"))
+    });
     Ok(Spawned {
         child: Child::Pipe(child),
         output,
@@ -683,7 +692,11 @@ fn spawn_host_args(
     } else {
         let (reader, writer) = std::io::pipe()?;
         command
-            .stdin(Stdio::piped())
+            .stdin(if launch.pipe_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(writer.try_clone()?)
             .stderr(writer);
         (None, pipe_output(reader, probe)?)
@@ -724,9 +737,10 @@ fn spawn_host_args(
     #[cfg(target_os = "macos")]
     drop(control_host);
     finish_host_startup(&mut host, &mut status)?;
-    let input: Box<dyn Write + Send> = match input {
-        Some(master) => Box::new(master),
-        None => Box::new(host.stdin.take().expect("stdin is piped")),
+    let input: Option<Box<dyn Write + Send>> = match input {
+        Some(master) => Some(Box::new(master)),
+        None if launch.pipe_stdin => Some(Box::new(host.stdin.take().expect("stdin is piped"))),
+        None => None,
     };
     let tree = Tree {
         #[cfg(not(target_os = "macos"))]
@@ -800,6 +814,7 @@ mod startup_tests {
             env: &context,
             login: false,
             pty: false,
+            pipe_stdin: false,
             cols: PTY_COLS,
             rows: PTY_ROWS,
             exit_status: None,

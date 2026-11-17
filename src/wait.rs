@@ -88,6 +88,7 @@ impl ReturnWhen {
 
 /// Why a wait ended, in the precedence order of conditions that hold together, with the text
 /// that matched.
+#[derive(Debug)]
 pub enum WaitEnd {
     TaskEnded,
     /// The processes a task held past its root's exit ended.
@@ -198,10 +199,11 @@ fn ended(task: &Task, root_reported: bool, conditions: bool) -> Option<WaitEnd> 
 
 /// Ends a wait the end of the task or its tree ended. After the tree, the output those
 /// processes held open reaches EOF shortly: the wait gives it up to the drain cap, within its
-/// deadline, so the result holds their last output.
-async fn finish(task: &Task, end: WaitEnd, deadline: tokio::time::Instant) -> WaitEnd {
+/// deadline when it has one, so the result holds their last output.
+async fn finish(task: &Task, end: WaitEnd, deadline: Option<tokio::time::Instant>) -> WaitEnd {
     if matches!(end, WaitEnd::TreeEnded) {
-        let until = deadline.min(tokio::time::Instant::now() + crate::tasks::DRAIN_CAP);
+        let drain_until = tokio::time::Instant::now() + crate::tasks::DRAIN_CAP;
+        let until = deadline.map_or(drain_until, |d| d.min(drain_until));
         let mut activity = task.activity();
         while !task.output_closed() {
             tokio::select! {
@@ -278,11 +280,11 @@ impl<'a> ScreenWatch<'a> {
     }
 }
 
-/// Waits until the task ends, `wait_ms` elapses, a `when` condition holds, or the call is
-/// cancelled, sending progress. `encoding` decodes output for `outputContains`.
+/// Waits until the task ends, `wait_duration` elapses (when `Some`), a `when` condition holds,
+/// or the call is cancelled, sending progress. `encoding` decodes output for `outputContains`.
 pub async fn wait(
     task: &Arc<Task>,
-    wait_ms: u64,
+    wait_duration: Option<Duration>,
     when: Option<&ReturnWhen>,
     mark: Mark,
     encoding: &'static Encoding,
@@ -290,9 +292,9 @@ pub async fn wait(
     progress: Option<&watch::Sender<Option<Progress>>>,
 ) -> Result<WaitEnd, String> {
     let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+    let deadline = wait_duration.and_then(|d| tokio::time::Instant::now().checked_add(d));
     // Quiet that begins past the deadline does not hold, however late the last check runs.
-    let last_quiet = started + Duration::from_millis(wait_ms);
+    let last_quiet = wait_duration.and_then(|d| started.checked_add(d));
     // The caller's forwarder sends the latest message; the loop only replaces it.
     let mut ticks =
         tokio::time::interval_at(tokio::time::Instant::now() + PROGRESS_EVERY, PROGRESS_EVERY);
@@ -332,7 +334,8 @@ pub async fn wait(
                 let (last, sync_pending) = task.last_output();
                 if !sync_pending {
                     let at = last.map_or(started, |last| last.max(started)) + quiet;
-                    quiet_met = at <= now.min(last_quiet);
+                    let bound = last_quiet.map_or(now, |lq| now.min(lq));
+                    quiet_met = at <= bound;
                     quiet_until = Some(tokio::time::Instant::from_std(at));
                 }
             }
@@ -370,16 +373,92 @@ pub async fn wait(
             _ = cancel.cancelled() => return Err("Cancelled; the task keeps running.".into()),
             _ = done.changed() => {}
             _ = tree_done.changed() => {}
-            _ = tokio::time::sleep_until(deadline) => expired = true,
+            _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => expired = true,
             _ = activity.changed() => {}
-            _ = tokio::time::sleep_until(quiet_until.unwrap_or(deadline)), if quiet_until.is_some() => {}
+            _ = async { tokio::time::sleep_until(quiet_until.unwrap()).await }, if quiet_until.is_some() => {}
             _ = ticks.tick(), if progress.is_some() => {
                 let seconds = started.elapsed().as_secs_f64();
-                let message = format!("{} running, waited {seconds:.0}s of {}s", task.id, wait_ms / 1000);
+                let message = match wait_duration {
+                    Some(d) => format!("{} running, waited {seconds:.0}s of {}s", task.id, d.as_secs()),
+                    None => format!("{} running, waited {seconds:.0}s", task.id),
+                };
                 if let Some(progress) = progress {
                     progress.send_replace(Some((seconds, message)));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::Service;
+    use crate::session::{LaunchContext, ReadState, Session};
+    use crate::tasks::{Limits, ScriptArgs, Tasks};
+
+    #[tokio::test]
+    async fn unbounded_and_overflow_waits_resolve_on_task_exit_or_cancellation() {
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let launch = Arc::new(LaunchContext::current().unwrap());
+        let session = Session::new("s".into(), "s".into(), Arc::clone(&launch));
+
+        let (task, _entry, reader) = tasks
+            .start_script(
+                ScriptArgs {
+                    code: "text('done');".into(),
+                    launch: Arc::clone(&launch),
+                    kill_after_ms: None,
+                    http: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                },
+                &session,
+                "r001".into(),
+            )
+            .unwrap();
+        let m = mark(&task, &reader, &ReadState::default(), None).unwrap();
+        let cancel = CancellationToken::new();
+        let end = wait(&task, None, None, m, encoding_rs::UTF_8, &cancel, None)
+            .await
+            .unwrap();
+        assert!(matches!(end, WaitEnd::TaskEnded));
+
+        let (task2, _entry2, reader2) = tasks
+            .start_script(
+                ScriptArgs {
+                    code: "while (true) {}".into(),
+                    launch,
+                    kill_after_ms: None,
+                    http: false,
+                    call_id: None,
+                    service,
+                },
+                &session,
+                "r002".into(),
+            )
+            .unwrap();
+        let m2 = mark(&task2, &reader2, &ReadState::default(), None).unwrap();
+        let cancel2 = CancellationToken::new();
+        let trigger = cancel2.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            trigger.cancel();
+        });
+        let err = wait(
+            &task2,
+            Some(Duration::MAX),
+            None,
+            m2,
+            encoding_rs::UTF_8,
+            &cancel2,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("Cancelled"), "{err}");
+        let _ = task2.kill();
+        tasks.shutdown();
     }
 }

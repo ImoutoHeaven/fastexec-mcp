@@ -210,7 +210,7 @@ pub fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
             exit_status: launch.exit_status.map(std::path::Path::to_path_buf),
         },
         output: suspended.output,
-        input: suspended.input,
+        input: Some(suspended.input),
         tree: suspended.tree,
         pty: Some(crate::process::PtyControl::new(terminal)),
     })

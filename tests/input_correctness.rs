@@ -118,7 +118,7 @@ fn text(result: &Value) -> String {
 fn pipe_input_is_confirmed_and_limit_rejection_delivers_nothing() {
     let mut server = Server::start();
     let task = server.task(json!({
-        "action": "start", "command": "wc -c", "waitMs": 0
+        "action": "start", "command": "wc -c", "eof": false, "waitMs": 0
     }));
     let too_large = server.exec(json!({
         "action": "poll", "taskId": task, "input": "a".repeat(16_385),
@@ -142,7 +142,7 @@ fn pipe_input_is_confirmed_and_limit_rejection_delivers_nothing() {
 fn the_first_write_to_closed_stdin_reports_the_writer_error() {
     let mut server = Server::start();
     let task = server.task(json!({
-        "action": "start", "command": "exec 0<&-; echo READY; sleep 30",
+        "action": "start", "command": "exec 0<&-; echo READY; sleep 30", "eof": false,
         "returnWhen": {"outputContains": ["READY"]}, "waitMs": 10_000
     }));
     let result = server.exec(json!({
@@ -293,7 +293,7 @@ fn noncanonical_pty_delivers_a_full_keys_burst_without_a_canonical_warning() {
 fn a_blocked_writer_reports_uncertain_delivery_and_warns_against_retry() {
     let mut server = Server::start();
     let task = server.task(json!({
-        "action": "start", "command": "echo READY; sleep 30",
+        "action": "start", "command": "echo READY; sleep 30", "eof": false,
         "returnWhen": {"outputContains": ["READY"]}, "waitMs": 10_000
     }));
     for _ in 0..80 {

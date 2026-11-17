@@ -17,7 +17,7 @@ pub const REQUEST_LIMIT: usize = 4 << 20;
 
 /// The largest serialized arguments a call may carry. The endpoint refuses a larger call itself,
 /// as a tool error, before it writes anything.
-pub const CALL_LIMIT: usize = 1 << 20;
+pub const CALL_LIMIT: usize = 3 << 20;
 
 /// The largest frame the endpoint accepts. Results are sized to fit, so a larger one is a bug and
 /// the endpoint closes the connection.

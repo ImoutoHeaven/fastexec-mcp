@@ -142,13 +142,13 @@ def smoke(binary, version):
             with contextlib.closing(Client(binary, env, version)) as first:
                 result, text = first.tool("exec", {
                     "action": "start", "command": "printf DAEMON_READY; IFS= read -r line; printf 'DAEMON:%s\\n' \"$line\"",
-                    "cwd": directory, "loginShell": False, "waitMs": 10000, "killAfterMs": 30000,
+                    "cwd": directory, "loginShell": False, "eof": False, "waitMs": 10000, "killAfterMs": 30000,
                     "returnWhen": {"outputContains": ["DAEMON_READY"]},
                 })
                 assert result["state"] == "running" and "DAEMON_READY" in text, (result, text)
                 task = result["taskId"]
             with contextlib.closing(Client(binary, env, version)) as second:
-                listed, _ = second.tool("exec", {"action": "list"})
+                listed, _ = second.tool("exec", {"action": "list", "scope": "all"})
                 assert any(item["taskId"] == task.split(".", 1)[0] for item in listed["tasks"]), listed
                 result, text = second.tool("exec", {
                     "action": "poll", "taskId": task, "input": "again\n", "waitMs": 10000,

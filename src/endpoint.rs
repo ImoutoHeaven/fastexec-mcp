@@ -132,7 +132,7 @@ impl Endpoint {
         match serde_json::to_vec(&arguments) {
             Ok(body) if body.len() > ipc::CALL_LIMIT => {
                 return error(format!(
-                    "The call is {} bytes; calls are limited to 1 MiB.",
+                    "The call is {} bytes; calls are limited to 3 MiB.",
                     body.len()
                 ));
             }
