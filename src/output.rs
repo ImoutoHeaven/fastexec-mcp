@@ -406,8 +406,8 @@ impl<'a> WindowBuilder<'a> {
     }
 
     fn raw_byte(&mut self, byte: u8) {
-        // The parser still advances so a later cleaned window starts in the right state.
-        self.cleaner.escape(byte);
+        // Advance the full cleaning state for later windows, ignoring only its rendering decision.
+        let _ = self.cleaner.step(byte);
         if byte == b'\n' {
             self.end_line(true);
         } else {
@@ -764,6 +764,38 @@ mod tests {
         let mut second = WindowBuilder::new(spec(false), &mut cleaner, 1);
         second.push(b"31mRED\n");
         assert_eq!(text(&second.finish()), "RED");
+    }
+
+    #[test]
+    fn raw_windows_consume_pending_crlf_state() {
+        let mut cleaner = Cleaner::default();
+        let spec = |raw| WindowSpec {
+            truncate: Truncate::None,
+            budget: UNBOUNDED,
+            raw,
+            encoding: encoding_rs::UTF_8,
+            source: "log",
+        };
+        let mut first = WindowBuilder::new(spec(false), &mut cleaner, 1);
+        first.push(b"first\r");
+        assert_eq!(text(&first.finish()), "first");
+        let mut raw = WindowBuilder::new(spec(true), &mut cleaner, 1);
+        raw.push(b"RAW\n");
+        assert_eq!(text(&raw.finish()), "RAW");
+        let mut last = WindowBuilder::new(spec(false), &mut cleaner, 2);
+        last.push(b"\nnext\n");
+        let out = last.finish();
+        assert_eq!(text(&out), "\nnext");
+        assert_eq!(out.newlines, 2);
+
+        let mut raw = WindowBuilder::new(spec(true), &mut cleaner, 4);
+        raw.push(b"raw\r");
+        assert_eq!(text(&raw.finish()), "raw\r");
+        let mut last = WindowBuilder::new(spec(false), &mut cleaner, 4);
+        last.push(b"\nnext\n");
+        let out = last.finish();
+        assert_eq!(text(&out), "next");
+        assert_eq!(out.newlines, 2);
     }
 
     #[test]
