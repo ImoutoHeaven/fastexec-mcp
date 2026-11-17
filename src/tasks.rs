@@ -3454,16 +3454,22 @@ mod tests {
             .is_ok()
         );
         // So does the return_when scan.
-        let mut matcher =
-            Matcher::new(&["abc".to_string()], encoding_rs::UTF_8, Cleaner::default());
+        let mut matcher = Matcher::new(
+            &["abc".to_string()],
+            encoding_rs::UTF_8,
+            Some(Cleaner::default()),
+        );
         let mut from = 0;
         assert_eq!(task.scan(&mut matcher, &mut from).unwrap(), None);
         // A log that is gone while the task is not evicted stays an error.
         let live = start(&tasks, start_args()).unwrap();
         finish(&live);
         std::fs::remove_file(tasks.dir.join(format!("{}.log", live.id))).unwrap();
-        let mut matcher =
-            Matcher::new(&["abc".to_string()], encoding_rs::UTF_8, Cleaner::default());
+        let mut matcher = Matcher::new(
+            &["abc".to_string()],
+            encoding_rs::UTF_8,
+            Some(Cleaner::default()),
+        );
         let mut from = 0;
         assert!(
             live.scan(&mut matcher, &mut from).is_err(),
@@ -4205,21 +4211,6 @@ mod script_tests {
             snap.input_warning
         );
         assert!(snap.input_error.is_none(), "{:?}", snap.input_error);
-
-        // Concurrent claim_outside admits at most one claimant; release restores it; consume seals it.
-        let fresh_session = Session::new(
-            "fresh".into(),
-            "fresh".into(),
-            Arc::new(LaunchContext::current().unwrap()),
-        );
-        let mut c1 = fresh_session.claim_outside();
-        let c2 = fresh_session.claim_outside();
-        assert!(c1.is_claimed() && !c2.is_claimed());
-        c1.release();
-        let c3 = fresh_session.claim_outside();
-        assert!(c3.is_claimed());
-        c3.consume();
-        assert!(!fresh_session.claim_outside().is_claimed());
 
         tasks.shutdown();
     }

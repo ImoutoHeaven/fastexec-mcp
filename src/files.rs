@@ -316,21 +316,48 @@ fn git_bash_drive_path(path: &str) -> Option<String> {
     None
 }
 
-/// Rebuilds `path` from its components, removing `.` and repeated separators while keeping `..`
-/// so the kernel resolves symlinks naturally without lexical `..` collapsing or canonicalization.
+/// Rebuilds paths without `PathBuf::push`, which folds `..` on Windows verbatim paths.
 fn clean_components(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
+    use std::path::Component;
+    let mut out = std::ffi::OsString::new();
+    let mut separator = false;
     for component in path.components() {
         match component {
-            std::path::Component::CurDir => {}
-            other => out.push(other.as_os_str()),
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir => {
+                out.push(component.as_os_str());
+                separator = false;
+            }
+            other => {
+                if separator {
+                    out.push(std::path::MAIN_SEPARATOR_STR);
+                }
+                out.push(other.as_os_str());
+                separator = true;
+            }
         }
     }
-    if out.as_os_str().is_empty() {
+    if out.is_empty() {
         PathBuf::from(".")
     } else {
-        out
+        PathBuf::from(out)
     }
+}
+
+/// Joins without folding parent components, including when the base is a verbatim Windows path.
+fn append_path(base: &Path, relative: &Path) -> PathBuf {
+    let mut joined = base.as_os_str().to_owned();
+    if !joined.is_empty()
+        && !joined
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
+    {
+        joined.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    // Parse the relative part before appending so Windows also accepts its forward slashes.
+    joined.push(clean_components(relative));
+    clean_components(Path::new(&joined))
 }
 
 /// Resolves a path parameter against `launch`: expands `~`, maps Git Bash `/c/...` drive roots on
@@ -349,12 +376,18 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
         return Ok(clean_components(&home()?));
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        return Ok(clean_components(&home()?.join(rest)));
+        return Ok(append_path(
+            &home()?,
+            Path::new(rest.trim_start_matches(std::path::is_separator)),
+        ));
     }
     #[cfg(windows)]
     {
         if let Some(rest) = path.strip_prefix("~\\") {
-            return Ok(clean_components(&home()?.join(rest)));
+            return Ok(append_path(
+                &home()?,
+                Path::new(rest.trim_start_matches(std::path::is_separator)),
+            ));
         }
         let rewritten = git_bash_drive_path(path);
         let candidate = Path::new(rewritten.as_deref().unwrap_or(path));
@@ -376,7 +409,7 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
             (Some(std::path::Component::RootDir), _) => Err(format!(
                 "Cannot resolve {path}: driveless paths such as /tmp name Git Bash locations on Windows; pass C:/... or /c/..., or convert it with cygpath -m."
             )),
-            _ => Ok(clean_components(&launch.cwd.join(candidate))),
+            _ => Ok(append_path(&launch.cwd, candidate)),
         }
     }
     #[cfg(not(windows))]
@@ -385,7 +418,7 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
         if named.is_absolute() {
             Ok(clean_components(named))
         } else {
-            Ok(clean_components(&launch.cwd.join(named)))
+            Ok(append_path(&launch.cwd, named))
         }
     }
 }
@@ -942,14 +975,14 @@ fn write_text(request: &WriteRequest, launch: &LaunchContext) -> Result<(String,
 /// meaning. A finite walk also refuses cycles before any file is changed.
 fn write_target(path: &Path) -> io::Result<PathBuf> {
     let mut target = path.to_path_buf();
-    for _ in 0..40 {
+    for _ in 0..=40 {
         match std::fs::symlink_metadata(&target) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 let link = std::fs::read_link(&target)?;
                 target = if link.is_absolute() {
                     link
                 } else {
-                    target.parent().unwrap_or_else(|| Path::new(".")).join(link)
+                    append_path(target.parent().unwrap_or_else(|| Path::new(".")), &link)
                 };
             }
             Ok(_) => return Ok(target),
@@ -992,7 +1025,7 @@ impl Staged {
             let mut random = [0u8; 16];
             getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
             let name = format!(".fastexec-save-{:032x}", u128::from_le_bytes(random));
-            let path = parent.join(name);
+            let path = append_path(parent, Path::new(&name));
             #[cfg(target_os = "freebsd")]
             let directory = if private {
                 match crate::runtime::create_private_new(&path) {
@@ -2041,13 +2074,9 @@ fn edit_outcome(
     let _guard = lock();
     let source = EditSource::read(resolved)
         .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
-    let (mut written, mut starts, fuzzy_flags) =
-        apply_edits(&source.content, request, &shown_path)?;
+    let (mut written, starts, fuzzy_flags) = apply_edits(&source.content, request, &shown_path)?;
     if source.content.starts_with('\u{feff}') && !written.starts_with('\u{feff}') {
         written.insert(0, '\u{feff}');
-        for start in &mut starts {
-            *start += '\u{feff}'.len_utf8();
-        }
     }
     if written == source.content {
         return Err(edit_no_change(&shown_path));
@@ -2061,7 +2090,7 @@ fn edit_outcome(
     );
     let mut edits = Vec::with_capacity(request.edits.len());
     for (index, (&at, &fuzzy)) in starts.iter().zip(&fuzzy_flags).enumerate() {
-        let line = 1 + line_breaks(&written[..at]);
+        let line = 1 + line_breaks(&source.content[..at]);
         text.push_str(&format!("\nedits[{index}]: line {line}"));
         if fuzzy {
             text.push_str(" (fuzzy match)");
@@ -2116,7 +2145,7 @@ fn apply_edits(
     let line_at_raw = |raw_pos: usize| 1 + raw_newlines.partition_point(|&nl| nl < raw_pos);
     let line_at_norm = |norm_pos: usize| line_at_raw(normalized.original(norm_pos));
 
-    let mut lazy_fuzzy: Option<(String, Vec<usize>, Option<FuzzyMap>)> = None;
+    let mut lazy_fuzzy: Option<(String, Vec<usize>, std::cell::OnceCell<Option<FuzzyMap>>)> = None;
     let edits: Vec<(String, String)> = request
         .edits
         .iter()
@@ -2137,11 +2166,11 @@ fn apply_edits(
     let mut fuzzy_flags = vec![false; total];
 
     for (index, (old, new)) in edits.iter().enumerate() {
-        let exact_starts = starts_positions(&normalized.text, old);
-        if exact_starts.len() > 1 {
+        let (exact_count, exact_starts) = starts_positions(&normalized.text, old);
+        if exact_count > 1 {
             let lines = exact_starts.iter().map(|&at| line_at_norm(at)).collect();
             problems[index] = Some(EntryProblem::Ambiguous {
-                count: exact_starts.len(),
+                count: exact_count,
                 lines,
             });
             continue;
@@ -2191,29 +2220,31 @@ fn apply_edits(
                 .zip(norm_real_flags)
                 .filter_map(|((i, _), is_real)| is_real.then_some(i))
                 .collect();
-            let m = FuzzyMap::new(&normalized.text);
-            (h, nls, m)
+            (h, nls, std::cell::OnceCell::new())
         });
         let line_at_fuzzy =
             |fuzzy_pos: usize| 1 + haystack_newlines.partition_point(|&nl| nl < fuzzy_pos);
 
-        let fuzzy_starts = if *haystack == normalized.text && needle == *old {
-            exact_starts.clone()
+        let same_form = *haystack == normalized.text && needle == *old;
+        let (fuzzy_count, fuzzy_starts) = if same_form {
+            (exact_count, exact_starts.clone())
         } else {
             starts_positions(haystack, &needle)
         };
 
         if let Some(&exact_at) = exact_starts.first() {
-            if fuzzy_starts.len() > 1 {
+            if fuzzy_count > 1 {
                 let lines = fuzzy_starts.iter().map(|&pos| line_at_fuzzy(pos)).collect();
                 problems[index] = Some(EntryProblem::Ambiguous {
-                    count: fuzzy_starts.len(),
+                    count: fuzzy_count,
                     lines,
                 });
                 continue;
             }
-            if fuzzy_starts.len() == 1
+            if !same_form
+                && fuzzy_count == 1
                 && let Some(fuzzy_span) = map
+                    .get_or_init(|| FuzzyMap::new(&normalized.text))
                     .as_ref()
                     .and_then(|m| m.span(fuzzy_starts[0], fuzzy_starts[0] + needle.len()))
                 && let Some((offset, len)) =
@@ -2245,19 +2276,20 @@ fn apply_edits(
             continue;
         }
 
-        if fuzzy_starts.is_empty() {
+        if fuzzy_count == 0 {
             problems[index] = Some(EntryProblem::NotFound);
             continue;
         }
-        if fuzzy_starts.len() > 1 {
+        if fuzzy_count > 1 {
             let lines = fuzzy_starts.iter().map(|&pos| line_at_fuzzy(pos)).collect();
             problems[index] = Some(EntryProblem::Ambiguous {
-                count: fuzzy_starts.len(),
+                count: fuzzy_count,
                 lines,
             });
             continue;
         }
         let Some((at, len)) = map
+            .get_or_init(|| FuzzyMap::new(&normalized.text))
             .as_ref()
             .and_then(|m| m.span(fuzzy_starts[0], fuzzy_starts[0] + needle.len()))
         else {
@@ -2305,7 +2337,7 @@ fn apply_edits(
                 match problem {
                     EntryProblem::Ambiguous { count, lines } => {
                         let shown = &lines[..lines.len().min(MAX_REPORTED_ITEMS)];
-                        let more = lines.len().saturating_sub(MAX_REPORTED_ITEMS);
+                        let more = count.saturating_sub(MAX_REPORTED_ITEMS);
                         let list = shown
                             .iter()
                             .map(usize::to_string)
@@ -2390,11 +2422,11 @@ fn apply_edits(
     Ok((replaced, starts, fuzzy_flags))
 }
 
-/// All starting byte offsets of `needle` in `haystack`, counting overlapping occurrences in one pass.
-fn starts_positions(haystack: &str, needle: &str) -> Vec<usize> {
+/// Counts overlapping occurrences in one pass, retaining only the starts a report can show.
+fn starts_positions(haystack: &str, needle: &str) -> (usize, Vec<usize>) {
     let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
     if needle.is_empty() {
-        return Vec::new();
+        return (0, Vec::new());
     }
     let mut table = vec![0usize; needle.len()];
     let mut matched = 0;
@@ -2408,6 +2440,7 @@ fn starts_positions(haystack: &str, needle: &str) -> Vec<usize> {
         table[at] = matched;
     }
     let mut positions = Vec::new();
+    let mut count = 0;
     matched = 0;
     for (idx, byte) in haystack.iter().enumerate() {
         while matched > 0 && *byte != needle[matched] {
@@ -2417,20 +2450,21 @@ fn starts_positions(haystack: &str, needle: &str) -> Vec<usize> {
             matched += 1;
         }
         if matched == needle.len() {
-            positions.push(idx + 1 - needle.len());
+            count += 1;
+            if positions.len() < MAX_REPORTED_ITEMS {
+                positions.push(idx + 1 - needle.len());
+            }
             matched = table[matched - 1];
         }
     }
-    positions
+    (count, positions)
 }
 
-/// Applies matches to `content`, answering with the new content and each edit's start in it.
+/// Applies matches to `content`, retaining each edit's start in the original file.
 fn replace(content: &str, matched: &[Matched<'_>]) -> (String, Vec<usize>) {
     let mut starts = vec![0usize; matched.len()];
-    let mut shift: i64 = 0;
     for edit in matched {
-        starts[edit.index] = (edit.at as i64 + shift) as usize;
-        shift += edit.new_text.len() as i64 - edit.len as i64;
+        starts[edit.index] = edit.at;
     }
     let mut result = content.to_owned();
     for edit in matched.iter().rev() {
@@ -2825,6 +2859,58 @@ mod tests {
             message.contains("the home directory is unknown"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn home_expansion_keeps_repeated_separators_under_home() {
+        let scratch = Scratch::new("home-separators");
+        let home = scratch.0.join("home");
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        let path = home.join("notes/a.txt");
+        std::fs::write(&path, b"home file\n").unwrap();
+        let launch = context(&scratch.0, &home);
+        for input in ["~/notes/a.txt", "~//notes///a.txt", "~///notes/a.txt"] {
+            assert_eq!(resolve(input, &launch).unwrap(), path);
+            assert_eq!(whole(input, &launch, false).unwrap(), "home file\n");
+        }
+        #[cfg(windows)]
+        for input in [r"~\\notes\\a.txt", r"~\\/notes//a.txt"] {
+            assert_eq!(resolve(input, &launch).unwrap(), path);
+        }
+        write_text(
+            &WriteRequest {
+                path: "~//notes/a.txt".into(),
+                content: "updated\n".into(),
+            },
+            &launch,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"updated\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_paths_keep_parent_components_when_resolved_and_appended() {
+        for base in [r"\\?\C:\base", r"\\?\UNC\server\share\base"] {
+            let launch = context(Path::new(base), Path::new(base));
+            let expected = PathBuf::from(format!(r"{base}\link\..\value"));
+            let absolute = format!(r"{base}\.\link\\..\value");
+            assert_eq!(resolve(&absolute, &launch).unwrap(), expected);
+            for input in [
+                "link/../value",
+                r"link\..\value",
+                "./link//../value",
+                "~/link/../value",
+                r"~\link\..\value",
+            ] {
+                assert_eq!(resolve(input, &launch).unwrap(), expected, "{input}");
+            }
+            let parent = PathBuf::from(format!(r"{base}\link\.."));
+            assert_eq!(
+                append_path(&parent, Path::new("staged")),
+                PathBuf::from(format!(r"{base}\link\..\staged"))
+            );
+        }
     }
 
     #[test]
@@ -3288,6 +3374,42 @@ mod tests {
                 panic!("cannot create fixture symlink {}: {error}", link.display());
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_relative_symlink_write_matches_native_resolution() {
+        // A root-relative target uses the current drive, which may differ from the temp drive.
+        let scratch = Scratch(std::env::current_dir().unwrap().join(format!(
+            "fastexec-rooted-link-{}",
+            crate::tasks::random_chars(8).unwrap()
+        )));
+        std::fs::create_dir(&scratch.0).unwrap();
+        let launch = context(&scratch.0, &scratch.0);
+        let target = scratch.file("target.txt", b"before");
+        let shown = display_path(&target);
+        assert_eq!(shown.as_bytes().get(1), Some(&b':'), "{shown}");
+        let rooted = PathBuf::from(shown[2..].replace('/', "\\"));
+        let link = scratch.0.join("link.txt");
+        if !file_symlink(&rooted, &link) {
+            return;
+        }
+        assert_eq!(std::fs::read(&link).unwrap(), b"before");
+        write_text(
+            &WriteRequest {
+                path: display_path(&link),
+                content: "after".into(),
+            },
+            &launch,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), b"after");
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -4368,7 +4490,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_reports_a_later_edits_line_after_an_earlier_one_adds_lines() {
+    fn edit_reports_original_lines_after_an_earlier_edit_adds_lines() {
         let scratch = Scratch::new("shift");
         let launch = context(&scratch.0, &scratch.0);
         let shown = display_path(&scratch.0.join("a.txt"));
@@ -4376,10 +4498,45 @@ mod tests {
         assert_eq!(
             change("a.txt", &[("2", "2\n2b\n2c"), ("4", "4x")], &launch).unwrap(),
             format!(
-                "Successfully replaced 2 block(s) in {shown}.\nedits[0]: line 2\nedits[1]: line 6"
+                "Successfully replaced 2 block(s) in {shown}.\nedits[0]: line 2\nedits[1]: line 4"
             )
         );
         assert_eq!(scratch.read("a.txt"), b"1\n2\n2b\n2c\n3\n4x\n");
+    }
+
+    #[test]
+    fn edit_reports_original_lines_after_deletion_and_bom_restoration() {
+        let scratch = Scratch::new("original-lines");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file(
+            "mixed.txt",
+            "\u{feff}before\r\nmiddle\ron same\nlast\r\n".as_bytes(),
+        );
+        let (_, result) = edit_outcome(
+            &EditRequest {
+                path: "mixed.txt".into(),
+                edits: vec![
+                    Edit {
+                        old_text: "last".into(),
+                        new_text: "LAST".into(),
+                    },
+                    Edit {
+                        old_text: "\u{feff}before\n".into(),
+                        new_text: String::new(),
+                    },
+                ],
+            },
+            &launch,
+        )
+        .unwrap();
+        assert_eq!(
+            result["edits"],
+            json!([{"line": 3, "fuzzy": false}, {"line": 1, "fuzzy": false}])
+        );
+        assert_eq!(
+            scratch.read("mixed.txt"),
+            "\u{feff}middle\ron same\nLAST\r\n".as_bytes()
+        );
     }
 
     #[test]
@@ -4652,13 +4809,12 @@ mod tests {
         let scratch = Scratch::new("trimmed-line-end");
         let launch = context(&scratch.0, &scratch.0);
         let shown = display_path(&scratch.0.join("a.txt"));
-        // The match ends on the newline the trim kept, so the removed spaces stay outside it and
-        // the edit after it keeps its line.
+        // The match includes the physical newline; the later edit reports its original line.
         scratch.file("a.txt", "it\u{2019}s   \nnext\nmore\n".as_bytes());
         assert_eq!(
             change("a.txt", &[("it's\n", "X"), ("more", "MORE")], &launch).unwrap(),
             format!(
-                "Successfully replaced 2 block(s) in {shown}.\nedits[0]: line 1 (fuzzy match)\nedits[1]: line 2"
+                "Successfully replaced 2 block(s) in {shown}.\nedits[0]: line 1 (fuzzy match)\nedits[1]: line 3"
             )
         );
         assert_eq!(scratch.read("a.txt"), b"Xnext\nMORE\n");
@@ -5211,6 +5367,48 @@ mod tests {
         assert_eq!(
             format_windows_display(r"\\?\UNC\server\share\dir\f"),
             "//server/share/dir/f"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_accepts_forty_symlinks_and_refuses_the_next() {
+        use std::os::unix::fs::symlink;
+        let scratch = Scratch::new("symlink-limit");
+        let launch = context(&scratch.0, &scratch.0);
+        scratch.file("target", b"before\n");
+        for index in 1..=41 {
+            let target = if index == 1 {
+                "target".to_owned()
+            } else {
+                format!("link{}", index - 1)
+            };
+            symlink(target, scratch.0.join(format!("link{index}"))).unwrap();
+        }
+        assert_eq!(whole("link40", &launch, false).unwrap(), "before\n");
+        write_text(
+            &WriteRequest {
+                path: "link40".into(),
+                content: "after\n".into(),
+            },
+            &launch,
+        )
+        .unwrap();
+        let error = write_text(
+            &WriteRequest {
+                path: "link41".into(),
+                content: "wrong\n".into(),
+            },
+            &launch,
+        )
+        .unwrap_err();
+        assert!(error.contains("too many symbolic links"), "{error}");
+        assert_eq!(scratch.read("target"), b"after\n");
+        assert!(
+            std::fs::symlink_metadata(scratch.0.join("link40"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 

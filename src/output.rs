@@ -118,9 +118,9 @@ impl Cleaner {
     }
 }
 
-/// Finds literal texts in output cleaned as windows clean it, fed in pieces of any size. Every
-/// state a cleaned line passes through counts, before a carriage return rewrites it and before
-/// trailing spaces are trimmed, so how the output is split never changes the answer.
+/// Finds literal texts in output as windows show it, fed in pieces of any size. With a cleaner,
+/// every state a line passes through counts before carriage-return rewrites and trailing-space
+/// trimming. Without one, only LF ends a line and every other byte is matched unchanged.
 pub struct Matcher {
     /// The texts sought, any of which ends the search.
     needles: Vec<String>,
@@ -129,7 +129,7 @@ pub struct Matcher {
     /// The longest needle, in bytes.
     longest: usize,
     encoding: &'static Encoding,
-    cleaner: Cleaner,
+    cleaner: Option<Cleaner>,
     decoder: encoding_rs::Decoder,
     /// The decoded end of the current line, long enough to hold a match that ends later.
     line: String,
@@ -138,8 +138,8 @@ pub struct Matcher {
 }
 
 impl Matcher {
-    /// A matcher that continues from `cleaner`, the cleaning state where its output starts.
-    pub fn new(needles: &[String], encoding: &'static Encoding, cleaner: Cleaner) -> Self {
+    /// Continues the cleaning state where output starts, or matches unchanged bytes with `None`.
+    pub fn new(needles: &[String], encoding: &'static Encoding, cleaner: Option<Cleaner>) -> Self {
         Self {
             needles: needles.to_vec(),
             best: None,
@@ -156,7 +156,17 @@ impl Matcher {
     /// contains. Reading stops early only at the first needle, which nothing can precede.
     pub fn push(&mut self, bytes: &[u8]) -> Option<usize> {
         for &byte in bytes {
-            let (clear, step) = self.cleaner.step(byte);
+            let (clear, step) = match &mut self.cleaner {
+                Some(cleaner) => cleaner.step(byte),
+                None => (
+                    false,
+                    if byte == b'\n' {
+                        Step::EndLine
+                    } else {
+                        Step::Append
+                    },
+                ),
+            };
             if clear {
                 self.found(true);
                 self.new_line();
@@ -1082,7 +1092,7 @@ mod tests {
         ];
         for (output, needles, encoding, expected) in cases {
             let needles: Vec<String> = needles.iter().map(|needle| needle.to_string()).collect();
-            let matcher = || Matcher::new(&needles, encoding, Cleaner::default());
+            let matcher = || Matcher::new(&needles, encoding, Some(Cleaner::default()));
             for split in 0..=output.len() {
                 let mut two = matcher();
                 let found = two
@@ -1100,8 +1110,28 @@ mod tests {
         }
         // Across lines, the lowest needle the output holds wins, wherever it stands.
         let needles = ["first".to_string(), "second".to_string()];
-        let mut matcher = Matcher::new(&needles, utf8, Cleaner::default());
+        let mut matcher = Matcher::new(&needles, utf8, Some(Cleaner::default()));
         assert_eq!(matcher.push(b"second\nfirst\n"), Some(0));
+    }
+
+    #[test]
+    fn matcher_preserves_codemode_control_bytes_at_every_chunk_boundary() {
+        for (output, needle, expected) in [
+            ("\x1b[31mready\n", "\x1b[31mready", Some(0)),
+            ("left\x1b[31mright\n", "leftright", None),
+            ("first\rsecond  \n", "first\rsecond  ", Some(0)),
+            ("first\nsecond\n", "firstsecond", None),
+        ] {
+            let needles = [needle.to_owned()];
+            for split in 0..=output.len() {
+                let mut matcher = Matcher::new(&needles, encoding_rs::UTF_8, None);
+                let found = matcher
+                    .push(&output.as_bytes()[..split])
+                    .or_else(|| matcher.push(&output.as_bytes()[split..]))
+                    .or_else(|| matcher.finish());
+                assert_eq!(found, expected, "{needle:?} split at {split}");
+            }
+        }
     }
 
     #[test]

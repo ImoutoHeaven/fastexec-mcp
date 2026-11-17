@@ -5677,14 +5677,15 @@ fn codemode_images_resize_and_survive_structured_only_output() {
 }
 
 #[test]
-fn codemode_nested_calls_do_not_consume_other_tasks_background_notifications() {
+fn codemode_nested_poll_and_kill_do_not_consume_other_tasks_background_notifications() {
     let mut server = codemode_server();
     let (task, _) = server.ok(json!({
         "action":"start", "eof":false, "command":"read -r reply", "loginShell":false, "waitMs":0
     }));
     let other = task["taskId"].as_str().unwrap().to_owned();
     let code = format!(
-        "await tools.exec({{action:'poll',taskId:{},input:'done\\n',waitMs:10000}}); await tools.exec({{action:'list'}}); text('done');",
+        "await tools.exec({{action:'poll',taskId:{},input:'done\\n',waitMs:10000}}); await tools.exec({{action:'kill',taskId:{}}}); text('done');",
+        json!(other),
         json!(other)
     );
     let result = code_result(&mut server, json!({"code":code}));
@@ -5873,6 +5874,82 @@ return {singleBytes: single.text.length, pages, bytes: joined.length};
             .unwrap()
             .starts_with("[Showing lines"),
         "{reply}"
+    );
+}
+
+#[test]
+fn codemode_waits_match_verbatim_output_on_start_and_poll() {
+    let mut server = codemode_server();
+    let marker = "\x1b[31mready";
+    let started = code_result(
+        &mut server,
+        json!({
+            "code": format!("text({}); while (true) {{}}", json!(marker)),
+            "waitMs": 1000,
+            "returnWhen": {"outputContains": [marker]},
+        }),
+    );
+    let start_data = &started["structuredContent"];
+    server.ok(json!({"action": "kill", "taskId": start_data["taskId"]}));
+    assert_eq!(
+        start_data["waitEndedBy"]["condition"], "output_contains",
+        "{started}"
+    );
+    assert_eq!(start_data["waitEndedBy"]["text"], marker, "{started}");
+    assert_eq!(start_data["output"], marker, "{started}");
+
+    let (release, release_bash) = scratch("codemode-matcher-release");
+    let wait_command = format!("while [ ! -f '{release_bash}' ]; do sleep 0.02; done");
+    let started = code_result(
+        &mut server,
+        json!({
+            "code": format!(
+                "text('boot'); await tools.exec({{action:'start', command:{}, loginShell:false}}); text({}); while (true) {{}}",
+                json!(wait_command), json!(marker)
+            ),
+            "waitMs": 10000,
+            "returnWhen": {"outputContains": ["boot"]},
+        }),
+    );
+    let handle = &started["structuredContent"]["taskId"];
+    std::fs::write(&*release, "ready").unwrap();
+    let (polled, text) = server.ok(json!({
+        "action": "poll", "taskId": handle, "waitMs": 10000,
+        "returnWhen": {"outputContains": [marker]},
+    }));
+    server.ok(json!({"action": "kill", "taskId": handle}));
+    assert_eq!(
+        polled["waitEndedBy"]["condition"], "output_contains",
+        "{text}"
+    );
+    assert_eq!(polled["waitEndedBy"]["text"], marker, "{text}");
+    assert!(
+        polled["output"].as_str().unwrap().contains(marker),
+        "{text}"
+    );
+}
+
+#[test]
+fn nested_list_marks_tasks_started_by_an_outer_call() {
+    let mut server = codemode_server();
+    let (started, _) = server.ok(json!({
+        "action": "start", "command": "sleep 0.1; exit 4",
+        "loginShell": false, "waitMs": 0,
+    }));
+    let handle = started["taskId"].as_str().unwrap();
+    let listed = code_result(
+        &mut server,
+        json!({
+            "code": format!(
+                "await tools.exec({{action:'poll', taskId:{}}}); const list = await tools.exec({{action:'list', state:'finished'}}); return list.tasks.find(task => task.taskId === {}).exitCode;",
+                json!(handle), json!(bare_id(handle)),
+            ),
+        }),
+    );
+    assert_eq!(listed["structuredContent"]["output"], "4", "{listed}");
+    assert!(
+        !code_text(&listed).contains("(Background:"),
+        "the delivered nested list already reported the finished outer task: {listed}",
     );
 }
 

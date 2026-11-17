@@ -63,8 +63,8 @@ execution, naming `exec` actions in lowercase.
 - **`returnWhen`**: Ends the wait early when any condition holds (`waitEndedBy`
   reports `{ condition, text? }`):
   - `outputContains`: `1–16` literal case-sensitive strings (`1–4096` bytes
-    each, no line breaks) matched against cleaned unseen output lines (including
-    text before a carriage return overwrites it).
+    each, no line breaks) matched against unseen output lines: cleaned for bash
+    (including text before a carriage return overwrites it), unchanged for codemode.
   - `screenContains`, `screenAppears`, `screenGone` (UTF-8 PTY only): match
     against the live screen at the task's size (`screenAppears` and `screenGone`
     compare against the screen captured before the call's resize and `input`).
@@ -168,11 +168,12 @@ pending tool call or JavaScript job fails because it has no way to settle.
 
 Calls use the script's session and launch context (with `cwd` overridden when
 the script sets `cwd`). A nested task's reader can be polled by the caller, and
-IPC children retain the outer call ID. Nested calls advance their reader state;
-tasks started outside the script keep their session background notifications
-pending, whereas tasks started by the script whose completion is already
-observed inside the script mark their session entry reported so finished helper
-commands do not pollute subsequent outer `Background:` footers. When a script
+IPC children retain the outer call ID. Nested calls advance their reader state.
+Nested poll, kill, and transcript leave background notifications pending for
+tasks started outside the script; completion observed for a script's own tasks
+marks their session entries reported. A nested list marks every existing session
+entry delivered in its `tasks` array, regardless of which script started it.
+When a script
 ends, in-flight nested calls are cancelled and drained before publishing the
 final script report, so any `exec start` already inside process creation is
 recorded in `startedTasks`. Each script accepts at most 4096 validated exec
@@ -280,8 +281,9 @@ retirement remove image files and reclaim their quota along with logs.
   match `read`. The file must be UTF-8; a byte-order mark
   and every unmatched byte are kept, including mixed CRLF, LF, and CR line
   endings, and inserted text follows the file's first line ending style. The
-  success result names each replaced block's first line in the file it produced,
-  marking fuzzy matches. Saving uses the same staged replacement and file
+  success result names each replaced block's first line in the original file,
+  so earlier insertions or deletions do not shift later reported lines, and marks
+  fuzzy matches. Saving uses the same staged replacement and file
   restrictions as `write`. Both `read` and `edit` validate the opened file as
   regular; an edit verifies the target's identity, contents, and path again
   before publishing.
@@ -419,7 +421,8 @@ omitted on final serialization unless noted as always-present below.
   consumed atomically when a delivered response shows that clause or when the
   session's first committed footer-bearing result finds no outside tasks (never
   on nested calls, cancelled calls, or tiny budgets that drop a non-zero count). A footer marks only session tasks it names; `list`
-  marks only shown tasks' existing session entries.
+  marks existing session entries shown in direct text or delivered in a nested
+  `tasks` array.
 
 ## 3. Logs, Terminal Emulator, and Transcript Spool
 

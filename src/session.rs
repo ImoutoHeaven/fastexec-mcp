@@ -5,7 +5,7 @@ use crate::tasks::{ALPHABET, Snapshot, Task, pids, random_chars};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -112,53 +112,31 @@ fn name_matches(key: &OsStr, name: &str) -> bool {
     }
 }
 
-const OUTSIDE_UNSEEN: u8 = 0;
-const OUTSIDE_CLAIMED: u8 = 1;
-const OUTSIDE_CONSUMED: u8 = 2;
-
-/// Reservation for showing or settling a session's once-per-session outside-task count.
-/// Dropping an uncommitted claim releases it so cancelled or budget-clipped calls leave it due.
+/// Serializes a session's final synchronous render and commit of its outside-task count.
+/// Hold only after the last await; dropping an uncommitted claim leaves the count due.
 pub struct OutsideClaim<'a> {
-    state: Option<&'a AtomicU8>,
-    claimed: bool,
+    state: Option<MutexGuard<'a, bool>>,
 }
 
 impl<'a> OutsideClaim<'a> {
     pub fn none() -> Self {
-        Self {
-            state: None,
-            claimed: false,
-        }
+        Self { state: None }
     }
 
     pub fn is_claimed(&self) -> bool {
-        self.claimed
+        self.state.is_some()
     }
 
-    /// Releases the reservation without consuming it when the footer budget could not fit it.
+    /// A budget-clipped count stays available to another result.
     pub fn release(&mut self) {
-        if self.claimed
-            && let Some(state) = self.state
-        {
-            state.store(OUTSIDE_UNSEEN, Ordering::Release);
-            self.claimed = false;
-        }
+        self.state = None;
     }
 
-    /// Consumes the once-per-session slot once the result carrying (or checking) it commits.
+    /// The result carrying or checking the count has committed.
     pub fn consume(mut self) {
-        if self.claimed
-            && let Some(state) = self.state
-        {
-            state.store(OUTSIDE_CONSUMED, Ordering::Release);
-            self.claimed = false;
+        if let Some(state) = self.state.as_mut() {
+            **state = true;
         }
-    }
-}
-
-impl Drop for OutsideClaim<'_> {
-    fn drop(&mut self) {
-        self.release();
     }
 }
 
@@ -168,7 +146,7 @@ pub struct Session {
     pub label: String,
     pub launch: Arc<LaunchContext>,
     tasks: Mutex<HashMap<String, Arc<TaskEntry>>>,
-    outside_state: AtomicU8,
+    outside_consumed: Mutex<bool>,
 }
 
 impl Session {
@@ -178,24 +156,17 @@ impl Session {
             label,
             launch,
             tasks: Mutex::default(),
-            outside_state: AtomicU8::new(OUTSIDE_UNSEEN),
+            outside_consumed: Mutex::new(false),
         })
     }
 
-    /// Claims the once-per-session outside-task count slot if no committed or in-flight call holds it.
+    /// Final renderers wait for an earlier commit instead of overtaking an in-flight claim.
     pub fn claim_outside(&self) -> OutsideClaim<'_> {
-        let claimed = self
-            .outside_state
-            .compare_exchange(
-                OUTSIDE_UNSEEN,
-                OUTSIDE_CLAIMED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok();
-        OutsideClaim {
-            state: Some(&self.outside_state),
-            claimed,
+        let state = lock(&self.outside_consumed);
+        if *state {
+            OutsideClaim::none()
+        } else {
+            OutsideClaim { state: Some(state) }
         }
     }
 
@@ -525,6 +496,45 @@ mod tests {
         finish.send(()).unwrap();
         reading.await.unwrap();
         assert_eq!(gate_refs, Some(2));
+    }
+
+    #[test]
+    fn outside_count_commits_in_claim_order_and_release_leaves_it_due() {
+        let session = Session::new(
+            "outside".into(),
+            "outside".into(),
+            Arc::new(LaunchContext::current().unwrap()),
+        );
+        let mut released = session.claim_outside();
+        assert!(released.is_claimed());
+        released.release();
+        let first = session.claim_outside();
+        assert!(first.is_claimed());
+        let other = Arc::clone(&session);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (commit, committed) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            let claim = other.claim_outside();
+            commit.send(claim.is_claimed()).unwrap();
+            claim.consume();
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let overtook = committed.recv_timeout(std::time::Duration::from_millis(25));
+        first.consume();
+        assert!(
+            matches!(overtook, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "a second renderer must not commit before the first claim"
+        );
+        assert!(
+            !committed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        second.join().unwrap();
+        assert!(!session.claim_outside().is_claimed());
     }
 
     fn context(env: &[(&str, &str)]) -> LaunchContext {

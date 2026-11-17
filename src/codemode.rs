@@ -66,7 +66,7 @@ pub struct Request {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReturnWhen {
-    /// Unseen output, cleaned as results show it, has a line containing one of the texts; text a carriage return later rewrites counts. For line-oriented programs: a TUI's redraws repeat old text.
+    /// Unseen output has a line containing one of the texts: cleaned for bash, unchanged for codemode. Text before a carriage-return rewrite counts. For line-oriented programs; TUI redraws repeat old text.
     pub output_contains: Option<Vec<String>>,
     /// No output for this many ms, 10-60000, counted from the last output or the start of the wait, whichever is later; the wait starts after input and keys.
     #[schemars(range(min = 10, max = 60000))]

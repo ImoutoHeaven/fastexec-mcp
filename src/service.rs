@@ -698,7 +698,6 @@ impl Service {
                 request.scope.unwrap_or_default(),
                 request.state,
                 request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
-                call.started,
             )),
             Action::Start => {
                 let base_launch = call.launch();
@@ -1042,7 +1041,6 @@ impl Service {
         scope: ListScope,
         state: Option<ListState>,
         limit: usize,
-        script: Option<&codemode::ScriptHandle>,
     ) -> CallToolResult {
         let active_filter = state.map(|state| state == ListState::Active);
         let (total_count, selected) =
@@ -1131,25 +1129,17 @@ impl Service {
                 text.push_str(&note);
             }
         }
-        // Direct calls mark tasks shown in the text window; nested calls mark tasks in the
-        // delivered `tasks` array (scoped to tasks owned by the script so external session
-        // notices are not silently swallowed).
-        if !view.nested {
-            for index in kept {
-                let (task, snapshot) = &selected[index];
-                if let Some(entry) = session.existing(task) {
-                    entry.mark_reported(snapshot);
-                    entry.mark_keeps_reported(snapshot);
-                }
-            }
+        // Direct calls deliver the text window; nested calls deliver every selected task.
+        let delivered = if view.nested {
+            (0..selected.len()).collect()
         } else {
-            for (task, snapshot) in &selected {
-                if script.is_some_and(|script| script.owns(&task.id))
-                    && let Some(entry) = session.existing(task)
-                {
-                    entry.mark_reported(snapshot);
-                    entry.mark_keeps_reported(snapshot);
-                }
+            kept
+        };
+        for index in delivered {
+            let (task, snapshot) = &selected[index];
+            if let Some(entry) = session.existing(task) {
+                entry.mark_reported(snapshot);
+                entry.mark_keeps_reported(snapshot);
             }
         }
         success(
@@ -1315,7 +1305,6 @@ fn report(
         }
         return;
     }
-    claim.consume();
     entry.mark_reported(shown);
     for (task, shown) in background.map(|(_, shown)| shown).unwrap_or_default() {
         if let Some(entry) = session.existing(&task) {
@@ -1323,6 +1312,7 @@ fn report(
             entry.mark_keeps_reported(&shown);
         }
     }
+    claim.consume();
 }
 
 fn kill_pending_note(task: &Task, snapshot: &Snapshot) -> &'static str {
@@ -1381,10 +1371,6 @@ impl Service {
             Truncate::None => FOOTER_LIMIT,
             _ => FOOTER_LIMIT.min(view.max_bytes / 4),
         };
-        let (background, claim) = self.background(session, &task.id, footer_cap, view.nested);
-        let footer = background
-            .as_ref()
-            .map_or(String::new(), |(line, _)| format!("\n{line}"));
         // The state is taken before the read: a finished state means output reached EOF (or
         // stayed open, which the status line notes), so the window below holds all of it. The
         // status line reserves room with `log` included and drops it later when complete.
@@ -1404,14 +1390,12 @@ impl Service {
             status_line(&self.tasks, &task, &before, &task_reader, true).len()
                 + extra_note_before.len()
                 + NOTES_RESERVE
-                + footer.len()
                 + fresh_len
         } else {
             let need_log = needs_log_in_status(&before, 0, None);
             status_line(&self.tasks, &task, &before, &task_reader, need_log).len()
                 + extra_note_before.len()
                 + 2
-                + footer.len()
                 + fresh_len
         };
         let budget = match view.truncate {
@@ -1477,6 +1461,10 @@ impl Service {
                 .unwrap()
                 .extend(images.warnings.into_iter().map(Value::String));
         }
+        let (background, claim) = self.background(session, &task.id, footer_cap, view.nested);
+        let footer = background
+            .as_ref()
+            .map_or(String::new(), |(line, _)| format!("\n{line}"));
         let text = self.layout(
             render,
             &window,
@@ -1538,10 +1526,6 @@ impl Service {
             Truncate::None => FOOTER_LIMIT,
             _ => FOOTER_LIMIT.min(view.max_bytes / 4),
         };
-        let (background, claim) = self.background(session, &task.id, footer_cap, view.nested);
-        let footer = background
-            .as_ref()
-            .map_or(String::new(), |(line, _)| format!("\n{line}"));
         let shown_transcript_path = files::display_path(&transcript.path);
         let transcript_note = format!(
             " · transcript {total} lines, final through {}; this read starts at line {} · {shown_transcript_path}",
@@ -1561,7 +1545,7 @@ impl Service {
             Truncate::None => none_limit(),
             _ if line_cut => view
                 .max_bytes
-                .saturating_sub(status_with_log.len() + NOTES_RESERVE + footer.len() + fresh_len)
+                .saturating_sub(status_with_log.len() + NOTES_RESERVE + fresh_len)
                 .max(MIN_BODY_BUDGET),
             _ => {
                 let base_status = if needs_log_in_status(&snapshot, 0, None) {
@@ -1570,7 +1554,7 @@ impl Service {
                     &status_no_log
                 };
                 view.max_bytes
-                    .saturating_sub(base_status.len() + 2 + footer.len() + fresh_len)
+                    .saturating_sub(base_status.len() + 2 + fresh_len)
                     .max(MIN_BODY_BUDGET)
             }
         };
@@ -1663,6 +1647,10 @@ impl Service {
         .await
         .map_err(|error| format!("Internal failure while reading: {error}."))?;
         let window = window?;
+        let (background, claim) = self.background(session, &task.id, footer_cap, view.nested);
+        let footer = background
+            .as_ref()
+            .map_or(String::new(), |(line, _)| format!("\n{line}"));
         let text = self.layout(
             render,
             &window,
@@ -1780,15 +1768,6 @@ impl Service {
         view: View,
         ended: WaitEnd,
     ) -> Result<CallToolResult, String> {
-        let (background, claim) = self.background(
-            session,
-            &task.id,
-            FOOTER_LIMIT.min(view.max_bytes / 4),
-            view.nested,
-        );
-        let footer = background
-            .as_ref()
-            .map_or(String::new(), |(line, _)| format!("\n{line}"));
         // A finished state, taken first, means the screen below holds all output.
         let snapshot = task.snapshot_held();
         let screen = task.screen()?;
@@ -1811,6 +1790,15 @@ impl Service {
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
         let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
+        let (background, claim) = self.background(
+            session,
+            &task.id,
+            FOOTER_LIMIT.min(view.max_bytes / 4),
+            view.nested,
+        );
+        let footer = background
+            .as_ref()
+            .map_or(String::new(), |(line, _)| format!("\n{line}"));
         let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
         let screen_note = format!(
             "{} · screen {}x{}, cursor row {row} col {col}",
@@ -2584,7 +2572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_results_consume_reader_state_without_consuming_session_notices() {
+    async fn nested_task_reads_consume_reader_state_without_consuming_session_notices() {
         let (service, tasks, session) = script_fixture();
         let result = service
             .codemode(
@@ -2601,7 +2589,10 @@ mod tests {
         assert!(entry.reader(key).unwrap().is_reported());
         assert!(!entry.is_reported());
         service
-            .call_json(json!({"action":"list"}), script_call(&session, true))
+            .call_json(
+                json!({"action":"poll","taskId":handle,"waitMs":0}),
+                script_call(&session, true),
+            )
             .await;
         service
             .call_json(
@@ -2619,6 +2610,41 @@ mod tests {
             )
             .await;
         assert!(entry.is_reported());
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nested_list_marks_only_delivered_session_tasks() {
+        let (service, tasks, session) = script_fixture();
+        let mut entries = Vec::new();
+        for code in ["return 7", "return 8"] {
+            let result = service
+                .codemode(
+                    serde_json::from_value(json!({"code":code})).unwrap(),
+                    script_call(&session, true),
+                    false,
+                )
+                .await;
+            let data = result.structured_content.unwrap();
+            let (id, _) = parse_handle(data["taskId"].as_str().unwrap()).unwrap();
+            let task = tasks.find(id).unwrap();
+            entries.push(session.entry(&task));
+        }
+        let listed = service
+            .call_json(
+                json!({"action":"list","limit":1,"maxBytes":100}),
+                script_call(&session, true),
+            )
+            .await;
+        assert_eq!(
+            listed.structured_content.unwrap()["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!entries[0].is_reported(), "an unselected task stays due");
+        assert!(entries[1].is_reported(), "the delivered task is reported");
         tasks.shutdown();
     }
 
@@ -2781,6 +2807,88 @@ mod tests {
             }
         }
         service.tasks.shutdown();
+    }
+
+    #[test]
+    fn first_committed_render_gets_outside_count_while_an_earlier_read_is_pending() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (service, tasks, owner) = script_fixture();
+            service
+                .codemode(
+                    serde_json::from_value(json!({"code":"while (true) {}","waitMs":0})).unwrap(),
+                    script_call(&owner, false),
+                    false,
+                )
+                .await;
+            let completed = service
+                .codemode(
+                    serde_json::from_value(json!({"code":"return 'ready'"})).unwrap(),
+                    script_call(&owner, false),
+                    false,
+                )
+                .await;
+            let data = completed.structured_content.unwrap();
+            let bare = parse_handle(data["taskId"].as_str().unwrap()).unwrap().0;
+            let request = json!({"action":"poll","taskId":bare,"waitMs":0});
+
+            for cancel_earlier in [false, true] {
+                let session = Session::new(
+                    format!("reader-{cancel_earlier}"),
+                    "reader".into(),
+                    Arc::clone(&owner.launch),
+                );
+                let (entered, ready) = tokio::sync::oneshot::channel();
+                let (release, blocked) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                });
+                ready.await.unwrap();
+                let cancel = CancellationToken::new();
+                let mut call = script_call(&session, false);
+                call.cancel = cancel.clone();
+                let mut earlier = Box::pin(service.call_json(request.clone(), call));
+                let pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(earlier.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                assert!(
+                    pending,
+                    "the first render must stop at its queued blocking read"
+                );
+
+                // Its I/O may finish, but the earlier future cannot commit until we poll it again.
+                let first = service
+                    .call_json(request.clone(), script_call(&session, false))
+                    .await;
+                let text = serde_json::to_value(&first.content).unwrap()[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                assert!(
+                    text.contains("1 task running outside this session"),
+                    "the first committed render must carry the count: {text}"
+                );
+                if cancel_earlier {
+                    cancel.cancel();
+                }
+                let later = earlier.await;
+                let text = serde_json::to_value(&later.content).unwrap()[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                assert!(!text.contains("running outside this session"), "{text}");
+                assert_eq!(later.is_error, Some(cancel_earlier), "{later:?}");
+            }
+            tasks.shutdown();
+        });
     }
 
     #[tokio::test]

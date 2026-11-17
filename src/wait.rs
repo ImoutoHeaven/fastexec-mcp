@@ -27,7 +27,7 @@ const NOTE_CHARS: usize = 60;
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReturnWhen {
-    /// Unseen output, cleaned as results show it, has a line containing one of the texts; text a carriage return later rewrites counts. For line-oriented programs: a TUI's redraws repeat old text.
+    /// Unseen output has a line containing one of the texts: cleaned for bash, unchanged for codemode. Text before a carriage-return rewrite counts. For line-oriented programs; TUI redraws repeat old text.
     output_contains: Option<Vec<String>>,
     /// PTY only: a row of the screen contains one of the texts now.
     screen_contains: Option<Vec<String>>,
@@ -305,8 +305,13 @@ pub async fn wait(
     let output_texts = when
         .and_then(|when| when.output_contains.as_deref())
         .unwrap_or_default();
-    let mut matcher =
-        (!output_texts.is_empty()).then(|| Matcher::new(output_texts, encoding, mark.cleaner));
+    let mut matcher = (!output_texts.is_empty()).then(|| {
+        Matcher::new(
+            output_texts,
+            encoding,
+            (!task.is_script()).then_some(mark.cleaner),
+        )
+    });
     let mut scanned = mark.cursor;
     let mut screen = when.and_then(|when| ScreenWatch::new(when, mark.rows));
     let quiet = when
