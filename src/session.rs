@@ -65,6 +65,17 @@ impl LaunchContext {
         ))
     }
 
+    /// The same launch environment for a new session, with independent discovery and snapshot caches.
+    pub fn for_session(&self) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            session_cwd: self.session_cwd.clone(),
+            removed: self.removed.clone(),
+            cache: Arc::new(LaunchCache::default()),
+        }
+    }
+
     /// This context with `cwd` replaced, sharing its cached bash path and login snapshot.
     pub fn with_cwd(&self, cwd: PathBuf) -> Self {
         Self {

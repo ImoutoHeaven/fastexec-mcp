@@ -88,6 +88,9 @@ execution, naming `exec` actions in lowercase.
     reserves the inline `... [<k> lines omitted: log lines <a>-<b>] ...` marker,
     reserves `B / 10` for the head, fills the tail from the last line backward
     (cutting the last line if needed), and returns unused tail bytes to the head.
+    `head` and `tail` use the full body budget for complete lines, cutting only
+    an oversized first or last line. Omitted ranges are also reported in the
+    status line, outside the body budget.
   - `encoding`: Any ASCII-compatible WHATWG label (such as `"utf-8"`, `"big5"`,
     `"gbk"`; UTF-16 is rejected). On `start`, sets the task default; on `poll`,
     overrides for that call.

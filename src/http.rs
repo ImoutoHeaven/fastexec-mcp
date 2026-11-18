@@ -222,13 +222,18 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     let principals: Arc<[Arc<Session>]> = (0..digests.len())
         .map(|index| {
             let id = format!("t{}", index + 1);
-            Session::new(id.clone(), format!("http-{id}"), Arc::clone(&launch))
+            Session::new(
+                id.clone(),
+                format!("http-{id}"),
+                Arc::new(launch.for_session()),
+            )
         })
         .collect();
     let factory = {
         let table = Arc::clone(&table);
         let public_root = public_root.clone();
         move || {
+            let launch = Arc::new(launch.for_session());
             let backend = Backend::Local {
                 service: Arc::clone(&service),
                 render,

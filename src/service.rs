@@ -1644,6 +1644,13 @@ impl Service {
         } else {
             status_no_log
         };
+        if let Some((first, last)) = omitted {
+            status.push_str(&format!(
+                " · {} lines omitted: {} lines {first}-{last}",
+                last - first + 1,
+                window.source
+            ));
+        }
         if fresh {
             status.push_str(NEW_READER_NOTE);
         }
@@ -2191,7 +2198,7 @@ fn prune_task_diagnostics(value: &mut Value) {
     }
 }
 
-/// The leading blank line and every warning prefix count towards a bounded result.
+/// Formats complete warnings outside the body budget.
 fn warning_text(warnings: &Value) -> String {
     let mut text = String::new();
     if let Some(warnings) = warnings.as_array() {

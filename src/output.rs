@@ -254,6 +254,8 @@ pub struct Window {
     /// Lines that held byte sequences invalid in the selected encoding.
     pub bad_lines: u64,
     pub encoding: &'static Encoding,
+    /// What the line numbers count: log or transcript.
+    pub source: &'static str,
     /// LF bytes consumed, for the caller's line cursor.
     pub newlines: u64,
     empty: bool,
@@ -519,6 +521,7 @@ impl<'a> WindowBuilder<'a> {
             omitted,
             bad_lines: self.bad_lines,
             encoding: self.spec.encoding,
+            source: self.spec.source,
             newlines: self.newlines,
             empty,
         }
@@ -560,40 +563,26 @@ impl<'a> WindowBuilder<'a> {
         };
 
         if self.spec.truncate == Truncate::Head {
-            let mut head_used = 0usize;
-            let mut h = 0usize;
-            for cand in &self.head {
-                if h as u64 + 1 >= self.total_lines || cand.dropped > 0 {
-                    break;
+            let first = &self.head[0];
+            if first.dropped > 0 {
+                let mut text = first.prefix.clone();
+                cut_line_to_budget(&mut text, budget, first.dropped);
+                if text.is_empty() {
+                    return (text, 0, Some((first_num, last_num)));
                 }
-                let next_used = head_used + cand.prefix.len() + 1;
-                let m_len = format_marker(source, first_num + (h + 1) as u64, last_num).len();
-                if next_used + m_len <= budget {
-                    head_used = next_used;
-                    h += 1;
-                } else {
-                    break;
-                }
+                return (text, 1, Some((first_num + 1, last_num)));
             }
-            if h > 0 {
-                let omitted = (first_num + h as u64, last_num);
-                let marker = format_marker(source, omitted.0, omitted.1);
-                let mut lines: Vec<&str> =
-                    self.head[..h].iter().map(|c| c.prefix.as_str()).collect();
-                lines.push(&marker);
-                return (lines.join("\n"), 0, Some(omitted));
-            }
-            let omitted = (first_num + 1, last_num);
-            let marker = format_marker(source, omitted.0, omitted.1);
-            if budget > marker.len() + 1 {
-                let avail = budget - marker.len() - 1;
-                let mut line0 = self.head[0].prefix.clone();
-                cut_line_to_budget(&mut line0, avail, self.head[0].dropped);
-                if !line0.is_empty() {
-                    return (format!("{line0}\n{marker}"), 1, Some(omitted));
-                }
-            }
-            return fallback_all();
+            let text = self
+                .head
+                .iter()
+                .map(|cand| cand.prefix.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return (
+                text,
+                0,
+                Some((first_num + self.head.len() as u64, last_num)),
+            );
         }
 
         // Suffix lines after line 0, ordered from the last line backwards.
@@ -607,40 +596,29 @@ impl<'a> WindowBuilder<'a> {
             let mut tail_used = 0usize;
             let mut t = 0usize;
             for cand in suffix_rev.iter().copied() {
-                if cand.dropped > 0 {
-                    break;
-                }
                 let next_used = tail_used + cand.prefix.len() + 1;
-                let m_len = format_marker(source, first_num, last_num - (t + 1) as u64).len();
-                if next_used + m_len <= budget {
-                    tail_used = next_used;
-                    t += 1;
-                } else {
+                if cand.dropped > 0 || next_used > budget.saturating_add(1) {
                     break;
                 }
+                tail_used = next_used;
+                t += 1;
             }
             if t > 0 {
-                let omitted = (first_num, last_num - t as u64);
-                let marker = format_marker(source, omitted.0, omitted.1);
-                let mut lines = Vec::with_capacity(t + 1);
-                lines.push(marker.as_str());
-                for cand in suffix_rev[..t].iter().rev() {
-                    lines.push(cand.prefix.as_str());
-                }
-                return (lines.join("\n"), 0, Some(omitted));
+                let text = suffix_rev[..t]
+                    .iter()
+                    .rev()
+                    .map(|cand| cand.prefix.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return (text, 0, Some((first_num, last_num - t as u64)));
             }
-            let omitted = (first_num, last_num - 1);
-            let marker = format_marker(source, omitted.0, omitted.1);
-            if budget > marker.len() + 1 {
-                let avail = budget - marker.len() - 1;
-                let last_cand = suffix_rev[0];
-                let mut last_text = last_cand.prefix.clone();
-                cut_line_to_budget(&mut last_text, avail, last_cand.dropped);
-                if !last_text.is_empty() {
-                    return (format!("{marker}\n{last_text}"), 1, Some(omitted));
-                }
+            let last = suffix_rev[0];
+            let mut text = last.prefix.clone();
+            cut_line_to_budget(&mut text, budget, last.dropped);
+            if text.is_empty() {
+                return (text, 0, Some((first_num, last_num)));
             }
-            return fallback_all();
+            return (text, 1, Some((first_num, last_num - 1)));
         }
 
         // Truncate::HeadTail multi-line overflow (Rule 5).
@@ -1073,7 +1051,10 @@ mod tests {
                     assert_eq!((shown[0], *shown.last().unwrap()), ("line001", "line100"));
                 }
             }
-            assert!(out.text.contains(&format!("log lines {first}-{last}")));
+            assert_eq!(
+                out.text.contains(&format!("log lines {first}-{last}")),
+                mode == Truncate::HeadTail
+            );
         }
     }
 
@@ -1212,6 +1193,52 @@ mod tests {
     }
 
     #[test]
+    fn head_and_tail_keep_complete_endpoint_lines_with_the_full_budget() {
+        for raw in [false, true] {
+            for mode in [Truncate::Head, Truncate::Tail] {
+                for endpoint in [
+                    "x".repeat(90),
+                    "中".repeat(30),
+                    "x".repeat(100),
+                    "x".repeat(101),
+                ] {
+                    let input = match mode {
+                        Truncate::Head => format!("{endpoint}\n{}\n", "other".repeat(30)),
+                        Truncate::Tail => format!("{}\n{endpoint}\n", "other".repeat(30)),
+                        Truncate::HeadTail => unreachable!(),
+                    };
+                    let out = window(&[input.as_bytes()], mode, 100, raw);
+                    assert_eq!(
+                        out.omitted,
+                        Some(if mode == Truncate::Head {
+                            (2, 2)
+                        } else {
+                            (1, 1)
+                        })
+                    );
+                    if endpoint.len() <= 100 {
+                        assert_eq!(out.text, endpoint, "{mode:?}, raw={raw}");
+                        assert_eq!(out.cut_lines, 0);
+                    } else {
+                        assert_eq!(out.text.len(), 100);
+                        assert!(out.text.contains("line cut at 100 bytes;"));
+                        assert_eq!(out.cut_lines, 1);
+                    }
+                }
+                let selected = format!("{}\n{}", "a".repeat(49), "b".repeat(50));
+                let input = if mode == Truncate::Head {
+                    format!("{selected}\nc")
+                } else {
+                    format!("c\n{selected}")
+                };
+                let out = window(&[input.as_bytes()], mode, 100, raw);
+                assert_eq!(out.text, selected);
+                assert_eq!(out.cut_lines, 0);
+            }
+        }
+    }
+
+    #[test]
     fn unified_window_rules_cover_all_five_cases_and_exact_boundaries() {
         let json_10k = format!("{{\"payload\":\"{}\"}}", "a".repeat(9_986));
         assert_eq!(json_10k.len(), 10_000);
@@ -1260,18 +1287,18 @@ mod tests {
         assert!(out_h.text.len() <= 150);
         assert_eq!(out_h.cut_lines, 1);
         assert_eq!(out_h.omitted, Some((2, 3)));
-        assert!(out_h.text.contains("2 lines omitted: log lines 2-3"));
+        assert_eq!(out_h.text.len(), 150);
+        assert!(out_h.text.contains("line cut at 150 bytes;"));
+        assert!(!out_h.text.contains("lines omitted:"));
 
         let tail_over = format!("first\nsecond\n{}\n", "T".repeat(300));
         let out_t = window(&[tail_over.as_bytes()], Truncate::Tail, 150, false);
         assert!(out_t.text.len() <= 150);
         assert_eq!(out_t.cut_lines, 1);
         assert_eq!(out_t.omitted, Some((1, 2)));
-        assert!(
-            out_t
-                .text
-                .starts_with("... [2 lines omitted: log lines 1-2] ...\n")
-        );
+        assert_eq!(out_t.text.len(), 150);
+        assert!(out_t.text.contains("line cut at 150 bytes;"));
+        assert!(!out_t.text.contains("lines omitted:"));
 
         let err_tail = format!("{}\nERROR: final line\n", "x".repeat(20_000));
         let out_ht = window(&[err_tail.as_bytes()], Truncate::HeadTail, 16_384, false);

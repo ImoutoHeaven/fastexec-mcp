@@ -141,16 +141,22 @@ impl Endpoint {
         }
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let deadline = std::time::Instant::now() + runtime::START_WAIT;
-        let link = match self.link(client_name, deadline).await {
-            Ok(link) => link,
-            // A connection can end or be rejected before a Welcome, such as a daemon stopping as
-            // it accepted. No call has been written, so connecting again replays nothing.
-            Err(_) => match self.link(client_name, deadline).await {
+        let connecting = async {
+            match self.link(client_name, deadline).await {
+                Ok(link) => Ok(link),
+                // No call was written before a Welcome, so one reconnect replays nothing.
+                Err(_) => self.link(client_name, deadline).await,
+            }
+        };
+        let link = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return error("Cancelled before the call was sent."),
+            linked = connecting => match linked {
                 Ok(link) => link,
                 Err(message) => {
                     return error(format!("Cannot reach the fastexec daemon: {message}"));
                 }
-            },
+            }
         };
         let (sender, answer) = oneshot::channel();
         {
@@ -169,19 +175,39 @@ impl Endpoint {
             request_id: request_id.clone(),
             arguments,
         };
-        let written = tokio::select! {
-            // A link that has already ended is never written to: the frame would go to a daemon
-            // that is gone, and this call would wait for an answer that cannot come. Choosing
-            // `closed` first also lets a call that is queued for the writer let go of the link,
-            // which is what releases the connection.
+        let write_deadline = tokio::time::Instant::now() + WRITE_WAIT;
+        let writer = tokio::select! {
             biased;
+            _ = cancel.cancelled() => {
+                lock(&link.pending).remove(&id);
+                return error("Cancelled before the call was sent.");
+            }
             _ = link.closed.cancelled() => None,
-            written = tokio::time::timeout(WRITE_WAIT, async {
-                let mut writer = link.writer.lock().await;
-                ipc::write_frame(&mut *writer, &frame).await
-            }) => Some(written),
+            writer = tokio::time::timeout_at(write_deadline, link.writer.lock()) => writer.ok(),
         };
+        let mut writing_started = false;
+        let written = if let Some(mut writer) = writer {
+            tokio::select! {
+                biased;
+                _ = link.closed.cancelled() => None,
+                _ = cancel.cancelled() => None,
+                written = async {
+                    writing_started = true;
+                    tokio::time::timeout_at(
+                        write_deadline,
+                        ipc::write_frame(&mut *writer, &frame),
+                    ).await
+                } => Some(written),
+            }
+        } else {
+            None
+        };
+        if !writing_started && cancel.is_cancelled() {
+            lock(&link.pending).remove(&id);
+            return error("Cancelled before the call was sent.");
+        }
         if !matches!(written, Some(Ok(Ok(())))) {
+            // Cancellation after writing began may leave a partial frame.
             self.close(&link);
         }
         // Closing drops all pending senders. A complete result sent before EOF wins even
@@ -246,6 +272,7 @@ impl Endpoint {
         {
             return Ok(Arc::clone(link));
         }
+        *slot = None;
         let (identity, paths) = self.identity().await?;
         let (mut client, startup) =
             runtime::connect_or_start(identity, paths, deadline, &[]).await?;
@@ -386,10 +413,13 @@ async fn read_loop(
     // Dropping the senders is what makes a waiting call see the link end.
     lock(&link.pending).clear();
     drop(reader);
+    // A reconnect holds the slot while handshaking; do not keep the old writer alive behind it.
+    let ended = Arc::downgrade(&link);
+    drop(link);
     let mut slot = slot.lock().await;
     if slot
         .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, &link))
+        .is_some_and(|current| ended.ptr_eq(&Arc::downgrade(current)))
     {
         *slot = None;
     }
@@ -579,6 +609,260 @@ mod tests {
             .await
             .expect("the peer finished")
             .expect("the peer did not panic");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_a_handshake_never_dispatches_the_call() {
+        let (identity, paths, mut listener, _target) = test_daemon("cancel-hello");
+        let (announced, hello_seen) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Hello { .. })
+            ));
+            announced.send(()).unwrap();
+            // No Welcome: cancellation must end the connection without sending a Call.
+            assert!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let endpoint = Endpoint::for_test(identity, paths);
+        let cancel = CancellationToken::new();
+        let calling = endpoint.call(
+            "exec",
+            serde_json::json!({"action": "list"}),
+            "1".into(),
+            "test",
+            cancel.clone(),
+            None,
+        );
+        tokio::pin!(calling);
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut calling => panic!("call ended before the handshake: {result:?}"),
+                seen = hello_seen => seen.unwrap(),
+            }
+            cancel.cancel();
+            let result = (&mut calling).await;
+            assert_eq!(
+                result.content[0].as_text().unwrap().text,
+                "Cancelled before the call was sent."
+            );
+        })
+        .await
+        .expect("cancellation does not wait for a Welcome");
+        assert!(endpoint.link.lock().await.is_none());
+        finish(peer).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_queued_for_the_writer_preserves_the_link() {
+        let (identity, paths, mut listener, _target) = test_daemon("cancel-queue");
+        let welcome = welcome(&identity);
+        let peer = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Hello { .. })
+            ));
+            ipc::write_frame(&mut conn, &welcome).await.unwrap();
+            // The first call was cancelled before sending; only the second may arrive.
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Call { id: 2, .. })
+            ));
+            ipc::write_frame(
+                &mut conn,
+                &ToEndpoint::Result {
+                    id: 2,
+                    result: CallToolResult::success(vec![ContentBlock::text("ok")]),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Bye)
+            ));
+        });
+        let endpoint = Arc::new(Endpoint::for_test(identity, paths));
+        let link = endpoint
+            .link("test", std::time::Instant::now() + runtime::START_WAIT)
+            .await
+            .unwrap();
+        let busy = link.writer.lock().await;
+        let cancel = CancellationToken::new();
+        let calling = {
+            let (endpoint, cancel) = (Arc::clone(&endpoint), cancel.clone());
+            tokio::spawn(async move {
+                endpoint
+                    .call(
+                        "exec",
+                        serde_json::json!({"action": "list"}),
+                        "1".into(),
+                        "test",
+                        cancel,
+                        None,
+                    )
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(5), async {
+            while !lock(&link.pending).contains_key(&1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the call queued for the writer");
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(5), calling)
+            .await
+            .expect("the queued cancellation ended")
+            .unwrap();
+        assert_eq!(
+            result.content[0].as_text().unwrap().text,
+            "Cancelled before the call was sent."
+        );
+        assert!(!link.closed.is_cancelled());
+        assert!(lock(&link.pending).is_empty());
+        drop(busy);
+        let result = timeout(
+            Duration::from_secs(5),
+            endpoint.call(
+                "exec",
+                serde_json::json!({"action": "list"}),
+                "2".into(),
+                "test",
+                CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("the existing link still works");
+        assert_eq!(result.content[0].as_text().unwrap().text, "ok");
+        endpoint.bye().await;
+        drop(link);
+        drop(endpoint);
+        finish(peer).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_a_frame_write_closes_then_reconnects() {
+        use tokio::io::AsyncReadExt;
+
+        let (identity, paths, mut listener, _target) = test_daemon("cancel-frame");
+        let welcome = welcome(&identity);
+        let (announced, writing) = oneshot::channel();
+        let (release, drain) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut first = listener.accept().await.unwrap();
+            let _ = ipc::read_frame::<_, ToDaemon>(&mut first, ipc::REQUEST_LIMIT)
+                .await
+                .unwrap();
+            ipc::write_frame(&mut first, &welcome).await.unwrap();
+            let mut bytes = vec![0_u8; 1];
+            first.read_exact(&mut bytes).await.unwrap();
+            announced.send(()).unwrap();
+            drain.await.unwrap();
+            first.read_to_end(&mut bytes).await.unwrap();
+            let declared = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            assert!(
+                bytes.len() < declared + 4,
+                "the fixture must leave a partial frame"
+            );
+            drop(first);
+
+            let mut second = listener.accept().await.unwrap();
+            let _ = ipc::read_frame::<_, ToDaemon>(&mut second, ipc::REQUEST_LIMIT)
+                .await
+                .unwrap();
+            ipc::write_frame(&mut second, &welcome).await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut second, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Call { id: 2, .. })
+            ));
+            ipc::write_frame(
+                &mut second,
+                &ToEndpoint::Result {
+                    id: 2,
+                    result: CallToolResult::success(vec![ContentBlock::text("ok")]),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut second, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Bye)
+            ));
+        });
+        let endpoint = Endpoint::for_test(identity, paths);
+        let link = endpoint
+            .link("test", std::time::Instant::now() + runtime::START_WAIT)
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let calling = endpoint.call(
+            "write",
+            serde_json::json!({"path": "unused", "content": "x".repeat(2 << 20)}),
+            "1".into(),
+            "test",
+            cancel.clone(),
+            None,
+        );
+        tokio::pin!(calling);
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut calling => panic!("call ended before writing: {result:?}"),
+                seen = writing => seen.unwrap(),
+            }
+            cancel.cancel();
+            let result = (&mut calling).await;
+            assert!(
+                result.content[0]
+                    .as_text()
+                    .unwrap()
+                    .text
+                    .contains("the call may or may not have run")
+            );
+        })
+        .await
+        .expect("cancellation does not wait for a blocked frame write");
+        assert!(link.closed.is_cancelled());
+        assert!(lock(&link.pending).is_empty());
+        drop(link);
+        release.send(()).unwrap();
+        let result = timeout(
+            Duration::from_secs(5),
+            endpoint.call(
+                "exec",
+                serde_json::json!({"action": "list"}),
+                "2".into(),
+                "test",
+                CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("a later call reconnects");
+        assert_eq!(result.content[0].as_text().unwrap().text, "ok");
+        endpoint.bye().await;
+        finish(peer).await;
     }
 
     /// The endpoint's own boundary: a cancelled call writes `Cancel` for its ID to the daemon,

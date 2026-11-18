@@ -2862,15 +2862,21 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
 }
 
 #[test]
-fn http_login_snapshot_strips_fastexec_http_token_even_when_profile_exports_it() {
-    let fixture = Fixture::bare("profile-token-strip");
+fn http_login_snapshots_are_session_scoped_and_strip_removed_variables() {
+    let mut fixture = Fixture::bare("profile-sessions");
+    fixture.tokens.push(random_token());
     let home = fixture.runtime.join("profile-home");
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(
-        home.join(".bash_profile"),
-        "export FASTEXEC_HTTP_TOKEN=profile-secret-token-value\nexport FX_HTTP_PROFILE=from_profile\n",
-    )
-    .unwrap();
+    let set_profile = |value: &str| {
+        std::fs::write(
+            home.join(".bash_profile"),
+            format!(
+                "export FASTEXEC_HTTP_TOKEN=profile-secret-token-value\nexport FX_HTTP_PROFILE={value}\necho x >> \"$HOME/profile-count\"\n"
+            ),
+        )
+        .unwrap();
+    };
+    set_profile("from_profile");
     let mut child = fixture.command(&["daemon", "run", "--http", "127.0.0.1:0"]);
     child
         .env("HOME", &home)
@@ -2898,15 +2904,42 @@ fn http_login_snapshot_strips_fastexec_http_token_even_when_profile_exports_it()
         .expect("http addr")
         .parse()
         .unwrap();
-    let mut client = Client::new(addr, fixture.tokens[0].clone());
-    let (out, text) = client.modern_result(json!({
+    let request = json!({
         "action": "start",
         "command": "printf '%s|%s' \"$FX_HTTP_PROFILE\" \"${FASTEXEC_HTTP_TOKEN:-absent}\""
-    }));
-    assert_eq!(out["exitCode"], 0, "{text}");
-    assert!(
-        text.starts_with("from_profile|absent"),
-        "FASTEXEC_HTTP_TOKEN must remain stripped even if .bash_profile exports it: {text}"
+    });
+    let check = |(out, text): (Value, String), expected: &str| {
+        assert_eq!(out["exitCode"], 0, "{text}");
+        assert!(
+            text.starts_with(&format!("{expected}|absent\n\n")),
+            "{text}"
+        );
+    };
+    let mut client = Client::new(addr, fixture.tokens[0].clone());
+    check(client.modern_result(request.clone()), "from_profile");
+
+    set_profile("other_token");
+    let mut other = Client::new(addr, fixture.tokens[1].clone());
+    check(other.modern_result(request.clone()), "other_token");
+    check(client.modern_result(request.clone()), "from_profile");
+
+    set_profile("legacy_one");
+    let mut legacy_one = Client::new(addr, fixture.tokens[0].clone());
+    legacy_one.initialize();
+    check(legacy_one.result(request.clone()), "legacy_one");
+    set_profile("legacy_two");
+    let mut legacy_two = Client::new(addr, fixture.tokens[0].clone());
+    legacy_two.initialize();
+    check(legacy_two.result(request.clone()), "legacy_two");
+    check(legacy_one.result(request.clone()), "legacy_one");
+    check(other.modern_result(request), "other_token");
+    assert_eq!(
+        std::fs::read_to_string(home.join("profile-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        4,
+        "each principal and legacy session probes exactly once"
     );
     let _ = fixture.run(&["daemon", "stop"]);
     let _ = spawned.wait();

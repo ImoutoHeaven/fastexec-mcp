@@ -22,6 +22,9 @@ use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+// QuickJS mixes column origins on its first physical line; user code starts on the next one.
+const SCRIPT_PREFIX: &str = "(async () => {\n";
+const SLEEP_CHUNK_MS: u64 = 1_u64 << 40;
 const MAX_CODE: usize = 256 * 1024;
 const MEMORY_LIMIT: usize = 128 * 1024 * 1024;
 const BRIDGE_LIMIT: usize = 128 * 1024 * 1024;
@@ -407,6 +410,41 @@ impl ToolCall {
     }
 }
 
+fn split_sleep(mut ms: f64, deferred: &mut Vec<f64>) -> f64 {
+    // Above this threshold, subtracting one timer chunk can round away or remove two chunks.
+    while ms > (1_u128 << 92) as f64 {
+        ms /= 2.0;
+        deferred.push(ms);
+    }
+    ms
+}
+
+async fn sleep(mut ms: f64) {
+    if ms <= 0.0 {
+        tokio::task::yield_now().await;
+        return;
+    }
+    let mut deferred = Vec::new();
+    loop {
+        ms = split_sleep(ms, &mut deferred);
+        // Keep each timer representable without shortening the requested delay.
+        while ms > 0.0 {
+            let chunk = ms.min(SLEEP_CHUNK_MS as f64);
+            let duration = if chunk == SLEEP_CHUNK_MS as f64 {
+                std::time::Duration::from_millis(SLEEP_CHUNK_MS)
+            } else {
+                std::time::Duration::from_secs_f64(chunk / 1000.0)
+            };
+            tokio::time::sleep(duration).await;
+            ms -= chunk;
+        }
+        let Some(next) = deferred.pop() else {
+            return;
+        };
+        ms = next;
+    }
+}
+
 impl Host {
     fn call(&mut self, tool: String, arguments: String) -> Result<u64, String> {
         if self.script.interrupted() || self.script.0.cancel.is_cancelled() {
@@ -509,20 +547,10 @@ impl Host {
             };
             let result = match request {
                 ToolCall::Sleep(ms) => {
-                    if ms <= 0.0 {
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => return,
-                            () = tokio::task::yield_now() => {}
-                        }
-                    } else {
-                        let max_ms = (1_u64 << 40) as f64;
-                        let duration = std::time::Duration::from_secs_f64(ms.min(max_ms) / 1000.0);
-                        tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => return,
-                            () = tokio::time::sleep(duration) => {}
-                        }
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return,
+                        () = sleep(ms) => {}
                     }
                     let _ = lock(&script.0.report).result(id, 0);
                     let _ = script.0.wake.send(Wake::Settled {
@@ -957,7 +985,7 @@ fn run_vm(
             let mut options = EvalOptions::default();
             options.filename = Some("codemode.js".into());
             let function: Function = ctx
-                .eval_with_options(format!("(async () => {{{code}\n}})"), options)
+                .eval_with_options(format!("{SCRIPT_PREFIX}{code}\n}})"), options)
                 .map_err(|error| js_error(&ctx, error))?;
             let run: Function = api.get("run").map_err(|error| js_error(&ctx, error))?;
             run.call::<_, ()>((function,))
@@ -1100,6 +1128,8 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     const objectToString = Function.prototype.call.bind(Object.prototype.toString);
     const charCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
     const stringIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
+    const regexpExec = Function.prototype.call.bind(RegExp.prototype.exec);
+    const sourceFrame = /^(    at (?:.* \()?codemode\.js:)([0-9]+)(:[0-9]+\)?)$/;
     const stringSlice = Function.prototype.call.bind(String.prototype.slice);
     const stringToLowerCase = Function.prototype.call.bind(String.prototype.toLowerCase);
     const fromCharCode = String.fromCharCode;
@@ -1115,14 +1145,36 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     const toStringTag = Symbol.toStringTag;
     const isArray = Array.isArray;
     const errorStackDesc = Object.getOwnPropertyDescriptor(ErrorCtor.prototype, "stack");
-    const getErrorStack = errorStackDesc && errorStackDesc.get
-        ? Function.prototype.call.bind(errorStackDesc.get)
-        : undefined;
+    const getErrorStack = Function.prototype.call.bind(errorStackDesc.get);
+    // The wrapper occupies one line; normalize native stacks at their shared getter.
+    defineProperty(ErrorCtor.prototype, "stack", {
+        __proto__: null,
+        get() { return sourceStack(getErrorStack(this)); },
+        set: errorStackDesc.set,
+        enumerable: errorStackDesc.enumerable,
+        configurable: errorStackDesc.configurable,
+    });
     const pending = new Map();
     let waiting = 0;
     let state = 0;
     let failure;
 
+    function sourceStack(raw) {
+        if (typeof raw !== "string") return raw;
+        let out = "";
+        let pos = 0;
+        while (pos < raw.length) {
+            const nl = stringIndexOf(raw, "\n", pos);
+            let line = nl === -1 ? stringSlice(raw, pos) : stringSlice(raw, pos, nl);
+            const frame = regexpExec(sourceFrame, line);
+            if (frame && +frame[2] > 1) line = frame[1] + (+frame[2] - 1) + frame[3];
+            out += line;
+            if (nl === -1) break;
+            out += "\n";
+            pos = nl + 1;
+        }
+        return out;
+    }
     function stripPreludeFrames(raw) {
         if (typeof raw !== "string" || raw.length === 0) return "";
         let out = "";
@@ -1140,14 +1192,8 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     }
     function readErrorStack(error) {
         if (error === null || typeof error !== "object") return "";
-        let raw = "";
-        if (getErrorStack) {
-            try { raw = getErrorStack(error); } catch {}
-        }
-        if (typeof raw !== "string" || raw.length === 0) {
-            try { raw = error.stack; } catch {}
-        }
-        return stripPreludeFrames(raw);
+        try { return stripPreludeFrames(error.stack); }
+        catch { return ""; }
     }
     function captureCallStack() {
         try { return readErrorStack(new ErrorCtor()); }
@@ -2720,7 +2766,7 @@ mod tests {
 
         // End-to-end JS ToolError on injected captureError and logError: non-empty message
         // built from diagnostics and full report (output, exitCode, diagnostic) in err.result,
-        // plus 1025th queued call (8 active + 1024 queued + 1 = 1033) rejecting with RangeError.
+        // plus the 1025th pending call rejecting with RangeError.
         let seeded = fixture.start("text('partial-out'); throw new Error('boom');", None);
         complete(&seeded).await;
         seeded.inject_io_errors(Some("pty pipe lost"), Some("disk full"));
@@ -2755,7 +2801,7 @@ mod tests {
                     s => s.status === "rejected" && s.reason instanceof RangeError
                 );
                 if (rangeErrors.length !== 1) {{
-                    throw new Error("expected 1 RangeError at 1025th queued call, got " + rangeErrors.length);
+                    throw new Error("expected 1 RangeError at 1025th pending call, got " + rangeErrors.length);
                 }}
                 return "io-and-queue-ok";
                 "#
@@ -2837,6 +2883,106 @@ mod tests {
         assert_eq!((st_str.exit_code, out_str.as_str()), (Some(0), "a\nb\n"));
     }
 
+    #[test]
+    fn very_large_sleep_splits_preserve_time_and_allow_exact_chunk_subtraction() {
+        for ms in [
+            (1_u128 << 92) as f64,
+            (1_u128 << 93) as f64,
+            ((1_u128 << 93) + (1_u128 << 41)) as f64,
+            (1_u128 << 94) as f64,
+            f64::MAX,
+        ] {
+            let mut deferred = Vec::new();
+            let part = split_sleep(ms, &mut deferred);
+            assert!(part <= (1_u128 << 92) as f64);
+            let chunk = SLEEP_CHUNK_MS as f64;
+            assert_eq!(part - (part - chunk), chunk);
+            let restored = deferred.iter().rev().fold(part, |sum, half| sum + half);
+            assert_eq!(restored, ms);
+            assert!(deferred.len() <= 932);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_sleep_keeps_every_chunk_of_the_requested_delay() {
+        let chunk = Duration::from_millis(SLEEP_CHUNK_MS);
+        let sleeping = tokio::spawn(sleep((SLEEP_CHUNK_MS * 2 + 1) as f64));
+        tokio::task::yield_now().await;
+        for _ in 0..2 {
+            tokio::time::advance(chunk).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !sleeping.is_finished(),
+                "sleep discarded the remaining delay"
+            );
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(sleeping.is_finished());
+        sleeping.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_line_stack_columns_match_later_lines_and_keep_custom_stacks() {
+        fn columns(output: &str, line: u32) -> Vec<u32> {
+            let location = format!("codemode.js:{line}:");
+            output
+                .lines()
+                .filter(|line| line.starts_with("    at "))
+                .filter_map(|frame| frame.rsplit_once(&location))
+                .map(|(_, column)| column.trim_end_matches(')').parse().unwrap())
+                .collect()
+        }
+
+        let fixture = Fixture::new();
+        for code in [
+            "throw new Error('codemode.js:1:99');",
+            "const = 1;",
+            "return new Error('direct').stack;",
+            "console.error(new Error('console'));",
+            "await tools.read({path: 'missing-column.txt'});",
+            "await tools.exec({action: 'bogus'});",
+            "try { await tools.read({path: 'missing-column.txt'}); } catch (e) { return e.stack; }",
+            "try { await tools.exec({action: 'bogus'}); } catch (e) { return e.stack; }",
+            "const holds = Array.from({length: 1024}, () => sleep(60000)); try { await sleep(60000); } catch (e) { return e.stack; }",
+            "const bad = {toJSON() { throw new Error('inner'); }}; try { await tools.write({path: 'unused', content: bad}); } catch (e) { return e.stack; }",
+            "let saved; try { await tools.read({path: 'missing-column.txt'}); } catch (e) { saved = e; } try { await tools.write({path: 'unused', content: {toJSON() { throw saved; }}}); } catch (e) { return e.stack; }",
+        ] {
+            let (first_state, first) = fixture.result(code).await;
+            let (later_state, later) = fixture.result(&format!("\n{code}")).await;
+            assert_eq!(
+                first_state.exit_code, later_state.exit_code,
+                "{first}\n{later}"
+            );
+            let first_columns = columns(&first, 1);
+            let later_columns = columns(&later, 2);
+            assert!(!first_columns.is_empty(), "{code}: {first}");
+            assert_eq!(first_columns, later_columns, "{code}:\n{first}\n{later}");
+            if code.starts_with("throw new Error") {
+                assert!(first.contains("Error: codemode.js:1:99"), "{first}");
+            }
+        }
+
+        let custom = "    at custom (codemode.js:1:73)\n    at caller (custom.js:2:3)";
+        for setup in [
+            format!(
+                "const error = new Error('custom'); Object.defineProperty(error, 'stack', {{value: {custom:?}, configurable: true}});"
+            ),
+            format!("const error = new Error('custom'); error.stack = {custom:?};"),
+            format!(
+                "class Custom extends Error {{ get stack() {{ return {custom:?}; }} }} const error = new Custom('custom');"
+            ),
+        ] {
+            for ending in [
+                "throw error;",
+                "try { await tools.write({path: 'unused', content: {toJSON() { throw error; }}}); } catch (e) { return e.stack; }",
+            ] {
+                let (_, output) = fixture.result(&format!("{setup} {ending}")).await;
+                assert!(output.contains(custom), "{output}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn sleep_primitive_race_kill_and_validation() {
         let fixture = Fixture::new();
@@ -2867,7 +3013,10 @@ mod tests {
         child_script.kill().unwrap();
         complete(&child_script).await;
 
-        let sleeping = fixture.start("const p = sleep(60000); text('ready'); await p;", None);
+        let sleeping = fixture.start(
+            "const p = sleep(Number.MAX_VALUE); text('ready'); await p;",
+            None,
+        );
         let wait_deadline = Instant::now() + Duration::from_secs(10);
         while lock(&sleeping.script().unwrap().0.report)
             .pending
@@ -2875,7 +3024,7 @@ mod tests {
         {
             assert!(
                 Instant::now() < wait_deadline,
-                "sleeping script did not admit sleep(60000) in time"
+                "sleeping script did not admit sleep(Number.MAX_VALUE) in time"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

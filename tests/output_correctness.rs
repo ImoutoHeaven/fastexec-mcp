@@ -35,6 +35,7 @@ impl Server {
                 if structured { "true" } else { "false" },
             )
             .env("FASTEXEC_OUTPUT_MODE", mode)
+            .env("FASTEXEC_CODEMODE", "true")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -297,6 +298,56 @@ fn encoding_warnings_survive_every_mode_and_small_output_budget() {
             let result = server.exec(json!({"action": "transcript", "taskId": task_id,
                                            "maxBytes": 100}));
             assert_encoding_warning(&result, structured);
+        }
+    }
+}
+
+#[test]
+fn head_and_tail_use_the_body_budget_and_report_omissions_in_status() {
+    let mut server = Server::start();
+    let endpoint = "x".repeat(90);
+    for raw in [false, true] {
+        for mode in ["head", "tail"] {
+            let (first, last, omitted) = if mode == "head" {
+                (endpoint.as_str(), "this line does not fit", [2, 2])
+            } else {
+                ("this line does not fit", endpoint.as_str(), [1, 1])
+            };
+            let arguments = json!({
+                "action": "start",
+                "command": format!("printf '%s\\n' '{first}' '{last}'"),
+                "truncate": mode,
+                "maxBytes": 100,
+                "raw": raw,
+            });
+            let direct = server.exec(arguments.clone());
+            let data = &direct["structuredContent"];
+            assert_eq!(data["output"], endpoint);
+            assert_eq!(data["omittedRange"], json!(omitted));
+            assert_eq!(data["cutLines"].as_u64().unwrap_or(0), 0);
+            let rendered = text(&direct);
+            let (body, status) = rendered.split_once("\n\n").unwrap();
+            assert_eq!(body, endpoint);
+            assert!(status.contains(&format!(
+                "1 lines omitted: log lines {}-{}",
+                omitted[0], omitted[1]
+            )));
+            assert!(status.contains(data["logPath"].as_str().unwrap()));
+
+            let nested = server.request(
+                "tools/call",
+                json!({
+                    "name": "codemode",
+                    "arguments": {"code": format!("return await tools.exec({arguments});")}
+                }),
+            );
+            assert_eq!(nested["structuredContent"]["exitCode"], 0, "{nested}");
+            let data: Value =
+                serde_json::from_str(nested["structuredContent"]["output"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(data["output"], endpoint);
+            assert_eq!(data["omittedRange"], json!(omitted));
+            assert_eq!(data["cutLines"].as_u64().unwrap_or(0), 0);
         }
     }
 }

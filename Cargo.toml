@@ -29,6 +29,9 @@ tower-service = "0.3"
 unicode-normalization = "0.1"
 unicode-width = "0.2"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

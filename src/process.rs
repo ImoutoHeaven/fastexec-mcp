@@ -1238,7 +1238,7 @@ impl Tree {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            Some(windows::job_members(self.job.as_raw_handle()))
+            windows::job_members(self.job.as_raw_handle())
         }
         #[cfg(unix)]
         {
@@ -1349,15 +1349,17 @@ mod windows {
     use super::Member;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+        CloseHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, GetLastError, INVALID_HANDLE_VALUE,
+        STILL_ACTIVE,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
-        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1393,43 +1395,72 @@ mod windows {
         Ok(job)
     }
 
-    /// The live processes of a job, without console hosts, which come and go with the
-    /// console programs they serve. A process that has exited but not left the job's list yet
-    /// is left out; one this user may not query counts, named `?`. Processes past the first
-    /// 1024 are left out.
-    pub fn job_members(job: RawHandle) -> Vec<Member> {
-        // JOBOBJECT_BASIC_PROCESS_ID_LIST with room for 1024 IDs.
-        #[repr(C)]
-        struct List {
-            assigned: u32,
-            listed: u32,
-            ids: [usize; 1024],
+    /// The live processes of a job, without console hosts or exited processes. A failed or
+    /// incomplete query stays unknown; a process this user may not query counts, named ?.
+    pub fn job_members(job: RawHandle) -> Option<Vec<Member>> {
+        let ids = job_pids(|buffer, bytes| {
+            // SAFETY: job_pids supplies a usize-aligned buffer with room for the header and IDs.
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    job,
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    bytes,
+                    std::ptr::null_mut(),
+                )
+            };
+            if queried == 0 {
+                Err(unsafe { GetLastError() })
+            } else {
+                Ok(())
+            }
+        })?;
+        Some(
+            ids.into_iter()
+                .filter_map(|pid| {
+                    let name = live_name(pid)?;
+                    (!name.eq_ignore_ascii_case("conhost.exe")).then_some(Member { pid, name })
+                })
+                .collect(),
+        )
+    }
+
+    const JOB_LIST_HEADER_WORDS: usize =
+        std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList)
+            / std::mem::size_of::<usize>();
+
+    /// A growing job may need another snapshot; bounded retries keep that uncertainty explicit.
+    fn job_pids(mut query: impl FnMut(&mut [usize], u32) -> Result<(), u32>) -> Option<Vec<u32>> {
+        let mut capacity = 1024_usize;
+        for _ in 0..8 {
+            let words = JOB_LIST_HEADER_WORDS.checked_add(capacity)?;
+            let bytes = u32::try_from(words.checked_mul(std::mem::size_of::<usize>())?).ok()?;
+            let mut buffer = Vec::new();
+            buffer.try_reserve_exact(words).ok()?;
+            buffer.resize(words, 0_usize);
+            let complete = match query(&mut buffer, bytes) {
+                Ok(()) => true,
+                Err(ERROR_MORE_DATA) => false,
+                Err(_) => return None,
+            };
+            // SAFETY: usize storage has the header's alignment and at least one PID slot.
+            let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+            let (assigned, listed) = (
+                list.NumberOfAssignedProcesses as usize,
+                list.NumberOfProcessIdsInList as usize,
+            );
+            if listed > capacity || listed > assigned {
+                return None;
+            }
+            if complete && listed == assigned {
+                return buffer[JOB_LIST_HEADER_WORDS..JOB_LIST_HEADER_WORDS + listed]
+                    .iter()
+                    .map(|&pid| u32::try_from(pid).ok())
+                    .collect();
+            }
+            capacity = capacity.checked_mul(2)?.max(assigned);
         }
-        let mut list = List {
-            assigned: 0,
-            listed: 0,
-            ids: [0; 1024],
-        };
-        // SAFETY: the buffer has the layout of the information class and outlives the call.
-        // A full buffer fails with ERROR_MORE_DATA after filling it, so the result is not checked.
-        unsafe {
-            QueryInformationJobObject(
-                job,
-                JobObjectBasicProcessIdList,
-                (&mut list as *mut List).cast(),
-                std::mem::size_of::<List>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        let listed = (list.listed as usize).min(list.ids.len());
-        list.ids[..listed]
-            .iter()
-            .filter_map(|&pid| {
-                let pid = pid as u32;
-                let name = live_name(pid)?;
-                (!name.eq_ignore_ascii_case("conhost.exe")).then_some(Member { pid, name })
-            })
-            .collect()
+        None
     }
 
     /// The file name of a process's image, `?` when it cannot be read, or `None` when the
@@ -1502,5 +1533,103 @@ mod windows {
         // SAFETY: this function owns the snapshot handle.
         unsafe { CloseHandle(snapshot) };
         result
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn fill(buffer: &mut [usize], assigned: u32, listed: u32) {
+            // SAFETY: job_pids supplies aligned, initialized storage for this header.
+            let header = unsafe {
+                &mut *buffer
+                    .as_mut_ptr()
+                    .cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+            };
+            header.NumberOfAssignedProcesses = assigned;
+            header.NumberOfProcessIdsInList = listed;
+            for (index, pid) in buffer[JOB_LIST_HEADER_WORDS..]
+                .iter_mut()
+                .take(listed as usize)
+                .enumerate()
+            {
+                *pid = index + 1;
+            }
+        }
+
+        #[test]
+        fn a_failed_job_query_is_unknown_and_an_empty_job_is_complete() {
+            assert!(job_members(INVALID_HANDLE_VALUE).is_none());
+            // SAFETY: null arguments create an unnamed job owned by this test.
+            let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            assert!(!raw.is_null());
+            let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+            assert!(job_members(job.as_raw_handle()).unwrap().is_empty());
+            assert!(job_pids(|_, _| Err(ERROR_INVALID_PARAMETER)).is_none());
+            assert_eq!(job_pids(|_, _| Ok(())), Some(Vec::new()));
+        }
+
+        #[test]
+        fn job_queries_grow_for_more_data_and_successful_short_lists() {
+            for first in [Ok(()), Err(ERROR_MORE_DATA)] {
+                let mut calls = 0;
+                let ids = job_pids(|buffer, bytes| {
+                    calls += 1;
+                    assert_eq!(bytes as usize, std::mem::size_of_val(buffer));
+                    let capacity = buffer.len() - JOB_LIST_HEADER_WORDS;
+                    if calls == 1 {
+                        assert_eq!(capacity, 1024);
+                        fill(buffer, 1025, 1024);
+                        first
+                    } else {
+                        assert!(capacity >= 1025);
+                        fill(buffer, 1025, 1025);
+                        Ok(())
+                    }
+                })
+                .unwrap();
+                assert_eq!(calls, 2);
+                assert_eq!(ids, (1..=1025).collect::<Vec<_>>());
+            }
+        }
+
+        #[test]
+        fn job_queries_never_accept_inconsistent_counts() {
+            for (assigned, listed) in [(0, 1), (1025, 1025)] {
+                assert!(
+                    job_pids(|buffer, _| {
+                        fill(buffer, assigned, listed);
+                        Ok(())
+                    })
+                    .is_none()
+                );
+            }
+        }
+
+        #[test]
+        fn job_query_growth_is_bounded_and_byte_sizes_are_checked() {
+            let mut calls = 0;
+            assert!(
+                job_pids(|buffer, _| {
+                    calls += 1;
+                    let capacity = (buffer.len() - JOB_LIST_HEADER_WORDS) as u32;
+                    fill(buffer, capacity + 1, capacity);
+                    Err(ERROR_MORE_DATA)
+                })
+                .is_none()
+            );
+            assert_eq!(calls, 8);
+
+            let mut calls = 0;
+            assert!(
+                job_pids(|buffer, _| {
+                    calls += 1;
+                    fill(buffer, u32::MAX, 0);
+                    Err(ERROR_MORE_DATA)
+                })
+                .is_none()
+            );
+            assert_eq!(calls, 1);
+        }
     }
 }
