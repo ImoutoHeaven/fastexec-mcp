@@ -29,28 +29,20 @@ const NESTED_MAX_BYTES: u64 = 4 << 20;
 /// How much of a file is sniffed before deciding whether it is text.
 const SNIFF: usize = 8 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReadLimits {
     max_lines: u64,
     max_bytes: u64,
-    whole_file: bool,
 }
 
 impl ReadLimits {
     pub(crate) const DIRECT: Self = Self {
         max_lines: MAX_LINES,
         max_bytes: MAX_BYTES,
-        whole_file: false,
     };
     pub(crate) const NESTED: Self = Self {
         max_lines: u64::MAX,
         max_bytes: NESTED_MAX_BYTES,
-        whole_file: false,
-    };
-    pub(crate) const NESTED_WHOLE: Self = Self {
-        max_lines: u64::MAX,
-        max_bytes: NESTED_MAX_BYTES,
-        whole_file: true,
     };
 
     /// How much of one line is kept while it is read: a line that fits whole, and one byte more,
@@ -166,17 +158,12 @@ pub(crate) async fn read_nested(
     permit: tokio::sync::OwnedSemaphorePermit,
     cancel: tokio_util::sync::CancellationToken,
 ) -> CallToolResult {
-    let limits = if request.offset.is_none() && request.limit.is_none() {
-        ReadLimits::NESTED_WHOLE
-    } else {
-        ReadLimits::NESTED
-    };
     read_with_limits_and_permit(
         request,
         launch,
         http,
         render,
-        limits,
+        ReadLimits::NESTED,
         Some(permit),
         Some(cancel),
     )
@@ -656,18 +643,24 @@ fn read_text_cancellable(
             metadata.len()
         ));
     }
-    if limits.whole_file && metadata.len() > limits.max_bytes {
-        return Err(format!(
-            "Cannot read {shown_path} as a whole file: its size ({} bytes) exceeds the {} byte (4 MiB) limit; pass offset and limit to read it in slices.",
+    if limits == ReadLimits::NESTED && request.offset.is_none() && request.limit.is_none() {
+        return read_whole_utf8(
+            &mut file,
             metadata.len(),
+            &sniff[..sniffed],
+            &shown_path,
             limits.max_bytes,
-        ));
+            cancel,
+        );
     }
-    let start_line: u64 = match request.offset {
-        None => 1,
-        Some(off) if off > 0 => off as u64,
-        Some(off) => {
-            let want_from_end = off.unsigned_abs();
+    let negative_from_end = match request.offset {
+        Some(off) if off < 0 => Some(off.unsigned_abs()),
+        _ => None,
+    };
+    let mut start_line: u64 = match (request.offset, negative_from_end) {
+        (None, _) => 1,
+        (Some(off), None) => off as u64,
+        (_, Some(want_from_end)) => {
             let total_lines = count_lines_streaming(&mut file, &shown_path, cancel)?;
             if total_lines == 0 || want_from_end >= total_lines {
                 1
@@ -678,27 +671,111 @@ fn read_text_cancellable(
     };
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
-    let read_cap = if limits.whole_file {
-        limits.max_bytes + 1
-    } else {
-        u64::MAX
-    };
-    let source = Source::new(BufReader::new(file.take(read_cap)), cancel);
-    let window = Window::scan(source, start_line, request.limit, limits)?;
-    if limits.whole_file {
-        if window.stopped_on_bytes || window.window_bytes > limits.max_bytes {
+    let mut window = Window::scan(
+        Source::new(BufReader::new(&mut file), cancel),
+        start_line,
+        request.limit,
+        limits,
+    )?;
+    if let Some(want_from_end) = negative_from_end
+        && start_line > 1
+        && start_line > window.total_lines
+    {
+        // The file shrank between line counting and scanning; rescan once against the new count.
+        start_line = if window.total_lines == 0 || want_from_end >= window.total_lines {
+            1
+        } else {
+            window.total_lines - want_from_end + 1
+        };
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
+        window = Window::scan(
+            Source::new(BufReader::new(&mut file), cancel),
+            start_line,
+            request.limit,
+            limits,
+        )?;
+        if start_line > 1 && start_line > window.total_lines {
             return Err(format!(
-                "Cannot read {shown_path} as a whole file: its size exceeds the {} byte (4 MiB) limit; pass offset and limit to read it in slices.",
-                limits.max_bytes,
+                "Cannot read {shown_path}: the file shrank while reading; retry."
             ));
         }
-        if window.lossy {
-            return Err(format!(
-                "Cannot read {shown_path} as a whole file: it is not valid UTF-8; pass offset and limit to inspect it with U+FFFD replacements, or process it with exec."
-            ));
-        }
+    } else if start_line > 1 && start_line > window.total_lines {
+        return Err(format!(
+            "Offset {start_line} is beyond end of file ({} lines total)",
+            window.total_lines
+        ));
     }
     Ok(window.render(start_line, request.limit, &shown_path, limits))
+}
+
+fn read_whole_utf8(
+    file: &mut File,
+    initial_len: u64,
+    prefix: &[u8],
+    shown_path: &str,
+    max_bytes: u64,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Outcome, String> {
+    if initial_len > max_bytes {
+        return Err(format!(
+            "Cannot read {shown_path} as a whole file: its size ({initial_len} bytes) exceeds the {max_bytes} byte (4 MiB) limit; pass offset and limit to read it in slices.",
+        ));
+    }
+    let limit = max_bytes as usize;
+    let mut raw = Vec::with_capacity((initial_len as usize).min(limit).max(prefix.len()) + 1);
+    raw.extend_from_slice(prefix);
+    let mut chunk = vec![0_u8; 64 * 1024];
+    while raw.len() <= limit {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err("Cancelled while reading file.".into());
+        }
+        let want = (limit + 1 - raw.len()).min(chunk.len());
+        let read = file
+            .read(&mut chunk[..want])
+            .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+    }
+    if raw.len() > limit {
+        let actual = file
+            .metadata()
+            .map_or(raw.len() as u64, |m| m.len().max(raw.len() as u64));
+        return Err(format!(
+            "Cannot read {shown_path} as a whole file: its size ({actual} bytes) exceeds the {max_bytes} byte (4 MiB) limit; pass offset and limit to read it in slices.",
+        ));
+    }
+    let body = String::from_utf8(raw).map_err(|_| {
+        format!(
+            "Cannot read {shown_path} as a whole file: it is not valid UTF-8; pass offset and limit to inspect it with U+FFFD replacements, or process it with exec."
+        )
+    })?;
+    let total_lines =
+        bytecount_lf(body.as_bytes()) + u64::from(!body.is_empty() && !body.ends_with('\n'));
+    let notice = format!("[read] {shown_path} · {total_lines} lines");
+    let end_line = (total_lines > 0).then_some(total_lines);
+    let structured = json!({
+        "ok": true,
+        "kind": "text",
+        "path": shown_path,
+        "startLine": 1_u64,
+        "endLine": end_line,
+        "shownLines": total_lines,
+        "totalLines": total_lines,
+        "truncated": false,
+        "nextOffset": Value::Null,
+        "lineTooLong": false,
+        "lossy": false,
+    });
+    Ok(Outcome {
+        text: body.clone(),
+        notice,
+        body: Some(body),
+        image: None,
+        structured,
+    })
 }
 
 /// Both text readers reject special files before reading any data. The initial check avoids
@@ -754,12 +831,14 @@ fn read_upto(file: &mut File, into: &mut [u8]) -> std::io::Result<usize> {
 /// A file's lines: decoded a line at a time while a line is kept, and only scanned for its end
 /// while it is not.
 struct Source<'a> {
-    reader: BufReader<std::io::Take<File>>,
+    reader: BufReader<&'a mut File>,
     cancel: Option<&'a tokio_util::sync::CancellationToken>,
-    /// Decoded text already read and not yet given to a line, with where each replacement
-    /// character it holds sits.
+    /// Decoded text already read and not yet given to a line (`pending[pos..]`), with where each
+    /// replacement character it holds sits (`marks[mark_pos..]`).
     pending: String,
+    pos: usize,
     marks: Vec<usize>,
+    mark_pos: usize,
     /// Bytes of a character the last read cut in two, carried to the next read.
     carry: Vec<u8>,
     /// Set once every line has been answered.
@@ -768,14 +847,16 @@ struct Source<'a> {
 
 impl<'a> Source<'a> {
     fn new(
-        reader: BufReader<std::io::Take<File>>,
+        reader: BufReader<&'a mut File>,
         cancel: Option<&'a tokio_util::sync::CancellationToken>,
     ) -> Self {
         Self {
             reader,
             cancel,
             pending: String::new(),
+            pos: 0,
             marks: Vec::new(),
+            mark_pos: 0,
             carry: Vec::new(),
             done: false,
         }
@@ -789,24 +870,33 @@ impl<'a> Source<'a> {
         }
         let mut line = Line::default();
         loop {
-            if let Some(at) = self.pending.find('\n') {
-                let end = at + 1;
-                let lossy = self.marks.iter().any(|mark| *mark < end);
-                line.push(&self.pending[..end], lossy, keep);
-                self.take(end);
+            if let Some(rel) = self.pending[self.pos..].find('\n') {
+                let end = self.pos + rel + 1;
+                let mut lossy = false;
+                while self.mark_pos < self.marks.len() && self.marks[self.mark_pos] < end {
+                    lossy = true;
+                    self.mark_pos += 1;
+                }
+                line.push(&self.pending[self.pos..end], lossy, keep);
+                self.pos = end;
+                if self.pos == self.pending.len() {
+                    self.clear_pending();
+                }
                 return Ok(Some(line));
             }
             // No line end here, so all of it belongs to this line.
-            let text = std::mem::take(&mut self.pending);
-            let lossy = !self.marks.is_empty();
-            line.push(&text, lossy, keep);
-            self.marks.clear();
+            if self.pos < self.pending.len() {
+                let lossy = self.mark_pos < self.marks.len();
+                line.push(&self.pending[self.pos..], lossy, keep);
+                self.clear_pending();
+            }
             if self.fill()? {
                 // The end: the flushed unfinished character is the rest of this line.
-                let text = std::mem::take(&mut self.pending);
-                let lossy = !self.marks.is_empty();
-                line.push(&text, lossy, keep);
-                self.marks.clear();
+                if self.pos < self.pending.len() {
+                    let lossy = self.mark_pos < self.marks.len();
+                    line.push(&self.pending[self.pos..], lossy, keep);
+                    self.clear_pending();
+                }
                 self.done = true;
                 return Ok((line.length > 0).then_some(line));
             }
@@ -818,14 +908,20 @@ impl<'a> Source<'a> {
         if self.done {
             return Ok(None);
         }
-        if let Some(at) = self.pending.find('\n') {
-            let end = at + 1;
-            self.take(end);
-            return Ok(Some(end as u64));
+        if let Some(rel) = self.pending[self.pos..].find('\n') {
+            let len = rel + 1;
+            let end = self.pos + len;
+            while self.mark_pos < self.marks.len() && self.marks[self.mark_pos] < end {
+                self.mark_pos += 1;
+            }
+            self.pos = end;
+            if self.pos == self.pending.len() {
+                self.clear_pending();
+            }
+            return Ok(Some(len as u64));
         }
-        let mut length = self.pending.len() as u64 + self.carry.len() as u64;
-        self.pending.clear();
-        self.marks.clear();
+        let mut length = (self.pending.len() - self.pos) as u64 + self.carry.len() as u64;
+        self.clear_pending();
         self.carry.clear();
         loop {
             if self
@@ -904,13 +1000,11 @@ impl<'a> Source<'a> {
         }
     }
 
-    /// Drops `count` bytes from the front of `pending`, marks included.
-    fn take(&mut self, count: usize) {
-        self.pending.drain(..count);
-        self.marks.retain(|mark| *mark >= count);
-        for mark in &mut self.marks {
-            *mark -= count;
-        }
+    fn clear_pending(&mut self) {
+        self.pending.clear();
+        self.pos = 0;
+        self.marks.clear();
+        self.mark_pos = 0;
     }
 }
 
@@ -960,12 +1054,6 @@ impl Window {
                 };
                 window.skip_line(in_window, length);
             }
-        }
-        if start > 0 && start >= window.total_lines {
-            return Err(format!(
-                "Offset {start_line} is beyond end of file ({} lines total)",
-                window.total_lines
-            ));
         }
         Ok(window)
     }
@@ -2569,13 +2657,33 @@ fn apply_edits(
             continue;
         }
 
-        if fuzzy.in_count == 0 {
-            let mut out_lines: Vec<usize> = fuzzy
-                .out_starts
-                .iter()
-                .map(|&pos| line_at_fuzzy(pos))
-                .collect();
-            let mut out_total = fuzzy.out_count;
+        let not_found_outside = || {
+            let (mut out_lines, mut out_total): (Vec<usize>, usize) = if same_form {
+                (
+                    fuzzy
+                        .out_starts
+                        .iter()
+                        .map(|&pos| line_at_fuzzy(pos))
+                        .collect(),
+                    fuzzy.out_count,
+                )
+            } else if fuzzy.out_count == 0 {
+                (Vec::new(), 0)
+            } else if let Some(m) = map.get_or_init(|| FuzzyMap::new(&normalized.text)).as_ref() {
+                let valid_out = starts_positions_filtered(haystack, &needle, |pos| {
+                    in_line_range(line_at_fuzzy(pos)) || m.span(pos, pos + needle.len()).is_none()
+                });
+                (
+                    valid_out
+                        .out_starts
+                        .iter()
+                        .map(|&pos| line_at_fuzzy(pos))
+                        .collect(),
+                    valid_out.out_count,
+                )
+            } else {
+                (Vec::new(), 0)
+            };
             if !same_form {
                 for &exact_out in &exact.out_starts {
                     if !exact_survives_fuzzy(&normalized.text, exact_out, old.len(), &needle) {
@@ -2586,10 +2694,13 @@ fn apply_edits(
                 }
                 out_lines.truncate(MAX_REPORTED_ITEMS);
             }
-            problems[index] = Some(EntryProblem::NotFound {
+            EntryProblem::NotFound {
                 lines: out_lines,
                 more: out_total.saturating_sub(MAX_REPORTED_ITEMS),
-            });
+            }
+        };
+        if fuzzy.in_count == 0 {
+            problems[index] = Some(not_found_outside());
             continue;
         }
         if fuzzy.in_count > 1 {
@@ -2609,10 +2720,7 @@ fn apply_edits(
             .as_ref()
             .and_then(|m| m.span(fuzzy.in_starts[0], fuzzy.in_starts[0] + needle.len()))
         else {
-            problems[index] = Some(EntryProblem::NotFound {
-                lines: Vec::new(),
-                more: 0,
-            });
+            problems[index] = Some(not_found_outside());
             continue;
         };
         let (raw_at, raw_end) = (normalized.original(at), normalized.original(at + len));
@@ -3538,7 +3646,7 @@ mod tests {
             },
             &launch,
             false,
-            ReadLimits::NESTED_WHOLE,
+            ReadLimits::NESTED,
         )
         .unwrap();
         assert_eq!(nested_huge.body.as_deref(), Some(huge.as_str()));
@@ -3558,7 +3666,7 @@ mod tests {
             },
             &launch,
             false,
-            ReadLimits::NESTED_WHOLE,
+            ReadLimits::NESTED,
         )
         .unwrap();
         assert_eq!(nested_whole.body.as_deref(), Some(nested_many.as_str()));
@@ -3578,7 +3686,7 @@ mod tests {
             },
             &launch,
             false,
-            ReadLimits::NESTED_WHOLE,
+            ReadLimits::NESTED,
         )
         .unwrap();
         assert_eq!(whole_mib.body.as_deref(), Some(one_mib_plus.as_str()));
@@ -3596,7 +3704,7 @@ mod tests {
             },
             &launch,
             false,
-            ReadLimits::NESTED_WHOLE,
+            ReadLimits::NESTED,
         )
         .err()
         .unwrap();
@@ -3631,7 +3739,7 @@ mod tests {
             },
             &launch,
             false,
-            ReadLimits::NESTED_WHOLE,
+            ReadLimits::NESTED,
         )
         .err()
         .unwrap();
@@ -6619,20 +6727,92 @@ mod tests {
         );
 
         // Concurrent growth past 4 MiB after metadata check (ending mid-UTF-8 codepoint at
-        // max_bytes + 1) reports the size limit rather than a false UTF-8 error.
+        // max_bytes + 1) reports the size limit with actual byte count rather than a UTF-8 error.
         let grown = scratch.0.join("grown.txt");
         let mut multibyte_over_4m = "a".repeat(NESTED_MAX_BYTES as usize - 1);
-        multibyte_over_4m.push('中'); // 4_194_303 + 3 = 4_194_306 bytes; take(4_194_305) cuts mid-'中'
+        multibyte_over_4m.push('中'); // 4_194_303 + 3 = 4_194_306 bytes
         std::fs::write(&grown, &multibyte_over_4m).unwrap();
-        let f = File::open(&grown).unwrap();
-        let source = Source::new(
-            BufReader::new(f.take(ReadLimits::NESTED_WHOLE.max_bytes + 1)),
+        let mut f = File::open(&grown).unwrap();
+        let grown_err = read_whole_utf8(
+            &mut f,
+            0, // simulates initial metadata.len() <= 4 MiB before concurrent append
+            &[],
+            "grown.txt",
+            NESTED_MAX_BYTES,
             None,
-        );
-        let win = Window::scan(source, 1, None, ReadLimits::NESTED_WHOLE).unwrap();
+        )
+        .err()
+        .unwrap();
         assert!(
-            win.stopped_on_bytes || win.window_bytes > ReadLimits::NESTED_WHOLE.max_bytes,
-            "must detect size overflow before lossy flag"
+            grown_err.contains("4194306 bytes")
+                && grown_err.contains("exceeds the 4194304 byte (4 MiB) limit"),
+            "{grown_err}"
         );
+
+        // Invalid UTF-8 file <= 4 MiB on disk whose lossy U+FFFD expansion would exceed 4 MiB
+        // (2,000,000 x 0xff -> 6,000,000 B if decoded lossily) must report invalid UTF-8, not size.
+        let bad_2m = scratch.0.join("bad_single_2m.txt");
+        std::fs::write(&bad_2m, vec![0xff_u8; 2_000_000]).unwrap();
+        let bad_2m_err = read_text(
+            &ReadRequest {
+                path: "bad_single_2m.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::NESTED,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            bad_2m_err.contains("not valid UTF-8") && !bad_2m_err.contains("exceeds"),
+            "{bad_2m_err}"
+        );
+
+        // Linear-time streaming over many short invalid-UTF-8 lines (previously O(N^2) in Source).
+        let many_lossy = scratch.0.join("many_lossy.txt");
+        std::fs::write(&many_lossy, b"\xff\n".repeat(200_000)).unwrap();
+        let started = std::time::Instant::now();
+        let lossy_slice = read_text(
+            &ReadRequest {
+                path: "many_lossy.txt".into(),
+                offset: Some(1),
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::NESTED,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(lossy_slice.structured["totalLines"], 200_000);
+        assert_eq!(lossy_slice.structured["lossy"], true);
+
+        // Partial compatibility decomposition inside or outside range (⒠ -> "(e)") rejected by
+        // FuzzyMap::span never counts as an out-of-range candidate, while real matches do.
+        let compat_path = scratch.0.join("compat.txt");
+        std::fs::write(&compat_path, "alpha\n\u{24a0}\n\u{24a0}\ne\n").unwrap();
+        let compat_miss = edit_outcome(
+            &EditRequest {
+                path: "compat.txt".into(),
+                edits: vec![Edit {
+                    old_text: "e".into(),
+                    new_text: "E".into(),
+                    start_line: Some(2),
+                    end_line: Some(2),
+                }],
+            },
+            &launch,
+        )
+        .unwrap_err()
+        .1
+        .unwrap();
+        assert_eq!(compat_miss["failures"][0]["problem"], "not_found");
+        assert_eq!(compat_miss["failures"][0]["lines"], json!([4]));
     }
 }

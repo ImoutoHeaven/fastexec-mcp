@@ -1726,22 +1726,15 @@ impl Service {
             screen.rows_count
         );
         let room = view.max_bytes;
-        let mut body = screen.rows.join("\n");
-        let need_log = needs_log_in_status(&snapshot, 0, None) || body.len() > room;
+        let full_len = screen.rows.iter().map(String::len).sum::<usize>()
+            + screen.rows.len().saturating_sub(1);
+        let need_log = needs_log_in_status(&snapshot, 0, None) || full_len > room;
         let mut status = status_line(&task, &snapshot, &task_reader, need_log, None);
         status.push_str(&screen_note);
         if task_reader.is_fresh() {
             status.push_str(NEW_READER_NOTE);
         }
-        let mut omitted = 0;
-        while body.len() > room && omitted < screen.rows.len() {
-            omitted += 1;
-            body = format!(
-                "... [{omitted} top rows omitted] ...\n{}",
-                screen.rows[omitted..].join("\n")
-            );
-        }
-        output::cut_to(&mut body, room.saturating_add(1));
+        let (body, omitted) = fit_screen_rows(&screen.rows, room);
         let shown = if body.is_empty() && room >= "(blank screen)".len() {
             "(blank screen)"
         } else {
@@ -1776,6 +1769,20 @@ impl Service {
         drop(state);
         Ok(result)
     }
+}
+
+fn fit_screen_rows(rows: &[String], room: usize) -> (String, usize) {
+    let mut body = rows.join("\n");
+    let mut omitted = 0;
+    while body.len() > room && omitted + 1 < rows.len() {
+        omitted += 1;
+        body = format!(
+            "... [{omitted} top rows omitted] ...\n{}",
+            rows[omitted..].join("\n")
+        );
+    }
+    output::cut_to(&mut body, room.saturating_add(1));
+    (body, omitted)
 }
 
 fn status_line(
@@ -2903,5 +2910,25 @@ mod tests {
             assert!(text.contains("short"));
             assert!(text.len() <= 100);
         }
+    }
+
+    #[test]
+    fn screen_row_omission_keeps_and_cuts_the_bottom_row_when_it_exceeds_budget() {
+        let single = vec!["bottom-".repeat(30)];
+        let (body, omitted) = fit_screen_rows(&single, 100);
+        assert_eq!(omitted, 0);
+        assert!(body.starts_with("bottom-bottom-"), "{body}");
+        assert!(body.ends_with(" … [cut]"), "{body}");
+        assert!(body.len() <= 100);
+
+        let multi = vec!["top-1".into(), "top-2".into(), "bottom-".repeat(30)];
+        let (body, omitted) = fit_screen_rows(&multi, 100);
+        assert_eq!(omitted, 2);
+        assert!(
+            body.starts_with("... [2 top rows omitted] ...\nbottom-"),
+            "{body}"
+        );
+        assert!(body.ends_with(" … [cut]"), "{body}");
+        assert!(body.len() <= 100);
     }
 }

@@ -443,7 +443,7 @@ omitted on final serialization unless noted as always-present below.
   outside this session; use list with scope "all".`; the session flag is
   consumed atomically when a delivered response shows that clause or when the
   session's first committed footer-bearing result finds no outside tasks (never
-  on nested calls, cancelled calls, or tiny budgets that drop a non-zero count). A footer marks only session tasks it names; `list`
+  on nested or cancelled calls). A footer marks only session tasks it names; `list`
   marks existing session entries shown in direct text or delivered in a nested
   `tasks` array.
 

@@ -524,13 +524,11 @@ impl Host {
                             () = tokio::time::sleep(duration) => {}
                         }
                     }
-                    let payload = "{\"ok\":true}".to_owned();
-                    let outcome = if lock(&script.0.report).result(id, payload.len()) {
-                        Outcome::Value(payload)
-                    } else {
-                        Outcome::Limit
-                    };
-                    let _ = script.0.wake.send(Wake::Settled { id, outcome });
+                    let _ = lock(&script.0.report).result(id, 0);
+                    let _ = script.0.wake.send(Wake::Settled {
+                        id,
+                        outcome: Outcome::Value(String::new()),
+                    });
                     return;
                 }
                 ToolCall::Exec(request) => {
@@ -1125,12 +1123,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     let state = 0;
     let failure;
 
-    function captureCallStack() {
-        let raw = "";
-        try {
-            const probe = new ErrorCtor();
-            raw = getErrorStack ? getErrorStack(probe) : probe.stack;
-        } catch {}
+    function stripPreludeFrames(raw) {
         if (typeof raw !== "string" || raw.length === 0) return "";
         let out = "";
         let pos = 0;
@@ -1145,17 +1138,35 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         }
         return out;
     }
+    function readErrorStack(error) {
+        if (error === null || typeof error !== "object") return "";
+        let raw = "";
+        if (getErrorStack) {
+            try { raw = getErrorStack(error); } catch {}
+        }
+        if (typeof raw !== "string" || raw.length === 0) {
+            try { raw = error.stack; } catch {}
+        }
+        return stripPreludeFrames(raw);
+    }
+    function captureCallStack() {
+        try { return readErrorStack(new ErrorCtor()); }
+        catch { return ""; }
+    }
     function withCallStack(error, stack) {
-        if (stack && error !== null && typeof error === "object") {
-            try {
-                defineProperty(error, "stack", {
-                    __proto__: null,
-                    value: stack,
-                    writable: true,
-                    enumerable: false,
-                    configurable: true,
-                });
-            } catch {}
+        if (error !== null && typeof error === "object") {
+            const chosen = readErrorStack(error) || stack;
+            if (chosen) {
+                try {
+                    defineProperty(error, "stack", {
+                        __proto__: null,
+                        value: chosen,
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    });
+                } catch {}
+            }
         }
         return error;
     }
@@ -1780,6 +1791,10 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             if (!ok) {
                 const error = range ? new RangeErrorCtor(payload) : new ErrorCtor(payload);
                 entry.reject(withCallStack(error, entry.stack));
+                return;
+            }
+            if (entry.tool === "sleep") {
+                entry.resolve(undefined);
                 return;
             }
             let envelope;
@@ -2925,5 +2940,30 @@ mod tests {
             "took {:?}",
             t0.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn sync_serialization_errors_keep_inner_frames_and_sleep_resolves_undefined() {
+        let fixture = Fixture::new();
+        let (st, out) = fixture
+            .result(
+                "const slept = await sleep(0);\n\
+                 if (slept !== undefined) throw new Error('expected undefined');\n\
+                 const bad = {\n\
+                     toJSON() { throw new Error('inner-tojson'); }\n\
+                 };\n\
+                 try {\n\
+                     await tools.write({ path: 'out.txt', content: bad });\n\
+                 } catch (e) {\n\
+                     return e.stack;\n\
+                 }",
+            )
+            .await;
+        assert_eq!(st.exit_code, Some(0), "{out}");
+        assert!(
+            out.contains("codemode.js:4") && out.contains("codemode.js:7"),
+            "expected both inner toJSON frame and tools.write call frame: {out}"
+        );
+        assert!(!out.contains("codemode-prelude.js"), "{out}");
     }
 }

@@ -790,7 +790,23 @@ fn cut_line_to_budget(text: &mut String, limit: usize, already_dropped: usize) {
     let max_dropped = already_dropped + text.len();
     let max_marker = format!(" … [line cut at {budget_label}; {max_dropped} more bytes]");
     if limit < max_marker.len() {
-        let _ = cut_to(text, limit.saturating_add(1));
+        if already_dropped == 0 && text.len() <= limit {
+            return;
+        }
+        if limit < 2 * MARK.len() {
+            let mut end = limit.min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            return;
+        }
+        let mut end = (limit - MARK.len()).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str(MARK);
         return;
     }
     let mut keep = (limit - max_marker.len()).min(text.len());
@@ -1361,5 +1377,27 @@ mod tests {
             (out.text.as_str(), out.cut_lines, out.omitted),
             ("OK", 0, None)
         );
+
+        // When a multi-byte character crosses a small budget (< max_marker.len()),
+        // prefix.len() < budget while dropped > 0: the cut marker must still appear.
+        let mut cleaner = Cleaner::default();
+        let mut small = WindowBuilder::new(
+            WindowSpec {
+                truncate: Truncate::Head,
+                budget: 25,
+                raw: false,
+                clean: true,
+                keep_nul: false,
+                encoding: encoding_rs::UTF_8,
+                source: "log",
+            },
+            &mut cleaner,
+            1,
+        );
+        small.push(format!("{}🦀\n", "a".repeat(24)).as_bytes());
+        let small_out = small.finish();
+        assert_eq!(small_out.cut_lines, 1);
+        assert!(small_out.text.ends_with(MARK), "{:?}", small_out.text);
+        assert!(small_out.text.len() <= 25);
     }
 }
