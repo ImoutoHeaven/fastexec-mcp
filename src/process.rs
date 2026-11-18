@@ -404,13 +404,11 @@ fn parse_env_dump(bytes: &[u8]) -> Result<Vec<(OsString, OsString)>, String> {
     #[cfg(windows)]
     let (units, from_units) = {
         use std::os::windows::ffi::OsStringExt;
-        if !payload.len().is_multiple_of(2) {
+        let (pairs, remainder) = payload.as_chunks::<2>();
+        if !remainder.is_empty() {
             return Err(invalid());
         }
-        let units: Vec<_> = payload
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+        let units: Vec<_> = pairs.iter().copied().map(u16::from_le_bytes).collect();
         (units, OsString::from_wide)
     };
     #[cfg(windows)]
