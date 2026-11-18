@@ -6,7 +6,7 @@ use crate::output::{
     incomplete_utf8_suffix,
 };
 use crate::process::{self, Launch, Member, Tree};
-use crate::session::{LaunchContext, ReadState, Reader, Session, TaskEntry};
+use crate::session::{LaunchContext, ProbeWarning, ReadState, Reader, Session, TaskEntry};
 use crate::terminal::Live;
 use encoding_rs::Encoding;
 use std::collections::HashSet;
@@ -236,6 +236,7 @@ struct EndWork {
     child: process::Child,
     script: PathBuf,
     exit_status: Option<PathBuf>,
+    confirmed: Option<mpsc::Sender<()>>,
 }
 
 fn worker<T: Send + 'static>(
@@ -357,6 +358,9 @@ impl Workers {
                     &job.script,
                     job.exit_status.as_deref(),
                 );
+                if let Some(confirmed) = job.confirmed {
+                    let _ = confirmed.send(());
+                }
             })?,
         })
     }
@@ -864,7 +868,7 @@ impl Tasks {
         args: StartArgs,
         session: &Session,
         key: String,
-    ) -> Result<(Started, Option<String>), String> {
+    ) -> Result<(Started, Option<ProbeWarning>), String> {
         let kill_after_ms = args.kill_after_ms;
         // Admission holds a place against the running limit, so the bash lookup, the file
         // creation, and the spawn below all run without the registry lock.
@@ -1595,6 +1599,24 @@ impl Tasks {
     }
 }
 
+/// Decide how to handle the root's last observed members. A successful requested cleanup
+/// still takes the normal output-drain path when the initial observation was unavailable.
+fn root_leftovers(
+    preserve: bool,
+    listed: Option<Vec<Member>>,
+    kill: impl FnOnce() -> std::io::Result<()>,
+) -> (Vec<Member>, bool, Option<std::io::Error>) {
+    let unknown = listed.is_none();
+    let leftovers = listed.unwrap_or_default();
+    if preserve {
+        let kept = unknown || !leftovers.is_empty();
+        (leftovers, kept, None)
+    } else {
+        let error = kill().err();
+        (leftovers, error.is_some(), error)
+    }
+}
+
 /// Waits for the root and publishes its result. The separately prepared ender owns the rest
 /// of the tree and closes the PTY in parallel: a slow OS wait or ConPTY close must not prevent
 /// the root result from being published after the bounded output drain.
@@ -1616,23 +1638,22 @@ fn wait_task(job: WaitWork) {
     } else {
         task.root.members()
     };
-    let mut leftovers = listed.clone().unwrap_or_default();
-    let mut kept = task.keep && listed.as_ref().is_none_or(|members| !members.is_empty());
-    let kill_error = if kept {
-        None
-    } else {
-        task.root.kill().err().map(|error| error.to_string())
-    };
-    if kill_error.is_some() || listed.is_none() {
-        kept = true;
+    let preserve = task.keep && !killed && !expired;
+    let (mut leftovers, mut kept, kill_error) =
+        root_leftovers(preserve, listed, || task.root.kill());
+    if let Some(error) = kill_error {
         leftovers = task.root.members().unwrap_or(leftovers);
-        *lock(&task.kill_error) = kill_error;
+        *lock(&task.kill_error) = Some(error.to_string());
     }
-    if !kept {
+    if !kept && !preserve {
         *lock(&task.input) = None;
     }
+    // A process listing can miss a fork while the parent disappears. Keep the input and
+    // lifetime alive while the ender independently waits for the operating system's proof.
+    let (confirmed, completion) = (preserve && !kept).then(mpsc::channel).unzip();
     ender
         .send(EndWork {
+            confirmed,
             shared: Arc::clone(&shared),
             task: Arc::clone(&task),
             child,
@@ -1642,6 +1663,10 @@ fn wait_task(job: WaitWork) {
         .unwrap_or_else(|_| unreachable!("prepared ender stopped"));
     let drain_deadline = Instant::now() + DRAIN_CAP;
     let output_open = drain_until(&task, &eof, kept, drain_deadline);
+    if let Some(completion) = completion {
+        let _ = completion.recv_timeout(drain_deadline.saturating_duration_since(Instant::now()));
+        kept = !*task.tree_done.borrow();
+    }
     if !kept {
         task.writer_done.wait_until(drain_deadline);
     }
@@ -2127,7 +2152,12 @@ impl Task {
 
     /// Feeds `matcher` the stored output from `from` on, advancing `from` past what it read,
     /// and ends it once output has ended; returns the lowest needle the matcher has found.
-    pub fn scan(&self, matcher: &mut Matcher, from: &mut u64) -> std::io::Result<Option<usize>> {
+    pub fn scan(
+        &self,
+        matcher: &mut Matcher,
+        from: &mut u64,
+        cancel: &CancellationToken,
+    ) -> std::io::Result<Option<usize>> {
         let (written, evicted, closed) = {
             let out = lock(&self.out);
             (out.written, out.evicted, out.closed)
@@ -2136,7 +2166,7 @@ impl Task {
             return Ok(None);
         }
         if written > *from {
-            if let Err(error) = self.scan_log(matcher, from, written) {
+            if let Err(error) = self.scan_log(matcher, from, written, cancel) {
                 // Eviction can delete the log between the flags above and this read.
                 if !lock(&self.out).evicted {
                     return Err(error);
@@ -2156,11 +2186,17 @@ impl Task {
 
     /// Feeds the matcher the stored output from `from` to `written`, advancing `from`; an error
     /// leaves `from` where the last complete read put it.
-    fn scan_log(&self, matcher: &mut Matcher, from: &mut u64, written: u64) -> std::io::Result<()> {
+    fn scan_log(
+        &self,
+        matcher: &mut Matcher,
+        from: &mut u64,
+        written: u64,
+        cancel: &CancellationToken,
+    ) -> std::io::Result<()> {
         let mut file = File::open(&self.log_path)?;
         file.seek(SeekFrom::Start(*from))?;
         let mut buffer = vec![0_u8; 64 * 1024];
-        while *from < written {
+        while *from < written && !cancel.is_cancelled() {
             let want = (written - *from).min(buffer.len() as u64) as usize;
             file.read_exact(&mut buffer[..want])?;
             *from += want as u64;
@@ -3064,6 +3100,20 @@ mod ids {
     }
 
     #[test]
+    fn uncertain_membership_never_kills_a_kept_tree_or_shortens_a_successful_cleanup() {
+        for listed in [Some(Vec::new()), None] {
+            let unknown = listed.is_none();
+            let (leftovers, kept, error) = root_leftovers(true, listed, || panic!("keepTree"));
+            assert!(leftovers.is_empty());
+            assert_eq!(kept, unknown);
+            assert!(error.is_none());
+        }
+        let (_, kept, error) = root_leftovers(false, None, || Ok(()));
+        assert!(!kept);
+        assert!(error.is_none());
+    }
+
+    #[test]
     fn base32_is_minimal_and_most_significant_first() {
         assert_eq!(base32(1, 1), "1");
         assert_eq!(base32(31, 1), "z");
@@ -3475,7 +3525,11 @@ mod tests {
             Some(Cleaner::default()),
         );
         let mut from = 0;
-        assert_eq!(task.scan(&mut matcher, &mut from).unwrap(), None);
+        assert_eq!(
+            task.scan(&mut matcher, &mut from, &CancellationToken::new())
+                .unwrap(),
+            None
+        );
         // A log that is gone while the task is not evicted stays an error.
         let live = start(&tasks, start_args()).unwrap();
         finish(&live);
@@ -3487,7 +3541,8 @@ mod tests {
         );
         let mut from = 0;
         assert!(
-            live.scan(&mut matcher, &mut from).is_err(),
+            live.scan(&mut matcher, &mut from, &CancellationToken::new())
+                .is_err(),
             "a missing log of a task that was not evicted is a real error"
         );
         tasks.shutdown();

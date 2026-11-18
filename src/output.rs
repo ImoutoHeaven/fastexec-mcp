@@ -28,7 +28,6 @@ enum EscState {
     Esc,
     Csi,
     Osc,
-    OscEsc,
 }
 
 /// Per-task cleaning state carried between windows so sequences split across reads stay intact.
@@ -36,8 +35,6 @@ enum EscState {
 pub struct Cleaner {
     escape: EscState,
     pending_cr: bool,
-    /// A CR ended the previous window's last line; a leading LF only completes that CRLF.
-    swallow_lf: bool,
     /// The previous window ended inside a line; an empty remainder of it is not shown again.
     continued: bool,
 }
@@ -50,32 +47,27 @@ enum Step {
     /// A control byte: it starts the line without adding text.
     Control,
     EndLine,
-    /// The LF completing a CRLF whose line the previous window already showed.
-    SwallowedLf,
 }
 
 impl Cleaner {
     /// Advances the ANSI CSI/OSC parser; returns true when `byte` belongs to a sequence.
     fn escape(&mut self, byte: u8) -> bool {
         self.escape = match (self.escape, byte) {
-            (EscState::Text, 0x1b) => EscState::Esc,
+            (_, 0x1b) => EscState::Esc, // ESC also restarts an interrupted CSI or OSC.
             (EscState::Text, _) => return false,
+            (_, 0x18 | 0x1a) => EscState::Text, // CAN and SUB cancel the sequence.
             (EscState::Esc, b'[') => EscState::Csi,
             (EscState::Esc, b']') => EscState::Osc,
             (EscState::Esc, _) | (EscState::Csi, 0x40..=0x7e) => EscState::Text,
             (EscState::Csi, _) => EscState::Csi,
-            (EscState::Osc, 0x07) | (EscState::OscEsc, b'\\') => EscState::Text,
-            (EscState::Osc, 0x1b) | (EscState::OscEsc, 0x1b) => EscState::OscEsc,
-            (EscState::Osc, _) | (EscState::OscEsc, _) => EscState::Osc,
+            (EscState::Osc, 0x07) => EscState::Text,
+            (EscState::Osc, _) => EscState::Osc,
         };
         true
     }
 
     /// Cleans one byte: returns whether the line is cleared first, and what the byte does.
     fn step(&mut self, byte: u8, keep_nul: bool) -> (bool, Step) {
-        if std::mem::take(&mut self.swallow_lf) && byte == b'\n' {
-            return (false, Step::SwallowedLf);
-        }
         let mut clear = false;
         if self.escape == EscState::Csi && matches!(byte, b'K' | b'J') && self.pending_cr {
             // An erase rewrites the line; SGR, OSC and cursor visibility leave its text intact.
@@ -171,7 +163,7 @@ impl Matcher {
                     self.found(true);
                     self.new_line();
                 }
-                Step::Nothing | Step::Control | Step::SwallowedLf => {}
+                Step::Nothing | Step::Control => {}
             }
             if self.best == Some(0) {
                 return self.best;
@@ -230,6 +222,9 @@ impl Matcher {
 /// One candidate line retained while streaming: its UTF-8 prefix (up to `spec.budget` bytes)
 /// and how many decoded UTF-8 bytes followed that prefix.
 struct Candidate {
+    /// Inclusive physical log lines. An OSC can span LF bytes without a displayed line break.
+    first: u64,
+    last: u64,
     prefix: String,
     dropped: usize,
 }
@@ -319,6 +314,8 @@ pub struct WindowBuilder<'a> {
     spec: WindowSpec,
     cleaner: &'a mut Cleaner,
     first_line: u64,
+    line_start: u64,
+    last_displayed: u64,
     newlines: u64,
     total_lines: u64,
     line: Vec<u8>,
@@ -340,6 +337,8 @@ impl<'a> WindowBuilder<'a> {
             spec,
             cleaner,
             first_line,
+            line_start: first_line,
+            last_displayed: first_line,
             newlines: 0,
             total_lines: 0,
             line: Vec::new(),
@@ -389,7 +388,7 @@ impl<'a> WindowBuilder<'a> {
             self.trailing_spaces = 0;
         }
         match step {
-            Step::Nothing => {}
+            Step::Nothing => self.newlines += u64::from(byte == b'\n'),
             Step::Append => {
                 self.trailing_spaces = if byte == b' ' {
                     self.trailing_spaces + 1
@@ -400,7 +399,6 @@ impl<'a> WindowBuilder<'a> {
             }
             Step::Control => self.line_started = true,
             Step::EndLine => self.end_line(true),
-            Step::SwallowedLf => self.newlines += 1,
         }
     }
 
@@ -416,9 +414,9 @@ impl<'a> WindowBuilder<'a> {
     }
 
     fn end_line(&mut self, terminated: bool) {
-        if terminated {
-            self.newlines += 1;
-        }
+        let last = self.first_line + self.newlines;
+        self.newlines += u64::from(terminated);
+        let first = std::mem::replace(&mut self.line_start, self.first_line + self.newlines);
         let bytes = std::mem::take(&mut self.line);
         self.line_started = false;
         if std::mem::take(&mut self.cleaner.continued) && bytes.is_empty() && self.decoded.is_none()
@@ -453,7 +451,13 @@ impl<'a> WindowBuilder<'a> {
         let stored_padding = trailing_spaces.saturating_sub(dropped);
         prefix.truncate(prefix.len() - stored_padding);
         dropped = dropped.saturating_sub(trailing_spaces);
-        self.place(Candidate { prefix, dropped });
+        self.last_displayed = last;
+        self.place(Candidate {
+            first,
+            last,
+            prefix,
+            dropped,
+        });
     }
 
     fn place(&mut self, cand: Candidate) {
@@ -499,11 +503,7 @@ impl<'a> WindowBuilder<'a> {
 
     pub fn finish(mut self) -> Window {
         if self.line_started || !self.line.is_empty() {
-            // The unterminated last line is shown now; a trailing CR may still pair with a LF.
-            if self.spec.clean && self.cleaner.pending_cr {
-                self.cleaner.pending_cr = false;
-                self.cleaner.swallow_lf = true;
-            }
+            // Deliver the fragment now. Keep the escape and CR parser states for the next read.
             self.end_line(false);
             self.cleaner.continued = true;
         }
@@ -541,16 +541,16 @@ impl<'a> WindowBuilder<'a> {
                 .join("\n");
             return (text, 0, None);
         }
-        let first_num = self.first_line;
-        let last_num = self.first_line + self.total_lines - 1;
+        let first_num = self.head[0].first;
+        let last_num = self.last_displayed;
         if self.total_lines == 1 {
             if budget == 0 {
-                return (String::new(), 0, Some((first_num, first_num)));
+                return (String::new(), 0, Some((first_num, last_num)));
             }
             let mut text = self.head[0].prefix.clone();
             cut_line_to_budget(&mut text, budget, self.head[0].dropped);
             if text.is_empty() {
-                return (String::new(), 0, Some((first_num, first_num)));
+                return (String::new(), 0, Some((first_num, last_num)));
             }
             return (text, 1, None);
         }
@@ -570,7 +570,7 @@ impl<'a> WindowBuilder<'a> {
                 if text.is_empty() {
                     return (text, 0, Some((first_num, last_num)));
                 }
-                return (text, 1, Some((first_num + 1, last_num)));
+                return (text, 1, Some((first.last + 1, last_num)));
             }
             let text = self
                 .head
@@ -581,7 +581,10 @@ impl<'a> WindowBuilder<'a> {
             return (
                 text,
                 0,
-                Some((first_num + self.head.len() as u64, last_num)),
+                Some((
+                    self.head.last().expect("head includes the first line").last + 1,
+                    last_num,
+                )),
             );
         }
 
@@ -610,7 +613,7 @@ impl<'a> WindowBuilder<'a> {
                     .map(|cand| cand.prefix.as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
-                return (text, 0, Some((first_num, last_num - t as u64)));
+                return (text, 0, Some((first_num, suffix_rev[t - 1].first - 1)));
             }
             let last = suffix_rev[0];
             let mut text = last.prefix.clone();
@@ -618,13 +621,13 @@ impl<'a> WindowBuilder<'a> {
             if text.is_empty() {
                 return (text, 0, Some((first_num, last_num)));
             }
-            return (text, 1, Some((first_num, last_num - 1)));
+            return (text, 1, Some((first_num, last.first - 1)));
         }
 
         // Truncate::HeadTail multi-line overflow (Rule 5).
         let max_marker_len = format!(
             "... [{} lines omitted: {source} lines {last_num}-{last_num}] ...",
-            self.total_lines
+            last_num - first_num + 1
         )
         .len();
         if budget <= max_marker_len + 2 {
@@ -664,8 +667,11 @@ impl<'a> WindowBuilder<'a> {
             }
         }
 
-        let first_tail_num = last_num + 1 - tail_kept.len() as u64;
-        let before_tail = (first_tail_num - first_num) as usize;
+        let first_tail_num = tail_kept
+            .len()
+            .checked_sub(1)
+            .map_or(last_num + 1, |index| suffix_rev[index].first);
+        let before_tail = self.total_lines as usize - tail_kept.len();
         let mut head_used = 0usize;
         let mut h = 0usize;
         for cand in self.head.iter().take(before_tail) {
@@ -677,8 +683,7 @@ impl<'a> WindowBuilder<'a> {
             let fits = if rem == 0 {
                 next_used + tail_used <= budget + 1
             } else {
-                let m_len =
-                    format_marker(source, first_num + (h + 1) as u64, first_tail_num - 1).len();
+                let m_len = format_marker(source, cand.last + 1, first_tail_num - 1).len();
                 next_used + m_len + tail_used <= budget
             };
             if fits {
@@ -695,7 +700,7 @@ impl<'a> WindowBuilder<'a> {
             return (lines.join("\n"), tail_cuts, None);
         }
         if h > 0 {
-            let omitted = (first_num + h as u64, first_tail_num - 1);
+            let omitted = (self.head[h - 1].last + 1, first_tail_num - 1);
             let marker = format_marker(source, omitted.0, omitted.1);
             let mut lines: Vec<&str> = self.head[..h].iter().map(|c| c.prefix.as_str()).collect();
             lines.push(&marker);
@@ -715,17 +720,21 @@ impl<'a> WindowBuilder<'a> {
                     return (lines.join("\n"), 1 + tail_cuts, None);
                 }
             }
-            let marker = format_marker(source, first_num, first_num);
+            let marker = format_marker(source, first_num, self.head[0].last);
             if marker.len() + tail_used <= budget {
                 let mut lines = Vec::with_capacity(1 + tail_kept.len());
                 lines.push(marker.as_str());
                 lines.extend(tail_kept.iter().map(String::as_str));
-                return (lines.join("\n"), tail_cuts, Some((first_num, first_num)));
+                return (
+                    lines.join("\n"),
+                    tail_cuts,
+                    Some((first_num, self.head[0].last)),
+                );
             }
             return fallback_all();
         }
 
-        let omitted = (first_num + 1, first_tail_num - 1);
+        let omitted = (self.head[0].last + 1, first_tail_num - 1);
         let marker = format_marker(source, omitted.0, omitted.1);
         if budget > marker.len() + tail_used + 1 {
             let avail = budget - marker.len() - tail_used - 1;
@@ -1078,6 +1087,78 @@ mod tests {
         let out = second.finish();
         assert_eq!(out.text, "next");
         assert_eq!(out.newlines, 2);
+    }
+
+    #[test]
+    fn physical_log_ranges_survive_split_lines_and_multiline_escapes() {
+        let spec = |truncate| WindowSpec {
+            truncate,
+            budget: 180,
+            raw: false,
+            clean: true,
+            keep_nul: false,
+            encoding: encoding_rs::UTF_8,
+            source: "log",
+        };
+        let mut cleaner = Cleaner::default();
+        for prefix in [b"partial".as_slice(), b"partial\r"] {
+            let mut first = WindowBuilder::new(spec(Truncate::Head), &mut cleaner, 1);
+            first.push(prefix);
+            assert_eq!(first.finish().text, "partial");
+            let mut second = WindowBuilder::new(spec(Truncate::Head), &mut cleaner, 1);
+            second.push(b"\n\n");
+            second.push(&[b'x'; 175]);
+            second.push(b"\ndropped\n");
+            let result = second.finish();
+            assert_eq!(result.text, format!("\n{}", "x".repeat(175)));
+            assert_eq!(result.omitted, Some((4, 4)));
+            assert_eq!(result.newlines, 4);
+        }
+
+        let row = "a".repeat(100);
+        let body = format!("{row}\n{row}\x1b]0;title\nsecond\nthird\x07\n{row}\n");
+        for (truncate, omitted) in [
+            (Truncate::Head, (2, 5)),
+            (Truncate::Tail, (1, 4)),
+            (Truncate::HeadTail, (2, 4)),
+        ] {
+            let mut builder = WindowBuilder::new(spec(truncate), &mut cleaner, 1);
+            builder.push(body.as_bytes());
+            let result = builder.finish();
+            assert_eq!(result.newlines, 5);
+            assert_eq!(result.omitted, Some(omitted), "{:?}", result.text);
+        }
+        let mut inside = WindowBuilder::new(spec(Truncate::Head), &mut cleaner, 1);
+        inside.push(b"\x1b]title\nmore\n");
+        let hidden = inside.finish();
+        assert!(hidden.is_empty());
+        assert_eq!(hidden.newlines, 2);
+        let mut next = WindowBuilder::new(spec(Truncate::Head), &mut cleaner, 3);
+        next.push(b"title\x07A\n");
+        next.push(&[b'x'; 200]);
+        assert_eq!(next.finish().omitted, Some((4, 4)));
+    }
+
+    #[test]
+    fn interrupted_ansi_sequences_release_following_text_in_windows_and_matches() {
+        for prefix in [b"\x1b]title".as_slice(), b"\x1b[123;"] {
+            for terminator in [b"\x18".as_slice(), b"\x1a", b"\x1b[31m", b"\x1b\\"] {
+                let chunks = [prefix, terminator, b"visible"];
+                let clean = window(&chunks, Truncate::Head, LARGE_BUDGET, false);
+                assert_eq!(clean.text, "visible");
+                let raw = window(&chunks, Truncate::Head, LARGE_BUDGET, true);
+                assert_eq!(raw.text.as_bytes(), chunks.concat());
+                let mut matcher = Matcher::new(
+                    &["visible".to_owned()],
+                    encoding_rs::UTF_8,
+                    Some(Cleaner::default()),
+                );
+                for chunk in chunks {
+                    matcher.push(chunk);
+                }
+                assert_eq!(matcher.finish(), Some(0));
+            }
+        }
     }
 
     #[test]

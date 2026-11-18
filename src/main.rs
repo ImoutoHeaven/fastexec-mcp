@@ -1975,23 +1975,32 @@ mod portable_schema_tests {
             edit_g["properties"]["edits"]["items"]["properties"]["oldText"]["type"],
             json!("STRING")
         );
+        // The wire constraints match. Each tool describes its own behavior and defaults.
+        let constraints = |field: &Value| {
+            let mut schema = field.as_object().unwrap().clone();
+            schema.remove("description");
+            schema
+        };
         for shared in ["waitMs", "killAfterMs", "truncate", "maxBytes"] {
             assert_eq!(
-                code_s["properties"][shared], exec_s["properties"][shared],
+                constraints(&code_s["properties"][shared]),
+                constraints(&exec_s["properties"][shared]),
                 "codemode.{shared} diverged from exec.{shared}"
             );
         }
-        assert_eq!(
-            code_s["properties"]["returnWhen"]["description"],
-            exec_s["properties"]["returnWhen"]["description"]
-        );
         for rw_field in ["outputContains", "quietMs"] {
             assert_eq!(
-                code_s["properties"]["returnWhen"]["properties"][rw_field],
-                exec_s["properties"]["returnWhen"]["properties"][rw_field],
+                constraints(&code_s["properties"]["returnWhen"]["properties"][rw_field]),
+                constraints(&exec_s["properties"]["returnWhen"]["properties"][rw_field]),
                 "returnWhen.{rw_field} diverged"
             );
         }
+        assert!(
+            code_s["properties"]["killAfterMs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Tasks the script already started keep running")
+        );
         assert_eq!(
             exec_s["properties"]["truncate"]["enum"],
             json!(["head_tail", "head", "tail"])

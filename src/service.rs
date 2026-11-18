@@ -5,7 +5,7 @@
 use crate::keys;
 use crate::output::{self, Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
 use crate::process;
-use crate::session::{ReadState, Reader, Session, TaskEntry, parse_handle};
+use crate::session::{ProbeWarning, ReadState, Reader, Session, TaskEntry, parse_handle};
 use crate::tasks::{self, EVICTED_TRANSCRIPT, ScriptArgs, Snapshot, StartArgs, Task, Tasks};
 use crate::wait::{self, WaitEnd};
 use crate::{codemode, conpty, files, images};
@@ -625,7 +625,7 @@ impl Service {
     async fn wait_started(
         &self,
         started: tasks::Started,
-        startup_warning: Option<String>,
+        startup_warning: Option<ProbeWarning>,
         wait_duration: Option<Duration>,
         when: Option<&wait::ReturnWhen>,
         view: View,
@@ -1335,7 +1335,7 @@ impl Service {
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
         ended: Option<WaitEnd>,
-        startup_warning: Option<String>,
+        startup_warning: Option<ProbeWarning>,
     ) -> Result<CallToolResult, String> {
         if view.screen {
             return self
@@ -1425,7 +1425,7 @@ impl Service {
                 .unwrap()
                 .extend(images.warnings.into_iter().map(Value::String));
         }
-        if let Some(warning) = startup_warning {
+        if let Some(warning) = startup_warning.and_then(ProbeWarning::deliver) {
             structured["warnings"]
                 .as_array_mut()
                 .unwrap()
@@ -1688,7 +1688,7 @@ impl Service {
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
         ended: WaitEnd,
-        startup_warning: Option<String>,
+        startup_warning: Option<ProbeWarning>,
     ) -> Result<CallToolResult, String> {
         // A finished state, taken first, means the screen below holds all output.
         let snapshot = task.snapshot_held();
@@ -1713,7 +1713,7 @@ impl Service {
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
         let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
         let mut structured = task_json(action, &task, &snapshot, &task_reader);
-        if let Some(warning) = startup_warning {
+        if let Some(warning) = startup_warning.and_then(ProbeWarning::deliver) {
             structured["warnings"]
                 .as_array_mut()
                 .unwrap()

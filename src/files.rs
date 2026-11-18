@@ -653,60 +653,60 @@ fn read_text_cancellable(
             cancel,
         );
     }
-    let negative_from_end = match request.offset {
-        Some(off) if off < 0 => Some(off.unsigned_abs()),
-        _ => None,
+    let tail = if let Some(offset) = request.offset.filter(|off| *off < 0) {
+        Some((
+            offset.unsigned_abs(),
+            count_lines_streaming(&mut file, &shown_path, cancel)?,
+        ))
+    } else {
+        None
     };
-    let mut start_line: u64 = match (request.offset, negative_from_end) {
-        (None, _) => 1,
-        (Some(off), None) => off as u64,
-        (_, Some(want_from_end)) => {
-            let total_lines = count_lines_streaming(&mut file, &shown_path, cancel)?;
-            if total_lines == 0 || want_from_end >= total_lines {
-                1
-            } else {
-                total_lines - want_from_end + 1
-            }
-        }
-    };
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
-    let mut window = Window::scan(
-        Source::new(BufReader::new(&mut file), cancel),
-        start_line,
-        request.limit,
-        limits,
-    )?;
-    if let Some(want_from_end) = negative_from_end
-        && start_line > 1
-        && start_line > window.total_lines
-    {
-        // The file shrank between line counting and scanning; rescan once against the new count.
-        start_line = if window.total_lines == 0 || want_from_end >= window.total_lines {
-            1
-        } else {
-            window.total_lines - want_from_end + 1
-        };
-        file.seek(SeekFrom::Start(0))
+    let mut scan = |start_line| {
+        file.rewind()
             .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
-        window = Window::scan(
+        Window::scan(
             Source::new(BufReader::new(&mut file), cancel),
             start_line,
             request.limit,
             limits,
-        )?;
-        if start_line > 1 && start_line > window.total_lines {
+        )
+    };
+    let (start_line, window) = if let Some((distance, total)) = tail {
+        scan_from_end(distance, total, &shown_path, scan)?
+    } else {
+        let start = request.offset.unwrap_or(1) as u64;
+        let window = scan(start)?;
+        if start > 1 && start > window.total_lines {
             return Err(format!(
-                "Cannot read {shown_path}: the file shrank while reading; retry."
+                "Offset {start} is beyond end of file ({} lines total)",
+                window.total_lines
             ));
         }
-    } else if start_line > 1 && start_line > window.total_lines {
-        return Err(format!(
-            "Offset {start_line} is beyond end of file ({} lines total)",
-            window.total_lines
-        ));
-    }
+        (start, window)
+    };
     Ok(window.render(start_line, request.limit, &shown_path, limits))
+}
+
+/// A successful tail slice must start at the offset implied by its own observed line count.
+fn scan_from_end(
+    distance: u64,
+    total: u64,
+    path: &str,
+    mut scan: impl FnMut(u64) -> Result<Window, String>,
+) -> Result<(u64, Window), String> {
+    let from_end = |lines: u64| lines.saturating_sub(distance) + 1;
+    let mut start = from_end(total);
+    for _ in 0..2 {
+        let window = scan(start)?;
+        let observed_start = from_end(window.total_lines);
+        if start == observed_start {
+            return Ok((start, window));
+        }
+        start = observed_start;
+    }
+    Err(format!(
+        "Cannot read {path}: the file changed while reading; retry."
+    ))
 }
 
 fn read_whole_utf8(
@@ -2658,45 +2658,48 @@ fn apply_edits(
         }
 
         let not_found_outside = || {
-            let (mut out_lines, mut out_total): (Vec<usize>, usize) = if same_form {
-                (
-                    fuzzy
-                        .out_starts
-                        .iter()
-                        .map(|&pos| line_at_fuzzy(pos))
-                        .collect(),
-                    fuzzy.out_count,
-                )
-            } else if fuzzy.out_count == 0 {
-                (Vec::new(), 0)
-            } else if let Some(m) = map.get_or_init(|| FuzzyMap::new(&normalized.text)).as_ref() {
-                let valid_out = starts_positions_filtered(haystack, &needle, |pos| {
-                    in_line_range(line_at_fuzzy(pos)) || m.span(pos, pos + needle.len()).is_none()
-                });
-                (
-                    valid_out
-                        .out_starts
-                        .iter()
-                        .map(|&pos| line_at_fuzzy(pos))
-                        .collect(),
-                    valid_out.out_count,
-                )
-            } else {
-                (Vec::new(), 0)
-            };
-            if !same_form {
-                for &exact_out in &exact.out_starts {
-                    if !exact_survives_fuzzy(&normalized.text, exact_out, old.len(), &needle) {
-                        let line = line_at_norm(exact_out);
-                        out_lines.insert(out_lines.partition_point(|&other| other < line), line);
-                        out_total += 1;
+            let mut lines: Vec<_> = exact
+                .out_starts
+                .iter()
+                .map(|&pos| line_at_norm(pos))
+                .collect();
+            let mut count = exact.out_count;
+            if !same_form
+                && fuzzy.out_count != 0
+                && let Some(m) = map.get_or_init(|| FuzzyMap::new(&normalized.text)).as_ref()
+            {
+                // Every exact start is editable. Add only whole-unit fuzzy spans with a
+                // separate source occurrence. Trimming can move a fuzzy boundary inside the
+                // exact span. Both searches advance in source order.
+                let mut exact_starts = matching_starts(&normalized.text, old).peekable();
+                let mut extra = 0;
+                for pos in matching_starts(haystack, &needle) {
+                    let line = line_at_fuzzy(pos);
+                    if in_line_range(line) {
+                        continue;
                     }
+                    let Some((start, len)) = m.span(pos, pos + needle.len()) else {
+                        continue;
+                    };
+                    while exact_starts
+                        .next_if(|&exact| exact + old.len() < start + len)
+                        .is_some()
+                    {}
+                    if exact_starts.peek().is_some_and(|&exact| exact <= start) {
+                        continue;
+                    }
+                    if extra < MAX_REPORTED_ITEMS {
+                        lines.push(line);
+                    }
+                    extra += 1;
                 }
-                out_lines.truncate(MAX_REPORTED_ITEMS);
+                count += extra;
+                lines.sort_unstable();
+                lines.truncate(MAX_REPORTED_ITEMS);
             }
             EntryProblem::NotFound {
-                lines: out_lines,
-                more: out_total.saturating_sub(MAX_REPORTED_ITEMS),
+                lines,
+                more: count.saturating_sub(MAX_REPORTED_ITEMS),
             }
         };
         if fuzzy.in_count == 0 {
@@ -2962,10 +2965,24 @@ fn starts_positions_filtered(
     needle: &str,
     mut in_range: impl FnMut(usize) -> bool,
 ) -> FilteredStarts {
-    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
-    if needle.is_empty() {
-        return FilteredStarts::default();
+    let mut out = FilteredStarts::default();
+    for pos in matching_starts(haystack, needle) {
+        let (count, starts) = if in_range(pos) {
+            (&mut out.in_count, &mut out.in_starts)
+        } else {
+            (&mut out.out_count, &mut out.out_starts)
+        };
+        *count += 1;
+        if starts.len() < MAX_REPORTED_ITEMS {
+            starts.push(pos);
+        }
     }
+    out
+}
+
+/// Overlapping matches in ascending byte order, in linear time.
+fn matching_starts<'a>(haystack: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let needle = needle.as_bytes();
     let mut table = vec![0usize; needle.len()];
     let mut matched = 0;
     for at in 1..needle.len() {
@@ -2977,32 +2994,22 @@ fn starts_positions_filtered(
         }
         table[at] = matched;
     }
-    let mut out = FilteredStarts::default();
     matched = 0;
-    for (idx, byte) in haystack.iter().enumerate() {
-        while matched > 0 && *byte != needle[matched] {
+    let haystack = if needle.is_empty() { "" } else { haystack };
+    haystack.bytes().enumerate().filter_map(move |(idx, byte)| {
+        while matched > 0 && byte != needle[matched] {
             matched = table[matched - 1];
         }
-        if *byte == needle[matched] {
+        if byte == needle[matched] {
             matched += 1;
         }
         if matched == needle.len() {
-            let pos = idx + 1 - needle.len();
-            if in_range(pos) {
-                out.in_count += 1;
-                if out.in_starts.len() < MAX_REPORTED_ITEMS {
-                    out.in_starts.push(pos);
-                }
-            } else {
-                out.out_count += 1;
-                if out.out_starts.len() < MAX_REPORTED_ITEMS {
-                    out.out_starts.push(pos);
-                }
-            }
             matched = table[matched - 1];
+            Some(idx + 1 - needle.len())
+        } else {
+            None
         }
-    }
-    out
+    })
 }
 
 /// Applies matches to `content`, retaining each edit's start in the original file.
@@ -6565,6 +6572,76 @@ mod tests {
             assert_eq!(a.structured, b.structured, "neg={neg} pos={pos}");
             assert_eq!(a.body, b.body, "neg={neg} pos={pos}");
         }
+    }
+
+    #[test]
+    fn a_tail_slice_rechecks_its_own_line_count_after_growth_or_shrinkage() {
+        let scratch = Scratch::new("changing-tail");
+        let path = scratch.0.join("changes.txt");
+        for (later, expected, start) in
+            [("1\n2\n3\n4\n5\n", "4\n5\n", 4), ("1\n2\n3\n", "2\n3\n", 2)]
+        {
+            std::fs::write(&path, "1\n2\n3\n4\n").unwrap();
+            let mut file = File::open(&path).unwrap();
+            let initial = count_lines_streaming(&mut file, "changes.txt", None).unwrap();
+            std::fs::write(&path, later).unwrap();
+            let (observed, window) = scan_from_end(2, initial, "changes.txt", |from| {
+                file.rewind().unwrap();
+                Window::scan(
+                    Source::new(BufReader::new(&mut file), None),
+                    from,
+                    None,
+                    ReadLimits::DIRECT,
+                )
+            })
+            .unwrap();
+            assert_eq!(observed, start);
+            let result = window.render(observed, None, "changes.txt", ReadLimits::DIRECT);
+            assert_eq!(result.body.as_deref(), Some(expected));
+        }
+
+        let mut totals = [5, 6].into_iter();
+        let error = scan_from_end(2, 4, "changes.txt", |_| {
+            Ok(Window {
+                total_lines: totals.next().unwrap(),
+                ..Default::default()
+            })
+        })
+        .err()
+        .unwrap();
+        assert!(error.contains("changed while reading; retry"));
+    }
+
+    #[test]
+    fn outside_range_hints_count_exact_and_editable_fuzzy_sources_once() {
+        let outside = |source: &str, old: &str, line| {
+            let request = EditRequest {
+                path: "sources.txt".into(),
+                edits: vec![Edit {
+                    old_text: old.into(),
+                    new_text: "updated".into(),
+                    start_line: Some(line),
+                    end_line: Some(line),
+                }],
+            };
+            apply_edits(source, &request, "sources.txt")
+                .unwrap_err()
+                .1
+                .unwrap()["failures"][0]
+                .clone()
+        };
+        for (source, old, line, starts) in [
+            ("q\u{301}\n“a”\n", "q", 2, vec![1]),
+            ("x \nfoo\nz\n", " \nfoo", 3, vec![1]),
+            ("e\nｅ\n⒠\ne\u{301}\n", "e", 5, vec![1, 2, 4]),
+        ] {
+            let failure = outside(source, old, line);
+            assert_eq!(failure["lines"], json!(starts));
+            assert!(failure.get("more").is_none());
+        }
+        let failure = outside(&"e\u{301}\n".repeat(23), "e", 24);
+        assert_eq!(failure["lines"], json!((1..=20).collect::<Vec<_>>()));
+        assert_eq!(failure["more"], 3);
     }
 
     #[test]

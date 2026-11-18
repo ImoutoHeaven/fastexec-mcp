@@ -16,6 +16,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const PROGRESS_EVERY: Duration = Duration::from_secs(20);
+const CANCELLED: &str = "Cancelled; the task keeps running.";
 /// The latest progress message: elapsed seconds and its text.
 pub type Progress = (f64, String);
 const MAX_TEXT_BYTES: usize = 4096;
@@ -200,19 +201,26 @@ fn ended(task: &Task, root_reported: bool, conditions: bool) -> Option<WaitEnd> 
 /// Ends a wait the end of the task or its tree ended. After the tree, the output those
 /// processes held open reaches EOF shortly: the wait gives it up to the drain cap, within its
 /// deadline when it has one, so the result holds their last output.
-async fn finish(task: &Task, end: WaitEnd, deadline: Option<tokio::time::Instant>) -> WaitEnd {
+async fn finish(
+    task: &Task,
+    end: WaitEnd,
+    deadline: Option<tokio::time::Instant>,
+    cancel: &CancellationToken,
+) -> Result<WaitEnd, String> {
     if matches!(end, WaitEnd::TreeEnded) {
         let drain_until = tokio::time::Instant::now() + crate::tasks::DRAIN_CAP;
         let until = deadline.map_or(drain_until, |d| d.min(drain_until));
         let mut activity = task.activity();
         while !task.output_closed() {
             tokio::select! {
-                _ = activity.changed() => {}
+                biased;
+                _ = cancel.cancelled() => return Err(CANCELLED.into()),
                 _ = tokio::time::sleep_until(until) => break,
+                _ = activity.changed() => {}
             }
         }
     }
-    end
+    Ok(end)
 }
 
 /// The screen conditions of a wait, with what they compare against.
@@ -323,7 +331,7 @@ pub async fn wait(
         done.borrow_and_update();
         tree_done.borrow_and_update();
         if let Some(end) = ended(task, root_reported, conditions) {
-            return Ok(finish(task, end, deadline).await);
+            return finish(task, end, deadline, cancel).await;
         }
         let mut quiet_until = None;
         let met = 'check: {
@@ -352,11 +360,19 @@ pub async fn wait(
             };
             if let Some(mut searching) = matcher.take() {
                 let (reader, mut from) = (Arc::clone(task), scanned);
-                let (searching, from, found) = tokio::task::spawn_blocking(move || {
-                    let found = reader.scan(&mut searching, &mut from);
+                let scan_cancel = cancel.clone();
+                let mut scan = tokio::task::spawn_blocking(move || {
+                    let found = reader.scan(&mut searching, &mut from, &scan_cancel);
                     (searching, from, found)
-                })
-                .await
+                });
+                let (searching, from, found) = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        scan.abort();
+                        return Err(CANCELLED.into());
+                    }
+                    result = &mut scan => result,
+                }
                 .map_err(|error| format!("Internal failure while reading output: {error}."))?;
                 let found = found.map_err(|error| format!("Cannot read the task log: {error}."))?;
                 if let Some(index) = found {
@@ -368,14 +384,14 @@ pub async fn wait(
         };
         // A task that ended while the conditions were checked takes precedence.
         if let Some(met) = met.or(expired.then_some(WaitEnd::MaxWait)) {
-            return Ok(match ended(task, root_reported, conditions) {
-                Some(end) => finish(task, end, deadline).await,
-                None => met,
-            });
+            return match ended(task, root_reported, conditions) {
+                Some(end) => finish(task, end, deadline, cancel).await,
+                None => Ok(met),
+            };
         }
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err("Cancelled; the task keeps running.".into()),
+            _ = cancel.cancelled() => return Err(CANCELLED.into()),
             _ = done.changed() => {}
             _ = tree_done.changed() => {}
             _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => expired = true,
@@ -401,6 +417,72 @@ mod tests {
     use crate::service::Service;
     use crate::session::{LaunchContext, ReadState, Session};
     use crate::tasks::{Limits, ScriptArgs, Tasks};
+
+    #[test]
+    fn cancellation_interrupts_a_queued_log_scan_and_an_open_output_drain() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tasks = Tasks::new(Limits::OFF).unwrap();
+            let launch = Arc::new(LaunchContext::current().unwrap());
+            let session = Session::new("s".into(), "s".into(), Arc::clone(&launch));
+            let (task, _, reader) = tasks
+                .start_script(
+                    ScriptArgs {
+                        code: "await sleep(60000);".into(),
+                        launch,
+                        kill_after_ms: None,
+                        http: false,
+                        call_id: None,
+                        service: Arc::new(Service::new(Arc::clone(&tasks), false)),
+                    },
+                    &session,
+                    "r001".into(),
+                )
+                .unwrap();
+
+            // Keep the only blocking worker occupied until the wait has returned.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let (started, busy) = tokio::sync::oneshot::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = held.recv();
+            });
+            busy.await.unwrap();
+            let when = serde_json::from_value(serde_json::json!({
+                "outputContains": ["never printed"]
+            }))
+            .unwrap();
+            let mark = mark(&task, &reader, &ReadState::default(), Some(&when)).unwrap();
+            let cancel = CancellationToken::new();
+            let mut scan = std::pin::pin!(wait(
+                &task,
+                None,
+                Some(&when),
+                mark,
+                encoding_rs::UTF_8,
+                &cancel,
+                None
+            ));
+            let mut drain = std::pin::pin!(finish(&task, WaitEnd::TreeEnded, None, &cancel));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(scan.as_mut().poll(&mut cx).is_pending());
+            assert!(drain.as_mut().poll(&mut cx).is_pending());
+            cancel.cancel();
+            for result in [scan.as_mut().poll(&mut cx), drain.as_mut().poll(&mut cx)] {
+                assert!(
+                    matches!(result, std::task::Poll::Ready(Err(message)) if message == CANCELLED)
+                );
+            }
+            drop(release);
+            worker.await.unwrap();
+            task.kill().unwrap();
+            tasks.shutdown();
+        });
+    }
 
     #[tokio::test]
     async fn unbounded_and_overflow_waits_resolve_on_task_exit_or_cancellation() {

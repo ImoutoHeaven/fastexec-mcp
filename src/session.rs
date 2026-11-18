@@ -16,17 +16,51 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 enum LoginEnv {
     Snapshot(Vec<(OsString, OsString)>),
-    Failed(String),
+    Failed(Arc<Mutex<Option<String>>>),
 }
+
+/// The start that ran the probe reserves its failure message until it can deliver it.
+/// If that start fails or is cancelled, another fallback start can report it.
+pub struct ProbeWarning {
+    reserved: Option<String>,
+    unreported: Arc<Mutex<Option<String>>>,
+}
+
+impl ProbeWarning {
+    pub fn deliver(mut self) -> Option<String> {
+        self.reserved
+            .take()
+            .or_else(|| lock(&self.unreported).take())
+    }
+}
+
+impl Drop for ProbeWarning {
+    fn drop(&mut self) {
+        if let Some(message) = self.reserved.take() {
+            *lock(&self.unreported) = Some(message);
+        }
+    }
+}
+
+type BashLookup = OnceLock<Result<PathBuf, String>>;
 
 #[derive(Default)]
 struct LaunchCache {
     /// GNU bash for this context, found on first use and reused by every task of the session.
-    /// A lookup that fails leaves `None` so the next task retries.
-    bash: Mutex<Option<PathBuf>>,
+    /// Concurrent callers share an attempt, including its failure. A later caller may retry.
+    bash: Mutex<Arc<BashLookup>>,
     /// Login-shell environment snapshot captured once on the first non-login start.
     login_env: OnceLock<LoginEnv>,
-    warned_probe_failure: AtomicBool,
+}
+
+impl LaunchCache {
+    fn bash_lookup(&self) -> Arc<BashLookup> {
+        let mut attempt = lock(&self.bash);
+        if attempt.get().is_some_and(Result::is_err) {
+            *attempt = Arc::default();
+        }
+        Arc::clone(&attempt)
+    }
 }
 
 const SHELL_MANAGED_VARS: [&str; 6] = ["PWD", "OLDPWD", "SHLVL", "_", "SHELLOPTS", "BASHOPTS"];
@@ -129,13 +163,10 @@ impl LaunchContext {
 
     /// The bash these tasks run, found once per session cache.
     pub fn bash(&self) -> Result<PathBuf, String> {
-        let mut slot = lock(&self.cache.bash);
-        if let Some(found) = slot.as_ref() {
-            return Ok(found.clone());
-        }
-        let found = crate::bash::find(self)?;
-        *slot = Some(found.clone());
-        Ok(found)
+        self.cache
+            .bash_lookup()
+            .get_or_init(|| crate::bash::find(self))
+            .clone()
     }
 
     /// Returns `(base_env, used_snapshot, one_time_warning)` for a task launch.
@@ -143,10 +174,11 @@ impl LaunchContext {
         &self,
         bash: &Path,
         login: bool,
-    ) -> (&[(OsString, OsString)], bool, Option<String>) {
+    ) -> (&[(OsString, OsString)], bool, Option<ProbeWarning>) {
         if login {
             return (&self.env, false, None);
         }
+        let mut reserved = None;
         let entry = self.cache.login_env.get_or_init(|| {
             match crate::process::probe_login_env(bash, self) {
                 Ok(mut vars) => {
@@ -161,20 +193,24 @@ impl LaunchContext {
                     });
                     LoginEnv::Snapshot(vars)
                 }
-                Err(reason) => LoginEnv::Failed(reason),
+                Err(reason) => {
+                    reserved = Some(format!(
+                        "Login environment probe failed ({reason}); tasks use the server's environment. Pass loginShell: true to run the profile."
+                    ));
+                    LoginEnv::Failed(Arc::default())
+                }
             }
         });
         match entry {
             LoginEnv::Snapshot(vars) => (vars.as_slice(), true, None),
-            LoginEnv::Failed(reason) => {
-                let warning = (!self.cache.warned_probe_failure.swap(true, Ordering::AcqRel))
-                    .then(|| {
-                        format!(
-                            "Login environment probe failed ({reason}); tasks use the server's environment. Pass loginShell: true to run the profile."
-                        )
-                    });
-                (self.env.as_slice(), false, warning)
-            }
+            LoginEnv::Failed(unreported) => (
+                self.env.as_slice(),
+                false,
+                Some(ProbeWarning {
+                    reserved,
+                    unreported: Arc::clone(unreported),
+                }),
+            ),
         }
     }
 }
@@ -625,6 +661,33 @@ mod tests {
                 .map(|(name, value)| ((*name).into(), (*value).into()))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn concurrent_bash_lookups_share_a_failure_and_a_later_call_retries() {
+        let cache = LaunchCache::default();
+        let ready = std::sync::Barrier::new(4);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let lookup = cache.bash_lookup();
+                    ready.wait(); // Every caller has joined this attempt before it can fail.
+                    assert_eq!(
+                        lookup.get_or_init(|| {
+                            attempts.fetch_add(1, Ordering::Relaxed);
+                            Err("unavailable".into())
+                        }),
+                        &Err("unavailable".into())
+                    );
+                });
+            }
+        });
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        let path = PathBuf::from("available");
+        let retry = cache.bash_lookup();
+        assert_eq!(retry.get_or_init(|| Ok(path.clone())), &Ok(path));
+        assert!(Arc::ptr_eq(&retry, &cache.bash_lookup()));
     }
 
     // Unix discovery runs under the real task-host binary, so the corresponding test lives

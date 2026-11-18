@@ -11,7 +11,7 @@
 //! and the root's exit code, and its EOF keeps meaning what it did.
 //!
 //! Wire format, both directions little-endian: a request is one byte, `M` or `K`. A members reply
-//! is `n` followed by a count and, per member, its pid, its name, and its name; a kill reply is
+//! is `U` for an unknown set or `n` followed by a count and each pid, name length and name. A kill reply is
 //! `O`, or `E` with the errno of a member the host may not signal. The host writes `O` before the
 //! group signal ends it. `D` confirms natural tree completion; a bare disconnect proves nothing.
 
@@ -111,8 +111,15 @@ impl Tracker {
 
     /// The live members: everything the scan still finds by identity, whether or not it stayed in
     /// the session, group, or parent chain it was admitted by.
-    pub fn list(&mut self) -> Vec<Member> {
+    pub fn list(&mut self) -> Option<Vec<Member>> {
         self.refresh(false);
+        self.list_snapshot()
+    }
+
+    fn list_snapshot(&mut self) -> Option<Vec<Member>> {
+        if !self.complete {
+            return None;
+        }
         let mut members: Vec<(i32, String)> = Vec::new();
         let mut disproved: Vec<(i32, u64)> = Vec::new();
         for &(pid, start) in self.members.keys() {
@@ -125,17 +132,26 @@ impl Tracker {
                 Membership::KeepUnnamed => members.push((pid, String::new())),
             }
         }
+        let changed = !disproved.is_empty();
         for key in disproved {
             self.members.remove(&key);
         }
+        if members.is_empty() && changed {
+            // A member may have forked between the table scan and its individual recheck.
+            // Only a fresh table scan can confirm that the tree then became empty.
+            self.recheck_empty();
+            return None;
+        }
         members.sort();
-        members
-            .into_iter()
-            .map(|(pid, name)| Member {
-                pid: pid as u32,
-                name,
-            })
-            .collect()
+        Some(
+            members
+                .into_iter()
+                .map(|(pid, name)| Member {
+                    pid: pid as u32,
+                    name,
+                })
+                .collect(),
+        )
     }
 
     /// Kills every member by identity, in passes, and reports the first member the host may not
@@ -202,6 +218,11 @@ impl Tracker {
         self.refresh(true);
     }
 
+    fn recheck_empty(&mut self) {
+        self.complete = false;
+        self.last_scan = None;
+    }
+
     /// An empty set is a finished kill only when the scan that emptied it read the whole process
     /// table.
     fn confirmed_empty(&self) -> std::io::Result<()> {
@@ -222,13 +243,76 @@ impl Tracker {
         }
     }
 
-    /// One bounded scan: the process table read once, then settled by [`Tracker::apply`].
+    /// One bounded scan, with a final PID listing when the observed tree looks empty.
     fn scan(&mut self) {
         self.last_scan = Some(Instant::now());
         match describe_all() {
-            Some(scan) => self.apply(&scan),
+            Some(scan) => self.apply_with_boundary(
+                &scan,
+                process_ids,
+                |pid| {
+                    // SAFETY: getsid takes a PID and writes no memory.
+                    unsafe { libc::getsid(pid) }
+                },
+                describe,
+            ),
             None => self.complete = false,
         }
+    }
+
+    /// A parent can fork and vanish between the PID listing and its individual lookup.
+    /// Accept an empty scan only when a later complete listing contains no uncovered PID.
+    /// Every scan checks its own boundary, including successive parent/child handoffs.
+    fn apply_with_boundary(
+        &mut self,
+        scan: &Scan,
+        current: impl FnOnce() -> Option<(Vec<i32>, bool)>,
+        session_of: impl Fn(i32) -> i32,
+        lookup: impl Fn(i32) -> Lookup,
+    ) {
+        self.apply(scan);
+        if self.complete && self.members.is_empty() {
+            self.complete = current().is_some_and(|(pids, complete)| {
+                complete
+                    && pids.into_iter().all(|pid| {
+                        pid <= 1
+                            || scan.live.contains_key(&pid)
+                            || scan.zombies.contains(&pid)
+                            || if scan.unknown.contains(&pid) {
+                                // A different session excludes our process group as well. An unreadable
+                                // PID already tracked by identity was retained by apply above.
+                                let session = session_of(pid);
+                                session > 0 && session != self.session && session != pid
+                            } else {
+                                self.foreign_newcomer(scan, pid, &lookup)
+                            }
+                    })
+            });
+        }
+    }
+
+    /// An ordinary worker in another session can fork throughout the scan. Exclude a new
+    /// child through its surviving foreign parent and their shared, inherited session.
+    /// launchd may have adopted a task descendant, so its parent edge proves nothing here.
+    fn foreign_newcomer(&self, scan: &Scan, pid: i32, lookup: &impl Fn(i32) -> Lookup) -> bool {
+        let Lookup::Entry(child) = lookup(pid) else {
+            return false;
+        };
+        if child.ppid <= 1
+            || child.session <= 0
+            || child.session == self.session
+            || child.session == pid
+            || child.group == self.group
+        {
+            return false;
+        }
+        let Some(parent) = scan.live.get(&child.ppid) else {
+            return false;
+        };
+        parent.start < child.start
+            && parent.session == child.session
+            && parent.group != self.group
+            && matches!(lookup(child.ppid), Lookup::Entry(now) if now.start == parent.start && now.session == parent.session)
     }
 
     /// Settles membership from one scan: passes so a child listed before its parent is still
@@ -286,6 +370,23 @@ impl Tracker {
     }
 }
 
+fn encode_members(members: Option<Vec<Member>>) -> Vec<u8> {
+    let Some(members) = members else {
+        return vec![b'U'];
+    };
+    let mut reply = Vec::with_capacity(5 + members.len() * 14);
+    reply.push(b'n');
+    reply.extend((members.len() as u32).to_le_bytes());
+    for member in members {
+        reply.extend((member.pid as i32).to_le_bytes());
+        let bytes = member.name.as_bytes();
+        let length = bytes.len().min(u16::MAX as usize);
+        reply.extend((length as u16).to_le_bytes());
+        reply.extend(&bytes[..length]);
+    }
+    reply
+}
+
 /// Serves control requests until the server closes the socket, which it does when the tree ends
 /// or the server dies. The host ends the tree on its lifeline meanwhile, as on Linux.
 pub fn serve(control: Arc<Mutex<UnixStream>>, tracker: Arc<Mutex<Tracker>>) {
@@ -299,20 +400,7 @@ pub fn serve(control: Arc<Mutex<UnixStream>>, tracker: Arc<Mutex<Tracker>>) {
         }
         let mut control = lock(&control);
         let reply = match op[0] {
-            b'M' => {
-                let members = lock(&tracker).list();
-                let mut reply = Vec::with_capacity(5 + members.len() * 14);
-                reply.push(b'n');
-                reply.extend((members.len() as u32).to_le_bytes());
-                for member in &members {
-                    reply.extend((member.pid as i32).to_le_bytes());
-                    let bytes = member.name.as_bytes();
-                    let length = bytes.len().min(u16::MAX as usize);
-                    reply.extend((length as u16).to_le_bytes());
-                    reply.extend(&bytes[..length]);
-                }
-                reply
-            }
+            b'M' => encode_members(lock(&tracker).list()),
             b'K' => {
                 // The guard is released before the reply: the group signal below ends this process,
                 // and a lock still held would be a deadlock, not a kill.
@@ -499,6 +587,9 @@ impl Client {
         if op[0] == b'D' {
             control.state = State::Ended;
             return Some(Vec::new());
+        }
+        if op[0] == b'U' {
+            return None;
         }
         if op[0] != b'n' {
             control.state = State::Broken;
@@ -776,9 +867,9 @@ fn libproc_entry(pid: i32) -> Option<Entry> {
 /// Every process the scan could describe, and the ones it could not; none at all when the process
 /// table itself could not be read. A table that fills the buffer is grown and re-read, and a scan
 /// that never fits is reported as incomplete rather than as a short list.
-fn describe_all() -> Option<Scan> {
+fn process_ids() -> Option<(Vec<i32>, bool)> {
     let mut size = 4096_usize;
-    let (pids, complete) = loop {
+    loop {
         let mut pids = vec![0 as libc::pid_t; size];
         // SAFETY: the buffer is as long as the size passed, and libproc writes whole pids into it.
         let count = unsafe {
@@ -793,14 +884,18 @@ fn describe_all() -> Option<Scan> {
         let count = count as usize;
         if count < size {
             pids.truncate(count);
-            break (pids, true);
+            return Some((pids, true));
         }
         if size >= 65536 {
             // The table is larger than any buffer tried: a real answer, but not a whole one.
-            break (pids, false);
+            return Some((pids, false));
         }
         size *= 2;
-    };
+    }
+}
+
+fn describe_all() -> Option<Scan> {
+    let (pids, complete) = process_ids()?;
     let mut scan = Scan {
         live: HashMap::new(),
         unknown: HashSet::new(),
@@ -950,6 +1045,123 @@ mod tests {
         assert!(!tracker.members.contains_key(&(700, 5)));
     }
 
+    #[test]
+    fn losing_the_last_tracked_parent_needs_a_fresh_scan_before_confirming_empty() {
+        let mut tracker = tracker();
+        tracker.members.insert((600, 1), 1);
+        // First 600, and then its child 601, fork and vanish before their row is read.
+        // A real, unrelated zombie in both tables does not prevent eventual confirmation.
+        let mut vanished = scan(Vec::new(), true);
+        vanished.zombies.insert(400);
+        for successor in [601, 602] {
+            tracker.apply_with_boundary(
+                &vanished,
+                || Some((vec![400, successor], true)),
+                |_| unreachable!(),
+                |_| Lookup::Gone,
+            );
+            assert!(!tracker.complete);
+            assert!(tracker.list_snapshot().is_none());
+        }
+        // The grandchild remained in the session and started a new process group.
+        tracker.apply_with_boundary(
+            &scan(vec![(602, entry(1, 602, 100, 2))], true),
+            || panic!("live member"),
+            |_| unreachable!(),
+            |_| unreachable!(),
+        );
+        assert!(tracker.members.contains_key(&(602, 2)));
+        tracker.apply_with_boundary(
+            &vanished,
+            || Some((vec![400], true)),
+            |_| unreachable!(),
+            |_| unreachable!(),
+        );
+        assert!(tracker.complete);
+        assert!(tracker.list_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_untracked_pid_needs_a_different_session_to_confirm_empty() {
+        let mut tracker = tracker();
+        let mut partial = scan(Vec::new(), true);
+        partial.unknown.insert(602);
+        for (session, empty) in [(100, false), (-1, false), (602, false), (200, true)] {
+            tracker.apply_with_boundary(
+                &partial,
+                || Some((vec![602], true)),
+                |pid| {
+                    assert_eq!(pid, 602);
+                    session
+                },
+                |_| unreachable!(),
+            );
+            assert_eq!(tracker.complete, empty);
+        }
+    }
+
+    #[test]
+    fn foreign_workers_may_fork_continuously_while_the_task_finishes() {
+        let mut tracker = tracker();
+        let first = scan(vec![(200, entry(1, 200, 200, 2))], true);
+        for pid in 610..620 {
+            tracker.apply_with_boundary(
+                &first,
+                || Some((vec![200, pid], true)),
+                |_| unreachable!(),
+                |p| {
+                    if p == pid {
+                        Lookup::Entry(entry(200, 200, 200, 5))
+                    } else {
+                        assert_eq!(p, 200);
+                        Lookup::Entry(entry(1, 200, 200, 2))
+                    }
+                },
+            );
+            assert!(tracker.complete);
+        }
+
+        for (ppid, session, parent_start) in [
+            (1, 200, 2),
+            (600, 200, 2),
+            (200, 200, 4),
+            (200, 100, 2),
+            (200, 610, 2),
+        ] {
+            // An orphan, a child of the vanished task member, a recycled foreign parent,
+            // our own session, and a new session founded by the child remain unconfirmed.
+            tracker.apply_with_boundary(
+                &first,
+                || Some((vec![200, 610], true)),
+                |_| unreachable!(),
+                |p| {
+                    if p == 610 {
+                        Lookup::Entry(entry(ppid, 610, session, 5))
+                    } else {
+                        Lookup::Entry(entry(1, 200, 200, parent_start))
+                    }
+                },
+            );
+            assert!(!tracker.complete, "ppid={ppid}, session={session}");
+        }
+    }
+
+    #[test]
+    fn an_incomplete_scan_leaves_the_next_members_request_usable() {
+        let mut tracker = tracker();
+        tracker.apply(&scan(Vec::new(), false));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let client = Client::new(server, 0);
+        let partial = encode_members(tracker.list_snapshot());
+        assert_eq!(partial, b"U");
+        peer.write_all(&partial).unwrap();
+        assert!(client.members().is_none());
+        tracker.apply(&scan(Vec::new(), true));
+        peer.write_all(&encode_members(tracker.list_snapshot()))
+            .unwrap();
+        assert!(client.members().unwrap().is_empty());
+    }
+
     /// Neither a closed peer nor a silent one confirms that its children ended.
     #[test]
     fn a_closed_peer_and_a_silent_one_confirm_nothing() {
@@ -1062,7 +1274,10 @@ mod tests {
         );
         let mut listing = tracker();
         listing.members.insert((pid, 1), 1);
-        assert!(listing.list().is_empty(), "a gone pid is no member");
+        assert!(
+            listing.list().is_none_or(|members| members.is_empty()),
+            "a gone pid is no member"
+        );
         assert!(!listing.members.contains_key(&(pid, 1)));
         // The kill drops it too, and finishes rather than reporting an unidentifiable member.
         let mut killing = tracker();

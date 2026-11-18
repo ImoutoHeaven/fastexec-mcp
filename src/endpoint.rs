@@ -20,7 +20,7 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, OnceCell, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-/// How long a call may take to reach the daemon before the link is treated as gone.
+/// How long a call may spend waiting for the writer and sending its frame.
 const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `bye` may take, locks and write together.
 const BYE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -66,6 +66,43 @@ struct Link {
 struct Pending {
     result: oneshot::Sender<CallToolResult>,
     progress: Option<watch::Sender<Option<wait::Progress>>>,
+}
+
+/// Removes the result routing entry even if the caller's future is dropped.
+struct Registration<'a> {
+    link: &'a Link,
+    id: u64,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        lock(&self.link.pending).remove(&self.id);
+    }
+}
+
+impl Link {
+    /// A write that ends early may leave half a frame. The drop guard poisons the stream
+    /// before the writer unlocks, including when the future itself is dropped.
+    async fn send(&self, frame: &ToDaemon, attempted: &mut bool) -> bool {
+        let mut writer = tokio::select! {
+            biased;
+            _ = self.closed.cancelled() => return false,
+            writer = self.writer.lock() => writer,
+        };
+        tokio::select! {
+            biased;
+            _ = self.closed.cancelled() => false,
+            sent = async {
+                let poison = self.closed.drop_guard_ref();
+                *attempted = true;
+                if ipc::write_frame(&mut *writer, frame).await.is_err() {
+                    return false;
+                }
+                poison.disarm();
+                true
+            } => sent,
+        }
+    }
 }
 
 impl Endpoint {
@@ -163,7 +200,7 @@ impl Endpoint {
                 }
             }
         };
-        let (sender, answer) = oneshot::channel();
+        let (sender, mut answer) = oneshot::channel();
         {
             let mut pending = lock(&link.pending);
             pending.insert(
@@ -174,71 +211,50 @@ impl Endpoint {
                 },
             );
         }
+        let _registration = Registration { link: &link, id };
         let frame = ToDaemon::Call {
             id,
             tool: tool.to_owned(),
             request_id: request_id.clone(),
             arguments,
         };
-        let write_deadline = tokio::time::Instant::now() + WRITE_WAIT;
-        let writer = tokio::select! {
+        let lost = || self.lost(&link, tool, &action, id, &request_id);
+        let mut attempted = false;
+        let sent = tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
-                lock(&link.pending).remove(&id);
-                return error("Cancelled before the call was sent.");
-            }
-            _ = link.closed.cancelled() => None,
-            writer = tokio::time::timeout_at(write_deadline, link.writer.lock()) => writer.ok(),
+            _ = cancel.cancelled() => Err("Cancelled before the call was sent."),
+            sent = tokio::time::timeout(WRITE_WAIT, link.send(&frame, &mut attempted)) => match sent {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("The daemon connection closed before the call was sent."),
+                Err(_) => Err("Timed out waiting for the daemon writer before the call was sent."),
+            },
         };
-        let mut writing_started = false;
-        let written = if let Some(mut writer) = writer {
-            tokio::select! {
-                biased;
-                _ = link.closed.cancelled() => None,
-                _ = cancel.cancelled() => None,
-                written = async {
-                    writing_started = true;
-                    tokio::time::timeout_at(
-                        write_deadline,
-                        ipc::write_frame(&mut *writer, &frame),
-                    ).await
-                } => Some(written),
+        if let Err(reason) = sent {
+            if !attempted {
+                return error(reason);
             }
-        } else {
-            None
-        };
-        if !writing_started && cancel.is_cancelled() {
-            lock(&link.pending).remove(&id);
-            return error("Cancelled before the call was sent.");
+            // The write guard closed the link. A result received before EOF still wins.
+            return answer.await.unwrap_or_else(|_| lost());
         }
-        if !matches!(written, Some(Ok(Ok(())))) {
-            // Cancellation after writing began may leave a partial frame.
-            self.close(&link);
-        }
-        // Closing drops all pending senders. A complete result sent before EOF wins even
-        // if the reader has already closed the link by the time the caller resumes.
         tokio::select! {
             biased;
-            answer = answer => match answer {
-                Ok(result) => result,
-                // The reader dropped the entry, so the link is gone.
-                Err(_) => self.lost(&link, tool, &action, id, &request_id),
-            },
+            answer = &mut answer => answer.unwrap_or_else(|_| lost()),
             _ = cancel.cancelled() => {
-                // The wait ends here; the task keeps running on the daemon.
-                let sent = tokio::time::timeout(CANCEL_WAIT, async {
-                    let mut writer = link.writer.lock().await;
-                    ipc::write_frame(&mut *writer, &ToDaemon::Cancel { id }).await
-                })
-                .await;
-                lock(&link.pending).remove(&id);
-                if !matches!(sent, Ok(Ok(()))) {
-                    // A Cancel that did not land may have left half a frame, so the stream is
-                    // not used again. The whole branch stays inside its one second.
-                    self.close(&link);
-                    return self.lost(&link, tool, &action, id, &request_id);
+                let mut attempted = false;
+                let frame = ToDaemon::Cancel { id };
+                // Finish a Cancel frame already in progress even if the call's result arrives
+                // meanwhile. Interrupting that frame would sacrifice unrelated pending calls.
+                let sent = tokio::time::timeout(CANCEL_WAIT, link.send(&frame, &mut attempted)).await;
+                if let Ok(result) = answer.try_recv() {
+                    return result;
                 }
-                error("Cancelled; the task keeps running.")
+                match sent {
+                    Ok(true) => error("Cancelled; the task keeps running."),
+                    Err(_) if !attempted && !link.closed.is_cancelled() => {
+                        error("The call was sent, but Cancel timed out before it was sent. The call's result is unknown.")
+                    }
+                    _ => lost(),
+                }
             }
         }
     }
@@ -252,10 +268,7 @@ impl Endpoint {
             let Some(link) = link else {
                 return;
             };
-            let sent = {
-                let mut writer = link.writer.lock().await;
-                ipc::write_frame(&mut *writer, &ToDaemon::Bye).await.is_ok()
-            };
+            let sent = link.send(&ToDaemon::Bye, &mut false).await;
             // The reader drains what the daemon still sends until it reads the Bye and closes the
             // stream, which cancels `closed`.
             if sent {
@@ -318,15 +331,6 @@ impl Endpoint {
         tokio::spawn(read_loop(Arc::clone(&link), reader, Arc::clone(&self.link)));
         *slot = Some(Arc::clone(&link));
         Ok(link)
-    }
-
-    /// Ends a link at once: every waiting call is lost and the reader stops, which drops the
-    /// read half; the write half goes with the last reference to the link. Nothing here waits,
-    /// so a caller's own bound stays the caller's. A failed write may have left half a frame, so
-    /// the stream is never used again.
-    fn close(&self, link: &Link) {
-        link.closed.cancel();
-        lock(&link.pending).clear();
     }
 
     /// The call may have run, so it is reported, never replayed.
@@ -827,10 +831,23 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_during_a_frame_write_closes_then_reconnects() {
+        interrupted_frame_reconnects(false).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_call_during_a_frame_write_closes_then_reconnects() {
+        interrupted_frame_reconnects(true).await;
+    }
+
+    async fn interrupted_frame_reconnects(drop_call: bool) {
         use tokio::io::AsyncReadExt;
 
         const PARTIAL_BYTES: usize = 5;
-        let (identity, paths, mut listener, _target) = test_daemon("cancel-frame");
+        let (identity, paths, mut listener, _target) = test_daemon(if drop_call {
+            "drop-frame"
+        } else {
+            "cancel-frame"
+        });
         let welcome = welcome(&identity);
         let (announced, writing) = oneshot::channel();
         let (paused, blocked) = oneshot::channel();
@@ -891,15 +908,14 @@ mod tests {
             blocked: Some(paused),
         });
         let cancel = CancellationToken::new();
-        let calling = endpoint.call(
+        let mut calling = Box::pin(endpoint.call(
             "write",
             serde_json::json!({"path": "unused", "content": "partial"}),
             "1".into(),
             "test",
             cancel.clone(),
             None,
-        );
-        tokio::pin!(calling);
+        ));
         timeout(Duration::from_secs(5), async {
             tokio::select! {
                 result = &mut calling => panic!("call ended before writing: {result:?}"),
@@ -908,8 +924,12 @@ mod tests {
                     writing.await.unwrap();
                 } => {},
             }
+            if drop_call {
+                drop(calling);
+                return;
+            }
             cancel.cancel();
-            let result = (&mut calling).await;
+            let result = calling.await;
             assert!(
                 result.content[0]
                     .as_text()
@@ -943,76 +963,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cancel_that_cannot_be_sent_reports_the_lost_link() {
-        let (identity, paths, mut listener, _target) = test_daemon("cancel-blocked");
+    async fn unsent_call_and_cancel_timeouts_leave_an_unrelated_call_on_the_link() {
+        let (identity, paths, mut listener, _target) = test_daemon("writer-deadline");
         let welcome = welcome(&identity);
-        let (announced, call_seen) = oneshot::channel();
+        let (announced, seen) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
         let peer = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
             let _ = ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
                 .await
                 .unwrap();
             ipc::write_frame(&mut conn, &welcome).await.unwrap();
+            for expected in [1, 2] {
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await.unwrap(),
+                    Some(ToDaemon::Call { id, .. }) if id == expected
+                ));
+            }
+            announced.send(()).unwrap();
+            wait.await.unwrap();
+            ipc::write_frame(
+                &mut conn,
+                &ToEndpoint::Result {
+                    id: 2,
+                    result: CallToolResult::success(vec![ContentBlock::text("still connected")]),
+                },
+            )
+            .await
+            .unwrap();
             assert!(matches!(
                 ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
                     .await
                     .unwrap(),
-                Some(ToDaemon::Call { id: 1, .. })
+                Some(ToDaemon::Bye)
             ));
-            announced.send(()).unwrap();
-            // The writer stays locked until Cancel times out; no Cancel frame can arrive.
-            assert!(
-                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
         });
-        let endpoint = Arc::new(Endpoint::for_test(identity, paths));
+
+        let endpoint = Endpoint::for_test(identity, paths);
         let link = endpoint
             .link("test", std::time::Instant::now() + runtime::START_WAIT)
             .await
             .unwrap();
-        let cancel = CancellationToken::new();
-        let calling = {
-            let (endpoint, cancel) = (Arc::clone(&endpoint), cancel.clone());
-            tokio::spawn(async move {
-                endpoint
-                    .call(
-                        "write",
-                        serde_json::json!({"path": "unused", "content": "complete"}),
-                        "1".into(),
-                        "test",
-                        cancel,
-                        None,
-                    )
-                    .await
-            })
+        let make_call = |id: u64, cancel| {
+            endpoint.call(
+                "exec",
+                serde_json::json!({"action":"list"}),
+                id.to_string(),
+                "test",
+                cancel,
+                None,
+            )
         };
-        timeout(Duration::from_secs(5), call_seen)
-            .await
-            .expect("the peer received the full call")
-            .unwrap();
-        let busy = timeout(Duration::from_secs(5), link.writer.lock())
-            .await
-            .expect("the call released the writer");
+        let cancel = CancellationToken::new();
+        let mut first = std::pin::pin!(make_call(1, cancel.clone()));
+        let mut other = std::pin::pin!(make_call(2, CancellationToken::new()));
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                result = &mut first => panic!("first call ended early: {result:?}"),
+                result = &mut other => panic!("second call ended early: {result:?}"),
+                seen = seen => seen.unwrap(),
+            }
+        })
+        .await
+        .expect("both complete calls reached the peer");
+        let busy = link.writer.lock().await;
         cancel.cancel();
-        let result = timeout(Duration::from_secs(5), calling)
-            .await
-            .expect("the blocked Cancel finished")
-            .unwrap();
-        assert!(
-            result.content[0]
-                .as_text()
-                .unwrap()
-                .text
-                .contains("the call may or may not have run")
+        let mut queued = std::pin::pin!(make_call(3, CancellationToken::new()));
+        tokio::time::pause();
+        tokio::select! {
+            biased;
+            _ = &mut first => panic!("Cancel did not queue"),
+            _ = &mut queued => panic!("Call did not queue"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(lock(&link.pending).contains_key(&3));
+        tokio::time::advance(WRITE_WAIT + Duration::from_millis(1)).await;
+        let cancelled = (&mut first).await;
+        let unsent = (&mut queued).await;
+        tokio::time::resume();
+        assert_eq!(
+            cancelled.content[0].as_text().unwrap().text,
+            "The call was sent, but Cancel timed out before it was sent. The call's result is unknown."
         );
-        assert!(link.closed.is_cancelled());
-        assert!(lock(&link.pending).is_empty());
+        assert_eq!(
+            unsent.content[0].as_text().unwrap().text,
+            "Timed out waiting for the daemon writer before the call was sent."
+        );
+        assert!(!link.closed.is_cancelled());
+        assert_eq!(lock(&link.pending).keys().copied().collect::<Vec<_>>(), [2]);
         drop(busy);
-        drop(link);
-        drop(endpoint);
+        release.send(()).unwrap();
+        let result = timeout(Duration::from_secs(5), other).await.unwrap();
+        assert_eq!(result.content[0].as_text().unwrap().text, "still connected");
+        endpoint.bye().await;
         finish(peer).await;
     }
 
@@ -1320,17 +1364,14 @@ mod tests {
             vec![1],
             "the call is not queued on this link"
         );
-        endpoint.close(&link);
+        link.closed.cancel();
         let result = timeout(Duration::from_secs(5), calling)
             .await
             .expect("the queued call ended")
             .unwrap();
         assert_eq!(
             result.content[0].as_text().map(|text| text.text.clone()),
-            Some(format!(
-                "The connection to the fastexec daemon (epoch {}) closed during list call 1 (request 1, session {}); the operation may have run. Use action list to check.",
-                TEST_EPOCH, endpoint.session
-            ))
+            Some("The daemon connection closed before the call was sent.".into())
         );
         drop(busy);
         // Nothing was written onto the ended link.
@@ -1352,6 +1393,7 @@ mod tests {
     async fn a_lost_file_tool_call_names_its_tool_and_no_action_list() {
         let (identity, paths, mut listener, _target) = test_daemon("lost-files");
         let welcome = welcome(&identity);
+        let (announced, seen) = oneshot::channel();
         let peer = tokio::spawn(async move {
             let Ok(mut conn) = listener.accept().await else {
                 return;
@@ -1365,6 +1407,13 @@ mod tests {
                 return;
             }
             // The daemon reads the call and never answers it, so the link is lost under it.
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Call { id: 1, .. })
+            ));
+            announced.send(()).unwrap();
             while let Ok(Some(frame)) =
                 ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await
             {
@@ -1379,7 +1428,6 @@ mod tests {
             .link("test", std::time::Instant::now() + runtime::START_WAIT)
             .await
             .expect("a link");
-        let busy = link.writer.lock().await;
         let calling = {
             let endpoint = Arc::clone(&endpoint);
             tokio::spawn(async move {
@@ -1395,17 +1443,11 @@ mod tests {
                     .await
             })
         };
-        let mut waited = 0;
-        while lock(&link.pending).is_empty() && waited < 500 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            waited += 1;
-        }
-        assert_eq!(
-            lock(&link.pending).keys().copied().collect::<Vec<u64>>(),
-            vec![1],
-            "the call is not queued on this link"
-        );
-        endpoint.close(&link);
+        timeout(Duration::from_secs(5), seen)
+            .await
+            .unwrap()
+            .unwrap();
+        link.closed.cancel();
         let result = timeout(Duration::from_secs(5), calling)
             .await
             .expect("the queued call ended")
@@ -1422,7 +1464,6 @@ mod tests {
             )
         );
         assert!(!text.contains("action list"), "{text}");
-        drop(busy);
 
         // Dropping the last reference closes the connection, which ends the peer.
         drop(link);

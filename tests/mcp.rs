@@ -4720,10 +4720,19 @@ fn sustained_output_through_resizes_keeps_every_line() {
 fn bash_discovery_still_works_after_the_session_directory_is_removed() {
     let gone = Scratch::new("gone-launch-cwd");
     std::fs::create_dir(&*gone).unwrap();
+    let home = Scratch::new("gone-cwd-profile");
+    std::fs::create_dir(&*home).unwrap();
+    std::fs::write(home.join(".bash_profile"), "exit 7\n").unwrap();
     let mut server = Server::start_with(|command| {
-        command.current_dir(&*gone);
+        command.current_dir(&*gone).env("HOME", &*home);
     });
     std::fs::remove_dir(&*gone).unwrap();
+    // The probe can run from bash's directory, but the actual start with the deleted cwd fails.
+    let (_, text, failed) = server.call(json!({"action": "start", "command": "true"}));
+    assert!(
+        failed && text.contains("Cannot start the command"),
+        "{text}"
+    );
     let cwd = std::env::temp_dir();
     let (result, text) = server.ok(json!({
         "action": "start", "command": "printf discovered", "cwd": cwd,
@@ -4731,6 +4740,7 @@ fn bash_discovery_still_works_after_the_session_directory_is_removed() {
     }));
     assert_eq!(result["exitCode"], 0, "{text}");
     assert!(text.starts_with("discovered"), "{text}");
+    assert!(text.contains("Login environment probe failed"), "{text}");
     // The successful discovery is cached, and later tasks still work from an explicit cwd.
     let (result, text) = server.ok(json!({
         "action": "start", "command": "printf cached", "cwd": cwd,
@@ -7685,6 +7695,49 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
     let ret_lines = code_result(&mut server, json!({"code": "return 'a\\nb';"}));
     assert_eq!(ret_lines["structuredContent"]["exitCode"], 0);
     assert_eq!(ret_lines["structuredContent"]["output"], "a\nb");
+}
+
+#[test]
+fn cancelled_start_leaves_the_login_probe_warning_for_the_next_delivery() {
+    let home = Scratch::new("login-warning-cancel");
+    std::fs::create_dir_all(&*home).unwrap();
+    std::fs::write(home.join(".bash_profile"), "exit 7\n").unwrap();
+    let mut server = Server::start_with(|cmd| {
+        cmd.env("HOME", &*home)
+            .env("USERPROFILE", &*home)
+            .env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_OUTPUT_MODE", "both");
+    });
+    let code = r#"
+        const command = "read -r keep_open";
+        const waiting = tools.exec({action: "start", command, eof: false});
+        while (!(await tools.exec({action: "list"})).tasks.some(t => t.command === command)) {
+            await sleep(10);
+        }
+        const other = await tools.exec({action: "start", command: "true"});
+        if (other.warnings?.some(w => w.includes("Login environment probe failed"))) {
+            throw Error("another start reported the first start's reserved warning");
+        }
+        return "registered";
+    "#;
+    let ended = code_result(&mut server, json!({"code": code}));
+    assert_eq!(ended["structuredContent"]["exitCode"], 0, "{ended}");
+    assert_eq!(
+        ended["structuredContent"]["output"], "registered",
+        "{ended}"
+    );
+    let (next, text) =
+        server.ok(json!({"action": "start", "command": "true", "pty": true, "screen": true}));
+    assert!(text.contains("Login environment probe failed"), "{text}");
+    assert!(
+        next["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("Login environment probe failed")),
+        "{next}"
+    );
+    let (_, once) = server.ok(json!({"action": "start", "command": "true"}));
+    assert!(!once.contains("Login environment probe failed"), "{once}");
 }
 
 #[test]

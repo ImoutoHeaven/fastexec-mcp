@@ -307,33 +307,55 @@ pub fn spawn(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     return spawn_host(launch);
 }
 
-/// Writes `ENV_MARKER` followed by NUL-separated `NAME=VALUE` entries and exits.
-pub fn dump_env() -> ! {
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(ENV_MARKER);
-    for (name, value) in std::env::vars_os() {
+/// The marker is byte-oriented so profile output can precede it. The entries use native
+/// units (bytes on Unix, little-endian UTF-16 on Windows), followed by an empty end record.
+fn write_env_dump(
+    mut out: impl Write,
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> std::io::Result<()> {
+    out.write_all(ENV_MARKER)?;
+    for (mut name, value) in vars {
+        name.push("=");
+        name.push(value);
+        name.push("\0");
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            let _ = out.write_all(name.as_bytes());
-            let _ = out.write_all(b"=");
-            let _ = out.write_all(value.as_bytes());
-            let _ = out.write_all(b"\0");
+            out.write_all(name.as_bytes())?;
         }
         #[cfg(windows)]
         {
-            let n = name.to_string_lossy();
-            let v = value.to_string_lossy();
-            if !n.contains('\0') && !v.contains('\0') {
-                let _ = out.write_all(n.as_bytes());
-                let _ = out.write_all(b"=");
-                let _ = out.write_all(v.as_bytes());
-                let _ = out.write_all(b"\0");
-            }
+            use std::os::windows::ffi::OsStrExt;
+            let bytes: Vec<_> = name.encode_wide().flat_map(u16::to_le_bytes).collect();
+            out.write_all(&bytes)?;
         }
     }
-    let _ = out.flush();
-    std::process::exit(0);
+    out.write_all(&[0; size_of::<crate::ipc::Unit>()])?;
+    out.flush()
+}
+
+pub fn dump_env() -> ! {
+    let result = write_env_dump(std::io::stdout().lock(), std::env::vars_os());
+    std::process::exit(i32::from(result.is_err()));
+}
+
+/// A path to pass to bash, preserving its native units and using MSYS separators on Windows.
+fn bash_path(path: &Path) -> OsString {
+    #[cfg(unix)]
+    {
+        path.as_os_str().to_owned()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<_> = path.as_os_str().encode_wide().collect();
+        for unit in &mut units {
+            if *unit == u16::from(b'\\') {
+                *unit = u16::from(b'/');
+            }
+        }
+        OsString::from_wide(&units)
+    }
 }
 
 fn fastexec_image_path() -> Result<OsString, String> {
@@ -351,26 +373,17 @@ fn fastexec_image_path() -> Result<OsString, String> {
             })
             .filter(|bin| bin.is_file())
     {
-        #[cfg(windows)]
-        return Ok(bin.to_string_lossy().replace('\\', "/").into());
-        #[cfg(not(windows))]
-        return Ok(bin.into_os_string());
+        return Ok(bash_path(&bin));
     }
     #[cfg(target_os = "linux")]
     {
         Ok(format!("/proc/{}/exe", std::process::id()).into())
     }
-    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    #[cfg(not(target_os = "linux"))]
     {
         std::env::current_exe()
-            .map(std::path::PathBuf::into_os_string)
+            .map(|exe| bash_path(&exe))
             .map_err(|error| format!("cannot locate fastexec image: {error}"))
-    }
-    #[cfg(windows)]
-    {
-        let exe = std::env::current_exe()
-            .map_err(|error| format!("cannot locate fastexec image: {error}"))?;
-        Ok(exe.to_string_lossy().replace('\\', "/").into())
     }
 }
 
@@ -382,38 +395,97 @@ fn parse_env_dump(bytes: &[u8]) -> Result<Vec<(OsString, OsString)>, String> {
         return Err("login shell exited without reporting its environment".to_owned());
     };
     let payload = &bytes[pos + ENV_MARKER.len()..];
+    let invalid = || "login shell reported an incomplete or malformed environment".to_owned();
+    #[cfg(unix)]
+    let from_units = |units: &[u8]| {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(units).to_owned()
+    };
+    #[cfg(windows)]
+    let (units, from_units) = {
+        use std::os::windows::ffi::OsStringExt;
+        if !payload.len().is_multiple_of(2) {
+            return Err(invalid());
+        }
+        let units: Vec<_> = payload
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        (units, OsString::from_wide)
+    };
+    #[cfg(windows)]
+    let payload = units.as_slice();
+    let mut records = payload.strip_suffix(&[0]).ok_or_else(invalid)?;
     let mut vars = Vec::new();
-    for entry in payload.split(|&b| b == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-        // Start searching at index 1 so Windows per-drive entries like `=C:=C:\...` split cleanly.
-        let Some(rel_eq) = entry
+    while !records.is_empty() {
+        let end = records
+            .iter()
+            .position(|&unit| unit == 0)
+            .ok_or_else(invalid)?;
+        let entry = &records[..end];
+        // A Windows per-drive entry starts with '=', for example `=C:=C:\work`.
+        let equals = entry
             .get(1..)
-            .and_then(|rest| rest.iter().position(|&b| b == b'='))
-        else {
-            continue;
-        };
-        let eq = 1 + rel_eq;
-        let (raw_name, raw_val) = (&entry[..eq], &entry[eq + 1..]);
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            vars.push((
-                OsString::from_vec(raw_name.to_vec()),
-                OsString::from_vec(raw_val.to_vec()),
-            ));
-        }
-        #[cfg(windows)]
-        {
-            if let (Ok(name), Ok(val)) =
-                (std::str::from_utf8(raw_name), std::str::from_utf8(raw_val))
-            {
-                vars.push((OsString::from(name), OsString::from(val)));
-            }
-        }
+            .and_then(|rest| {
+                rest.iter()
+                    .position(|&unit| u32::from(unit) == u32::from(b'='))
+            })
+            .ok_or_else(invalid)?
+            + 1;
+        vars.push((
+            from_units(&entry[..equals]),
+            from_units(&entry[equals + 1..]),
+        ));
+        records = &records[end + 1..];
     }
     Ok(vars)
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn login_environment_dump_preserves_native_units_and_rejects_incomplete_records() {
+        #[cfg(unix)]
+        let native = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![b'x', 0xff])
+        };
+        #[cfg(windows)]
+        let native = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[120, 0xd800])
+        };
+        let vars = vec![
+            (native.clone(), OsString::new()),
+            ("equals".into(), "one=two".into()),
+            ("=C:".into(), native),
+        ];
+        let mut bytes = b"profile output\n".to_vec();
+        write_env_dump(&mut bytes, vars.clone()).unwrap();
+        assert_eq!(parse_env_dump(&bytes).unwrap(), vars);
+        for cut in 1..=2 * size_of::<crate::ipc::Unit>() {
+            assert!(parse_env_dump(&bytes[..bytes.len() - cut]).is_err());
+        }
+        let mut empty = Vec::new();
+        write_env_dump(&mut empty, []).unwrap();
+        assert!(parse_env_dump(&empty).unwrap().is_empty());
+
+        let mut short = [0; 3];
+        assert!(write_env_dump(short.as_mut_slice(), []).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn msys_paths_keep_non_unicode_native_units() {
+        use std::os::windows::ffi::OsStringExt;
+        let path = OsString::from_wide(&[67, 58, 92, 0xd800]);
+        assert_eq!(
+            bash_path(Path::new(&path)),
+            OsString::from_wide(&[67, 58, 47, 0xd800])
+        );
+    }
 }
 
 /// Runs a bounded, nonblocking probe under the same host/Job ownership as a task.
@@ -656,13 +728,7 @@ pub(crate) fn bash_args(launch: &Launch<'_>) -> Vec<OsString> {
         vec!["--noprofile".into(), "--norc".into()]
     };
     match launch.script {
-        Some(script) => {
-            // MSYS needs forward slashes; Unix paths must retain their native bytes.
-            #[cfg(windows)]
-            args.push(script.to_string_lossy().replace('\\', "/").into());
-            #[cfg(unix)]
-            args.push(script.as_os_str().to_owned());
-        }
+        Some(script) => args.push(bash_path(script)),
         None => {
             args.push("-c".into());
             args.push(launch.command.into());
@@ -699,11 +765,7 @@ pub(crate) fn environment(launch: &Launch<'_>) -> Vec<(&'static str, OsString)> 
     #[cfg(windows)]
     windows_path_environment(launch, &mut env);
     if let Some(status) = launch.exit_status {
-        // msys reads a native path only with forward slashes.
-        env.push((
-            "FASTEXEC_EXIT_STATUS",
-            status.to_string_lossy().replace('\\', "/").into(),
-        ));
+        env.push(("FASTEXEC_EXIT_STATUS", bash_path(status)));
     }
     env
 }
@@ -1316,20 +1378,20 @@ pub fn is_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0,
         };
-        // SAFETY: the handle is checked and closed; the exit code buffer outlives the call.
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+        // SAFETY: the handle is checked, waited without blocking, and closed.
         unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
             if handle.is_null() {
-                // A process this user may not query still exists.
-                return std::io::Error::last_os_error().raw_os_error()
-                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32);
+                // Only an absent PID proves its old owner's directory is unused.
+                return GetLastError() != ERROR_INVALID_PARAMETER;
             }
-            let mut code = 0;
-            let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
+            let alive = WaitForSingleObject(handle, 0) != WAIT_OBJECT_0;
             CloseHandle(handle);
             alive
         }
@@ -1350,20 +1412,21 @@ mod windows {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, GetLastError, INVALID_HANDLE_VALUE,
-        STILL_ACTIVE,
+        WAIT_OBJECT_0,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
         JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
         SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW, ResumeThread, THREAD_SUSPEND_RESUME,
+        OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        QueryFullProcessImageNameW, ResumeThread, THREAD_SUSPEND_RESUME, WaitForSingleObject,
     };
 
     /// Creates a job that terminates its processes when its last handle closes, and assigns
@@ -1398,31 +1461,72 @@ mod windows {
     /// The live processes of a job, without console hosts or exited processes. A failed or
     /// incomplete query stays unknown; a process this user may not query counts, named ?.
     pub fn job_members(job: RawHandle) -> Option<Vec<Member>> {
-        let ids = job_pids(|buffer, bytes| {
-            // SAFETY: job_pids supplies a usize-aligned buffer with room for the header and IDs.
-            let queried = unsafe {
+        let accounting = || {
+            let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: info has the layout and size requested for this job query.
+            let ok = unsafe {
                 QueryInformationJobObject(
                     job,
-                    JobObjectBasicProcessIdList,
-                    buffer.as_mut_ptr().cast(),
-                    bytes,
+                    JobObjectBasicAccountingInformation,
+                    (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    std::mem::size_of_val(&info) as u32,
                     std::ptr::null_mut(),
                 )
             };
-            if queried == 0 {
-                Err(unsafe { GetLastError() })
-            } else {
-                Ok(())
+            (ok != 0).then_some(info)
+        };
+        let ids = || {
+            job_pids(|buffer, bytes| {
+                // SAFETY: job_pids supplies a usize-aligned buffer with room for the header and IDs.
+                let queried = unsafe {
+                    QueryInformationJobObject(
+                        job,
+                        JobObjectBasicProcessIdList,
+                        buffer.as_mut_ptr().cast(),
+                        bytes,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if queried == 0 {
+                    Err(unsafe { GetLastError() })
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        collect_job_members(accounting, ids, live_name)
+    }
+
+    fn collect_job_members(
+        mut accounting: impl FnMut() -> Option<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>,
+        ids: impl FnOnce() -> Option<Vec<u32>>,
+        mut live_name: impl FnMut(u32) -> Option<String>,
+    ) -> Option<Vec<Member>> {
+        let before = accounting()?;
+        if before.ActiveProcesses == 0 {
+            return Some(Vec::new());
+        }
+        let ids = ids()?;
+        if ids.is_empty() {
+            return Some(Vec::new());
+        }
+        let live: Vec<Member> = ids
+            .into_iter()
+            .filter_map(|pid| {
+                let name = live_name(pid)?;
+                (!name.eq_ignore_ascii_case("conhost.exe")).then_some(Member { pid, name })
+            })
+            .collect();
+        if live.is_empty() {
+            // A disappearing parent may have started a successor after the PID list was read.
+            // Terminated IDs can stay in the job while a process handle is held. The lifetime
+            // count distinguishes those stale entries from a newly admitted process.
+            let after = accounting()?;
+            if after.ActiveProcesses != 0 && after.TotalProcesses != before.TotalProcesses {
+                return None;
             }
-        })?;
-        Some(
-            ids.into_iter()
-                .filter_map(|pid| {
-                    let name = live_name(pid)?;
-                    (!name.eq_ignore_ascii_case("conhost.exe")).then_some(Member { pid, name })
-                })
-                .collect(),
-        )
+        }
+        Some(live)
     }
 
     const JOB_LIST_HEADER_WORDS: usize =
@@ -1468,13 +1572,17 @@ mod windows {
     fn live_name(pid: u32) -> Option<String> {
         // SAFETY: the handle is checked and closed; the buffers outlive the calls.
         unsafe {
-            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            let process = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            );
             if process.is_null() {
                 // An ID no process has any more is an invalid parameter.
                 return (GetLastError() != ERROR_INVALID_PARAMETER).then(|| "?".into());
             }
-            let mut code = 0;
-            let exited = GetExitCodeProcess(process, &mut code) != 0 && code != STILL_ACTIVE as u32;
+            // A terminated process may return 259 (STILL_ACTIVE) as its actual exit code.
+            let exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
             // The longest path Windows supports.
             let mut buffer = vec![0_u16; 32_768];
             let mut size = buffer.len() as u32;
@@ -1567,6 +1675,40 @@ mod windows {
             assert!(job_members(job.as_raw_handle()).unwrap().is_empty());
             assert!(job_pids(|_, _| Err(ERROR_INVALID_PARAMETER)).is_none());
             assert_eq!(job_pids(|_, _| Ok(())), Some(Vec::new()));
+        }
+
+        #[test]
+        fn a_terminated_process_with_exit_code_259_is_not_a_live_member() {
+            let mut child = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "exit 259"])
+                .spawn()
+                .unwrap();
+            assert_eq!(child.wait().unwrap().code(), Some(259));
+            assert!(live_name(child.id()).is_none());
+            assert!(!crate::process::is_alive(child.id()));
+        }
+
+        #[test]
+        fn filtering_terminated_job_ids_checks_for_new_processes() {
+            let counts = |total, active| JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+                TotalProcesses: total,
+                ActiveProcesses: active,
+                ..Default::default()
+            };
+            for (after, empty) in [
+                (Some(counts(3, 2)), false), // A new child appeared after the PID snapshot.
+                (None, false),
+                (Some(counts(2, 2)), true), // Exited PID still held, plus conhost.
+                (Some(counts(3, 0)), true), // New child also exited before the check.
+            ] {
+                let mut samples = [Some(counts(2, 2)), after].into_iter();
+                let members = collect_job_members(
+                    || samples.next().unwrap(),
+                    || Some(vec![21, 22]),
+                    |pid| (pid == 22).then(|| "conhost.exe".into()),
+                );
+                assert_eq!(members.map(|members| members.len()), empty.then_some(0));
+            }
         }
 
         #[test]

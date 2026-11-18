@@ -49,20 +49,20 @@ pub struct Request {
     /// Working directory for nested exec (when it omits cwd) and relative paths in read, write, and edit. Omit for the session's default working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// start, poll: wait up to 240000 ms per call. Poll again for longer. Ignored by kill and transcript.
+    /// Wait up to this many milliseconds for the script (0–240000, default 30000). Use exec poll to continue waiting.
     #[schemars(range(min = 0, max = 240000))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
-    /// start, poll: any match returns; the task continues. Text conditions take 1-16 case-sensitive literals, 1-4096 bytes each, without line breaks. waitMs defaults to 30000.
+    /// Return when script output matches a condition. Use 1–16 case-sensitive literals of 1–4096 bytes each, without line breaks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_when: Option<ReturnWhen>,
-    /// start: kill the entire tree, including kept processes, this many ms after launch. Zero or omitted disables it.
+    /// Stop the script after this many milliseconds. Zero or omitted disables the deadline. Tasks the script already started keep running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kill_after_ms: Option<u64>,
-    /// Window placement for all actions. Default head_tail, tail for transcript, head for nested.
+    /// Placement within the script output. Defaults to head_tail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncate: Option<Truncate>,
-    /// Body budget in UTF-8 bytes, 100-4194304 (default 16384; nested 4194304). Status, footer, errors, and warnings stay outside it.
+    /// Script output body budget in UTF-8 bytes, 100–4194304 (default 16384). Status, footer, errors, and warnings are additional.
     #[schemars(range(min = 100, max = 4194304))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
@@ -71,9 +71,9 @@ pub struct Request {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReturnWhen {
-    /// Match a substring within one unseen line, including text before carriage-return rewrites. Bash lines are cleaned. Codemode lines are unchanged.
+    /// Match a substring within one unseen line of script output.
     pub output_contains: Option<Vec<String>>,
-    /// 10-60000 ms of silence, counted from wait start (after input and keys) or the latest output, whichever is later.
+    /// 10–60000 ms of silence since the wait began or the script last produced output, whichever is later.
     #[schemars(range(min = 10, max = 60000))]
     pub quiet_ms: Option<u64>,
 }
@@ -445,6 +445,23 @@ async fn sleep(mut ms: f64) {
     }
 }
 
+/// Register the wait on the VM thread, where calls arrive in script order. A spawned
+/// future may run before an older sibling, so its first poll cannot establish queue order.
+fn queue_permit(pool: Arc<Semaphore>) -> impl Future<Output = tokio::sync::OwnedSemaphorePermit> {
+    use std::task::{Context, Poll, Waker};
+    let mut waiting = Box::pin(pool.acquire_owned());
+    let first = waiting
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()));
+    async move {
+        match first {
+            Poll::Ready(result) => result,
+            Poll::Pending => waiting.await,
+        }
+        .expect("script permit pools stay open")
+    }
+}
+
 impl Host {
     fn call(&mut self, tool: String, arguments: String) -> Result<u64, String> {
         if self.script.interrupted() || self.script.0.cancel.is_cancelled() {
@@ -520,6 +537,7 @@ impl Host {
             }
             ToolCall::Sleep(_) => None,
         };
+        let permit_wait = permit_pool.map(queue_permit);
         let service = Arc::clone(&self.service);
         let session = Arc::clone(&self.session);
         let launch = Arc::clone(&self.launch);
@@ -534,14 +552,11 @@ impl Host {
         };
         self.runtime.spawn(async move {
             let _in_flight = in_flight;
-            let permit = match permit_pool {
-                Some(pool) => Some(tokio::select! {
+            let permit = match permit_wait {
+                Some(wait) => Some(tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
-                    permit = pool.acquire_owned() => match permit {
-                        Ok(permit) => permit,
-                        Err(_) => return,
-                    },
+                    permit = wait => permit,
                 }),
                 None => None,
             };
@@ -1964,6 +1979,24 @@ mod tests {
         assert_eq!(report.bridge_bytes, 12);
         report.remove(3);
         assert_eq!(report.bridge_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn queued_starts_keep_submission_order_when_workers_poll_in_reverse() {
+        let pool = Arc::new(Semaphore::new(1));
+        let occupied = pool.clone().acquire_owned().await.unwrap();
+        let first = queue_permit(pool.clone());
+        let second = queue_permit(pool.clone());
+        let mut second = std::pin::pin!(second);
+        drop(occupied);
+        let first_permit = tokio::select! {
+            biased;
+            _ = &mut second => panic!("the second worker jumped the start queue"),
+            permit = first => permit,
+        };
+        drop(first_permit);
+        drop(second.await);
+        assert_eq!(pool.available_permits(), 1);
     }
 
     #[tokio::test]

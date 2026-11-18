@@ -175,7 +175,8 @@ note}` (`image()` throws `TypeError` with `note` when `attached` is `false`); `w
 `{path, replacements, edits}`. Each script has `8` `exec start` slots and `8`
 file/transcript I/O slots (`read`, `write`, and `edit` hold their slot inside the
 blocking worker until disk I/O finishes; `poll`, `kill`, `list`, and `sleep` take
-no slot), within `1024` pending calls; additional calls reject with `RangeError`.
+no slot), within `1024` pending calls. Starts waiting for a slot are admitted in
+script submission order. Additional calls past the pending limit reject with `RangeError`.
 Pending tool arguments and results have a separate 128 MiB budget per script;
 exceeding it rejects the call with `RangeError`. A completed result that cannot
 fit rejects after the operation ran; its error identifies this case, and the
@@ -242,7 +243,9 @@ retirement remove image files and reclaim their quota along with logs.
   file up to `4` MiB or reject with `ToolError` when larger or non-UTF-8, and
   with `offset` or `limit` read up to `4` MiB with no line cap). `offset` is a
   non-zero integer (`1`-indexed from the start when positive, or counting from
-  the end when negative with `-1` naming the last line; `0` is rejected) and
+  the end when negative with `-1` naming the last line; `0` is rejected). If the file
+  changes the starting line of a negative offset during the scan, the reader
+  retries once and reports an error if the starting line changes again. The
   `limit` (`>= 1`) bounds the number of lines. Directories report `Cannot read <path>: it is a directory; list it with exec.` Line counts
   follow real `\n` / `\r\n` lines (`""` has `totalLines: 0`, `"a\n"` and `"a"`
   have `totalLines: 1`, and `offset: 1` on an empty file returns `""` with
@@ -255,8 +258,8 @@ retirement remove image files and reclaim their quota along with logs.
   resize cannot fit, returns `attached: false` and the note as text instead of
   an image. Images ignore `offset` and `limit`. A non-regular file, and one
   that is not a recognized image and has a NUL byte in its first `8` KiB, are
-  refused; any other file decodes as text, lossily, with a note naming the
-  replacements.
+  refused. Slices report invalid UTF-8 with replacements and a note. A nested
+  whole-file read requires valid UTF-8 throughout.
 - **`write`**: Saves `content`, creating missing parent directories of the final
   target, including a dangling symlink's resolved target. Relative, absolute,
   and chained symlinks are preserved; `edit` still requires an existing file.
@@ -656,7 +659,9 @@ omitted on final serialization unless noted as always-present below.
   holding no tasks of its own and killing none. The first call works to one `10` s
   deadline that covers connecting, starting a daemon, and its `Hello`; only an
   absent daemon is started, and one that is there but does not answer in time is
-  reported instead. A call whose connection fails after it was sent returns an
+  reported instead. A timeout in the writer queue leaves the connection usable
+  and identifies the frame that never went out. Interrupting a frame write
+  closes the connection. A call whose connection fails after sending began returns an
   error naming the call, request ID, session, and daemon epoch — the action for
   `exec`, the tool for `codemode`, `read`, `write`, and `edit` — and is not
   replayed.
