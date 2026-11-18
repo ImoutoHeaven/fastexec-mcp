@@ -3201,7 +3201,7 @@ mod tests {
         let session = session("prune");
         let mut started = Vec::new();
         for _ in 0..3 {
-            let (task, _, _) = tasks
+            let ((task, _, _), _) = tasks
                 .start(start_args(), &session, random_chars(4).unwrap())
                 .unwrap();
             finish(&task);
