@@ -48,10 +48,15 @@ pub struct Endpoint {
     link: Arc<Mutex<Option<Arc<Link>>>>,
 }
 
+#[cfg(not(test))]
+type Writer = WriteHalf<transport::Client>;
+#[cfg(test)]
+type Writer = tests::ControlledWriter;
+
 /// A live connection to the daemon, shared by every call in flight.
 struct Link {
     epoch: String,
-    writer: Mutex<WriteHalf<transport::Client>>,
+    writer: Mutex<Writer>,
     pending: std::sync::Mutex<HashMap<u64, Pending>>,
     /// Cancelled when the link ends: every call on it is lost, and the reader stops.
     closed: CancellationToken,
@@ -231,6 +236,7 @@ impl Endpoint {
                     // A Cancel that did not land may have left half a frame, so the stream is
                     // not used again. The whole branch stays inside its one second.
                     self.close(&link);
+                    return self.lost(&link, tool, &action, id, &request_id);
                 }
                 error("Cancelled; the task keeps running.")
             }
@@ -301,6 +307,8 @@ impl Endpoint {
         // The start is exclusive until the daemon has answered, and no longer.
         drop(startup);
         let (reader, writer) = tokio::io::split(client);
+        #[cfg(test)]
+        let writer = tests::ControlledWriter::new(writer);
         let link = Arc::new(Link {
             epoch,
             writer: Mutex::new(writer),
@@ -486,8 +494,67 @@ mod tests {
     use super::*;
     use crate::ipc::OsText;
     use crate::transport::{Endpoint as TestEndpoint, Listener};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
+    use tokio::io::AsyncWrite;
     use tokio::time::timeout;
+
+    /// An opt-in write barrier for one link, independent of the transport's buffering.
+    pub(super) struct ControlledWriter {
+        inner: WriteHalf<transport::Client>,
+        pause: Option<WritePause>,
+    }
+
+    struct WritePause {
+        remaining: usize,
+        blocked: Option<oneshot::Sender<()>>,
+    }
+
+    impl ControlledWriter {
+        pub(super) fn new(inner: WriteHalf<transport::Client>) -> Self {
+            Self { inner, pause: None }
+        }
+    }
+
+    impl AsyncWrite for ControlledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if bytes.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            let length = if let Some(pause) = &mut this.pause {
+                if pause.remaining == 0 {
+                    if let Some(blocked) = pause.blocked.take() {
+                        let _ = blocked.send(());
+                    }
+                    return Poll::Pending;
+                }
+                bytes.len().min(pause.remaining)
+            } else {
+                bytes.len()
+            };
+            let written = Pin::new(&mut this.inner).poll_write(cx, &bytes[..length]);
+            if let Poll::Ready(Ok(count)) = &written
+                && let Some(pause) = &mut this.pause
+            {
+                pause.remaining -= count;
+            }
+            written
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
 
     /// Answers one Hello on a real endpoint with `welcome`, then holds the connection until the
     /// client lets go.
@@ -762,9 +829,11 @@ mod tests {
     async fn cancellation_during_a_frame_write_closes_then_reconnects() {
         use tokio::io::AsyncReadExt;
 
+        const PARTIAL_BYTES: usize = 5;
         let (identity, paths, mut listener, _target) = test_daemon("cancel-frame");
         let welcome = welcome(&identity);
         let (announced, writing) = oneshot::channel();
+        let (paused, blocked) = oneshot::channel();
         let (release, drain) = oneshot::channel();
         let peer = tokio::spawn(async move {
             let mut first = listener.accept().await.unwrap();
@@ -772,11 +841,12 @@ mod tests {
                 .await
                 .unwrap();
             ipc::write_frame(&mut first, &welcome).await.unwrap();
-            let mut bytes = vec![0_u8; 1];
+            let mut bytes = vec![0_u8; PARTIAL_BYTES];
             first.read_exact(&mut bytes).await.unwrap();
             announced.send(()).unwrap();
             drain.await.unwrap();
             first.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes.len(), PARTIAL_BYTES);
             let declared = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
             assert!(
                 bytes.len() < declared + 4,
@@ -816,10 +886,14 @@ mod tests {
             .link("test", std::time::Instant::now() + runtime::START_WAIT)
             .await
             .unwrap();
+        link.writer.lock().await.pause = Some(WritePause {
+            remaining: PARTIAL_BYTES,
+            blocked: Some(paused),
+        });
         let cancel = CancellationToken::new();
         let calling = endpoint.call(
             "write",
-            serde_json::json!({"path": "unused", "content": "x".repeat(2 << 20)}),
+            serde_json::json!({"path": "unused", "content": "partial"}),
             "1".into(),
             "test",
             cancel.clone(),
@@ -829,7 +903,10 @@ mod tests {
         timeout(Duration::from_secs(5), async {
             tokio::select! {
                 result = &mut calling => panic!("call ended before writing: {result:?}"),
-                seen = writing => seen.unwrap(),
+                () = async {
+                    blocked.await.unwrap();
+                    writing.await.unwrap();
+                } => {},
             }
             cancel.cancel();
             let result = (&mut calling).await;
@@ -862,6 +939,80 @@ mod tests {
         .expect("a later call reconnects");
         assert_eq!(result.content[0].as_text().unwrap().text, "ok");
         endpoint.bye().await;
+        finish(peer).await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_cannot_be_sent_reports_the_lost_link() {
+        let (identity, paths, mut listener, _target) = test_daemon("cancel-blocked");
+        let welcome = welcome(&identity);
+        let (announced, call_seen) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let _ = ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                .await
+                .unwrap();
+            ipc::write_frame(&mut conn, &welcome).await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Call { id: 1, .. })
+            ));
+            announced.send(()).unwrap();
+            // The writer stays locked until Cancel times out; no Cancel frame can arrive.
+            assert!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let endpoint = Arc::new(Endpoint::for_test(identity, paths));
+        let link = endpoint
+            .link("test", std::time::Instant::now() + runtime::START_WAIT)
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let calling = {
+            let (endpoint, cancel) = (Arc::clone(&endpoint), cancel.clone());
+            tokio::spawn(async move {
+                endpoint
+                    .call(
+                        "write",
+                        serde_json::json!({"path": "unused", "content": "complete"}),
+                        "1".into(),
+                        "test",
+                        cancel,
+                        None,
+                    )
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(5), call_seen)
+            .await
+            .expect("the peer received the full call")
+            .unwrap();
+        let busy = timeout(Duration::from_secs(5), link.writer.lock())
+            .await
+            .expect("the call released the writer");
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(5), calling)
+            .await
+            .expect("the blocked Cancel finished")
+            .unwrap();
+        assert!(
+            result.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("the call may or may not have run")
+        );
+        assert!(link.closed.is_cancelled());
+        assert!(lock(&link.pending).is_empty());
+        drop(busy);
+        drop(link);
+        drop(endpoint);
         finish(peer).await;
     }
 
