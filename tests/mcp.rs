@@ -7248,26 +7248,27 @@ fn windows_git_bash_drive_paths_and_forward_slash_reports() {
 
     // P1-1 Windows: default start PATH matches loginShell: true order, git & ls resolve, and
     // non-login snapshot execution runs at non-login speed.
+    let path_cmd = "git --version >/dev/null && ls >/dev/null && IFS=: && for p in $PATH; do cygpath -m \"$p\"; done";
     let (snap_path, _) = server.ok(json!({
         "action": "start",
-        "command": "git --version >/dev/null && ls >/dev/null && printf '%s' \"$PATH\""
+        "command": path_cmd
     }));
     let (login_path, _) = server.ok(json!({
         "action": "start",
         "loginShell": true,
-        "command": "printf '%s' \"$PATH\""
+        "command": path_cmd
     }));
     let snap_entries: Vec<&str> = snap_path["output"]
         .as_str()
         .unwrap()
-        .split(':')
-        .take(4)
+        .lines()
+        .take(5)
         .collect();
     let login_entries: Vec<&str> = login_path["output"]
         .as_str()
         .unwrap()
-        .split(':')
-        .take(4)
+        .lines()
+        .take(5)
         .collect();
     assert_eq!(
         snap_entries, login_entries,
