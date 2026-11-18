@@ -158,49 +158,58 @@ impl Tracker {
     /// signal — sudo or root — which leaves the host holding the tree, as on Linux. A member whose
     /// identity could not be confirmed is not treated as killed.
     pub fn kill_members(&mut self) -> std::io::Result<()> {
+        self.kill_members_with(Self::scan, Self::signal_members)
+    }
+
+    fn kill_members_with(
+        &mut self,
+        mut scan: impl FnMut(&mut Self),
+        mut signal: impl FnMut(&mut Self) -> Option<std::io::Error>,
+    ) -> std::io::Result<()> {
         let mut denied = None;
-        for pass in 0..8 {
-            self.refresh(true);
-            let keys: Vec<(i32, u64)> = self.members.keys().copied().collect();
-            if keys.is_empty() {
-                // Nothing to kill is only a finished kill when the scan that found it empty read
-                // the whole process table.
-                return self.confirmed_empty();
+        for pass in 0..=8 {
+            scan(self);
+            if self.members.is_empty() && self.complete {
+                return Ok(());
             }
-            denied = None;
-            for (pid, start) in keys {
-                match describe(pid) {
-                    // The identity is checked again right before the signal: a member whose pid was
-                    // reused after the scan is dropped, not signalled as its successor.
-                    Lookup::Entry(entry) if entry.start != start => {
-                        self.members.remove(&(pid, start));
-                    }
-                    // The kernel says it ended: nothing to kill and nothing to hold.
-                    Lookup::Gone => {
-                        self.members.remove(&(pid, start));
-                    }
-                    // A zombie runs nothing: the next scan drops it.
-                    Lookup::Entry(entry) if entry.status == ZOMBIE => {}
-                    Lookup::Entry(_) => denied = denied.or(kill_member(pid)),
-                    // The process could not be described: it may still run, so it is neither
-                    // killed nor reported gone.
-                    Lookup::Unknown => {}
+            if pass == 8 {
+                break;
+            }
+            // An incomplete empty scan can be a parent handing off to a child. Give it the
+            // same chance to settle as a signalled member that has not yet exited.
+            if !self.members.is_empty()
+                && let Some(error) = signal(self)
+            {
+                denied.get_or_insert(error);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err(denied.unwrap_or_else(|| {
+            std::io::Error::other(if self.members.is_empty() {
+                "the process table could not be read to confirm the kill"
+            } else {
+                "a member of the tree could not be identified"
+            })
+        }))
+    }
+
+    fn signal_members(&mut self) -> Option<std::io::Error> {
+        let mut denied = None;
+        self.members.retain(|&(pid, start), _| match describe(pid) {
+            // Recheck identity immediately before the signal. A recycled PID belongs to a
+            // different process; a gone or zombie member no longer needs a signal.
+            Lookup::Entry(entry) if entry.start != start || entry.status == ZOMBIE => false,
+            Lookup::Gone => false,
+            Lookup::Entry(_) => {
+                if let Some(error) = kill_member(pid) {
+                    denied.get_or_insert(error);
                 }
+                true
             }
-            if pass < 7 {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        if let Some(error) = denied {
-            return Err(error);
-        }
-        self.refresh(true);
-        if self.members.is_empty() {
-            return self.confirmed_empty();
-        }
-        Err(std::io::Error::other(
-            "a member of the tree could not be identified",
-        ))
+            // An unreadable member may still run. Preserve it for the next scan.
+            Lookup::Unknown => true,
+        });
+        denied
     }
 
     /// Signals the host's own group, the last step of a kill. The host names the group with its
@@ -221,18 +230,6 @@ impl Tracker {
     fn recheck_empty(&mut self) {
         self.complete = false;
         self.last_scan = None;
-    }
-
-    /// An empty set is a finished kill only when the scan that emptied it read the whole process
-    /// table.
-    fn confirmed_empty(&self) -> std::io::Result<()> {
-        if self.complete {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(
-                "the process table could not be read to confirm the kill",
-            ))
-        }
     }
 
     /// Scans when the last one is older than the cadence, or always when a kill needs the truth.
@@ -351,15 +348,13 @@ impl Tracker {
                 // parent is a member, the child is younger than it, and the parent's identity is
                 // still that one when it is read again now. A scan reads processes one by one, so
                 // either half of the snapshot can be stale, and both orders are covered.
-                let known_parent = scan.live.get(&entry.ppid).is_some_and(|parent| {
-                    let tracked = self.members.contains_key(&(entry.ppid, parent.start));
-                    let fresh = match describe(entry.ppid) {
-                        Lookup::Entry(parent) => Some(parent.start),
-                        Lookup::Gone | Lookup::Unknown => None,
-                    };
-                    parent_edge(entry, parent, tracked, fresh)
-                });
-                if known_parent || entry.group == self.group || entry.session == self.session {
+                if entry.group == self.group
+                    || entry.session == self.session
+                    || scan.live.get(&entry.ppid).is_some_and(|parent| {
+                        let tracked = self.members.contains_key(&(entry.ppid, parent.start));
+                        parent_edge(entry, parent, tracked, || start_time(entry.ppid))
+                    })
+                {
                     self.members.insert((pid, entry.start), entry.start);
                 }
             }
@@ -436,8 +431,13 @@ pub fn serve(control: Arc<Mutex<UnixStream>>, tracker: Arc<Mutex<Tracker>>) {
 
 /// Whether a child may be admitted through a parent edge: the parent is a member, the child is
 /// younger than it, and the parent's identity read again now is the one the tracker holds.
-fn parent_edge(child: &Entry, parent: &Entry, tracked: bool, fresh: Option<u64>) -> bool {
-    tracked && child.start > parent.start && fresh == Some(parent.start)
+fn parent_edge(
+    child: &Entry,
+    parent: &Entry,
+    tracked: bool,
+    fresh: impl FnOnce() -> Option<u64>,
+) -> bool {
+    tracked && child.start > parent.start && fresh() == Some(parent.start)
 }
 
 /// Signals one identified member; a signal that failed for a reason other than the process being
@@ -1288,6 +1288,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kill_retries_incomplete_empty_scans_and_signals_a_late_descendant() {
+        let mut tracker = tracker();
+        let mut passes = 0;
+        let mut signals = 0;
+        tracker
+            .kill_members_with(
+                |tracker| {
+                    passes += 1;
+                    tracker.complete = passes >= 3;
+                    if passes == 3 {
+                        tracker.members.insert((602, 2), 2);
+                    }
+                },
+                |tracker| {
+                    assert!(tracker.members.remove(&(602, 2)).is_some());
+                    signals += 1;
+                    None
+                },
+            )
+            .expect("the final complete scan confirms the kill");
+        assert_eq!(passes, 4);
+        assert_eq!(signals, 1);
+    }
+
+    #[test]
+    fn kill_requires_confirmation_and_preserves_a_signal_error() {
+        for refused in [false, true] {
+            let mut tracker = tracker();
+            let mut passes = 0;
+            let error = tracker
+                .kill_members_with(
+                    |tracker| {
+                        passes += 1;
+                        tracker.members.clear();
+                        tracker.complete = false;
+                        if refused && passes == 1 {
+                            tracker.members.insert((602, 2), 2);
+                        }
+                    },
+                    |_| Some(std::io::Error::from_raw_os_error(libc::EPERM)),
+                )
+                .expect_err("a persistent unknown cannot confirm cleanup");
+            assert_eq!(passes, 9);
+            assert_eq!(error.raw_os_error(), refused.then_some(libc::EPERM));
+        }
+    }
+
     /// A parent edge is admitted only while the parent's identity holds when it is read again: a
     /// scan can read the owned parent first, then see that number recycled, then read a foreign
     /// child that names it.
@@ -1296,23 +1344,25 @@ mod tests {
         let parent = entry(1, 300, 100, 10);
         let child = entry(900, 500, 500, 30);
         assert!(
-            parent_edge(&child, &parent, true, Some(10)),
+            parent_edge(&child, &parent, true, || Some(10)),
             "the same parent"
         );
         assert!(
-            !parent_edge(&child, &parent, true, Some(20)),
+            !parent_edge(&child, &parent, true, || Some(20)),
             "a recycled parent number is no edge"
         );
         assert!(
-            !parent_edge(&child, &parent, true, None),
+            !parent_edge(&child, &parent, true, || None),
             "an unread parent"
         );
         assert!(
-            !parent_edge(&child, &parent, false, Some(10)),
+            !parent_edge(&child, &parent, false, || panic!("unrelated parent")),
             "an untracked parent"
         );
         assert!(
-            !parent_edge(&entry(1, 500, 500, 5), &parent, true, Some(10)),
+            !parent_edge(&entry(1, 500, 500, 5), &parent, true, || panic!(
+                "older child"
+            )),
             "a child older than its parent"
         );
     }
