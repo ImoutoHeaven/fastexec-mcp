@@ -11,7 +11,6 @@
 
 use crate::frames::{History, Row as FrameRow};
 use crate::keys::Modes;
-use crate::process::{PTY_COLS, PTY_ROWS};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Row};
 use alacritty_terminal::index::{Column, Line};
@@ -300,12 +299,6 @@ impl EventListener for Replies {
 }
 
 impl Live {
-    /// An emulator at the default size, which is what a task that names no size gets.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new() -> Live {
-        Live::at(PTY_COLS, PTY_ROWS)
-    }
-
     /// An emulator for a terminal of `cols` by `rows`.
     pub fn at(cols: u16, rows: u16) -> Live {
         let replies = Replies::default();
@@ -1564,6 +1557,7 @@ fn row_text(row: &Row<Cell>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::{PTY_COLS, PTY_ROWS};
 
     /// What happened to the output at a point of a test log.
     #[derive(Clone, Copy, Debug)]
@@ -1577,7 +1571,7 @@ mod tests {
     /// The transcript of `log`, read in pieces split where `marks` fall: the lines written out,
     /// then those pending. `closed` ends the output.
     fn record(log: &[u8], marks: &[(usize, Mark)], closed: bool) -> String {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         let mut text = String::new();
         let (mut start, mut pause) = (0, None);
         for &(at, mark) in marks {
@@ -1607,7 +1601,7 @@ mod tests {
 
     #[test]
     fn an_internal_panic_stops_emulation_without_stopping_raw_progress() {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         live.process(b"before\r\n", Instant::now(), None);
         let before = live.read;
         // Inject at the existing panic boundary; no production input needs to be able to
@@ -1635,7 +1629,7 @@ mod tests {
 
     #[test]
     fn regression_keyboard_push_overflow_keeps_the_emulator_alive() {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         live.process("\x1b[>1u".repeat(4097).as_bytes(), Instant::now(), None);
         assert!(
             !live.stopped(),
@@ -1651,7 +1645,7 @@ mod tests {
 
     #[test]
     fn keyboard_queries_follow_direct_changes_and_nested_restores() {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         for (input, flags) in [
             ("\x1b[=3u", 3),
             ("\x1b[=4;2u", 7),
@@ -1671,7 +1665,7 @@ mod tests {
 
     #[test]
     fn keyboard_stacks_are_per_screen_and_reset_together() {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         for (input, flags) in [
             ("\x1b[=3u\x1b[>5u", 5),
             ("\x1b[?1049h", 0),
@@ -1697,7 +1691,7 @@ mod tests {
 
     #[test]
     fn regression_osc_guard_preserves_the_raw_sync_cursor() {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         let arrived = Instant::now();
         // An earlier discarded OSC makes raw and forwarded offsets differ before the sync.
         let prefix = format!(
@@ -1729,7 +1723,7 @@ mod tests {
     #[test]
     fn osc_offsets_survive_sync_end_resize_timeout_and_buffer_limit() {
         for ending in ["explicit", "resize", "timeout", "buffer"] {
-            let mut live = Live::new();
+            let mut live = Live::at(PTY_COLS, PTY_ROWS);
             let arrived = Instant::now();
             live.process(b"A\x1b[?2026hB", arrived, None);
             for _ in 0..12 {
@@ -1768,7 +1762,7 @@ mod tests {
     fn sync_raw_offsets_do_not_depend_on_osc_chunk_boundaries() {
         let held = b"B\x1b]0;small title\x07C";
         for split in 0..=held.len() {
-            let mut live = Live::new();
+            let mut live = Live::at(PTY_COLS, PTY_ROWS);
             let arrived = Instant::now();
             live.process(b"A\x1b[?2026h", arrived, None);
             live.process(&held[..split], arrived, None);
@@ -1785,7 +1779,7 @@ mod tests {
     fn oversized_osc_is_bounded_across_chunks_and_does_not_become_text() {
         for prefix in ["0;", "8;;https://example.test/", "52;c;"] {
             for terminator in ["\x07", "\x1b\\", "\x18"] {
-                let mut live = Live::new();
+                let mut live = Live::at(PTY_COLS, PTY_ROWS);
                 live.process(
                     format!("before\x1b]{prefix}").as_bytes(),
                     Instant::now(),
@@ -1863,7 +1857,7 @@ mod tests {
 
     #[test]
     fn regression_internal_row_marks_remain_bounded() {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         live.process(b"a", Instant::now(), None);
         for n in 0..256 {
             let frame = format!("\x1b[1;2H{n:04}\x1b[?1049h\x1b[?1049l");
@@ -1887,7 +1881,7 @@ mod tests {
 
     #[test]
     fn regression_combining_marks_are_bounded_per_cell() {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         live.process(b"a", Instant::now(), None);
         let marks = "\u{301}".repeat(4096);
         for _ in 0..16 {
@@ -2159,7 +2153,7 @@ mod tests {
                 .map(|k| format!("[{};1H[2Kframed {k:05}", k % 5 + 2))
                 .collect()
         }
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         let mut text = String::new();
         let arrived = Instant::now();
         // A whole frame of five rows on the alternate screen.
@@ -2235,7 +2229,7 @@ mod tests {
             log += "\x1b[?2026l";
         }
         // Read in pieces, as a program's output arrives.
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         let mut text = String::new();
         // One arrival for every piece: the chunks are one program's output, and a fresh instant
         // per chunk would let a scheduling gap expire a synchronized update the fixture means to
@@ -2283,7 +2277,7 @@ mod tests {
 
     #[test]
     fn written_lines_and_pending_lines_make_the_transcript() {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         let log: String = (0..100).map(|k| format!("line {k}\r\n")).collect();
         live.process(log.as_bytes(), Instant::now(), None);
         let written = live.take_written();
@@ -2667,7 +2661,7 @@ mod tests {
 
     #[test]
     fn a_synchronized_update_shows_once_it_ends_across_reads() {
-        let mut live = Live::new();
+        let mut live = Live::at(PTY_COLS, PTY_ROWS);
         live.process(b"before\r\n\x1b[?2026h", Instant::now(), None);
         live.process(b"held", Instant::now(), None);
         let (rows, _) = live.screen().unwrap();
@@ -2728,7 +2722,7 @@ mod tests {
         for _ in 0..150 {
             let log: String = (0..400).map(|_| PIECES[next(PIECES.len())]).collect();
             let log = log.as_bytes();
-            let mut live = Live::new();
+            let mut live = Live::at(PTY_COLS, PTY_ROWS);
             let mut start = 0;
             while start < log.len() {
                 let end = (start + 1 + next(200)).min(log.len());

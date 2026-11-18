@@ -131,7 +131,6 @@ impl Fixture {
             .env_remove("FASTEXEC_OUTPUT_MODE")
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
-            .env_remove("FASTEXEC_TEST_NONE_LIMIT")
             .stdin(std::process::Stdio::null());
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
@@ -1161,7 +1160,7 @@ fn legacy_initialize_with_a_modern_version_keeps_its_client_session() {
 }
 
 #[test]
-fn minimum_budget_with_one_tenant_task_defers_the_outside_count_until_room_allows() {
+fn minimum_body_budget_keeps_outside_tenant_footer_whole_and_once_per_session() {
     let mut fixture = Fixture::bare("tenant-budget");
     fixture.tokens.push(random_token());
     fixture.start();
@@ -1170,19 +1169,21 @@ fn minimum_budget_with_one_tenant_task_defers_the_outside_count_until_room_allow
     let (started, _) = tenant.modern_result(json!({
         "action": "start", "eof": false, "command": "read -r line", "waitMs": 0,
     }));
-    // A 100-byte result cannot fit the outside-task count (77 bytes > 25-byte footer cap),
-    // so it neither overflows maxBytes nor consumes the session's outside-count slot.
-    let (_, tight) = caller.modern_result(json!({
-        "action": "start", "command": "true", "waitMs": 30000, "maxBytes": 100,
-    }));
-    assert!(tight.len() <= 100, "{tight:?}");
-    assert!(!tight.contains("running outside this session"), "{tight}");
+    // Footer lives outside the body maxBytes budget, so a 100-byte body still carries the
+    // outside-task notice on the session's first call and does not repeat it on the second.
     let (_, first_full) = caller.modern_result(json!({
-        "action": "start", "command": "true", "waitMs": 30000,
+        "action": "start", "command": "true", "waitMs": 30000, "maxBytes": 100,
     }));
     assert!(
         first_full.contains("1 task running outside this session; use list with scope \"all\"."),
         "{first_full}"
+    );
+    let (_, second_call) = caller.modern_result(json!({
+        "action": "start", "command": "true", "waitMs": 30000,
+    }));
+    assert!(
+        !second_call.contains("running outside this session"),
+        "{second_call}"
     );
     assert!(
         !first_full.contains(
@@ -2858,4 +2859,55 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
     );
 
     c1.call_tool("exec", json!({"action": "kill", "taskId": task_id}));
+}
+
+#[test]
+fn http_login_snapshot_strips_fastexec_http_token_even_when_profile_exports_it() {
+    let fixture = Fixture::bare("profile-token-strip");
+    let home = fixture.runtime.join("profile-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join(".bash_profile"),
+        "export FASTEXEC_HTTP_TOKEN=profile-secret-token-value\nexport FX_HTTP_PROFILE=from_profile\n",
+    )
+    .unwrap();
+    let mut child = fixture.command(&["daemon", "run", "--http", "127.0.0.1:0"]);
+    child
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut spawned = child.spawn().unwrap();
+    let stderr = spawned.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = tx.send(line);
+        }
+    });
+    let banner = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("daemon run banner");
+    let addr: std::net::SocketAddr = banner
+        .split(" http ")
+        .nth(1)
+        .expect("http addr")
+        .parse()
+        .unwrap();
+    let mut client = Client::new(addr, fixture.tokens[0].clone());
+    let (out, text) = client.modern_result(json!({
+        "action": "start",
+        "command": "printf '%s|%s' \"$FX_HTTP_PROFILE\" \"${FASTEXEC_HTTP_TOKEN:-absent}\""
+    }));
+    assert_eq!(out["exitCode"], 0, "{text}");
+    assert!(
+        text.starts_with("from_profile|absent"),
+        "FASTEXEC_HTTP_TOKEN must remain stripped even if .bash_profile exports it: {text}"
+    );
+    let _ = fixture.run(&["daemon", "stop"]);
+    let _ = spawned.wait();
 }

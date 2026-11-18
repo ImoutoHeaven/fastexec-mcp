@@ -1,7 +1,6 @@
 //! Who this server is and where its daemon keeps its state: the build ID, the namespace, the
 //! runtime directory and its endpoint, the locks that serialize starters, and the cached image a
 //! daemon is started from.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::session::LaunchContext;
 use crate::transport;

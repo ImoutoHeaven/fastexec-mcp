@@ -1,6 +1,5 @@
 //! The daemon's side of a connection: the handshake, the session table, the writer task, and the
-//! calls it runs. It works over any byte stream; the sockets that carry one come later.
-#![cfg_attr(not(test), allow(dead_code))]
+//! calls it runs over local byte streams and Streamable HTTP.
 
 use crate::http::{self, Http};
 use crate::ipc::{self, ToDaemon, ToEndpoint};
@@ -187,10 +186,6 @@ struct Attached {
 }
 
 impl Daemon {
-    pub fn new(tasks: Arc<Tasks>, namespace: String, build: String) -> Arc<Self> {
-        Self::with_config(tasks, namespace, build, None, Config::default())
-    }
-
     pub fn with_config(
         tasks: Arc<Tasks>,
         namespace: String,
@@ -1357,16 +1352,7 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let lock = one_at_a_time();
-        let daemon = Daemon::new(
-            Tasks::new(Limits::OFF).unwrap(),
-            "fastexec".to_owned(),
-            env!("CARGO_PKG_VERSION").to_owned(),
-        );
-        Fixture {
-            daemon,
-            _one_at_a_time: lock,
-        }
+        fixture_with_config(Config::default())
     }
 
     fn fixture_with_config(config: Config) -> Fixture {

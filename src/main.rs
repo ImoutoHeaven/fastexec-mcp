@@ -443,7 +443,7 @@ impl Server {
         }
     }
 
-    #[doc = "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."]
+    #[doc = "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. Text output caps at 2000 lines or 50KB. Pass offset (1-indexed, or negative from the end) and limit for slices, continuing with nextOffset until complete."]
     #[tool(name = "read", annotations(title = "Read file", read_only_hint = true))]
     async fn read(
         &self,
@@ -482,7 +482,7 @@ impl Server {
         }
     }
 
-    #[doc = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes. Bytes outside the matches are preserved. Saving requires a writable parent directory and a regular file with one hard link."]
+    #[doc = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file (or start within startLine..=endLine). Merge changes touching the same block or nearby lines instead of emitting overlapping edits, and avoid large unchanged bridges. Unmatched bytes are preserved. Saving requires a writable parent directory and a single-link regular file."]
     #[tool(
         name = "edit",
         annotations(title = "Edit file", destructive_hint = true, idempotent_hint = false)
@@ -915,6 +915,9 @@ fn main() {
         if args.first().is_some_and(|arg| arg == host::FLAG) {
             host::main(&args[1..]);
         }
+    }
+    if args.first().is_some_and(|arg| arg == process::ENV_FLAG) {
+        process::dump_env();
     }
     if args.first().is_some_and(|arg| arg == "daemon") {
         std::process::exit(daemon_main(&args[1..]));
@@ -1989,11 +1992,13 @@ mod portable_schema_tests {
                 "returnWhen.{rw_field} diverged"
             );
         }
-        assert!(
-            exec_s["properties"]["maxBytes"]["description"]
-                .as_str()
-                .unwrap()
-                .ends_with("Not with truncate \"none\".")
+        assert_eq!(
+            exec_s["properties"]["truncate"]["enum"],
+            json!(["head_tail", "head", "tail"])
+        );
+        assert_eq!(
+            exec_s["properties"]["maxBytes"]["maximum"],
+            json!(4_194_304)
         );
         assert!(code_s["properties"].get("raw").is_none());
 

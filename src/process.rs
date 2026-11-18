@@ -5,12 +5,19 @@
 //! (Apache-2.0, Copyright 2026 yc-duan), modified for fastexec.
 
 use crate::session::LaunchContext;
+#[cfg(windows)]
+use crate::session::var_in;
 #[cfg(unix)]
 use crate::unix_pty::open as open_pty;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+/// Hidden CLI flag used by the per-session login environment probe.
+pub const ENV_FLAG: &str = "--fastexec-dump-env";
+const ENV_MARKER: &[u8] = b"\0__FASTEXEC_ENV_START__\0";
+const LOGIN_ENV_LIMIT: u64 = 1 << 20;
 
 /// Commands longer than this run from a script file: the Git for Windows runtime cuts an
 /// argument past 8,190 UTF-16 units, and a UTF-8 command has at least as many bytes as units.
@@ -22,8 +29,11 @@ pub struct Launch<'a> {
     /// Script file holding `command` when it exceeds [`SCRIPT_THRESHOLD_BYTES`].
     pub script: Option<&'a Path>,
     pub cwd: &'a Path,
-    /// The session's environment: a task inherits it, never the server's own.
-    pub env: &'a LaunchContext,
+    /// Base environment pairs for this task (snapshot or raw session environment).
+    pub base_env: &'a [(OsString, OsString)],
+    /// True when `base_env` already comes from the session's login-shell snapshot.
+    #[cfg(windows)]
+    pub used_snapshot: bool,
     pub login: bool,
     pub pty: bool,
     /// Whether a pipe task gets a writable stdin pipe rather than `/dev/null` (`NUL`).
@@ -297,16 +307,125 @@ pub fn spawn(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     return spawn_host(launch);
 }
 
-/// The banner probe uses the same host/Job ownership as a task. Its output is nonblocking,
-/// so a candidate or descendant holding stdout cannot strand a reader thread after timeout.
-pub(crate) fn bash_version(
-    path: &Path,
-    context: &LaunchContext,
-    banner_limit: u64,
+/// Writes `ENV_MARKER` followed by NUL-separated `NAME=VALUE` entries and exits.
+pub fn dump_env() -> ! {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(ENV_MARKER);
+    for (name, value) in std::env::vars_os() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let _ = out.write_all(name.as_bytes());
+            let _ = out.write_all(b"=");
+            let _ = out.write_all(value.as_bytes());
+            let _ = out.write_all(b"\0");
+        }
+        #[cfg(windows)]
+        {
+            let n = name.to_string_lossy();
+            let v = value.to_string_lossy();
+            if !n.contains('\0') && !v.contains('\0') {
+                let _ = out.write_all(n.as_bytes());
+                let _ = out.write_all(b"=");
+                let _ = out.write_all(v.as_bytes());
+                let _ = out.write_all(b"\0");
+            }
+        }
+    }
+    let _ = out.flush();
+    std::process::exit(0);
+}
+
+fn fastexec_image_path() -> Result<OsString, String> {
+    #[cfg(test)]
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(bin) = exe
+            .parent()
+            .and_then(Path::parent)
+            .map(|dir| {
+                dir.join(if cfg!(windows) {
+                    "fastexec.exe"
+                } else {
+                    "fastexec"
+                })
+            })
+            .filter(|bin| bin.is_file())
+    {
+        #[cfg(windows)]
+        return Ok(bin.to_string_lossy().replace('\\', "/").into());
+        #[cfg(not(windows))]
+        return Ok(bin.into_os_string());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(format!("/proc/{}/exe", std::process::id()).into())
+    }
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    {
+        std::env::current_exe()
+            .map(std::path::PathBuf::into_os_string)
+            .map_err(|error| format!("cannot locate fastexec image: {error}"))
+    }
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("cannot locate fastexec image: {error}"))?;
+        Ok(exe.to_string_lossy().replace('\\', "/").into())
+    }
+}
+
+fn parse_env_dump(bytes: &[u8]) -> Result<Vec<(OsString, OsString)>, String> {
+    let Some(pos) = bytes
+        .windows(ENV_MARKER.len())
+        .position(|window| window == ENV_MARKER)
+    else {
+        return Err("login shell exited without reporting its environment".to_owned());
+    };
+    let payload = &bytes[pos + ENV_MARKER.len()..];
+    let mut vars = Vec::new();
+    for entry in payload.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        // Start searching at index 1 so Windows per-drive entries like `=C:=C:\...` split cleanly.
+        let Some(rel_eq) = entry
+            .get(1..)
+            .and_then(|rest| rest.iter().position(|&b| b == b'='))
+        else {
+            continue;
+        };
+        let eq = 1 + rel_eq;
+        let (raw_name, raw_val) = (&entry[..eq], &entry[eq + 1..]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            vars.push((
+                OsString::from_vec(raw_name.to_vec()),
+                OsString::from_vec(raw_val.to_vec()),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            if let (Ok(name), Ok(val)) =
+                (std::str::from_utf8(raw_name), std::str::from_utf8(raw_val))
+            {
+                vars.push((OsString::from(name), OsString::from(val)));
+            }
+        }
+    }
+    Ok(vars)
+}
+
+/// Runs a bounded, nonblocking probe under the same host/Job ownership as a task.
+fn run_probe(
+    label: &str,
+    launch: &Launch<'_>,
+    args: Vec<OsString>,
+    raw_probe_env: bool,
+    output_limit: u64,
+    limit_label: &str,
     timeout: std::time::Duration,
 ) -> Result<Vec<u8>, String> {
-    // Reserve a reaper before a process exists. It also keeps an unkillable tree owned if the
-    // OS refuses cleanup; the caller reports that failure instead of blocking forever.
     let (cleanup, pending) = std::sync::mpsc::channel::<(Child, Tree)>();
     let (settled, settlement) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -317,27 +436,11 @@ pub(crate) fn bash_version(
                 let _ = settled.send(ended);
             }
         })
-        .map_err(|error| format!("cannot prepare the --version reaper: {error}"))?;
-    let launch = Launch {
-        bash: path,
-        command: "",
-        script: None,
-        // Discovery must still work when the session's old working directory is gone.
-        cwd: path
-            .parent()
-            .ok_or("the bash path has no parent directory")?,
-        env: context,
-        login: false,
-        pty: false,
-        pipe_stdin: false,
-        cols: PTY_COLS,
-        rows: PTY_ROWS,
-        exit_status: None,
-    };
+        .map_err(|error| format!("cannot prepare the {label} reaper: {error}"))?;
     #[cfg(unix)]
-    let spawned = spawn_host_args(&launch, vec!["--version".into()], true);
+    let spawned = spawn_host_args(launch, args, true, raw_probe_env);
     #[cfg(windows)]
-    let spawned = spawn_pipe_args(&launch, vec!["--version".into()], true);
+    let spawned = spawn_pipe_args(launch, args, true, raw_probe_env);
     let Spawned {
         mut child,
         mut output,
@@ -349,33 +452,35 @@ pub(crate) fn bash_version(
     let result = (|| {
         let deadline = std::time::Instant::now() + timeout;
         let mut bytes = Vec::new();
-        let mut buffer = [0_u8; 1024];
+        let mut buffer = [0_u8; 8192];
         let mut status = None;
         let mut output_ended = false;
         loop {
             if std::time::Instant::now() >= deadline {
-                return Err("--version did not finish within 5 s".to_string());
+                return Err(format!(
+                    "{label} did not finish within {} s",
+                    timeout.as_secs()
+                ));
             }
             if status.is_none() {
                 status = child.try_wait(&tree).map_err(|error| error.to_string())?;
                 if status.is_some() {
-                    // No child is part of a version banner once its root has exited.
                     tree.kill()
-                        .map_err(|error| format!("cannot end the --version tree: {error}"))?;
+                        .map_err(|error| format!("cannot end the {label} tree: {error}"))?;
                 }
             }
-            if !output_ended {
+            while !output_ended {
                 match output.read(&mut buffer) {
                     Ok(0) => output_ended = true,
                     Ok(read) => {
                         bytes.extend_from_slice(&buffer[..read]);
-                        if bytes.len() as u64 > banner_limit {
-                            return Err("--version printed more than 4 KiB".to_string());
+                        if bytes.len() as u64 > output_limit {
+                            return Err(format!("{label} printed more than {limit_label}"));
                         }
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(format!("cannot read --version output: {error}")),
+                    Err(error) => return Err(format!("cannot read {label} output: {error}")),
                 }
             }
             if let Some(code) = status
@@ -384,7 +489,7 @@ pub(crate) fn bash_version(
                 return if code == 0 {
                     Ok(bytes)
                 } else {
-                    Err(format!("--version failed (exit code {code})"))
+                    Err(format!("{label} failed (exit code {code})"))
                 };
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -396,13 +501,93 @@ pub(crate) fn bash_version(
         .unwrap_or_else(|_| unreachable!("prepared probe reaper stopped"));
     if let Err(error) = killed {
         return Err(format!(
-            "cannot terminate the --version process tree: {error}"
+            "cannot terminate the {label} process tree: {error}"
         ));
     }
     if settlement.recv_timeout(std::time::Duration::from_secs(1)) != Ok(true) {
-        return Err("the --version process tree did not confirm cleanup within 1 s".to_owned());
+        return Err(format!(
+            "the {label} process tree did not confirm cleanup within 1 s"
+        ));
     }
     result
+}
+
+/// The banner probe uses the same host/Job ownership as a task. Its output is nonblocking,
+/// so a candidate or descendant holding stdout cannot strand a reader thread after timeout.
+pub(crate) fn bash_version(
+    path: &Path,
+    context: &LaunchContext,
+    banner_limit: u64,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    let launch = Launch {
+        bash: path,
+        command: "",
+        script: None,
+        // Discovery must still work when the session's old working directory is gone.
+        cwd: path
+            .parent()
+            .ok_or("the bash path has no parent directory")?,
+        base_env: &context.env,
+        #[cfg(windows)]
+        used_snapshot: false,
+        login: false,
+        pty: false,
+        pipe_stdin: false,
+        cols: PTY_COLS,
+        rows: PTY_ROWS,
+        exit_status: None,
+    };
+    run_probe(
+        "--version",
+        &launch,
+        vec!["--version".into()],
+        false,
+        banner_limit,
+        "4 KiB",
+        timeout,
+    )
+}
+
+/// Probes `bash -l` once per session to capture the login environment snapshot.
+pub(crate) fn probe_login_env(
+    bash: &Path,
+    context: &LaunchContext,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let image = fastexec_image_path()?;
+    let launch = Launch {
+        bash,
+        command: "",
+        script: None,
+        cwd: bash
+            .parent()
+            .ok_or("the bash path has no parent directory")?,
+        base_env: &context.env,
+        #[cfg(windows)]
+        used_snapshot: false,
+        login: true,
+        pty: false,
+        pipe_stdin: false,
+        cols: PTY_COLS,
+        rows: PTY_ROWS,
+        exit_status: None,
+    };
+    let args = vec![
+        "-l".into(),
+        "-c".into(),
+        format!("exec \"$0\" {ENV_FLAG}").into(),
+        image,
+    ];
+    let bytes = run_probe(
+        "login shell",
+        &launch,
+        args,
+        true,
+        LOGIN_ENV_LIMIT,
+        "1 MiB",
+        std::time::Duration::from_secs(5),
+    )?;
+    parse_env_dump(&bytes)
 }
 
 struct ProbeReader(std::io::PipeReader);
@@ -524,14 +709,17 @@ pub(crate) fn environment(launch: &Launch<'_>) -> Vec<(&'static str, OsString)> 
 }
 
 /// A login shell composes PATH in /etc/profile; msys2 installs default to `minimal`, which drops
-/// the user's tools, so `inherit` is set unless the user chose a value. A non-login shell skips
-/// the profile and gets the Git toolset directories prepended instead.
+/// the user's tools, so `inherit` is set unless the user chose a value. When a non-login shell has
+/// no login snapshot, the Git toolset directories are prepended instead.
 #[cfg(windows)]
 fn windows_path_environment(launch: &Launch<'_>, env: &mut Vec<(&'static str, OsString)>) {
     if launch.login {
-        if launch.env.var("MSYS2_PATH_TYPE").is_none() {
+        if var_in(launch.base_env, "MSYS2_PATH_TYPE").is_none() {
             env.push(("MSYS2_PATH_TYPE", "inherit".into()));
         }
+        return;
+    }
+    if launch.used_snapshot {
         return;
     }
     let Some(usr_bin) = launch.bash.parent() else {
@@ -547,9 +735,7 @@ fn windows_path_environment(launch: &Launch<'_>, env: &mut Vec<(&'static str, Os
         }
     }
     dirs.extend(
-        launch
-            .env
-            .var("PATH")
+        var_in(launch.base_env, "PATH")
             .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
             .unwrap_or_default(),
     );
@@ -559,8 +745,17 @@ fn windows_path_environment(launch: &Launch<'_>, env: &mut Vec<(&'static str, Os
 }
 
 #[cfg(windows)]
+fn probe_overrides(launch: &Launch<'_>) -> Vec<(&'static str, OsString)> {
+    let mut env = Vec::new();
+    if var_in(launch.base_env, "MSYS2_PATH_TYPE").is_none() {
+        env.push(("MSYS2_PATH_TYPE", "inherit".into()));
+    }
+    env
+}
+
+#[cfg(windows)]
 fn spawn_pipe(launch: &Launch<'_>) -> std::io::Result<Spawned> {
-    spawn_pipe_args(launch, bash_args(launch), false)
+    spawn_pipe_args(launch, bash_args(launch), false, false)
 }
 
 #[cfg(windows)]
@@ -568,18 +763,24 @@ fn spawn_pipe_args(
     launch: &Launch<'_>,
     args: Vec<OsString>,
     probe: bool,
+    raw_probe_env: bool,
 ) -> std::io::Result<Spawned> {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
     let (reader, writer) = std::io::pipe()?;
     let output = pipe_output(reader, probe)?;
+    let overrides = if raw_probe_env {
+        probe_overrides(launch)
+    } else {
+        environment(launch)
+    };
     let mut command = quiet_command(launch.bash);
     command
         .args(args)
         .env_clear()
-        .envs(launch.env.env.iter().map(|(name, value)| (name, value)))
-        .envs(environment(launch))
+        .envs(launch.base_env.iter().map(|(name, value)| (name, value)))
+        .envs(overrides)
         .current_dir(launch.cwd)
         .stdin(if launch.pipe_stdin {
             Stdio::piped()
@@ -638,7 +839,7 @@ fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
 /// host's controlling terminal, so bash ending leaves the terminal and its session up.
 #[cfg(unix)]
 fn spawn_host(launch: &Launch<'_>) -> std::io::Result<Spawned> {
-    spawn_host_args(launch, bash_args(launch), false)
+    spawn_host_args(launch, bash_args(launch), false, false)
 }
 
 #[cfg(unix)]
@@ -646,6 +847,7 @@ fn spawn_host_args(
     launch: &Launch<'_>,
     args: Vec<OsString>,
     probe: bool,
+    raw_probe_env: bool,
 ) -> std::io::Result<Spawned> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
@@ -670,6 +872,11 @@ fn spawn_host_args(
     } else {
         std::env::current_exe()?
     };
+    let overrides = if raw_probe_env {
+        Vec::new()
+    } else {
+        environment(launch)
+    };
     let mut command = Command::new(host);
     command
         .arg(crate::host::FLAG)
@@ -678,8 +885,8 @@ fn spawn_host_args(
         .args(args)
         // The host needs no environment of its own: it execs bash with this one.
         .env_clear()
-        .envs(launch.env.env.iter().map(|(name, value)| (name, value)))
-        .envs(environment(launch))
+        .envs(launch.base_env.iter().map(|(name, value)| (name, value)))
+        .envs(overrides)
         .current_dir(launch.cwd);
     let (master, output): (_, Box<dyn Read + Send>) = if launch.pty {
         let (master, slave) = open_pty(launch.cols, launch.rows)?;
@@ -811,7 +1018,7 @@ mod startup_tests {
             command: "",
             script: Some(&script),
             cwd: Path::new("/"),
-            env: &context,
+            base_env: &context.env,
             login: false,
             pty: false,
             pipe_stdin: false,

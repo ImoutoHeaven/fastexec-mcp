@@ -1,6 +1,5 @@
 //! The local byte streams the daemon listens on and a client connects to: a named pipe whose
 //! access is the current user's alone on Windows, a Unix socket elsewhere.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use std::ffi::OsStr;
 use std::io;

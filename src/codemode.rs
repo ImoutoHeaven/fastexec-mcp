@@ -30,11 +30,13 @@ const BRIDGE_ERROR: &str =
 const DIAGNOSTIC_RESERVE: u64 = 4096;
 const MAX_IMAGES: usize = 64;
 const BRIDGE_RESULT_ERROR: &str = "The tool call completed, but its result does not fit in the 128 MiB pending bridge budget; the operation was not undone.";
-const ACTIVE_CALLS: usize = 8;
-const QUEUED_CALLS: usize = 1024;
+const START_PERMITS: usize = 8;
+const IO_PERMITS: usize = 8;
+const PENDING_CALLS: usize = 1024;
 const MAX_STARTS: usize = 4096;
 const STARTS_ERROR: &str = "A script may accept at most 4096 exec start calls.";
-const STALLED: &str = "The script is waiting on a promise that can never settle: no tool call is pending, and timers do not exist here.";
+const STALLED: &str =
+    "The script is waiting on a promise that can never settle: no tool call or sleep is pending.";
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -44,7 +46,7 @@ pub struct Request {
     /// Working directory for nested exec (when it omits cwd) and relative paths in read, write, and edit. Omit for the session's default working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// start, poll: wait up to 240000 ms per call. Poll again for longer. Ignored by kill.
+    /// start, poll: wait up to 240000 ms per call. Poll again for longer. Ignored by kill and transcript.
     #[schemars(range(min = 0, max = 240000))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
@@ -54,11 +56,11 @@ pub struct Request {
     /// start: kill the entire tree, including kept processes, this many ms after launch. Zero or omitted disables it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kill_after_ms: Option<u64>,
-    /// Window placement for all actions. Default head_tail, or tail for transcript.
+    /// Window placement for all actions. Default head_tail, tail for transcript, head for nested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncate: Option<Truncate>,
-    /// Result budget in bytes, 100-1048576 (default 16384). Errors and correctness warnings stay whole. Not with truncate "none".
-    #[schemars(range(min = 100, max = 1048576))]
+    /// Body budget in UTF-8 bytes, 100-4194304 (default 16384; nested 4194304). Status, footer, errors, and warnings stay outside it.
+    #[schemars(range(min = 100, max = 4194304))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
 }
@@ -138,8 +140,8 @@ struct Report {
 
 impl Report {
     fn admit(&mut self, id: u64, info: CallInfo, bytes: usize) -> Result<(), String> {
-        if self.pending.len() >= ACTIVE_CALLS + QUEUED_CALLS {
-            return Err("At most 8 tool calls may run and 1024 may queue per script.".into());
+        if self.pending.len() >= PENDING_CALLS {
+            return Err("At most 1024 calls may be pending per script.".into());
         }
         if bytes > BRIDGE_LIMIT - self.bridge_bytes {
             return Err(BRIDGE_ERROR.into());
@@ -364,7 +366,8 @@ struct Host {
     call_id: Option<u64>,
     runtime: Handle,
     script: ScriptHandle,
-    semaphore: Arc<Semaphore>,
+    start_permits: Arc<Semaphore>,
+    io_permits: Arc<Semaphore>,
     next: u64,
     starts: usize,
 }
@@ -374,6 +377,7 @@ enum ToolCall {
     Read(files::ReadRequest),
     Write(files::WriteRequest),
     Edit(files::EditRequest),
+    Sleep(f64),
 }
 
 impl ToolCall {
@@ -383,8 +387,11 @@ impl ToolCall {
         }
         let invalid = |error: serde_json::Error| format!("Invalid {tool} arguments: {error}");
         match tool {
-            "exec" => serde_json::from_value(value)
-                .map(|request| Self::Exec(Box::new(request)))
+            "exec" => serde_json::from_value::<service::Request>(value)
+                .map(|mut request| {
+                    service::normalize_request(&mut request);
+                    Self::Exec(Box::new(request))
+                })
                 .map_err(invalid),
             "read" => serde_json::from_value(value)
                 .map(Self::Read)
@@ -417,6 +424,14 @@ impl Host {
             arguments.len(),
         )?;
         let parsed = (|| {
+            if tool == "sleep" {
+                let ms = arguments
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|ms| ms.is_finite())
+                    .ok_or_else(|| "sleep requires a finite number of milliseconds.".to_owned())?;
+                return Ok(ToolCall::Sleep(ms.max(0.0)));
+            }
             let value: serde_json::Value =
                 serde_json::from_str(&arguments).map_err(|error| error.to_string())?;
             let info = CallInfo {
@@ -456,7 +471,17 @@ impl Host {
             self.starts += 1;
         }
         drop(arguments);
-        let semaphore = Arc::clone(&self.semaphore);
+        let permit_pool = match &request {
+            ToolCall::Exec(req) => match req.action {
+                service::Action::Start => Some(Arc::clone(&self.start_permits)),
+                service::Action::Transcript => Some(Arc::clone(&self.io_permits)),
+                service::Action::Poll | service::Action::Kill | service::Action::List => None,
+            },
+            ToolCall::Read(_) | ToolCall::Write(_) | ToolCall::Edit(_) => {
+                Some(Arc::clone(&self.io_permits))
+            }
+            ToolCall::Sleep(_) => None,
+        };
         let service = Arc::clone(&self.service);
         let session = Arc::clone(&self.session);
         let launch = Arc::clone(&self.launch);
@@ -471,16 +496,45 @@ impl Host {
         };
         self.runtime.spawn(async move {
             let _in_flight = in_flight;
-            let _permit = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return,
-                permit = semaphore.acquire_owned() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => return,
-                },
+            let permit = match permit_pool {
+                Some(pool) => Some(tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    permit = pool.acquire_owned() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    },
+                }),
+                None => None,
             };
             let result = match request {
+                ToolCall::Sleep(ms) => {
+                    if ms <= 0.0 {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            () = tokio::task::yield_now() => {}
+                        }
+                    } else {
+                        let max_ms = (1_u64 << 40) as f64;
+                        let duration = std::time::Duration::from_secs_f64(ms.min(max_ms) / 1000.0);
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            () = tokio::time::sleep(duration) => {}
+                        }
+                    }
+                    let payload = "{\"ok\":true}".to_owned();
+                    let outcome = if lock(&script.0.report).result(id, payload.len()) {
+                        Outcome::Value(payload)
+                    } else {
+                        Outcome::Limit
+                    };
+                    let _ = script.0.wake.send(Wake::Settled { id, outcome });
+                    return;
+                }
                 ToolCall::Exec(request) => {
+                    let _permit = permit;
                     service
                         .call(
                             *request,
@@ -497,24 +551,29 @@ impl Host {
                         )
                         .await
                 }
-                request => {
+                ToolCall::Read(request) => {
+                    let permit = permit.expect("read acquires an I/O permit");
+                    let read_cancel = cancel.clone();
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        result = async move {
-                            match request {
-                                ToolCall::Read(request) => {
-                                    files::read_nested(request, launch, http, nested_render).await
-                                }
-                                ToolCall::Write(request) => {
-                                    files::write(request, launch, nested_render).await
-                                }
-                                ToolCall::Edit(request) => {
-                                    files::edit(request, launch, nested_render).await
-                                }
-                                ToolCall::Exec(_) => unreachable!(),
-                            }
-                        } => result,
+                        result = files::read_nested(request, launch, http, nested_render, permit, read_cancel) => result,
+                    }
+                }
+                ToolCall::Write(request) => {
+                    let permit = permit.expect("write acquires an I/O permit");
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return,
+                        result = files::write_nested(request, launch, nested_render, permit) => result,
+                    }
+                }
+                ToolCall::Edit(request) => {
+                    let permit = permit.expect("edit acquires an I/O permit");
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return,
+                        result = files::edit_nested(request, launch, nested_render, permit) => result,
                     }
                 }
             };
@@ -645,7 +704,8 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
         call_id,
         runtime,
         script: script.clone(),
-        semaphore: Arc::new(Semaphore::new(ACTIVE_CALLS)),
+        start_permits: Arc::new(Semaphore::new(START_PERMITS)),
+        io_permits: Arc::new(Semaphore::new(IO_PERMITS)),
         next: 1,
         starts: 0,
     }));
@@ -1056,10 +1116,49 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     const arrayJoin = Function.prototype.call.bind(Array.prototype.join);
     const toStringTag = Symbol.toStringTag;
     const isArray = Array.isArray;
+    const errorStackDesc = Object.getOwnPropertyDescriptor(ErrorCtor.prototype, "stack");
+    const getErrorStack = errorStackDesc && errorStackDesc.get
+        ? Function.prototype.call.bind(errorStackDesc.get)
+        : undefined;
     const pending = new Map();
     let waiting = 0;
     let state = 0;
     let failure;
+
+    function captureCallStack() {
+        let raw = "";
+        try {
+            const probe = new ErrorCtor();
+            raw = getErrorStack ? getErrorStack(probe) : probe.stack;
+        } catch {}
+        if (typeof raw !== "string" || raw.length === 0) return "";
+        let out = "";
+        let pos = 0;
+        while (pos < raw.length) {
+            const nl = stringIndexOf(raw, "\n", pos);
+            const line = nl === -1 ? stringSlice(raw, pos) : stringSlice(raw, pos, nl);
+            if (line.length > 0 && stringIndexOf(line, "codemode-prelude.js") === -1) {
+                out += out.length === 0 ? line : "\n" + line;
+            }
+            if (nl === -1) break;
+            pos = nl + 1;
+        }
+        return out;
+    }
+    function withCallStack(error, stack) {
+        if (stack && error !== null && typeof error === "object") {
+            try {
+                defineProperty(error, "stack", {
+                    __proto__: null,
+                    value: stack,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                });
+            } catch {}
+        }
+        return error;
+    }
 
     function safeString(value) {
         try { return StringCtor(value); }
@@ -1147,16 +1246,33 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     }
     const members = Object.create(null);
     for (const name of ["exec", "read", "write", "edit"]) {
-        members[name] = args => new PromiseCtor((resolve, reject) => {
-            if (args === null || typeof args !== "object" || isArray(args)) {
-                reject(new TypeErrorCtor("Tool arguments must be an object."));
+        members[name] = args => {
+            const callStack = captureCallStack();
+            return new PromiseCtor((resolve, reject) => {
+                if (args === null || typeof args !== "object" || isArray(args)) {
+                    reject(withCallStack(new TypeErrorCtor("Tool arguments must be an object."), callStack));
+                    return;
+                }
+                try {
+                    const id = __call(name, stringify(args));
+                    set(pending, id, { resolve, reject, tool: name, stack: callStack });
+                    waiting++;
+                } catch (error) { reject(withCallStack(error, callStack)); }
+            });
+        };
+    }
+    function sleep(ms) {
+        const callStack = captureCallStack();
+        return new PromiseCtor((resolve, reject) => {
+            if (typeof ms !== "number" || !numberIsFinite(ms)) {
+                reject(withCallStack(new TypeErrorCtor("sleep requires a finite number of milliseconds."), callStack));
                 return;
             }
             try {
-                const id = __call(name, stringify(args));
-                set(pending, id, { resolve, reject, tool: name });
+                const id = __call("sleep", ms <= 0 ? "0" : StringCtor(ms));
+                set(pending, id, { resolve, reject, tool: "sleep", stack: callStack });
                 waiting++;
-            } catch (error) { reject(error); }
+            } catch (error) { reject(withCallStack(error, callStack)); }
         });
     }
     const tools = new Proxy(members, {
@@ -1629,11 +1745,30 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     globalThis.console = console;
     globalThis.text = text;
     globalThis.image = image;
+    globalThis.sleep = sleep;
     globalThis.exit = exit;
     return {
         run(fn) {
             then(fn(), value => {
-                try { if (value !== undefined) text(value); state = 1; }
+                try {
+                    if (value !== undefined) {
+                        if (typeof value === "string") {
+                            __write(value);
+                        } else {
+                            let json;
+                            try {
+                                json = stringify(value);
+                            } catch {
+                                throw new TypeErrorCtor("the return value is not JSON-serializable");
+                            }
+                            if (json === undefined) {
+                                throw new TypeErrorCtor("the return value is not JSON-serializable");
+                            }
+                            __write(json);
+                        }
+                    }
+                    state = 1;
+                }
                 catch (error) { failure = error; state = 2; }
             }, error => { failure = error; state = 2; });
         },
@@ -1642,13 +1777,17 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             if (!entry) return;
             remove(pending, id);
             waiting--;
-            if (!ok) { entry.reject(range ? new RangeErrorCtor(payload) : new ErrorCtor(payload)); return; }
+            if (!ok) {
+                const error = range ? new RangeErrorCtor(payload) : new ErrorCtor(payload);
+                entry.reject(withCallStack(error, entry.stack));
+                return;
+            }
             let envelope;
-            try { envelope = parse(payload); } catch (error) { entry.reject(error); return; }
+            try { envelope = parse(payload); } catch (error) { entry.reject(withCallStack(error, entry.stack)); return; }
             if (envelope.ok) {
                 entry.resolve(envelope.value);
             } else {
-                entry.reject(new ToolError(entry.tool, envelope.value));
+                entry.reject(withCallStack(new ToolError(entry.tool, envelope.value), entry.stack));
             }
         },
         status() { return state || (waiting ? 0 : 3); },
@@ -1780,7 +1919,8 @@ mod tests {
             call_id: None,
             runtime,
             script: script.clone(),
-            semaphore: Arc::new(Semaphore::new(0)),
+            start_permits: Arc::new(Semaphore::new(0)),
+            io_permits: Arc::new(Semaphore::new(0)),
             next: 1,
             starts: MAX_STARTS - 1,
         };
@@ -2594,7 +2734,7 @@ mod tests {
                 }}
 
                 const settled = await Promise.allSettled(
-                    Array.from({{length: 1033}}, () => tools.read({{path: "ok.png"}}))
+                    Array.from({{length: 1025}}, () => tools.read({{path: "ok.png"}}))
                 );
                 const rangeErrors = settled.filter(
                     s => s.status === "rejected" && s.reason instanceof RangeError
@@ -2630,6 +2770,150 @@ mod tests {
         assert_eq!(
             parsed["value"]["inputError"],
             "INPUT_WRITE_FAILED: broken pipe"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_site_stacks_and_serializable_return_values() {
+        let fixture = Fixture::new();
+        let (st_uncaught, out_uncaught) = fixture
+            .result("const x = 1;\nawait tools.read({path: 'no-such-file-xyz'});\nreturn x;")
+            .await;
+        assert_eq!(st_uncaught.exit_code, Some(1), "{out_uncaught}");
+        assert!(out_uncaught.contains("codemode.js:2"), "{out_uncaught}");
+
+        let (st_caught, out_caught) = fixture
+            .result(
+                r#"
+                let toolStack = "";
+                try { await tools.read({path: "missing-2"}); } catch (e) { toolStack = e.stack; }
+                let typeStack = "";
+                try { await tools.exec({action: "bogus"}); } catch (e) { typeStack = e.stack; }
+                const holds = Array.from({length: 1024}, () => sleep(60000));
+                let rangeStack = "";
+                try { await sleep(60000); } catch (e) { if (e instanceof RangeError) rangeStack = e.stack; }
+                if (!toolStack.includes("codemode.js:3")) throw new Error("toolStack: " + toolStack);
+                if (!typeStack.includes("codemode.js:5")) throw new Error("typeStack: " + typeStack);
+                if (!rangeStack.includes("codemode.js:8")) throw new Error("rangeStack: " + rangeStack);
+                return "stacks-ok";
+                "#,
+            )
+            .await;
+        assert_eq!(st_caught.exit_code, Some(0), "{out_caught}");
+        assert_eq!(out_caught, "stacks-ok\n");
+
+        for bad in [
+            "return Symbol('x')",
+            "return () => 1",
+            "return 1n",
+            "const c = {}; c.self = c; return c;",
+        ] {
+            let (st, out) = fixture.result(bad).await;
+            assert_eq!(st.exit_code, Some(1), "{bad}: {out}");
+            assert!(
+                out.contains("Script error: TypeError: the return value is not JSON-serializable"),
+                "{bad}: {out}"
+            );
+        }
+
+        let (st_null, out_null) = fixture.result("return null").await;
+        assert_eq!((st_null.exit_code, out_null.as_str()), (Some(0), "null\n"));
+        let (st_str, out_str) = fixture.result("return \"a\\nb\"").await;
+        assert_eq!((st_str.exit_code, out_str.as_str()), (Some(0), "a\nb\n"));
+    }
+
+    #[tokio::test]
+    async fn sleep_primitive_race_kill_and_validation() {
+        let fixture = Fixture::new();
+        let child_script = fixture.start("await sleep(10000);", None);
+        let child_id = child_script.id.clone();
+        let start_t = Instant::now();
+        let (st, out) = fixture
+            .result(&format!(
+                r#"
+                await sleep(-3);
+                await sleep(0);
+                for (const bad of [NaN, Infinity, -Infinity, "1", null, undefined, {{}}]) {{
+                    let ok = false;
+                    try {{ await sleep(bad); }} catch (e) {{ if (e instanceof TypeError) ok = true; }}
+                    if (!ok) throw new Error("accepted bad sleep: " + String(bad));
+                }}
+                const winner = await Promise.race([
+                    tools.exec({{action: "poll", taskId: {child_id:?}}}),
+                    sleep(100).then(() => "timeout"),
+                ]);
+                return winner;
+                "#
+            ))
+            .await;
+        assert_eq!(st.exit_code, Some(0), "{out}");
+        assert_eq!(out, "timeout\n");
+        assert!(start_t.elapsed() < Duration::from_secs(3));
+        child_script.kill().unwrap();
+        complete(&child_script).await;
+
+        let sleeping = fixture.start("await sleep(60000);", None);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let kill_t = Instant::now();
+        sleeping.kill().unwrap();
+        complete(&sleeping).await;
+        assert!(kill_t.elapsed() < Duration::from_millis(500));
+        assert_eq!(sleeping.snapshot().state, "killed");
+        let (cancelled, _) = sleeping.script().unwrap().report();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].tool, "sleep");
+    }
+
+    #[tokio::test]
+    async fn passive_waits_and_control_calls_need_no_start_or_io_permits() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.dir.join("probe.txt"), "fast-read\n").unwrap();
+
+        // Start 2 background script tasks (using 2 of Limits::OFF's 4 script slots) so the
+        // orchestrator script (slot 3) can hold 8 passive polls across distinct readers,
+        // read files, list, and kill without starvation.
+        let bg1 = fixture.start("text('ready'); await sleep(60000);", None);
+        let bg2 = fixture.start("await sleep(60000);", None);
+        let id1 = bg1.id.clone();
+        let id2 = bg2.id.clone();
+
+        let t0 = Instant::now();
+        let (st, out) = fixture
+            .result(&format!(
+                r#"
+                const polls1 = Array.from({{length: 8}}, (_, i) =>
+                    tools.exec({{action: "poll", taskId: {id1:?} + ".a00" + i, waitMs: 400}})
+                        .then(() => "poll_done")
+                );
+                const polls2 = Array.from({{length: 8}}, (_, i) =>
+                    tools.exec({{action: "poll", taskId: {id2:?} + ".b00" + i}})
+                );
+                await sleep(30);
+                // 16 passive polls are in flight simultaneously; read, list, and kill still run immediately.
+                const raceWinner = await Promise.race([
+                    tools.read({{path: "probe.txt"}}).then(r => r.text.trim()),
+                    Promise.all(polls1).then(() => "polls_won"),
+                ]);
+                if (raceWinner !== "fast-read") throw new Error("read delayed: " + raceWinner);
+                const listed = await tools.exec({{action: "list", state: "active"}});
+                if (listed.tasks.length < 2) throw new Error("list failed");
+                const k2 = await tools.exec({{action: "kill", taskId: {id2:?}}});
+                if (k2.state !== "killed") throw new Error("kill failed: " + k2.state);
+                const settled2 = await Promise.all(polls2);
+                if (!settled2.every(s => s.state === "killed")) throw new Error("polls2 state");
+                const k1 = await tools.exec({{action: "kill", taskId: {id1:?}}});
+                if (k1.state !== "killed") throw new Error("k1 failed");
+                await Promise.allSettled(polls1);
+                return "permits-ok";
+                "#
+            ))
+            .await;
+        assert_eq!(st.exit_code, Some(0), "{out}");
+        assert_eq!(out, "permits-ok\n");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            t0.elapsed()
         );
     }
 }

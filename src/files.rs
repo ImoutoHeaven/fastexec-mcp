@@ -24,10 +24,8 @@ use unicode_normalization::char::canonical_combining_class;
 const MAX_LINES: u64 = 2000;
 /// The most bytes a direct result shows.
 const MAX_BYTES: u64 = 50 * 1024;
-/// The most lines a nested codemode read shows.
-const NESTED_MAX_LINES: u64 = 50_000;
 /// The most bytes a nested codemode read shows.
-const NESTED_MAX_BYTES: u64 = 1024 * 1024;
+const NESTED_MAX_BYTES: u64 = 4 << 20;
 /// How much of a file is sniffed before deciding whether it is text.
 const SNIFF: usize = 8 * 1024;
 
@@ -35,16 +33,24 @@ const SNIFF: usize = 8 * 1024;
 pub(crate) struct ReadLimits {
     max_lines: u64,
     max_bytes: u64,
+    whole_file: bool,
 }
 
 impl ReadLimits {
     pub(crate) const DIRECT: Self = Self {
         max_lines: MAX_LINES,
         max_bytes: MAX_BYTES,
+        whole_file: false,
     };
     pub(crate) const NESTED: Self = Self {
-        max_lines: NESTED_MAX_LINES,
+        max_lines: u64::MAX,
         max_bytes: NESTED_MAX_BYTES,
+        whole_file: false,
+    };
+    pub(crate) const NESTED_WHOLE: Self = Self {
+        max_lines: u64::MAX,
+        max_bytes: NESTED_MAX_BYTES,
+        whole_file: true,
     };
 
     /// How much of one line is kept while it is read: a line that fits whole, and one byte more,
@@ -69,10 +75,11 @@ fn lock() -> MutexGuard<'static, ()> {
 pub struct ReadRequest {
     /// Path to the file to read (relative or absolute)
     pub path: String,
-    /// Line number to start reading from (1-indexed)
+    /// Line number to start reading from (1-indexed; negative counts from the end, -1 is the last line)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-    /// Maximum number of lines to read
+    pub offset: Option<i64>,
+    /// Maximum number of lines to read (at least 1)
+    #[schemars(range(min = 1))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
 }
@@ -98,10 +105,18 @@ pub struct EditRequest {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Edit {
-    /// Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.
+    /// Exact text for one targeted replacement. It must be unique in the original file (or within startLine..=endLine) and must not overlap with any other edits[].oldText in the same call.
     pub old_text: String,
     /// Replacement text for this targeted edit.
     pub new_text: String,
+    /// Optional 1-based line range the match must start in (inclusive first line); use it to pick one of several identical matches.
+    #[schemars(range(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    /// Optional 1-based inclusive last line the match must start in.
+    #[schemars(range(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u64>,
 }
 
 /// Runs one file tool from raw arguments, the way a daemon receives them, with the same
@@ -140,14 +155,32 @@ pub async fn read(
     read_with_limits(request, launch, http, render, ReadLimits::DIRECT).await
 }
 
-/// Reads one file for an in-process codemode script, with the larger nested window.
+/// Reads one file for an in-process codemode script: whole-file when neither `offset` nor
+/// `limit` is given, or a 4 MiB slice otherwise. `permit` stays inside the blocking worker
+/// until disk I/O finishes, even if the awaiting task is cancelled.
 pub(crate) async fn read_nested(
     request: ReadRequest,
     launch: Arc<LaunchContext>,
     http: bool,
     render: Render,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> CallToolResult {
-    read_with_limits(request, launch, http, render, ReadLimits::NESTED).await
+    let limits = if request.offset.is_none() && request.limit.is_none() {
+        ReadLimits::NESTED_WHOLE
+    } else {
+        ReadLimits::NESTED
+    };
+    read_with_limits_and_permit(
+        request,
+        launch,
+        http,
+        render,
+        limits,
+        Some(permit),
+        Some(cancel),
+    )
+    .await
 }
 
 async fn read_with_limits(
@@ -157,14 +190,29 @@ async fn read_with_limits(
     render: Render,
     limits: ReadLimits,
 ) -> CallToolResult {
+    read_with_limits_and_permit(request, launch, http, render, limits, None, None).await
+}
+
+async fn read_with_limits_and_permit(
+    request: ReadRequest,
+    launch: Arc<LaunchContext>,
+    http: bool,
+    render: Render,
+    limits: ReadLimits,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) -> CallToolResult {
     let effective = render.effective();
-    let result =
-        match tokio::task::spawn_blocking(move || read_text(&request, &launch, http, limits)).await
-        {
-            Ok(Ok(outcome)) => outcome.into_result(effective),
-            Ok(Err(message)) => failed(message),
-            Err(error) => failed(format!("the file operation did not finish: {error}")),
-        };
+    let result = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read_text_cancellable(&request, &launch, http, limits, cancel.as_ref())
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => outcome.into_result(effective),
+        Ok(Err(message)) => failed(message),
+        Err(error) => failed(format!("the file operation did not finish: {error}")),
+    };
     service::suppress(result, effective)
 }
 
@@ -206,9 +254,31 @@ pub async fn write(
     launch: Arc<LaunchContext>,
     render: Render,
 ) -> CallToolResult {
+    write_with_permit(request, launch, render, None).await
+}
+
+pub(crate) async fn write_nested(
+    request: WriteRequest,
+    launch: Arc<LaunchContext>,
+    render: Render,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> CallToolResult {
+    write_with_permit(request, launch, render, Some(permit)).await
+}
+
+async fn write_with_permit(
+    request: WriteRequest,
+    launch: Arc<LaunchContext>,
+    render: Render,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> CallToolResult {
     let effective = render.effective();
     let bytes = request.content.len();
-    let outcome = tokio::task::spawn_blocking(move || write_text(&request, &launch)).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        write_text(&request, &launch)
+    })
+    .await;
     let result = finished(outcome.map(|res| {
         res.map(|(text, path)| (text, json!({ "ok": true, "path": path, "bytes": bytes })))
             .map_err(|msg| (msg, None))
@@ -222,9 +292,32 @@ pub async fn edit(
     launch: Arc<LaunchContext>,
     render: Render,
 ) -> CallToolResult {
+    edit_with_permit(request, launch, render, None).await
+}
+
+pub(crate) async fn edit_nested(
+    request: EditRequest,
+    launch: Arc<LaunchContext>,
+    render: Render,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> CallToolResult {
+    edit_with_permit(request, launch, render, Some(permit)).await
+}
+
+async fn edit_with_permit(
+    request: EditRequest,
+    launch: Arc<LaunchContext>,
+    render: Render,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> CallToolResult {
     let effective = render.effective();
-    let result =
-        finished(tokio::task::spawn_blocking(move || edit_outcome(&request, &launch)).await);
+    let result = finished(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            edit_outcome(&request, &launch)
+        })
+        .await,
+    );
     service::suppress(result, effective)
 }
 
@@ -271,7 +364,7 @@ pub fn display_path(path: &Path) -> String {
     }
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, test))]
 fn format_windows_display(raw: &str) -> String {
     if raw.len() >= 8 && raw.as_bytes()[..8].eq_ignore_ascii_case(b"\\\\?\\UNC\\") {
         return format!("//{}", raw[8..].replace('\\', "/"));
@@ -292,7 +385,7 @@ fn format_windows_display(raw: &str) -> String {
 /// Rewrites Git Bash `/<letter>` and `/<letter>/...` drive paths to `<LETTER>:/...`, and
 /// forward-slash UNC `//server/share...` paths to `\\server\share...` so `std::path::Path`
 /// parses `Component::Prefix(Prefix::UNC)` on Windows.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, test))]
 fn git_bash_drive_path(path: &str) -> Option<String> {
     if path.starts_with("//") && !path.starts_with("///") {
         let rest = &path[2..];
@@ -460,12 +553,62 @@ pub(crate) fn resolve_from(path: &Path, base: &Path) -> Result<PathBuf, String> 
 }
 
 /// The text of one file, cut to the window and the limits a result may show.
+#[cfg(test)]
 fn read_text(
     request: &ReadRequest,
     launch: &LaunchContext,
     http: bool,
     limits: ReadLimits,
 ) -> Result<Outcome, String> {
+    read_text_cancellable(request, launch, http, limits, None)
+}
+
+fn count_lines_streaming(
+    file: &mut File,
+    shown_path: &str,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<u64, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut newlines = 0_u64;
+    let mut total_bytes = 0_u64;
+    let mut last_byte = b'\n';
+    loop {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err("Cancelled while reading file.".into());
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        newlines += bytecount_lf(chunk);
+        total_bytes += read as u64;
+        last_byte = chunk[read - 1];
+    }
+    Ok(newlines + u64::from(total_bytes > 0 && last_byte != b'\n'))
+}
+
+fn bytecount_lf(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|&&b| b == b'\n').count() as u64
+}
+
+fn read_text_cancellable(
+    request: &ReadRequest,
+    launch: &LaunchContext,
+    http: bool,
+    limits: ReadLimits,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Outcome, String> {
+    if request.offset == Some(0) {
+        return Err("offset must be non-zero (1-indexed from start, or negative from end).".into());
+    }
+    if request.limit == Some(0) {
+        return Err("limit must be at least 1.".into());
+    }
     let resolved = resolve(&request.path, launch)?;
     let shown_path = display_path(&resolved);
     let (mut file, metadata) =
@@ -513,20 +656,60 @@ fn read_text(
             metadata.len()
         ));
     }
-    if request.offset == Some(0) {
-        return Err("offset must be at least 1 (line numbers are 1-indexed).".into());
+    if limits.whole_file && metadata.len() > limits.max_bytes {
+        return Err(format!(
+            "Cannot read {shown_path} as a whole file: its size ({} bytes) exceeds the {} byte (4 MiB) limit; pass offset and limit to read it in slices.",
+            metadata.len(),
+            limits.max_bytes,
+        ));
     }
+    let start_line: u64 = match request.offset {
+        None => 1,
+        Some(off) if off > 0 => off as u64,
+        Some(off) => {
+            let want_from_end = off.unsigned_abs();
+            let total_lines = count_lines_streaming(&mut file, &shown_path, cancel)?;
+            if total_lines == 0 || want_from_end >= total_lines {
+                1
+            } else {
+                total_lines - want_from_end + 1
+            }
+        }
+    };
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
-    let source = Source::new(BufReader::new(file));
-    Ok(Window::scan(source, request, limits)?.render(request, &shown_path, limits))
+    let read_cap = if limits.whole_file {
+        limits.max_bytes + 1
+    } else {
+        u64::MAX
+    };
+    let source = Source::new(BufReader::new(file.take(read_cap)), cancel);
+    let window = Window::scan(source, start_line, request.limit, limits)?;
+    if limits.whole_file {
+        if window.stopped_on_bytes || window.window_bytes > limits.max_bytes {
+            return Err(format!(
+                "Cannot read {shown_path} as a whole file: its size exceeds the {} byte (4 MiB) limit; pass offset and limit to read it in slices.",
+                limits.max_bytes,
+            ));
+        }
+        if window.lossy {
+            return Err(format!(
+                "Cannot read {shown_path} as a whole file: it is not valid UTF-8; pass offset and limit to inspect it with U+FFFD replacements, or process it with exec."
+            ));
+        }
+    }
+    Ok(window.render(start_line, request.limit, &shown_path, limits))
 }
 
 /// Both text readers reject special files before reading any data. The initial check avoids
 /// opening devices at all; the handle check covers replacement between metadata and open. On
 /// Unix, a FIFO swapped into that gap must not block open while edit holds the mutation lock.
 fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
-    if !std::fs::metadata(path)?.is_file() {
+    let initial = std::fs::metadata(path)?;
+    if initial.is_dir() {
+        return Err(io::Error::other("it is a directory; list it with exec"));
+    }
+    if !initial.is_file() {
         return Err(io::Error::other("it is not a regular file"));
     }
     let mut options = OpenOptions::new();
@@ -547,6 +730,9 @@ fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
         }
     }
     let metadata = file.metadata()?;
+    if metadata.is_dir() {
+        return Err(io::Error::other("it is a directory; list it with exec"));
+    }
     if !metadata.is_file() {
         return Err(io::Error::other("it is not a regular file"));
     }
@@ -567,8 +753,9 @@ fn read_upto(file: &mut File, into: &mut [u8]) -> std::io::Result<usize> {
 
 /// A file's lines: decoded a line at a time while a line is kept, and only scanned for its end
 /// while it is not.
-struct Source {
-    reader: BufReader<File>,
+struct Source<'a> {
+    reader: BufReader<std::io::Take<File>>,
+    cancel: Option<&'a tokio_util::sync::CancellationToken>,
     /// Decoded text already read and not yet given to a line, with where each replacement
     /// character it holds sits.
     pending: String,
@@ -579,10 +766,14 @@ struct Source {
     done: bool,
 }
 
-impl Source {
-    fn new(reader: BufReader<File>) -> Self {
+impl<'a> Source<'a> {
+    fn new(
+        reader: BufReader<std::io::Take<File>>,
+        cancel: Option<&'a tokio_util::sync::CancellationToken>,
+    ) -> Self {
         Self {
             reader,
+            cancel,
             pending: String::new(),
             marks: Vec::new(),
             carry: Vec::new(),
@@ -637,6 +828,12 @@ impl Source {
         self.marks.clear();
         self.carry.clear();
         loop {
+            if self
+                .cancel
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                return Err("Cancelled while reading file.".into());
+            }
             let (end, read) = {
                 let available = match self.reader.fill_buf() {
                     Ok(available) => available,
@@ -665,6 +862,12 @@ impl Source {
 
     /// Reads one part of the file into `pending`, and answers whether the file ended.
     fn fill(&mut self) -> Result<bool, String> {
+        if self
+            .cancel
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            return Err("Cancelled while reading file.".into());
+        }
         let (data, read) = {
             let available = match self.reader.fill_buf() {
                 Ok(available) => available,
@@ -733,11 +936,14 @@ struct Window {
 
 impl Window {
     /// Streams the file, keeping only the lines the result may show and counting the rest.
-    fn scan(mut source: Source, request: &ReadRequest, limits: ReadLimits) -> Result<Self, String> {
-        let start = request.offset.map_or(0, |offset| offset.saturating_sub(1));
-        let end = request
-            .limit
-            .map_or(u64::MAX, |limit| start.saturating_add(limit));
+    fn scan(
+        mut source: Source<'_>,
+        start_line: u64,
+        limit: Option<u64>,
+        limits: ReadLimits,
+    ) -> Result<Self, String> {
+        let start = start_line.saturating_sub(1);
+        let end = limit.map_or(u64::MAX, |limit| start.saturating_add(limit));
         let keep = limits.keep();
         let mut window = Self::default();
         let mut deciding = true;
@@ -757,8 +963,7 @@ impl Window {
         }
         if start > 0 && start >= window.total_lines {
             return Err(format!(
-                "Offset {} is beyond end of file ({} lines total)",
-                request.offset.unwrap_or(1),
+                "Offset {start_line} is beyond end of file ({} lines total)",
                 window.total_lines
             ));
         }
@@ -803,8 +1008,14 @@ impl Window {
 
     /// The result text and structured metadata: the window, cut to the budget, with the notice
     /// that says how to see more.
-    fn render(&self, request: &ReadRequest, shown_path: &str, limits: ReadLimits) -> Outcome {
-        let start = request.offset.map_or(0, |offset| offset.saturating_sub(1));
+    fn render(
+        &self,
+        start_line: u64,
+        limit: Option<u64>,
+        shown_path: &str,
+        limits: ReadLimits,
+    ) -> Outcome {
+        let start = start_line.saturating_sub(1);
         let start_display = start + 1;
         let shown = self.shown_lines;
         let budget_truncated =
@@ -846,7 +1057,7 @@ impl Window {
         } else {
             shown_lines = shown;
             body.push_str(&self.content);
-            if let Some(limit) = request.limit {
+            if let Some(limit) = limit {
                 let selected_end = start.saturating_add(limit);
                 if selected_end < self.total_lines {
                     let remaining = self.total_lines - selected_end;
@@ -2107,7 +2318,7 @@ const MAX_REPORTED_ITEMS: usize = 20;
 
 enum EntryProblem {
     Ambiguous { count: usize, lines: Vec<usize> },
-    NotFound,
+    NotFound { lines: Vec<usize>, more: usize },
 }
 
 /// Applies every edit to one file: exact matches first, and the fuzzy form when any edit needs it.
@@ -2124,6 +2335,23 @@ fn edit_outcome(
     for (index, edit) in request.edits.iter().enumerate() {
         if normalize_to_lf(&edit.old_text).is_empty() {
             return Err((format!("edits[{index}].oldText must not be empty."), None));
+        }
+        if edit.start_line == Some(0) {
+            return Err((
+                format!("edits[{index}].startLine must be at least 1."),
+                None,
+            ));
+        }
+        if edit.end_line == Some(0) {
+            return Err((format!("edits[{index}].endLine must be at least 1."), None));
+        }
+        if let (Some(start), Some(end)) = (edit.start_line, edit.end_line)
+            && start > end
+        {
+            return Err((
+                format!("edits[{index}].startLine ({start}) must not exceed endLine ({end})."),
+                None,
+            ));
         }
     }
     let resolved = resolve(&request.path, launch).map_err(|msg| (msg, None))?;
@@ -2223,18 +2451,24 @@ fn apply_edits(
     let mut fuzzy_flags = vec![false; total];
 
     for (index, (old, new)) in edits.iter().enumerate() {
-        let (exact_count, exact_starts) = starts_positions(&normalized.text, old);
-        if exact_count > 1 {
-            let lines = exact_starts.iter().map(|&at| line_at_norm(at)).collect();
+        let edit_spec = &request.edits[index];
+        let min_line = edit_spec.start_line.unwrap_or(1);
+        let max_line = edit_spec.end_line.unwrap_or(u64::MAX);
+        let in_line_range = |line: usize| (line as u64) >= min_line && (line as u64) <= max_line;
+
+        let exact =
+            starts_positions_filtered(&normalized.text, old, |at| in_line_range(line_at_norm(at)));
+        if exact.in_count > 1 {
+            let lines = exact.in_starts.iter().map(|&at| line_at_norm(at)).collect();
             problems[index] = Some(EntryProblem::Ambiguous {
-                count: exact_count,
+                count: exact.in_count,
                 lines,
             });
             continue;
         }
         let needle = normalize_for_fuzzy_match(old);
         if needle.is_empty() {
-            if let Some(&at) = exact_starts.first() {
+            if let Some(&at) = exact.in_starts.first() {
                 let (raw_at, raw_end) =
                     (normalized.original(at), normalized.original(at + old.len()));
                 let new_text = if normalized.text[at..at + old.len()] == *new {
@@ -2250,7 +2484,15 @@ fn apply_edits(
                     new_text,
                 });
             } else {
-                problems[index] = Some(EntryProblem::NotFound);
+                let out_lines = exact
+                    .out_starts
+                    .iter()
+                    .map(|&at| line_at_norm(at))
+                    .collect();
+                problems[index] = Some(EntryProblem::NotFound {
+                    lines: out_lines,
+                    more: exact.out_count.saturating_sub(MAX_REPORTED_ITEMS),
+                });
             }
             continue;
         }
@@ -2283,20 +2525,23 @@ fn apply_edits(
             |fuzzy_pos: usize| 1 + haystack_newlines.partition_point(|&nl| nl < fuzzy_pos);
 
         let same_form = *haystack == normalized.text && needle == *old;
-        let (fuzzy_count, fuzzy_starts) = if same_form {
-            (exact_count, exact_starts.clone())
+        let fuzzy = if same_form {
+            exact.clone()
         } else {
-            starts_positions(haystack, &needle)
+            starts_positions_filtered(haystack, &needle, |pos| in_line_range(line_at_fuzzy(pos)))
         };
 
-        if let Some(&exact_at) = exact_starts.first() {
-            let separate = fuzzy_count > 0
+        if let Some(&exact_at) = exact.in_starts.first() {
+            let separate = fuzzy.in_count > 0
                 && !same_form
                 && !exact_survives_fuzzy(&normalized.text, exact_at, old.len(), &needle);
-            let count = fuzzy_count + usize::from(separate);
+            let count = fuzzy.in_count + usize::from(separate);
             if count > 1 {
-                let mut lines: Vec<_> =
-                    fuzzy_starts.iter().map(|&pos| line_at_fuzzy(pos)).collect();
+                let mut lines: Vec<_> = fuzzy
+                    .in_starts
+                    .iter()
+                    .map(|&pos| line_at_fuzzy(pos))
+                    .collect();
                 if separate {
                     let line = line_at_norm(exact_at);
                     lines.insert(lines.partition_point(|&other| other < line), line);
@@ -2324,14 +2569,37 @@ fn apply_edits(
             continue;
         }
 
-        if fuzzy_count == 0 {
-            problems[index] = Some(EntryProblem::NotFound);
+        if fuzzy.in_count == 0 {
+            let mut out_lines: Vec<usize> = fuzzy
+                .out_starts
+                .iter()
+                .map(|&pos| line_at_fuzzy(pos))
+                .collect();
+            let mut out_total = fuzzy.out_count;
+            if !same_form {
+                for &exact_out in &exact.out_starts {
+                    if !exact_survives_fuzzy(&normalized.text, exact_out, old.len(), &needle) {
+                        let line = line_at_norm(exact_out);
+                        out_lines.insert(out_lines.partition_point(|&other| other < line), line);
+                        out_total += 1;
+                    }
+                }
+                out_lines.truncate(MAX_REPORTED_ITEMS);
+            }
+            problems[index] = Some(EntryProblem::NotFound {
+                lines: out_lines,
+                more: out_total.saturating_sub(MAX_REPORTED_ITEMS),
+            });
             continue;
         }
-        if fuzzy_count > 1 {
-            let lines = fuzzy_starts.iter().map(|&pos| line_at_fuzzy(pos)).collect();
+        if fuzzy.in_count > 1 {
+            let lines = fuzzy
+                .in_starts
+                .iter()
+                .map(|&pos| line_at_fuzzy(pos))
+                .collect();
             problems[index] = Some(EntryProblem::Ambiguous {
-                count: fuzzy_count,
+                count: fuzzy.in_count,
                 lines,
             });
             continue;
@@ -2339,9 +2607,12 @@ fn apply_edits(
         let Some((at, len)) = map
             .get_or_init(|| FuzzyMap::new(&normalized.text))
             .as_ref()
-            .and_then(|m| m.span(fuzzy_starts[0], fuzzy_starts[0] + needle.len()))
+            .and_then(|m| m.span(fuzzy.in_starts[0], fuzzy.in_starts[0] + needle.len()))
         else {
-            problems[index] = Some(EntryProblem::NotFound);
+            problems[index] = Some(EntryProblem::NotFound {
+                lines: Vec::new(),
+                more: 0,
+            });
             continue;
         };
         let (raw_at, raw_end) = (normalized.original(at), normalized.original(at + len));
@@ -2409,14 +2680,40 @@ fn apply_edits(
                         }
                         failures.push(item);
                     }
-                    EntryProblem::NotFound => {
-                        bullets.push(format!(
-                            "- edits[{index}]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
-                        ));
-                        failures.push(json!({
-                            "index": index,
-                            "problem": "not_found",
-                        }));
+                    EntryProblem::NotFound { lines, more } => {
+                        if lines.is_empty() {
+                            bullets.push(format!(
+                                "- edits[{index}]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
+                            ));
+                            failures.push(json!({
+                                "index": index,
+                                "problem": "not_found",
+                            }));
+                        } else {
+                            let shown = &lines[..lines.len().min(MAX_REPORTED_ITEMS)];
+                            let list = shown
+                                .iter()
+                                .map(usize::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let extra = if *more > 0 {
+                                format!(" (and {more} more)")
+                            } else {
+                                String::new()
+                            };
+                            bullets.push(format!(
+                                "- edits[{index}]: oldText was not found in the requested line range (it occurs outside that range, starting at lines {list}{extra})."
+                            ));
+                            let mut item = json!({
+                                "index": index,
+                                "problem": "not_found",
+                                "lines": shown,
+                            });
+                            if *more > 0 {
+                                item["more"] = json!(more);
+                            }
+                            failures.push(item);
+                        }
                     }
                 }
             } else if !overlaps[index].is_empty() {
@@ -2543,11 +2840,23 @@ fn tagged_nfkd<T: Copy>(chars: impl Iterator<Item = (char, T)>) -> Vec<(char, T)
     parts
 }
 
-/// Counts overlapping occurrences in one pass, retaining only the starts a report can show.
-fn starts_positions(haystack: &str, needle: &str) -> (usize, Vec<usize>) {
+#[derive(Clone, Default)]
+struct FilteredStarts {
+    in_count: usize,
+    in_starts: Vec<usize>,
+    out_count: usize,
+    out_starts: Vec<usize>,
+}
+
+/// Counts overlapping occurrences in one pass, partitioning in-range and out-of-range starts.
+fn starts_positions_filtered(
+    haystack: &str,
+    needle: &str,
+    mut in_range: impl FnMut(usize) -> bool,
+) -> FilteredStarts {
     let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
     if needle.is_empty() {
-        return (0, Vec::new());
+        return FilteredStarts::default();
     }
     let mut table = vec![0usize; needle.len()];
     let mut matched = 0;
@@ -2560,8 +2869,7 @@ fn starts_positions(haystack: &str, needle: &str) -> (usize, Vec<usize>) {
         }
         table[at] = matched;
     }
-    let mut positions = Vec::new();
-    let mut count = 0;
+    let mut out = FilteredStarts::default();
     matched = 0;
     for (idx, byte) in haystack.iter().enumerate() {
         while matched > 0 && *byte != needle[matched] {
@@ -2571,14 +2879,22 @@ fn starts_positions(haystack: &str, needle: &str) -> (usize, Vec<usize>) {
             matched += 1;
         }
         if matched == needle.len() {
-            count += 1;
-            if positions.len() < MAX_REPORTED_ITEMS {
-                positions.push(idx + 1 - needle.len());
+            let pos = idx + 1 - needle.len();
+            if in_range(pos) {
+                out.in_count += 1;
+                if out.in_starts.len() < MAX_REPORTED_ITEMS {
+                    out.in_starts.push(pos);
+                }
+            } else {
+                out.out_count += 1;
+                if out.out_starts.len() < MAX_REPORTED_ITEMS {
+                    out.out_starts.push(pos);
+                }
             }
             matched = table[matched - 1];
         }
     }
-    (count, positions)
+    out
 }
 
 /// Applies matches to `content`, retaining each edit's start in the original file.
@@ -2912,7 +3228,7 @@ mod tests {
 
     fn window(
         path: &str,
-        offset: Option<u64>,
+        offset: Option<i64>,
         limit: Option<u64>,
         launch: &LaunchContext,
     ) -> Result<String, String> {
@@ -2946,6 +3262,8 @@ mod tests {
                     .map(|(old, new)| Edit {
                         old_text: (*old).to_owned(),
                         new_text: (*new).to_owned(),
+                        start_line: None,
+                        end_line: None,
                     })
                     .collect(),
             },
@@ -3125,10 +3443,9 @@ mod tests {
             window(&path, Some(2), Some(3), &launch).unwrap(),
             "line 2\nline 3\nline 4\n\n[6 more lines in file. Use offset=5 to continue.]"
         );
-        // A limit of zero shows nothing and still says where the rest is.
         assert_eq!(
-            window(&path, None, Some(0), &launch).unwrap(),
-            "[10 more lines in file. Use offset=1 to continue.]"
+            window(&path, None, Some(0), &launch).unwrap_err(),
+            "limit must be at least 1."
         );
         assert_eq!(window(&path, Some(10), None, &launch).unwrap(), "line 10\n");
         assert_eq!(
@@ -3221,7 +3538,7 @@ mod tests {
             },
             &launch,
             false,
-            ReadLimits::NESTED,
+            ReadLimits::NESTED_WHOLE,
         )
         .unwrap();
         assert_eq!(nested_huge.body.as_deref(), Some(huge.as_str()));
@@ -3229,10 +3546,11 @@ mod tests {
         assert_eq!(nested_huge.structured["lineTooLong"], false);
         assert_eq!(nested_huge.structured["shownLines"], 1);
 
-        let nested_many: String = (1..=50_005).map(|line| format!("n{line}\n")).collect();
+        // P0-2: nested whole-file reads have no line cap up to 4 MiB.
+        let nested_many = "x\n".repeat(50_003);
         scratch.file("nested-many.txt", nested_many.as_bytes());
         let nested_many_path = scratch.path("nested-many.txt");
-        let nested_page = read_text(
+        let nested_whole = read_text(
             &ReadRequest {
                 path: nested_many_path,
                 offset: None,
@@ -3240,23 +3558,37 @@ mod tests {
             },
             &launch,
             false,
-            ReadLimits::NESTED,
+            ReadLimits::NESTED_WHOLE,
         )
         .unwrap();
-        assert!(
-            nested_page
-                .text
-                .ends_with("[Showing lines 1-50000 of 50005. Use offset=50001 to continue.]"),
-            "{}",
-            &nested_page.text[nested_page.text.len().saturating_sub(128)..]
-        );
-        assert_eq!(nested_page.structured["shownLines"], 50_000);
-        assert_eq!(nested_page.structured["nextOffset"], 50_001);
+        assert_eq!(nested_whole.body.as_deref(), Some(nested_many.as_str()));
+        assert_eq!(nested_whole.structured["totalLines"], 50_003);
+        assert_eq!(nested_whole.structured["shownLines"], 50_003);
+        assert_eq!(nested_whole.structured["truncated"], false);
+        assert!(nested_whole.structured["nextOffset"].is_null());
 
-        let over_nested = format!("{}\n", "z".repeat(NESTED_MAX_BYTES as usize + 1));
+        // First line 1,048,577 B + "\ny\n" succeeds whole in nested whole-file mode.
+        let one_mib_plus = format!("{}\ny\n", "a".repeat(1_048_577));
+        scratch.file("one-mib-plus.txt", one_mib_plus.as_bytes());
+        let whole_mib = read_text(
+            &ReadRequest {
+                path: scratch.path("one-mib-plus.txt"),
+                offset: None,
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::NESTED_WHOLE,
+        )
+        .unwrap();
+        assert_eq!(whole_mib.body.as_deref(), Some(one_mib_plus.as_str()));
+        assert_eq!(whole_mib.structured["totalLines"], 2);
+
+        // 4 MiB + 1 B rejects whole-file mode naming offset & limit; slice mode works.
+        let over_nested = "z".repeat(NESTED_MAX_BYTES as usize + 1);
         scratch.file("over-nested.txt", over_nested.as_bytes());
         let over_nested_path = scratch.path("over-nested.txt");
-        let too_long = read_text(
+        let whole_err = read_text(
             &ReadRequest {
                 path: over_nested_path.clone(),
                 offset: None,
@@ -3264,17 +3596,101 @@ mod tests {
             },
             &launch,
             false,
+            ReadLimits::NESTED_WHOLE,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            whole_err.contains("offset")
+                && whole_err.contains("limit")
+                && whole_err.contains("4 MiB"),
+            "{whole_err}"
+        );
+        let slice_long = read_text(
+            &ReadRequest {
+                path: over_nested_path.clone(),
+                offset: Some(1),
+                limit: None,
+            },
+            &launch,
+            false,
             ReadLimits::NESTED,
         )
         .unwrap();
-        assert_eq!(
-            too_long.text,
-            format!(
-                "[Line 1 is 1.0MB, exceeds 1.0MB limit. Use exec: sed -n '1p' '{over_nested_path}' | head -c {NESTED_MAX_BYTES}]"
-            )
+        assert_eq!(slice_long.structured["lineTooLong"], true);
+        assert_eq!(slice_long.structured["shownLines"], 0);
+
+        // Invalid UTF-8 (6f ff 6b 0a) rejects whole-file mode, succeeds with lossy: true on offset: 1.
+        scratch.file("invalid-utf8.txt", &[0x6f, 0xff, 0x6b, 0x0a]);
+        let inv_path = scratch.path("invalid-utf8.txt");
+        let inv_err = read_text(
+            &ReadRequest {
+                path: inv_path.clone(),
+                offset: None,
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::NESTED_WHOLE,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            inv_err.contains("not valid UTF-8")
+                && inv_err.contains("offset")
+                && inv_err.contains("limit"),
+            "{inv_err}"
         );
-        assert_eq!(too_long.structured["lineTooLong"], true);
-        assert_eq!(too_long.structured["shownLines"], 0);
+        let inv_slice = read_text(
+            &ReadRequest {
+                path: inv_path,
+                offset: Some(1),
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::NESTED,
+        )
+        .unwrap();
+        assert_eq!(inv_slice.structured["lossy"], true);
+        assert_eq!(inv_slice.body.as_deref(), Some("o\u{fffd}k\n"));
+
+        // 5 MiB multi-line file with offset: 1, limit: 100 returns lines 1-100 with nextOffset: 101.
+        let five_mib: String = (1..=100_000)
+            .map(|i| format!("row-{i:06}-padding-abcdefghij-0123456789-xyz-0123456789\n"))
+            .collect();
+        assert!(five_mib.len() > 5 << 20);
+        scratch.file("five-mib.txt", five_mib.as_bytes());
+        let five_slice = read_text(
+            &ReadRequest {
+                path: scratch.path("five-mib.txt"),
+                offset: Some(1),
+                limit: Some(100),
+            },
+            &launch,
+            false,
+            ReadLimits::NESTED,
+        )
+        .unwrap();
+        assert_eq!(five_slice.structured["startLine"], 1);
+        assert_eq!(five_slice.structured["endLine"], 100);
+        assert_eq!(five_slice.structured["shownLines"], 100);
+        assert_eq!(five_slice.structured["truncated"], true);
+        assert_eq!(five_slice.structured["nextOffset"], 101);
+        assert_eq!(
+            nested_whole
+                .structured
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            five_slice
+                .structured
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>()
+        );
     }
 
     #[cfg(unix)]
@@ -3323,7 +3739,7 @@ mod tests {
         let shown_dir = display_path(&scratch.0);
         assert_eq!(
             whole(&directory, &launch, false).unwrap_err(),
-            format!("Cannot read {shown_dir}: it is not a regular file.")
+            format!("Cannot read {shown_dir}: it is a directory; list it with exec.")
         );
         scratch.file("bad.txt", b"ok\n\xffbad\n");
         let path = scratch.path("bad.txt");
@@ -4807,10 +5223,14 @@ mod tests {
                     Edit {
                         old_text: "last".into(),
                         new_text: "LAST".into(),
+                        start_line: None,
+                        end_line: None,
                     },
                     Edit {
                         old_text: "\u{feff}before\n".into(),
                         new_text: String::new(),
+                        start_line: None,
+                        end_line: None,
                     },
                 ],
             },
@@ -5324,6 +5744,8 @@ mod tests {
                             edits: vec![Edit {
                                 old_text: old.clone(),
                                 new_text: format!("worker-{worker}={}", round + 1),
+                                start_line: None,
+                                end_line: None,
                             }],
                         };
                         edit_text(&request, launch)
@@ -5503,7 +5925,7 @@ mod tests {
                 assert!(out.structured["endLine"].is_null());
             } else {
                 let mut joined = String::new();
-                let mut next = Some(1_u64);
+                let mut next = Some(1_i64);
                 let mut pages = 0_u64;
                 while let Some(off) = next {
                     let page = read_text(
@@ -5518,7 +5940,7 @@ mod tests {
                     )
                     .unwrap();
                     joined.push_str(page.body.as_deref().unwrap());
-                    next = page.structured["nextOffset"].as_u64();
+                    next = page.structured["nextOffset"].as_i64();
                     pages += 1;
                 }
                 assert_eq!(pages, expected_total, "{sample:?}");
@@ -5546,22 +5968,32 @@ mod tests {
                     Edit {
                         old_text: "dup".into(),
                         new_text: "D".into(),
+                        start_line: None,
+                        end_line: None,
                     },
                     Edit {
                         old_text: "missing".into(),
                         new_text: "M".into(),
+                        start_line: None,
+                        end_line: None,
                     },
                     Edit {
                         old_text: "abcdef".into(),
                         new_text: "X".into(),
+                        start_line: None,
+                        end_line: None,
                     },
                     Edit {
                         old_text: "bc".into(),
                         new_text: "Y".into(),
+                        start_line: None,
+                        end_line: None,
                     },
                     Edit {
                         old_text: "ef".into(),
                         new_text: "Z".into(),
+                        start_line: None,
+                        end_line: None,
                     },
                 ],
             },
@@ -5589,6 +6021,8 @@ mod tests {
                 edits: vec![Edit {
                     old_text: "f".into(),
                     new_text: "F".into(),
+                    start_line: None,
+                    end_line: None,
                 }],
             },
             &launch,
@@ -5606,11 +6040,15 @@ mod tests {
         let mut ov_edits = vec![Edit {
             old_text: alphabet.clone(),
             new_text: "ALL".into(),
+            start_line: None,
+            end_line: None,
         }];
         for i in 0..22 {
             ov_edits.push(Edit {
                 old_text: format!("tok{i:02}"),
                 new_text: "T".into(),
+                start_line: None,
+                end_line: None,
             });
         }
         let ov_err = edit_outcome(
@@ -5634,6 +6072,8 @@ mod tests {
             edits: vec![Edit {
                 old_text: "e".into(),
                 new_text: "E".into(),
+                start_line: None,
+                end_line: None,
             }],
         };
         for (sample, lines) in [
@@ -5659,6 +6099,8 @@ mod tests {
             edits: vec![Edit {
                 old_text: "\u{301}".into(),
                 new_text: "X".into(),
+                start_line: None,
+                end_line: None,
             }],
         };
         let failure = apply_edits("a\u{301}\u{341}", &mark_request, "marks.txt")
@@ -5678,6 +6120,8 @@ mod tests {
             edits: vec![Edit {
                 old_text: "é ".into(),
                 new_text: "E".into(),
+                start_line: None,
+                end_line: None,
             }],
         };
         assert_eq!(
@@ -5820,6 +6264,373 @@ mod tests {
         assert_eq!(
             std::fs::read(scratch.0.join("base/value")).unwrap(),
             b"wrong-base\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_nested_file_read_retains_io_permit_until_blocking_worker_finishes() {
+        let scratch = Scratch::new("nested-read-permit");
+        let path = scratch.0.join("sample.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let launch = Arc::new(context(&scratch.0, &scratch.0));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let render = Render {
+            structured_content: true,
+            output_mode: OutputMode::Text,
+        };
+
+        // Hold MUTATION on a dedicated OS thread while write_nested enters spawn_blocking, then
+        // abort the awaiting future and verify the permit stays taken until MUTATION unlocks.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = MUTATION.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let write_launch = Arc::clone(&launch);
+        let write_path = path.display().to_string();
+        let handle = tokio::spawn(async move {
+            write_nested(
+                WriteRequest {
+                    path: write_path,
+                    content: "updated\n".into(),
+                },
+                write_launch,
+                render,
+                permit,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "dropping the awaiting future must not release the permit before blocking I/O finishes"
+        );
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        let reacquired =
+            tokio::time::timeout(std::time::Duration::from_secs(2), semaphore.acquire_owned())
+                .await
+                .expect("permit released once blocking worker finishes")
+                .unwrap();
+        drop(reacquired);
+    }
+
+    #[test]
+    fn read_supports_negative_offsets_across_sizes_empty_files_and_line_endings() {
+        let scratch = Scratch::new("negative-offset");
+        let launch = context(&scratch.0, &scratch.0);
+
+        let thousand_path = scratch.0.join("thousand.txt");
+        let mut thousand = String::new();
+        for i in 1..=1000 {
+            thousand.push_str(&format!("line-{i}\n"));
+        }
+        std::fs::write(&thousand_path, &thousand).unwrap();
+        for limits in [ReadLimits::DIRECT, ReadLimits::NESTED] {
+            let tail = read_text(
+                &ReadRequest {
+                    path: "thousand.txt".into(),
+                    offset: Some(-50),
+                    limit: None,
+                },
+                &launch,
+                false,
+                limits,
+            )
+            .unwrap();
+            assert_eq!(tail.structured["startLine"], 951);
+            assert_eq!(tail.structured["endLine"], 1000);
+            assert_eq!(tail.structured["shownLines"], 50);
+            assert_eq!(tail.structured["nextOffset"], Value::Null);
+            assert!(tail.body.as_deref().unwrap().starts_with("line-951\n"));
+            assert!(tail.body.as_deref().unwrap().ends_with("line-1000\n"));
+        }
+
+        let big_path = scratch.0.join("hundred_k.txt");
+        let mut big = String::with_capacity(900_000);
+        for i in 1..=100_000 {
+            big.push_str(&format!("r{i}\n"));
+        }
+        std::fs::write(&big_path, &big).unwrap();
+        let slice = read_text(
+            &ReadRequest {
+                path: "hundred_k.txt".into(),
+                offset: Some(-90_000),
+                limit: Some(2),
+            },
+            &launch,
+            false,
+            ReadLimits::DIRECT,
+        )
+        .unwrap();
+        assert_eq!(slice.structured["startLine"], 10_001);
+        assert_eq!(slice.structured["endLine"], 10_002);
+        assert_eq!(slice.body.as_deref(), Some("r10001\nr10002\n"));
+
+        let ten_path = scratch.0.join("ten.txt");
+        std::fs::write(
+            &ten_path,
+            (1..=10).map(|i| format!("{i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        for neg in [-5000_i64, i64::MIN] {
+            let clamped = read_text(
+                &ReadRequest {
+                    path: "ten.txt".into(),
+                    offset: Some(neg),
+                    limit: Some(3),
+                },
+                &launch,
+                false,
+                ReadLimits::DIRECT,
+            )
+            .unwrap();
+            assert_eq!(clamped.structured["startLine"], 1);
+            assert_eq!(clamped.structured["endLine"], 3);
+        }
+
+        let empty_path = scratch.0.join("empty.txt");
+        std::fs::write(&empty_path, b"").unwrap();
+        let empty_neg = read_text(
+            &ReadRequest {
+                path: "empty.txt".into(),
+                offset: Some(-1),
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::DIRECT,
+        )
+        .unwrap();
+        let empty_pos = read_text(
+            &ReadRequest {
+                path: "empty.txt".into(),
+                offset: Some(1),
+                limit: None,
+            },
+            &launch,
+            false,
+            ReadLimits::DIRECT,
+        )
+        .unwrap();
+        assert_eq!(empty_neg.structured, empty_pos.structured);
+        assert_eq!(empty_neg.body.as_deref(), Some(""));
+        assert_eq!(empty_neg.structured["startLine"], 1);
+        assert_eq!(empty_neg.structured["shownLines"], 0);
+
+        // Mixed LF, CRLF, lone CR, and unterminated final segment: negative offset matches positive.
+        let mixed_path = scratch.0.join("mixed.txt");
+        std::fs::write(&mixed_path, b"one\ntwo\r\nthree\rfour\nfive").unwrap();
+        for (neg, pos) in [(-1, 4), (-2, 3), (-3, 2), (-4, 1)] {
+            let a = read_text(
+                &ReadRequest {
+                    path: "mixed.txt".into(),
+                    offset: Some(neg),
+                    limit: None,
+                },
+                &launch,
+                false,
+                ReadLimits::DIRECT,
+            )
+            .unwrap();
+            let b = read_text(
+                &ReadRequest {
+                    path: "mixed.txt".into(),
+                    offset: Some(pos),
+                    limit: None,
+                },
+                &launch,
+                false,
+                ReadLimits::DIRECT,
+            )
+            .unwrap();
+            assert_eq!(a.structured, b.structured, "neg={neg} pos={pos}");
+            assert_eq!(a.body, b.body, "neg={neg} pos={pos}");
+        }
+    }
+
+    #[test]
+    fn edit_start_line_and_end_line_disambiguate_report_outside_and_detect_overlap() {
+        let scratch = Scratch::new("edit-line-range");
+        let launch = context(&scratch.0, &scratch.0);
+
+        let lines_path = scratch.0.join("hundred.txt");
+        let original: String = (1..=100)
+            .map(|line| {
+                if matches!(line, 10 | 50 | 90) {
+                    "value = 1;\n".to_owned()
+                } else {
+                    format!("line {line}\n")
+                }
+            })
+            .collect();
+        std::fs::write(&lines_path, &original).unwrap();
+
+        let amb = edit_outcome(
+            &EditRequest {
+                path: "hundred.txt".into(),
+                edits: vec![Edit {
+                    old_text: "value = 1;".into(),
+                    new_text: "value = 2;".into(),
+                    start_line: None,
+                    end_line: None,
+                }],
+            },
+            &launch,
+        )
+        .unwrap_err()
+        .1
+        .unwrap();
+        assert_eq!(amb["failures"][0]["problem"], "ambiguous");
+        assert_eq!(amb["failures"][0]["lines"], json!([10, 50, 90]));
+
+        let miss = edit_outcome(
+            &EditRequest {
+                path: "hundred.txt".into(),
+                edits: vec![Edit {
+                    old_text: "value = 1;".into(),
+                    new_text: "value = 2;".into(),
+                    start_line: Some(20),
+                    end_line: Some(30),
+                }],
+            },
+            &launch,
+        )
+        .unwrap_err()
+        .1
+        .unwrap();
+        assert_eq!(miss["failures"][0]["problem"], "not_found");
+        assert_eq!(miss["failures"][0]["lines"], json!([10, 50, 90]));
+        assert_eq!(std::fs::read_to_string(&lines_path).unwrap(), original);
+
+        let half = edit_outcome(
+            &EditRequest {
+                path: "hundred.txt".into(),
+                edits: vec![Edit {
+                    old_text: "value = 1;".into(),
+                    new_text: "value = 2;".into(),
+                    start_line: Some(50),
+                    end_line: None,
+                }],
+            },
+            &launch,
+        )
+        .unwrap_err()
+        .1
+        .unwrap();
+        assert_eq!(half["failures"][0]["problem"], "ambiguous");
+        assert_eq!(half["failures"][0]["lines"], json!([50, 90]));
+
+        let inverted = edit_outcome(
+            &EditRequest {
+                path: "hundred.txt".into(),
+                edits: vec![Edit {
+                    old_text: "value = 1;".into(),
+                    new_text: "value = 2;".into(),
+                    start_line: Some(60),
+                    end_line: Some(50),
+                }],
+            },
+            &launch,
+        )
+        .unwrap_err();
+        assert!(inverted.0.contains("startLine"), "{inverted:?}");
+
+        // Overlap between a ranged edit and an unranged edit is still rejected cleanly.
+        let overlap = edit_outcome(
+            &EditRequest {
+                path: "hundred.txt".into(),
+                edits: vec![
+                    Edit {
+                        old_text: "value = 1;".into(),
+                        new_text: "value = 2;".into(),
+                        start_line: Some(45),
+                        end_line: Some(55),
+                    },
+                    Edit {
+                        old_text: "line 49\nvalue = 1;\nline 51".into(),
+                        new_text: "block".into(),
+                        start_line: None,
+                        end_line: None,
+                    },
+                ],
+            },
+            &launch,
+        )
+        .unwrap_err()
+        .1
+        .unwrap();
+        assert_eq!(overlap["failures"][0]["problem"], "overlap");
+        assert_eq!(std::fs::read_to_string(&lines_path).unwrap(), original);
+
+        // Scoped edit updates only line 50; multi-line oldText starting on endLine also succeeds.
+        let ok = edit_outcome(
+            &EditRequest {
+                path: "hundred.txt".into(),
+                edits: vec![Edit {
+                    old_text: "value = 1;\nline 51".into(),
+                    new_text: "value = 2;\nline 51".into(),
+                    start_line: Some(45),
+                    end_line: Some(50),
+                }],
+            },
+            &launch,
+        )
+        .unwrap();
+        assert_eq!(ok.1["edits"][0]["line"], 50);
+        let updated: Vec<String> = std::fs::read_to_string(&lines_path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(updated[9], "value = 1;");
+        assert_eq!(updated[49], "value = 2;");
+        assert_eq!(updated[89], "value = 1;");
+
+        // Mixed LF, CRLF, and lone CR line endings count LF breaks consistently.
+        let mixed = scratch.0.join("mixed_endings.txt");
+        std::fs::write(&mixed, b"same\nsame\r\nsame\rtail\nsame\n").unwrap();
+        edit_outcome(
+            &EditRequest {
+                path: "mixed_endings.txt".into(),
+                edits: vec![Edit {
+                    old_text: "same".into(),
+                    new_text: "picked".into(),
+                    start_line: Some(3),
+                    end_line: Some(3),
+                }],
+            },
+            &launch,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&mixed).unwrap(),
+            b"same\nsame\r\npicked\rtail\nsame\n"
+        );
+
+        // Concurrent growth past 4 MiB after metadata check (ending mid-UTF-8 codepoint at
+        // max_bytes + 1) reports the size limit rather than a false UTF-8 error.
+        let grown = scratch.0.join("grown.txt");
+        let mut multibyte_over_4m = "a".repeat(NESTED_MAX_BYTES as usize - 1);
+        multibyte_over_4m.push('中'); // 4_194_303 + 3 = 4_194_306 bytes; take(4_194_305) cuts mid-'中'
+        std::fs::write(&grown, &multibyte_over_4m).unwrap();
+        let f = File::open(&grown).unwrap();
+        let source = Source::new(
+            BufReader::new(f.take(ReadLimits::NESTED_WHOLE.max_bytes + 1)),
+            None,
+        );
+        let win = Window::scan(source, 1, None, ReadLimits::NESTED_WHOLE).unwrap();
+        assert!(
+            win.stopped_on_bytes || win.window_bytes > ReadLimits::NESTED_WHOLE.max_bytes,
+            "must detect size overflow before lossy flag"
         );
     }
 }

@@ -538,8 +538,7 @@ fn append_quoted(arg: &OsStr, line: &mut Vec<u16>) -> std::io::Result<()> {
 fn environment_block(launch: &Launch<'_>) -> std::io::Result<Vec<u16>> {
     let overrides = environment(launch);
     let pairs = launch
-        .env
-        .env
+        .base_env
         .iter()
         .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
         .chain(
@@ -934,7 +933,8 @@ mod tests {
             command: "sleep 5",
             script: None,
             cwd: &cwd,
-            env: &context,
+            base_env: &context.env,
+            used_snapshot: false,
             login: false,
             pty: true,
             pipe_stdin: false,

@@ -14,6 +14,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+enum LoginEnv {
+    Snapshot(Vec<(OsString, OsString)>),
+    Failed(String),
+}
+
+#[derive(Default)]
+struct LaunchCache {
+    /// GNU bash for this context, found on first use and reused by every task of the session.
+    /// A lookup that fails leaves `None` so the next task retries.
+    bash: Mutex<Option<PathBuf>>,
+    /// Login-shell environment snapshot captured once on the first non-login start.
+    login_env: OnceLock<LoginEnv>,
+    warned_probe_failure: AtomicBool,
+}
+
+const SHELL_MANAGED_VARS: [&str; 6] = ["PWD", "OLDPWD", "SHLVL", "_", "SHELLOPTS", "BASHOPTS"];
+
 /// What a session's tasks inherit: the directory they start in and their whole environment.
 /// A task's environment comes from here, never from the server's own globals, so one server can
 /// serve sessions with different environments.
@@ -23,9 +40,10 @@ pub struct LaunchContext {
     pub env: Vec<(OsString, OsString)>,
     /// The directory that anchors a relative home even after a codemode call changes its cwd.
     session_cwd: PathBuf,
-    /// GNU bash for this context, found on first use and reused by every task of the session. A
-    /// lookup that fails is retried by the next task.
-    bash: OnceLock<PathBuf>,
+    /// Variable names stripped from this session (e.g. `FASTEXEC_HTTP_TOKEN`), removed from
+    /// login-profile snapshots as well.
+    removed: Vec<String>,
+    cache: Arc<LaunchCache>,
 }
 
 impl LaunchContext {
@@ -34,7 +52,8 @@ impl LaunchContext {
             session_cwd: cwd.clone(),
             cwd,
             env,
-            bash: OnceLock::new(),
+            removed: Vec::new(),
+            cache: Arc::new(LaunchCache::default()),
         }
     }
 
@@ -46,34 +65,30 @@ impl LaunchContext {
         ))
     }
 
-    /// This context with `cwd` replaced, preserving its environment and cached bash path.
+    /// This context with `cwd` replaced, sharing its cached bash path and login snapshot.
     pub fn with_cwd(&self, cwd: PathBuf) -> Self {
-        let bash = OnceLock::new();
-        if let Some(found) = self.bash.get() {
-            let _ = bash.set(found.clone());
-        }
         Self {
             cwd,
             env: self.env.clone(),
             session_cwd: self.session_cwd.clone(),
-            bash,
+            removed: self.removed.clone(),
+            cache: Arc::clone(&self.cache),
         }
     }
 
-    /// This context with `name` removed from its environment, so the tasks it starts cannot carry
-    /// a secret the caller used to reach the server.
+    /// This context with `name` removed from its environment and future login snapshots, so the
+    /// tasks it starts cannot carry a secret the caller used to reach the server.
     pub fn without(mut self, name: &str) -> Self {
         self.env.retain(|(key, _)| !name_matches(key, name));
+        self.removed.push(name.to_owned());
+        self.cache = Arc::new(LaunchCache::default());
         self
     }
 
     /// The value of `name`. Windows compares environment names case-insensitively; Unix does
     /// not, so a context can hold `Path` and `PATH` as distinct names there.
     pub fn var(&self, name: &str) -> Option<&OsStr> {
-        self.env
-            .iter()
-            .find(|(key, _)| name_matches(key, name))
-            .map(|(_, value)| value.as_os_str())
+        var_in(&self.env, name)
     }
 
     /// The absolute home directory for file tools and the Host description.
@@ -101,14 +116,62 @@ impl LaunchContext {
         value("HOME").map(|home| PathBuf::from(home.to_os_string()))
     }
 
-    /// The bash these tasks run, found in this context's environment.
-    pub fn bash(&self) -> Result<&Path, String> {
-        if let Some(found) = self.bash.get() {
-            return Ok(found.as_path());
+    /// The bash these tasks run, found once per session cache.
+    pub fn bash(&self) -> Result<PathBuf, String> {
+        let mut slot = lock(&self.cache.bash);
+        if let Some(found) = slot.as_ref() {
+            return Ok(found.clone());
         }
         let found = crate::bash::find(self)?;
-        Ok(self.bash.get_or_init(|| found).as_path())
+        *slot = Some(found.clone());
+        Ok(found)
     }
+
+    /// Returns `(base_env, used_snapshot, one_time_warning)` for a task launch.
+    pub fn task_env(
+        &self,
+        bash: &Path,
+        login: bool,
+    ) -> (&[(OsString, OsString)], bool, Option<String>) {
+        if login {
+            return (&self.env, false, None);
+        }
+        let entry = self.cache.login_env.get_or_init(|| {
+            match crate::process::probe_login_env(bash, self) {
+                Ok(mut vars) => {
+                    vars.retain(|(key, _)| {
+                        !SHELL_MANAGED_VARS
+                            .iter()
+                            .any(|managed| name_matches(key, managed))
+                            && !self
+                                .removed
+                                .iter()
+                                .any(|removed| name_matches(key, removed))
+                    });
+                    LoginEnv::Snapshot(vars)
+                }
+                Err(reason) => LoginEnv::Failed(reason),
+            }
+        });
+        match entry {
+            LoginEnv::Snapshot(vars) => (vars.as_slice(), true, None),
+            LoginEnv::Failed(reason) => {
+                let warning = (!self.cache.warned_probe_failure.swap(true, Ordering::AcqRel))
+                    .then(|| {
+                        format!(
+                            "Login environment probe failed ({reason}); tasks use the server's environment. Pass loginShell: true to run the profile."
+                        )
+                    });
+                (self.env.as_slice(), false, warning)
+            }
+        }
+    }
+}
+
+pub(crate) fn var_in<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsStr> {
+    env.iter()
+        .find(|(key, _)| name_matches(key, name))
+        .map(|(_, value)| value.as_os_str())
 }
 
 /// Environment names compare case-insensitively on Windows and exactly on Unix, where a name

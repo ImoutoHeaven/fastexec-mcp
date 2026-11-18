@@ -286,8 +286,7 @@ impl Endpoint {
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
             .env_remove("FASTEXEC_YOLO")
             .env_remove("FASTEXEC_CODEMODE")
-            .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
-            .env_remove("FASTEXEC_TEST_NONE_LIMIT");
+            .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT");
         configure(&mut command);
         command
             .env("FASTEXEC_DAEMON", "on")
@@ -2234,21 +2233,12 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
         "nested exec inside codemode must not swallow outer session's first outside-task notice: {nested_outer_text}"
     );
 
-    let (_, tiny_text, tiny_err) = ep_b.call(json!({
-        "action": "start",
-        "loginShell": false,
-        "command": "true",
-        "maxBytes": 100
-    }));
-    assert!(
-        !tiny_err && !tiny_text.contains("outside this session"),
-        "{tiny_text}"
-    );
-
+    // Footer lives outside the body maxBytes budget, so even maxBytes: 100 delivers the
+    // outside-session notice once on the first call and omits it on subsequent calls.
     let (_, first_text, first_err) = ep_b.call(json!({
         "action": "start",
-        "loginShell": false,
-        "command": "true"
+        "command": "true",
+        "maxBytes": 100
     }));
     assert!(
         !first_err
@@ -2260,7 +2250,6 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
 
     let (_, second_text, second_err) = ep_b.call(json!({
         "action": "start",
-        "loginShell": false,
         "command": "true"
     }));
     assert!(
@@ -2269,9 +2258,9 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
     );
 
     let (sess_list, _, _) = ep_b.call(json!({"action": "list"}));
-    assert_eq!(sess_list["totalCount"], 3, "{sess_list}");
+    assert_eq!(sess_list["totalCount"], 2, "{sess_list}");
     let (all_list, _, _) = ep_b.call(json!({"action": "list", "scope": "all"}));
-    assert_eq!(all_list["totalCount"], 7, "{all_list}");
+    assert_eq!(all_list["totalCount"], 6, "{all_list}");
 
     // Stale 8-char base32 epoch in daemon mode reports an earlier daemon; malformed ID says Unknown taskId.
     let (_, stale_text, stale_err) = ep_b.call(json!({"action": "poll", "taskId": "01234567-9z"}));
@@ -2306,4 +2295,85 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
 
     ep_a.call(json!({"action": "kill", "taskId": id1}));
     ep_a.call(json!({"action": "kill", "taskId": id2}));
+}
+
+#[test]
+fn daemon_delivers_4mib_both_mode_window_and_probes_login_profile_once_per_session() {
+    let fixture = Fixture::new("four-mib-and-probe");
+    let home = fixture.runtime.join("test-home");
+    let sub_a = fixture.runtime.join("test-sub-a");
+    let sub_b = fixture.runtime.join("test-sub-b");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&sub_a).unwrap();
+    std::fs::create_dir_all(&sub_b).unwrap();
+    std::fs::write(
+        home.join(".bash_profile"),
+        "export FX_DAEMON_SNAP=from_profile\necho BannerNoise\necho x >> \"$HOME/probe_count\"\n",
+    )
+    .unwrap();
+
+    let sub_a_str = sub_a.to_string_lossy().replace('\\', "/");
+    let sub_b_str = sub_b.to_string_lossy().replace('\\', "/");
+    let mut ep1 = Endpoint::start_with(&fixture, |cmd| {
+        cmd.env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("FASTEXEC_OUTPUT_MODE", "both")
+            .env("FASTEXEC_CODEMODE", "true");
+    });
+
+    for _ in 0..2 {
+        let (out, text, err) = ep1.call(json!({
+            "action": "start",
+            "command": "printf '%s' \"$FX_DAEMON_SNAP\""
+        }));
+        assert!(!err, "{text}");
+        assert_eq!(out["output"], "from_profile");
+        assert!(!text.contains("BannerNoise"), "{text}");
+    }
+
+    for cwd in [&sub_a_str, &sub_b_str] {
+        let cm = ep1.request(
+            "tools/call",
+            json!({
+                "name": "codemode",
+                "arguments": {
+                    "cwd": cwd,
+                    "code": "const r = await tools.exec({action: 'start', command: 'printf \"%s\" \"$FX_DAEMON_SNAP\"'}); return r.output;"
+                }
+            }),
+        );
+        assert_ne!(cm["result"]["isError"], true, "{cm}");
+        assert_eq!(cm["result"]["structuredContent"]["output"], "from_profile");
+    }
+
+    let count_ep1 = std::fs::read_to_string(home.join("probe_count")).unwrap();
+    assert_eq!(
+        count_ep1.lines().count(),
+        1,
+        "one session plus with_cwd codemode derivations must probe login env once: {count_ep1:?}"
+    );
+
+    // A second endpoint session probes its own snapshot once.
+    let mut ep2 = Endpoint::start_with(&fixture, |cmd| {
+        cmd.env("HOME", &home).env("USERPROFILE", &home);
+    });
+    let (_, text2, err2) = ep2.call(json!({
+        "action": "start",
+        "command": "printf '%s' \"$FX_DAEMON_SNAP\""
+    }));
+    assert!(!err2 && text2.starts_with("from_profile"), "{text2}");
+    let count_ep2 = std::fs::read_to_string(home.join("probe_count")).unwrap();
+    assert_eq!(count_ep2.lines().count(), 2, "{count_ep2:?}");
+    drop(ep2);
+
+    // 4 MiB body in FASTEXEC_OUTPUT_MODE=both carries both text and structuredContent.output
+    // comfortably within ipc::RESPONSE_LIMIT (64 MiB).
+    let (four_mib, _, four_err) = ep1.call(json!({
+        "action": "start",
+        "maxBytes": 4194304,
+        "truncate": "head",
+        "command": "head -c 4194300 /dev/zero | tr '\\0' M"
+    }));
+    assert!(!four_err);
+    assert_eq!(four_mib["output"].as_str().unwrap().len(), 4_194_300);
 }

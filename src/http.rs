@@ -264,7 +264,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     config.allowed_origins = allowed_origins(bound, &origins_from_env());
     let mut session_config = SessionConfig::default();
     session_config.channel_capacity = 16;
-    session_config.keep_alive = Some(Duration::from_secs(600));
+    session_config.keep_alive = Some(Duration::from_secs(3600));
     session_config.sse_retry = None;
     session_config.completed_cache_ttl = Duration::from_secs(60);
     session_config.init_timeout = Some(Duration::from_secs(60));

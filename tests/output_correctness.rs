@@ -26,7 +26,6 @@ impl Server {
             "FASTEXEC_YOLO",
             "FASTEXEC_TEST_RUNTIME_DIR",
             "FASTEXEC_TEST_TOTAL_LOG_LIMIT",
-            "FASTEXEC_TEST_NONE_LIMIT",
         ] {
             command.env_remove(name);
         }
@@ -131,7 +130,7 @@ fn assert_log_recovers(command: &str, expected: &[u8], retained: usize, scan: bo
     let handle = format!("{bare}.abcd");
     std::fs::write(&path, &original[..retained]).unwrap();
     let mut poll = json!({"action": "poll", "taskId": handle, "waitMs": 0,
-                          "truncate": "none", "raw": true});
+                          "truncate": "head", "maxBytes": 4194304, "raw": true});
     if scan {
         poll["returnWhen"] = json!({"outputContains": ["absent-marker"]});
     }
@@ -144,7 +143,7 @@ fn assert_log_recovers(command: &str, expected: &[u8], retained: usize, scan: bo
     );
     std::fs::write(&path, &original).unwrap();
     let recovered = server.exec(json!({"action": "poll", "taskId": handle,
-        "waitMs": 0, "truncate": "none", "raw": true}));
+        "waitMs": 0, "truncate": "head", "maxBytes": 4194304, "raw": true}));
     assert_ne!(recovered["isError"], true, "{}", text(&recovered));
     let output = recovered["structuredContent"]["output"].as_str().unwrap();
     assert_eq!(
@@ -193,7 +192,7 @@ fn a_short_transcript_fails_without_advancing_its_reader() {
     let original = std::fs::read(&path).unwrap();
     assert!(original.starts_with(b"A\nB\nC\nD\n"));
     std::fs::write(&path, &original[..1]).unwrap();
-    let arguments = json!({"action": "transcript", "taskId": handle, "truncate": "none"});
+    let arguments = json!({"action": "transcript", "taskId": handle, "maxBytes": 4194304});
     let failed = server.exec(arguments.clone());
     assert_eq!(failed["isError"], true, "{}", text(&failed));
     assert!(
@@ -300,4 +299,229 @@ fn encoding_warnings_survive_every_mode_and_small_output_budget() {
             assert_encoding_warning(&result, structured);
         }
     }
+}
+
+#[test]
+fn p0_1_and_p1_6_windows_and_nul_preservation_hold_direct_and_nested() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+    for name in [
+        "FASTEXEC_DAEMON",
+        "FASTEXEC_NAMESPACE",
+        "FASTEXEC_BASH",
+        "FASTEXEC_YOLO",
+        "FASTEXEC_TEST_RUNTIME_DIR",
+        "FASTEXEC_TEST_TOTAL_LOG_LIMIT",
+    ] {
+        command.env_remove(name);
+    }
+    let mut child = command
+        .env("FASTEXEC_STRUCTURED_CONTENT", "true")
+        .env("FASTEXEC_OUTPUT_MODE", "both")
+        .env("FASTEXEC_CODEMODE", "true")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let (send, lines) = channel();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if let Ok(value) = serde_json::from_str(&line)
+                && send.send(value).is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut server = Server {
+        child,
+        lines,
+        next: 0,
+    };
+    server.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "output-correctness-cm", "version": "1"}
+        }),
+    );
+    server.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    // Direct 10,000 B JSON line under default parameters: whole, valid JSON, no cutLines.
+    let payload_10k = "j".repeat(9980);
+    let json_10k = server.exec(json!({
+        "action": "start",
+        "command": format!("printf '{{\"k\":\"%s\"}}\\n' '{payload_10k}'")
+    }));
+    assert_ne!(json_10k["isError"], true, "{}", text(&json_10k));
+    assert!(json_10k["structuredContent"].get("cutLines").is_none());
+    let parsed_10k: Value =
+        serde_json::from_str(json_10k["structuredContent"]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed_10k["k"].as_str().unwrap().len(), 9980);
+
+    // Direct 20,000-char line followed by ERROR: final line: tail line whole, first line cut.
+    let err_tail = server.exec(json!({
+        "action": "start",
+        "command": "(printf '%20000s\\n' '' | tr ' ' x; printf 'ERROR: final line\\n')"
+    }));
+    let err_body = err_tail["structuredContent"]["output"].as_str().unwrap();
+    assert!(err_body.len() <= 16_384, "len={}", err_body.len());
+    assert!(err_body.ends_with("ERROR: final line"), "{err_body}");
+    assert_eq!(err_tail["structuredContent"]["cutLines"], 1, "{err_tail}");
+
+    // Single 200 KiB multi-byte UTF-8 line under default budget: cut on char boundary, logPath in status.
+    let multi_200k = server.exec(json!({
+        "action": "start",
+        "command": "awk 'BEGIN { for (i = 0; i < 70000; i++) printf \"中\"; printf \"\\n\" }'"
+    }));
+    let body_200k = multi_200k["structuredContent"]["output"].as_str().unwrap();
+    assert!(body_200k.len() <= 16_384);
+    assert_eq!(multi_200k["structuredContent"]["cutLines"], 1);
+    let log_200k = multi_200k["structuredContent"]["logPath"].as_str().unwrap();
+    assert!(text(&multi_200k).contains(log_200k));
+
+    // Codemode script 1 & 2 from Spec P0-1.
+    let cm1 = server.request(
+        "tools/call",
+        json!({
+            "name": "codemode",
+            "arguments": {
+                "code": "text('x'.repeat(20000)); text('MIDDLE'); text('END-LINE-IMPORTANT'); return 'RET';"
+            }
+        }),
+    );
+    let cm1_body = cm1["structuredContent"]["output"].as_str().unwrap();
+    assert!(cm1_body.len() <= 16_384);
+    assert_eq!(cm1["structuredContent"]["cutLines"], 1);
+    assert!(
+        cm1_body.ends_with(
+            "MIDDLE
+END-LINE-IMPORTANT
+RET"
+        ),
+        "{cm1_body}"
+    );
+
+    let cm1_many = server.request(
+        "tools/call",
+        json!({
+            "name": "codemode",
+            "arguments": {
+                "code": "text('x'.repeat(20000)); for (let i = 0; i < 3000; i++) text('MIDDLE-' + i); text('END-LINE-IMPORTANT'); return 'RET';"
+            }
+        }),
+    );
+    let cm1_many_body = cm1_many["structuredContent"]["output"].as_str().unwrap();
+    assert!(cm1_many_body.len() <= 16_384);
+    assert!(
+        cm1_many_body.contains("lines omitted: log lines "),
+        "{cm1_many_body}"
+    );
+    assert!(
+        cm1_many_body.ends_with(
+            "END-LINE-IMPORTANT
+RET"
+        ),
+        "{cm1_many_body}"
+    );
+
+    let cm2 = server.request(
+        "tools/call",
+        json!({
+            "name": "codemode",
+            "arguments": {
+                "code": "text('H'.repeat(15000)); return {tail: 'V'.repeat(12000), done: 'END'};"
+            }
+        }),
+    );
+    let cm2_body = cm2["structuredContent"]["output"].as_str().unwrap();
+    assert!(cm2_body.len() <= 16_384);
+    let last_line = cm2_body.lines().last().unwrap();
+    let parsed_cm2: Value = serde_json::from_str(last_line).expect("12,000 B return line whole");
+    assert_eq!(parsed_cm2["done"], "END");
+    assert_eq!(parsed_cm2["tail"].as_str().unwrap().len(), 12_000);
+
+    // Nested 150 lines with maxBytes: 180 (head default, no status deduction) + P1-6 NUL preservation.
+    let dir = std::env::temp_dir().join(format!("fastexec-nul-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in [
+        "alpha beta.txt",
+        "quote's file.txt",
+        "third 'space' item.txt",
+    ] {
+        std::fs::write(dir.join(name), "ok").unwrap();
+    }
+    let dir_str = dir.to_string_lossy().replace('\\', "/");
+
+    let direct_nul = server.exec(json!({
+        "action": "start",
+        "command": "printf 'a b\\0c\\nd\\0'"
+    }));
+    assert_eq!(direct_nul["structuredContent"]["output"], "a bc\nd");
+
+    let nested_checks = server.request(
+        "tools/call",
+        json!({
+            "name": "codemode",
+            "arguments": {
+                "cwd": dir_str,
+                "code": r#"
+                    const r150 = await tools.exec({
+                        action: "start",
+                        maxBytes: 180,
+                        command: "awk 'BEGIN { for (i = 1; i <= 150; i++) printf \"row-%03d\\n\", i }'"
+                    });
+                    if (r150.output.length < 150 || r150.output.length > 180) {
+                        throw new Error("bad r150 len=" + r150.output.length + " out=" + JSON.stringify(r150.output));
+                    }
+                    if (!Array.isArray(r150.omittedRange) || r150.omittedRange[1] !== 150 || r150.omittedRange[0] < 15) {
+                        throw new Error("expected tail omission, got " + JSON.stringify(r150.omittedRange));
+                    }
+
+                    const nulOut = await tools.exec({
+                        action: "start",
+                        command: "printf 'a b\\0c\\nd\\0'"
+                    });
+                    if (nulOut.output !== "a b\u0000c\nd\u0000") {
+                        throw new Error("nested NUL mismatch: " + JSON.stringify(nulOut.output));
+                    }
+
+                    const found = await tools.exec({
+                        action: "start",
+                        command: "find . -maxdepth 1 -type f -print0"
+                    });
+                    const names = found.output
+                        .split("\0")
+                        .filter(Boolean)
+                        .map(p => p.replace(/^\.\//, ""))
+                        .sort();
+                    return names;
+                "#
+            }
+        }),
+    );
+    assert_eq!(
+        nested_checks["structuredContent"]["exitCode"],
+        0,
+        "{}",
+        text(&nested_checks)
+    );
+    let names: Vec<String> = serde_json::from_str(
+        nested_checks["structuredContent"]["output"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        names,
+        vec![
+            "alpha beta.txt".to_string(),
+            "quote's file.txt".to_string(),
+            "third 'space' item.txt".to_string()
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

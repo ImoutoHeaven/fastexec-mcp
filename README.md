@@ -114,7 +114,7 @@ structured results, and return only the output it needs:
 
 ```javascript
 const [run, file] = await Promise.all([
-  tools.exec({action: "start", command: "printf ready", loginShell: false}),
+  tools.exec({action: "start", command: "printf ready"}),
   tools.read({path: "README.md", limit: 5})
 ]);
 text(run.output);
@@ -135,9 +135,11 @@ and `edit` resolve against it. Continue with `exec poll`,
 stop with `exec kill`, and inspect with `exec list`. A script has no terminal
 or input. `sh.quote(value)` single-quotes strings and finite numbers for POSIX
 bash, and UTF-8 `TextEncoder` and `TextDecoder` are available alongside `atob`
-and `btoa`; JavaScript has no Node APIs, modules, timers, filesystem or network
-access, and host operations go through `tools` (pass `loginShell: false` to
-`tools.exec` for fast non-interactive commands that need no profile setup).
+and `btoa`, and `sleep(ms)` pauses without spawning a process; JavaScript has no
+Node APIs, modules, callback timers, filesystem, or network access, and host
+operations go through `tools` (`exec` starts run non-interactively with the
+session's login-environment snapshot by default; pass `loginShell: true` when a
+command needs fresh login profile side effects).
 
 Stopping a script cancels its pending tool calls. Bash tasks it already
 started continue running, and the result lists their handles for `exec kill`.
@@ -157,17 +159,22 @@ only `true` or `false`; invalid values stop startup.
 An endpoint's environment decides whether it advertises codemode, even when
 its daemon was started without it. HTTP uses the daemon's startup setting.
 Nested calls resolve directly to unwrapped structured objects regardless of the
-outer output setting (`exec` returns `{output, exitCode, state, ...}` with
-uncut lines up to its byte budget and no default `waitMs` ceiling, text `read`
-returns up to `50000` lines or `1` MiB per call with `{path, text, truncated,
-nextOffset, startLine, endLine, shownLines, totalLines}`, image `read` returns
+outer output setting (`exec` returns `{output, exitCode, state, ...}` defaulting
+to `truncate: "head"` and `maxBytes: 4194304` with NUL bytes preserved in clean
+output and no default `waitMs` ceiling, text `read` without `offset` or `limit`
+returns the whole UTF-8 file up to `4` MiB or rejects with `ToolError` if larger
+or non-UTF-8 — and with `offset` or `limit` reads a slice up to `4` MiB — as
+`{kind: "text", path, text, startLine, endLine, shownLines, totalLines,
+truncated, nextOffset, lineTooLong, lossy}`, image `read` returns
 `{path, attached, ...}`, `write` returns `{path, bytes}`, and `edit` returns
 `{path, replacements, edits}`). Validation, file, and integrity errors reject
 with `ToolError` (`{tool, result}`), while non-zero command exit codes
 resolve normally.
 
-Each script has 128 MiB of VM memory, eight tool calls in flight with up to
-1024 queued, a separate 128 MiB budget for pending tool arguments and results,
+Each script has 128 MiB of VM memory, eight `exec start` calls and eight
+file/transcript I/O calls in flight (`poll`, `kill`, `list`, and `sleep` take no
+concurrency slot) within 1024 pending calls, a separate 128 MiB budget for
+pending tool arguments and results,
 64 MiB of output including images and diagnostic space, and up
 to 64 images. Up to four scripts run in a local stdio server, or eight in a
 daemon. Each script accepts at most 4096 `exec start` calls, including calls

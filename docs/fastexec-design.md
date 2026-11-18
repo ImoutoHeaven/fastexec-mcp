@@ -27,11 +27,11 @@ execution, naming `exec` actions in lowercase.
 
 | Action | Allowed Parameters | Summary |
 | --- | --- | --- |
-| `start` | `command`, `cwd`, `pty`, `loginShell`, `input`, `eof`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Rejects NUL bytes in `command` before execution, then spawns it in GNU bash and waits up to `waitMs` (default `30000`, range `0–240000` on direct calls; unbounded by default without `returnWhen` in nested `codemode` calls). Pipe mode defaults stdin to `/dev/null`, writes `input` (`<= 1` MiB UTF-8) and closes stdin unless `eof: false`, or keeps stdin open with `eof: false`; PTY mode rejects `input` and `eof: true` on `start` (`eof: false` is a no-op) and defaults size to `120×30`. |
-| `poll` | `taskId`, `cols`, `rows`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Resizes the terminal (PTY only), writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only, idempotent when already closed), waits (`2000` ms with a resize, `input`, or `keys` and no `returnWhen`; `30000` ms on direct calls or with `returnWhen`; unbounded by default on nested `codemode` waits without `returnWhen` or input), and returns unseen output. |
-| `kill` | `taskId`, `truncate`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns unseen output through the reader gate without `waitEndedBy` (`head_tail` default on direct calls; uncut `none` window up to `4` MiB on nested calls). On a finished `keepTree` task, ends held processes while keeping the root exit result. |
+| `start` | `command`, `cwd`, `pty`, `loginShell`, `input`, `eof`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Rejects NUL bytes in `command` before execution, then spawns it in GNU bash (`loginShell: false` default with the session's login-environment snapshot; `loginShell: true` runs `bash -l -c`) and waits up to `waitMs` (default `30000`, range `0–240000` on direct calls; unbounded by default without `returnWhen` in nested `codemode` calls). Pipe mode defaults stdin to `/dev/null`, writes `input` (`<= 1` MiB UTF-8) and closes stdin unless `eof: false`, or keeps stdin open with `eof: false`; PTY mode rejects `input` and `eof: true` on `start` (`eof: false` is a no-op) and defaults size to `120×30`. |
+| `poll` | `taskId`, `cols`, `rows`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Normalizes `keys: []` (and any accompanying `keyDelayMs`) to absent before validation, resizes the terminal (PTY only), writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only, idempotent when already closed), waits (`2000` ms with a resize, `input`, or `keys` and no `returnWhen`; `30000` ms on direct calls or with `returnWhen`; unbounded by default on nested `codemode` waits without `returnWhen` or input), and returns unseen output. |
+| `kill` | `taskId`, `truncate`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns unseen output through the reader gate without `waitEndedBy` (`head_tail` / `16384` B default on direct calls; `head` / `4194304` B default on nested calls). On a finished `keepTree` task, ends held processes while keeping the root exit result. |
 | `list` | `scope`, `state`, `limit`, `truncate`, `maxBytes` | Lists bare task IDs newest first filtered by `scope` (`"session"` default or `"all"`), `state` (`"active"` or `"finished"`; omitted lists both), and `limit` (`1–500`, default `20`), reporting `totalCount` before `limit`; creates no readers and marks only delivered entries. |
-| `transcript` | `taskId`, `truncate` (default `"tail"`), `maxBytes` | Reads a UTF-8 PTY task's terminal transcript from the first unseen final line, followed by pending lines. Does not wait or advance the `poll` cursor. |
+| `transcript` | `taskId`, `truncate` (default `"tail"`), `maxBytes`, `waitMs` (ignored) | Reads a UTF-8 PTY task's terminal transcript from the first unseen final line, followed by pending lines. Does not wait or advance the `poll` cursor. |
 
 ### Key Parameter Rules
 
@@ -70,23 +70,24 @@ execution, naming `exec` actions in lowercase.
     compare against the screen captured before the call's resize and `input`).
   - `quietMs`: `10–60000` ms without output after `input` and `keys` finish.
 - **Window and encoding options**:
-  - `maxBytes`: `100–1048576` (default `16384`). Rejected when
-    `truncate: "none"`. Bounds the output window, status line, and background
-    footer together; metadata and JSON framing are outside that budget. Correctness
-    warnings remain whole even when they exceed the budget.
-  - `truncate`: `"head_tail"` (default for `start`/`poll`/`kill`: ~10% head,
-    ~90% tail), `"head"`, `"tail"` (default for `transcript`, including nested
-    calls that pass `maxBytes` alone), or `"none"` (all unseen lines whole up to
-    `4` MiB, with the rest reported as an omitted range). Direct bash calls
-    clean ANSI/CR rewrites unless `raw: true` and cap each line in bounded modes
-    at `2000` characters (`64` KiB with `raw: true`), reporting `cutLines`.
-    Outer `codemode` results skip cleaning, and both outer `codemode` and nested
-    `exec` results skip fixed line-length limits: lines stay whole unless a
-    single line exceeds the body budget (`maxBytes` after layout, or `4` MiB
-    with `none`). The prefix and ` … [line cut at <budget>; <n> more bytes]`
-    share that budget. The count measures omitted UTF-8 bytes after decoding
-    and any requested output cleaning. `head_tail` keeps a fitting first line
-    whole and gives the tail the space the head actually leaves.
+  - `maxBytes`: `100–4194304` (`4` MiB; default `16384` on direct `exec` and
+    outer `codemode`, `4194304` on nested `tools.exec`). Bounds the output body
+    (`structuredContent.output`) only; the status line, background footer (`<= 512`
+    bytes), metadata, JSON framing, errors, and correctness warnings stay outside
+    that budget.
+  - `truncate`: `"head_tail"` (default for direct `start`/`poll`/`kill`/`list`
+    and outer `codemode`), `"head"` (default for nested `start`/`poll`/`kill`/`list`),
+    or `"tail"` (default for `transcript`, direct or nested). Placement and
+    `maxBytes` default independently. Direct bash calls clean ANSI/CR rewrites
+    unless `raw: true` and drop NUL (`0x00`) bytes; nested bash clean output
+    preserves NUL bytes so `find -print0` and `rg -0` streams parse cleanly.
+    There is no fixed per-line length cap: across all windows (bash or codemode,
+    direct or nested, clean or `raw`), fitting output returns whole; a single
+    overflowing line cuts its UTF-8 prefix so `<prefix> … [line cut at <B>; <n> more bytes]`
+    fits `B` and increments `cutLines`; and multi-line `head_tail` overflow
+    reserves the inline `... [<k> lines omitted: log lines <a>-<b>] ...` marker,
+    reserves `B / 10` for the head, fills the tail from the last line backward
+    (cutting the last line if needed), and returns unused tail bytes to the head.
   - `encoding`: Any ASCII-compatible WHATWG label (such as `"utf-8"`, `"big5"`,
     `"gbk"`; UTF-16 is rejected). On `start`, sets the task default; on `poll`,
     overrides for that call.
@@ -109,9 +110,8 @@ function body with top-level `await` and `return`, up to 256 KiB of UTF-8,
 nonempty after trimming and without NUL bytes. Unknown parameters are refused.
 It shares `exec start`'s directory, wait, and output options except `raw`:
 `cwd`, `waitMs`, `killAfterMs`, `truncate` (default `head_tail`, keeping lines
-uncut up to `maxBytes`; `none` returns whole lines up to `4` MiB and cannot
-combine with `maxBytes`), `maxBytes`, and `returnWhen` (`outputContains`,
-`quietMs`). Schema-decoding failures return a tool error
+uncut up to `maxBytes`), `maxBytes` (`100–4194304`, default `16384`), and
+`returnWhen` (`outputContains`, `quietMs`). Schema-decoding failures return a tool error
 without `structuredContent`; parameter validation and admission failures return
 `isError: true` with `structuredContent` (`ok: false`, `action: "codemode"`)
 without creating a task.
@@ -131,15 +131,21 @@ server admits four scripts and a daemon eight, within the existing total task
 limit. The VM, output reader and capture workers are prepared before admission
 is published; a failed preparation returns its capacity and files.
 
-The script globals are `tools.exec/read/write/edit`, `sh.quote`, `text`,
+The script globals are `tools.exec/read/write/edit`, `sleep`, `sh.quote`, `text`,
 `console`, `image`, `exit`, and UTF-8 `TextEncoder`/`TextDecoder` (alongside
-QuickJS's built-in `atob`/`btoa`). `sh` is frozen; `sh.quote(value)` formats a
+QuickJS's built-in `atob`/`btoa`). `sleep(ms)` returns a `Promise<void>` without
+spawning a process (yielding once when `ms <= 0` and throwing `TypeError` for
+non-finite numbers). `sh` is frozen; `sh.quote(value)` formats a
 string or finite number as one POSIX single-quoted word and throws `TypeError`
 for `NaN`, infinities, NUL bytes, or other types. There are no modules, Node
-APIs, timers, store/load, network or direct filesystem APIs. `text` appends
-strings as-is and other values as JSON (preserved verbatim without ANSI or
-trailing-space stripping). Console methods join formatted arguments with spaces
-and show Error stacks. A non-undefined return value is appended last. `exit()`
+APIs, callback timers (`setTimeout`/`setInterval`), store/load, network, or direct
+filesystem APIs. `text` appends strings as-is and other values as JSON
+(preserved verbatim without ANSI or trailing-space stripping). Console methods
+join formatted arguments with spaces and show Error stacks. A non-undefined
+return value must be a string or JSON-serializable and is appended last (values
+for which `JSON.stringify` throws or returns `undefined`, such as `Symbol`,
+functions, `BigInt`, or circular objects, end the script with exit `1` and
+`Script error: TypeError: the return value is not JSON-serializable`). `exit()`
 ends successfully even inside a try/catch. Each script owns its globals; bridge
 and codec functions bind the built-ins they depend on before user code runs.
 
@@ -148,23 +154,30 @@ Schema-invalid argument shapes and unknown tools reject with `TypeError`;
 validation, file, and integrity failures reject with `ToolError` (`name:
 "ToolError"`, `tool`, `result` carrying full diagnostics such as `action`,
 `output`, `exitCode`, `inputError`, or `failures`), while non-zero command
-`exitCode`s resolve normally. `exec` returns `{action, taskId, state, exitCode,
-output, ...}` (keeping lines uncut up to `maxBytes` or the `4` MiB default `none`
-window, and waiting with no `waitMs` ceiling unless `waitMs`, `returnWhen`, or
-input/resize/keys supplies one); text `read` returns up to `50000` lines and
-`1` MiB per call as `{kind: "text", path, text, startLine, endLine, shownLines,
-totalLines, truncated, nextOffset, lineTooLong, lossy}`; image `read` returns
+`exitCode`s resolve normally. Async rejections from `tools.*` and `sleep` carry
+the caller's script stack frame (`codemode.js:<line>:<col>`). `exec` returns
+`{action, taskId, state, exitCode, output, ...}` (defaulting to `truncate: "head"`,
+or `"tail"` for `transcript`, and `maxBytes: 4194304`, keeping NUL bytes in clean
+output and waiting with no `waitMs` ceiling unless `waitMs`, `returnWhen`, or
+input/resize/keys supplies one); text `read` without `offset` or `limit` returns
+the whole UTF-8 file up to `4` MiB or rejects with `ToolError` when larger or
+non-UTF-8, and with `offset` or `limit` reads a slice up to `4` MiB (no line cap,
+marking invalid UTF-8 with `lossy: true`), always returning `{kind: "text", path,
+text, startLine, endLine, shownLines, totalLines, truncated, nextOffset,
+lineTooLong, lossy}`; image `read` returns
 `{kind: "image", path, mimeType, attached: true, originalWidth, originalHeight,
 width, height, image: {type: "image", data, mimeType}}` or `{kind: "image",
 path, mimeType, attached: false, originalWidth, originalHeight, width, height,
 note}` (`image()` throws `TypeError` with `note` when `attached` is `false`); `write` returns `{path, bytes}`; and `edit` returns
-`{path, replacements, edits}`. Eight nested calls run at once, with
-1024 queued calls; additional calls reject with RangeError. Pending tool
-arguments and results have a separate 128 MiB budget per script; exceeding it
-rejects the call with RangeError. A completed result that cannot fit rejects
-after the operation ran; its error identifies this case, and the operation
-remains in effect. A script awaiting a promise with no
-pending tool call or JavaScript job fails because it has no way to settle.
+`{path, replacements, edits}`. Each script has `8` `exec start` slots and `8`
+file/transcript I/O slots (`read`, `write`, and `edit` hold their slot inside the
+blocking worker until disk I/O finishes; `poll`, `kill`, `list`, and `sleep` take
+no slot), within `1024` pending calls; additional calls reject with `RangeError`.
+Pending tool arguments and results have a separate 128 MiB budget per script;
+exceeding it rejects the call with `RangeError`. A completed result that cannot
+fit rejects after the operation ran; its error identifies this case, and the
+operation remains in effect. A script awaiting a promise with no pending tool
+call, `sleep`, or JavaScript job fails because it has no way to settle.
 
 Calls use the script's session and launch context (with `cwd` overridden when
 the script sets `cwd`). A nested task's reader can be polled by the caller, and
@@ -221,9 +234,13 @@ retirement remove image files and reclaim their quota along with logs.
 
 ### File Tools
 
-- **`read`**: Shows up to `2000` lines and `50` KiB of a text file (`50000`
-  lines and `1` MiB when called from `codemode`), with
-  `offset` (1-indexed line) and `limit` (lines) selecting a window. Line counts
+- **`read`**: Direct calls show up to `2000` lines and `50` KiB of a text file
+  (nested `codemode` calls without `offset` or `limit` return the whole UTF-8
+  file up to `4` MiB or reject with `ToolError` when larger or non-UTF-8, and
+  with `offset` or `limit` read up to `4` MiB with no line cap). `offset` is a
+  non-zero integer (`1`-indexed from the start when positive, or counting from
+  the end when negative with `-1` naming the last line; `0` is rejected) and
+  `limit` (`>= 1`) bounds the number of lines. Directories report `Cannot read <path>: it is a directory; list it with exec.` Line counts
   follow real `\n` / `\r\n` lines (`""` has `totalLines: 0`, `"a\n"` and `"a"`
   have `totalLines: 1`, and `offset: 1` on an empty file returns `""` with
   `startLine: 1`, `endLine: null`, `shownLines: 0`, `truncated: false`), preserving original line
@@ -269,10 +286,14 @@ retirement remove image files and reclaim their quota along with logs.
   sufficiently privileged server to preserve it. Attribute
   lengths are checked again after reading so a concurrent growth cannot be
   saved as a truncated value.
-- **`edit`**: Each `edits[]` entry is `{oldText, newText}`, matched against the
-  original file, not against the result of an earlier entry. Every `oldText`
-  must match at least once (`not_found`), be unique over every start position
-  including overlapping ones (`ambiguous`, reporting `lines` in match order with
+- **`edit`**: Each `edits[]` entry is `{oldText, newText, startLine?, endLine?}`,
+  matched against the original file, not against the result of an earlier entry.
+  When `startLine` and/or `endLine` (`1`-based inclusive LF line bounds;
+  `startLine > endLine` is rejected) are given, only exact or fuzzy candidates
+  whose start line falls within that range match, and `not_found` lists up to
+  `20` out-of-range candidate start lines in `lines`. Every `oldText`
+  must match at least once (`not_found`), be unique over every start position in
+  range including overlapping ones (`ambiguous`, reporting `lines` in match order with
   repeats kept), and not overlap any other matched span (`overlap`, sweeping
   across all overlapping spans rather than only adjacent ones and listing
   partner indices in `with`). `lines` and `with` cap at `20` items (`more`
@@ -414,7 +435,7 @@ omitted on final serialization unless noted as always-present below.
   `ok: false` and `isError: true` while preserving `exitCode` and captured
   output. Warnings stay whole regardless of `maxBytes`.
 - **Background footer**: Appended to `start`, `poll`, `kill`, `transcript`, and
-  `codemode` results (up to `512` bytes and `maxBytes / 4`) naming up to three
+  `codemode` results (up to `512` bytes, outside `maxBytes`) naming up to three
   other tasks this session has addressed, using bare task IDs. HTTP clients
   sharing a token share this scope. Running tasks (or tasks holding processes)
   outside this session appear **at most once per session** as `1 task running
@@ -529,9 +550,15 @@ omitted on final serialization unless noted as always-present below.
 
 ## 5. Bash Launch and Process-Tree Ownership
 
-- **Launch (`src/bash.rs`, `src/process.rs`)**: Runs `bash -l -c`
-  (`loginShell: true`, default) or `bash --noprofile --norc -c`
-  (`loginShell: false`). Commands over `8000` bytes run from a temporary script
+- **Launch (`src/bash.rs`, `src/process.rs`, `src/session.rs`)**: Runs
+  `bash --noprofile --norc -c` (`loginShell: false`, default) on top of a
+  once-per-session login-environment snapshot probed via `bash -l -c 'exec "$0" --fastexec-dump-env' <fastexec>`
+  (`5` s deadline, `1` MiB cap, stripping `PWD`, `OLDPWD`, `SHLVL`, `_`,
+  `SHELLOPTS`, `BASHOPTS`, and session-removed variables; `with_cwd` shares both
+  the bash path and snapshot cache, and probe failure falls back to the raw
+  session environment with a one-time warning), or `bash -l -c`
+  (`loginShell: true`) on the raw session environment to re-source profiles.
+  Commands over `8000` bytes run from a temporary script
   file in the log directory. Both modes set `LANG`/`LC_ALL` (`C.UTF-8`, or
   `en_US.UTF-8` on macOS), `PAGER=cat`, `GIT_PAGER=cat`, `PYTHONUNBUFFERED=1`,
   and `PYTHONIOENCODING=utf-8`; pipe mode also sets `TERM=dumb`, `NO_COLOR=1`,
@@ -710,7 +737,7 @@ omitted on final serialization unless noted as always-present below.
   `FASTEXEC_HTTP_ALLOWED_ORIGINS`, where an entry without a port matches any
   port. This is request Origin validation, not CORS support: browser cross-origin
   preflights and CORS response headers are not provided. HTTP sessions run with
-  the daemon's own environment. The `10` minute inactivity TTL expires idle
+  the daemon's own environment. The `60` minute (`3600` s) inactivity TTL expires idle
   legacy HTTP sessions without bounding their count or memory; principal
   sessions last until the listener stops.
   The HTTP listener admits at most `128` concurrent connections and allows

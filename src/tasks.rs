@@ -42,7 +42,6 @@ impl Limits {
 
     /// A daemon's limits: it serves more than one client and lives longer, so it admits more
     /// tasks and lets finished ones go after a day.
-    #[allow(dead_code)] // the daemon entry point picks it in block 9
     pub const ON: Limits = Limits {
         max_running: 64,
         max_scripts: 8,
@@ -865,7 +864,7 @@ impl Tasks {
         args: StartArgs,
         session: &Session,
         key: String,
-    ) -> Result<Started, String> {
+    ) -> Result<(Started, Option<String>), String> {
         let kill_after_ms = args.kill_after_ms;
         // Admission holds a place against the running limit, so the bash lookup, the file
         // creation, and the spawn below all run without the registry lock.
@@ -883,7 +882,8 @@ impl Tasks {
         };
         let need_input_worker = args.pty || keep_stdin_open || initial_input.is_some();
         let (id, mut pending) = self.admit(false)?;
-        let bash = args.launch.bash()?.to_path_buf();
+        let bash = args.launch.bash()?;
+        let (base_env, _used_snapshot, probe_warning) = args.launch.task_env(&bash, args.login);
         let workers = Workers::new(need_input_worker)
             .map_err(|error| format!("Cannot prepare the task workers: {error}."))?;
         let log_path = self.dir.join(format!("{id}.log"));
@@ -915,7 +915,9 @@ impl Tasks {
             command: &command,
             script,
             cwd: &args.cwd,
-            env: &args.launch,
+            base_env,
+            #[cfg(windows)]
+            used_snapshot: _used_snapshot,
             login: args.login,
             pty: args.pty,
             pipe_stdin,
@@ -1061,7 +1063,7 @@ impl Tasks {
                 ender: workers.ender,
             })
             .unwrap_or_else(|_| unreachable!("prepared waiter worker stopped"));
-        Ok((task, entry, reader))
+        Ok(((task, entry, reader), probe_warning))
     }
 
     pub(crate) fn start_script(
@@ -2587,24 +2589,24 @@ impl Task {
         budget: usize,
         raw: bool,
         clean: bool,
-        line_cut: bool,
+        keep_nul: bool,
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> std::io::Result<Window> {
         if lock(&self.out).evicted {
             return Ok(self.read_evicted(
-                state, truncate, budget, raw, clean, line_cut, encoding, until,
+                state, truncate, budget, raw, clean, keep_nul, encoding, until,
             ));
         }
         match self.read_stored(
-            state, truncate, budget, raw, clean, line_cut, encoding, until,
+            state, truncate, budget, raw, clean, keep_nul, encoding, until,
         ) {
             Ok(window) => Ok(window),
             Err(_) if lock(&self.out).evicted => {
                 // Eviction deleted the log between the flags above and the read. The window is
                 // empty either way, so the half-read state is simply not committed.
                 Ok(self.read_evicted(
-                    state, truncate, budget, raw, clean, line_cut, encoding, until,
+                    state, truncate, budget, raw, clean, keep_nul, encoding, until,
                 ))
             }
             Err(error) => Err(error),
@@ -2622,7 +2624,7 @@ impl Task {
         budget: usize,
         raw: bool,
         clean: bool,
-        line_cut: bool,
+        keep_nul: bool,
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> Window {
@@ -2634,7 +2636,7 @@ impl Task {
             budget,
             raw,
             clean,
-            line_cut,
+            keep_nul,
             encoding,
             source: "log",
         };
@@ -2651,7 +2653,7 @@ impl Task {
         budget: usize,
         raw: bool,
         clean: bool,
-        line_cut: bool,
+        keep_nul: bool,
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> std::io::Result<Window> {
@@ -2674,7 +2676,7 @@ impl Task {
             budget,
             raw,
             clean,
-            line_cut,
+            keep_nul,
             encoding,
             source: "log",
         };
@@ -3137,7 +3139,7 @@ mod tests {
     fn start(tasks: &Arc<Tasks>, args: StartArgs) -> Result<Arc<Task>, String> {
         tasks
             .start(args, &session("test-client"), random_chars(4).unwrap())
-            .map(|(task, _, _)| task)
+            .map(|((task, _, _), _)| task)
     }
 
     fn start_args() -> StartArgs {
@@ -3424,7 +3426,7 @@ mod tests {
         let window = task
             .read_window(
                 &mut state,
-                Truncate::None,
+                Truncate::Head,
                 4096,
                 false,
                 true,
@@ -3434,14 +3436,14 @@ mod tests {
             )
             .expect("an evicted log is not an I/O error");
         // Empty, with no invented line range: the snapshot reports the eviction.
-        assert_eq!(window.fit(usize::MAX).0, "");
+        assert_eq!(window.text, "");
         assert_eq!(window.omitted, None);
         assert_eq!(state.cursor, written, "the cursor moved past the output");
         // A second read has nothing more to move past and stays empty.
         let again = task
             .read_window(
                 &mut state,
-                Truncate::None,
+                Truncate::Head,
                 4096,
                 false,
                 true,
@@ -3450,7 +3452,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(again.fit(usize::MAX).0, "");
+        assert_eq!(again.text, "");
         assert_eq!(state.cursor, written);
         // A legacy encoding takes its own path through the same read.
         assert!(
@@ -3460,7 +3462,7 @@ mod tests {
                 1024,
                 false,
                 true,
-                true,
+                false,
                 encoding_rs::BIG5,
                 None,
             )
@@ -3812,12 +3814,12 @@ mod tests {
                     1024,
                     false,
                     true,
-                    true,
+                    false,
                     encoding_rs::UTF_8,
                     None,
                 )
                 .unwrap();
-            window.fit(1024).0
+            window.text
         };
         let (from_first, from_second) = (read(&first), read(&second));
         assert!(

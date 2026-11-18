@@ -7,11 +7,6 @@ use encoding_rs::Encoding;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-/// Bytes kept per line in bounded windows; the rest of an oversized line is counted, then cut.
-const LINE_BYTES_LIMIT: usize = 64 * 1024;
-/// Characters kept per cleaned line in bounded windows. `Truncate::None` keeps whole lines.
-const LINE_CHARS_LIMIT: usize = 2000;
-
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq,
 )]
@@ -24,8 +19,6 @@ pub enum Truncate {
     Head,
     /// Last lines only.
     Tail,
-    /// Every unseen line whole, up to 4 MiB; the rest is reported as an omitted range.
-    None,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,7 +72,7 @@ impl Cleaner {
     }
 
     /// Cleans one byte: returns whether the line is cleared first, and what the byte does.
-    fn step(&mut self, byte: u8) -> (bool, Step) {
+    fn step(&mut self, byte: u8, keep_nul: bool) -> (bool, Step) {
         if std::mem::take(&mut self.swallow_lf) && byte == b'\n' {
             return (false, Step::SwallowedLf);
         }
@@ -111,6 +104,7 @@ impl Cleaner {
                 Step::Control
             }
             b'\t' => Step::Append,
+            0x00 if keep_nul => Step::Append,
             0x00..=0x1f | 0x7f => Step::Control,
             _ => Step::Append,
         };
@@ -157,7 +151,7 @@ impl Matcher {
     pub fn push(&mut self, bytes: &[u8]) -> Option<usize> {
         for &byte in bytes {
             let (clear, step) = match &mut self.cleaner {
-                Some(cleaner) => cleaner.step(byte),
+                Some(cleaner) => cleaner.step(byte, false),
                 None => (
                     false,
                     if byte == b'\n' {
@@ -233,29 +227,11 @@ impl Matcher {
     }
 }
 
-/// One line ready for the window, with its 1-based log line number.
-#[derive(Clone)]
-struct Line {
-    number: u64,
-    text: String,
-    /// The line lost part of its text to a per-line limit or the budget.
-    cut: bool,
-    /// For `!line_cut` windows, the decoded prefix before any budget-cut marker and the byte
-    /// count dropped after it, so `Window::fit` can re-cut cleanly for a tighter `room`
-    /// without cutting an earlier marker.
-    raw_uncut: Option<(String, usize)>,
-}
-
-impl Line {
-    fn recut_to_budget(&mut self, limit: usize) {
-        let (raw_prefix, raw_dropped) = match &self.raw_uncut {
-            Some((prefix, dropped)) => (prefix.clone(), *dropped),
-            None => (std::mem::take(&mut self.text), 0),
-        };
-        self.text = raw_prefix;
-        self.cut = true;
-        cut_line_to_budget(&mut self.text, limit, raw_dropped);
-    }
+/// One candidate line retained while streaming: its UTF-8 prefix (up to `spec.budget` bytes)
+/// and how many decoded UTF-8 bytes followed that prefix.
+struct Candidate {
+    prefix: String,
+    dropped: usize,
 }
 
 pub struct WindowSpec {
@@ -264,21 +240,15 @@ pub struct WindowSpec {
     pub budget: usize,
     pub raw: bool,
     pub clean: bool,
-    pub line_cut: bool,
+    pub keep_nul: bool,
     pub encoding: &'static Encoding,
     /// What the line numbers count, named in the omission marker: "log" or "transcript".
     pub source: &'static str,
 }
 
 pub struct Window {
-    /// Candidate lines retain their source numbers so final fitting can account for omissions.
-    lines: Vec<Line>,
-    truncate: Truncate,
-    clean: bool,
-    line_cut: bool,
-    /// Budget at which a `!line_cut` line was cut, so `fit` refreshes the marker when `room` shrinks.
-    cut_budget: Option<usize>,
-    source: &'static str,
+    pub text: String,
+    pub cut_lines: u64,
     /// Inclusive line range left out of the window.
     pub omitted: Option<(u64, u64)>,
     /// Lines that held byte sequences invalid in the selected encoding.
@@ -286,134 +256,21 @@ pub struct Window {
     pub encoding: &'static Encoding,
     /// LF bytes consumed, for the caller's line cursor.
     pub newlines: u64,
+    empty: bool,
 }
 
 impl Window {
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty() && self.omitted.is_none()
-    }
-
-    fn marker(&self, omitted: Option<(u64, u64)>) -> String {
-        omitted.map_or(String::new(), |(first, last)| {
-            let count = last - first + 1;
-            format!(
-                "... [{count} lines omitted: {} lines {first}-{last}] ...",
-                self.source
-            )
-        })
-    }
-
-    fn render(&self, marker: &str) -> (String, u64, Option<(u64, u64)>) {
-        let mut lines: Vec<&str> = self.lines.iter().map(|line| line.text.as_str()).collect();
-        if let Some((first, _)) = self.omitted.filter(|_| !marker.is_empty()) {
-            let at = self.lines.partition_point(|line| line.number < first);
-            lines.insert(at, marker);
-        }
-        let cuts = self.lines.iter().filter(|line| line.cut).count() as u64;
-        (lines.join("\n"), cuts, self.omitted)
-    }
-
-    /// Fits the final body using the requested ends, returning its actual omitted range.
-    pub fn fit(&self, room: usize) -> (String, u64, Option<(u64, u64)>) {
-        let full = self.render(&self.marker(self.omitted));
-        if full.0.len() <= room && (self.line_cut || self.cut_budget.is_none_or(|b| b <= room)) {
-            return full;
-        }
-        let mut cleaner = Cleaner::default();
-        let mut builder = WindowBuilder::new(
-            WindowSpec {
-                truncate: if self.truncate == Truncate::None {
-                    Truncate::Head
-                } else {
-                    self.truncate
-                },
-                budget: 0,
-                raw: true,
-                clean: self.clean,
-                line_cut: self.line_cut,
-                encoding: encoding_rs::UTF_8,
-                source: self.source,
-            },
-            &mut cleaner,
-            1,
-        );
-        builder.omitted = self.omitted;
-        // Size the full marker conservatively from the entire range, then prefer actual
-        // endpoint text over a marker when the body is too small to carry both.
-        let mut all = self.omitted;
-        for line in &self.lines {
-            merge_omitted(&mut all, line.number, line.number);
-        }
-        let widest = self.marker(all);
-        let marker_limit = widest.len()
-            + all.map_or(0, |(first, last)| {
-                last.to_string().len() - first.to_string().len()
-            });
-        let first = self.lines.first().map_or(0, |line| line.text.len() + 1);
-        let last = self.lines.last().map_or(0, |line| line.text.len() + 1);
-        let content = match self.truncate {
-            Truncate::Head | Truncate::None => first,
-            Truncate::Tail => last,
-            Truncate::HeadTail if self.lines.len() > 1 => first + last,
-            Truncate::HeadTail => first,
-        };
-        let marker_room = if room >= marker_limit.saturating_add(content) {
-            marker_limit
-        } else if room >= 3_usize.saturating_add(content) {
-            3
-        } else if !self.line_cut && self.truncate == Truncate::HeadTail && self.lines.len() > 1 {
-            if room >= marker_limit.saturating_add(first) {
-                marker_limit
-            } else if room >= 3_usize.saturating_add(first) {
-                3
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        builder.spec.budget = if self.line_cut {
-            if marker_room == 0 {
-                room.saturating_add(1)
-            } else {
-                room - marker_room
-            }
-        } else if marker_room == 0 {
-            room
-        } else {
-            (room - marker_room).saturating_sub(1)
-        };
-        if room == 0 {
-            builder.omitted = all;
-        } else {
-            for line in &self.lines {
-                // The original gap already closed the head. Promoting a later tail line back
-                // into the head could leave a shown line inside the new omitted range.
-                if self.omitted.is_some_and(|(first, _)| line.number > first) {
-                    builder.head_open = false;
-                }
-                builder.place(line.clone());
-            }
-        }
-        let fitted = builder.finish();
-        let marker = if marker_room == 0 {
-            String::new()
-        } else if marker_room == 3 {
-            "...".to_owned()
-        } else {
-            fitted.marker(fitted.omitted)
-        };
-        fitted.render(&marker)
+        self.empty
     }
 }
 
-fn merge_omitted(range: &mut Option<(u64, u64)>, first: u64, last: u64) {
-    *range = Some(range.map_or((first, last), |(old_first, old_last)| {
-        (old_first.min(first), old_last.max(last))
-    }));
+fn format_marker(source: &str, first: u64, last: u64) -> String {
+    let count = last - first + 1;
+    format!("... [{count} lines omitted: {source} lines {first}-{last}] ...")
 }
 
-/// A large program-facing line is decoded in chunks. Only its UTF-8 prefix is retained;
+/// A large line is decoded in chunks. Only its UTF-8 prefix up to `budget` is retained;
 /// the full decoded length accounts for transcoding, invalid bytes and trailing padding.
 struct DecodedLine {
     decoder: encoding_rs::Decoder,
@@ -461,17 +318,16 @@ pub struct WindowBuilder<'a> {
     cleaner: &'a mut Cleaner,
     first_line: u64,
     newlines: u64,
+    total_lines: u64,
     line: Vec<u8>,
-    line_overflow: usize,
     decoded: Option<DecodedLine>,
     trailing_spaces: usize,
     line_started: bool,
-    head: Vec<Line>,
+    head: Vec<Candidate>,
     head_bytes: usize,
     head_open: bool,
-    tail: VecDeque<Line>,
+    tail: VecDeque<Candidate>,
     tail_bytes: usize,
-    omitted: Option<(u64, u64)>,
     bad_lines: u64,
 }
 
@@ -483,8 +339,8 @@ impl<'a> WindowBuilder<'a> {
             cleaner,
             first_line,
             newlines: 0,
+            total_lines: 0,
             line: Vec::new(),
-            line_overflow: 0,
             decoded: None,
             trailing_spaces: 0,
             line_started: false,
@@ -493,7 +349,6 @@ impl<'a> WindowBuilder<'a> {
             head_open: true,
             tail: VecDeque::new(),
             tail_bytes: 0,
-            omitted: None,
             bad_lines: 0,
         }
     }
@@ -516,7 +371,7 @@ impl<'a> WindowBuilder<'a> {
 
     fn raw_byte(&mut self, byte: u8) {
         // Advance the full cleaning state for later windows, ignoring only its rendering decision.
-        let _ = self.cleaner.step(byte);
+        let _ = self.cleaner.step(byte, self.spec.keep_nul);
         if byte == b'\n' {
             self.end_line(true);
         } else {
@@ -525,10 +380,9 @@ impl<'a> WindowBuilder<'a> {
     }
 
     fn clean_byte(&mut self, byte: u8) {
-        let (clear, step) = self.cleaner.step(byte);
+        let (clear, step) = self.cleaner.step(byte, self.spec.keep_nul);
         if clear {
             self.line.clear();
-            self.line_overflow = 0;
             self.decoded = None;
             self.trailing_spaces = 0;
         }
@@ -548,60 +402,46 @@ impl<'a> WindowBuilder<'a> {
         }
     }
 
-    /// The direct per-line cap is in raw bytes. Program-facing lines use the UTF-8 body budget.
-    fn line_limit(&self) -> usize {
-        if self.spec.line_cut {
-            LINE_BYTES_LIMIT
-        } else {
-            self.spec.budget
-        }
-    }
-
     fn append(&mut self, byte: u8) {
         self.line_started = true;
-        if !self.spec.line_cut && self.line.len() == 8192 {
+        if self.line.len() == 8192 {
             self.decoded
                 .get_or_insert_with(|| DecodedLine::new(self.spec.encoding))
                 .push(&self.line, false, self.spec.budget);
             self.line.clear();
         }
-        if !self.spec.line_cut || self.line.len() < LINE_BYTES_LIMIT {
-            self.line.push(byte);
-        } else {
-            self.line_overflow += 1;
-        }
+        self.line.push(byte);
     }
 
     fn end_line(&mut self, terminated: bool) {
-        let number = self.first_line + self.newlines;
         if terminated {
             self.newlines += 1;
         }
-        let mut bytes = std::mem::take(&mut self.line);
-        let overflow = std::mem::take(&mut self.line_overflow);
+        let bytes = std::mem::take(&mut self.line);
         self.line_started = false;
-        if std::mem::take(&mut self.cleaner.continued) && bytes.is_empty() && overflow == 0 {
+        if std::mem::take(&mut self.cleaner.continued) && bytes.is_empty() && self.decoded.is_none()
+        {
             return;
         }
         let trailing_spaces = std::mem::take(&mut self.trailing_spaces);
-        let limit = self.line_limit();
-        let (mut text, mut dropped, had_errors) = if let Some(mut decoded) = self.decoded.take() {
+        let limit = self.spec.budget;
+        let (mut prefix, mut dropped, had_errors) = if let Some(mut decoded) = self.decoded.take() {
             decoded.push(&bytes, true, limit);
             let dropped = decoded.bytes - decoded.prefix.len();
             (decoded.prefix, dropped, decoded.had_errors)
         } else {
-            // A direct bash window retains a raw byte prefix. Do not turn a character split
-            // at the fixed cap into a false encoding error.
-            let suffix = if overflow == 0 {
-                0
-            } else if self.spec.encoding == encoding_rs::UTF_8 {
-                incomplete_utf8_suffix(&bytes)
-            } else {
-                incomplete_legacy_suffix(&bytes, self.spec.encoding)
-            };
-            bytes.truncate(bytes.len() - suffix);
             let (decoded, errors) = self.spec.encoding.decode_without_bom_handling(&bytes);
-            (decoded.into_owned(), overflow + suffix, errors)
+            let mut text = decoded.into_owned();
+            let full = text.len();
+            if full > limit {
+                let mut keep = limit;
+                while !text.is_char_boundary(keep) {
+                    keep -= 1;
+                }
+                text.truncate(keep);
+            }
+            let dropped = full - text.len();
+            (text, dropped, errors)
         };
         if had_errors {
             self.bad_lines += 1;
@@ -609,205 +449,49 @@ impl<'a> WindowBuilder<'a> {
         // Spaces before omitted text are significant. Trim only the actual end of the line,
         // including terminal padding beyond the retained prefix.
         let stored_padding = trailing_spaces.saturating_sub(dropped);
-        text.truncate(text.len() - stored_padding);
+        prefix.truncate(prefix.len() - stored_padding);
         dropped = dropped.saturating_sub(trailing_spaces);
-        let mut cut = dropped > 0;
-        if self.spec.line_cut && !self.spec.raw {
-            let chars = text.chars().count();
-            if chars > LINE_CHARS_LIMIT {
-                cut = true;
-                let cut = text
-                    .char_indices()
-                    .nth(LINE_CHARS_LIMIT)
-                    .map_or(text.len(), |(i, _)| i);
-                text.truncate(cut);
-                text.push_str(&format!(
-                    " … [line cut at {LINE_CHARS_LIMIT} of {chars} chars]"
-                ));
-            }
-        }
-        let raw_uncut = (!self.spec.line_cut && (dropped != 0 || text.len() > limit))
-            .then(|| (text.clone(), dropped));
-        if self.spec.line_cut {
-            if dropped > 0 {
-                text.push_str(&format!(
-                    " … [line cut at {}; {dropped} more bytes]",
-                    brief_bytes(limit)
-                ));
-            }
-        } else if dropped > 0 || text.len() > limit {
-            // Decoded text can also exceed limit when invalid bytes expand to U+FFFD; fit the
-            // kept prefix and the cut marker within limit together on a character boundary.
-            cut = true;
-            cut_line_to_budget(&mut text, limit, dropped);
-        }
-        self.place(Line {
-            number,
-            text,
-            cut,
-            raw_uncut,
-        });
+        self.place(Candidate { prefix, dropped });
     }
 
-    fn place(&mut self, mut line: Line) {
-        let (head_budget, tail_budget) = if self.spec.line_cut {
-            match self.spec.truncate {
-                // A `None` window stores whole lines up to its cap and reports the rest as omitted,
-                // so nothing is buffered past it.
-                Truncate::None => (self.spec.budget.saturating_add(1), 0),
-                Truncate::Head => (self.spec.budget, 0),
-                Truncate::Tail => (0, self.spec.budget),
-                Truncate::HeadTail => {
-                    let first = self.head.first().unwrap_or(&line).text.len() + 1;
-                    let head = (self.spec.budget / 10).max(first.min(self.spec.budget / 2));
-                    (head, self.spec.budget - head)
-                }
-            }
-        } else {
-            // Joined `k` lines occupy `sum(len + 1) - 1 <= budget` iff `sum(len + 1) <= budget + 1`.
-            // When per-line cuts are disabled, a first line that fits the body budget may take up to
-            // all of it without being cut.
-            let total = self.spec.budget.saturating_add(1);
-            match self.spec.truncate {
-                Truncate::None | Truncate::Head => (total, 0),
-                Truncate::Tail => (0, total),
-                Truncate::HeadTail => {
-                    let first = self.head.first().unwrap_or(&line);
-                    let first_cost = if first.cut {
-                        total
-                    } else {
-                        first.text.len() + 1
-                    };
-                    let head = (total / 10).max(first_cost.min(total));
-                    // Once the head closes, the tail can use every byte the head did not use.
-                    (head, total - self.head_bytes)
-                }
-            }
-        };
-        if !self.spec.line_cut {
-            let fits_whole_in = |budget: usize, line: &Line| -> bool {
-                match &line.raw_uncut {
-                    Some((prefix, 0)) => prefix.len() < budget,
-                    Some(_) => false,
-                    None => !line.cut && line.text.len() < budget,
-                }
-            };
-            let restore_whole = |line: &mut Line| {
-                if let Some((prefix, 0)) = &line.raw_uncut {
-                    line.text = prefix.clone();
-                    line.cut = false;
-                }
-            };
-            if self.head_open {
-                if fits_whole_in(head_budget, &line) {
-                    restore_whole(&mut line);
-                    let cost = line.text.len() + 1;
-                    if self.head_bytes + cost <= head_budget {
-                        self.head_bytes += cost;
-                        self.head.push(line);
-                        return;
-                    }
-                }
-                self.head_open = false;
-                if self.head.is_empty() && head_budget > 1 && self.spec.truncate != Truncate::Tail {
-                    if self.spec.truncate != Truncate::None {
-                        line.recut_to_budget(head_budget - 1);
-                    }
-                    if line.cut && line.text.is_empty() {
-                        merge_omitted(&mut self.omitted, line.number, line.number);
-                        return;
-                    }
-                    self.head_bytes += line.text.len() + 1;
-                    self.head.push(line);
-                    return;
-                }
-            }
-            if self.spec.truncate == Truncate::Tail {
-                // An earlier oversized tail line is replaced whole as soon as a later line follows.
-                if self.tail.front().is_some_and(|front| front.cut) {
-                    while let Some(dropped) = self.tail.pop_front() {
-                        merge_omitted(&mut self.omitted, dropped.number, dropped.number);
-                    }
-                    self.tail_bytes = 0;
-                }
-                if !fits_whole_in(tail_budget, &line) {
-                    if tail_budget <= 1 {
-                        merge_omitted(&mut self.omitted, line.number, line.number);
-                        return;
-                    }
-                    line.recut_to_budget(tail_budget - 1);
-                    if line.text.is_empty() {
-                        merge_omitted(&mut self.omitted, line.number, line.number);
-                        return;
-                    }
-                    while let Some(dropped) = self.tail.pop_front() {
-                        merge_omitted(&mut self.omitted, dropped.number, dropped.number);
-                    }
-                    self.tail_bytes = line.text.len() + 1;
-                    self.tail.push_back(line);
-                    return;
-                }
-                restore_whole(&mut line);
-            } else if !fits_whole_in(tail_budget, &line) {
-                while let Some(dropped) = self.tail.pop_front() {
-                    merge_omitted(&mut self.omitted, dropped.number, dropped.number);
-                }
-                self.tail_bytes = 0;
-                merge_omitted(&mut self.omitted, line.number, line.number);
-                return;
-            } else {
-                restore_whole(&mut line);
-            }
-            self.tail_bytes += line.text.len() + 1;
-            self.tail.push_back(line);
-            while self.tail_bytes > tail_budget {
-                let Some(dropped) = self.tail.pop_front() else {
-                    break;
-                };
-                self.tail_bytes -= dropped.text.len() + 1;
-                merge_omitted(&mut self.omitted, dropped.number, dropped.number);
-            }
-            return;
-        }
-        let cost = line.text.len() + 1;
+    fn place(&mut self, cand: Candidate) {
+        self.total_lines += 1;
+        let total = self.spec.budget.saturating_add(1);
         if self.head_open {
-            if self.head_bytes + cost <= head_budget {
-                self.head_bytes += cost;
-                self.head.push(line);
-                return;
+            if cand.dropped == 0 {
+                let cost = cand.prefix.len().saturating_add(1);
+                if self.head_bytes.saturating_add(cost) <= total {
+                    self.head_bytes += cost;
+                    self.head.push(cand);
+                    return;
+                }
             }
             self.head_open = false;
-            // The first line of a bounded window is shown cut rather than left out, so a single
-            // line longer than the whole budget still shows its beginning.
-            if self.head.is_empty() && head_budget > 1 && self.spec.truncate != Truncate::Tail {
-                // A `None` line is already bounded by the cap, with the note that says so.
-                if self.spec.truncate != Truncate::None {
-                    line.cut |= cut_to(&mut line.text, head_budget);
-                }
-                if line.cut && line.text.is_empty() {
-                    merge_omitted(&mut self.omitted, line.number, line.number);
-                    return;
-                }
-                self.head_bytes += line.text.len() + 1;
-                self.head.push(line);
+            if self.head.is_empty() {
+                self.head_bytes = cand.prefix.len().saturating_add(1);
+                self.head.push(cand);
                 return;
             }
         }
-        if line.text.len() + 1 > tail_budget && tail_budget > 0 {
-            line.cut |= cut_to(&mut line.text, tail_budget);
-        }
-        if line.cut && line.text.is_empty() {
-            merge_omitted(&mut self.omitted, line.number, line.number);
+        if self.spec.truncate == Truncate::Head {
             return;
         }
-        self.tail_bytes += line.text.len() + 1;
-        self.tail.push_back(line);
-        while self.tail_bytes > tail_budget {
-            let Some(dropped) = self.tail.pop_front() else {
-                break;
-            };
-            self.tail_bytes -= dropped.text.len() + 1;
-            merge_omitted(&mut self.omitted, dropped.number, dropped.number);
+        if cand.dropped > 0 {
+            self.tail.clear();
+            self.tail_bytes = cand.prefix.len().saturating_add(1);
+            self.tail.push_back(cand);
+            return;
+        }
+        if self.tail.back().is_some_and(|back| back.dropped > 0) {
+            self.tail.clear();
+            self.tail_bytes = 0;
+        }
+        let cost = cand.prefix.len().saturating_add(1);
+        self.tail_bytes = self.tail_bytes.saturating_add(cost);
+        self.tail.push_back(cand);
+        while self.tail.len() > 1 && self.tail_bytes > total {
+            let dropped = self.tail.pop_front().expect("tail has multiple items");
+            self.tail_bytes -= dropped.prefix.len().saturating_add(1);
         }
     }
 
@@ -821,22 +505,271 @@ impl<'a> WindowBuilder<'a> {
             self.end_line(false);
             self.cleaner.continued = true;
         }
-        let mut lines = self.head;
-        lines.extend(self.tail);
-        let cut_budget =
-            (!self.spec.line_cut && lines.iter().any(|line| line.cut)).then_some(self.spec.budget);
+        let budget = self.spec.budget;
+        let empty = self.total_lines == 0;
+        let (text, cut_lines, omitted) = self.assemble();
+        debug_assert!(
+            text.len() <= budget,
+            "window body {} exceeds budget {budget}",
+            text.len()
+        );
         Window {
-            lines,
-            truncate: self.spec.truncate,
-            clean: self.spec.clean,
-            line_cut: self.spec.line_cut,
-            cut_budget,
-            source: self.spec.source,
-            omitted: self.omitted,
+            text,
+            cut_lines,
+            omitted,
             bad_lines: self.bad_lines,
             encoding: self.spec.encoding,
             newlines: self.newlines,
+            empty,
         }
+    }
+
+    fn assemble(&mut self) -> (String, u64, Option<(u64, u64)>) {
+        let budget = self.spec.budget;
+        if self.total_lines == 0 {
+            return (String::new(), 0, None);
+        }
+        if self.head_open {
+            let text = self
+                .head
+                .iter()
+                .map(|cand| cand.prefix.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return (text, 0, None);
+        }
+        let first_num = self.first_line;
+        let last_num = self.first_line + self.total_lines - 1;
+        if self.total_lines == 1 {
+            if budget == 0 {
+                return (String::new(), 0, Some((first_num, first_num)));
+            }
+            let mut text = self.head[0].prefix.clone();
+            cut_line_to_budget(&mut text, budget, self.head[0].dropped);
+            if text.is_empty() {
+                return (String::new(), 0, Some((first_num, first_num)));
+            }
+            return (text, 1, None);
+        }
+
+        let source = self.spec.source;
+        let fallback_all = || {
+            let mut marker = format_marker(source, first_num, last_num);
+            cut_to(&mut marker, budget.saturating_add(1));
+            (marker, 0, Some((first_num, last_num)))
+        };
+
+        if self.spec.truncate == Truncate::Head {
+            let mut head_used = 0usize;
+            let mut h = 0usize;
+            for cand in &self.head {
+                if h as u64 + 1 >= self.total_lines || cand.dropped > 0 {
+                    break;
+                }
+                let next_used = head_used + cand.prefix.len() + 1;
+                let m_len = format_marker(source, first_num + (h + 1) as u64, last_num).len();
+                if next_used + m_len <= budget {
+                    head_used = next_used;
+                    h += 1;
+                } else {
+                    break;
+                }
+            }
+            if h > 0 {
+                let omitted = (first_num + h as u64, last_num);
+                let marker = format_marker(source, omitted.0, omitted.1);
+                let mut lines: Vec<&str> =
+                    self.head[..h].iter().map(|c| c.prefix.as_str()).collect();
+                lines.push(&marker);
+                return (lines.join("\n"), 0, Some(omitted));
+            }
+            let omitted = (first_num + 1, last_num);
+            let marker = format_marker(source, omitted.0, omitted.1);
+            if budget > marker.len() + 1 {
+                let avail = budget - marker.len() - 1;
+                let mut line0 = self.head[0].prefix.clone();
+                cut_line_to_budget(&mut line0, avail, self.head[0].dropped);
+                if !line0.is_empty() {
+                    return (format!("{line0}\n{marker}"), 1, Some(omitted));
+                }
+            }
+            return fallback_all();
+        }
+
+        // Suffix lines after line 0, ordered from the last line backwards.
+        let contiguous = self.head.len() as u64 + self.tail.len() as u64 == self.total_lines;
+        let mut suffix_rev: Vec<&Candidate> = self.tail.iter().rev().collect();
+        if contiguous && self.head.len() > 1 {
+            suffix_rev.extend(self.head[1..].iter().rev());
+        }
+
+        if self.spec.truncate == Truncate::Tail {
+            let mut tail_used = 0usize;
+            let mut t = 0usize;
+            for cand in suffix_rev.iter().copied() {
+                if cand.dropped > 0 {
+                    break;
+                }
+                let next_used = tail_used + cand.prefix.len() + 1;
+                let m_len = format_marker(source, first_num, last_num - (t + 1) as u64).len();
+                if next_used + m_len <= budget {
+                    tail_used = next_used;
+                    t += 1;
+                } else {
+                    break;
+                }
+            }
+            if t > 0 {
+                let omitted = (first_num, last_num - t as u64);
+                let marker = format_marker(source, omitted.0, omitted.1);
+                let mut lines = Vec::with_capacity(t + 1);
+                lines.push(marker.as_str());
+                for cand in suffix_rev[..t].iter().rev() {
+                    lines.push(cand.prefix.as_str());
+                }
+                return (lines.join("\n"), 0, Some(omitted));
+            }
+            let omitted = (first_num, last_num - 1);
+            let marker = format_marker(source, omitted.0, omitted.1);
+            if budget > marker.len() + 1 {
+                let avail = budget - marker.len() - 1;
+                let last_cand = suffix_rev[0];
+                let mut last_text = last_cand.prefix.clone();
+                cut_line_to_budget(&mut last_text, avail, last_cand.dropped);
+                if !last_text.is_empty() {
+                    return (format!("{marker}\n{last_text}"), 1, Some(omitted));
+                }
+            }
+            return fallback_all();
+        }
+
+        // Truncate::HeadTail multi-line overflow (Rule 5).
+        let max_marker_len = format!(
+            "... [{} lines omitted: {source} lines {last_num}-{last_num}] ...",
+            self.total_lines
+        )
+        .len();
+        if budget <= max_marker_len + 2 {
+            return fallback_all();
+        }
+        let head_reserve = budget / 10;
+        let after_marker = budget - max_marker_len;
+        let tail_budget = after_marker.saturating_sub(head_reserve);
+        if tail_budget <= 1 {
+            return fallback_all();
+        }
+
+        let mut tail_kept: Vec<String> = Vec::new();
+        let mut tail_used = 0usize;
+        let mut tail_cuts = 0u64;
+        for cand in suffix_rev.iter().copied() {
+            if cand.dropped > 0 {
+                break;
+            }
+            let cost = cand.prefix.len() + 1;
+            if tail_used + cost <= tail_budget {
+                tail_used += cost;
+                tail_kept.push(cand.prefix.clone());
+            } else {
+                break;
+            }
+        }
+        tail_kept.reverse();
+        if tail_kept.is_empty() {
+            let last_cand = suffix_rev[0];
+            let mut last_text = last_cand.prefix.clone();
+            cut_line_to_budget(&mut last_text, tail_budget - 1, last_cand.dropped);
+            if !last_text.is_empty() {
+                tail_used = last_text.len() + 1;
+                tail_kept.push(last_text);
+                tail_cuts = 1;
+            }
+        }
+
+        let first_tail_num = last_num + 1 - tail_kept.len() as u64;
+        let before_tail = (first_tail_num - first_num) as usize;
+        let mut head_used = 0usize;
+        let mut h = 0usize;
+        for cand in self.head.iter().take(before_tail) {
+            if cand.dropped > 0 {
+                break;
+            }
+            let next_used = head_used + cand.prefix.len() + 1;
+            let rem = before_tail - (h + 1);
+            let fits = if rem == 0 {
+                next_used + tail_used <= budget + 1
+            } else {
+                let m_len =
+                    format_marker(source, first_num + (h + 1) as u64, first_tail_num - 1).len();
+                next_used + m_len + tail_used <= budget
+            };
+            if fits {
+                head_used = next_used;
+                h += 1;
+            } else {
+                break;
+            }
+        }
+
+        if h == before_tail {
+            let mut lines: Vec<&str> = self.head[..h].iter().map(|c| c.prefix.as_str()).collect();
+            lines.extend(tail_kept.iter().map(String::as_str));
+            return (lines.join("\n"), tail_cuts, None);
+        }
+        if h > 0 {
+            let omitted = (first_num + h as u64, first_tail_num - 1);
+            let marker = format_marker(source, omitted.0, omitted.1);
+            let mut lines: Vec<&str> = self.head[..h].iter().map(|c| c.prefix.as_str()).collect();
+            lines.push(&marker);
+            lines.extend(tail_kept.iter().map(String::as_str));
+            return (lines.join("\n"), tail_cuts, Some(omitted));
+        }
+
+        if before_tail == 1 && !tail_kept.is_empty() {
+            let avail = budget.saturating_sub(tail_used);
+            if avail > 0 {
+                let mut line0 = self.head[0].prefix.clone();
+                cut_line_to_budget(&mut line0, avail, self.head[0].dropped);
+                if !line0.is_empty() {
+                    let mut lines = Vec::with_capacity(1 + tail_kept.len());
+                    lines.push(line0.as_str());
+                    lines.extend(tail_kept.iter().map(String::as_str));
+                    return (lines.join("\n"), 1 + tail_cuts, None);
+                }
+            }
+            let marker = format_marker(source, first_num, first_num);
+            if marker.len() + tail_used <= budget {
+                let mut lines = Vec::with_capacity(1 + tail_kept.len());
+                lines.push(marker.as_str());
+                lines.extend(tail_kept.iter().map(String::as_str));
+                return (lines.join("\n"), tail_cuts, Some((first_num, first_num)));
+            }
+            return fallback_all();
+        }
+
+        let omitted = (first_num + 1, first_tail_num - 1);
+        let marker = format_marker(source, omitted.0, omitted.1);
+        if budget > marker.len() + tail_used + 1 {
+            let avail = budget - marker.len() - tail_used - 1;
+            let mut line0 = self.head[0].prefix.clone();
+            cut_line_to_budget(&mut line0, avail, self.head[0].dropped);
+            if !line0.is_empty() {
+                let mut lines = Vec::with_capacity(2 + tail_kept.len());
+                lines.push(line0.as_str());
+                lines.push(marker.as_str());
+                lines.extend(tail_kept.iter().map(String::as_str));
+                return (lines.join("\n"), 1 + tail_cuts, Some(omitted));
+            }
+        }
+        let omitted_all = (first_num, first_tail_num - 1);
+        let marker_all = format_marker(source, omitted_all.0, omitted_all.1);
+        if !tail_kept.is_empty() && marker_all.len() + tail_used <= budget {
+            let mut lines = Vec::with_capacity(1 + tail_kept.len());
+            lines.push(marker_all.as_str());
+            lines.extend(tail_kept.iter().map(String::as_str));
+            return (lines.join("\n"), tail_cuts, Some(omitted_all));
+        }
+        fallback_all()
     }
 }
 
@@ -910,8 +843,8 @@ pub fn cut_to(text: &mut String, budget: usize) -> bool {
     true
 }
 
-/// What a cut line ends with, so a reader knows the rest is elsewhere.
-pub const MARK: &str = " … [cut]";
+/// What a cut line ends with when the full byte-count note cannot fit.
+const MARK: &str = " … [cut]";
 
 /// Length of an incomplete UTF-8 sequence at the end of `tail` (the last 1..=3 bytes).
 pub fn incomplete_utf8_suffix(tail: &[u8]) -> usize {
@@ -953,12 +886,7 @@ pub fn incomplete_legacy_suffix(line: &[u8], encoding: &'static encoding_rs::Enc
 mod tests {
     use super::*;
 
-    /// A budget the fixtures do not mean to bound a `Truncate::None` window with.
-    const UNBOUNDED: usize = usize::MAX;
-
-    fn text(window: &Window) -> String {
-        window.fit(usize::MAX).0
-    }
+    const LARGE_BUDGET: usize = 4 << 20;
 
     fn window(chunks: &[&[u8]], truncate: Truncate, budget: usize, raw: bool) -> Window {
         let mut cleaner = Cleaner::default();
@@ -967,7 +895,7 @@ mod tests {
             budget,
             raw,
             clean: true,
-            line_cut: truncate != Truncate::None,
+            keep_nul: false,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -987,11 +915,11 @@ mod tests {
                 b"2K100%\n",
                 b"\x1b]0;title\x07done",
             ],
-            Truncate::None,
-            UNBOUNDED,
+            Truncate::HeadTail,
+            LARGE_BUDGET,
             false,
         );
-        assert_eq!(text(&out), "ok\n100%\ndone");
+        assert_eq!(out.text, "ok\n100%\ndone");
         assert_eq!(out.newlines, 2);
     }
 
@@ -1005,8 +933,8 @@ mod tests {
             (&b"old\r\x1b[2K\n"[..], ""),
         ] {
             for chunks in [vec![input], input.chunks(1).collect()] {
-                let out = window(&chunks, Truncate::None, UNBOUNDED, false);
-                assert_eq!(text(&out), expected, "{input:?}");
+                let out = window(&chunks, Truncate::HeadTail, LARGE_BUDGET, false);
+                assert_eq!(out.text, expected, "{input:?}");
             }
         }
     }
@@ -1016,26 +944,30 @@ mod tests {
         let input = "中文😀\n".as_bytes();
         let out = window(
             &[&input[..2], &input[2..5], &input[5..]],
-            Truncate::None,
-            UNBOUNDED,
+            Truncate::HeadTail,
+            LARGE_BUDGET,
             false,
         );
-        assert_eq!(text(&out), "中文😀");
+        assert_eq!(out.text, "中文😀");
         assert_eq!(out.bad_lines, 0);
     }
 
     #[test]
     fn raw_mode_keeps_escapes_and_carriage_returns() {
-        let out = window(&[b"\x1b[1mA\r\nB\rC\n"], Truncate::None, UNBOUNDED, true);
-        assert_eq!(text(&out), "\x1b[1mA\r\nB\rC");
-        // A raw window that ends inside a sequence leaves a cleaned window parsing it.
+        let out = window(
+            &[b"\x1b[1mA\r\nB\rC\n"],
+            Truncate::HeadTail,
+            LARGE_BUDGET,
+            true,
+        );
+        assert_eq!(out.text, "\x1b[1mA\r\nB\rC");
         let mut cleaner = Cleaner::default();
         let spec = |raw| WindowSpec {
-            truncate: Truncate::None,
-            budget: UNBOUNDED,
+            truncate: Truncate::HeadTail,
+            budget: LARGE_BUDGET,
             raw,
             clean: true,
-            line_cut: false,
+            keep_nul: false,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -1044,41 +976,65 @@ mod tests {
         first.finish();
         let mut second = WindowBuilder::new(spec(false), &mut cleaner, 1);
         second.push(b"31mRED\n");
-        assert_eq!(text(&second.finish()), "RED");
+        assert_eq!(second.finish().text, "RED");
     }
 
     #[test]
     fn raw_windows_consume_pending_crlf_state() {
         let mut cleaner = Cleaner::default();
         let spec = |raw| WindowSpec {
-            truncate: Truncate::None,
-            budget: UNBOUNDED,
+            truncate: Truncate::HeadTail,
+            budget: LARGE_BUDGET,
             raw,
             clean: true,
-            line_cut: false,
+            keep_nul: false,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
         let mut first = WindowBuilder::new(spec(false), &mut cleaner, 1);
         first.push(b"first\r");
-        assert_eq!(text(&first.finish()), "first");
+        assert_eq!(first.finish().text, "first");
         let mut raw = WindowBuilder::new(spec(true), &mut cleaner, 1);
         raw.push(b"RAW\n");
-        assert_eq!(text(&raw.finish()), "RAW");
+        assert_eq!(raw.finish().text, "RAW");
         let mut last = WindowBuilder::new(spec(false), &mut cleaner, 2);
         last.push(b"\nnext\n");
         let out = last.finish();
-        assert_eq!(text(&out), "\nnext");
+        assert_eq!(out.text, "\nnext");
         assert_eq!(out.newlines, 2);
 
         let mut raw = WindowBuilder::new(spec(true), &mut cleaner, 4);
         raw.push(b"raw\r");
-        assert_eq!(text(&raw.finish()), "raw\r");
+        assert_eq!(raw.finish().text, "raw\r");
         let mut last = WindowBuilder::new(spec(false), &mut cleaner, 4);
         last.push(b"\nnext\n");
         let out = last.finish();
-        assert_eq!(text(&out), "next");
+        assert_eq!(out.text, "next");
         assert_eq!(out.newlines, 2);
+    }
+
+    #[test]
+    fn keep_nul_preserves_nul_only_when_requested() {
+        let sample = b"a b\0c\nd\0";
+        for (keep_nul, expected) in [(false, "a bc\nd"), (true, "a b\0c\nd\0")] {
+            let mut cleaner = Cleaner::default();
+            let mut builder = WindowBuilder::new(
+                WindowSpec {
+                    truncate: Truncate::Head,
+                    budget: LARGE_BUDGET,
+                    raw: false,
+                    clean: true,
+                    keep_nul,
+                    encoding: encoding_rs::UTF_8,
+                    source: "log",
+                },
+                &mut cleaner,
+                1,
+            );
+            builder.push(sample);
+            let out = builder.finish();
+            assert_eq!(out.text, expected, "keep_nul={keep_nul}");
+        }
     }
 
     #[test]
@@ -1091,19 +1047,17 @@ mod tests {
         ] {
             let out = window(&[input.as_bytes()], mode, budget, false);
             let (first, last) = out.omitted.expect("lines must be omitted");
-            let rendered = text(&out);
-            let shown: Vec<&str> = rendered.lines().filter(|l| l.starts_with("line")).collect();
-            assert!(
-                shown.iter().map(|l| l.len() + 1).sum::<usize>() <= budget,
-                "{mode:?}"
-            );
+            assert!(out.text.len() <= budget, "{mode:?}: {}", out.text.len());
+            let shown: Vec<&str> = out.text.lines().filter(|l| l.starts_with("line")).collect();
             assert_eq!(shown.len() as u64 + (last - first + 1), 100, "{mode:?}");
             match mode {
                 Truncate::Head => assert_eq!((shown[0], last), ("line001", 100)),
                 Truncate::Tail => assert_eq!((first, *shown.last().unwrap()), (1, "line100")),
-                _ => assert_eq!((shown[0], *shown.last().unwrap()), ("line001", "line100")),
+                Truncate::HeadTail => {
+                    assert_eq!((shown[0], *shown.last().unwrap()), ("line001", "line100"));
+                }
             }
-            assert!(text(&out).contains(&format!("log lines {first}-{last}")));
+            assert!(out.text.contains(&format!("log lines {first}-{last}")));
         }
     }
 
@@ -1111,28 +1065,27 @@ mod tests {
     fn lines_split_between_windows_yield_no_phantom_lines() {
         let mut cleaner = Cleaner::default();
         let spec = || WindowSpec {
-            truncate: Truncate::None,
-            budget: UNBOUNDED,
+            truncate: Truncate::HeadTail,
+            budget: LARGE_BUDGET,
             raw: false,
             clean: true,
-            line_cut: false,
+            keep_nul: false,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
         let mut first = WindowBuilder::new(spec(), &mut cleaner, 1);
         first.push(b"Password:\r");
-        assert_eq!(text(&first.finish()), "Password:");
+        assert_eq!(first.finish().text, "Password:");
         let mut second = WindowBuilder::new(spec(), &mut cleaner, 1);
         second.push(b"\nnext\n");
         let out = second.finish();
-        assert_eq!(text(&out), "next");
+        assert_eq!(out.text, "next");
         assert_eq!(out.newlines, 2);
     }
 
     #[test]
     fn matcher_finds_text_in_cleaned_output_however_it_is_split() {
         let utf8 = encoding_rs::UTF_8;
-        // Output, needles, encoding, and the needle found.
         type Case<'a> = (&'a [u8], &'a [&'a str], &'static Encoding, Option<usize>);
         let cases: [Case; 9] = [
             (
@@ -1141,11 +1094,9 @@ mod tests {
                 utf8,
                 Some(0),
             ),
-            // Text a carriage return rewrites still counts.
             (b"10%\r50%\r100%\r\x1b[Kdone", &["100%"], utf8, Some(0)),
             (b"Password: ", &["Password: "], utf8, Some(0)),
             (b"SERVER READY", &["server ready"], utf8, None),
-            // Any needle ends the search; the line keeps enough text for the longest one.
             (
                 b"boot\nerror: port in use",
                 &["ready", "error: port"],
@@ -1159,7 +1110,6 @@ mod tests {
                 Some(0),
             ),
             (b"ab\ncd", &["bc"], utf8, None),
-            // A line ending inside a character shows, and matches, the replacement character.
             (b"\xe2\n", &["\u{fffd}"], utf8, Some(0)),
             (b"\xe2", &["\u{fffd}"], utf8, Some(0)),
         ];
@@ -1181,7 +1131,6 @@ mod tests {
                 .or_else(|| bytes.finish());
             assert_eq!(found, expected, "{needles:?} byte by byte");
         }
-        // Across lines, the lowest needle the output holds wins, wherever it stands.
         let needles = ["first".to_string(), "second".to_string()];
         let mut matcher = Matcher::new(&needles, utf8, Some(Cleaner::default()));
         assert_eq!(matcher.push(b"second\nfirst\n"), Some(0));
@@ -1247,128 +1196,101 @@ mod tests {
     }
 
     #[test]
-    fn a_none_window_stops_at_its_cap_and_reports_the_rest() {
-        let lines: Vec<u8> = (0..40)
-            .flat_map(|line| format!("line {line:02}\n").into_bytes())
-            .collect();
-        let out = window(&[&lines], Truncate::None, 100, false);
-        let shown = text(&out);
-        assert!(shown.contains("lines omitted"), "{shown}");
-        assert!(!shown.contains("line 20"), "{shown}");
-        assert!(shown.len() <= 100 + 64, "{} bytes: {shown}", shown.len());
-
-        // A line longer than the whole cap shows its beginning, cut so line + marker fit the cap.
-        let long = format!("{}\n", "x".repeat(200));
-        let out = window(&[long.as_bytes()], Truncate::None, 100, false);
-        let shown = text(&out);
-        assert_eq!(shown.len(), 100, "{shown}");
-        assert!(
-            shown.contains("line cut at 100 bytes; 144 more bytes"),
-            "{shown}"
-        );
-        assert!(out.omitted.is_none(), "{shown}");
-
-        // A valid multibyte line crossing the cap stays valid: the unfinished character at the
-        // cut is dropped rather than decoded into a false encoding error, and line + marker fit.
-        let mut multibyte = "中".repeat(400).into_bytes();
-        multibyte.push(0x0a);
-        let out = window(&[&multibyte], Truncate::None, 100, false);
-        assert_eq!(out.bad_lines, 0);
-        let shown = text(&out);
-        assert!(
-            shown.contains("line cut at 100 bytes; 1146 more bytes"),
-            "{shown}"
-        );
-        assert!(shown.len() <= 100, "{} bytes: {shown}", shown.len());
-
-        // Bytes that are invalid on their own decode to 3-byte replacement characters: the cap
-        // holds on the text too, and the error is still reported.
-        let mut invalid = vec![0x80_u8; 100];
-        invalid.push(0x0a);
-        let out = window(&[&invalid], Truncate::None, 100, false);
-        let shown = text(&out);
-        assert!(shown.contains("line cut at 100 bytes"), "{shown}");
-        assert!(shown.len() <= 100, "{} bytes: {shown}", shown.len());
-        assert_eq!(out.bad_lines, 1);
-    }
-
-    #[test]
-    fn a_small_final_tail_window_keeps_the_actual_last_line() {
-        let lines: Vec<u8> = (1..=50)
-            .flat_map(|line| format!("line{line:03}\n").into_bytes())
-            .collect();
-        let out = window(&[&lines], Truncate::Tail, 256, false);
-        let fitted = out.fit(60);
-        assert!(fitted.0.ends_with("line050"), "{}", fitted.0);
-    }
-
-    #[test]
-    fn final_windows_report_the_lines_they_actually_omit() {
-        let lines: Vec<u8> = (1..=50)
-            .flat_map(|line| format!("line{line:03}\n").into_bytes())
-            .collect();
-        for (mode, expected, omitted) in [
-            (Truncate::Head, "line001\nline002\n...", (3, 50)),
-            (Truncate::Tail, "...\nline049\nline050", (1, 48)),
-            (Truncate::HeadTail, "line001\n...\nline050", (2, 49)),
-        ] {
-            let out = window(&[&lines], mode, 256, false);
-            let fitted = out.fit(21);
-            assert_eq!(fitted.0, expected);
-            assert_eq!(fitted.1, 0);
-            assert_eq!(fitted.2, Some(omitted));
-            for room in 0..=300 {
-                let fitted = out.fit(room);
-                assert!(fitted.0.len() <= room, "{mode:?}, {room}: {}", fitted.0);
-            }
+    fn unified_window_rules_cover_all_five_cases_and_exact_boundaries() {
+        let json_10k = format!("{{\"payload\":\"{}\"}}", "a".repeat(9_986));
+        assert_eq!(json_10k.len(), 10_000);
+        for mode in [Truncate::HeadTail, Truncate::Head, Truncate::Tail] {
+            let out = window(&[json_10k.as_bytes(), b"\n"], mode, 16_384, false);
+            assert_eq!(out.text, json_10k);
+            assert_eq!(out.cut_lines, 0);
+            assert_eq!(out.omitted, None);
         }
-        // None's caller normally does not refit; a finite room still needs truthful omissions.
-        let out = window(&[&lines], Truncate::None, 256, false);
-        let fitted = out.fit(21);
-        assert_eq!(fitted.0, "line001\nline002\n...");
-        assert_eq!(fitted.2, Some((3, 50)));
 
-        for mode in [
-            Truncate::Head,
-            Truncate::Tail,
-            Truncate::HeadTail,
-            Truncate::None,
-        ] {
-            let long = format!("{}\n", "x".repeat(80));
-            let out = window(&[long.as_bytes()], mode, 256, false);
-            let fitted = out.fit(20);
-            assert!(!fitted.0.is_empty(), "{mode:?}");
-            assert!(fitted.0.len() <= 20);
-            assert_eq!(fitted.1, 1);
-            assert_eq!(fitted.2, None);
+        let exact_180 = format!("{}\n", "E".repeat(180));
+        let over_181 = format!("{}\n", "E".repeat(181));
+        for mode in [Truncate::Head, Truncate::Tail, Truncate::HeadTail] {
+            let fit = window(&[exact_180.as_bytes()], mode, 180, false);
+            assert_eq!(fit.text.len(), 180);
+            assert_eq!(fit.cut_lines, 0);
+            assert_eq!(fit.omitted, None);
+
+            let cut = window(&[over_181.as_bytes()], mode, 180, false);
+            assert_eq!(cut.text.len(), 180);
+            assert_eq!(cut.cut_lines, 1);
+            assert_eq!(cut.omitted, None);
+            assert!(cut.text.contains("line cut at 180 bytes;"), "{}", cut.text);
         }
-        let out = window(&["中\n".as_bytes()], Truncate::Tail, 256, false);
-        let fitted = out.fit(1);
-        assert_eq!(fitted.0, "");
-        assert_eq!(fitted.2, Some((1, 1)));
-    }
 
-    #[test]
-    fn fitting_a_window_counts_each_shown_cut_line_once() {
-        let line = format!(
-            "{}
-",
-            "x".repeat(3000)
+        let two_exact = b"aaa\nbbb\n";
+        for mode in [Truncate::Head, Truncate::Tail, Truncate::HeadTail] {
+            let fit = window(&[two_exact], mode, 7, false);
+            assert_eq!(fit.text, "aaa\nbbb");
+            assert_eq!(fit.cut_lines, 0);
+            assert_eq!(fit.omitted, None);
+        }
+
+        let multi_200k = format!("{}\n", "🚀中".repeat(30_000));
+        assert!(multi_200k.len() > 200 * 1024);
+        for mode in [Truncate::Head, Truncate::Tail, Truncate::HeadTail] {
+            let out = window(&[multi_200k.as_bytes()], mode, 16_384, false);
+            assert!(out.text.len() <= 16_384);
+            assert_eq!(out.cut_lines, 1);
+            assert_eq!(out.omitted, None);
+            assert!(out.text.contains("line cut at 16 KiB;"), "{}", out.text);
+        }
+
+        let head_over = format!("{}\nsecond\nthird\n", "H".repeat(300));
+        let out_h = window(&[head_over.as_bytes()], Truncate::Head, 150, false);
+        assert!(out_h.text.len() <= 150);
+        assert_eq!(out_h.cut_lines, 1);
+        assert_eq!(out_h.omitted, Some((2, 3)));
+        assert!(out_h.text.contains("2 lines omitted: log lines 2-3"));
+
+        let tail_over = format!("first\nsecond\n{}\n", "T".repeat(300));
+        let out_t = window(&[tail_over.as_bytes()], Truncate::Tail, 150, false);
+        assert!(out_t.text.len() <= 150);
+        assert_eq!(out_t.cut_lines, 1);
+        assert_eq!(out_t.omitted, Some((1, 2)));
+        assert!(
+            out_t
+                .text
+                .starts_with("... [2 lines omitted: log lines 1-2] ...\n")
         );
-        let out = window(
-            &[
-                line.as_bytes(),
-                b"tail
-",
-            ],
-            Truncate::HeadTail,
-            16_000,
-            false,
+
+        let err_tail = format!("{}\nERROR: final line\n", "x".repeat(20_000));
+        let out_ht = window(&[err_tail.as_bytes()], Truncate::HeadTail, 16_384, false);
+        assert!(out_ht.text.len() <= 16_384);
+        assert!(
+            out_ht.text.ends_with("\nERROR: final line"),
+            "{}",
+            out_ht.text
         );
-        assert_eq!(out.fit(usize::MAX).1, 1, "the 2000-char cap cut one line");
-        let (fitted, cut_lines, _) = out.fit(500);
-        assert!(fitted.len() <= 500 && fitted.ends_with("tail"), "{fitted}");
-        assert_eq!(cut_lines, 1, "a line cut twice still counts once");
+        assert_eq!(out_ht.cut_lines, 1);
+        assert_eq!(out_ht.omitted, None);
+
+        let mid_omit = format!(
+            "{}\n{}\nEND-LINE-IMPORTANT\nRET\n",
+            "x".repeat(20_000),
+            "M".repeat(20_000)
+        );
+        let out_mid = window(&[mid_omit.as_bytes()], Truncate::HeadTail, 16_384, false);
+        assert!(out_mid.text.len() <= 16_384);
+        assert_eq!(out_mid.omitted, Some((2, 2)));
+        assert_eq!(out_mid.cut_lines, 1);
+        assert!(
+            out_mid
+                .text
+                .contains("... [1 lines omitted: log lines 2-2] ...")
+        );
+        assert!(out_mid.text.ends_with("\nEND-LINE-IMPORTANT\nRET"));
+
+        let ret_line = format!("{{\"tail\":\"{}\",\"done\":\"END\"}}", "V".repeat(12_000));
+        let script2 = format!("{}\n{ret_line}\n", "H".repeat(15_000));
+        let out_s2 = window(&[script2.as_bytes()], Truncate::HeadTail, 16_384, false);
+        assert!(out_s2.text.len() <= 16_384);
+        assert!(out_s2.text.ends_with(&format!("\n{ret_line}")));
+        assert_eq!(out_s2.cut_lines, 1);
+        assert_eq!(out_s2.omitted, None);
     }
 
     #[test]
@@ -1382,7 +1304,7 @@ mod tests {
                     budget,
                     raw,
                     clean: true,
-                    line_cut: false,
+                    keep_nul: false,
                     encoding,
                     source: "log",
                 },
@@ -1395,9 +1317,10 @@ mod tests {
         for count in [500, 16000] {
             let mut padded = b"AB".to_vec();
             padded.resize(2 + count, b' ');
+            let trimmed = build(&padded, false, encoding_rs::UTF_8);
             assert_eq!(
-                build(&padded, false, encoding_rs::UTF_8).fit(budget),
-                ("AB".into(), 0, None)
+                (trimmed.text.as_str(), trimmed.cut_lines, trimmed.omitted),
+                ("AB", 0, None)
             );
 
             padded.push(b'Z');
@@ -1418,166 +1341,25 @@ mod tests {
                 ),
             ] {
                 let out = build(line, raw, encoding);
-                for room in [budget, 148] {
-                    let (text, cuts, omitted) = out.fit(room);
-                    let (kept, marker) = text.split_once(" … [").unwrap();
-                    assert!(shown.starts_with(kept));
-                    assert!(kept.len() + 50 > room, "{text}");
-                    assert_eq!(
-                        marker,
-                        format!(
-                            "line cut at {room} bytes; {} more bytes]",
-                            shown.len() - kept.len()
-                        )
-                    );
-                    assert_eq!((cuts, omitted), (1, None));
-                }
+                let (kept, marker) = out.text.split_once(" … [").unwrap();
+                assert!(shown.starts_with(kept));
+                assert!(kept.len() + 50 > budget, "{}", out.text);
+                assert_eq!(
+                    marker,
+                    format!(
+                        "line cut at {budget} bytes; {} more bytes]",
+                        shown.len() - kept.len()
+                    )
+                );
+                assert_eq!((out.cut_lines, out.omitted), (1, None));
             }
         }
 
-        // A large decoded line can end before the raw boundary when the terminal rewrites it.
         let reset = format!("{}\rOK  \n", "x".repeat(16000));
+        let out = build(reset.as_bytes(), false, encoding_rs::UTF_8);
         assert_eq!(
-            build(reset.as_bytes(), false, encoding_rs::UTF_8).fit(budget),
-            ("OK".into(), 0, None)
+            (out.text.as_str(), out.cut_lines, out.omitted),
+            ("OK", 0, None)
         );
-    }
-
-    #[test]
-    fn uncleaned_uncut_windows_preserve_bytes_whole_lines_and_utf8_boundaries() {
-        let build = |chunks: &[&[u8]], truncate: Truncate, budget: usize| {
-            let mut cleaner = Cleaner::default();
-            let mut b = WindowBuilder::new(
-                WindowSpec {
-                    truncate,
-                    budget,
-                    raw: false,
-                    clean: false,
-                    line_cut: false,
-                    encoding: encoding_rs::UTF_8,
-                    source: "log",
-                },
-                &mut cleaner,
-                1,
-            );
-            for chunk in chunks {
-                b.push(chunk);
-            }
-            b.finish()
-        };
-
-        // P0-1: no ANSI stripping, CR collapsing, trailing-space trim, or 2000-char cut.
-        let raw_sample = format!("first\rsecond  \n\x1b[32m{}\x1b[0m  \n", "a".repeat(10_000));
-        let out = build(&[raw_sample.as_bytes()], Truncate::HeadTail, 16_384);
-        let (rendered, cuts, omitted) = out.fit(16_384);
-        assert_eq!(cuts, 0);
-        assert_eq!(omitted, None);
-        assert_eq!(format!("{rendered}\n"), raw_sample);
-
-        // Placement: a first line between half and all of the budget stays whole; non-fitting
-        // later lines are omitted whole rather than clipped.
-        let first_800 = "J".repeat(800);
-        let second_500 = "K".repeat(500);
-        let two = format!("{first_800}\n{second_500}\n");
-        let out = build(&[two.as_bytes()], Truncate::HeadTail, 1000);
-        let (rendered, cuts, omitted) = out.fit(950);
-        assert!(rendered.len() <= 950, "{}", rendered.len());
-        assert!(rendered.starts_with(&first_800), "{rendered}");
-        assert!(!rendered.contains(&second_500));
-        assert_eq!(cuts, 0);
-        assert_eq!(omitted, Some((2, 2)));
-
-        // The tail gets unused head space. An uneven result that fits in full is never clipped.
-        let whole = format!("x\n{}\ny", "Z".repeat(996));
-        let out = build(&[whole.as_bytes()], Truncate::HeadTail, 1000);
-        assert_eq!(out.fit(1000), (whole, 0, None));
-
-        let separated = format!(
-            "line1\n{}\nline3\n{}\nline5",
-            "x".repeat(2000),
-            "M".repeat(850)
-        );
-        let out = build(&[separated.as_bytes()], Truncate::HeadTail, 1000);
-        let (refit, _, omitted) = out.fit(800);
-        assert_eq!(omitted, Some((2, 4)), "{refit}");
-        assert!(
-            !refit.contains("line3") && refit.starts_with("line1\n") && refit.ends_with("\nline5"),
-            "{refit}"
-        );
-
-        // Exact-budget single line stays whole (no off-by-one premature cut) across all modes.
-        let exact_180 = format!("{}\n", "E".repeat(180));
-        for mode in [
-            Truncate::Head,
-            Truncate::Tail,
-            Truncate::HeadTail,
-            Truncate::None,
-        ] {
-            let out = build(&[exact_180.as_bytes()], mode, 180);
-            let (rendered, cuts, omitted) = out.fit(180);
-            assert_eq!(rendered.len(), 180, "{mode:?}");
-            assert_eq!(cuts, 0, "{mode:?}: {rendered}");
-            assert_eq!(omitted, None, "{mode:?}");
-        }
-
-        // HeadTail omits an oversized middle line while keeping fitting head and tail whole.
-        let sandwiched = format!("header\n{}\nfooter\n", "M".repeat(5_000));
-        let out = build(&[sandwiched.as_bytes()], Truncate::HeadTail, 200);
-        let (rendered, cuts, omitted) = out.fit(200);
-        assert!(
-            rendered.starts_with("header\n") && rendered.ends_with("\nfooter"),
-            "{rendered}"
-        );
-        assert_eq!(cuts, 0, "{rendered}");
-        assert_eq!(omitted, Some((2, 2)));
-
-        // Refitting an already budget-cut line to a tighter room re-cuts from the raw prefix
-        // instead of slicing inside the earlier marker or appending a second " … [cut]".
-        let over_300 = format!("{}\n", "R".repeat(300));
-        for mode in [Truncate::Head, Truncate::Tail, Truncate::HeadTail] {
-            let out = build(&[over_300.as_bytes()], mode, 256);
-            for room in [245_usize, 200, 120] {
-                let (refit, cuts, _) = out.fit(room);
-                assert_eq!(refit.len(), room, "{mode:?} room={room}: {refit}");
-                assert_eq!(cuts, 1, "{mode:?} room={room}");
-                assert!(
-                    refit.contains(&format!(" … [line cut at {room} bytes; ")),
-                    "{mode:?} room={room}: {refit}"
-                );
-                assert_eq!(refit.matches("line cut at ").count(), 1, "{refit}");
-                assert!(!refit.contains(" … [cut]"), "double-cut marker in {refit}");
-                let kept_r = refit.bytes().take_while(|&b| b == b'R').count();
-                let expected_dropped = 300 - kept_r;
-                assert!(
-                    refit.ends_with(&format!("{expected_dropped} more bytes]")),
-                    "{mode:?} room={room}: {refit}"
-                );
-            }
-        }
-
-        // A line longer than the budget fits with its marker inside the budget across all
-        // modes and never splits a multi-byte UTF-8 character.
-        let multi = format!("{}\n", "🚀中".repeat(200));
-        for mode in [
-            Truncate::Head,
-            Truncate::Tail,
-            Truncate::HeadTail,
-            Truncate::None,
-        ] {
-            let out = build(&[multi.as_bytes()], mode, 180);
-            let (rendered, cuts, _) = out.fit(180);
-            assert!(
-                rendered.len() <= 180,
-                "{mode:?}: {} > 180: {rendered}",
-                rendered.len()
-            );
-            assert_eq!(cuts, 1, "{mode:?}");
-            assert!(rendered.contains("line cut at "), "{mode:?}: {rendered}");
-            for room in 1..=200 {
-                let (refit, _, _) = out.fit(room);
-                assert!(refit.len() <= room, "{mode:?} room={room}: {}", refit.len());
-                assert!(refit.matches("line cut at ").count() <= 1, "{refit}");
-            }
-        }
     }
 }

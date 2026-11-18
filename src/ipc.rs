@@ -1,7 +1,5 @@
 //! The wire between an endpoint and the daemon: length-prefixed JSON frames and the messages they
-//! carry. This module is the format alone; the socket block wires it up, and until then only the
-//! tests below use it.
-#![cfg_attr(not(test), allow(dead_code))]
+//! carry.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

@@ -22,7 +22,6 @@ impl Server {
             "FASTEXEC_YOLO",
             "FASTEXEC_TEST_RUNTIME_DIR",
             "FASTEXEC_TEST_TOTAL_LOG_LIMIT",
-            "FASTEXEC_TEST_NONE_LIMIT",
         ] {
             command.env_remove(name);
         }
