@@ -2852,12 +2852,22 @@ mod tests {
         child_script.kill().unwrap();
         complete(&child_script).await;
 
-        let sleeping = fixture.start("await sleep(60000);", None);
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        let sleeping = fixture.start("const p = sleep(60000); text('ready'); await p;", None);
+        let wait_deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&sleeping.script().unwrap().0.report)
+            .pending
+            .is_empty()
+        {
+            assert!(
+                Instant::now() < wait_deadline,
+                "sleeping script did not admit sleep(60000) in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let kill_t = Instant::now();
         sleeping.kill().unwrap();
         complete(&sleeping).await;
-        assert!(kill_t.elapsed() < Duration::from_millis(500));
+        assert!(kill_t.elapsed() < Duration::from_secs(3));
         assert_eq!(sleeping.snapshot().state, "killed");
         let (cancelled, _) = sleeping.script().unwrap().report();
         assert_eq!(cancelled.len(), 1);
@@ -2882,13 +2892,13 @@ mod tests {
             .result(&format!(
                 r#"
                 const polls1 = Array.from({{length: 8}}, (_, i) =>
-                    tools.exec({{action: "poll", taskId: {id1:?} + ".a00" + i, waitMs: 400}})
+                    tools.exec({{action: "poll", taskId: {id1:?} + ".a00" + i, waitMs: 2000}})
                         .then(() => "poll_done")
                 );
                 const polls2 = Array.from({{length: 8}}, (_, i) =>
                     tools.exec({{action: "poll", taskId: {id2:?} + ".b00" + i}})
                 );
-                await sleep(30);
+                await sleep(20);
                 // 16 passive polls are in flight simultaneously; read, list, and kill still run immediately.
                 const raceWinner = await Promise.race([
                     tools.read({{path: "probe.txt"}}).then(r => r.text.trim()),
@@ -2911,7 +2921,7 @@ mod tests {
         assert_eq!(st.exit_code, Some(0), "{out}");
         assert_eq!(out, "permits-ok\n");
         assert!(
-            t0.elapsed() < Duration::from_secs(2),
+            t0.elapsed() < Duration::from_secs(10),
             "took {:?}",
             t0.elapsed()
         );

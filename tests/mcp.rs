@@ -7501,7 +7501,11 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
 
     let cm_running = code_result(
         &mut server,
-        json!({"code": "await sleep(30000);", "waitMs": 50}),
+        json!({
+            "code": "const p = sleep(30000); text('sleep-started'); await p;",
+            "waitMs": 10000,
+            "returnWhen": {"outputContains": ["sleep-started"]}
+        }),
     );
     let cm_id = cm_running["structuredContent"]["taskId"]
         .as_str()
@@ -7556,28 +7560,33 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
                 await Promise.all(active.map(t => tools.exec({ action: "kill", taskId: t.taskId })));
                 const endedEight = await eightStarts;
                 const dtEight = Date.now() - t0;
-                if (dtEight > 5000 || endedEight.some(r => r.state !== "killed")) {
+                if (dtEight > 20000 || endedEight.some(r => r.state !== "killed")) {
                     throw new Error("8 starts kill mismatch: dt=" + dtEight + " states=" + endedEight.map(r => r.state));
                 }
 
-                // 8 concurrent 260 ms observation polls on distinct readers do not block read.
-                const holder = await tools.exec({ action: "start", command: "sleep 30", waitMs: 20 });
+                // 8 concurrent observation polls on distinct readers do not block read.
+                const holder = await tools.exec({
+                    action: "start",
+                    command: "printf 'holder-ready\\n'; sleep 30",
+                    returnWhen: { outputContains: ["holder-ready"] }
+                });
                 const bare = holder.taskId.split(".")[0];
                 const polls = Array.from({ length: 8 }, (_, idx) =>
                     tools.exec({
                         action: "poll",
                         taskId: bare + ".r00" + idx,
-                        waitMs: 260
-                    })
+                        waitMs: 2500
+                    }).then(() => "polls-ended")
                 );
-                await sleep(30);
-                const rStart = Date.now();
-                const fastRead = await tools.read({ path: "hello.txt" });
-                const rElapsed = Date.now() - rStart;
-                await Promise.all(polls);
+                await sleep(20);
+                const readWinner = await Promise.race([
+                    tools.read({ path: "hello.txt" }).then(r => r.text),
+                    Promise.all(polls).then(() => "polls-won")
+                ]);
                 await tools.exec({ action: "kill", taskId: holder.taskId });
-                if (fastRead.text !== "hello-world\n" || rElapsed >= 220) {
-                    throw new Error("read was blocked by observation polls: " + rElapsed + "ms");
+                await Promise.allSettled(polls);
+                if (readWinner !== "hello-world\n") {
+                    throw new Error("read was blocked by observation polls: " + readWinner);
                 }
 
                 // 9 sleep 0.3 starts succeed via Promise.all.

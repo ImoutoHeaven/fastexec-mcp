@@ -6293,21 +6293,23 @@ mod tests {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let write_launch = Arc::clone(&launch);
         let write_path = path.display().to_string();
-        let handle = tokio::spawn(async move {
-            write_nested(
-                WriteRequest {
-                    path: write_path,
-                    content: "updated\n".into(),
-                },
-                write_launch,
-                render,
-                permit,
-            )
-            .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        handle.abort();
-        let _ = handle.await;
+        let mut fut = Box::pin(write_nested(
+            WriteRequest {
+                path: write_path,
+                content: "updated\n".into(),
+            },
+            write_launch,
+            render,
+            permit,
+        ));
+        let polled_once =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_pending()))
+                .await;
+        assert!(
+            polled_once,
+            "write_nested must be pending while MUTATION is held"
+        );
+        drop(fut);
         assert_eq!(
             semaphore.available_permits(),
             0,
