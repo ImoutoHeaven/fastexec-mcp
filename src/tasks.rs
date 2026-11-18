@@ -1650,7 +1650,9 @@ fn wait_task(job: WaitWork) {
     }
     // A process listing can miss a fork while the parent disappears. Keep the input and
     // lifetime alive while the ender independently waits for the operating system's proof.
-    let (confirmed, completion) = (preserve && !kept).then(mpsc::channel).unzip();
+    let (confirmed, completion) = (preserve && leftovers.is_empty())
+        .then(mpsc::channel)
+        .unzip();
     ender
         .send(EndWork {
             confirmed,

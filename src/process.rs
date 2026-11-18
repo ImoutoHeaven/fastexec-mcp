@@ -186,6 +186,8 @@ impl Child {
             std::thread::sleep(pause);
             pause = (pause * 2).min(std::time::Duration::from_millis(500));
         }
+        // No more member queries need the original root identity once the tree ends.
+        *lock(&tree.root) = None;
         true
     }
 }
@@ -1189,7 +1191,6 @@ mod host_end_tests {
     }
 }
 
-#[cfg(unix)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -1233,6 +1234,9 @@ enum TreeState {
 pub struct Tree {
     #[cfg(windows)]
     job: std::os::windows::io::OwnedHandle,
+    /// The original root identity stays queryable by every observer until the tree ends.
+    #[cfg(windows)]
+    root: std::sync::Mutex<Option<std::os::windows::io::OwnedHandle>>,
     /// The task host: session leader, process group leader, and Linux/FreeBSD reaper that
     /// adopts every orphan of the tree. macOS never names it: the host answers instead.
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -1298,7 +1302,15 @@ impl Tree {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            windows::job_members(self.job.as_raw_handle())
+            use windows_sys::Win32::System::Threading::GetProcessId;
+            let held = lock(&self.root);
+            let Some(process) = held.as_ref() else {
+                return Some(Vec::new());
+            };
+            let handle = process.as_raw_handle();
+            // SAFETY: the held handle keeps this root's PID reserved during the query.
+            let pid = unsafe { GetProcessId(handle) };
+            windows::job_members(self.job.as_raw_handle(), Some((pid, handle)))
         }
         #[cfg(unix)]
         {
@@ -1329,7 +1341,13 @@ impl Tree {
 
     #[cfg(windows)]
     pub(crate) fn adopt(process: std::os::windows::io::RawHandle) -> std::io::Result<Tree> {
-        windows::kill_on_close_job(process).map(|job| Tree { job })
+        use std::os::windows::io::BorrowedHandle;
+        // SAFETY: the caller owns the process handle for the duration of adoption.
+        let root = unsafe { BorrowedHandle::borrow_raw(process) }.try_clone_to_owned()?;
+        Ok(Tree {
+            job: windows::kill_on_close_job(process)?,
+            root: std::sync::Mutex::new(Some(root)),
+        })
     }
 }
 
@@ -1410,21 +1428,22 @@ mod windows {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, GetLastError, INVALID_HANDLE_VALUE,
-        WAIT_OBJECT_0,
+        STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
-        JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-        SetInformationJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        QueryFullProcessImageNameW, ResumeThread, THREAD_SUSPEND_RESUME, WaitForSingleObject,
+        GetExitCodeProcess, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, ResumeThread, THREAD_SUSPEND_RESUME,
+        WaitForSingleObject,
     };
 
     /// Creates a job that terminates its processes when its last handle closes, and assigns
@@ -1458,7 +1477,7 @@ mod windows {
 
     /// The live processes of a job, without console hosts or exited processes. A failed or
     /// incomplete query stays unknown; a process this user may not query counts, named ?.
-    pub fn job_members(job: RawHandle) -> Option<Vec<Member>> {
+    pub fn job_members(job: RawHandle, root: Option<(u32, RawHandle)>) -> Option<Vec<Member>> {
         let accounting = || {
             let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
             // SAFETY: info has the layout and size requested for this job query.
@@ -1492,37 +1511,61 @@ mod windows {
                 }
             })
         };
-        collect_job_members(accounting, ids, live_name)
+        collect_job_members(accounting, ids, |pid| {
+            if let Some((root_pid, handle)) = root
+                && root_pid == pid
+            {
+                inspect_member(job, handle, true)
+            } else {
+                job_process(job, pid)
+            }
+        })
     }
 
     fn collect_job_members(
         mut accounting: impl FnMut() -> Option<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>,
-        ids: impl FnOnce() -> Option<Vec<u32>>,
-        mut live_name: impl FnMut(u32) -> Option<String>,
+        mut ids: impl FnMut() -> Option<Vec<u32>>,
+        mut inspect: impl FnMut(u32) -> JobProcess,
     ) -> Option<Vec<Member>> {
         let before = accounting()?;
         if before.ActiveProcesses == 0 {
             return Some(Vec::new());
         }
-        let ids = ids()?;
-        if ids.is_empty() {
+        let mut live = Vec::new();
+        let mut unknown = Vec::new();
+        let initial = ids()?;
+        let mut uncovered = false;
+        for &pid in &initial {
+            match inspect(pid) {
+                JobProcess::Named(name) => live.push(Member { pid, name }),
+                JobProcess::Unknown => unknown.push(pid),
+                JobProcess::Gone => {}
+            }
+        }
+        if !unknown.is_empty() {
+            let mut current: std::collections::HashSet<u32> = ids()?.into_iter().collect();
+            live.extend(
+                unknown
+                    .into_iter()
+                    .filter(|pid| current.contains(pid))
+                    .map(|pid| Member {
+                        pid,
+                        name: "?".into(),
+                    }),
+            );
+            for pid in initial {
+                current.remove(&pid);
+            }
+            uncovered = !current.is_empty();
+        }
+        // A process may exit while we read its image, or a parent may fork after the PID list.
+        // Zero active members is authoritative even when an earlier PID could not be inspected.
+        let after = accounting()?;
+        if after.ActiveProcesses == 0 {
             return Some(Vec::new());
         }
-        let live: Vec<Member> = ids
-            .into_iter()
-            .filter_map(|pid| {
-                let name = live_name(pid)?;
-                (!name.eq_ignore_ascii_case("conhost.exe")).then_some(Member { pid, name })
-            })
-            .collect();
-        if live.is_empty() {
-            // A disappearing parent may have started a successor after the PID list was read.
-            // Terminated IDs can stay in the job while a process handle is held. The lifetime
-            // count distinguishes those stale entries from a newly admitted process.
-            let after = accounting()?;
-            if after.ActiveProcesses != 0 && after.TotalProcesses != before.TotalProcesses {
-                return None;
-            }
+        if live.is_empty() && (uncovered || after.TotalProcesses != before.TotalProcesses) {
+            return None;
         }
         Some(live)
     }
@@ -1565,36 +1608,86 @@ mod windows {
         None
     }
 
-    /// The file name of a process's image, `?` when it cannot be read, or `None` when the
-    /// process has exited or is gone.
-    fn live_name(pid: u32) -> Option<String> {
-        // SAFETY: the handle is checked and closed; the buffers outlive the calls.
+    enum JobProcess {
+        Gone,
+        Named(String),
+        Unknown,
+    }
+
+    fn job_process(job: RawHandle, pid: u32) -> JobProcess {
+        // SAFETY: every successful OpenProcess handle is owned and closed in this function.
         unsafe {
-            let process = OpenProcess(
+            let mut raw = OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
                 0,
                 pid,
             );
-            if process.is_null() {
-                // An ID no process has any more is an invalid parameter.
-                return (GetLastError() != ERROR_INVALID_PARAMETER).then(|| "?".into());
+            let can_wait = !raw.is_null();
+            if !can_wait && GetLastError() != ERROR_INVALID_PARAMETER {
+                // Query rights alone may still expose the exit code and job membership.
+                raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             }
-            // A terminated process may return 259 (STILL_ACTIVE) as its actual exit code.
-            let exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
-            // The longest path Windows supports.
+            if raw.is_null() {
+                if GetLastError() == ERROR_INVALID_PARAMETER {
+                    return JobProcess::Gone;
+                }
+                // A process may allow waiting without granting image or exit-code queries.
+                let raw = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+                if raw.is_null() {
+                    return if GetLastError() == ERROR_INVALID_PARAMETER {
+                        JobProcess::Gone
+                    } else {
+                        JobProcess::Unknown
+                    };
+                }
+                let process = OwnedHandle::from_raw_handle(raw);
+                return if WaitForSingleObject(process.as_raw_handle(), 0) == WAIT_OBJECT_0 {
+                    JobProcess::Gone
+                } else {
+                    JobProcess::Unknown
+                };
+            }
+            let process = OwnedHandle::from_raw_handle(raw);
+            inspect_member(job, process.as_raw_handle(), can_wait)
+        }
+    }
+
+    fn inspect_member(job: RawHandle, process: RawHandle, can_wait: bool) -> JobProcess {
+        // SAFETY: both handles remain open and each buffer lives through its call.
+        unsafe {
+            if can_wait && WaitForSingleObject(process, 0) == WAIT_OBJECT_0 {
+                return JobProcess::Gone;
+            }
+            let mut in_job = 0;
+            let membership_known = IsProcessInJob(process, job, &mut in_job) != 0;
+            if membership_known && in_job == 0 {
+                return JobProcess::Gone;
+            }
             let mut buffer = vec![0_u16; 32_768];
             let mut size = buffer.len() as u32;
-            let named = !exited
+            let named = membership_known
                 && QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) != 0;
-            CloseHandle(process);
-            if exited {
-                return None;
+            // Inspect termination after the image lookup. A normal exit code can be available
+            // during teardown; 259 is also a valid final code, so only a wait resolves it.
+            let mut code = 0;
+            if GetExitCodeProcess(process, &mut code) != 0 && code != STILL_ACTIVE as u32 {
+                return JobProcess::Gone;
             }
-            if !named {
-                return Some("?".into());
+            let waited = can_wait.then(|| WaitForSingleObject(process, 0));
+            if waited == Some(WAIT_OBJECT_0) {
+                return JobProcess::Gone;
             }
-            let path = String::from_utf16_lossy(&buffer[..size as usize]);
-            Some(path.rsplit('\\').next().unwrap_or(&path).to_string())
+            if named {
+                let path = String::from_utf16_lossy(&buffer[..size as usize]);
+                let name = path.rsplit('\\').next().unwrap_or(&path);
+                if name.eq_ignore_ascii_case("conhost.exe") {
+                    return JobProcess::Gone;
+                }
+                if waited == Some(WAIT_TIMEOUT) {
+                    return JobProcess::Named(name.to_owned());
+                }
+            }
+            JobProcess::Unknown
         }
     }
 
@@ -1665,25 +1758,53 @@ mod windows {
 
         #[test]
         fn a_failed_job_query_is_unknown_and_an_empty_job_is_complete() {
-            assert!(job_members(INVALID_HANDLE_VALUE).is_none());
+            assert!(job_members(INVALID_HANDLE_VALUE, None).is_none());
             // SAFETY: null arguments create an unnamed job owned by this test.
             let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             assert!(!raw.is_null());
             let job = unsafe { OwnedHandle::from_raw_handle(raw) };
-            assert!(job_members(job.as_raw_handle()).unwrap().is_empty());
+            assert!(job_members(job.as_raw_handle(), None).unwrap().is_empty());
             assert!(job_pids(|_, _| Err(ERROR_INVALID_PARAMETER)).is_none());
             assert_eq!(job_pids(|_, _| Ok(())), Some(Vec::new()));
         }
 
         #[test]
         fn a_terminated_process_with_exit_code_259_is_not_a_live_member() {
-            let mut child = std::process::Command::new("cmd.exe")
-                .args(["/d", "/c", "exit 259"])
-                .spawn()
-                .unwrap();
-            assert_eq!(child.wait().unwrap().code(), Some(259));
-            assert!(live_name(child.id()).is_none());
-            assert!(!crate::process::is_alive(child.id()));
+            use std::os::windows::process::CommandExt;
+            use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+            for code in [0, 3, 259] {
+                let mut child = std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", &format!("exit {code}")])
+                    .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)
+                    .spawn()
+                    .unwrap();
+                let handle = child.as_raw_handle();
+                let owned_job = kill_on_close_job(handle).unwrap_or_else(|error| {
+                    let _ = child.kill();
+                    panic!("assign child to job: {error}")
+                });
+                let job = owned_job.as_raw_handle();
+                let root = Some((child.id(), handle));
+                assert!(matches!(
+                    job_process(job, std::process::id()),
+                    JobProcess::Gone
+                ));
+                assert!(
+                    job_members(job, root)
+                        .unwrap()
+                        .iter()
+                        .any(|member| member.pid == child.id())
+                );
+                resume_threads(child.id()).unwrap();
+                assert_eq!(child.wait().unwrap().code(), Some(code));
+                assert!(matches!(
+                    inspect_member(job, handle, true),
+                    JobProcess::Gone
+                ));
+                assert!(job_members(job, root).unwrap().is_empty());
+                assert!(job_members(job, None).unwrap().is_empty());
+                assert!(!crate::process::is_alive(child.id()));
+            }
         }
 
         #[test]
@@ -1703,9 +1824,38 @@ mod windows {
                 let members = collect_job_members(
                     || samples.next().unwrap(),
                     || Some(vec![21, 22]),
-                    |pid| (pid == 22).then(|| "conhost.exe".into()),
+                    |_| JobProcess::Gone,
                 );
                 assert_eq!(members.map(|members| members.len()), empty.then_some(0));
+            }
+        }
+
+        #[test]
+        fn an_unidentified_job_entry_needs_current_job_evidence() {
+            let info = |active| {
+                Some(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+                    TotalProcesses: 2,
+                    ActiveProcesses: active,
+                    ..Default::default()
+                })
+            };
+            for (current, active, expected) in [
+                (vec![20], 0, Some(0)),
+                (vec![21], 1, None),
+                (vec![], 1, Some(0)),
+                (vec![20], 1, Some(1)),
+            ] {
+                let mut samples = [info(2), info(active)].into_iter();
+                let mut lists = [vec![20], current].into_iter();
+                let members = collect_job_members(
+                    || samples.next().unwrap(),
+                    || lists.next(),
+                    |_| JobProcess::Unknown,
+                );
+                assert_eq!(members.as_ref().map(Vec::len), expected);
+                if expected == Some(1) {
+                    assert_eq!(members.unwrap()[0].name, "?");
+                }
             }
         }
 
