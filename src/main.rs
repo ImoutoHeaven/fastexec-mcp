@@ -2447,10 +2447,10 @@ mod instructions_file_tests {
             "{dir_err}"
         );
 
-        let nul_path = dir.0.join("nul.txt");
+        let nul_path = dir.0.join("has-nul.txt");
         std::fs::write(&nul_path, b"hello\0world").unwrap();
-        let nul_err =
-            instructions_file(&launch_with(&dir.0, Some(OsString::from("nul.txt")))).unwrap_err();
+        let nul_err = instructions_file(&launch_with(&dir.0, Some(OsString::from("has-nul.txt"))))
+            .unwrap_err();
         assert!(nul_err.ends_with(" contains a NUL byte"), "{nul_err}");
 
         let bad_utf8 = dir.0.join("bad.txt");
