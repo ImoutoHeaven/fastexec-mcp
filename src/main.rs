@@ -1260,6 +1260,26 @@ async fn within<T>(
     }
 }
 
+/// A separate thread keeps stalled file I/O from holding up Tokio runtime shutdown.
+async fn blocking_within<T: Send + 'static>(
+    deadline: std::time::Instant,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    within(deadline, async move {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("instructions-check".into())
+            .spawn(move || {
+                let _ = send.send(work());
+            })
+            .map_err(|error| format!("cannot start instructions check: {error}"))?;
+        receive
+            .await
+            .map_err(|error| format!("instructions check did not finish: {error}"))?
+    })
+    .await
+}
+
 async fn cli_start(
     identity: &runtime::Identity,
     paths: &runtime::Paths,
@@ -1314,11 +1334,14 @@ async fn cli_start(
         extra.push("--idle-exit".into());
         extra.push(if idle_exit { "on" } else { "off" }.into());
     }
-    let (mut client, lock) = match connect_existing(paths).await {
+    let (mut client, lock) = match within(deadline, connect_existing(paths)).await {
         Ok(Some(client)) => (client, None),
         Ok(None) => {
             if flags.http.is_some()
-                && let Err(message) = instructions_file(launch)
+                && let Err(message) = {
+                    let launch = launch.for_session();
+                    blocking_within(deadline, move || instructions_file(&launch)).await
+                }
             {
                 return fail(&message);
             }
@@ -1372,7 +1395,7 @@ async fn cli_status(
     launch: &LaunchContext,
     deadline: std::time::Instant,
 ) -> i32 {
-    let mut client = match connect_existing(paths).await {
+    let mut client = match within(deadline, connect_existing(paths)).await {
         Ok(Some(client)) => client,
         Ok(None) => {
             println!("No fastexec daemon for namespace {}.", identity.namespace);
@@ -1411,7 +1434,7 @@ async fn cli_stop(
     launch: &LaunchContext,
     deadline: std::time::Instant,
 ) -> i32 {
-    let mut client = match connect_existing(paths).await {
+    let mut client = match within(deadline, connect_existing(paths)).await {
         Ok(Some(client)) => client,
         Ok(None) => {
             println!("No fastexec daemon for namespace {}.", identity.namespace);
@@ -2549,5 +2572,55 @@ mod instructions_file_tests {
             err.contains("it is not a regular file"),
             "unexpected FIFO error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_deadline_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_probe_uses_remaining_command_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
+        assert_eq!(
+            within::<()>(deadline, std::future::pending())
+                .await
+                .unwrap_err(),
+            NO_ANSWER
+        );
+    }
+
+    #[test]
+    fn slow_preflight_does_not_hold_runtime_shutdown() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, start) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let task = runtime.spawn(blocking_within(deadline, move || {
+            started.send(()).unwrap();
+            // A regression must fail instead of hanging runtime shutdown forever.
+            wait.recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+            finished.send(()).unwrap();
+            Ok(())
+        }));
+        runtime.block_on(tokio::task::yield_now());
+        start
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let result = runtime.block_on(async {
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(7200)).await;
+            task.await.unwrap()
+        });
+        assert_eq!(result.unwrap_err(), NO_ANSWER);
+        drop(runtime);
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
     }
 }

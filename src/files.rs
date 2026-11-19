@@ -519,10 +519,14 @@ fn is_windows_reserved_device_name(component: &str) -> bool {
     {
         return true;
     }
-    let bytes = stem.as_bytes();
-    bytes.len() == 4
-        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
-        && matches!(bytes[3], b'1'..=b'9')
+    let Some(prefix) = stem.get(..3) else {
+        return false;
+    };
+    (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+        && matches!(
+            &stem[3..],
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
 }
 
 /// Resolves a native or Git Bash path against a fixed base, without tilde expansion.
@@ -6969,15 +6973,45 @@ mod tests {
     #[test]
     fn windows_reserved_device_names_match_dos_rules() {
         for reserved in [
-            "CON", "con", "CON:", "PRN", "AUX", "NUL", "NUL:foo", "COM1", "COM9", "LPT1", "LPT9",
-            "COM1.txt", "nul.log", "CON .txt", "NUL   ",
+            "CON",
+            "con",
+            "CON:",
+            "PRN",
+            "AUX",
+            "NUL",
+            "NUL:foo",
+            "COM1",
+            "COM9",
+            "LPT1",
+            "LPT9",
+            "COM1.txt",
+            "nul.log",
+            "CON .txt",
+            "NUL   ",
+            "COM¹",
+            "COM².txt",
+            "com³:stream",
+            "LPT¹",
+            "lpt².log",
+            "LPT³",
         ] {
             assert!(
                 is_windows_reserved_device_name(reserved),
                 "expected reserved: {reserved}"
             );
         }
-        for normal in ["COM0", "COM10", "LPT0", "LPT10", "CONSOLE", "NULL", "a.NUL"] {
+        for normal in [
+            "COM0",
+            "COM10",
+            "LPT0",
+            "LPT10",
+            "CONSOLE",
+            "NULL",
+            "a.NUL",
+            "COM⁴",
+            "LPT¹0",
+            "日本語",
+        ] {
             assert!(
                 !is_windows_reserved_device_name(normal),
                 "expected normal: {normal}"
