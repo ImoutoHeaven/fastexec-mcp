@@ -4,6 +4,8 @@
 
 #[cfg(any(windows, target_os = "freebsd"))]
 mod support;
+#[path = "support/transfer_http.rs"]
+mod transfer_http;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -80,6 +82,9 @@ impl Fixture {
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
             .env_remove("FASTEXEC_YOLO")
             .env_remove("FASTEXEC_CODEMODE")
+            .env_remove("FASTEXEC_TRANSFER")
+            .env_remove("FASTEXEC_TRANSFER_ADDR")
+            .env_remove("FASTEXEC_PUBLIC_URL")
             .stdin(std::process::Stdio::null());
         if let Some(tmpdir) = &self.tmpdir {
             command
@@ -286,6 +291,9 @@ impl Endpoint {
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
             .env_remove("FASTEXEC_YOLO")
             .env_remove("FASTEXEC_CODEMODE")
+            .env_remove("FASTEXEC_TRANSFER")
+            .env_remove("FASTEXEC_TRANSFER_ADDR")
+            .env_remove("FASTEXEC_PUBLIC_URL")
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT");
         configure(&mut command);
         command
@@ -1179,7 +1187,7 @@ fn initialize_and_tools_list_answer_with_no_daemon() {
         .collect();
     names.sort_unstable();
     assert_eq!(names, ["edit", "exec", "read", "write"], "{listed}");
-    // A stdio endpoint has no route to serve a URL from, so `transfer` is not even a tool here.
+    // `transfer` is off unless `FASTEXEC_TRANSFER=true`, so it is not listed by default.
     let refused = endpoint.request(
         "tools/call",
         json!({"name": "transfer", "arguments": {"path": "notes/a.txt"}}),
@@ -1888,6 +1896,11 @@ fn invalid_yolo_refuses_start_without_blocking_status_or_stop() {
             "invalid FASTEXEC_YOLO \"on\"; expected true or false",
         ),
         (
+            "FASTEXEC_TRANSFER",
+            "on",
+            "invalid FASTEXEC_TRANSFER \"on\"; expected true or false",
+        ),
+        (
             "FASTEXEC_OUTPUT_MODE",
             "bogus",
             "invalid FASTEXEC_OUTPUT_MODE \"bogus\"; expected text, both, or structured",
@@ -1918,6 +1931,27 @@ fn invalid_yolo_refuses_start_without_blocking_status_or_stop() {
         String::from_utf8_lossy(&endpoint_output.stderr)
             .contains("invalid FASTEXEC_YOLO \"on\"; expected true or false")
     );
+    let bad_xfer_ep = fixture
+        .command(&[])
+        .env("FASTEXEC_DAEMON", "on")
+        .env("FASTEXEC_TRANSFER", "on")
+        .output()
+        .unwrap();
+    assert_eq!(bad_xfer_ep.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&bad_xfer_ep.stderr)
+            .contains("invalid FASTEXEC_TRANSFER \"on\"; expected true or false")
+    );
+    let bad_xfer_run = fixture
+        .command(&["daemon", "run"])
+        .env("FASTEXEC_TRANSFER", "on")
+        .output()
+        .unwrap();
+    assert_eq!(bad_xfer_run.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&bad_xfer_run.stderr)
+            .contains("invalid FASTEXEC_TRANSFER \"on\"; expected true or false")
+    );
 
     for action in ["status", "stop"] {
         let output = fixture
@@ -1938,6 +1972,7 @@ fn invalid_yolo_refuses_start_without_blocking_status_or_stop() {
     let status = fixture
         .command(&["daemon", "status"])
         .env("FASTEXEC_YOLO", "bogus")
+        .env("FASTEXEC_TRANSFER", "bogus")
         .output()
         .unwrap();
     assert_eq!(status.status.code(), Some(0));
@@ -1948,6 +1983,7 @@ fn invalid_yolo_refuses_start_without_blocking_status_or_stop() {
     let stop = fixture
         .command(&["daemon", "stop"])
         .env("FASTEXEC_YOLO", "bogus")
+        .env("FASTEXEC_TRANSFER", "bogus")
         .output()
         .unwrap();
     assert_eq!(stop.status.code(), Some(0));
@@ -2092,16 +2128,22 @@ fn invalid_codemode_is_rejected_by_daemon_start_and_run() {
 fn daemon_ipc_accepts_1mib_escaped_input_refuses_over_3mib_and_matches_stdio_schemas() {
     let fixture = Fixture::new("ipc-3mib-and-schemas");
     let mut daemon_ep = Endpoint::start_with(&fixture, |cmd| {
-        cmd.env("FASTEXEC_CODEMODE", "true");
+        cmd.env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_TRANSFER", "true");
     });
 
     let daemon_tools = daemon_ep.request("tools/list", json!({}))["result"]["tools"]
         .as_array()
         .unwrap()
         .clone();
+    assert_eq!(daemon_tools.len(), 6, "{daemon_tools:?}");
     let mut stdio_child = Command::new(env!("CARGO_BIN_EXE_fastexec"))
         .env("FASTEXEC_DAEMON", "off")
         .env("FASTEXEC_CODEMODE", "true")
+        .env("FASTEXEC_TRANSFER", "true")
+        .env_remove("FASTEXEC_YOLO")
+        .env_remove("FASTEXEC_TRANSFER_ADDR")
+        .env_remove("FASTEXEC_PUBLIC_URL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -2376,4 +2418,289 @@ fn daemon_delivers_4mib_both_mode_window_and_probes_login_profile_once_per_sessi
     }));
     assert!(!four_err);
     assert_eq!(four_mib["output"].as_str().unwrap().len(), 4_194_300);
+}
+
+#[test]
+fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() {
+    let fixture = Fixture::new("daemon-transfer");
+    let work = fixture.runtime.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("blob.bin"), [0u8, 1, 2, 3]).unwrap();
+    std::fs::write(work.join("note.txt"), "hello\n").unwrap();
+
+    // When FASTEXEC_TRANSFER is unset or false without --http, invalid transfer env vars are
+    // unread by both `daemon start` and lazy daemon startup on an endpoint's first exec/read.
+    for (idx, setting) in [None, Some("false")].into_iter().enumerate() {
+        let start_fixture = Fixture::sharing(&fixture.runtime, &format!("xfer-off-start-{idx}"));
+        let mut start_cmd = start_fixture.command(&["daemon", "start"]);
+        start_cmd
+            .env("FASTEXEC_PUBLIC_URL", "not-a-url")
+            .env("FASTEXEC_TRANSFER_ADDR", "not-an-addr");
+        if let Some(value) = setting {
+            start_cmd.env("FASTEXEC_TRANSFER", value);
+        }
+        let started = start_cmd.output().unwrap();
+        assert_eq!(
+            started.status.code(),
+            Some(0),
+            "{setting:?}: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let (_, status, _) = start_fixture.run(&["daemon", "status"]);
+        assert!(status.lines().any(|line| line == "http off"), "{status}");
+        drop(start_fixture);
+
+        let lazy_fixture = Fixture::sharing(&fixture.runtime, &format!("xfer-off-lazy-{idx}"));
+        let mut lazy_ep = Endpoint::start_with(&lazy_fixture, |cmd| {
+            cmd.current_dir(&work)
+                .env("FASTEXEC_PUBLIC_URL", "not-a-url")
+                .env("FASTEXEC_TRANSFER_ADDR", "not-an-addr");
+            if let Some(value) = setting {
+                cmd.env("FASTEXEC_TRANSFER", value);
+            }
+        });
+        let (exec_sc, exec_text, exec_err) = lazy_ep.call(json!({
+            "action": "start",
+            "command": "printf LAZY_OK",
+            "loginShell": false,
+        }));
+        assert!(!exec_err && exec_sc["exitCode"] == 0, "{exec_text}");
+        assert!(exec_text.contains("LAZY_OK"), "{exec_text}");
+        let (_, read_text, read_err) = lazy_ep.file("read", json!({"path": "note.txt"}));
+        assert!(!read_err && read_text == "hello\n", "{read_text}");
+        lazy_ep.close();
+        drop(lazy_fixture);
+    }
+
+    // Wildcard FASTEXEC_TRANSFER_ADDR=0.0.0.0:0 with FASTEXEC_HTTP_ALLOW_REMOTE=1 requires FASTEXEC_PUBLIC_URL.
+    {
+        let wildcard_fixture = Fixture::sharing(&fixture.runtime, "xfer-wildcard");
+        for action in [&["daemon", "start"][..], &["daemon", "run"][..]] {
+            let out = wildcard_fixture
+                .command(action)
+                .env("FASTEXEC_TRANSFER", "true")
+                .env("FASTEXEC_HTTP_ALLOW_REMOTE", "1")
+                .env("FASTEXEC_TRANSFER_ADDR", "0.0.0.0:0")
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(1), "{action:?}: {out:?}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(
+                    "FASTEXEC_TRANSFER_ADDR 0.0.0.0:0 is an unspecified address; set FASTEXEC_PUBLIC_URL"
+                ),
+                "{action:?}: {stderr:?}"
+            );
+        }
+        let ok = wildcard_fixture
+            .command(&["daemon", "start"])
+            .env("FASTEXEC_TRANSFER", "true")
+            .env("FASTEXEC_HTTP_ALLOW_REMOTE", "1")
+            .env("FASTEXEC_TRANSFER_ADDR", "0.0.0.0:0")
+            .env("FASTEXEC_PUBLIC_URL", "https://files.example/")
+            .output()
+            .unwrap();
+        assert_eq!(
+            ok.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        let mut ep = Endpoint::start_with(&wildcard_fixture, |cmd| {
+            cmd.current_dir(&work).env("FASTEXEC_TRANSFER", "true");
+        });
+        let minted = ep.request(
+            "tools/call",
+            json!({"name": "transfer", "arguments": {"path": "wild.bin"}}),
+        )["result"]
+            .clone();
+        assert_eq!(minted["isError"], false, "{minted}");
+        assert!(
+            minted["structuredContent"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://files.example/t/"),
+            "{minted}"
+        );
+        ep.close();
+        drop(wildcard_fixture);
+    }
+
+    // Start a plain daemon without --http and without FASTEXEC_TRANSFER.
+    let (code, out, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let (_, status, _) = fixture.run(&["daemon", "status"]);
+    assert!(status.lines().any(|line| line == "http off"), "{status}");
+
+    let mut transfer_ep = Endpoint::start_with(&fixture, |cmd| {
+        cmd.current_dir(&work)
+            .env("FASTEXEC_TRANSFER", "true")
+            .env("FASTEXEC_YOLO", "true");
+    });
+    let mut plain_ep = Endpoint::start_with(&fixture, |cmd| {
+        cmd.current_dir(&work);
+    });
+
+    let xfer_tools = transfer_ep.request("tools/list", json!({}))["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(xfer_tools.len(), 5, "{xfer_tools:?}");
+    let xfer_tool = xfer_tools
+        .iter()
+        .find(|tool| tool["name"] == "transfer")
+        .unwrap();
+    assert_eq!(
+        xfer_tool["annotations"],
+        json!({
+            "title": "Transfer file",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": false,
+        }),
+        "{xfer_tool}"
+    );
+    let plain_tools = plain_ep.request("tools/list", json!({}))["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(plain_tools.len(), 4, "{plain_tools:?}");
+    assert!(!plain_tools.iter().any(|tool| tool["name"] == "transfer"));
+
+    let (_, xfer_bin_text, xfer_bin_err) = transfer_ep.file("read", json!({"path": "blob.bin"}));
+    assert!(xfer_bin_err, "{xfer_bin_text}");
+    assert!(
+        xfer_bin_text.contains("Inspect it with exec or download it with transfer."),
+        "{xfer_bin_text}"
+    );
+    let (_, plain_bin_text, plain_bin_err) = plain_ep.file("read", json!({"path": "blob.bin"}));
+    assert!(plain_bin_err, "{plain_bin_text}");
+    assert!(
+        plain_bin_text.ends_with("Inspect it with exec.")
+            && !plain_bin_text.contains("download it with transfer"),
+        "{plain_bin_text}"
+    );
+
+    let minted = transfer_ep.request(
+        "tools/call",
+        json!({"name": "transfer", "arguments": {"path": "uploaded.bin"}}),
+    )["result"]
+        .clone();
+    assert_eq!(minted["isError"], false, "{minted}");
+    let url = minted["structuredContent"]["url"].as_str().unwrap();
+    let rest = url.strip_prefix("http://").expect("http:// URL");
+    let (authority, path_part) = rest.split_once('/').unwrap();
+    let addr: std::net::SocketAddr = authority.parse().unwrap();
+    let target = format!("/{path_part}");
+
+    assert_eq!(transfer_http::send(addr, "HEAD", &target, b"").0, 200);
+    assert_eq!(
+        transfer_http::send(addr, "PUT", &format!("{target}?offset=0"), b"").0,
+        200
+    );
+    let payload = b"daemon-stdio-transfer";
+    let (put_status, _, put_body) = transfer_http::send(addr, "PUT", &target, payload);
+    assert_eq!(put_status, 200);
+    assert_eq!(put_body, payload.len().to_string().as_bytes());
+    let (head_status, head_headers, _) = transfer_http::send(addr, "HEAD", &target, b"");
+    assert_eq!(head_status, 200);
+    assert!(
+        head_headers
+            .iter()
+            .any(|(k, v)| k == "content-length" && v == &payload.len().to_string())
+    );
+    let (get_status, _, get_bytes) = transfer_http::send(addr, "GET", &target, b"");
+    assert_eq!(get_status, 200);
+    assert_eq!(get_bytes, payload);
+    assert_eq!(std::fs::read(work.join("uploaded.bin")).unwrap(), payload);
+    assert_eq!(transfer_http::send(addr, "GET", "/mcp", b"").0, 404);
+
+    // Requesting a different IP (`0.0.0.0:0` with port 0) on a daemon already serving `127.0.0.1:<port>` is refused.
+    let mut conflict_ep = Endpoint::start_with(&fixture, |cmd| {
+        cmd.current_dir(&work)
+            .env("FASTEXEC_TRANSFER", "true")
+            .env("FASTEXEC_HTTP_ALLOW_REMOTE", "1")
+            .env("FASTEXEC_TRANSFER_ADDR", "0.0.0.0:0")
+            .env("FASTEXEC_PUBLIC_URL", "https://files.example/");
+    });
+    let conflict = conflict_ep.request(
+        "tools/call",
+        json!({"name": "transfer", "arguments": {"path": "conflict.bin"}}),
+    )["result"]
+        .clone();
+    assert_eq!(conflict["isError"], true, "{conflict}");
+    assert_eq!(
+        conflict["structuredContent"]["error"],
+        json!(format!(
+            "the daemon already serves /t/ on {addr}, not 0.0.0.0:0; stop it first"
+        ))
+    );
+    conflict_ep.close();
+
+    plain_ep.close();
+    transfer_ep.close();
+
+    // Even when FASTEXEC_PUBLIC_URL is set without --http, the daemon binds /t/ on FASTEXEC_TRANSFER_ADDR
+    // (and an earlier directory refusal does not prematurely bind `127.0.0.1:0`).
+    let (fixed_addr, proxied_fixture, proxied_ep, minted) = (0..8)
+        .find_map(|attempt| {
+            let proxied_fixture =
+                Fixture::sharing(&fixture.runtime, &format!("xfer-proxied-{attempt}"));
+            let mut dir_ep = Endpoint::start_with(&proxied_fixture, |cmd| {
+                cmd.current_dir(&work).env("FASTEXEC_TRANSFER", "true");
+            });
+            let dir_refused = dir_ep.request(
+                "tools/call",
+                json!({"name": "transfer", "arguments": {"path": "."}}),
+            )["result"]
+                .clone();
+            assert_eq!(dir_refused["isError"], true, "{dir_refused}");
+            dir_ep.close();
+
+            let candidate = transfer_http::free_loopback_addr();
+            let mut proxied_ep = Endpoint::start_with(&proxied_fixture, |cmd| {
+                cmd.current_dir(&work)
+                    .env("FASTEXEC_TRANSFER", "true")
+                    .env("FASTEXEC_TRANSFER_ADDR", candidate.to_string())
+                    .env("FASTEXEC_PUBLIC_URL", "https://files.example/daemon");
+            });
+            let minted = proxied_ep.request(
+                "tools/call",
+                json!({"name": "transfer", "arguments": {"path": "proxied.bin"}}),
+            )["result"]
+                .clone();
+            if minted["isError"] == true {
+                let err_text = minted["structuredContent"]["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                proxied_ep.close();
+                if attempt < 7 && err_text.contains("cannot listen on") {
+                    return None;
+                }
+                panic!("unexpected daemon proxied transfer error: {minted}");
+            }
+            Some((candidate, proxied_fixture, proxied_ep, minted))
+        })
+        .expect("bound fixed loopback port for daemon transfer");
+    let url = minted["structuredContent"]["url"].as_str().unwrap();
+    let id = url
+        .strip_prefix("https://files.example/daemon/t/")
+        .unwrap_or_else(|| panic!("unexpected proxied URL: {url}"));
+    let target = format!("/t/{id}");
+    assert_eq!(
+        transfer_http::send(fixed_addr, "PUT", &format!("{target}?offset=0"), b"").0,
+        200
+    );
+    assert_eq!(
+        transfer_http::send(fixed_addr, "PUT", &target, b"proxied-daemon").0,
+        200
+    );
+    assert_eq!(
+        transfer_http::send(fixed_addr, "GET", &target, b"").2,
+        b"proxied-daemon"
+    );
+    proxied_ep.close();
+    drop(proxied_fixture);
 }

@@ -33,6 +33,7 @@ struct Fixture {
     /// `FASTEXEC_YOLO` passed to this fixture's commands when a case sets one.
     yolo: Option<String>,
     codemode: Option<String>,
+    transfer: Option<String>,
     /// An explicitly chosen launch directory for path-alias regression tests.
     cwd: Option<PathBuf>,
     /// The turn this fixture holds until it ends: held, never read.
@@ -71,6 +72,11 @@ impl Fixture {
         self
     }
 
+    fn with_transfer(mut self, value: &str) -> Fixture {
+        self.transfer = Some(value.to_owned());
+        self
+    }
+
     /// A fixture with its runtime directory, and no daemon yet: the shape of a start that is
     /// expected to be refused.
     fn bare(tag: &str) -> Fixture {
@@ -100,6 +106,7 @@ impl Fixture {
             public_url: None,
             yolo: None,
             codemode: None,
+            transfer: None,
             cwd: None,
             starting,
         }
@@ -130,6 +137,7 @@ impl Fixture {
             .env_remove("FASTEXEC_HTTP_ALLOWED_ORIGINS")
             .env_remove("FASTEXEC_OUTPUT_MODE")
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_TRANSFER_ADDR")
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
             .stdin(std::process::Stdio::null());
         if let Some(cwd) = &self.cwd {
@@ -146,6 +154,10 @@ impl Fixture {
         match &self.codemode {
             Some(value) => command.env("FASTEXEC_CODEMODE", value),
             None => command.env_remove("FASTEXEC_CODEMODE"),
+        };
+        match &self.transfer {
+            Some(value) => command.env("FASTEXEC_TRANSFER", value),
+            None => command.env_remove("FASTEXEC_TRANSFER"),
         };
         command
     }
@@ -772,7 +784,7 @@ fn modern_discovery_and_task_polls_work_without_a_handshake() {
         "fastexec"
     );
     let listed = client.modern("tools/list", json!({}));
-    assert_eq!(listed["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(listed["tools"].as_array().unwrap().len(), 4);
     let started = client.modern(
         "tools/call",
         json!({"name": "exec", "arguments": {
@@ -1212,7 +1224,28 @@ fn a_session_runs_a_task_over_http() {
     client.initialize();
     let mut tools = client.tools();
     tools.sort_unstable();
-    assert_eq!(tools, ["edit", "exec", "read", "transfer", "write"]);
+    assert_eq!(tools, ["edit", "exec", "read", "write"]);
+    let missing_tool = client.send(json!({
+        "jsonrpc": "2.0",
+        "id": 77,
+        "method": "tools/call",
+        "params": {"name": "transfer", "arguments": {"path": "x.bin"}},
+    }));
+    assert_eq!(
+        missing_tool.answer(77)["error"]["message"],
+        json!("tool not found")
+    );
+    assert_eq!(
+        send(
+            fixture.addr,
+            "GET",
+            "/t/0123456789abcdefghjkmnpqrs",
+            "",
+            b""
+        )
+        .status,
+        404
+    );
     // The program reads a line and prints a marker, so the marker can only appear once this poll
     // delivered the input: a start that had already finished could not produce it. It also says
     // whether the token reached it, which it must not have.
@@ -1448,12 +1481,25 @@ fn a_start_outside_loopback_or_without_a_long_enough_token_is_refused() {
 
 #[test]
 fn file_tools_round_trip_over_http_and_name_transfer_for_a_binary() {
-    let fixture = Fixture::new("files");
-    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
     let dir = std::env::temp_dir().join(format!("fastexec-http-files-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let blob = dir.join("blob.bin");
+    std::fs::write(&blob, [0u8, 1]).unwrap();
+    {
+        let plain = Fixture::new("files-plain");
+        let mut client = Client::new(plain.addr, plain.tokens[0].clone());
+        client.initialize();
+        let binary = client.call_tool("read", json!({"path": blob.display().to_string()}));
+        assert_eq!(binary["isError"], json!(true), "{binary}");
+        let text = binary["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.ends_with("Inspect it with exec."), "{binary}");
+        assert!(!text.contains("download it with transfer"), "{binary}");
+    }
+    let mut fixture = Fixture::bare("files").with_transfer("true");
+    fixture.start();
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
+    client.initialize();
     let path = dir.join("notes.txt");
     let written = client.call_tool(
         "write",
@@ -1470,9 +1516,6 @@ fn file_tools_round_trip_over_http_and_name_transfer_for_a_binary() {
     let read = client.call_tool("read", json!({"path": path.display().to_string()}));
     assert_eq!(read["isError"], json!(false), "{read}");
     assert_eq!(read["content"][0]["text"], json!("one\ntwo\n"));
-    // An HTTP session has a way to download a file, so a binary names it.
-    let blob = dir.join("blob.bin");
-    std::fs::write(&blob, [0u8, 1]).unwrap();
     let binary = client.call_tool("read", json!({"path": blob.display().to_string()}));
     assert_eq!(binary["isError"], json!(true), "{binary}");
     let text = binary["content"][0]["text"].as_str().unwrap_or_default();
@@ -1545,7 +1588,8 @@ fn wait_for_size(addr: SocketAddr, target: &str, expected: u64) -> u64 {
 
 #[test]
 fn transfer_is_listed_over_http_and_names_the_scheme_the_client_saw() {
-    let fixture = Fixture::new("transfer-url");
+    let mut fixture = Fixture::bare("transfer-url").with_transfer("true");
+    fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let tools = client.tools();
@@ -1583,7 +1627,9 @@ fn transfer_is_listed_over_http_and_names_the_scheme_the_client_saw() {
 #[test]
 fn a_named_root_wins_over_the_host_and_keeps_its_prefix() {
     let root = "https://files.example/mac/";
-    let mut fixture = Fixture::bare("public-root").with_public_url(root);
+    let mut fixture = Fixture::bare("public-root")
+        .with_public_url(root)
+        .with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
@@ -1642,7 +1688,9 @@ fn requesting_http_on_a_daemon_without_it_releases_the_cli_session() {
 #[test]
 fn a_second_start_with_another_root_keeps_the_root_the_daemon_has() {
     let first = "https://first.example/mac/";
-    let mut fixture = Fixture::bare("root-kept").with_public_url(first);
+    let mut fixture = Fixture::bare("root-kept")
+        .with_public_url(first)
+        .with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
@@ -1724,7 +1772,8 @@ fn a_daemon_refuses_a_public_root_it_cannot_use() {
 
 #[test]
 fn an_upload_and_a_download_over_t_need_no_token() {
-    let fixture = Fixture::new("transfer-io");
+    let mut fixture = Fixture::bare("transfer-io").with_transfer("true");
+    fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "up.bin");
@@ -1773,7 +1822,8 @@ fn an_upload_and_a_download_over_t_need_no_token() {
 
 #[test]
 fn ranges_offsets_and_unknown_ids_answer_as_specified() {
-    let fixture = Fixture::new("transfer-edges");
+    let mut fixture = Fixture::bare("transfer-edges").with_transfer("true");
+    fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "edges.bin");
@@ -1855,7 +1905,8 @@ fn ranges_offsets_and_unknown_ids_answer_as_specified() {
 
 #[test]
 fn an_interrupted_upload_leaves_a_prefix_that_resumes() {
-    let fixture = Fixture::new("transfer-resume");
+    let mut fixture = Fixture::bare("transfer-resume").with_transfer("true");
+    fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "resume.bin");
@@ -1909,7 +1960,8 @@ fn send_chunked(addr: SocketAddr, target: &str, body: &[u8]) -> Response {
 
 #[test]
 fn an_upload_larger_than_the_call_cap_arrives_whole() {
-    let fixture = Fixture::new("transfer-large");
+    let mut fixture = Fixture::bare("transfer-large").with_transfer("true");
+    fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "large.bin");
@@ -1969,7 +2021,8 @@ impl MemoryFile {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_refused_disk_write_is_not_acknowledged_as_success() {
-    let fixture = Fixture::new("transfer-sealed");
+    let mut fixture = Fixture::bare("transfer-sealed").with_transfer("true");
+    fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let addr = fixture.addr;
@@ -2084,7 +2137,7 @@ fn check_serial_uploads(fixture: &Fixture, first: &str, second: &str, file: &Pat
 
 #[test]
 fn transfer_uploads_to_one_file_serialize_across_capabilities_and_aliases() {
-    let mut fixture = Fixture::bare("transfer-file-identity");
+    let mut fixture = Fixture::bare("transfer-file-identity").with_transfer("true");
     fixture.cwd = Some(fixture.runtime.clone());
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
@@ -2132,7 +2185,8 @@ fn transfer_uploads_to_one_file_serialize_across_capabilities_and_aliases() {
 
 #[test]
 fn transfer_uploads_to_different_files_do_not_wait_for_each_other() {
-    let fixture = Fixture::new("transfer-independent");
+    let mut fixture = Fixture::bare("transfer-independent").with_transfer("true");
+    fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let first_file = published(&fixture, "first.bin");
@@ -2278,7 +2332,8 @@ fn http_a_long_tool_call_outlives_the_header_deadline() {
 #[cfg(target_os = "linux")]
 #[test]
 fn disconnected_uploads_waiting_for_the_same_file_release_their_descriptors() {
-    let fixture = Fixture::new("transfer-cancelled-queue");
+    let mut fixture = Fixture::bare("transfer-cancelled-queue").with_transfer("true");
+    fixture.start();
     let pid = fixture.pid.get().expect("the fixture started a daemon");
     let descriptors = || {
         std::fs::read_dir(format!("/proc/{pid}/fd"))
@@ -2331,7 +2386,8 @@ fn disconnected_uploads_waiting_for_the_same_file_release_their_descriptors() {
 
 #[test]
 fn malformed_or_truncated_upload_bodies_keep_the_prefix_but_are_not_successful() {
-    let fixture = Fixture::new("transfer-invalid-body");
+    let mut fixture = Fixture::bare("transfer-invalid-body").with_transfer("true");
+    fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
     let file = published(&fixture, "partial.bin");
@@ -2421,7 +2477,7 @@ fn freebsd_fixture_fallback_cleanup_owns_its_daemon() {
 
 #[test]
 fn yolo_overrides_all_five_http_tools_and_rejects_invalid_values() {
-    let defaults = [
+    let core_defaults = [
         (
             "edit",
             json!({"title": "Edit file", "destructiveHint": true, "idempotentHint": false}),
@@ -2432,37 +2488,35 @@ fn yolo_overrides_all_five_http_tools_and_rejects_invalid_values() {
         ),
         ("read", json!({"title": "Read file", "readOnlyHint": true})),
         (
-            "transfer",
-            json!({"title": "Transfer file", "destructiveHint": true, "openWorldHint": true}),
-        ),
-        (
             "write",
             json!({"title": "Write file", "destructiveHint": true, "idempotentHint": false}),
         ),
     ];
+    let with_transfer_defaults = [
+        core_defaults[0].clone(),
+        core_defaults[1].clone(),
+        core_defaults[2].clone(),
+        (
+            "transfer",
+            json!({"title": "Transfer file", "destructiveHint": true, "openWorldHint": true}),
+        ),
+        core_defaults[3].clone(),
+    ];
 
     {
-        let fixture = Fixture::new("yolo-off");
+        let fixture = Fixture::new("yolo-core-off");
         let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
         let modern_listed = modern.modern("tools/list", json!({}));
-        let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
-        legacy.initialize();
-        let legacy_listed =
-            legacy.send(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list"}));
-        let legacy_tools = legacy_listed.answer(99)["result"]["tools"].clone();
-
-        for tools_value in [&modern_listed["tools"], &legacy_tools] {
-            let tools = tools_value.as_array().unwrap();
-            assert_eq!(tools.len(), 5, "{tools_value}");
-            for (name, expected) in &defaults {
-                let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
-                assert_eq!(&tool["annotations"], expected, "default {name}: {tool}");
-            }
+        let tools = modern_listed["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4, "{modern_listed}");
+        for (name, expected) in &core_defaults {
+            let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
+            assert_eq!(&tool["annotations"], expected, "default {name}: {tool}");
         }
     }
 
     {
-        let mut fixture = Fixture::bare("yolo-on").with_yolo("true");
+        let mut fixture = Fixture::bare("yolo-off").with_transfer("true");
         fixture.start();
         let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
         let modern_listed = modern.modern("tools/list", json!({}));
@@ -2475,7 +2529,30 @@ fn yolo_overrides_all_five_http_tools_and_rejects_invalid_values() {
         for tools_value in [&modern_listed["tools"], &legacy_tools] {
             let tools = tools_value.as_array().unwrap();
             assert_eq!(tools.len(), 5, "{tools_value}");
-            for (name, expected) in &defaults {
+            for (name, expected) in &with_transfer_defaults {
+                let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
+                assert_eq!(&tool["annotations"], expected, "default {name}: {tool}");
+            }
+        }
+    }
+
+    {
+        let mut fixture = Fixture::bare("yolo-on")
+            .with_transfer("true")
+            .with_yolo("true");
+        fixture.start();
+        let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
+        let modern_listed = modern.modern("tools/list", json!({}));
+        let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
+        legacy.initialize();
+        let legacy_listed =
+            legacy.send(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list"}));
+        let legacy_tools = legacy_listed.answer(99)["result"]["tools"].clone();
+
+        for tools_value in [&modern_listed["tools"], &legacy_tools] {
+            let tools = tools_value.as_array().unwrap();
+            assert_eq!(tools.len(), 5, "{tools_value}");
+            for (name, expected) in &with_transfer_defaults {
                 let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
                 assert_eq!(
                     tool["annotations"],
@@ -2492,28 +2569,122 @@ fn yolo_overrides_all_five_http_tools_and_rejects_invalid_values() {
         }
     }
 
-    let fixture = Fixture::bare("yolo-bad").with_yolo("bogus");
-    for action in [
-        ["daemon", "start", "--http", "127.0.0.1:0"],
-        ["daemon", "run", "--http", "127.0.0.1:0"],
-    ] {
-        let (code, out, err) = fixture.run(&action);
-        assert_eq!(code, 1, "{action:?}: {out}{err}");
+    {
+        let fixture = Fixture::bare("yolo-bad").with_yolo("bogus");
+        for action in [
+            ["daemon", "start", "--http", "127.0.0.1:0"],
+            ["daemon", "run", "--http", "127.0.0.1:0"],
+        ] {
+            let (code, out, err) = fixture.run(&action);
+            assert_eq!(code, 1, "{action:?}: {out}{err}");
+            assert!(
+                err.contains("invalid FASTEXEC_YOLO \"bogus\"; expected true or false"),
+                "{action:?}: {err:?}"
+            );
+        }
+        let status = fixture
+            .command(&["daemon", "status"])
+            .env_remove("FASTEXEC_YOLO")
+            .env_remove("FASTEXEC_CODEMODE")
+            .env_remove("FASTEXEC_TRANSFER")
+            .output()
+            .unwrap();
         assert!(
-            err.contains("invalid FASTEXEC_YOLO \"bogus\"; expected true or false"),
-            "{action:?}: {err:?}"
+            String::from_utf8_lossy(&status.stdout).starts_with("No fastexec daemon"),
+            "{status:?}"
         );
     }
-    let status = fixture
-        .command(&["daemon", "status"])
-        .env_remove("FASTEXEC_YOLO")
-        .env_remove("FASTEXEC_CODEMODE")
-        .output()
+
+    {
+        let bad_transfer = Fixture::bare("transfer-bad").with_transfer("bogus");
+        for action in [
+            ["daemon", "start", "--http", "127.0.0.1:0"],
+            ["daemon", "run", "--http", "127.0.0.1:0"],
+        ] {
+            let (code, out, err) = bad_transfer.run(&action);
+            assert_eq!(code, 1, "{action:?}: {out}{err}");
+            assert!(
+                err.contains("invalid FASTEXEC_TRANSFER \"bogus\"; expected true or false"),
+                "{action:?}: {err:?}"
+            );
+            let conflict = bad_transfer
+                .command(&action)
+                .env_remove("FASTEXEC_TRANSFER")
+                .env("FASTEXEC_TRANSFER_ADDR", "127.0.0.1:0")
+                .output()
+                .unwrap();
+            assert_eq!(conflict.status.code(), Some(1), "{action:?}: {conflict:?}");
+            assert!(
+                String::from_utf8_lossy(&conflict.stderr).contains("FASTEXEC_TRANSFER_ADDR"),
+                "{action:?}: {conflict:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn stdio_transfer_endpoint_shares_the_http_daemons_transfer_route() {
+    let fixture = Fixture::new("http-shared-transfer");
+    let file = published(&fixture, "from-stdio.bin");
+    let mut child = fixture
+        .command(&[])
+        .env("FASTEXEC_DAEMON", "on")
+        .env("FASTEXEC_TRANSFER", "true")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let reader = std::io::BufReader::new(child.stdout.take().unwrap());
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"stdio-xfer","version":"0"}}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"transfer","arguments":{"path":file.display().to_string()}}})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let mut url = None;
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(msg) = serde_json::from_str::<Value>(&line)
+            && msg["id"] == 2
+        {
+            assert_ne!(msg["result"]["isError"], true, "{msg}");
+            url = msg["result"]["structuredContent"]["url"]
+                .as_str()
+                .map(str::to_owned);
+            break;
+        }
+    }
+    drop(stdin);
+    let _ = child.wait();
+    let url = url.expect("transfer url from stdio endpoint");
     assert!(
-        String::from_utf8_lossy(&status.stdout).starts_with("No fastexec daemon"),
-        "{status:?}"
+        url.starts_with(&format!("http://{}/t/", fixture.addr)),
+        "{url}"
     );
+    let target = target_of(&url);
+    assert_eq!(
+        send(fixture.addr, "PUT", &format!("{target}?offset=0"), "", b"").status,
+        200
+    );
+    assert_eq!(
+        send(fixture.addr, "PUT", &target, "", b"shared-route").status,
+        200
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), b"shared-route");
 }
 
 #[test]
@@ -2598,7 +2769,7 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
     std::fs::create_dir_all(cwd_dir.join("sub")).unwrap();
     std::fs::write(cwd_dir.join("sub/existing.bin"), b"hello-bytes").unwrap();
 
-    let mut fixture = Fixture::bare("transfer-p26");
+    let mut fixture = Fixture::bare("transfer-p26").with_transfer("true");
     fixture.cwd = Some(cwd_dir.clone());
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
@@ -2708,7 +2879,9 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
 
 #[test]
 fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
-    let mut fixture = Fixture::bare("http-schemas-input-footer").with_codemode("true");
+    let mut fixture = Fixture::bare("http-schemas-input-footer")
+        .with_codemode("true")
+        .with_transfer("true");
     fixture.tokens = vec![random_token(), random_token()];
     fixture.start();
     let mut c1 = Client::new(fixture.addr, fixture.tokens[0].clone());
@@ -2728,6 +2901,10 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
     let mut stdio_child = std::process::Command::new(env!("CARGO_BIN_EXE_fastexec"))
         .env("FASTEXEC_DAEMON", "off")
         .env("FASTEXEC_CODEMODE", "true")
+        .env("FASTEXEC_TRANSFER", "true")
+        .env_remove("FASTEXEC_YOLO")
+        .env_remove("FASTEXEC_TRANSFER_ADDR")
+        .env_remove("FASTEXEC_PUBLIC_URL")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -2770,7 +2947,7 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
     }
     drop(stdio_child.stdin.take());
     let _ = stdio_child.wait();
-    assert_eq!(stdio_tools.len(), 5, "{stdio_tools:?}");
+    assert_eq!(stdio_tools.len(), 6, "{stdio_tools:?}");
     for st in &stdio_tools {
         let name = st["name"].as_str().unwrap();
         let ht = tools.iter().find(|t| t["name"] == name).unwrap();

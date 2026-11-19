@@ -44,13 +44,49 @@ use rmcp::model::{
     ServerCapabilities, ServerConfig, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
-use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::{RoleServer, ServerHandler, ServiceExt, tool, tool_handler};
 use service::{Call, Render, Service};
 use session::{LaunchContext, Session};
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use tasks::{Limits, Tasks};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+
+/// Optional fixed `host:port` listener address for standalone `/t/` transfers.
+pub const TRANSFER_ADDR: &str = "FASTEXEC_TRANSFER_ADDR";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tools {
+    pub codemode: bool,
+    pub transfer: bool,
+    pub yolo: bool,
+}
+
+impl Tools {
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            codemode: codemode()?,
+            transfer: transfer()?,
+            yolo: yolo()?,
+        })
+    }
+}
+
+/// How a local or HTTP server publishes `/t/` capabilities when `transfer` is enabled.
+#[derive(Clone)]
+pub(crate) enum TransferEndpoint {
+    /// Local stdio: a dedicated `/t/` listener with a fixed base URL.
+    Fixed {
+        table: Arc<transfer::Transfers>,
+        base: Arc<str>,
+    },
+    /// Streamable HTTP: `public_root` when configured, else inferred from each request.
+    Http {
+        table: Arc<transfer::Transfers>,
+        public_root: Option<Arc<str>>,
+    },
+}
 
 // Keep the advertised schema while returning invalid tool arguments as tool errors.
 #[derive(serde::Deserialize)]
@@ -74,12 +110,8 @@ struct Server {
     /// This server's own routes: the tool list and the description of `exec` are built per
     /// server, because what they say about the host differs between servers.
     router: ToolRouter<Server>,
-    /// The files this server publishes under `/t/`, for an HTTP session only. Its absence is what
-    /// removes the `transfer` route from a stdio session.
-    transfers: Option<Arc<transfer::Transfers>>,
-    /// The base a `transfer` URL is minted from when a proxy names it at daemon start. `None` means
-    /// each request's Host and `X-Forwarded-Proto` are the address the client saw.
-    public_root: Option<Arc<str>>,
+    transfer: Option<TransferEndpoint>,
+    tools: Tools,
     /// Sessionless HTTP calls select the session for their authenticated token.
     principals: Option<Arc<[Arc<Session>]>>,
 }
@@ -116,55 +148,45 @@ impl Server {
     fn new(
         backend: Backend,
         launch: &LaunchContext,
-        transfers: Option<Arc<transfer::Transfers>>,
-        public_root: Option<Arc<str>>,
-        yolo: bool,
-        codemode: bool,
+        transfer: Option<TransferEndpoint>,
+        tools: Tools,
     ) -> Self {
-        let mut router = Self::tool_router();
-        let exec = router
-            .map
-            .get_mut("exec")
-            .expect("the generated router has the exec route");
-        exec.attr.description = Some(exec_description(launch, codemode).into());
-        if transfers.is_none() {
-            // A stdio session has no route to serve a URL from, so it never sees the tool.
-            router.remove_route("transfer");
-        }
-        if !codemode {
-            router.remove_route("codemode");
-        }
-        if yolo {
-            for route in router.map.values_mut() {
-                let title = route
-                    .attr
-                    .annotations
-                    .as_ref()
-                    .and_then(|annotations| annotations.title.clone());
-                route.attr.annotations = Some(ToolAnnotations::from_raw(
-                    title,
-                    Some(true),
-                    Some(false),
-                    Some(false),
-                    Some(false),
-                ));
-            }
-        }
-        for route in router.map.values_mut() {
-            let raw = serde_json::Value::Object((*route.attr.input_schema).clone());
-            if let serde_json::Value::Object(portable) = portable_schema(raw) {
-                route.attr.input_schema = Arc::new(portable);
-            }
-        }
-        let instructions = server_instructions(backend.daemon_owned(), codemode);
+        let router = Self::build_router(launch, tools);
+        let instructions = server_instructions(backend.daemon_owned(), tools.codemode);
         Self {
             backend,
             instructions,
             router,
-            transfers,
-            public_root,
+            transfer,
+            tools,
             principals: None,
         }
+    }
+
+    fn build_router(launch: &LaunchContext, tools: Tools) -> ToolRouter<Self> {
+        let mut exec = Self::exec_tool_attr();
+        exec.description = Some(exec_description(launch, tools.codemode).into());
+        let mut router = ToolRouter::new()
+            .with_route((prepare_tool(exec, tools.yolo), Self::exec))
+            .with_route((prepare_tool(Self::read_tool_attr(), tools.yolo), Self::read))
+            .with_route((
+                prepare_tool(Self::write_tool_attr(), tools.yolo),
+                Self::write,
+            ))
+            .with_route((prepare_tool(Self::edit_tool_attr(), tools.yolo), Self::edit));
+        if tools.codemode {
+            router = router.with_route((
+                prepare_tool(Self::codemode_tool_attr(), tools.yolo),
+                Self::codemode,
+            ));
+        }
+        if tools.transfer {
+            router = router.with_route((
+                prepare_tool(Self::transfer_tool_attr(), tools.yolo),
+                Self::transfer,
+            ));
+        }
+        router
     }
 
     /// The principal session for sessionless HTTP, or this server's client-named session.
@@ -325,7 +347,27 @@ impl ServerHandler for Server {
     }
 }
 
-#[tool_router]
+fn prepare_tool(mut attr: rmcp::model::Tool, yolo: bool) -> rmcp::model::Tool {
+    let raw = serde_json::Value::Object((*attr.input_schema).clone());
+    if let serde_json::Value::Object(portable) = portable_schema(raw) {
+        attr.input_schema = Arc::new(portable);
+    }
+    if yolo {
+        let title = attr
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.title.clone());
+        attr.annotations = Some(ToolAnnotations::from_raw(
+            title,
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+        ));
+    }
+    attr
+}
+
 impl Server {
     #[doc = include_str!("description.md")]
     #[tool(
@@ -436,9 +478,7 @@ impl Server {
                     nested: false,
                     started: None,
                 };
-                service
-                    .codemode(request, call, self.transfers.is_some())
-                    .await
+                service.codemode(request, call, self.tools.transfer).await
             }
         }
     }
@@ -452,13 +492,7 @@ impl Server {
     ) -> CallToolResult {
         match &self.backend {
             Backend::Local { launch, render, .. } => {
-                files::read(
-                    request,
-                    Arc::clone(launch),
-                    self.transfers.is_some(),
-                    *render,
-                )
-                .await
+                files::read(request, Arc::clone(launch), self.tools.transfer, *render).await
             }
             Backend::Daemon(endpoint) => forward(endpoint, "read", &request, &context).await,
         }
@@ -514,46 +548,105 @@ impl Server {
         Parameters(request): Parameters<transfer::Request>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let Backend::Local { launch, render, .. } = &self.backend else {
-            return CallToolResult::error(vec![ContentBlock::text(
-                "transfer needs an HTTP session, and this one is stdio.",
-            )]);
-        };
-        let effective = render.effective();
-        let fail = |message: String| {
-            let mut result = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
-            result.structured_content = Some(serde_json::json!({ "ok": false, "error": message }));
-            service::suppress(result, effective)
-        };
-        let Some(table) = &self.transfers else {
-            return fail("transfer needs an HTTP session, and this one is stdio.".to_owned());
-        };
-        let path = match files::resolve(&request.path, launch) {
-            Ok(path) => path,
-            Err(message) => return fail(message),
-        };
-        let shown_path = files::display_path(&path);
-        let bytes = match inspect_transfer_target(&path, &shown_path) {
-            Ok(bytes) => bytes,
-            Err(message) => return fail(message),
-        };
-        let url = match transfer_url(path, table, &context, self.public_root.as_deref()) {
-            Ok(url) => url,
-            Err(message) => return fail(message),
-        };
-        let text = match bytes {
-            Some(size) => format!("{url}\n{shown_path} · {size} bytes"),
-            None => format!("{url}\n{shown_path} · does not exist yet; a PUT creates it"),
-        };
-        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-        result.structured_content = Some(serde_json::json!({
-            "ok": true,
-            "url": url,
-            "path": shown_path,
-            "bytes": bytes,
-        }));
-        service::suppress(result, effective)
+        match &self.backend {
+            Backend::Daemon(endpoint) => forward(endpoint, "transfer", &request, &context).await,
+            Backend::Local { launch, render, .. } => match &self.transfer {
+                None => transfer_error(
+                    "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
+                    *render,
+                ),
+                Some(TransferEndpoint::Fixed { table, base }) => {
+                    publish_transfer(request, Arc::clone(launch), table, base, *render).await
+                }
+                Some(TransferEndpoint::Http { table, public_root }) => {
+                    let base = match public_root {
+                        Some(root) => root.to_string(),
+                        None => {
+                            let Some(parts) = context.extensions.get::<::http::request::Parts>()
+                            else {
+                                return transfer_error(
+                                    "Cannot make a transfer URL outside an HTTP request."
+                                        .to_owned(),
+                                    *render,
+                                );
+                            };
+                            match inferred_base(&parts.headers) {
+                                Ok(base) => base,
+                                Err(message) => return transfer_error(message, *render),
+                            }
+                        }
+                    };
+                    publish_transfer(request, Arc::clone(launch), table, &base, *render).await
+                }
+            },
+        }
     }
+}
+
+pub(crate) fn transfer_error(message: String, render: Render) -> CallToolResult {
+    let effective = render.effective();
+    let mut result = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
+    result.structured_content = Some(serde_json::json!({ "ok": false, "error": message }));
+    service::suppress(result, effective)
+}
+
+pub(crate) async fn inspect_transfer_request(
+    request: transfer::Request,
+    launch: Arc<LaunchContext>,
+) -> Result<(std::path::PathBuf, String, Option<u64>), String> {
+    let inspected = tokio::task::spawn_blocking(move || {
+        let path = files::resolve(&request.path, &launch)?;
+        let shown = files::display_path(&path);
+        let bytes = inspect_transfer_target(&path, &shown)?;
+        Ok::<_, String>((path, shown, bytes))
+    })
+    .await;
+    match inspected {
+        Ok(result) => result,
+        Err(error) => Err(format!("the file operation did not finish: {error}")),
+    }
+}
+
+pub(crate) fn mint_transfer(
+    path: std::path::PathBuf,
+    shown_path: String,
+    bytes: Option<u64>,
+    table: &Arc<transfer::Transfers>,
+    base: &str,
+    render: Render,
+) -> CallToolResult {
+    let effective = render.effective();
+    let id = match table.create(path) {
+        Ok(id) => id,
+        Err(message) => return transfer_error(message, render),
+    };
+    let url = format!("{base}t/{id}");
+    let text = match bytes {
+        Some(size) => format!("{url}\n{shown_path} · {size} bytes"),
+        None => format!("{url}\n{shown_path} · does not exist yet; a PUT creates it"),
+    };
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(serde_json::json!({
+        "ok": true,
+        "url": url,
+        "path": shown_path,
+        "bytes": bytes,
+    }));
+    service::suppress(result, effective)
+}
+
+async fn publish_transfer(
+    request: transfer::Request,
+    launch: Arc<LaunchContext>,
+    table: &Arc<transfer::Transfers>,
+    base: &str,
+    render: Render,
+) -> CallToolResult {
+    let (path, shown_path, bytes) = match inspect_transfer_request(request, launch).await {
+        Ok(inspected) => inspected,
+        Err(message) => return transfer_error(message, render),
+    };
+    mint_transfer(path, shown_path, bytes, table, base, render)
 }
 
 /// Verifies that `path` is either an existing regular file (returning its byte size) or a
@@ -765,27 +858,6 @@ fn rewrite_schema_node(
         };
     }
     serde_json::Value::Object(obj)
-}
-
-/// The URL a transfer publishes: the public root the daemon was started with, or else this
-/// listener as the client reached it, and a fresh id.
-fn transfer_url(
-    path: std::path::PathBuf,
-    table: &Arc<transfer::Transfers>,
-    context: &RequestContext<RoleServer>,
-    public_root: Option<&str>,
-) -> Result<String, String> {
-    let Some(parts) = context.extensions.get::<::http::request::Parts>() else {
-        return Err("Cannot make a transfer URL outside an HTTP request.".to_owned());
-    };
-    // A named root is the whole address a proxy publishes, so the request's own Host says nothing;
-    // without one, the request's Host over the scheme it was forwarded as is the client's address.
-    let base = match public_root {
-        Some(root) => root.to_owned(),
-        None => inferred_base(&parts.headers)?,
-    };
-    let id = table.create(path)?;
-    Ok(format!("{base}t/{id}"))
 }
 
 /// The base inferred from a request: its Host, over the scheme the client saw.
@@ -1024,7 +1096,7 @@ fn daemon_flags(action: &str, args: &[std::ffi::OsString]) -> Result<DaemonFlags
                     .next()
                     .ok_or("--http needs an address (host:port)")?
                     .to_string_lossy();
-                parse_http_addr(&value)?;
+                check_listen_addr("--http", &value, true)?;
                 flags.http = Some(value.into_owned());
             }
             Some("--idle-exit")
@@ -1126,29 +1198,45 @@ async fn cli_start(
     if let Err(message) = render() {
         return fail(&message);
     }
-    if let Err(message) = yolo() {
-        return fail(&message);
-    }
-    if let Err(message) = codemode() {
-        return fail(&message);
-    }
-    // A start that cannot serve HTTP is refused before anything runs, so it leaves no daemon
-    // behind that the caller did not ask for.
+    let tools = match Tools::from_env() {
+        Ok(tools) => tools,
+        Err(message) => return fail(&message),
+    };
+    let public_root = if flags.http.is_some() || tools.transfer {
+        match http::public_root() {
+            Ok(root) => root,
+            Err(message) => return fail(&message),
+        }
+    } else {
+        None
+    };
+    // A start that cannot serve HTTP or `/t/` is refused before anything runs, so it leaves no
+    // daemon behind that the caller did not ask for.
     let mut extra: Vec<std::ffi::OsString> = Vec::new();
     if let Some(value) = &flags.http {
+        if std::env::var_os(TRANSFER_ADDR).is_some() {
+            return fail(&format!(
+                "cannot set {TRANSFER_ADDR} with --http; --http already serves /t/"
+            ));
+        }
         if let Err(message) = http_addr(value) {
             return fail(&message);
         }
         if let Err(message) = http_token() {
             return fail(&message);
         }
-        // A root that cannot be used is refused here too, so the terminal gets the reason and no
-        // daemon is left behind to fail binding for it.
-        if let Err(message) = http::public_root() {
-            return fail(&message);
-        }
         extra.push("--http".into());
         extra.push(value.into());
+    } else if tools.transfer {
+        let requested = match transfer_addr() {
+            Ok(addr) => addr,
+            Err(message) => return fail(&message),
+        };
+        if let Some(addr) = requested
+            && let Err(message) = check_routable_addr(TRANSFER_ADDR, addr, public_root.is_some())
+        {
+            return fail(&message);
+        }
     }
     if let Some(idle_exit) = flags.idle_exit {
         extra.push("--idle-exit".into());
@@ -1427,6 +1515,15 @@ pub fn codemode() -> Result<bool, String> {
     )
 }
 
+/// Whether this server advertises `/t/` file transfer capabilities.
+pub fn transfer() -> Result<bool, String> {
+    parse_bool_env(
+        "FASTEXEC_TRANSFER",
+        std::env::var_os("FASTEXEC_TRANSFER").as_deref(),
+        false,
+    )
+}
+
 fn parse_bool_env(
     name: &str,
     value: Option<&std::ffi::OsStr>,
@@ -1479,22 +1576,60 @@ fn http_tokens(value: Option<&std::ffi::OsStr>) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
-fn parse_http_addr(value: &str) -> Result<std::net::SocketAddr, String> {
-    value
+pub(crate) fn check_listen_addr(
+    label: &str,
+    value: &str,
+    allow_remote: bool,
+) -> Result<std::net::SocketAddr, String> {
+    let addr: std::net::SocketAddr = value
         .parse()
-        .map_err(|_| format!("--http {value} is not an address (host:port)"))
+        .map_err(|_| format!("{label} {value} is not an address (host:port)"))?;
+    if !addr.ip().is_loopback() && !allow_remote {
+        return Err(format!(
+            "{label} {value} is not a loopback address; set FASTEXEC_HTTP_ALLOW_REMOTE=1 only behind a TLS-terminating proxy"
+        ));
+    }
+    Ok(addr)
+}
+
+pub(crate) fn check_routable_addr(
+    label: &str,
+    addr: std::net::SocketAddr,
+    has_public_root: bool,
+) -> Result<(), String> {
+    if !has_public_root && addr.ip().is_unspecified() {
+        return Err(format!(
+            "{label} {addr} is an unspecified address; set {} to the URL clients reach",
+            http::PUBLIC_URL
+        ));
+    }
+    Ok(())
 }
 
 /// The address a `--http` argument names, refused when it is outside loopback and serving there
 /// was not allowed.
 pub fn http_addr(value: &str) -> Result<std::net::SocketAddr, String> {
-    let addr = parse_http_addr(value)?;
-    if !addr.ip().is_loopback() && !http::remote_allowed() {
-        return Err(format!(
-            "--http {value} is not a loopback address; set FASTEXEC_HTTP_ALLOW_REMOTE=1 only behind a TLS-terminating proxy"
-        ));
-    }
-    Ok(addr)
+    check_listen_addr("--http", value, http::remote_allowed())
+}
+
+pub(crate) fn transfer_addr_of(
+    value: Option<&std::ffi::OsStr>,
+    allow_remote: bool,
+) -> Result<Option<std::net::SocketAddr>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(text) = value.to_str() else {
+        return Err(format!("{TRANSFER_ADDR} is not UTF-8"));
+    };
+    check_listen_addr(TRANSFER_ADDR, text, allow_remote).map(Some)
+}
+
+pub fn transfer_addr() -> Result<Option<std::net::SocketAddr>, String> {
+    transfer_addr_of(
+        std::env::var_os(TRANSFER_ADDR).as_deref(),
+        http::remote_allowed(),
+    )
 }
 
 #[tokio::main]
@@ -1506,19 +1641,31 @@ async fn serve() {
             std::process::exit(1);
         }
     };
-    let yolo = match yolo() {
-        Ok(yolo) => yolo,
+    let tools = match Tools::from_env() {
+        Ok(tools) => tools,
         Err(message) => {
             eprintln!("fastexec: {message}");
             std::process::exit(1);
         }
     };
-    let codemode = match codemode() {
-        Ok(codemode) => codemode,
-        Err(message) => {
-            eprintln!("fastexec: {message}");
-            std::process::exit(1);
-        }
+    let transfer_cfg = if tools.transfer {
+        let root = match http::public_root() {
+            Ok(root) => root,
+            Err(message) => {
+                eprintln!("fastexec: {message}");
+                std::process::exit(1);
+            }
+        };
+        let addr = match transfer_addr() {
+            Ok(addr) => addr,
+            Err(message) => {
+                eprintln!("fastexec: {message}");
+                std::process::exit(1);
+            }
+        };
+        Some((root, addr))
+    } else {
+        None
     };
     // Captured once, at startup: the client's own environment is the server's own here.
     let launch = match LaunchContext::current() {
@@ -1542,7 +1689,7 @@ async fn serve() {
             std::process::exit(1);
         }
     };
-    let (backend, tasks) = if daemon {
+    let (backend, tasks, transfer_endpoint, transfer_stop) = if daemon {
         let endpoint = match endpoint::Endpoint::new(Arc::clone(&launch), render) {
             Ok(endpoint) => endpoint,
             Err(error) => {
@@ -1550,8 +1697,46 @@ async fn serve() {
                 std::process::exit(1);
             }
         };
-        (Backend::Daemon(Arc::new(endpoint)), None)
+        (Backend::Daemon(Arc::new(endpoint)), None, None, None)
     } else {
+        let (transfer_endpoint, transfer_stop) = match transfer_cfg {
+            Some((public_root, requested_addr)) => {
+                if let Some(addr) = requested_addr
+                    && let Err(message) =
+                        check_routable_addr(TRANSFER_ADDR, addr, public_root.is_some())
+                {
+                    eprintln!("fastexec: {message}");
+                    std::process::exit(1);
+                }
+                let addr = requested_addr
+                    .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        eprintln!("fastexec: cannot listen on {addr} for transfer: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                let bound = match listener.local_addr() {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        eprintln!("fastexec: cannot read transfer listener address: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                let table = Arc::new(transfer::Transfers::new());
+                let stop = CancellationToken::new();
+                tokio::spawn(http::serve_transfers(
+                    listener,
+                    Arc::clone(&table),
+                    stop.clone(),
+                ));
+                let base: Arc<str> =
+                    Arc::from(public_root.unwrap_or_else(|| format!("http://{bound}/")));
+                (Some(TransferEndpoint::Fixed { table, base }), Some(stop))
+            }
+            None => (None, None),
+        };
         let tasks = match Tasks::new(Limits::OFF) {
             Ok(tasks) => tasks,
             Err(error) => {
@@ -1566,9 +1751,9 @@ async fn serve() {
             launch: Arc::clone(&launch),
             daemon: false,
         };
-        (backend, Some(tasks))
+        (backend, Some(tasks), transfer_endpoint, transfer_stop)
     };
-    let server = Server::new(backend, &launch, None, None, yolo, codemode);
+    let server = Server::new(backend, &launch, transfer_endpoint, tools);
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
         inner: tokio::io::stdin(),
@@ -1604,6 +1789,9 @@ async fn serve() {
         // using them.
         Backend::Daemon(endpoint) => endpoint.bye().await,
         Backend::Local { .. } => {
+            if let Some(stop) = transfer_stop {
+                stop.cancel();
+            }
             if let Some(tasks) = tasks {
                 tasks.shutdown();
             }
@@ -1746,13 +1934,42 @@ mod http_token_tests {
 
 #[cfg(test)]
 mod yolo_tests {
-    use super::{output_mode_of, parse_bool_env};
+    use super::{
+        TRANSFER_ADDR, check_listen_addr, check_routable_addr, output_mode_of, parse_bool_env,
+        transfer_addr_of,
+    };
     use crate::service::OutputMode;
     use std::ffi::OsStr;
 
     #[test]
     fn valid_and_invalid_values_match_contract() {
         assert_eq!(parse_bool_env("FASTEXEC_YOLO", None, false), Ok(false));
+        assert_eq!(parse_bool_env("FASTEXEC_TRANSFER", None, false), Ok(false));
+        assert_eq!(transfer_addr_of(None, false), Ok(None));
+        assert_eq!(
+            transfer_addr_of(Some(OsStr::new("127.0.0.1:0")), false),
+            Ok(Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))))
+        );
+        assert!(transfer_addr_of(Some(OsStr::new("0.0.0.0:0")), false).is_err());
+        assert!(transfer_addr_of(Some(OsStr::new("0.0.0.0:0")), true).is_ok());
+        for unspecified in ["0.0.0.0:0", "[::]:0"] {
+            let addr: std::net::SocketAddr = unspecified.parse().unwrap();
+            assert_eq!(
+                check_routable_addr(TRANSFER_ADDR, addr, false).unwrap_err(),
+                format!(
+                    "{TRANSFER_ADDR} {addr} is an unspecified address; set FASTEXEC_PUBLIC_URL to the URL clients reach"
+                )
+            );
+            assert!(check_routable_addr(TRANSFER_ADDR, addr, true).is_ok());
+        }
+        for specific in ["127.0.0.1:0", "[::1]:0", "192.0.2.1:8080"] {
+            let addr: std::net::SocketAddr = specific.parse().unwrap();
+            assert!(check_routable_addr(TRANSFER_ADDR, addr, false).is_ok());
+        }
+        assert_eq!(
+            check_listen_addr("--http", "0.0.0.0:0", false).unwrap_err(),
+            "--http 0.0.0.0:0 is not a loopback address; set FASTEXEC_HTTP_ALLOW_REMOTE=1 only behind a TLS-terminating proxy"
+        );
         assert_eq!(
             parse_bool_env("FASTEXEC_YOLO", Some(OsStr::new("false")), false),
             Ok(false)
@@ -1933,8 +2150,20 @@ mod portable_schema_tests {
             launch: Arc::clone(&launch),
             daemon: true,
         };
-        let transfers = Some(Arc::new(transfer::Transfers::new()));
-        let server = Server::new(backend, &launch, transfers, None, false, true);
+        let transfer = Some(TransferEndpoint::Fixed {
+            table: Arc::new(transfer::Transfers::new()),
+            base: Arc::from("http://127.0.0.1:1/"),
+        });
+        let server = Server::new(
+            backend,
+            &launch,
+            transfer,
+            Tools {
+                codemode: true,
+                transfer: true,
+                yolo: false,
+            },
+        );
         let tools = server.router.list_all();
         assert_eq!(tools.len(), 6);
         let mut by_name = std::collections::HashMap::new();

@@ -1,8 +1,8 @@
-//! The transfer table: one URL per file, for the HTTP session that asked for it.
+//! The transfer table: one temporary `/t/<id>` capability URL per published file.
 //!
 //! An entry lives until it has been idle for [`IDLE`]; a request in progress pins it, so a slow
-//! download or a stalled upload never loses its URL. The table is in memory only: a daemon
-//! restart starts with none.
+//! download or a stalled upload never loses its URL. The table is in memory only: a server or
+//! daemon restart starts with none.
 
 use crate::tasks::ALPHABET;
 use schemars::JsonSchema;
@@ -27,7 +27,7 @@ pub struct Request {
     pub path: String,
 }
 
-/// The files this session has published, by id.
+/// Published capabilities, by id.
 pub struct Transfers {
     entries: Mutex<HashMap<String, Entry>>,
     /// Active writers share a lock by the opened file's identity, not by URL or path spelling.
@@ -136,10 +136,27 @@ impl Transfers {
             path: entry.path.clone(),
         })
     }
+
+    /// Drops entries that have been idle for [`IDLE`] with no active requests.
+    pub fn sweep(&self, now: Instant) {
+        let _ = self.is_idle(now);
+    }
+
+    /// Sweeps expired entries at `now` and reports whether none remain live or in flight.
+    pub fn is_idle(&self, now: Instant) -> bool {
+        let empty = {
+            let mut entries = lock(&self.entries);
+            sweep(&mut entries, now);
+            entries.is_empty()
+        };
+        if empty {
+            lock(&self.uploads).retain(|_, entry| entry.strong_count() > 0);
+        }
+        empty
+    }
 }
 
-/// Drops the entries that have been idle for [`IDLE`]. No timer keeps an entry alive or takes it
-/// away: the sweep runs on the two calls that touch the table.
+/// Drops entries idle for [`IDLE`], called on capability operations and daemon ticks.
 fn sweep(entries: &mut HashMap<String, Entry>, now: Instant) {
     entries.retain(|_, entry| {
         entry.active > 0 || now.saturating_duration_since(entry.last_used) < IDLE
@@ -347,6 +364,23 @@ mod tests {
     fn an_unknown_id_is_never_admitted() {
         let table = Arc::new(Transfers::new());
         assert!(table.admit("0123456789abcdefghjkmnpqrs").is_none());
+    }
+
+    #[test]
+    fn is_idle_holds_for_live_and_active_entries_until_swept() {
+        let table = Arc::new(Transfers::new());
+        let start = Instant::now();
+        assert!(table.is_idle(start));
+        let id = table.create_at(PathBuf::from("/tmp/a"), start).unwrap();
+        assert!(!table.is_idle(start));
+        assert!(!table.is_idle(start + IDLE - Duration::from_secs(1)));
+
+        let held = table.admit_at(&id, start).unwrap();
+        assert!(!table.is_idle(start + IDLE * 2));
+        drop(held);
+        let after_drop = Instant::now();
+        assert!(!table.is_idle(after_drop));
+        assert!(table.is_idle(after_drop + IDLE));
     }
 
     #[test]

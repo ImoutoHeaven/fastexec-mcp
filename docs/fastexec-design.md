@@ -21,7 +21,7 @@ execution, naming `exec` actions in lowercase.
 | `read` | `path`, `offset`, `limit` | Shows a text file, or an image inline. |
 | `write` | `path`, `content` | Saves a complete replacement of a regular file. |
 | `edit` | `path`, `edits` | Applies exact text replacements to a UTF-8 file. |
-| `transfer` | `path` | Publishes one regular file at a URL on HTTP, returning `{ ok, url, path, bytes }`. |
+| `transfer` | `path` | Publishes one regular file at a `/t/<id>` URL when `FASTEXEC_TRANSFER=true`, returning `{ ok, url, path, bytes }`. |
 
 ### `exec` Actions
 
@@ -258,8 +258,10 @@ retirement remove image files and reclaim their quota along with logs.
   resize cannot fit, returns `attached: false` and the note as text instead of
   an image. Images ignore `offset` and `limit`. A non-regular file, and one
   that is not a recognized image and has a NUL byte in its first `8` KiB, are
-  refused. Slices report invalid UTF-8 with replacements and a note. A nested
-  whole-file read requires valid UTF-8 throughout.
+  refused (binary files suggest `exec`, and also `transfer` when
+  `FASTEXEC_TRANSFER=true` for that session). Slices report invalid UTF-8 with
+  replacements and a note. A nested whole-file read requires valid UTF-8
+  throughout.
 - **`write`**: Saves `content`, creating missing parent directories of the final
   target, including a dangling symlink's resolved target. Relative, absolute,
   and chained symlinks are preserved; `edit` still requires an existing file.
@@ -374,14 +376,51 @@ startup; an invalid value exits with status `1`.
 
 ### `FASTEXEC_CODEMODE`
 
-`"false"` (default) hides the codemode route. `"true"` exposes it and adds
+`"false"` (default) omits the `codemode` route. `"true"` registers it and adds
 script-specific poll and kill rules to the exec description, before its final
 Host line. Local stdio and daemon endpoints use their own startup environment;
 HTTP uses the daemon's. The daemon accepts forwarded codemode calls regardless
 of its advertised setting, within the same session and task permissions as exec.
-Invalid values fail stdio startup, daemon start, and daemon run with exit 1.
-The IPC protocol version is unchanged. YOLO rewrites codemode annotations just
-as it does exec, after disabled routes have been removed.
+Invalid values fail stdio startup, daemon start, and daemon run with exit 1,
+without blocking `daemon status` or `daemon stop`. The IPC protocol version is
+unchanged.
+
+### `FASTEXEC_TRANSFER` and `FASTEXEC_TRANSFER_ADDR`
+
+`FASTEXEC_TRANSFER` defaults to `"false"` across local stdio, daemon endpoints,
+and Streamable HTTP, leaving `transfer` unregistered. `"true"` registers
+`transfer` and enables binary-file `read` hints naming `transfer`. Invalid
+values fail stdio startup, `daemon start`, and `daemon run` with exit `1`
+without blocking `daemon status` or `daemon stop`.
+
+- **Local stdio (`FASTEXEC_DAEMON=off`)**: When `FASTEXEC_TRANSFER=false`,
+  `FASTEXEC_PUBLIC_URL` and `FASTEXEC_TRANSFER_ADDR` are unread and no port is
+  bound. When `true`, startup validates both (refusing an unspecified
+  `0.0.0.0` or `[::]` listener address when `FASTEXEC_PUBLIC_URL` is unset),
+  binds a `/t/` listener on `FASTEXEC_TRANSFER_ADDR` (default `127.0.0.1:0`),
+  and mints `{base}t/{id}` from `FASTEXEC_PUBLIC_URL` or `http://<bound>/`.
+- **Daemon stdio (`FASTEXEC_DAEMON=on`)**: Each endpoint advertises `transfer`
+  from its own `FASTEXEC_TRANSFER` setting (validating `FASTEXEC_PUBLIC_URL` and
+  `FASTEXEC_TRANSFER_ADDR` at startup when `true`) and forwards `"transfer"`
+  over the unchanged IPC protocol. A non-HTTP daemon started with
+  `FASTEXEC_TRANSFER=false` leaves `FASTEXEC_PUBLIC_URL` and
+  `FASTEXEC_TRANSFER_ADDR` unread and binds no `/t/` port; it binds one shared
+  `/t/` listener at startup when both `FASTEXEC_TRANSFER=true` and
+  `FASTEXEC_TRANSFER_ADDR` are set in the daemon's environment, or on the first
+  valid `"transfer"` call using that session's `FASTEXEC_TRANSFER_ADDR` or
+  `127.0.0.1:0` (including when `FASTEXEC_PUBLIC_URL` is set). URL prefix
+  precedence is session `FASTEXEC_PUBLIC_URL`, then daemon startup
+  `FASTEXEC_PUBLIC_URL`, then `http://<http_addr>/` when `--http` is active,
+  then `http://<transfer_listener_addr>/`; an unspecified `--http` or
+  `FASTEXEC_TRANSFER_ADDR` address without `FASTEXEC_PUBLIC_URL` is refused.
+- **Streamable HTTP (`--http <addr>`)**: Uses the daemon's startup
+  `FASTEXEC_TRANSFER` setting to decide whether HTTP sessions register
+  `transfer`. The `/t/` route stays mounted on the HTTP listener backed by the
+  daemon's shared `Transfers` table, returning `404` when no capability exists
+  and serving capabilities minted by `FASTEXEC_TRANSFER=true` stdio endpoints on
+  the same daemon. Non-loopback `FASTEXEC_TRANSFER_ADDR` values require
+  `FASTEXEC_HTTP_ALLOW_REMOTE=1`, and setting `FASTEXEC_TRANSFER_ADDR` alongside
+  `--http` fails startup with exit `1`.
 
 ### `FASTEXEC_YOLO`
 
@@ -662,9 +701,9 @@ omitted on final serialization unless noted as always-present below.
   reported instead. A timeout in the writer queue leaves the connection usable
   and identifies the frame that never went out. Interrupting a frame write
   closes the connection. A call whose connection fails after sending began returns an
-  error naming the call, request ID, session, and daemon epoch — the action for
-  `exec`, the tool for `codemode`, `read`, `write`, and `edit` — and is not
-  replayed.
+  error naming the call, request ID, session, and daemon epoch: the action for
+  `exec`, and the tool for `codemode`, `read`, `write`, `edit`, and `transfer`.
+  Failed calls are not replayed.
   `list` shows each task's owner and, for a call through this endpoint, the
   session and call ID that started it; both are null for a task started in the
   default mode or over HTTP.
@@ -682,7 +721,8 @@ omitted on final serialization unless noted as always-present below.
   owner-only DACL that rejects remote clients, or a Unix socket at
   `ns/<namespace>/sock` when that path fits in `100` bytes, else at
   `/tmp/fastexec-<uid>/<namespace>.sock`. Frames are length-prefixed JSON, and a
-  call names its tool (`exec`, `codemode`, `read`, `write`, `edit`). The endpoint refuses a
+  call names its tool (`exec`, `codemode`, `read`, `write`, `edit`, `transfer`).
+  The endpoint refuses a
   call whose serialized arguments pass `3` MiB before writing it (sizing for up
   to `1` MiB of JSON-escaped `start` `input`), a request frame
   is at most `4` MiB (a `Hello` carries the endpoint's environment), a response
@@ -696,9 +736,10 @@ omitted on final serialization unless noted as always-present below.
   configured token for the listener's entire lifetime; these sessions do not
   expire. A session's entries retire with their tasks.
 - **Lifetimes**: The daemon does not exit idle by default. Starting it with
-  `--idle-exit on` enables exit after `10` minutes with no connections and an
-  empty task registry (finished tasks stay for up to `24` hours). `--idle-exit off`
-  explicitly disables it. HTTP daemons never exit idle, even with `--idle-exit on`.
+  `--idle-exit on` enables exit after `10` minutes with no connections, an empty
+  task registry (finished tasks stay for up to `24` hours), and no live or
+  in-flight `/t/` transfers. `--idle-exit off` explicitly disables it. HTTP
+  daemons never exit idle, even with `--idle-exit on`.
   `fastexec daemon stop` kills
   every task and exits. A daemon crash ends its tasks, through the Windows Job
   or the Linux task host, and a task ID from a dead daemon answers as coming
@@ -756,9 +797,10 @@ omitted on final serialization unless noted as always-present below.
   append one error-log entry per request. Streamed responses carry
   `X-Accel-Buffering: no`, which tells a proxy not to buffer them.
 - **Transfer route**: `/t/<capability id>` serves one file without the bearer
-  token, which is what makes a URL usable by `curl`; the `transfer` tool mints
-  the id and builds the URL from `FASTEXEC_PUBLIC_URL` when the daemon was
-  started with it, and from the request's own `Host` and scheme when it was not.
+  token, which makes the URL usable by `curl`. It runs on `--http` (sharing the
+  daemon's table with any `FASTEXEC_TRANSFER=true` stdio endpoints) or on the
+  standalone `/t/` listener in local stdio and non-HTTP daemon modes when
+  `FASTEXEC_TRANSFER=true`, returning `404` on any non-`/t/` path there.
   An id expires after `10` minutes unused, and an unknown or expired one answers
   `404`. `GET` returns the file, honouring one `bytes=` range with `206` and
   `416` and ignoring any other form, so the whole file comes back with `200`.

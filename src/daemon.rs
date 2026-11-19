@@ -7,6 +7,7 @@ use crate::runtime;
 use crate::service::{Call, OutputMode, Render, Service};
 use crate::session::{LaunchContext, Session};
 use crate::tasks::{Limits, Tasks};
+use crate::transfer::Transfers;
 use crate::transport::Listener;
 use rmcp::model::{CallToolResult, ContentBlock};
 use sha2::{Digest, Sha256};
@@ -88,6 +89,9 @@ pub struct Daemon {
     /// The address it serves Streamable HTTP on, when it serves it: `Status` reports it, and the
     /// listener it names is the one `run` was given.
     http: Option<String>,
+    transfers: Arc<Transfers>,
+    public_root: Option<Arc<str>>,
+    transfer_listener: tokio::sync::OnceCell<std::net::SocketAddr>,
     sessions: Mutex<HashMap<String, Entry>>,
     /// One permit per byte of queued result, `BUDGET - RESERVED` of them.
     budget: Arc<Semaphore>,
@@ -191,6 +195,7 @@ impl Daemon {
         namespace: String,
         build: String,
         http: Option<String>,
+        public_root: Option<Arc<str>>,
         config: Config,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -199,6 +204,9 @@ impl Daemon {
             namespace,
             build,
             http,
+            transfers: Arc::new(Transfers::new()),
+            public_root,
+            transfer_listener: tokio::sync::OnceCell::new(),
             sessions: Mutex::new(HashMap::new()),
             budget: Arc::new(Semaphore::new(BUDGET - RESERVED)),
             reserved: Arc::new(Semaphore::new(RESERVED)),
@@ -211,6 +219,115 @@ impl Daemon {
     /// The service every connection's calls run on.
     pub fn service(&self) -> Arc<Service> {
         Arc::clone(&self.service)
+    }
+
+    /// The transfer capability table shared across HTTP sessions and stdio endpoints.
+    pub fn transfers(&self) -> Arc<Transfers> {
+        Arc::clone(&self.transfers)
+    }
+
+    fn attach_transfer_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+        bound: std::net::SocketAddr,
+    ) {
+        let _ = self.transfer_listener.set(bound);
+        tokio::spawn(http::serve_transfers(
+            listener,
+            Arc::clone(&self.transfers),
+            self.stopped.clone(),
+        ));
+    }
+
+    async fn ensure_transfer_listener(
+        &self,
+        launch: &LaunchContext,
+        has_public_root: bool,
+    ) -> Result<std::net::SocketAddr, String> {
+        let allow_remote = http::remote_allowed()
+            || launch.var("FASTEXEC_HTTP_ALLOW_REMOTE") == Some(std::ffi::OsStr::new("1"));
+        let requested = crate::transfer_addr_of(launch.var(crate::TRANSFER_ADDR), allow_remote)?;
+        if let Some(addr) = requested {
+            crate::check_routable_addr(crate::TRANSFER_ADDR, addr, has_public_root)?;
+        }
+        let bound = *self
+            .transfer_listener
+            .get_or_try_init(|| async {
+                let addr =
+                    requested.unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .map_err(|error| format!("cannot listen on {addr} for transfer: {error}"))?;
+                let bound = listener
+                    .local_addr()
+                    .map_err(|error| format!("cannot read transfer listener address: {error}"))?;
+                tokio::spawn(http::serve_transfers(
+                    listener,
+                    Arc::clone(&self.transfers),
+                    self.stopped.clone(),
+                ));
+                Ok::<std::net::SocketAddr, String>(bound)
+            })
+            .await?;
+        if let Some(addr) = requested
+            && (bound.ip() != addr.ip() || (addr.port() != 0 && bound.port() != addr.port()))
+        {
+            return Err(format!(
+                "the daemon already serves /t/ on {bound}, not {addr}; stop it first"
+            ));
+        }
+        crate::check_routable_addr(crate::TRANSFER_ADDR, bound, has_public_root)?;
+        Ok(bound)
+    }
+
+    async fn transfer(
+        &self,
+        request: crate::transfer::Request,
+        launch: &Arc<LaunchContext>,
+        render: Render,
+    ) -> CallToolResult {
+        let session_root = match http::root_of(launch.var(http::PUBLIC_URL)) {
+            Ok(root) => root,
+            Err(message) => return crate::transfer_error(message, render),
+        };
+        let public_root = session_root.or_else(|| self.public_root.as_deref().map(str::to_owned));
+        if let Some(http_addr) = &self.http {
+            if launch.var(crate::TRANSFER_ADDR).is_some() {
+                return crate::transfer_error(
+                    format!(
+                        "cannot set {} with --http; --http already serves /t/",
+                        crate::TRANSFER_ADDR
+                    ),
+                    render,
+                );
+            }
+            if public_root.is_none()
+                && let Ok(addr) = http_addr.parse::<std::net::SocketAddr>()
+                && let Err(message) = crate::check_routable_addr("--http", addr, false)
+            {
+                return crate::transfer_error(message, render);
+            }
+        }
+        let (path, shown_path, bytes) =
+            match crate::inspect_transfer_request(request, Arc::clone(launch)).await {
+                Ok(inspected) => inspected,
+                Err(message) => return crate::transfer_error(message, render),
+            };
+        let base = match (public_root, &self.http) {
+            (Some(root), Some(_)) => root,
+            (None, Some(http_addr)) => format!("http://{http_addr}/"),
+            (public_root, None) => {
+                let bound = match self
+                    .ensure_transfer_listener(launch, public_root.is_some())
+                    .await
+                {
+                    Ok(addr) => addr,
+                    Err(message) => return crate::transfer_error(message, render),
+                };
+                public_root.unwrap_or_else(|| format!("http://{bound}/"))
+            }
+        };
+        crate::mint_transfer(path, shown_path, bytes, &self.transfers, &base, render)
     }
 
     /// Takes a place for a connection, or refuses it: the daemon is stopping, or it already
@@ -292,6 +409,7 @@ impl Daemon {
                     let now = Instant::now();
                     self.sweep_sessions(now);
                     self.tasks.expire_finished(now);
+                    self.transfers.sweep(now);
                     if self.idle_expired(now) {
                         break;
                     }
@@ -319,11 +437,14 @@ impl Daemon {
     /// Stops the daemon when it has been idle for `idle_after` and exiting on idleness is what it
     /// was asked to do. Called under the gate, which is where idleness is read.
     fn idle_expired(&self, now: Instant) -> bool {
-        // Only `Tasks::idle` is called under the gate, and it takes the registry: gate, then
-        // registry, never the other way round.
+        // Only `Tasks::idle` and `Transfers::is_idle` are called under the gate; neither takes
+        // `gate` or `sessions`.
         let mut gate = lock(&self.gate);
-        let idle =
-            self.config.idle_exit && gate.handshaking == 0 && gate.live == 0 && self.tasks.idle();
+        let idle = self.config.idle_exit
+            && gate.handshaking == 0
+            && gate.live == 0
+            && self.tasks.idle()
+            && self.transfers.is_idle(now);
         if !idle {
             gate.idle_since = None;
             return false;
@@ -575,7 +696,7 @@ impl Daemon {
     /// Reads calls until the connection ends. The reader owns the stream: a read cancelled
     /// part-way through a frame ends that stream, and this loop with it.
     async fn read_loop(
-        &self,
+        self: &Arc<Self>,
         reader: &mut Reader,
         attached: &Attached,
         outgoing: &mpsc::UnboundedSender<Outgoing>,
@@ -612,7 +733,7 @@ impl Daemon {
                     match token {
                         Some(token) => {
                             tokio::spawn(run_call(
-                                Arc::clone(&self.service),
+                                Arc::clone(self),
                                 Arc::clone(&attached.session),
                                 attached.render,
                                 attached.token.clone(),
@@ -622,8 +743,6 @@ impl Daemon {
                                 arguments,
                                 Arc::clone(in_flight),
                                 outgoing.clone(),
-                                Arc::clone(&self.budget),
-                                Arc::clone(&self.reserved),
                             ));
                         }
                         None => {
@@ -715,7 +834,7 @@ impl Daemon {
 /// Runs one call: its progress frames while it waits, then its result within the budget.
 #[allow(clippy::too_many_arguments)]
 async fn run_call(
-    service: Arc<Service>,
+    daemon: Arc<Daemon>,
     session: Arc<Session>,
     render: Render,
     connection: CancellationToken,
@@ -725,8 +844,6 @@ async fn run_call(
     arguments: serde_json::Value,
     in_flight: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     outgoing: mpsc::UnboundedSender<Outgoing>,
-    budget: Arc<Semaphore>,
-    reserved: Arc<Semaphore>,
 ) {
     let management = tool == "exec"
         && matches!(
@@ -745,18 +862,33 @@ async fn run_call(
         nested: false,
         started: None,
     };
+    let transfer = session.launch.var("FASTEXEC_TRANSFER") == Some(std::ffi::OsStr::new("true"));
     let result = if tool == "exec" {
-        service.call_json(arguments, call).await
+        daemon.service.call_json(arguments, call).await
     } else if tool == "codemode" {
         match serde_json::from_value::<crate::codemode::Request>(arguments) {
-            Ok(request) => service.codemode(request, call, false).await,
+            Ok(request) => daemon.service.codemode(request, call, transfer).await,
             Err(problem) => error(problem.to_string()),
         }
+    } else if tool == "transfer" {
+        if !transfer {
+            crate::transfer_error(
+                "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
+                render,
+            )
+        } else {
+            match serde_json::from_value::<crate::transfer::Request>(arguments) {
+                Ok(request) => daemon.transfer(request, &session.launch, render).await,
+                Err(problem) => crate::transfer_error(
+                    format!("failed to deserialize parameters: {problem}"),
+                    render,
+                ),
+            }
+        }
     } else {
-        // A file tool runs in the daemon's own process, with the session's launch context and no
-        // HTTP session behind it.
+        // File tools run in the daemon process using the calling session's launch context.
         let launch = Arc::clone(&session.launch);
-        crate::files::call(&tool, arguments, launch, false, render).await
+        crate::files::call(&tool, arguments, launch, transfer, render).await
     };
     // The result goes out last. Aborting the forwarder is not enough on its own: one already
     // inside an encode or a send could still queue a frame after the result, so this waits for
@@ -788,9 +920,9 @@ async fn run_call(
     // A small `kill` or `list` result takes the reserved share; everything else, and any result
     // too large for that share, takes the main budget, which holds one whole frame.
     let (semaphore, capacity) = if management && length <= RESERVED {
-        (reserved, RESERVED)
+        (&daemon.reserved, RESERVED)
     } else {
-        (budget, BUDGET - RESERVED)
+        (&daemon.budget, BUDGET - RESERVED)
     };
     let want = u32::try_from(length.min(capacity)).unwrap_or(u32::MAX);
     let permit = tokio::select! {
@@ -801,7 +933,7 @@ async fn run_call(
             lock(&in_flight).remove(&id);
             return;
         }
-        permit = Arc::clone(&semaphore).acquire_many_owned(want) => match permit {
+        permit = Arc::clone(semaphore).acquire_many_owned(want) => match permit {
             Ok(permit) => permit,
             Err(_) => {
                 lock(&in_flight).remove(&id);
@@ -1092,24 +1224,37 @@ async fn serve_daemon(
             return 1;
         }
     };
-    let yolo = match crate::yolo() {
-        Ok(yolo) => yolo,
+    let tools = match crate::Tools::from_env() {
+        Ok(tools) => tools,
         Err(message) => {
             eprintln!("fastexec: {message}");
             return 1;
         }
     };
-    let codemode = match crate::codemode() {
-        Ok(codemode) => codemode,
-        Err(message) => {
-            eprintln!("fastexec: {message}");
-            return 1;
+    // Parsed only when `--http` or daemon-level `FASTEXEC_TRANSFER=true` uses it; a plain
+    // daemon with `transfer` off leaves `FASTEXEC_PUBLIC_URL` unread.
+    let public_root = if http.is_some() || tools.transfer {
+        match http::public_root() {
+            Ok(root) => root.map(Arc::from),
+            Err(message) => {
+                eprintln!("fastexec: {message}");
+                return 1;
+            }
         }
+    } else {
+        None
     };
     // The launch context is captured before the daemon leaves its starting directory, so HTTP
     // sessions keep that directory as the one a task starts in.
-    let (http_addr, http, config) = match http {
+    let (http_addr, http, startup_transfer, config) = match http {
         Some(value) => {
+            if std::env::var_os(crate::TRANSFER_ADDR).is_some() {
+                eprintln!(
+                    "fastexec: cannot set {} with --http; --http already serves /t/",
+                    crate::TRANSFER_ADDR
+                );
+                return 1;
+            }
             let addr = match crate::http_addr(&value) {
                 Ok(addr) => addr,
                 Err(message) => {
@@ -1122,15 +1267,6 @@ async fn serve_daemon(
                     .iter()
                     .map(|token| Sha256::digest(token.as_bytes()).into())
                     .collect(),
-                Err(message) => {
-                    eprintln!("fastexec: {message}");
-                    return 1;
-                }
-            };
-            // The root is parsed once here, before anything is bound: from now on the daemon mints
-            // every transfer URL from this value and the environment is never read again.
-            let public_root = match http::public_root() {
-                Ok(root) => root.map(Arc::from),
                 Err(message) => {
                     eprintln!("fastexec: {message}");
                     return 1;
@@ -1159,25 +1295,60 @@ async fn serve_daemon(
                     listener,
                     digests,
                     render,
-                    yolo,
-                    codemode,
+                    tools,
                     launch,
-                    public_root,
+                    public_root: public_root.clone(),
                 }),
+                None,
                 Config {
                     idle_exit: false,
                     ..Config::default()
                 },
             )
         }
-        None => (
-            None,
-            None,
-            Config {
-                idle_exit: idle_exit && !foreground,
-                ..Config::default()
-            },
-        ),
+        None => {
+            let startup_transfer = if tools.transfer {
+                match crate::transfer_addr() {
+                    Ok(Some(addr)) => {
+                        if let Err(message) = crate::check_routable_addr(
+                            crate::TRANSFER_ADDR,
+                            addr,
+                            public_root.is_some(),
+                        ) {
+                            eprintln!("fastexec: {message}");
+                            return 1;
+                        }
+                        let listener = match tokio::net::TcpListener::bind(addr).await {
+                            Ok(listener) => listener,
+                            Err(error) => {
+                                eprintln!(
+                                    "fastexec: cannot listen on {addr} for transfer: {error}"
+                                );
+                                return 1;
+                            }
+                        };
+                        let bound = listener.local_addr().unwrap_or(addr);
+                        Some((listener, bound))
+                    }
+                    Ok(None) => None,
+                    Err(message) => {
+                        eprintln!("fastexec: {message}");
+                        return 1;
+                    }
+                }
+            } else {
+                None
+            };
+            (
+                None,
+                None,
+                startup_transfer,
+                Config {
+                    idle_exit: idle_exit && !foreground,
+                    ..Config::default()
+                },
+            )
+        }
     };
     // The daemon leaves the directory it was started from: a Windows process holds that directory
     // open for its whole life, and a starter's checkout must stay removable.
@@ -1224,7 +1395,10 @@ async fn serve_daemon(
             None => std::future::pending::<()>().await,
         }
     };
-    let daemon = Daemon::with_config(tasks, namespace, build, http_addr, config);
+    let daemon = Daemon::with_config(tasks, namespace, build, http_addr, public_root, config);
+    if let Some((transfer_tcp, bound)) = startup_transfer {
+        daemon.attach_transfer_listener(transfer_tcp, bound);
+    }
     let mut run = std::pin::pin!(Arc::clone(&daemon).run(listener, http));
     let mut shutdown = std::pin::pin!(shutdown);
     if foreground {
@@ -1361,6 +1535,7 @@ mod tests {
             Tasks::new(Limits::OFF).unwrap(),
             "fastexec".to_owned(),
             env!("CARGO_PKG_VERSION").to_owned(),
+            None,
             None,
             config,
         );
@@ -1738,15 +1913,13 @@ mod tests {
             )),
         ));
         let (outgoing, mut queued) = mpsc::unbounded_channel();
-        let budget = Arc::new(Semaphore::new(BUDGET - RESERVED));
-        let reserved = Arc::new(Semaphore::new(RESERVED));
         // A connection that is already gone, with the budget ready: only the token decides.
         for id in 1..=32 {
             let connection = CancellationToken::new();
             connection.cancel();
             let in_flight = Arc::new(Mutex::new(HashMap::new()));
             run_call(
-                Arc::clone(&daemon.service()),
+                Arc::clone(daemon),
                 Arc::clone(&session),
                 Render {
                     output_mode: OutputMode::Text,
@@ -1759,8 +1932,6 @@ mod tests {
                 json!({"action": "list"}),
                 Arc::clone(&in_flight),
                 outgoing.clone(),
-                Arc::clone(&budget),
-                Arc::clone(&reserved),
             )
             .await;
             assert!(
@@ -2221,6 +2392,241 @@ mod tests {
             crate::transport::connect(endpoint.name()).await.is_err(),
             "the endpoint still accepts after the daemon exited"
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_transfer_keeps_an_idle_exit_daemon_running() {
+        let fixture = fixture_with_config(Config {
+            tick: Duration::from_millis(50),
+            idle_after: Duration::from_millis(200),
+            idle_exit: true,
+            ..Config::default()
+        });
+        let daemon = Arc::clone(&fixture.daemon);
+        daemon
+            .transfers()
+            .create(std::env::temp_dir().join("pinned.bin"))
+            .unwrap();
+        let created = Instant::now();
+        assert!(!daemon.idle_expired(created));
+        assert!(!daemon.idle_expired(created + Duration::from_secs(30)));
+        let expired = created + crate::transfer::IDLE;
+        // The first check after the capability expires starts the daemon's own idle window.
+        assert!(!daemon.idle_expired(expired));
+        assert!(daemon.idle_expired(expired + Duration::from_millis(200)));
+    }
+
+    #[tokio::test]
+    async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspecified_addrs() {
+        let fixture = fixture();
+        let daemon = Arc::clone(&fixture.daemon);
+        let dir = std::env::temp_dir().join(format!(
+            "fastexec-daemon-transfer-unit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let no_sc_render = Render {
+            output_mode: OutputMode::Text,
+            structured_content: false,
+        };
+        let plain_launch = Arc::new(LaunchContext::new(dir.clone(), Vec::new()));
+        let plain_session = Session::new("u1".into(), "u1".into(), Arc::clone(&plain_launch));
+        let (outgoing, mut queued) = mpsc::unbounded_channel();
+
+        // Raw IPC `"transfer"` on a session without `FASTEXEC_TRANSFER=true` is refused via `transfer_error`.
+        run_call(
+            Arc::clone(&daemon),
+            Arc::clone(&plain_session),
+            no_sc_render,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            1,
+            "transfer".into(),
+            json!({"path": "file.bin"}),
+            Arc::new(Mutex::new(HashMap::new())),
+            outgoing.clone(),
+        )
+        .await;
+        let disabled_frame = queued.recv().await.unwrap();
+        let mut cursor = std::io::Cursor::new(disabled_frame.bytes);
+        let Some(ToEndpoint::Result { result, .. }) =
+            ipc::read_frame::<_, ToEndpoint>(&mut cursor, ipc::RESPONSE_LIMIT)
+                .await
+                .unwrap()
+        else {
+            panic!("expected Result frame");
+        };
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.structured_content.is_none(),
+            "FASTEXEC_STRUCTURED_CONTENT=false suppresses structured_content"
+        );
+        assert_eq!(
+            result.content,
+            vec![ContentBlock::text(
+                "transfer is disabled; set FASTEXEC_TRANSFER=true."
+            )]
+        );
+        assert!(daemon.transfer_listener.get().is_none());
+
+        // Malformed arguments on an enabled session also honor `render` without binding `/t/`.
+        let enabled_launch = Arc::new(LaunchContext::new(
+            dir.clone(),
+            vec![("FASTEXEC_TRANSFER".into(), "true".into())],
+        ));
+        let enabled_session = Session::new("u2".into(), "u2".into(), Arc::clone(&enabled_launch));
+        run_call(
+            Arc::clone(&daemon),
+            Arc::clone(&enabled_session),
+            no_sc_render,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            2,
+            "transfer".into(),
+            json!({"unexpected": 1}),
+            Arc::new(Mutex::new(HashMap::new())),
+            outgoing,
+        )
+        .await;
+        let bad_args_frame = queued.recv().await.unwrap();
+        let mut cursor = std::io::Cursor::new(bad_args_frame.bytes);
+        let Some(ToEndpoint::Result { result, .. }) =
+            ipc::read_frame::<_, ToEndpoint>(&mut cursor, ipc::RESPONSE_LIMIT)
+                .await
+                .unwrap()
+        else {
+            panic!("expected Result frame");
+        };
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.is_none());
+        assert!(
+            result.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .starts_with("failed to deserialize parameters:")
+        );
+        assert!(daemon.transfer_listener.get().is_none());
+
+        let text_render = Render {
+            output_mode: OutputMode::Text,
+            structured_content: true,
+        };
+        // Passing a directory fails before `ensure_transfer_listener` binds any port.
+        let dir_result = daemon
+            .transfer(
+                crate::transfer::Request { path: ".".into() },
+                &enabled_launch,
+                text_render,
+            )
+            .await;
+        assert_eq!(dir_result.is_error, Some(true));
+        assert!(
+            daemon.transfer_listener.get().is_none(),
+            "directory target must not bind /t/ listener"
+        );
+
+        // Unspecified `0.0.0.0:0` without `FASTEXEC_PUBLIC_URL` fails before binding.
+        let unspec_no_root = Arc::new(LaunchContext::new(
+            dir.clone(),
+            vec![
+                ("FASTEXEC_TRANSFER".into(), "true".into()),
+                ("FASTEXEC_HTTP_ALLOW_REMOTE".into(), "1".into()),
+                ("FASTEXEC_TRANSFER_ADDR".into(), "0.0.0.0:0".into()),
+            ],
+        ));
+        let unspec_err = daemon
+            .transfer(
+                crate::transfer::Request {
+                    path: "ok.bin".into(),
+                },
+                &unspec_no_root,
+                text_render,
+            )
+            .await;
+        assert_eq!(unspec_err.is_error, Some(true));
+        assert!(
+            unspec_err.structured_content.as_ref().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("is an unspecified address; set FASTEXEC_PUBLIC_URL")
+        );
+        assert!(daemon.transfer_listener.get().is_none());
+
+        // Valid mint binds `127.0.0.1:<port>`, and subsequent `0.0.0.0:0` (even with port 0 and
+        // `FASTEXEC_PUBLIC_URL`) is rejected due to IP mismatch.
+        let minted = daemon
+            .transfer(
+                crate::transfer::Request {
+                    path: "ok.bin".into(),
+                },
+                &enabled_launch,
+                text_render,
+            )
+            .await;
+        assert_eq!(minted.is_error, Some(false));
+        let bound = *daemon.transfer_listener.get().expect("listener bound");
+        assert_eq!(bound.ip(), std::net::Ipv4Addr::LOCALHOST);
+
+        let conflict_launch = Arc::new(LaunchContext::new(
+            dir.clone(),
+            vec![
+                ("FASTEXEC_TRANSFER".into(), "true".into()),
+                ("FASTEXEC_HTTP_ALLOW_REMOTE".into(), "1".into()),
+                ("FASTEXEC_TRANSFER_ADDR".into(), "0.0.0.0:0".into()),
+                (
+                    "FASTEXEC_PUBLIC_URL".into(),
+                    "https://files.example/".into(),
+                ),
+            ],
+        ));
+        let conflict = daemon
+            .transfer(
+                crate::transfer::Request {
+                    path: "other.bin".into(),
+                },
+                &conflict_launch,
+                text_render,
+            )
+            .await;
+        assert_eq!(conflict.is_error, Some(true));
+        assert_eq!(
+            conflict.structured_content.as_ref().unwrap()["error"],
+            json!(format!(
+                "the daemon already serves /t/ on {bound}, not 0.0.0.0:0; stop it first"
+            ))
+        );
+
+        daemon.stop();
+
+        // `--http 0.0.0.0:<port>` without `FASTEXEC_PUBLIC_URL` refuses stdio `Daemon::transfer`.
+        let http_wildcard = Daemon::with_config(
+            Arc::clone(&daemon.tasks),
+            "fastexec".into(),
+            env!("CARGO_PKG_VERSION").into(),
+            Some("0.0.0.0:8765".into()),
+            None,
+            Config::default(),
+        );
+        let wildcard_err = http_wildcard
+            .transfer(
+                crate::transfer::Request {
+                    path: "ok.bin".into(),
+                },
+                &enabled_launch,
+                text_render,
+            )
+            .await;
+        assert_eq!(wildcard_err.is_error, Some(true));
+        assert_eq!(
+            wildcard_err.structured_content.as_ref().unwrap()["error"],
+            json!(
+                "--http 0.0.0.0:8765 is an unspecified address; set FASTEXEC_PUBLIC_URL to the URL clients reach"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

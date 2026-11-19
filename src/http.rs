@@ -5,7 +5,7 @@ use crate::daemon::Daemon;
 use crate::service::Render;
 use crate::session::{LaunchContext, Session};
 use crate::transfer::{self, Admitted, Transfers};
-use crate::{Backend, Server};
+use crate::{Backend, Server, Tools, TransferEndpoint};
 use bytes::Bytes;
 use http::header::HeaderName;
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
@@ -49,10 +49,8 @@ pub struct Http {
     pub digests: Vec<[u8; 32]>,
     /// How results are rendered for the sessions this listener serves.
     pub render: Render,
-    /// Whether all tools are advertised as read-only via `FASTEXEC_YOLO`.
-    pub yolo: bool,
-    /// Whether HTTP sessions advertise the codemode tool.
-    pub codemode: bool,
+    /// Which optional tools and annotation overrides HTTP sessions advertise.
+    pub tools: Tools,
     /// What the sessions this listener serves inherit: captured before the daemon leaves the
     /// directory it was started in.
     pub launch: Arc<LaunchContext>,
@@ -70,7 +68,7 @@ pub fn public_root() -> Result<Option<String>, String> {
 
 /// [`public_root`] over a value that is already in hand, so the unset, the valid, the empty and
 /// the non-UTF-8 cases are all one function.
-fn root_of(value: Option<&std::ffi::OsStr>) -> Result<Option<String>, String> {
+pub(crate) fn root_of(value: Option<&std::ffi::OsStr>) -> Result<Option<String>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -209,16 +207,15 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         listener,
         digests,
         render,
-        yolo,
-        codemode,
+        tools,
         launch,
         public_root,
     } = http;
     // The factory makes a server for each legacy session or inline-lifecycle request.
     let service = Arc::clone(&daemon.service());
-    // One table for this listener: the factory hands it to every session, so a URL a session
-    // makes is served by the same route that carries the requests.
-    let table = Arc::new(Transfers::new());
+    // Shared with the daemon so both HTTP sessions and stdio endpoints connected to it serve
+    // capabilities through this `/t/` route.
+    let table = daemon.transfers();
     let principals: Arc<[Arc<Session>]> = (0..digests.len())
         .map(|index| {
             let id = format!("t{}", index + 1);
@@ -241,14 +238,11 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
                 launch: Arc::clone(&launch),
                 daemon: true,
             };
-            let mut server = Server::new(
-                backend,
-                &launch,
-                Some(Arc::clone(&table)),
-                public_root.clone(),
-                yolo,
-                codemode,
-            );
+            let transfer = tools.transfer.then(|| TransferEndpoint::Http {
+                table: Arc::clone(&table),
+                public_root: public_root.clone(),
+            });
+            let mut server = Server::new(backend, &launch, transfer, tools);
             server.principals = Some(Arc::clone(&principals));
             Ok(server)
         }
@@ -287,6 +281,26 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         table,
         inner,
     };
+    serve_connections(listener, layer, stopped).await;
+}
+
+/// Serves `/t/` capabilities on `listener` until `stopped` is cancelled.
+pub async fn serve_transfers(
+    listener: TcpListener,
+    table: Arc<Transfers>,
+    stopped: CancellationToken,
+) {
+    serve_connections(listener, TransferOnly { table }, stopped).await;
+}
+
+async fn serve_connections<S>(listener: TcpListener, service: S, stopped: CancellationToken)
+where
+    S: tower_service::Service<Request<Incoming>, Response = Reply, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
@@ -305,7 +319,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
                 let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
                     continue;
                 };
-                let layer = layer.clone();
+                let service = service.clone();
                 let stopped = stopped.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -314,7 +328,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
                     let served = tokio::select! {
                         _ = stopped.cancelled() => return,
                         served = builder.serve_connection(
-                            TokioIo::new(stream), TowerToHyperService::new(layer)
+                            TokioIo::new(stream), TowerToHyperService::new(service)
                         ) => served,
                     };
                     // Malformed or abandoned unauthenticated requests are ordinary client
@@ -327,6 +341,31 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
                 });
             }
         }
+    }
+}
+
+#[derive(Clone)]
+struct TransferOnly {
+    table: Arc<Transfers>,
+}
+
+impl tower_service::Service<Request<Incoming>> for TransferOnly {
+    type Response = Reply;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Reply, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Incoming>) -> Self::Future {
+        let table = Arc::clone(&self.table);
+        Box::pin(async move {
+            if request.uri().path().starts_with("/t/") {
+                return Ok(serve_transfer(request, table).await);
+            }
+            Ok(refusal(StatusCode::NOT_FOUND, ""))
+        })
     }
 }
 

@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 #[cfg(any(windows, target_os = "freebsd"))]
 #[path = "support/private_runtime.rs"]
 mod private_runtime;
+#[path = "support/transfer_http.rs"]
+mod transfer_http;
 
 struct Server {
     child: Child,
@@ -63,6 +65,9 @@ impl Server {
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
             .env_remove("FASTEXEC_YOLO")
             .env_remove("FASTEXEC_CODEMODE")
+            .env_remove("FASTEXEC_TRANSFER")
+            .env_remove("FASTEXEC_TRANSFER_ADDR")
+            .env_remove("FASTEXEC_PUBLIC_URL")
             .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT");
         configure(&mut command);
         let mut child = command
@@ -115,6 +120,99 @@ impl Server {
         );
         server.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         server
+    }
+
+    /// Like [`Server::start_with`], returning `Err(stderr)` if the process exits before answering
+    /// `initialize` (for example, when a probed `FASTEXEC_TRANSFER_ADDR` raced with another test).
+    fn try_start_with(configure: impl FnOnce(&mut Command)) -> Result<Server, String> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        command
+            .env_remove("FASTEXEC_OUTPUT_MODE")
+            .env_remove("FASTEXEC_DAEMON")
+            .env_remove("FASTEXEC_NAMESPACE")
+            .env_remove("FASTEXEC_TEST_RUNTIME_DIR")
+            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_YOLO")
+            .env_remove("FASTEXEC_CODEMODE")
+            .env_remove("FASTEXEC_TRANSFER")
+            .env_remove("FASTEXEC_TRANSFER_ADDR")
+            .env_remove("FASTEXEC_PUBLIC_URL")
+            .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT");
+        configure(&mut command);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn fastexec");
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}})
+        );
+        let _ = stdin.flush();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut first_line = String::new();
+        match reader.read_line(&mut first_line) {
+            Ok(0) => {
+                drop(stdin);
+                let output = child.wait_with_output().expect("wait failed fastexec");
+                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+            }
+            Ok(_) => {
+                let init: Value = serde_json::from_str(&first_line).unwrap_or_else(|error| {
+                    panic!("invalid initialize JSON {error}: {first_line:?}")
+                });
+                assert!(init.get("error").is_none(), "{init}");
+            }
+            Err(error) => {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+        }
+        if let Some(mut stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+            });
+        }
+        let (tx, lines) = channel();
+        std::thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = tx.send(json!({"__stdout_ended": "end of file"}));
+                        return;
+                    }
+                    Ok(_) => match serde_json::from_str(&line) {
+                        Ok(value) => {
+                            let _ = tx.send(value);
+                        }
+                        Err(error) => {
+                            let _ = tx.send(json!({"__stdout_ended": format!("invalid JSON: {error}: {line:?}")}));
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        let _ = tx.send(json!({"__stdout_ended": format!("{error}")}));
+                        return;
+                    }
+                }
+            }
+        });
+        let mut server = Server {
+            child,
+            stdin: Some(stdin),
+            lines,
+            next_id: 1,
+            pending_messages: Vec::new(),
+            started: Vec::new(),
+        };
+        server.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        Ok(server)
     }
 
     fn send(&mut self, message: Value) {
@@ -508,6 +606,7 @@ fn output_modes_place_start_and_poll_body_without_losing_metadata() {
         .env_remove("FASTEXEC_STRUCTURED_CONTENT")
         .env_remove("FASTEXEC_YOLO")
         .env_remove("FASTEXEC_CODEMODE")
+        .env_remove("FASTEXEC_TRANSFER")
         .env("FASTEXEC_OUTPUT_MODE", "bogus")
         .output()
         .unwrap();
@@ -587,6 +686,7 @@ fn structured_content_can_be_disabled_for_every_action() {
     let result = Command::new(env!("CARGO_BIN_EXE_fastexec"))
         .env_remove("FASTEXEC_YOLO")
         .env_remove("FASTEXEC_CODEMODE")
+        .env_remove("FASTEXEC_TRANSFER")
         .env("FASTEXEC_OUTPUT_MODE", "text")
         .env("FASTEXEC_STRUCTURED_CONTENT", "bogus")
         .output()
@@ -1005,7 +1105,7 @@ fn the_listed_tool_says_which_host_it_runs_on() {
         .collect();
     names.sort_unstable();
     assert_eq!(names, ["edit", "exec", "read", "write"], "{listed}");
-    // A stdio session has no route to serve a URL from, so `transfer` is not even a tool here.
+    // `transfer` is off unless `FASTEXEC_TRANSFER=true`, so it is not listed by default.
     let refused = server.request(
         "tools/call",
         json!({"name": "transfer", "arguments": {"path": "notes/a.txt"}}),
@@ -4229,6 +4329,7 @@ fn daemon_command(exe: &str, runtime: &std::path::Path, namespace: &str, action:
         .env("FASTEXEC_NAMESPACE", namespace)
         .env_remove("FASTEXEC_YOLO")
         .env_remove("FASTEXEC_CODEMODE")
+        .env_remove("FASTEXEC_TRANSFER")
         .stdin(Stdio::null());
     command
 }
@@ -5139,6 +5240,8 @@ fn yolo_overrides_stdio_tool_annotations_and_rejects_invalid_values() {
             .env_remove("FASTEXEC_DAEMON")
             .env_remove("FASTEXEC_OUTPUT_MODE")
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_CODEMODE")
+            .env_remove("FASTEXEC_TRANSFER")
             .env("FASTEXEC_YOLO", &bad)
             .stdin(Stdio::null())
             .output()
@@ -5284,6 +5387,7 @@ fn codemode_requires_explicit_enable_and_respects_yolo() {
             .env_remove("FASTEXEC_OUTPUT_MODE")
             .env_remove("FASTEXEC_STRUCTURED_CONTENT")
             .env_remove("FASTEXEC_YOLO")
+            .env_remove("FASTEXEC_TRANSFER")
             .env("FASTEXEC_CODEMODE", bad)
             .stdin(Stdio::null())
             .output()
@@ -7942,5 +8046,316 @@ fn p1_1_login_environment_snapshot_bash_cache_and_fallbacks() {
             1,
             "bash --version must run once per session: {v_lines:?}"
         );
+    }
+}
+
+#[test]
+fn transfer_over_local_stdio_serves_put_head_get_and_validates_settings() {
+    let dir = Scratch::new("stdio-transfer");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let blob = dir.join("blob.bin");
+    std::fs::write(&blob, [0u8, 1, 2, 3]).unwrap();
+
+    // Off by default and when explicitly false; unused transfer env vars are not read.
+    for setting in [None, Some("false")] {
+        let mut server = Server::start_with(|command| {
+            command
+                .current_dir(&*dir)
+                .env("FASTEXEC_PUBLIC_URL", "not-a-url")
+                .env("FASTEXEC_TRANSFER_ADDR", "not-an-addr");
+            if let Some(value) = setting {
+                command.env("FASTEXEC_TRANSFER", value);
+            }
+        });
+        let listed = server.request("tools/list", json!({}));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4, "{listed}");
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == "transfer"),
+            "{listed}"
+        );
+        let refused = server.request(
+            "tools/call",
+            json!({"name": "transfer", "arguments": {"path": "blob.bin"}}),
+        );
+        assert_eq!(refused["error"]["message"], "tool not found", "{refused}");
+        let read_bin = server.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "blob.bin"}}),
+        )["result"]
+            .clone();
+        assert_eq!(read_bin["isError"], true, "{read_bin}");
+        let msg = read_bin["content"][0]["text"].as_str().unwrap();
+        assert!(msg.ends_with("Inspect it with exec."), "{msg}");
+        assert!(!msg.contains("download it with transfer"), "{msg}");
+    }
+
+    // Enabled on local stdio with default and YOLO annotations, binary hint linkage, and PUT/HEAD/GET.
+    for yolo in [false, true] {
+        let mut server = Server::start_with(|command| {
+            command
+                .current_dir(&*dir)
+                .env("FASTEXEC_TRANSFER", "true")
+                .env("FASTEXEC_CODEMODE", "true")
+                .env("FASTEXEC_YOLO", yolo.to_string());
+        });
+        let listed = server.request("tools/list", json!({}));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 6, "{listed}");
+        let transfer = tools
+            .iter()
+            .find(|tool| tool["name"] == "transfer")
+            .unwrap();
+        if yolo {
+            assert_eq!(
+                transfer["annotations"],
+                json!({
+                    "title": "Transfer file",
+                    "readOnlyHint": true,
+                    "destructiveHint": false,
+                    "idempotentHint": false,
+                    "openWorldHint": false,
+                }),
+                "{transfer}"
+            );
+        } else {
+            assert_eq!(
+                transfer["annotations"],
+                json!({
+                    "title": "Transfer file",
+                    "destructiveHint": true,
+                    "openWorldHint": true,
+                }),
+                "{transfer}"
+            );
+        }
+
+        let read_bin = server.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "blob.bin"}}),
+        )["result"]
+            .clone();
+        assert!(
+            read_bin["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Inspect it with exec or download it with transfer."),
+            "{read_bin}"
+        );
+        let cm_bin = code_result(
+            &mut server,
+            json!({"code": "try { await tools.read({path: 'blob.bin'}); return 'ok'; } catch (e) { return e.message; }"}),
+        );
+        assert!(
+            code_text(&cm_bin).contains("download it with transfer"),
+            "{cm_bin}"
+        );
+
+        let target_name = format!("roundtrip-{yolo}.bin");
+        let minted = server.request(
+            "tools/call",
+            json!({"name": "transfer", "arguments": {"path": &target_name}}),
+        )["result"]
+            .clone();
+        assert_eq!(minted["isError"], false, "{minted}");
+        let url = minted["structuredContent"]["url"].as_str().unwrap();
+        let rest = url.strip_prefix("http://").expect("http:// URL");
+        let (authority, path_part) = rest.split_once('/').unwrap();
+        let addr: std::net::SocketAddr = authority.parse().unwrap();
+        let target = format!("/{path_part}");
+
+        let (status, headers, _) = transfer_http::send(addr, "HEAD", &target, b"");
+        assert_eq!(status, 200);
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "content-length" && v == "0")
+        );
+
+        let (status, _, body) =
+            transfer_http::send(addr, "PUT", &format!("{target}?offset=0"), b"");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"0");
+
+        let payload = b"stdio-transfer-payload";
+        let (status, _, body) = transfer_http::send(addr, "PUT", &target, payload);
+        assert_eq!(status, 200);
+        assert_eq!(body, payload.len().to_string().as_bytes());
+
+        let (status, headers, _) = transfer_http::send(addr, "HEAD", &target, b"");
+        assert_eq!(status, 200);
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "content-length" && v == &payload.len().to_string())
+        );
+
+        let (status, _, downloaded) = transfer_http::send(addr, "GET", &target, b"");
+        assert_eq!(status, 200);
+        assert_eq!(downloaded, payload);
+        assert_eq!(std::fs::read(dir.join(&target_name)).unwrap(), payload);
+
+        let (not_found, _, _) = transfer_http::send(addr, "GET", "/mcp", b"");
+        assert_eq!(not_found, 404);
+    }
+
+    // FASTEXEC_TRANSFER_ADDR + FASTEXEC_PUBLIC_URL bind the fixed port while minting under the public root.
+    let (fixed_addr, mut proxied) = (0..8)
+        .find_map(|attempt| {
+            let candidate = transfer_http::free_loopback_addr();
+            match Server::try_start_with(|command| {
+                command
+                    .current_dir(&*dir)
+                    .env("FASTEXEC_TRANSFER", "true")
+                    .env("FASTEXEC_TRANSFER_ADDR", candidate.to_string())
+                    .env("FASTEXEC_PUBLIC_URL", "https://files.example/stdio");
+            }) {
+                Ok(server) => Some((candidate, server)),
+                Err(stderr) if attempt < 7 && stderr.contains("cannot listen on") => None,
+                Err(stderr) => panic!("failed to start proxied stdio server: {stderr}"),
+            }
+        })
+        .expect("bound fixed loopback port for stdio transfer");
+    let minted = proxied.request(
+        "tools/call",
+        json!({"name": "transfer", "arguments": {"path": "proxied.bin"}}),
+    )["result"]
+        .clone();
+    assert_eq!(minted["isError"], false, "{minted}");
+    let url = minted["structuredContent"]["url"].as_str().unwrap();
+    let id = url
+        .strip_prefix("https://files.example/stdio/t/")
+        .unwrap_or_else(|| panic!("unexpected proxied URL: {url}"));
+    let target = format!("/t/{id}");
+    assert_eq!(
+        transfer_http::send(fixed_addr, "PUT", &format!("{target}?offset=0"), b"").0,
+        200
+    );
+    assert_eq!(
+        transfer_http::send(fixed_addr, "PUT", &target, b"via-proxy").0,
+        200
+    );
+    assert_eq!(
+        transfer_http::send(fixed_addr, "GET", &target, b"").2,
+        b"via-proxy"
+    );
+    drop(proxied);
+
+    // Wildcard FASTEXEC_TRANSFER_ADDR=0.0.0.0:0 with FASTEXEC_HTTP_ALLOW_REMOTE=1 requires FASTEXEC_PUBLIC_URL.
+    let wildcard_without_root = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+        .env_remove("FASTEXEC_DAEMON")
+        .env_remove("FASTEXEC_OUTPUT_MODE")
+        .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+        .env_remove("FASTEXEC_YOLO")
+        .env_remove("FASTEXEC_CODEMODE")
+        .env_remove("FASTEXEC_PUBLIC_URL")
+        .env("FASTEXEC_TRANSFER", "true")
+        .env("FASTEXEC_HTTP_ALLOW_REMOTE", "1")
+        .env("FASTEXEC_TRANSFER_ADDR", "0.0.0.0:0")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(wildcard_without_root.status.code(), Some(1));
+    let wildcard_err = String::from_utf8_lossy(&wildcard_without_root.stderr);
+    assert!(
+        wildcard_err.contains(
+            "FASTEXEC_TRANSFER_ADDR 0.0.0.0:0 is an unspecified address; set FASTEXEC_PUBLIC_URL"
+        ),
+        "{wildcard_err:?}"
+    );
+
+    let mut wildcard_with_root = Server::start_with(|command| {
+        command
+            .current_dir(&*dir)
+            .env("FASTEXEC_TRANSFER", "true")
+            .env("FASTEXEC_HTTP_ALLOW_REMOTE", "1")
+            .env("FASTEXEC_TRANSFER_ADDR", "0.0.0.0:0")
+            .env("FASTEXEC_PUBLIC_URL", "https://files.example/");
+    });
+    let wildcard_minted = wildcard_with_root.request(
+        "tools/call",
+        json!({"name": "transfer", "arguments": {"path": "wildcard.bin"}}),
+    )["result"]
+        .clone();
+    assert_eq!(wildcard_minted["isError"], false, "{wildcard_minted}");
+    assert!(
+        wildcard_minted["structuredContent"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://files.example/t/"),
+        "{wildcard_minted}"
+    );
+    drop(wildcard_with_root);
+
+    // Invalid FASTEXEC_TRANSFER, FASTEXEC_PUBLIC_URL, and FASTEXEC_TRANSFER_ADDR fail startup with exit 1.
+    let mut invalid: Vec<std::ffi::OsString> = ["", "on", "off", "1", "0", "bogus"]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        invalid.push(std::ffi::OsString::from_vec(vec![0xff]));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        invalid.push(std::ffi::OsString::from_wide(&[0xD800]));
+    }
+    for bad in invalid {
+        let output = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+            .env_remove("FASTEXEC_DAEMON")
+            .env_remove("FASTEXEC_OUTPUT_MODE")
+            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_YOLO")
+            .env_remove("FASTEXEC_CODEMODE")
+            .env_remove("FASTEXEC_TRANSFER_ADDR")
+            .env_remove("FASTEXEC_PUBLIC_URL")
+            .env("FASTEXEC_TRANSFER", &bad)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{bad:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("fastexec: invalid FASTEXEC_TRANSFER ")
+                && stderr.contains("; expected true or false"),
+            "{bad:?}: {stderr:?}"
+        );
+    }
+    for (var, bad, expected) in [
+        (
+            "FASTEXEC_PUBLIC_URL",
+            "ftp://bad.example/",
+            "FASTEXEC_PUBLIC_URL",
+        ),
+        (
+            "FASTEXEC_TRANSFER_ADDR",
+            "typo",
+            "FASTEXEC_TRANSFER_ADDR typo is not an address",
+        ),
+        (
+            "FASTEXEC_TRANSFER_ADDR",
+            "0.0.0.0:0",
+            "FASTEXEC_TRANSFER_ADDR 0.0.0.0:0 is not a loopback address",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+            .env_remove("FASTEXEC_DAEMON")
+            .env_remove("FASTEXEC_HTTP_ALLOW_REMOTE")
+            .env_remove("FASTEXEC_OUTPUT_MODE")
+            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
+            .env_remove("FASTEXEC_YOLO")
+            .env_remove("FASTEXEC_CODEMODE")
+            .env_remove("FASTEXEC_TRANSFER_ADDR")
+            .env_remove("FASTEXEC_PUBLIC_URL")
+            .env("FASTEXEC_TRANSFER", "true")
+            .env(var, bad)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{var}={bad}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{var}={bad}: {stderr:?}");
     }
 }

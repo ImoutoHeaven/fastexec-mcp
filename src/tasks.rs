@@ -666,7 +666,7 @@ pub(crate) struct ScriptArgs {
     pub code: String,
     pub launch: Arc<LaunchContext>,
     pub kill_after_ms: Option<u64>,
-    pub http: bool,
+    pub transfer: bool,
     pub call_id: Option<u64>,
     pub service: Arc<crate::service::Service>,
 }
@@ -1152,7 +1152,7 @@ impl Tasks {
             service: args.service,
             session: Arc::clone(session),
             launch: args.launch,
-            http: args.http,
+            transfer: args.transfer,
             call_id: args.call_id,
             code: args.code,
             writer,
@@ -3948,7 +3948,7 @@ mod script_tests {
             code: "return undefined".into(),
             launch: Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new())),
             kill_after_ms: None,
-            http: false,
+            transfer: false,
             call_id: None,
             service: Arc::new(crate::service::Service::new(Arc::clone(tasks), false)),
         }

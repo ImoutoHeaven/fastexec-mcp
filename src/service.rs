@@ -572,11 +572,11 @@ impl Service {
         self: &Arc<Self>,
         request: codemode::Request,
         mut call: Call<'_>,
-        http: bool,
+        transfer: bool,
     ) -> CallToolResult {
         self.tasks.prune_entries(call.session);
         call.render = call.render.effective();
-        let result = match self.start_script(request, &call, http).await {
+        let result = match self.start_script(request, &call, transfer).await {
             Ok(result) => result,
             Err(message) => codemode_error(&message),
         };
@@ -587,7 +587,7 @@ impl Service {
         self: &Arc<Self>,
         request: codemode::Request,
         call: &Call<'_>,
-        http: bool,
+        transfer: bool,
     ) -> Result<CallToolResult, String> {
         let base_launch = call.launch();
         let (start, resolved_cwd) = codemode::validate(&request, base_launch)?;
@@ -600,7 +600,7 @@ impl Service {
             code: request.code,
             launch,
             kill_after_ms: start.kill_after_ms,
-            http,
+            transfer,
             call_id: call.call_id,
             service: Arc::clone(self),
         };

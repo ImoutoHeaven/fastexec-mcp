@@ -24,6 +24,9 @@ impl Server {
             "FASTEXEC_NAMESPACE",
             "FASTEXEC_BASH",
             "FASTEXEC_YOLO",
+            "FASTEXEC_TRANSFER",
+            "FASTEXEC_TRANSFER_ADDR",
+            "FASTEXEC_PUBLIC_URL",
             "FASTEXEC_TEST_RUNTIME_DIR",
             "FASTEXEC_TEST_TOTAL_LOG_LIMIT",
         ] {
@@ -360,6 +363,9 @@ fn p0_1_and_p1_6_windows_and_nul_preservation_hold_direct_and_nested() {
         "FASTEXEC_NAMESPACE",
         "FASTEXEC_BASH",
         "FASTEXEC_YOLO",
+        "FASTEXEC_TRANSFER",
+        "FASTEXEC_TRANSFER_ADDR",
+        "FASTEXEC_PUBLIC_URL",
         "FASTEXEC_TEST_RUNTIME_DIR",
         "FASTEXEC_TEST_TOTAL_LOG_LIMIT",
     ] {

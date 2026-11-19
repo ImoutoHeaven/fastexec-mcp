@@ -274,7 +274,7 @@ pub struct Work {
     pub service: Arc<Service>,
     pub session: Arc<Session>,
     pub launch: Arc<LaunchContext>,
-    pub http: bool,
+    pub transfer: bool,
     pub call_id: Option<u64>,
     pub code: String,
     pub writer: PipeWriter,
@@ -365,7 +365,7 @@ struct Host {
     service: Arc<Service>,
     session: Arc<Session>,
     launch: Arc<LaunchContext>,
-    http: bool,
+    transfer: bool,
     call_id: Option<u64>,
     runtime: Handle,
     script: ScriptHandle,
@@ -543,7 +543,7 @@ impl Host {
         let launch = Arc::clone(&self.launch);
         let script = self.script.clone();
         let in_flight = InFlightGuard::enter(script.clone());
-        let http = self.http;
+        let transfer = self.transfer;
         let call_id = self.call_id;
         let cancel = script.0.cancel.child_token();
         let nested_render = Render {
@@ -598,7 +598,7 @@ impl Host {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        result = files::read_nested(request, launch, http, nested_render, permit, read_cancel) => result,
+                        result = files::read_nested(request, launch, transfer, nested_render, permit, read_cancel) => result,
                     }
                 }
                 ToolCall::Write(request) => {
@@ -723,7 +723,7 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
         service,
         session,
         launch,
-        http,
+        transfer,
         call_id,
         code,
         writer,
@@ -741,7 +741,7 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
         service,
         session,
         launch,
-        http,
+        transfer,
         call_id,
         runtime,
         script: script.clone(),
@@ -1916,7 +1916,7 @@ mod tests {
                         code: code.into(),
                         launch: Arc::clone(&self.session.launch),
                         kill_after_ms: deadline,
-                        http: false,
+                        transfer: false,
                         call_id: None,
                         service: Arc::clone(&self.service),
                     },
@@ -2009,7 +2009,7 @@ mod tests {
             service: Arc::clone(&fixture.service),
             session: Arc::clone(&fixture.session),
             launch: Arc::clone(&fixture.session.launch),
-            http: false,
+            transfer: false,
             call_id: None,
             runtime,
             script: script.clone(),

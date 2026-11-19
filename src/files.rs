@@ -117,12 +117,12 @@ pub async fn call(
     tool: &str,
     arguments: Value,
     launch: Arc<LaunchContext>,
-    http: bool,
+    transfer: bool,
     render: Render,
 ) -> CallToolResult {
     match tool {
         "read" => match serde_json::from_value::<ReadRequest>(arguments) {
-            Ok(request) => read(request, launch, http, render).await,
+            Ok(request) => read(request, launch, transfer, render).await,
             Err(error) => schema_failed(format!("failed to deserialize parameters: {error}")),
         },
         "write" => match serde_json::from_value::<WriteRequest>(arguments) {
@@ -141,10 +141,10 @@ pub async fn call(
 pub async fn read(
     request: ReadRequest,
     launch: Arc<LaunchContext>,
-    http: bool,
+    transfer: bool,
     render: Render,
 ) -> CallToolResult {
-    read_with_limits(request, launch, http, render, ReadLimits::DIRECT).await
+    read_with_limits(request, launch, transfer, render, ReadLimits::DIRECT).await
 }
 
 /// Reads one file for an in-process codemode script: whole-file when neither `offset` nor
@@ -153,7 +153,7 @@ pub async fn read(
 pub(crate) async fn read_nested(
     request: ReadRequest,
     launch: Arc<LaunchContext>,
-    http: bool,
+    transfer: bool,
     render: Render,
     permit: tokio::sync::OwnedSemaphorePermit,
     cancel: tokio_util::sync::CancellationToken,
@@ -161,7 +161,7 @@ pub(crate) async fn read_nested(
     read_with_limits_and_permit(
         request,
         launch,
-        http,
+        transfer,
         render,
         ReadLimits::NESTED,
         Some(permit),
@@ -173,17 +173,17 @@ pub(crate) async fn read_nested(
 async fn read_with_limits(
     request: ReadRequest,
     launch: Arc<LaunchContext>,
-    http: bool,
+    transfer: bool,
     render: Render,
     limits: ReadLimits,
 ) -> CallToolResult {
-    read_with_limits_and_permit(request, launch, http, render, limits, None, None).await
+    read_with_limits_and_permit(request, launch, transfer, render, limits, None, None).await
 }
 
 async fn read_with_limits_and_permit(
     request: ReadRequest,
     launch: Arc<LaunchContext>,
-    http: bool,
+    transfer: bool,
     render: Render,
     limits: ReadLimits,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -192,7 +192,7 @@ async fn read_with_limits_and_permit(
     let effective = render.effective();
     let result = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        read_text_cancellable(&request, &launch, http, limits, cancel.as_ref())
+        read_text_cancellable(&request, &launch, transfer, limits, cancel.as_ref())
     })
     .await
     {
@@ -544,10 +544,10 @@ pub(crate) fn resolve_from(path: &Path, base: &Path) -> Result<PathBuf, String> 
 fn read_text(
     request: &ReadRequest,
     launch: &LaunchContext,
-    http: bool,
+    transfer: bool,
     limits: ReadLimits,
 ) -> Result<Outcome, String> {
-    read_text_cancellable(request, launch, http, limits, None)
+    read_text_cancellable(request, launch, transfer, limits, None)
 }
 
 fn count_lines_streaming(
@@ -586,7 +586,7 @@ fn bytecount_lf(bytes: &[u8]) -> u64 {
 fn read_text_cancellable(
     request: &ReadRequest,
     launch: &LaunchContext,
-    http: bool,
+    transfer: bool,
     limits: ReadLimits,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<Outcome, String> {
@@ -633,7 +633,7 @@ fn read_text_cancellable(
         });
     }
     if sniff[..sniffed].contains(&0) {
-        let hint = if http {
+        let hint = if transfer {
             " Inspect it with exec or download it with transfer."
         } else {
             " Inspect it with exec."
@@ -3327,7 +3327,7 @@ mod tests {
         )
     }
 
-    fn whole(path: &str, launch: &LaunchContext, http: bool) -> Result<String, String> {
+    fn whole(path: &str, launch: &LaunchContext, transfer: bool) -> Result<String, String> {
         read_text(
             &ReadRequest {
                 path: path.to_owned(),
@@ -3335,7 +3335,7 @@ mod tests {
                 limit: None,
             },
             launch,
-            http,
+            transfer,
             ReadLimits::DIRECT,
         )
         .map(|outcome| outcome.text)

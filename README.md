@@ -57,9 +57,9 @@ Hosts without progress-aware timeouts need at least 300 seconds per tool call.
 ## Tool Usage and Example
 
 The server exposes `exec` for bash tasks and `read`, `write`, and `edit` for
-files; an HTTP session also gets `transfer`. Pi names each tool
-`mcp__<server>__<tool>`, where `<server>` is the key in the configuration, so
-the entry above gives `mcp__fastexec_local__exec`.
+files. Set `FASTEXEC_TRANSFER=true` to expose `transfer` as well. Pi names each
+tool `mcp__<server>__<tool>`, where `<server>` is the key in the configuration,
+so the entry above gives `mcp__fastexec_local__exec`.
 
 `exec` selects an operation with its `action` field (`start`, `poll`, `kill`,
 `list`, `transcript`)—these are MCP tool arguments, not CLI subcommands. See
@@ -149,15 +149,18 @@ bound the script's lifetime.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `FASTEXEC_CODEMODE` | `false` | Exposes the JavaScript tool when `true`. |
-| `FASTEXEC_YOLO` | `false` | Overrides annotations on all exposed tools, including codemode. |
+| `FASTEXEC_TRANSFER` | `false` | Exposes the file transfer tool and serves `/t/<id>` when `true`. |
+| `FASTEXEC_TRANSFER_ADDR` | `127.0.0.1:0` | Sets the `/t/` listener `host:port` when `--http` is off. |
+| `FASTEXEC_YOLO` | `false` | Overrides annotations on all exposed tools. |
 | `FASTEXEC_STRUCTURED_CONTENT` | `true` | Includes task metadata in results. |
 | `FASTEXEC_OUTPUT_MODE` | `text` | Places task output in `text`, `both`, or `structured` output. |
 | `FASTEXEC_DAEMON` | `off` | Runs tasks in the shared daemon when `on`. |
 
-`FASTEXEC_CODEMODE`, `FASTEXEC_YOLO`, and `FASTEXEC_STRUCTURED_CONTENT` accept
-only `true` or `false`; invalid values stop startup.
-An endpoint's environment decides whether it advertises codemode, even when
-its daemon was started without it. HTTP uses the daemon's startup setting.
+`FASTEXEC_CODEMODE`, `FASTEXEC_TRANSFER`, `FASTEXEC_YOLO`, and
+`FASTEXEC_STRUCTURED_CONTENT` accept only `true` or `false`; invalid values
+stop startup. An endpoint's environment decides whether it advertises
+`codemode` and `transfer`, even when its daemon was started without them. HTTP
+uses the daemon's startup settings.
 Nested calls resolve directly to unwrapped structured objects regardless of the
 outer output setting (`exec` returns `{output, exitCode, state, ...}` defaulting
 to `truncate: "head"` and `maxBytes: 4194304` with NUL bytes preserved in clean
@@ -249,10 +252,11 @@ starts it, reports its epoch, build, PID, sessions, tasks, and HTTP address, and
 stops it; `status` and `stop` never start one.
 
 Daemons stay running when idle by default. `fastexec daemon start --idle-exit on`
-enables exit after 10 minutes with no connections and an empty task registry;
-`--idle-exit off` explicitly keeps the default. Finished tasks remain in the
-registry for up to 24 hours. These options apply only when starting a new daemon;
-stop an existing daemon before changing its policy. HTTP daemons never exit idle.
+enables exit after 10 minutes with no connections, no tasks, and no live `/t/`
+transfers; `--idle-exit off` explicitly keeps the default. Finished tasks remain
+in the registry for up to 24 hours. These options apply only when starting a new
+daemon; stop an existing daemon before changing its policy. HTTP daemons never
+exit idle.
 
 A host that keeps its children in a Job without breakaway, such as a fastexec
 task, cannot start a detached daemon: run `fastexec daemon start` from a
@@ -357,6 +361,7 @@ strips. Each daemon is started with the address clients reach, which is the root
 `transfer` mints its URLs from:
 
 ```bash
+FASTEXEC_TRANSFER=true \
 FASTEXEC_PUBLIC_URL=https://example.com/mac/ \
 FASTEXEC_HTTP_ALLOW_REMOTE=1 \
 fastexec daemon start --http 127.0.0.1:8765
@@ -375,14 +380,19 @@ location /mac/ {
 The same block with `/linux/`, `/windows/` and one port per machine. MCP clients
 use `<root>mcp`: `https://example.com/mac/mcp` for the block above.
 
-When `FASTEXEC_PUBLIC_URL` is unset, `transfer` uses the `Host` and
-`X-Forwarded-Proto` of the request it answers. The daemon reads the variable
-once when it starts and keeps that root until it stops; a `daemon start` that
-finds a running HTTP daemon keeps the root that daemon already has, and a daemon
-started over stdio has no HTTP front door and no root. A value that is not
-`http` or `https`, names no host, has a port outside 1-65535, or carries
-userinfo, a query, a fragment, a dot segment or an empty path segment is refused
-with its reason and exit 1, before anything binds.
+When `FASTEXEC_PUBLIC_URL` is unset on HTTP, `transfer` uses the `Host` and
+`X-Forwarded-Proto` of the request it answers. Over local stdio or a non-HTTP
+daemon, `transfer` uses `FASTEXEC_PUBLIC_URL` when set (an endpoint's value
+overrides the daemon's startup root) and otherwise `http://<bound>/` on its
+`/t/` listener (`FASTEXEC_TRANSFER_ADDR`, defaulting to `127.0.0.1:0` and
+requiring `FASTEXEC_HTTP_ALLOW_REMOTE=1` outside loopback, plus
+`FASTEXEC_PUBLIC_URL` when the address is unspecified). Combining `--http`
+with `FASTEXEC_TRANSFER_ADDR` is refused at startup because `--http` already
+serves `/t/`. A `daemon start` that finds a running HTTP daemon keeps the root
+that daemon already has. A `FASTEXEC_PUBLIC_URL` value that is not `http` or
+`https`, names no host, has a port outside 1-65535, or carries userinfo, a
+query, a fragment, a dot segment or an empty path segment is refused with its
+reason and exit 1, before anything binds.
 
 The server sends `X-Accel-Buffering: no` on the responses a proxy would
 otherwise buffer.

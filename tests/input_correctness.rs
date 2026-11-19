@@ -20,6 +20,10 @@ impl Server {
             "FASTEXEC_BASH",
             "FASTEXEC_OUTPUT_MODE",
             "FASTEXEC_YOLO",
+            "FASTEXEC_CODEMODE",
+            "FASTEXEC_TRANSFER",
+            "FASTEXEC_TRANSFER_ADDR",
+            "FASTEXEC_PUBLIC_URL",
             "FASTEXEC_TEST_RUNTIME_DIR",
             "FASTEXEC_TEST_TOTAL_LOG_LIMIT",
         ] {
