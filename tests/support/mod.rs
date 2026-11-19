@@ -3,7 +3,7 @@
 #[cfg(any(windows, target_os = "freebsd"))]
 mod private_runtime;
 #[cfg(any(windows, target_os = "freebsd"))]
-#[allow(dead_code)]
+#[allow(unused_imports)]
 pub use private_runtime::create_private_runtime;
 
 /// Removes inherited `FASTEXEC_*` variables except `FASTEXEC_BASH` so host settings do not leak
