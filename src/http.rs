@@ -177,7 +177,7 @@ fn unparsed_form(text: &str) -> &'static str {
 ///
 /// `http::Uri` reads a bracketed authority loosely: `[]` parses with a host of `[]`, and anything
 /// behind the closing `]` is dropped from `host()` and answers `None` from `port()`. The raw text is
-/// therefore read here, so a bracketed host is either a host with an optional port or a refusal.
+/// therefore read here; brackets must contain an IPv6 address, optionally followed by a port.
 fn authority_port(authority: &str) -> Result<Option<&str>, &'static str> {
     let Some(rest) = authority.strip_prefix('[') else {
         let mut parts = authority.rsplitn(2, ':');
@@ -189,6 +189,9 @@ fn authority_port(authority: &str) -> Result<Option<&str>, &'static str> {
     };
     if host.is_empty() {
         return Err("names no host");
+    }
+    if host.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err("has a bracketed host that is not an IPv6 address");
     }
     match after.strip_prefix(':') {
         Some(port) => Ok(Some(port)),
@@ -1066,6 +1069,11 @@ mod tests {
             ("http://[::1]", "http://[::1]/"),
             ("http://[::1]:80/", "http://[::1]:80/"),
             ("http://[::1]:8080/mac", "http://[::1]:8080/mac/"),
+            (
+                "https://[2001:db8:0:0:0:0:0:1]:443/files",
+                "https://[2001:db8:0:0:0:0:0:1]:443/files/",
+            ),
+            ("http://[::ffff:127.0.0.1]/", "http://[::ffff:127.0.0.1]/"),
             // Encoded bytes are what a proxy rewrites to, so they are kept as stated.
             ("https://h/a%20b/", "https://h/a%20b/"),
             ("https://h/%2E%2E/%2e/", "https://h/%2E%2E/%2e/"),
@@ -1107,6 +1115,22 @@ mod tests {
             // `http::Uri` reads a bracketed authority loosely, so these are judged on the raw text.
             ("http://[]/", "names no host"),
             ("http://[]:80/mac/", "names no host"),
+            (
+                "http://[localhost]/",
+                "has a bracketed host that is not an IPv6 address",
+            ),
+            (
+                "http://[127.0.0.1]:80/mac/",
+                "has a bracketed host that is not an IPv6 address",
+            ),
+            (
+                "http://[:::1]/",
+                "has a bracketed host that is not an IPv6 address",
+            ),
+            (
+                "http://[::1::]/",
+                "has a bracketed host that is not an IPv6 address",
+            ),
             ("http://[::1]junk/mac/", "has text after a bracketed host"),
             (
                 "http://[::1]junk:abc/mac/",
