@@ -1,6 +1,7 @@
 //! FreeBSD must retain queued terminal output until its consumer reads it.
 #![cfg(target_os = "freebsd")]
 
+mod support;
 #[path = "../src/unix_pty.rs"]
 mod unix_pty;
 
@@ -25,6 +26,7 @@ impl Host {
         let (reader, lifeline) = std::io::pipe().unwrap();
         let passed = [writer.as_raw_fd(), reader.as_raw_fd()];
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
         command
             .arg("--fastexec-task-host")
             .args(passed.iter().map(|fd| fd.to_string()))

@@ -55,6 +55,10 @@ use tokio_util::sync::CancellationToken;
 
 /// Optional fixed `host:port` listener address for standalone `/t/` transfers.
 pub const TRANSFER_ADDR: &str = "FASTEXEC_TRANSFER_ADDR";
+/// Optional path to a plain UTF-8 file appended to MCP server instructions at startup.
+pub const INSTRUCTIONS_FILE: &str = "FASTEXEC_INSTRUCTIONS_FILE";
+/// Maximum raw byte size accepted for `FASTEXEC_INSTRUCTIONS_FILE`.
+const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tools {
@@ -106,7 +110,7 @@ impl schemars::JsonSchema for CodemodeArguments {
 #[derive(Clone)]
 struct Server {
     backend: Backend,
-    instructions: String,
+    instructions: Arc<str>,
     /// This server's own routes: the tool list and the description of `exec` are built per
     /// server, because what they say about the host differs between servers.
     router: ToolRouter<Server>,
@@ -150,9 +154,22 @@ impl Server {
         launch: &LaunchContext,
         transfer: Option<TransferEndpoint>,
         tools: Tools,
+        extra_instructions: Option<&str>,
     ) -> Self {
         let router = Self::build_router(launch, tools);
-        let instructions = server_instructions(backend.daemon_owned(), tools.codemode);
+        let instructions =
+            server_instructions(backend.daemon_owned(), tools.codemode, extra_instructions);
+        Self::with_shared(backend, router, instructions, transfer, tools)
+    }
+
+    /// A server reusing a pre-built tool router and composed instructions snapshot.
+    pub(crate) fn with_shared(
+        backend: Backend,
+        router: ToolRouter<Self>,
+        instructions: Arc<str>,
+        transfer: Option<TransferEndpoint>,
+        tools: Tools,
+    ) -> Self {
         Self {
             backend,
             instructions,
@@ -163,7 +180,7 @@ impl Server {
         }
     }
 
-    fn build_router(launch: &LaunchContext, tools: Tools) -> ToolRouter<Self> {
+    pub(crate) fn build_router(launch: &LaunchContext, tools: Tools) -> ToolRouter<Self> {
         let mut exec = Self::exec_tool_attr();
         exec.description = Some(exec_description(launch, tools.codemode).into());
         let mut router = ToolRouter::new()
@@ -239,13 +256,17 @@ fn client_name(context: &RequestContext<RoleServer>) -> String {
 
 /// Server instructions say when to use the tools; hosts that show one line take the first. The
 /// second line states how long tasks live, and codemode adds a routing hint when enabled.
-fn server_instructions(daemon_owned: bool, codemode: bool) -> String {
+pub(crate) fn server_instructions(
+    daemon_owned: bool,
+    codemode: bool,
+    extra: Option<&str>,
+) -> Arc<str> {
     let lifetime = if daemon_owned {
         "tasks run in a shared background daemon, outlive this session, and are visible to every session using it."
     } else {
         "tasks end when the session ends."
     };
-    if codemode {
+    let mut text = if codemode {
         format!(
             "Run bash tasks with exec, orchestrate multi-step tool workflows in JavaScript with codemode, and read, write, and edit files on this host.\nPrefer exec over one-shot shell tools when a command may outlive a single call or needs input; {lifetime}\nPrefer codemode over multi-turn exec or read calls when aggregating across multiple files, looping or branching on tool results, or filtering bulky output in-process to save context."
         )
@@ -253,7 +274,58 @@ fn server_instructions(daemon_owned: bool, codemode: bool) -> String {
         format!(
             "Run bash tasks with exec and read, write, and edit files on this host.\nPrefer it over one-shot shell tools when a command may outlive a single call or needs input; {lifetime}"
         )
+    };
+    if let Some(extra) = extra {
+        text.push_str("\n\n");
+        text.push_str(extra);
     }
+    Arc::from(text)
+}
+
+/// Loads and normalizes `FASTEXEC_INSTRUCTIONS_FILE` once at startup.
+pub(crate) fn instructions_file(launch: &LaunchContext) -> Result<Option<String>, String> {
+    use std::io::Read;
+
+    let Some(value) = launch.var(INSTRUCTIONS_FILE) else {
+        return Ok(None);
+    };
+    let Some(raw) = value.to_str() else {
+        return Err(format!("{INSTRUCTIONS_FILE} is not UTF-8"));
+    };
+    if raw.is_empty() {
+        return Err(format!("{INSTRUCTIONS_FILE} must not be empty"));
+    }
+    let resolved = files::resolve(raw, launch).map_err(|error| {
+        format!(
+            "invalid {INSTRUCTIONS_FILE}: {}",
+            error.trim_end_matches('.')
+        )
+    })?;
+    let shown_path = files::display_path(&resolved);
+    let (file, _) = files::open_regular(&resolved)
+        .map_err(|error| format!("cannot read {INSTRUCTIONS_FILE} {shown_path}: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_INSTRUCTIONS_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {INSTRUCTIONS_FILE} {shown_path}: {error}"))?;
+    if bytes.len() > MAX_INSTRUCTIONS_BYTES {
+        return Err(format!(
+            "{INSTRUCTIONS_FILE} {shown_path} exceeds {MAX_INSTRUCTIONS_BYTES} bytes"
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err(format!(
+            "{INSTRUCTIONS_FILE} {shown_path} contains a NUL byte"
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("{INSTRUCTIONS_FILE} {shown_path} is not valid UTF-8"))?;
+    let normalized = files::normalize_to_lf(&text);
+    let content = normalized.trim_start_matches('\u{feff}');
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(content.to_owned()))
 }
 
 /// The `exec` tool's description: the static text, the Windows paragraph on Windows, and one
@@ -343,7 +415,7 @@ impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fastexec", env!("CARGO_PKG_VERSION")))
-            .with_instructions(self.instructions.clone())
+            .with_instructions(self.instructions.as_ref())
     }
 }
 
@@ -1242,11 +1314,21 @@ async fn cli_start(
         extra.push("--idle-exit".into());
         extra.push(if idle_exit { "on" } else { "off" }.into());
     }
-    let (mut client, lock) =
-        match runtime::connect_or_start(identity, paths, deadline, &extra).await {
-            Ok(pair) => pair,
-            Err(message) => return fail(&message),
-        };
+    let (mut client, lock) = match connect_existing(paths).await {
+        Ok(Some(client)) => (client, None),
+        Ok(None) => {
+            if flags.http.is_some()
+                && let Err(message) = instructions_file(launch)
+            {
+                return fail(&message);
+            }
+            match runtime::connect_or_start(identity, paths, deadline, &extra).await {
+                Ok(pair) => pair,
+                Err(message) => return fail(&message),
+            }
+        }
+        Err(message) => return fail(&message),
+    };
     let hello = match hello(identity, launch) {
         Ok(hello) => hello,
         Err(message) => return fail(&message),
@@ -1689,6 +1771,13 @@ async fn serve() {
             std::process::exit(1);
         }
     };
+    let extra_instructions = match instructions_file(&launch) {
+        Ok(extra) => extra,
+        Err(message) => {
+            eprintln!("fastexec: {message}");
+            std::process::exit(1);
+        }
+    };
     let (backend, tasks, transfer_endpoint, transfer_stop) = if daemon {
         let endpoint = match endpoint::Endpoint::new(Arc::clone(&launch), render) {
             Ok(endpoint) => endpoint,
@@ -1753,7 +1842,13 @@ async fn serve() {
         };
         (backend, Some(tasks), transfer_endpoint, transfer_stop)
     };
-    let server = Server::new(backend, &launch, transfer_endpoint, tools);
+    let server = Server::new(
+        backend,
+        &launch,
+        transfer_endpoint,
+        tools,
+        extra_instructions.as_deref(),
+    );
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
         inner: tokio::io::stdin(),
@@ -2163,6 +2258,7 @@ mod portable_schema_tests {
                 transfer: true,
                 yolo: false,
             },
+            None,
         );
         let tools = server.router.list_all();
         assert_eq!(tools.len(), 6);
@@ -2272,5 +2368,186 @@ mod portable_schema_tests {
             json!("Run mode. fast: quick full: complete")
         );
         assert_eq!(tricky["properties"]["format"]["type"], json!("string"));
+    }
+}
+
+#[cfg(test)]
+mod instructions_file_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fastexec-instructions-{label}-{}",
+                tasks::random_chars(10).unwrap()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn launch_with(cwd: &std::path::Path, value: Option<OsString>) -> LaunchContext {
+        let mut env = Vec::new();
+        if let Some(value) = value {
+            env.push((OsString::from(INSTRUCTIONS_FILE), value));
+        }
+        LaunchContext::new(cwd.to_path_buf(), env)
+    }
+
+    #[test]
+    fn env_var_unset_empty_and_non_utf8() {
+        let dir = TempDir::new("env");
+        assert_eq!(instructions_file(&launch_with(&dir.0, None)), Ok(None));
+
+        let empty_err =
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("")))).unwrap_err();
+        assert_eq!(empty_err, "FASTEXEC_INSTRUCTIONS_FILE must not be empty");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = OsString::from_vec(vec![b'a', 0xff]);
+            let err = instructions_file(&launch_with(&dir.0, Some(bad))).unwrap_err();
+            assert_eq!(err, "FASTEXEC_INSTRUCTIONS_FILE is not UTF-8");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_directory_nul_invalid_utf8_and_oversized_split_multibyte() {
+        let dir = TempDir::new("rejects");
+
+        let missing = instructions_file(&launch_with(
+            &dir.0,
+            Some(OsString::from("does-not-exist.txt")),
+        ))
+        .unwrap_err();
+        assert!(
+            missing.starts_with("cannot read FASTEXEC_INSTRUCTIONS_FILE "),
+            "{missing}"
+        );
+
+        let subdir = dir.0.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let dir_err =
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("subdir")))).unwrap_err();
+        assert!(
+            dir_err.starts_with("cannot read FASTEXEC_INSTRUCTIONS_FILE ")
+                && dir_err.contains("it is a directory")
+                && !dir_err.contains("list it with exec"),
+            "{dir_err}"
+        );
+
+        let nul_path = dir.0.join("nul.txt");
+        std::fs::write(&nul_path, b"hello\0world").unwrap();
+        let nul_err =
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("nul.txt")))).unwrap_err();
+        assert!(nul_err.ends_with(" contains a NUL byte"), "{nul_err}");
+
+        let bad_utf8 = dir.0.join("bad.txt");
+        std::fs::write(&bad_utf8, b"hello\xff").unwrap();
+        let utf8_err =
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("bad.txt")))).unwrap_err();
+        assert!(utf8_err.ends_with(" is not valid UTF-8"), "{utf8_err}");
+
+        // 16_383 ASCII bytes + 3-byte UTF-8 char = 16_386 bytes; truncated read splits '中'
+        // at byte 16_385, so size check must run before UTF-8 validation.
+        let oversized = dir.0.join("oversized.txt");
+        let mut payload = vec![b'a'; 16_383];
+        payload.extend_from_slice("中".as_bytes());
+        assert_eq!(payload.len(), 16_386);
+        std::fs::write(&oversized, &payload).unwrap();
+        let size_err =
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("oversized.txt"))))
+                .unwrap_err();
+        assert!(size_err.ends_with(" exceeds 16384 bytes"), "{size_err}");
+    }
+
+    #[test]
+    fn exact_cap_normalization_preservation_and_blank_files() {
+        let dir = TempDir::new("valid");
+
+        let exact = dir.0.join("exact.txt");
+        let exact_text = "x".repeat(MAX_INSTRUCTIONS_BYTES);
+        std::fs::write(&exact, &exact_text).unwrap();
+        assert_eq!(
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("exact.txt")))),
+            Ok(Some(exact_text))
+        );
+
+        let formatted = dir.0.join("formatted.txt");
+        std::fs::write(&formatted, "\u{feff}    indented\r\nline 2\rline 3\n").unwrap();
+        assert_eq!(
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("formatted.txt")))),
+            Ok(Some("    indented\nline 2\nline 3\n".to_owned()))
+        );
+
+        let ws_only = dir.0.join("ws.txt");
+        std::fs::write(&ws_only, "  \r\n\t \n").unwrap();
+        assert_eq!(
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("ws.txt")))),
+            Ok(None)
+        );
+
+        let bom_only = dir.0.join("bom.txt");
+        std::fs::write(&bom_only, "\u{feff}\u{feff}  \r\n").unwrap();
+        assert_eq!(
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("bom.txt")))),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn server_instructions_appends_extra_and_keeps_first_line() {
+        for daemon_owned in [false, true] {
+            for codemode in [false, true] {
+                let base = server_instructions(daemon_owned, codemode, None);
+                let with_extra = server_instructions(
+                    daemon_owned,
+                    codemode,
+                    Some("    custom line\ntrailing\n"),
+                );
+                assert_eq!(base.lines().next(), with_extra.lines().next());
+                assert_eq!(
+                    with_extra.as_ref(),
+                    format!("{base}\n\n    custom line\ntrailing\n")
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_fifo_fails_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = TempDir::new("fifo");
+        let fifo = dir.0.join("pipe");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path string.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let started = std::time::Instant::now();
+        let err =
+            instructions_file(&launch_with(&dir.0, Some(OsString::from("pipe")))).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO check took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.contains("it is not a regular file"),
+            "unexpected FIFO error: {err}"
+        );
     }
 }

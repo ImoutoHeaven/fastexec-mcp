@@ -500,38 +500,86 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
                 "Cannot resolve {path}: the path after ~ must be relative to the home directory, without a Windows path prefix."
             ));
         }
-        return Ok(append_path(&home()?, relative));
+        return resolve_from(relative, &home()?);
     }
     resolve_from(Path::new(path), &launch.cwd)
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_reserved_device_name(component: &str) -> bool {
+    let stem = component
+        .split(['.', ':'])
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(' ');
+    if stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL")
+    {
+        return true;
+    }
+    let bytes = stem.as_bytes();
+    bytes.len() == 4
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
 }
 
 /// Resolves a native or Git Bash path against a fixed base, without tilde expansion.
 pub(crate) fn resolve_from(path: &Path, base: &Path) -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
+        use std::path::{Component, Prefix};
+
         let rewritten = path.to_str().and_then(git_bash_drive_path);
         let candidate = rewritten.as_deref().map_or(path, Path::new);
         let shown = path.to_string_lossy();
         let mut comps = candidate.components();
         let first = comps.next();
         let second = comps.next();
-        match (first, second) {
-            (Some(std::path::Component::Prefix(prefix)), second) => {
-                if matches!(prefix.kind(), std::path::Prefix::Disk(_))
-                    && second != Some(std::path::Component::RootDir)
-                {
-                    Err(format!(
-                        "Cannot resolve {shown}: drive-relative paths such as C:file depend on a per-drive current directory; pass C:/... or a relative path."
-                    ))
-                } else {
-                    Ok(clean_components(candidate))
+        let resolved = match (first, second) {
+            (Some(Component::Prefix(prefix)), second) => match prefix.kind() {
+                Prefix::DeviceNS(_) => {
+                    return Err(format!(
+                        "Cannot resolve {shown}: Windows device namespace paths are not supported."
+                    ));
                 }
+                Prefix::UNC(_, share) | Prefix::VerbatimUNC(_, share)
+                    if share.eq_ignore_ascii_case("pipe") =>
+                {
+                    return Err(format!(
+                        "Cannot resolve {shown}: Windows named pipe paths are not supported."
+                    ));
+                }
+                Prefix::Verbatim(name) if name.eq_ignore_ascii_case("pipe") => {
+                    return Err(format!(
+                        "Cannot resolve {shown}: Windows named pipe paths are not supported."
+                    ));
+                }
+                Prefix::Disk(_) if second != Some(Component::RootDir) => {
+                    return Err(format!(
+                        "Cannot resolve {shown}: drive-relative paths such as C:file depend on a per-drive current directory; pass C:/... or a relative path."
+                    ));
+                }
+                _ => clean_components(candidate),
+            },
+            (Some(Component::RootDir), _) => {
+                return Err(format!(
+                    "Cannot resolve {shown}: driveless paths such as /tmp name Git Bash locations on Windows; pass C:/... or /c/..., or convert it with cygpath -m."
+                ));
             }
-            (Some(std::path::Component::RootDir), _) => Err(format!(
-                "Cannot resolve {shown}: driveless paths such as /tmp name Git Bash locations on Windows; pass C:/... or /c/..., or convert it with cygpath -m."
-            )),
-            _ => Ok(append_path(base, candidate)),
+            _ => append_path(base, candidate),
+        };
+        for component in candidate.components() {
+            if let Component::Normal(name) = component
+                && is_windows_reserved_device_name(&name.to_string_lossy())
+            {
+                return Err(format!(
+                    "Cannot resolve {shown}: Windows reserved device names are not supported."
+                ));
+            }
         }
+        Ok(resolved)
     }
     #[cfg(not(windows))]
     {
@@ -598,8 +646,13 @@ fn read_text_cancellable(
     }
     let resolved = resolve(&request.path, launch)?;
     let shown_path = display_path(&resolved);
-    let (mut file, metadata) =
-        open_regular(&resolved).map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
+    let (mut file, metadata) = open_regular(&resolved).map_err(|error| {
+        if error.kind() == io::ErrorKind::IsADirectory {
+            format!("Cannot read {shown_path}: {error}; list it with exec.")
+        } else {
+            format!("Cannot read {shown_path}: {error}.")
+        }
+    })?;
     let mut sniff = vec![0u8; SNIFF];
     let sniffed = read_upto(&mut file, &mut sniff)
         .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
@@ -781,10 +834,13 @@ fn read_whole_utf8(
 /// Both text readers reject special files before reading any data. The initial check avoids
 /// opening devices at all; the handle check covers replacement between metadata and open. On
 /// Unix, a FIFO swapped into that gap must not block open while edit holds the mutation lock.
-fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
+pub(crate) fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
     let initial = std::fs::metadata(path)?;
     if initial.is_dir() {
-        return Err(io::Error::other("it is a directory; list it with exec"));
+        return Err(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            "it is a directory",
+        ));
     }
     if !initial.is_file() {
         return Err(io::Error::other("it is not a regular file"));
@@ -795,6 +851,12 @@ fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT};
+        options.security_qos_flags(SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS);
     }
     let file = options.open(path)?;
     #[cfg(windows)]
@@ -808,7 +870,10 @@ fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
     }
     let metadata = file.metadata()?;
     if metadata.is_dir() {
-        return Err(io::Error::other("it is a directory; list it with exec"));
+        return Err(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            "it is a directory",
+        ));
     }
     if !metadata.is_file() {
         return Err(io::Error::other("it is not a regular file"));
@@ -3064,7 +3129,7 @@ fn detect_line_ending(content: &str) -> &'static str {
     }
 }
 
-fn normalize_to_lf(text: &str) -> String {
+pub(crate) fn normalize_to_lf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
@@ -6891,5 +6956,56 @@ mod tests {
         .unwrap();
         assert_eq!(compat_miss["failures"][0]["problem"], "not_found");
         assert_eq!(compat_miss["failures"][0]["lines"], json!([4]));
+    }
+
+    #[test]
+    fn open_regular_reports_directory_as_is_a_directory_without_exec_hint() {
+        let scratch = Scratch::new("open-regular-dir");
+        let err = open_regular(&scratch.0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
+        assert_eq!(err.to_string(), "it is a directory");
+    }
+
+    #[test]
+    fn windows_reserved_device_names_match_dos_rules() {
+        for reserved in [
+            "CON", "con", "CON:", "PRN", "AUX", "NUL", "NUL:foo", "COM1", "COM9", "LPT1", "LPT9",
+            "COM1.txt", "nul.log", "CON .txt", "NUL   ",
+        ] {
+            assert!(
+                is_windows_reserved_device_name(reserved),
+                "expected reserved: {reserved}"
+            );
+        }
+        for normal in ["COM0", "COM10", "LPT0", "LPT10", "CONSOLE", "NULL", "a.NUL"] {
+            assert!(
+                !is_windows_reserved_device_name(normal),
+                "expected normal: {normal}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_from_rejects_windows_device_paths_named_pipes_and_reserved_names() {
+        let base = Path::new(r"C:\work");
+        for rejected in [
+            r"\\.\pipe\demo",
+            "//./pipe/demo",
+            "//server/pipe/demo",
+            r"\\server\pipe\demo",
+            r"\\.\NUL",
+            r"\\.\PhysicalDrive0",
+            "NUL",
+            "CON",
+            "COM1.txt",
+            r"sub\LPT9.log",
+            r"C:\work\aux",
+        ] {
+            assert!(
+                resolve_from(Path::new(rejected), base).is_err(),
+                "expected rejection for {rejected}"
+            );
+        }
     }
 }

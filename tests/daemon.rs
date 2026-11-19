@@ -2,7 +2,6 @@
 //! directory of the test's own; and the MCP endpoint in `on` mode, which forwards every call to
 //! that daemon.
 
-#[cfg(any(windows, target_os = "freebsd"))]
 mod support;
 #[path = "support/transfer_http.rs"]
 mod transfer_http;
@@ -73,18 +72,11 @@ impl Fixture {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
         command
             .args(args)
             .env("FASTEXEC_TEST_RUNTIME_DIR", &self.runtime)
             .env("FASTEXEC_NAMESPACE", &self.namespace)
-            .env_remove("FASTEXEC_DAEMON")
-            .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-            .env_remove("FASTEXEC_YOLO")
-            .env_remove("FASTEXEC_CODEMODE")
-            .env_remove("FASTEXEC_TRANSFER")
-            .env_remove("FASTEXEC_TRANSFER_ADDR")
-            .env_remove("FASTEXEC_PUBLIC_URL")
             .stdin(std::process::Stdio::null());
         if let Some(tmpdir) = &self.tmpdir {
             command
@@ -284,17 +276,6 @@ impl Endpoint {
     /// Starts an endpoint after `configure` adjusts its launch, such as its environment.
     fn start_with(fixture: &Fixture, configure: impl FnOnce(&mut Command)) -> Endpoint {
         let mut command = fixture.command(&[]);
-        command
-            // The endpoint's own settings are the defaults here: a host's environment must not
-            // change what these tests read.
-            .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-            .env_remove("FASTEXEC_YOLO")
-            .env_remove("FASTEXEC_CODEMODE")
-            .env_remove("FASTEXEC_TRANSFER")
-            .env_remove("FASTEXEC_TRANSFER_ADDR")
-            .env_remove("FASTEXEC_PUBLIC_URL")
-            .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT");
         configure(&mut command);
         command
             .env("FASTEXEC_DAEMON", "on")
@@ -2137,13 +2118,12 @@ fn daemon_ipc_accepts_1mib_escaped_input_refuses_over_3mib_and_matches_stdio_sch
         .unwrap()
         .clone();
     assert_eq!(daemon_tools.len(), 6, "{daemon_tools:?}");
-    let mut stdio_child = Command::new(env!("CARGO_BIN_EXE_fastexec"))
+    let mut stdio_cmd = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+    support::scrub_fastexec_env(&mut stdio_cmd);
+    let mut stdio_child = stdio_cmd
         .env("FASTEXEC_DAEMON", "off")
         .env("FASTEXEC_CODEMODE", "true")
         .env("FASTEXEC_TRANSFER", "true")
-        .env_remove("FASTEXEC_YOLO")
-        .env_remove("FASTEXEC_TRANSFER_ADDR")
-        .env_remove("FASTEXEC_PUBLIC_URL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -2703,4 +2683,70 @@ fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() 
     );
     proxied_ep.close();
     drop(proxied_fixture);
+}
+
+#[test]
+fn cold_http_daemon_missing_instructions_file_exits_without_deleting_logs() {
+    let fixture = Fixture::new("instructions-cold-http");
+    // Start and stop once so the namespace directory exists under its derived hex name.
+    let (code, _, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "seed start failed: {err}");
+    let (code, _, err) = fixture.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "seed stop failed: {err}");
+
+    let ns_dir = std::fs::read_dir(fixture.runtime.join("ns"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("namespace directory");
+    let logs = ns_dir.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let sentinel = logs.join("preexisting.log");
+    std::fs::write(&sentinel, b"keep this log").unwrap();
+
+    let missing = fixture.runtime.join("does-not-exist.txt");
+    for subcommand in ["start", "run"] {
+        let output = fixture
+            .command(&["daemon", subcommand, "--http", "127.0.0.1:0"])
+            .env("FASTEXEC_HTTP_TOKEN", "0123456789abcdef")
+            .env("FASTEXEC_INSTRUCTIONS_FILE", &missing)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "daemon {subcommand} --http");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("FASTEXEC_INSTRUCTIONS_FILE"),
+            "daemon {subcommand} --http: {stderr:?}"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"keep this log",
+            "daemon {subcommand} --http deleted pre-existing logs"
+        );
+    }
+}
+
+#[test]
+fn non_http_daemon_cli_ignores_missing_instructions_file() {
+    let fixture = Fixture::new("instructions-non-http");
+    let missing = fixture.runtime.join("does-not-exist.txt");
+
+    for subcommand in ["start", "status", "stop"] {
+        let output = fixture
+            .command(&["daemon", subcommand])
+            .env("FASTEXEC_INSTRUCTIONS_FILE", &missing)
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        if let Some(pid) = pid_of(&out) {
+            fixture.pid.set(Some(pid));
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "daemon {subcommand} failed: {out}{err}"
+        );
+    }
 }

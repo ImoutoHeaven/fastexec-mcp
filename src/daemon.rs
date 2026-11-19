@@ -1206,14 +1206,6 @@ async fn serve_daemon(
         eprintln!("fastexec: cannot write {}: {error}", log.display());
         return 1;
     }
-    // Whatever other namespaces left behind is swept, and this one starts with empty logs.
-    runtime::sweep(&paths.root, &namespace);
-    let logs = paths.ns.join("logs");
-    let _ = std::fs::remove_dir_all(&logs);
-    if let Err(error) = runtime::create_private(&logs) {
-        eprintln!("fastexec: cannot create {}: {error}", logs.display());
-        return 1;
-    }
     // The HTTP front door is opened before the pipe or socket, so a daemon that cannot serve it
     // never becomes reachable the other way, and it never exits on idleness: a client that speaks
     // HTTP expects it to be there.
@@ -1279,6 +1271,13 @@ async fn serve_daemon(
                     return 1;
                 }
             };
+            let extra_instructions = match crate::instructions_file(&launch) {
+                Ok(extra) => extra,
+                Err(message) => {
+                    eprintln!("fastexec: {message}");
+                    return 1;
+                }
+            };
             let listener = match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => listener,
                 Err(error) => {
@@ -1298,6 +1297,7 @@ async fn serve_daemon(
                     tools,
                     launch,
                     public_root: public_root.clone(),
+                    extra_instructions,
                 }),
                 None,
                 Config {
@@ -1369,6 +1369,14 @@ async fn serve_daemon(
             return 1;
         }
     };
+    // Whatever other namespaces left behind is swept, and this one starts with empty logs.
+    runtime::sweep(&paths.root, &namespace);
+    let logs = paths.ns.join("logs");
+    let _ = std::fs::remove_dir_all(&logs);
+    if let Err(error) = runtime::create_private(&logs) {
+        eprintln!("fastexec: cannot create {}: {error}", logs.display());
+        return 1;
+    }
     let tasks = match Tasks::new_in(Limits::ON, logs) {
         Ok(tasks) => tasks,
         Err(error) => {

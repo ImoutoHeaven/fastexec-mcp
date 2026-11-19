@@ -1,4 +1,6 @@
 //! Input delivery regressions through a private stdio MCP server.
+mod support;
+
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -14,21 +16,7 @@ struct Server {
 impl Server {
     fn start() -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
-        for name in [
-            "FASTEXEC_DAEMON",
-            "FASTEXEC_NAMESPACE",
-            "FASTEXEC_BASH",
-            "FASTEXEC_OUTPUT_MODE",
-            "FASTEXEC_YOLO",
-            "FASTEXEC_CODEMODE",
-            "FASTEXEC_TRANSFER",
-            "FASTEXEC_TRANSFER_ADDR",
-            "FASTEXEC_PUBLIC_URL",
-            "FASTEXEC_TEST_RUNTIME_DIR",
-            "FASTEXEC_TEST_TOTAL_LOG_LIMIT",
-        ] {
-            command.env_remove(name);
-        }
+        support::scrub_fastexec_env(&mut command);
         let mut child = command
             .env("FASTEXEC_STRUCTURED_CONTENT", "true")
             .stdin(Stdio::piped())

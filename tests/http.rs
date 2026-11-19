@@ -1,7 +1,6 @@
 //! The daemon's Streamable HTTP front door, driven over a socket the way a client that speaks
 //! MCP over HTTP does: one request per connection, and an answer read back as it arrives.
 
-#[cfg(any(windows, target_os = "freebsd"))]
 mod support;
 
 use serde_json::{Value, json};
@@ -34,6 +33,7 @@ struct Fixture {
     yolo: Option<String>,
     codemode: Option<String>,
     transfer: Option<String>,
+    instructions_file: Option<String>,
     /// An explicitly chosen launch directory for path-alias regression tests.
     cwd: Option<PathBuf>,
     /// The turn this fixture holds until it ends: held, never read.
@@ -77,6 +77,11 @@ impl Fixture {
         self
     }
 
+    fn with_instructions_file(mut self, value: impl Into<String>) -> Fixture {
+        self.instructions_file = Some(value.into());
+        self
+    }
+
     /// A fixture with its runtime directory, and no daemon yet: the shape of a start that is
     /// expected to be refused.
     fn bare(tag: &str) -> Fixture {
@@ -107,6 +112,7 @@ impl Fixture {
             yolo: None,
             codemode: None,
             transfer: None,
+            instructions_file: None,
             cwd: None,
             starting,
         }
@@ -126,39 +132,31 @@ impl Fixture {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
         command
             .args(args)
             .env("FASTEXEC_TEST_RUNTIME_DIR", &self.runtime)
             .env("FASTEXEC_NAMESPACE", &self.namespace)
             .env("FASTEXEC_HTTP_TOKEN", self.tokens.join(" "))
-            // Nothing this process carries may change what a case sets up itself.
-            .env_remove("FASTEXEC_DAEMON")
-            .env_remove("FASTEXEC_HTTP_ALLOW_REMOTE")
-            .env_remove("FASTEXEC_HTTP_ALLOWED_ORIGINS")
-            .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-            .env_remove("FASTEXEC_TRANSFER_ADDR")
-            .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT")
             .stdin(std::process::Stdio::null());
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
-        match &self.public_url {
-            Some(root) => command.env("FASTEXEC_PUBLIC_URL", root),
-            None => command.env_remove("FASTEXEC_PUBLIC_URL"),
-        };
-        match &self.yolo {
-            Some(value) => command.env("FASTEXEC_YOLO", value),
-            None => command.env_remove("FASTEXEC_YOLO"),
-        };
-        match &self.codemode {
-            Some(value) => command.env("FASTEXEC_CODEMODE", value),
-            None => command.env_remove("FASTEXEC_CODEMODE"),
-        };
-        match &self.transfer {
-            Some(value) => command.env("FASTEXEC_TRANSFER", value),
-            None => command.env_remove("FASTEXEC_TRANSFER"),
-        };
+        if let Some(root) = &self.public_url {
+            command.env("FASTEXEC_PUBLIC_URL", root);
+        }
+        if let Some(value) = &self.yolo {
+            command.env("FASTEXEC_YOLO", value);
+        }
+        if let Some(value) = &self.codemode {
+            command.env("FASTEXEC_CODEMODE", value);
+        }
+        if let Some(value) = &self.transfer {
+            command.env("FASTEXEC_TRANSFER", value);
+        }
+        if let Some(value) = &self.instructions_file {
+            command.env("FASTEXEC_INSTRUCTIONS_FILE", value);
+        }
         command
     }
 
@@ -532,11 +530,11 @@ impl Client {
     }
 
     /// The MCP handshake, which names the session every later request carries.
-    fn initialize(&mut self) {
-        self.initialize_version("2025-06-18");
+    fn initialize(&mut self) -> Value {
+        self.initialize_version("2025-06-18")
     }
 
-    fn initialize_version(&mut self, version: &str) {
+    fn initialize_version(&mut self, version: &str) -> Value {
         self.next_id += 1;
         let id = self.next_id;
         let response = self.send(json!({
@@ -554,8 +552,9 @@ impl Client {
                 .unwrap_or_else(|| panic!("no session id in {:?}", response.headers))
                 .to_owned(),
         );
+        let result = response.answer(id)["result"].clone();
         assert!(
-            response.answer(id)["result"]["serverInfo"]["name"] == json!("fastexec"),
+            result["serverInfo"]["name"] == json!("fastexec"),
             "{:?}",
             response.body
         );
@@ -565,6 +564,7 @@ impl Client {
             "{}",
             notified.body
         );
+        result
     }
 
     /// The tools the server offers, by name.
@@ -674,14 +674,21 @@ struct Stdio {
     /// the test instead of holding it.
     lines: std::sync::mpsc::Receiver<Value>,
     next_id: u64,
+    instructions: String,
 }
 
 impl Stdio {
     /// Starts an endpoint on `fixture`'s namespace, so it meets the daemon the fixture started.
     fn start(fixture: &Fixture) -> Stdio {
-        let mut child = fixture
-            .command(&[])
-            .env("FASTEXEC_DAEMON", "on")
+        Stdio::start_with(fixture, |_| {})
+    }
+
+    /// Starts an endpoint on `fixture`'s namespace after `configure` adjusts its launch.
+    fn start_with(fixture: &Fixture, configure: impl FnOnce(&mut Command)) -> Stdio {
+        let mut command = fixture.command(&[]);
+        command.env("FASTEXEC_DAEMON", "on");
+        configure(&mut command);
+        let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -705,6 +712,7 @@ impl Stdio {
             stdin,
             lines,
             next_id: 0,
+            instructions: String::new(),
         };
         let answer = stdio.request(
             "initialize",
@@ -719,6 +727,10 @@ impl Stdio {
             json!("fastexec"),
             "{answer}"
         );
+        stdio.instructions = answer["result"]["instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         stdio.notify(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         stdio
     }
@@ -2898,13 +2910,12 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
         .unwrap()
         .clone();
     assert_eq!(tools.len(), 6, "{tools:?}");
-    let mut stdio_child = std::process::Command::new(env!("CARGO_BIN_EXE_fastexec"))
+    let mut stdio_cmd = std::process::Command::new(env!("CARGO_BIN_EXE_fastexec"));
+    support::scrub_fastexec_env(&mut stdio_cmd);
+    let mut stdio_child = stdio_cmd
         .env("FASTEXEC_DAEMON", "off")
         .env("FASTEXEC_CODEMODE", "true")
         .env("FASTEXEC_TRANSFER", "true")
-        .env_remove("FASTEXEC_YOLO")
-        .env_remove("FASTEXEC_TRANSFER_ADDR")
-        .env_remove("FASTEXEC_PUBLIC_URL")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -3120,4 +3131,120 @@ fn http_login_snapshots_are_session_scoped_and_strip_removed_variables() {
     );
     let _ = fixture.run(&["daemon", "stop"]);
     let _ = spawned.wait();
+}
+
+const BUILTIN_DAEMON_INSTRUCTIONS: &str = "Run bash tasks with exec and read, write, and edit files on this host.\nPrefer it over one-shot shell tools when a command may outlive a single call or needs input; tasks run in a shared background daemon, outlive this session, and are visible to every session using it.";
+
+#[test]
+fn http_instructions_file_matches_initialize_and_discover_and_stays_pinned() {
+    let mut fixture = Fixture::bare("instructions-pin");
+    let file = fixture.runtime.join("extra.txt");
+    std::fs::write(&file, "    pinned line\r\nsecond line\r\n").unwrap();
+    fixture = fixture.with_instructions_file(file.to_string_lossy().into_owned());
+    fixture.start();
+
+    let expected = format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\n    pinned line\nsecond line\n");
+    let check = |fixture: &Fixture| {
+        let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
+        let init = legacy.initialize();
+        assert_eq!(init["instructions"].as_str(), Some(expected.as_str()));
+
+        let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
+        let discover = modern.modern("server/discover", json!({}));
+        assert_eq!(discover["instructions"].as_str(), Some(expected.as_str()));
+        assert_eq!(init["instructions"], discover["instructions"]);
+    };
+
+    check(&fixture);
+    std::fs::write(&file, "mutated after startup\n").unwrap();
+    check(&fixture);
+    std::fs::remove_file(&file).unwrap();
+    check(&fixture);
+}
+
+#[test]
+fn shared_namespace_isolates_http_and_stdio_instructions_files() {
+    let mut fixture = Fixture::bare("instructions-iso");
+    let file_a = fixture.runtime.join("a.txt");
+    let file_b = fixture.runtime.join("b.txt");
+    std::fs::write(&file_a, "alpha guidance\n").unwrap();
+    std::fs::write(&file_b, "beta guidance\n").unwrap();
+    fixture = fixture.with_instructions_file(file_a.to_string_lossy().into_owned());
+    fixture.start();
+
+    let expected_a = format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\nalpha guidance\n");
+    let expected_b = format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\nbeta guidance\n");
+
+    let mut http = Client::new(fixture.addr, fixture.tokens[0].clone());
+    assert_eq!(
+        http.initialize()["instructions"].as_str(),
+        Some(expected_a.as_str())
+    );
+    assert_eq!(
+        http.modern("server/discover", json!({}))["instructions"].as_str(),
+        Some(expected_a.as_str())
+    );
+
+    let stdio_b = Stdio::start_with(&fixture, |cmd| {
+        cmd.env("FASTEXEC_INSTRUCTIONS_FILE", &file_b);
+    });
+    assert_eq!(stdio_b.instructions, expected_b);
+
+    let stdio_unset = Stdio::start_with(&fixture, |cmd| {
+        cmd.env_remove("FASTEXEC_INSTRUCTIONS_FILE");
+    });
+    assert_eq!(stdio_unset.instructions, BUILTIN_DAEMON_INSTRUCTIONS);
+
+    let mut http_after = Client::new(fixture.addr, fixture.tokens[0].clone());
+    assert_eq!(
+        http_after.modern("server/discover", json!({}))["instructions"].as_str(),
+        Some(expected_a.as_str())
+    );
+}
+
+#[test]
+fn idempotent_http_start_keeps_running_daemon_instructions() {
+    let mut fixture = Fixture::bare("instructions-idempotent");
+    let file_a = fixture.runtime.join("a.txt");
+    std::fs::write(&file_a, "initial guidance\n").unwrap();
+    fixture = fixture.with_instructions_file(file_a.to_string_lossy().into_owned());
+    fixture.start();
+
+    let original_pid = fixture.pid.get().expect("daemon pid");
+    let original_addr = fixture.addr;
+    let expected = format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\ninitial guidance\n");
+
+    std::fs::remove_file(&file_a).unwrap();
+    let (code, out, err) = fixture.run(&["daemon", "start", "--http", "127.0.0.1:0"]);
+    assert_eq!(code, 0, "re-start after delete failed: {out}{err}");
+    assert_eq!(pid_of(&out), Some(original_pid), "{out}");
+    assert!(out.contains(&format!("http {original_addr}")), "{out}");
+
+    let other_cwd = fixture.runtime.join("other-cwd");
+    std::fs::create_dir_all(&other_cwd).unwrap();
+    let output = fixture
+        .command(&["daemon", "start", "--http", "127.0.0.1:0"])
+        .current_dir(&other_cwd)
+        .env("FASTEXEC_INSTRUCTIONS_FILE", "missing-relative.txt")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "re-start from other cwd failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out2 = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(pid_of(&out2), Some(original_pid), "{out2}");
+    assert!(out2.contains(&format!("http {original_addr}")), "{out2}");
+
+    let mut client = Client::new(original_addr, fixture.tokens[0].clone());
+    assert_eq!(
+        client.initialize()["instructions"].as_str(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        client.modern("server/discover", json!({}))["instructions"].as_str(),
+        Some(expected.as_str())
+    );
 }

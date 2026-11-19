@@ -431,6 +431,32 @@ while keeping each tool's `title`. The value is read at startup by the MCP
 server process (stdio, daemon endpoint, and HTTP daemon); an invalid value
 exits with status `1`.
 
+### `FASTEXEC_INSTRUCTIONS_FILE`
+
+When unset, MCP `initialize` and `server/discover` return the built-in server
+instructions unchanged. When set, the path is resolved with `files::resolve`
+(relative to the launch working directory, with `~` expansion and Windows Git
+Bash drive paths) and opened non-blockingly as a regular file with
+`files::open_regular`, rejecting directories, FIFOs, sockets, device nodes, and
+Windows named pipes or reserved DOS device names.
+
+The server reads at most `16,385` raw bytes without pre-checking file metadata
+and validates in order: size cap (`16,384` raw bytes), absence of NUL bytes,
+and valid UTF-8. It normalizes CRLF and lone CR to LF and strips leading UTF-8
+BOM characters. Whitespace-only or BOM-only files leave the built-in
+instructions unchanged; otherwise the normalized text is appended after a blank
+line (`\n\n`) with leading indentation and trailing whitespace preserved.
+Empty, non-UTF-8, unreadable, or invalid values exit with status `1`.
+
+Each serving process captures one immutable `Arc<str>` snapshot at startup;
+later edits or deletions do not change `initialize` or `server/discover`
+responses. Local stdio (`FASTEXEC_DAEMON=off`), daemon stdio endpoints
+(`FASTEXEC_DAEMON=on`), and HTTP daemons (`--http`) read it at startup.
+`daemon start --http` probes for an already-running daemon first and skips
+reading the file when reusing one, pre-validating it only on a cold HTTP start.
+Non-HTTP `daemon start` and `daemon run`, plus `daemon status` and
+`daemon stop`, leave the variable unread. The IPC protocol version is unchanged.
+
 A nonzero command `exitCode` is a normal result (`ok: true`). Operational
 failures set `isError` and `ok: false`; schema-decoding errors may have no
 `structuredContent`.

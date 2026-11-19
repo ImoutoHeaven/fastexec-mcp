@@ -1,22 +1,17 @@
 /// Use the production directory checks to create or validate a private runtime root.
 /// Existing directories must already satisfy its ownership, mode and ACL policy.
 /// The status command prepares the paths without starting a daemon.
+#[allow(dead_code)]
 pub fn create_private_runtime(path: &std::path::Path) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_fastexec"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_fastexec"));
+    super::scrub_fastexec_env(&mut command);
+    let output = command
         .args(["daemon", "status"])
         .env("FASTEXEC_TEST_RUNTIME_DIR", path)
         .env(
             "FASTEXEC_NAMESPACE",
             format!("private-fixture-{}", std::process::id()),
         )
-        .env_remove("FASTEXEC_DAEMON")
-        .env_remove("FASTEXEC_OUTPUT_MODE")
-        .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-        .env_remove("FASTEXEC_YOLO")
-        .env_remove("FASTEXEC_CODEMODE")
-        .env_remove("FASTEXEC_TRANSFER")
-        .env_remove("FASTEXEC_TRANSFER_ADDR")
-        .env_remove("FASTEXEC_PUBLIC_URL")
         .stdin(std::process::Stdio::null())
         .output()
         .expect("the binary creates the fixture's private runtime root");

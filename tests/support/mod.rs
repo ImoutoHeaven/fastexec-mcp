@@ -1,14 +1,27 @@
 //! Platform setup shared by the process-level integration tests.
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "freebsd"))]
 mod private_runtime;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "freebsd"))]
+#[allow(dead_code)]
 pub use private_runtime::create_private_runtime;
+
+/// Removes inherited `FASTEXEC_*` variables except `FASTEXEC_BASH` so host settings do not leak
+/// into test child processes.
+pub fn scrub_fastexec_env(cmd: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        let lower = key.to_string_lossy().to_ascii_lowercase();
+        if lower.starts_with("fastexec_") && lower != "fastexec_bash" {
+            cmd.env_remove(key);
+        }
+    }
+}
 
 /// Native FreeBSD queries and cleanup for fixture daemons. Becoming their reaper retains
 /// orphaned daemon PIDs until this harness explicitly waits for them, so a checked image
 /// cannot turn into an unrelated numeric PID between the ownership check and SIGKILL.
 #[cfg(target_os = "freebsd")]
+#[allow(dead_code)]
 pub mod freebsd {
     use std::io;
     use std::os::unix::ffi::OsStringExt;

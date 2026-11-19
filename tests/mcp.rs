@@ -7,9 +7,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-#[cfg(any(windows, target_os = "freebsd"))]
-#[path = "support/private_runtime.rs"]
-mod private_runtime;
+mod support;
 #[path = "support/transfer_http.rs"]
 mod transfer_http;
 
@@ -57,18 +55,7 @@ impl Server {
     /// Starts the server from `executable`, such as a world-reachable copy for dropped-uid tests.
     fn start_bin(executable: &std::path::Path, configure: impl FnOnce(&mut Command)) -> Server {
         let mut command = Command::new(executable);
-        command
-            .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_DAEMON")
-            .env_remove("FASTEXEC_NAMESPACE")
-            .env_remove("FASTEXEC_TEST_RUNTIME_DIR")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-            .env_remove("FASTEXEC_YOLO")
-            .env_remove("FASTEXEC_CODEMODE")
-            .env_remove("FASTEXEC_TRANSFER")
-            .env_remove("FASTEXEC_TRANSFER_ADDR")
-            .env_remove("FASTEXEC_PUBLIC_URL")
-            .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT");
+        support::scrub_fastexec_env(&mut command);
         configure(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
@@ -126,18 +113,7 @@ impl Server {
     /// `initialize` (for example, when a probed `FASTEXEC_TRANSFER_ADDR` raced with another test).
     fn try_start_with(configure: impl FnOnce(&mut Command)) -> Result<Server, String> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
-        command
-            .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_DAEMON")
-            .env_remove("FASTEXEC_NAMESPACE")
-            .env_remove("FASTEXEC_TEST_RUNTIME_DIR")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-            .env_remove("FASTEXEC_YOLO")
-            .env_remove("FASTEXEC_CODEMODE")
-            .env_remove("FASTEXEC_TRANSFER")
-            .env_remove("FASTEXEC_TRANSFER_ADDR")
-            .env_remove("FASTEXEC_PUBLIC_URL")
-            .env_remove("FASTEXEC_TEST_TOTAL_LOG_LIMIT");
+        support::scrub_fastexec_env(&mut command);
         configure(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
@@ -429,6 +405,7 @@ fn a_task_host_reports_readiness_after_its_command_exists() {
         let (lifeline_reader, lifeline) = std::io::pipe().unwrap();
         let descriptors = [status_writer.as_raw_fd(), lifeline_reader.as_raw_fd()];
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
         command
             .arg("--fastexec-task-host")
             .args(descriptors.iter().map(|fd| fd.to_string()))
@@ -601,12 +578,9 @@ fn output_modes_place_start_and_poll_body_without_losing_metadata() {
     distinct.dedup();
     assert_eq!(distinct.len(), first_ids.len(), "{first_ids:?}");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_fastexec"))
-        .env_remove("FASTEXEC_OUTPUT_MODE")
-        .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-        .env_remove("FASTEXEC_YOLO")
-        .env_remove("FASTEXEC_CODEMODE")
-        .env_remove("FASTEXEC_TRANSFER")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+    support::scrub_fastexec_env(&mut command);
+    let result = command
         .env("FASTEXEC_OUTPUT_MODE", "bogus")
         .output()
         .unwrap();
@@ -683,10 +657,9 @@ fn structured_content_can_be_disabled_for_every_action() {
         );
     }
 
-    let result = Command::new(env!("CARGO_BIN_EXE_fastexec"))
-        .env_remove("FASTEXEC_YOLO")
-        .env_remove("FASTEXEC_CODEMODE")
-        .env_remove("FASTEXEC_TRANSFER")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+    support::scrub_fastexec_env(&mut command);
+    let result = command
         .env("FASTEXEC_OUTPUT_MODE", "text")
         .env("FASTEXEC_STRUCTURED_CONTENT", "bogus")
         .output()
@@ -3532,7 +3505,7 @@ fn processes_the_server_may_not_kill_stay_held_and_reported() {
     assert_eq!(metadata.uid(), 0);
     assert_eq!(metadata.mode() & 0o777, 0o700);
     #[cfg(target_os = "freebsd")]
-    private_runtime::create_private_runtime(&dir);
+    support::create_private_runtime(&dir);
 
     let beats = [dir.join("exit"), dir.join("kill")];
     let stops = [dir.join("exit.stop"), dir.join("kill.stop")];
@@ -4286,7 +4259,7 @@ fn long_wait_sends_progress_and_cancellation_leaves_the_task_running() {
 #[test]
 fn a_task_cannot_start_a_daemon_and_says_so() {
     let runtime = Scratch::new("daemon-in-task");
-    private_runtime::create_private_runtime(&runtime);
+    support::create_private_runtime(&runtime);
     let namespace = format!("mcp{}", std::process::id());
     let exe = env!("CARGO_BIN_EXE_fastexec");
     // Armed before the start, so a daemon that was started by accident is stopped even when an
@@ -4323,13 +4296,11 @@ fn a_task_cannot_start_a_daemon_and_says_so() {
 #[cfg(windows)]
 fn daemon_command(exe: &str, runtime: &std::path::Path, namespace: &str, action: &str) -> Command {
     let mut command = Command::new(exe);
+    support::scrub_fastexec_env(&mut command);
     command
         .args(["daemon", action])
         .env("FASTEXEC_TEST_RUNTIME_DIR", runtime)
         .env("FASTEXEC_NAMESPACE", namespace)
-        .env_remove("FASTEXEC_YOLO")
-        .env_remove("FASTEXEC_CODEMODE")
-        .env_remove("FASTEXEC_TRANSFER")
         .stdin(Stdio::null());
     command
 }
@@ -5236,12 +5207,9 @@ fn yolo_overrides_stdio_tool_annotations_and_rejects_invalid_values() {
         invalid.push(std::ffi::OsString::from_wide(&[0xD800]));
     }
     for bad in invalid {
-        let output = Command::new(env!("CARGO_BIN_EXE_fastexec"))
-            .env_remove("FASTEXEC_DAEMON")
-            .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-            .env_remove("FASTEXEC_CODEMODE")
-            .env_remove("FASTEXEC_TRANSFER")
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
+        let output = command
             .env("FASTEXEC_YOLO", &bad)
             .stdin(Stdio::null())
             .output()
@@ -5382,12 +5350,9 @@ fn codemode_requires_explicit_enable_and_respects_yolo() {
         );
     }
     for bad in ["", "on", "off", "1", "0", "bogus"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_fastexec"))
-            .env_remove("FASTEXEC_DAEMON")
-            .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-            .env_remove("FASTEXEC_YOLO")
-            .env_remove("FASTEXEC_TRANSFER")
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
+        let output = command
             .env("FASTEXEC_CODEMODE", bad)
             .stdin(Stdio::null())
             .output()
@@ -7268,9 +7233,13 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
         "input": null
     }));
 
-    let bin = env!("CARGO_BIN_EXE_fastexec");
+    let bin_cmd = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
+        command
+    };
     for flag in ["--version", "-V"] {
-        let out = Command::new(bin).arg(flag).output().unwrap();
+        let out = bin_cmd().arg(flag).output().unwrap();
         assert_eq!(out.status.code(), Some(0), "{flag}: {out:?}");
         assert!(
             String::from_utf8_lossy(&out.stdout).starts_with("fastexec "),
@@ -7278,7 +7247,7 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
         );
     }
     for flag in ["--help", "-h"] {
-        let out = Command::new(bin).arg(flag).output().unwrap();
+        let out = bin_cmd().arg(flag).output().unwrap();
         assert_eq!(out.status.code(), Some(0), "{flag}: {out:?}");
         assert!(
             String::from_utf8_lossy(&out.stdout).contains("daemon"),
@@ -7290,14 +7259,14 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
         &["--version", "extra"][..],
         &["--help", "extra"][..],
     ] {
-        let out = Command::new(bin).args(bad_args).output().unwrap();
+        let out = bin_cmd().args(bad_args).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "{bad_args:?}: {out:?}");
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("unknown argument"),
             "{out:?}"
         );
     }
-    let eof_stdio = Command::new(bin).stdin(Stdio::null()).output().unwrap();
+    let eof_stdio = bin_cmd().stdin(Stdio::null()).output().unwrap();
     assert_eq!(eof_stdio.status.code(), Some(1), "{eof_stdio:?}");
 }
 
@@ -8242,13 +8211,9 @@ fn transfer_over_local_stdio_serves_put_head_get_and_validates_settings() {
     drop(proxied);
 
     // Wildcard FASTEXEC_TRANSFER_ADDR=0.0.0.0:0 with FASTEXEC_HTTP_ALLOW_REMOTE=1 requires FASTEXEC_PUBLIC_URL.
-    let wildcard_without_root = Command::new(env!("CARGO_BIN_EXE_fastexec"))
-        .env_remove("FASTEXEC_DAEMON")
-        .env_remove("FASTEXEC_OUTPUT_MODE")
-        .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-        .env_remove("FASTEXEC_YOLO")
-        .env_remove("FASTEXEC_CODEMODE")
-        .env_remove("FASTEXEC_PUBLIC_URL")
+    let mut wildcard_cmd = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+    support::scrub_fastexec_env(&mut wildcard_cmd);
+    let wildcard_without_root = wildcard_cmd
         .env("FASTEXEC_TRANSFER", "true")
         .env("FASTEXEC_HTTP_ALLOW_REMOTE", "1")
         .env("FASTEXEC_TRANSFER_ADDR", "0.0.0.0:0")
@@ -8303,14 +8268,9 @@ fn transfer_over_local_stdio_serves_put_head_get_and_validates_settings() {
         invalid.push(std::ffi::OsString::from_wide(&[0xD800]));
     }
     for bad in invalid {
-        let output = Command::new(env!("CARGO_BIN_EXE_fastexec"))
-            .env_remove("FASTEXEC_DAEMON")
-            .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-            .env_remove("FASTEXEC_YOLO")
-            .env_remove("FASTEXEC_CODEMODE")
-            .env_remove("FASTEXEC_TRANSFER_ADDR")
-            .env_remove("FASTEXEC_PUBLIC_URL")
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
+        let output = command
             .env("FASTEXEC_TRANSFER", &bad)
             .stdin(Stdio::null())
             .output()
@@ -8340,15 +8300,9 @@ fn transfer_over_local_stdio_serves_put_head_get_and_validates_settings() {
             "FASTEXEC_TRANSFER_ADDR 0.0.0.0:0 is not a loopback address",
         ),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_fastexec"))
-            .env_remove("FASTEXEC_DAEMON")
-            .env_remove("FASTEXEC_HTTP_ALLOW_REMOTE")
-            .env_remove("FASTEXEC_OUTPUT_MODE")
-            .env_remove("FASTEXEC_STRUCTURED_CONTENT")
-            .env_remove("FASTEXEC_YOLO")
-            .env_remove("FASTEXEC_CODEMODE")
-            .env_remove("FASTEXEC_TRANSFER_ADDR")
-            .env_remove("FASTEXEC_PUBLIC_URL")
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
+        let output = command
             .env("FASTEXEC_TRANSFER", "true")
             .env(var, bad)
             .stdin(Stdio::null())
@@ -8357,5 +8311,64 @@ fn transfer_over_local_stdio_serves_put_head_get_and_validates_settings() {
         assert_eq!(output.status.code(), Some(1), "{var}={bad}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains(expected), "{var}={bad}: {stderr:?}");
+    }
+}
+
+#[test]
+fn instructions_file_appends_to_stdio_initialize_and_rejects_invalid_files() {
+    let dir = Scratch::new("instructions-file");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let file = dir.join("notes.txt");
+    std::fs::write(&file, "\u{feff}    indented line\r\nsecond line\r\n").unwrap();
+
+    let init_params = json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "probe", "version": "0"},
+    });
+
+    let mut plain = Server::start();
+    let base = plain.request("initialize", init_params.clone())["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(plain);
+
+    let mut with_file = Server::start_with(|command| {
+        command
+            .current_dir(&*dir)
+            .env("FASTEXEC_INSTRUCTIONS_FILE", "notes.txt");
+    });
+    let actual = with_file.request("initialize", init_params)["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(with_file);
+
+    assert_eq!(
+        actual,
+        format!("{base}\n\n    indented line\nsecond line\n")
+    );
+
+    let oversized = dir.join("oversized.txt");
+    std::fs::write(&oversized, vec![b'a'; 16_385]).unwrap();
+    for (case, value, expected) in [
+        ("missing", "missing.txt", "FASTEXEC_INSTRUCTIONS_FILE"),
+        ("oversized", "oversized.txt", "exceeds 16384 bytes"),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
+        let output = command
+            .current_dir(&*dir)
+            .env("FASTEXEC_INSTRUCTIONS_FILE", value)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{case}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("FASTEXEC_INSTRUCTIONS_FILE") && stderr.contains(expected),
+            "{case}: {stderr:?}"
+        );
     }
 }

@@ -1,4 +1,6 @@
 //! Stored output reads must reject missing bytes without consuming the reader's position.
+mod support;
+
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -19,19 +21,7 @@ impl Server {
 
     fn with_render(mode: &str, structured: bool) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
-        for name in [
-            "FASTEXEC_DAEMON",
-            "FASTEXEC_NAMESPACE",
-            "FASTEXEC_BASH",
-            "FASTEXEC_YOLO",
-            "FASTEXEC_TRANSFER",
-            "FASTEXEC_TRANSFER_ADDR",
-            "FASTEXEC_PUBLIC_URL",
-            "FASTEXEC_TEST_RUNTIME_DIR",
-            "FASTEXEC_TEST_TOTAL_LOG_LIMIT",
-        ] {
-            command.env_remove(name);
-        }
+        support::scrub_fastexec_env(&mut command);
         let mut child = command
             .env(
                 "FASTEXEC_STRUCTURED_CONTENT",
@@ -358,19 +348,7 @@ fn head_and_tail_use_the_body_budget_and_report_omissions_in_status() {
 #[test]
 fn p0_1_and_p1_6_windows_and_nul_preservation_hold_direct_and_nested() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
-    for name in [
-        "FASTEXEC_DAEMON",
-        "FASTEXEC_NAMESPACE",
-        "FASTEXEC_BASH",
-        "FASTEXEC_YOLO",
-        "FASTEXEC_TRANSFER",
-        "FASTEXEC_TRANSFER_ADDR",
-        "FASTEXEC_PUBLIC_URL",
-        "FASTEXEC_TEST_RUNTIME_DIR",
-        "FASTEXEC_TEST_TOTAL_LOG_LIMIT",
-    ] {
-        command.env_remove(name);
-    }
+    support::scrub_fastexec_env(&mut command);
     let mut child = command
         .env("FASTEXEC_STRUCTURED_CONTENT", "true")
         .env("FASTEXEC_OUTPUT_MODE", "both")

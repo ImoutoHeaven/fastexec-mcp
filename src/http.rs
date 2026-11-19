@@ -57,6 +57,8 @@ pub struct Http {
     /// The base a `transfer` URL is minted from: the parsed [`PUBLIC_URL`], read once at start.
     /// Its absence means each request's own Host and `X-Forwarded-Proto` name the address.
     pub public_root: Option<Arc<str>>,
+    /// Normalized extra instructions loaded once at daemon startup.
+    pub extra_instructions: Option<String>,
 }
 
 /// The root this process was started with: `None` when the variable is unset, the normalized root
@@ -213,6 +215,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         tools,
         launch,
         public_root,
+        extra_instructions,
     } = http;
     // The factory makes a server for each legacy session or inline-lifecycle request.
     let service = Arc::clone(&daemon.service());
@@ -229,6 +232,9 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
             )
         })
         .collect();
+    let router = Server::build_router(&launch, tools);
+    let instructions =
+        crate::server_instructions(true, tools.codemode, extra_instructions.as_deref());
     let factory = {
         let table = Arc::clone(&table);
         let public_root = public_root.clone();
@@ -245,7 +251,13 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
                 table: Arc::clone(&table),
                 public_root: public_root.clone(),
             });
-            let mut server = Server::new(backend, &launch, transfer, tools);
+            let mut server = Server::with_shared(
+                backend,
+                router.clone(),
+                Arc::clone(&instructions),
+                transfer,
+                tools,
+            );
             server.principals = Some(Arc::clone(&principals));
             Ok(server)
         }

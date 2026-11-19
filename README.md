@@ -155,10 +155,15 @@ bound the script's lifetime.
 | `FASTEXEC_STRUCTURED_CONTENT` | `true` | Includes task metadata in results. |
 | `FASTEXEC_OUTPUT_MODE` | `text` | Places task output in `text`, `both`, or `structured` output. |
 | `FASTEXEC_DAEMON` | `off` | Runs tasks in the shared daemon when `on`. |
+| `FASTEXEC_INSTRUCTIONS_FILE` | unset | Appends a UTF-8 text file (up to 16 KiB) to MCP server instructions at startup. |
 
 `FASTEXEC_CODEMODE`, `FASTEXEC_TRANSFER`, `FASTEXEC_YOLO`, and
 `FASTEXEC_STRUCTURED_CONTENT` accept only `true` or `false`; invalid values
-stop startup. An endpoint's environment decides whether it advertises
+stop startup. `FASTEXEC_INSTRUCTIONS_FILE` is read once when a stdio server,
+daemon endpoint, or HTTP daemon starts, and invalid, unreadable, or oversized
+files exit with status `1` (non-HTTP `daemon start` and `daemon run`, plus
+`daemon status` and `daemon stop`, leave it unread). An endpoint's environment
+decides whether it advertises
 `codemode` and `transfer`, even when its daemon was started without them. HTTP
 uses the daemon's startup settings.
 Nested calls resolve directly to unwrapped structured objects regardless of the
