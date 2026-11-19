@@ -2834,17 +2834,11 @@ fn remove_stale_dirs(temp: &Path) {
             .to_str()
             .and_then(|name| name.strip_prefix(prefix.as_str()))
             .and_then(|tail| {
-                match tail.split_once('-') {
-                    Some((pid, nonce))
-                        if nonce.len() == 12
-                            && nonce.bytes().all(|byte| ALPHABET.contains(&byte)) =>
-                    {
-                        pid.parse().ok()
-                    }
-                    Some(_) => None,
-                    // Also retire directories written by older versions.
-                    None => tail.parse().ok(),
+                let (pid, nonce) = tail.split_once('-')?;
+                if nonce.len() != 12 || !nonce.bytes().all(|byte| ALPHABET.contains(&byte)) {
+                    return None;
                 }
+                pid.parse().ok()
             });
         if pid.is_some_and(|pid| pid != std::process::id() && !process::is_alive(pid))
             && crate::runtime::create_private_unix_check(&entry.path()).is_ok()
@@ -2870,13 +2864,14 @@ mod private_directory_tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let prefix = dir_prefix();
-        let valid = root.join(format!("{prefix}2147483647"));
-        let shared = root.join(format!("{prefix}2147483646"));
+        let valid = root.join(format!("{prefix}2147483647-0123456789ab"));
+        let shared = root.join(format!("{prefix}2147483646-0123456789ab"));
         let target = root.join("target");
-        let link = root.join(format!("{prefix}2147483645"));
-        let foreign = root.join(format!("{prefix}2147483644"));
-        let live = root.join(format!("{prefix}{}", std::process::id()));
-        for dir in [&valid, &shared, &target, &foreign, &live] {
+        let link = root.join(format!("{prefix}2147483645-0123456789ab"));
+        let foreign = root.join(format!("{prefix}2147483644-0123456789ab"));
+        let live = root.join(format!("{prefix}{}-0123456789ab", std::process::id()));
+        let old_format = root.join(format!("{prefix}2147483643"));
+        for dir in [&valid, &shared, &target, &foreign, &live, &old_format] {
             std::fs::create_dir(dir).unwrap();
         }
         std::fs::set_permissions(&valid, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2884,6 +2879,7 @@ mod private_directory_tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&old_format, std::fs::Permissions::from_mode(0o700)).unwrap();
         // Exercise another owner's otherwise private directory when run as root.
         if unsafe { libc::geteuid() } == 0 {
             use std::os::unix::ffi::OsStrExt;
@@ -2907,6 +2903,10 @@ mod private_directory_tests {
         );
         assert!(target.exists());
         assert!(live.exists(), "live process logs must not be removed");
+        assert!(
+            old_format.exists(),
+            "names without a nonce must be retained"
+        );
         if unsafe { libc::geteuid() } == 0 {
             assert!(
                 foreign.exists(),
