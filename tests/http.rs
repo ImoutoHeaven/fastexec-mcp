@@ -3291,9 +3291,12 @@ fn assert_http_instructions_result(result: &Value, expected: &str, context: &str
 #[test]
 fn http_instructions_tool_move_and_copy_pin_snapshot_and_reject_extra_args() {
     let marker = "HTTP-MARKER-AFTER-512-9a2f1d";
-    let padding = "h".repeat(540);
-    let raw = format!("\u{feff}    HTTP directive — 東京 café  \r\n{padding}\r\n{marker}   \r\n");
+    let prefix = "\u{feff}    HTTP directive — 東京 café  \r\n";
+    let suffix = format!("\r\n{marker}   \r\n");
+    let padding = "h".repeat(16 * 1024 - prefix.len() - suffix.len());
+    let raw = format!("{prefix}{padding}{suffix}");
     let normalized = format!("    HTTP directive — 東京 café  \n{padding}\n{marker}   \n");
+    assert_eq!(raw.len(), 16 * 1024);
     assert!(normalized.find(marker).unwrap() > 512);
 
     let expected_schema = json!({
@@ -3407,6 +3410,14 @@ fn http_instructions_tool_move_and_copy_pin_snapshot_and_reject_extra_args() {
                 Some(expected_proto.as_str()),
                 "{mode} {stage} server/discover"
             );
+            let modern_list = modern.modern("tools/list", json!({}));
+            let modern_tool = modern_list["tools"]
+                .as_array()
+                .expect("modern tools/list array")
+                .iter()
+                .find(|tool| tool["name"] == "instructions")
+                .expect("modern instructions tool");
+            assert_eq!(modern_tool, &tool, "{mode} {stage} modern tool metadata");
             let modern_call = modern.modern(
                 "tools/call",
                 json!({"name": "instructions", "arguments": {}}),

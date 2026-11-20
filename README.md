@@ -5,41 +5,30 @@
   <img src="assets/fastexec.svg" alt="fastexec" width="560">
 </picture>
 
-`fastexec` is an MCP server that runs bash commands as background tasks, with
-stdin pipes, interactive PTYs, bounded output, and process-tree termination, and
-reads, writes, and edits files on the host. It also runs a background daemon
-shared by every session in a namespace, opt-in with `FASTEXEC_DAEMON=on`.
+`fastexec` is an MCP server for bash tasks and host files. Run commands with
+`exec`, or use `read`, `write`, and `edit` for files. Tasks run with the
+server account's permissions, without a sandbox.
 
-## Requirements and Quickstart
+## Quick start
 
-- **Runtime**: GNU bash on Linux (including Alpine), macOS, and FreeBSD, or
-  [Git for Windows](https://git-scm.com/downloads) on Windows. Install bash with
-  `apk add bash` on Alpine or `pkg install bash` on FreeBSD. Set `FASTEXEC_BASH`
-  to an absolute GNU bash path to override discovery. Linux requires kernel
-  `5.3+`, readable `/proc`, and permission to use `pidfd_open` and
-  `pidfd_send_signal`; these keep process-tree termination safe when PIDs are reused.
-- **Build** (optional): Rust `1.92+` (`edition = "2024"`) and a C compiler.
-  Linux musl builds need `musl-tools`. FreeBSD builds also need `llvm`; set
-  `LIBCLANG_PATH` to its `lib` directory, such as `/usr/local/llvm21/lib`.
+Install GNU bash on Linux, macOS, or FreeBSD, or
+[Git for Windows](https://git-scm.com/downloads) on Windows. Linux requires a
+5.3 or newer kernel, readable `/proc`, and access to the pidfd syscalls.
+Set `FASTEXEC_BASH` to an absolute path if Bash is not found.
 
-Download the archive for your platform from
-[Releases](https://github.com/ImoutoHeaven/fastexec-mcp/releases)
-(`linux`, `macos`, or `windows`, each `amd64` or `arm64`, and `freebsd-amd64`),
-check it against `SHA256SUMS`, and extract `fastexec` (`fastexec.exe` on Windows).
-The Linux binaries link musl statically and run directly on Alpine without a
-glibc compatibility package. The FreeBSD archive is built and tested on FreeBSD
-15.1; source builds require FreeBSD 15.1 or newer and use its native toolchain.
-Shared runtime directories require atomic no-replace directory renames; UFS and
-ZFS are tested. The macOS binaries are
-unsigned: clear the quarantine a browser download sets with
-`xattr -d com.apple.quarantine fastexec`. To build from source instead:
+Download the matching archive from
+[Releases](https://github.com/ImoutoHeaven/fastexec-mcp/releases), verify it
+against `SHA256SUMS`, then extract `fastexec` (`fastexec.exe` on Windows).
+Linux, macOS, and Windows have amd64 and arm64 archives; FreeBSD has amd64.
+See [platform notes](docs/fastexec-design.md#platform-notes) for package and
+build requirements. To build from source:
 
 ```bash
 cargo build --release
 ```
 
-Register the absolute path of the binary (`target/release/fastexec` when built)
-in Pi's `~/.pi/agent/mcp.json`:
+Register the absolute binary path (built binaries are under `target/release`).
+For Pi, use `~/.pi/agent/mcp.json`:
 
 ```json
 {
@@ -52,65 +41,64 @@ in Pi's `~/.pi/agent/mcp.json`:
 }
 ```
 
-Hosts without progress-aware timeouts need at least 300 seconds per tool call.
-
-## Tool Usage and Example
-
-The server exposes `exec` for bash tasks and `read`, `write`, and `edit` for
-files. Set `FASTEXEC_TRANSFER=true` to expose `transfer` as well. Pi names each
-tool `mcp__<server>__<tool>`, where `<server>` is the key in the configuration,
-so the entry above gives `mcp__fastexec_local__exec`.
-
-`exec` selects an operation with its `action` field (`start`, `poll`, `kill`,
-`list`, `transcript`)—these are MCP tool arguments, not CLI subcommands. See
-[`src/description.md`](src/description.md) for the runtime parameter contract,
-and [the design document](docs/fastexec-design.md) for the file tools.
-
-Start a command through the tool:
+In Pi the command tool is `mcp__fastexec_local__exec`. Start a bash task with
+these MCP tool arguments:
 
 ```json
 {"action": "start", "command": "printf 'ready\\n'; sleep 5; printf 'done\\n'", "waitMs": 1000}
 ```
 
-If it is still running, poll with the returned `taskId` (replace the placeholder):
+If it is still running, poll with the returned `taskId`:
 
 ```json
 {"action": "poll", "taskId": "<returned taskId>", "waitMs": 10000}
 ```
 
-### Several servers
+Use the returned `taskId` to keep your output cursor. A wait timeout or a
+cancelled request does not stop the task. Use `killAfterMs` to set its
+deadline, or send `action: "kill"` to stop it. Each start runs a fresh Bash:
+`cd` and exports do not carry over. Use pipes for input, or `pty: true` with
+`keys` for interactive terminals.
 
-One config can hold a local stdio server and a remote HTTP one under different
-keys. Pi treats `-` and `_` in server names as the same character, so names that
-differ only in those collide.
+Hosts without progress-aware timeouts need at least 300 seconds per tool
+call. Hosts may log MCP arguments, and task logs and PTY transcripts can
+record sensitive input. Avoid putting secrets in arguments or typing them
+into a recorded terminal. After an unconfirmed input write or an oversized
+Codemode result, check what happened before retrying.
 
-```json
-{
-  "mcpServers": {
-    "fastexec_local": {
-      "command": "/absolute/path/to/fastexec",
-      "exposure": "direct"
-    },
-    "remote_linux": {
-      "url": "https://build.example.com/mcp",
-      "headers": {"Authorization": "Bearer ${FASTEXEC_TOKEN}"},
-      "exposure": "deferred"
-    }
-  }
-}
-```
+## Choose how to run
 
-`${NAME}` reads the variable from the environment Pi runs in. Prefer `codemode`
-or `deferred` exposure for a remote server: a `direct` server that has not
-connected within the first prompt's 10 second wait changes the declared tools
-mid-session.
+| Setting | Default | When to change it |
+| --- | --- | --- |
+| `FASTEXEC_DAEMON` | `off` | Set `on` to share tasks across sessions in one namespace and keep them running after disconnect. |
+| `FASTEXEC_CODEMODE` | `false` | Set `true` to run a JavaScript script that calls tools. |
+| `FASTEXEC_TRANSFER` | `false` | Set `true` to publish files through capability URLs. Treat each URL as a credential. |
+| `FASTEXEC_TRANSFER_ADDR` | `127.0.0.1:0` | Set the transfer listener address outside HTTP daemon mode. |
+| `FASTEXEC_YOLO` | `false` | Override tool hints except for `instructions`. This does not restrict what tools can do. |
+| `FASTEXEC_STRUCTURED_CONTENT` | `true` | Set `false` to omit structured metadata. |
+| `FASTEXEC_OUTPUT_MODE` | `text` | Use `both` or `structured` to include the output body in structured results. |
 
-## JavaScript tasks
+For stdio, set environment variables on the client entry. For HTTP, set them
+on the daemon and restart it.
 
-Set `FASTEXEC_CODEMODE=true` to expose `codemode` and advertise it in server
-instructions. Its `code` argument is the body of an async JavaScript function.
-The script can call `exec`, `read`, `write`, and `edit`, inspect their
-structured results, and return only the output it needs:
+### Instructions
+
+Set `FASTEXEC_INSTRUCTIONS_FILE` to append a UTF-8 file (up to 16 KiB) at
+startup. Choose `FASTEXEC_INSTRUCTIONS_TOOL` based on what your client shows:
+
+| Value | Protocol instructions | `instructions` tool description and result |
+| --- | --- | --- |
+| `off` (default) | Built-in guidance plus file text | Tool absent |
+| `move` | Built-in guidance plus a pointer | File text only |
+| `copy` | Built-in guidance plus file text | Same full text |
+
+With no extra text, `move` sends the built-in guidance on both surfaces.
+Clients that list tools can receive the description without calling it. Do
+not put secrets in the file.
+
+### JavaScript tasks
+
+Pass the body of an async function as `codemode`'s `code`:
 
 ```javascript
 const [run, file] = await Promise.all([
@@ -121,318 +109,43 @@ text(run.output);
 text(file.text);
 ```
 
-`text`, `console.log/info/warn/error/debug`, and a returned value write to the
-task log. `image(await tools.read({path: "shot.png"}))` saves and returns an
-image. A result carries at most four images and 4718592 base64 bytes; warnings
-name saved images that can be read separately. A nested `exec poll` or `kill`
-that receives images exposes the blocks in `result.codemode.images`. Pass a
-block to `image()` to include it in the outer script's result.
+Poll or stop the script with `exec`. Stopping the script cancels pending tool
+calls but leaves Bash tasks it already started running. Set `killAfterMs` to
+bound the script itself. See the [Codemode tool contract](src/description-codemode.md)
+for arguments and limits.
 
-`codemode` accepts `cwd`, `waitMs`, `returnWhen` with `outputContains` or `quietMs`,
-`killAfterMs`, `truncate`, and `maxBytes`. When `cwd` is set, nested `exec`
-starts (unless they pass their own `cwd`) and relative paths in `read`, `write`,
-and `edit` resolve against it. Continue with `exec poll`,
-stop with `exec kill`, and inspect with `exec list`. A script has no terminal
-or input. `sh.quote(value)` single-quotes strings and finite numbers for POSIX
-bash, and UTF-8 `TextEncoder` and `TextDecoder` are available alongside `atob`
-and `btoa`, and `sleep(ms)` pauses without spawning a process; JavaScript has no
-Node APIs, modules, callback timers, filesystem, or network access, and host
-operations go through `tools` (`exec` starts run non-interactively with the
-session's login-environment snapshot by default; pass `loginShell: true` when a
-command needs fresh login profile side effects).
+### Shared daemon and remote HTTP
 
-Stopping a script cancels its pending tool calls. Bash tasks it already
-started continue running, and the result lists their handles for `exec kill`.
-A request cancellation ends only that request's wait. Set `killAfterMs` to
-bound the script's lifetime.
+Stdio tasks end with the session unless you set `FASTEXEC_DAEMON=on`. Set the
+same `FASTEXEC_NAMESPACE` on clients that should share a daemon. Use
+`fastexec daemon start`, `fastexec daemon status`, and `fastexec daemon stop`
+to manage it. Stop the existing daemon before changing its startup settings.
 
-| Setting | Default | Effect |
-| --- | --- | --- |
-| `FASTEXEC_CODEMODE` | `false` | Exposes the JavaScript tool when `true`. |
-| `FASTEXEC_TRANSFER` | `false` | Exposes the file transfer tool and serves `/t/<id>` when `true`. |
-| `FASTEXEC_TRANSFER_ADDR` | `127.0.0.1:0` | Sets the `/t/` listener `host:port` when `--http` is off. |
-| `FASTEXEC_YOLO` | `false` | Overrides annotations on all exposed tools. |
-| `FASTEXEC_STRUCTURED_CONTENT` | `true` | Includes task metadata in results. |
-| `FASTEXEC_OUTPUT_MODE` | `text` | Places task output in `text`, `both`, or `structured` output. |
-| `FASTEXEC_DAEMON` | `off` | Runs tasks in the shared daemon when `on`. |
-| `FASTEXEC_INSTRUCTIONS_FILE` | unset | Appends a UTF-8 text file (up to 16 KiB) to MCP server instructions at startup. |
-| `FASTEXEC_INSTRUCTIONS_TOOL` | `off` | Exposes server instructions as an MCP `instructions` tool (`off`, `move`, or `copy`). |
-
-`FASTEXEC_CODEMODE`, `FASTEXEC_TRANSFER`, `FASTEXEC_YOLO`, and
-`FASTEXEC_STRUCTURED_CONTENT` accept only `true` or `false`; invalid values
-stop startup. `FASTEXEC_INSTRUCTIONS_FILE` and `FASTEXEC_INSTRUCTIONS_TOOL` are
-read once when a stdio server, daemon endpoint, or HTTP daemon starts, and
-invalid values or unreadable/oversized files exit with status `1` (non-HTTP
-`daemon start` and `daemon run`, warm `daemon start --http` reuse, `daemon
-status`, and `daemon stop` leave them unread). In `move` mode, protocol
-`instructions` keeps the built-in lines with a short pointer and puts the extra
-file in the `instructions` tool description and result; `copy` puts the full
-composed instructions on both surfaces. An endpoint's environment
-decides whether it advertises
-`codemode` and `transfer`, even when its daemon was started without them. HTTP
-uses the daemon's startup settings.
-Nested calls resolve directly to unwrapped structured objects regardless of the
-outer output setting (`exec` returns `{output, exitCode, state, ...}` defaulting
-to `truncate: "head"` and `maxBytes: 4194304` with NUL bytes preserved in clean
-output and no default `waitMs` ceiling, text `read` without `offset` or `limit`
-returns the whole UTF-8 file up to `4` MiB or rejects with `ToolError` if larger
-or non-UTF-8 — and with `offset` or `limit` reads a slice up to `4` MiB — as
-`{kind: "text", path, text, startLine, endLine, shownLines, totalLines,
-truncated, nextOffset, lineTooLong, lossy}`, image `read` returns
-`{path, attached, ...}`, `write` returns `{path, bytes}`, and `edit` returns
-`{path, replacements, edits}`). Validation, file, and integrity errors reject
-with `ToolError` (`{tool, result}`), while non-zero command exit codes
-resolve normally.
-
-Each script has 128 MiB of VM memory, eight `exec start` calls and eight
-file/transcript I/O calls in flight (`poll`, `kill`, `list`, and `sleep` take no
-concurrency slot) within 1024 pending calls, a separate 128 MiB budget for
-pending tool arguments and results,
-64 MiB of output including images and diagnostic space, and up
-to 64 images. Up to four scripts run in a local stdio server, or eight in a
-daemon. Each script accepts at most 4096 `exec start` calls, including calls
-that later fail or are cancelled; further starts reject with `RangeError`.
-If a completed tool result cannot fit the bridge budget, its call rejects
-with `RangeError` after the operation ran; inspect its effects before retrying.
-The existing total task and log limits also apply. See
-[`src/description-codemode.md`](src/description-codemode.md) for the tool contract.
-
-## Key Constraints
-
-- **Wait window and process deadline**. Direct `start` and `poll` calls accept
-  `waitMs` from 0 to 240000 ms. Nested calls accept longer waits and default to
-  waiting until completion. `returnWhen` sets a 30 s default. Without it,
-  a poll that sends input, presses keys, or resizes the PTY defaults to 2 s. If
-  `waitMs` elapses, `returnWhen` matches, or the call is cancelled, the task
-  keeps running. Use `killAfterMs` on `start` or `action: "kill"` to bound or
-  stop the process tree.
-- **Owned process trees**: Tasks inherit server permissions, without a
-  sandbox. Every `start` runs a fresh bash (`cd` and exports do not persist).
-  Processes left behind when root bash exits are killed
-  unless started with `keepTree: true`.
-- **Task lifetime**: with the default `FASTEXEC_DAEMON=off`, tasks end when the
-  server's session ends. With `FASTEXEC_DAEMON=on` they run in the namespace's
-  daemon, outlive sessions, and are visible to every session; they end by exit,
-  `kill`, `killAfterMs`, or `fastexec daemon stop`, and finished tasks stay
-  listable for up to 24 h.
-- **Pipe stdin vs. PTY keys**: Pipe-mode `start` connects stdin to `/dev/null`
-  by default so tools like `rg` or `cat` never hang waiting on unused stdin;
-  pass `input` (up to `1` MiB on `start`, closing stdin afterwards unless
-  `eof: false`) or `eof: false` to stream follow-up `poll` input (`<= 16` KiB
-  per poll). In PTY mode (`pty: true`), send text with `input` on `poll` and
-  terminal keys (such as `"Enter"` or `"C-c"`) with `keys`.
-- **Data integrity feedback**: Invalid or oversized requests are rejected. Input
-  writes are acknowledged; a failed or unconfirmed write returns an error and
-  may have partially taken effect. Canonical PTY input warns that long lines can
-  be discarded even when split across polls; use a pipe or file for long text.
-  Windows MSYS readers may also lose a leading byte after a resize, even for
-  short keys; PTY input results explicitly warn about this [known risk](https://github.com/ImoutoHeaven/fastexec-mcp/issues/5).
-  Output capture failures and permanent log loss are explicit, with warnings
-  preserved even beyond `maxBytes`.
-- **Sensitive input and logs**: MCP hosts may log tool arguments (`command`,
-  `input`, `keys`). Task output is written to log files (up to `64` MiB per
-  task), and PTY transcripts record terminal-rendered screen text, including
-  echoed input.
-- **Windows paths and path conversion**: Tool `cwd` and `path` fields accept
-  relative paths, `~`, `C:/...`, `C:\...`, and Git Bash drive paths (`/c`,
-  `/c/...`), refuse driveless POSIX paths like `/tmp/x` (use `cygpath -m` when
-  needed), and always report forward slashes. Inside bash commands, Git Bash
-  rewrites POSIX-shaped arguments for native Windows binaries unless prefixed
-  with `MSYS_NO_PATHCONV=1`.
-
-## Shared daemon (`FASTEXEC_DAEMON=on`)
-
-Set `env` on the server entry to run every session's tasks in one daemon per
-namespace:
-
-```json
-{
-  "mcpServers": {
-    "fastexec_local": {
-      "command": "/absolute/path/to/fastexec",
-      "env": {"FASTEXEC_DAEMON": "on"}
-    }
-  }
-}
-```
-
-`FASTEXEC_NAMESPACE` names the daemon: sessions that set the same name share
-one, and different builds never share one. `fastexec daemon start|status|stop`
-starts it, reports its epoch, build, PID, sessions, tasks, and HTTP address, and
-stops it; `status` and `stop` never start one.
-
-Daemons stay running when idle by default. `fastexec daemon start --idle-exit on`
-enables exit after 10 minutes with no connections, no tasks, and no live `/t/`
-transfers; `--idle-exit off` explicitly keeps the default. Finished tasks remain
-in the registry for up to 24 hours. These options apply only when starting a new
-daemon; stop an existing daemon before changing its policy. HTTP daemons never
-exit idle.
-
-A host that keeps its children in a Job without breakaway, such as a fastexec
-task, cannot start a detached daemon: run `fastexec daemon start` from a
-terminal outside the host, or `fastexec daemon run` in the foreground.
-
-See [`docs/fastexec-design.md`](docs/fastexec-design.md) §6 for the directory
-layout, limits, and lifetimes.
-
-## Remote host
-
-`fastexec daemon run --http 127.0.0.1:<port>` serves the same toolset over
-Streamable HTTP in the foreground, in the process the supervisor started. Once
-both listeners are bound it prints one line to stderr — `fastexec daemon <epoch>
-pid <pid> namespace <namespace> http <addr>` — and keeps its logs on stderr.
-`SIGTERM` and `SIGINT`, and on Windows `Ctrl+C`, `Ctrl+Break`, console close and
-shutdown, stop it the way `fastexec daemon stop` does: every task is killed and
-the process exits `0`. That cleanup is best effort where the operating system
-ends the process first, by a close deadline it enforces or a forced termination.
-It runs with idle exit off, refuses `--idle-exit`, and exits `1` when the
-namespace already has a daemon.
-
-`FASTEXEC_HTTP_TOKEN` holds one or more bearer tokens separated by ASCII
-whitespace. Each token needs at least 16 visible ASCII characters; empty lists
-and duplicate tokens are refused. Every `/mcp` request carries one of them.
-
-Modern MCP clients use `server/discover` and sessionless requests. Each token
-has its own session for the listener's lifetime, with owner labels `http-t1`,
-`http-t2`, and so on in configuration order. Clients sharing a token share
-background notices. Other clients' running tasks appear once per session in the
-footer; `list` defaults to the current session and accepts `scope: "all"` to
-show all tasks with their owner labels. Legacy clients retain
-their client-named sessions through the `initialize` handshake.
-
-A `start` result's `taskId` is a reader handle, `<taskId>.<reader>`. Poll with
-that handle to keep your own output cursor. IDs from `list` and background
-notices are bare task IDs: polling one creates a new reader from the beginning
-of the retained log and returns its handle with a `new reader` notice. A task
-can hold 16 readers per session; a new reader replaces the least recently used
-idle reader, while readers with active calls stay in place. A handle whose
-reader was evicted, or belongs to an ended session, attaches again from the
-retained log's beginning. These reader rules also apply to stdio and daemon
-endpoint clients.
-
-A systemd **user** unit shares `XDG_RUNTIME_DIR` with the user's shells, so
-`fastexec daemon status` and `stop` reach the daemon it started:
-
-```ini
-# ~/.config/systemd/user/fastexec.service
-[Unit]
-Description=fastexec daemon
-
-[Service]
-Type=exec
-ExecStart=%h/.local/bin/fastexec daemon run --http 127.0.0.1:8765
-EnvironmentFile=%h/.config/fastexec.env
-WorkingDirectory=%h
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-`~/.config/fastexec.env` holds `FASTEXEC_HTTP_TOKEN=<token>` and
-`FASTEXEC_HTTP_ALLOW_REMOTE=1`. Then:
+For HTTP, set `FASTEXEC_HTTP_TOKEN` in the server's environment. Each token
+needs at least 16 visible ASCII characters. Run:
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable --now fastexec
-loginctl enable-linger <user>
+fastexec daemon run --http 127.0.0.1:8765
 ```
 
-`loginctl enable-linger` starts the unit without a login session.
+Point clients to `/mcp` and send `Authorization: Bearer <token>` on every
+request. Use a TLS-terminating proxy for remote access. A proxy forwarding the
+public Host requires `FASTEXEC_HTTP_ALLOW_REMOTE=1`, even with a loopback bind.
+Stopping the HTTP daemon stops its tasks.
 
-On Windows, [nssm](https://nssm.cc/usage) runs it under the user's own account
-rather than LocalSystem:
+See [service setup](docs/fastexec-design.md#run-http-under-a-service-manager),
+[proxy setup](docs/fastexec-design.md#behind-a-proxy), and
+[daemon behavior](docs/fastexec-design.md#6-daemon-mode-fastexec_daemonon).
 
-```powershell
-nssm install fastexec "C:\path\to\fastexec.exe" "daemon run --http 127.0.0.1:8765"
-nssm set fastexec AppDirectory "C:\Users\<user>"
-nssm set fastexec AppEnvironmentExtra "FASTEXEC_HTTP_TOKEN=<token>" "FASTEXEC_HTTP_ALLOW_REMOTE=1" "LOCALAPPDATA=C:\Users\<user>\AppData\Local"
-nssm edit fastexec
-nssm start fastexec
-```
+## Reference and testing
 
-`nssm edit` sets the Log on account without putting a password on the command
-line. Every environment entry goes in one `AppEnvironmentExtra` command, because
-a later one replaces the block. The runtime root comes from `LOCALAPPDATA`, so
-the service and the user's shell must see the same value: set it explicitly
-rather than inherit an administrator's profile. A service runs in Session 0
-without a desktop, so an app that needs a visible window belongs in Task
-Scheduler "at logon" instead.
-
-### Behind a proxy
-
-`FASTEXEC_HTTP_ALLOW_REMOTE=1` is required even on a loopback bind, because a
-proxy forwards the public `Host`. The daemon serves `/mcp` and `/t/<id>`, and an
-authenticated request for any other path answers 404, so a proxy that forwards
-its prefix unstripped fails at `initialize` instead of at a download.
-
-One domain carries every machine, each on a prefix of its own that the proxy
-strips. Each daemon is started with the address clients reach, which is the root
-`transfer` mints its URLs from:
-
-```bash
-FASTEXEC_TRANSFER=true \
-FASTEXEC_PUBLIC_URL=https://example.com/mac/ \
-FASTEXEC_HTTP_ALLOW_REMOTE=1 \
-fastexec daemon start --http 127.0.0.1:8765
-```
-
-```nginx
-location /mac/ {
-    proxy_pass http://127.0.0.1:8765/;
-    proxy_http_version 1.1;
-    proxy_set_header Host $http_host;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    client_max_body_size 4m;
-}
-```
-
-The same block with `/linux/`, `/windows/` and one port per machine. MCP clients
-use `<root>mcp`: `https://example.com/mac/mcp` for the block above.
-
-When `FASTEXEC_PUBLIC_URL` is unset on HTTP, `transfer` uses the `Host` and
-`X-Forwarded-Proto` of the request it answers. Over local stdio or a non-HTTP
-daemon, `transfer` uses `FASTEXEC_PUBLIC_URL` when set (an endpoint's value
-overrides the daemon's startup root) and otherwise `http://<bound>/` on its
-`/t/` listener (`FASTEXEC_TRANSFER_ADDR`, defaulting to `127.0.0.1:0` and
-requiring `FASTEXEC_HTTP_ALLOW_REMOTE=1` outside loopback, plus
-`FASTEXEC_PUBLIC_URL` when the address is unspecified). Combining `--http`
-with `FASTEXEC_TRANSFER_ADDR` is refused at startup because `--http` already
-serves `/t/`. A `daemon start` that finds a running HTTP daemon keeps the root
-that daemon already has. A `FASTEXEC_PUBLIC_URL` value that is not `http` or
-`https`, names no host, has a port outside 1-65535, or carries userinfo, a
-query, a fragment, a dot segment or an empty path segment is refused with its
-reason and exit 1, before anything binds.
-
-The server sends `X-Accel-Buffering: no` on the responses a proxy would
-otherwise buffer.
-
-Cloudflare reaches the daemon through a named tunnel; Quick Tunnels do not
-support server-sent events. Plan limits are in
-[Cloudflare's connection limits](https://developers.cloudflare.com/fundamentals/reference/connection-limits/).
-
-`transfer` publishes one regular file at a URL that serves it to `curl`,
-returning its resolved `path` and current `bytes` (`null` when the file does not
-exist yet) and staying valid until 10 minutes pass unused. Directories are
-refused (pack them with `tar` via `exec` first). A proxy that limits request
-size still carries a large file in parts, one at a time; the tool description
-has the recipe.
-
-## Testing, Reference, and License
-
-```bash
-cargo test
-```
-
-Windows daemon tests must run outside any Job: build with
-`cargo test --no-run` and run the test executables from a shell outside any Job
-(`cargo test` places its children in one).
-
-See [`docs/fastexec-design.md`](docs/fastexec-design.md) for host timeouts,
-`FASTEXEC_OUTPUT_MODE`, PTY keys, transcript spooling, and process trees, and
-[`src/description.md`](src/description.md) for agent usage rules.
+The [tool description](src/description.md) lists `exec` arguments.
+The [design reference](docs/fastexec-design.md) covers tool behavior, output,
+platform differences, and daemon limits. Run `cargo test` for local tests.
+On Windows, use `cargo test --no-run`, then run daemon test executables from a
+shell outside any Windows Job.
 
 Licensed under [Apache-2.0](LICENSE). Derived parts from
-[FastCtx](https://github.com/yc-duan/fastctx) and key-encoding credits are in
-[`NOTICE`](NOTICE). Windows x64 and arm64 builds embed Microsoft ConPTY under the MIT
-license in [`vendor/conpty/README.md`](vendor/conpty/README.md).
+[FastCtx](https://github.com/yc-duan/fastctx) and key-encoding credits are
+listed in [NOTICE](NOTICE). Windows builds embed
+[Microsoft ConPTY](vendor/conpty/README.md) under the MIT license.

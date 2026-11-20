@@ -1412,12 +1412,21 @@ struct Foreground {
 
 impl Foreground {
     fn start(fixture: &Fixture, args: &[&str]) -> Foreground {
+        Self::start_with(fixture, args, |_| {})
+    }
+
+    fn start_with(
+        fixture: &Fixture,
+        args: &[&str],
+        configure: impl FnOnce(&mut Command),
+    ) -> Foreground {
         let mut command = fixture.command(&["daemon", "run"]);
         command
             .args(args)
             .env("FASTEXEC_HTTP_TOKEN", TOKEN)
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        configure(&mut command);
         let mut child = command.spawn().expect("spawn fastexec daemon run");
         let stderr = child.stderr.take().unwrap();
         // The guard owns the child from the moment it exists, so a startup that fails, or that
@@ -2979,4 +2988,21 @@ fn non_http_daemon_cli_ignores_invalid_instructions_tool() {
             "daemon {subcommand} failed: {out}{err}"
         );
     }
+}
+
+#[test]
+fn non_http_foreground_daemon_ignores_invalid_instructions_tool() {
+    let fixture = Fixture::new("inst-tool-non-http-fg");
+    let mut running = Foreground::start_with(&fixture, &[], |command| {
+        command.env("FASTEXEC_INSTRUCTIONS_TOOL", "bogus");
+    });
+    assert_eq!(pid_of(&running.ready), Some(running.pid()));
+    assert_eq!(running.http(), None, "{}", running.ready);
+
+    let (code, out, err) = fixture.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let status = running
+        .wait_exit(Duration::from_secs(30))
+        .expect("daemon did not exit after stop");
+    assert!(status.success(), "{status}");
 }

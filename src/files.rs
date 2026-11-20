@@ -839,18 +839,28 @@ fn read_whole_utf8(
 /// opening devices at all; the handle check covers replacement between metadata and open. On
 /// Unix, a FIFO swapped into that gap must not block open while edit holds the mutation lock.
 pub(crate) fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
-    let initial = std::fs::metadata(path)?;
-    if initial.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::IsADirectory,
-            "it is a directory",
-        ));
-    }
-    if !initial.is_file() {
-        return Err(io::Error::other("it is not a regular file"));
+    open_regular_for(path, false, false)
+}
+
+pub(crate) fn open_regular_for_upload(
+    path: &Path,
+    create: bool,
+) -> io::Result<(File, std::fs::Metadata)> {
+    open_regular_for(path, true, create)
+}
+
+fn open_regular_for(
+    path: &Path,
+    write: bool,
+    create: bool,
+) -> io::Result<(File, std::fs::Metadata)> {
+    match std::fs::metadata(path) {
+        Ok(initial) => check_regular(&initial)?,
+        Err(error) if create && error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     let mut options = OpenOptions::new();
-    options.read(true);
+    options.read(!write).write(write).create(create);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -869,10 +879,18 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)>
         use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
         // SAFETY: file owns this live handle. Reject named pipes/consoles before any read.
         if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
-            return Err(io::Error::other("it is not a regular file"));
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "it is not a regular file",
+            ));
         }
     }
     let metadata = file.metadata()?;
+    check_regular(&metadata)?;
+    Ok((file, metadata))
+}
+
+fn check_regular(metadata: &std::fs::Metadata) -> io::Result<()> {
     if metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::IsADirectory,
@@ -880,9 +898,12 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<(File, std::fs::Metadata)>
         ));
     }
     if !metadata.is_file() {
-        return Err(io::Error::other("it is not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "it is not a regular file",
+        ));
     }
-    Ok((file, metadata))
+    Ok(())
 }
 
 /// Reads as much of `into` as the file gives, which is short only at the end.

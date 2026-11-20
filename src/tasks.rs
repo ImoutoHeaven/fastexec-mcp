@@ -3284,6 +3284,7 @@ mod tests {
             call_id: None,
             nested: false,
             started: None,
+            render_slot: None,
         };
         runtime.block_on(service.call(request, call));
         assert!(
@@ -3585,6 +3586,7 @@ mod tests {
             call_id: None,
             nested: false,
             started: None,
+            render_slot: None,
         };
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         // A pipe task and a PTY task see the same environment and the same default directory.
@@ -4173,6 +4175,7 @@ mod script_tests {
             call_id: None,
             nested: false,
             started: None,
+            render_slot: None,
         };
         runtime.block_on(async {
             let request = serde_json::json!({

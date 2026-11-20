@@ -41,6 +41,26 @@ where
     Ok(bytes)
 }
 
+/// Encodes a measured response directly into its frame instead of keeping a second JSON buffer.
+pub(crate) fn encode_measured<T>(message: &T, length: usize) -> std::io::Result<Vec<u8>>
+where
+    T: Serialize + ?Sized,
+{
+    let body_length = u32::try_from(length.saturating_sub(4))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(&body_length.to_le_bytes());
+    serde_json::to_writer(&mut bytes, message)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if bytes.len() != length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame length changed between measuring and encoding",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// The bytes a frame of `message` occupies, counted without holding them: the length prefix and
 /// the JSON. A caller that must reserve room for a frame before it exists measures it here, so
 /// no encoded buffer is ever held without the room for it.
@@ -446,6 +466,21 @@ mod tests {
                 "{message:?}"
             );
         }
+    }
+
+    #[test]
+    fn measured_encoding_matches_regular_encoding() {
+        let frame = ToEndpoint::Progress {
+            id: 9,
+            seconds: 1.25,
+            message: "line one\n次の行".into(),
+        };
+        let length = frame_len(&frame).unwrap();
+        assert_eq!(
+            encode_measured(&frame, length).unwrap(),
+            encode_frame(&frame).unwrap()
+        );
+        assert!(encode_measured(&frame, length + 1).is_err());
     }
 
     #[tokio::test]

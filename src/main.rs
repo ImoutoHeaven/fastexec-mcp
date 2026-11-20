@@ -123,9 +123,8 @@ struct Server {
     backend: Backend,
     instructions: Arc<str>,
     tool_instructions: Option<Arc<str>>,
-    /// This server's own routes: the tool list and the description of `exec` are built per
-    /// server, because what they say about the host differs between servers.
-    router: ToolRouter<Server>,
+    /// Connection instances share the immutable routing and tool metadata for their host.
+    router: Arc<ToolRouter<Server>>,
     transfer: Option<TransferEndpoint>,
     tools: Tools,
     /// Sessionless HTTP calls select the session for their authenticated token.
@@ -175,7 +174,11 @@ impl Server {
             extra_instructions,
             instructions_tool,
         );
-        let router = Self::build_router(launch, tools, tool_instructions.as_deref());
+        let router = Arc::new(Self::build_router(
+            launch,
+            tools,
+            tool_instructions.as_deref(),
+        ));
         Self::with_shared(
             backend,
             router,
@@ -189,7 +192,7 @@ impl Server {
     /// A server reusing a pre-built tool router and composed instructions snapshot.
     pub(crate) fn with_shared(
         backend: Backend,
-        router: ToolRouter<Self>,
+        router: Arc<ToolRouter<Self>>,
         instructions: Arc<str>,
         tool_instructions: Option<Arc<str>>,
         transfer: Option<TransferEndpoint>,
@@ -569,6 +572,7 @@ impl Server {
                         call_id: None,
                         nested: false,
                         started: None,
+                        render_slot: None,
                     };
                     service.call(request, call).await
                 }
@@ -621,6 +625,7 @@ impl Server {
                     call_id: None,
                     nested: false,
                     started: None,
+                    render_slot: None,
                 };
                 service.codemode(request, call, self.tools.transfer).await
             }

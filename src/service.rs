@@ -19,7 +19,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
 const MAX_WAIT_MS: u64 = 240_000;
@@ -507,6 +507,47 @@ pub fn suppress(mut result: CallToolResult, render: Render) -> CallToolResult {
     result
 }
 
+/// A local daemon call obtains one render slot on demand and keeps it until encoding.
+pub(crate) struct RenderSlot<'a> {
+    pool: &'a Arc<Semaphore>,
+    permit: OnceCell<Arc<OwnedSemaphorePermit>>,
+}
+
+impl<'a> RenderSlot<'a> {
+    pub(crate) fn new(pool: &'a Arc<Semaphore>) -> Self {
+        Self {
+            pool,
+            permit: OnceCell::new(),
+        }
+    }
+
+    fn try_hold(&self) -> Option<Arc<OwnedSemaphorePermit>> {
+        if let Some(permit) = self.permit.get() {
+            return Some(Arc::clone(permit));
+        }
+        let permit = Arc::new(Arc::clone(self.pool).try_acquire_owned().ok()?);
+        self.permit
+            .set(Arc::clone(&permit))
+            .expect("one renderer per call");
+        Some(permit)
+    }
+
+    pub(crate) async fn hold(&self) -> Arc<OwnedSemaphorePermit> {
+        Arc::clone(
+            self.permit
+                .get_or_init(|| async {
+                    Arc::new(
+                        Arc::clone(self.pool)
+                            .acquire_owned()
+                            .await
+                            .expect("render pool never closes"),
+                    )
+                })
+                .await,
+        )
+    }
+}
+
 /// What a call carries besides its arguments: the session it reads for, how to render, and the
 /// ways the caller can stop it or watch it.
 pub struct Call<'a> {
@@ -522,9 +563,48 @@ pub struct Call<'a> {
     pub nested: bool,
     /// Records a nested start before its caller's wait can be cancelled.
     pub started: Option<&'a codemode::ScriptHandle>,
+    pub(crate) render_slot: Option<&'a RenderSlot<'a>>,
 }
 
 impl<'a> Call<'a> {
+    async fn render_permit(&self) -> Result<Option<Arc<OwnedSemaphorePermit>>, String> {
+        let Some(slot) = self.render_slot else {
+            return Ok(None);
+        };
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => Err("Cancelled while reading output; use poll to continue.".into()),
+            permit = slot.hold() => Ok(Some(permit)),
+        }
+    }
+
+    async fn task_render_permit(
+        &self,
+        action: Action,
+        task: &Task,
+        reader: &Reader,
+    ) -> Result<Option<Arc<OwnedSemaphorePermit>>, String> {
+        let Some(slot) = self.render_slot else {
+            return Ok(None);
+        };
+        if action == Action::Kill {
+            return self.render_permit().await;
+        }
+        // Do not wait on ordinary output while holding a reader that kill may need.
+        slot.try_hold().map(Some).ok_or_else(|| {
+            let recovery = match action {
+                Action::Poll => "Poll the same task for output only. Do not resend input, keys, or resize.",
+                Action::Transcript => "Repeat transcript for the same task or read its log.",
+                _ => "Poll the task or read its log. Do not replay the original operation.",
+            };
+            format!(
+                "The task exists and may still be running. Its output was not read because the daemon is rendering other results.\ntaskId: {}\nlogPath: {}\n{recovery}",
+                reader.handle(&task.id),
+                files::display_path(&task.log_path),
+            )
+        })
+    }
+
     fn launch(&self) -> &'a Arc<crate::session::LaunchContext> {
         self.launch.unwrap_or(&self.session.launch)
     }
@@ -648,7 +728,7 @@ impl Service {
         read_result(
             &call.cancel,
             self.window_result(
-                call.render,
+                call,
                 call.session,
                 Action::Start,
                 task,
@@ -692,13 +772,16 @@ impl Service {
         let mut view = validate(&request, call.nested)?;
         let session = Arc::clone(call.session);
         match request.action {
-            Action::List => Ok(self.list(
-                &session,
-                &view,
-                request.scope.unwrap_or_default(),
-                request.state,
-                request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
-            )),
+            Action::List => {
+                let _permit = call.render_permit().await?;
+                Ok(self.list(
+                    &session,
+                    &view,
+                    request.scope.unwrap_or_default(),
+                    request.state,
+                    request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
+                ))
+            }
             Action::Start => {
                 let base_launch = call.launch();
                 let cwd = match request.cwd {
@@ -894,7 +977,7 @@ impl Service {
                 read_result(
                     &call.cancel,
                     self.window_result(
-                        call.render,
+                        call,
                         &session,
                         Action::Poll,
                         task,
@@ -941,7 +1024,7 @@ impl Service {
                 read_result(
                     &call.cancel,
                     self.window_result(
-                        call.render,
+                        call,
                         &session,
                         Action::Kill,
                         task,
@@ -978,15 +1061,7 @@ impl Service {
                 let state = read_gate(&task_reader, &call.cancel).await?;
                 read_result(
                     &call.cancel,
-                    self.transcript_result(
-                        call.render,
-                        &session,
-                        task,
-                        entry,
-                        task_reader,
-                        state,
-                        view,
-                    ),
+                    self.transcript_result(call, &session, task, entry, task_reader, state, view),
                 )
                 .await
             }
@@ -1326,7 +1401,7 @@ impl Service {
     #[allow(clippy::too_many_arguments)]
     async fn window_result(
         &self,
-        render: Render,
+        call: &Call<'_>,
         session: &Session,
         action: Action,
         task: Arc<Task>,
@@ -1337,6 +1412,8 @@ impl Service {
         ended: Option<WaitEnd>,
         startup_warning: Option<ProbeWarning>,
     ) -> Result<CallToolResult, String> {
+        let permit = call.task_render_permit(action, &task, &task_reader).await?;
+        let render = call.render;
         if view.screen {
             return self
                 .screen_result(
@@ -1350,6 +1427,7 @@ impl Service {
                     view,
                     ended.expect("screen applies to start and poll"),
                     startup_warning,
+                    permit,
                 )
                 .await;
         }
@@ -1361,7 +1439,7 @@ impl Service {
         let clean = !task.is_script();
         let keep_nul = view.nested;
         let budget = view.max_bytes;
-        let (window, images, read) = tokio::task::spawn_blocking(move || {
+        let (window, images, read, _permit) = tokio::task::spawn_blocking(move || {
             let mut read = StagedRead::new(state);
             let start = read.state.cursor;
             let window = reader.read_window(
@@ -1382,7 +1460,7 @@ impl Service {
             if let Ok(images) = &images {
                 read.state.images_seen = images.seen;
             }
-            (window, images, read)
+            (window, images, read, permit)
         })
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
@@ -1474,7 +1552,7 @@ impl Service {
     #[allow(clippy::too_many_arguments)]
     async fn transcript_result(
         &self,
-        render: Render,
+        call: &Call<'_>,
         session: &Session,
         task: Arc<Task>,
         entry: Arc<TaskEntry>,
@@ -1482,12 +1560,17 @@ impl Service {
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
     ) -> Result<CallToolResult, String> {
+        let permit = call
+            .task_render_permit(Action::Transcript, &task, &task_reader)
+            .await?;
+        let render = call.render;
         let snapshot = task.snapshot_held();
         let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
-        let (transcript, read) = tokio::task::spawn_blocking(move || {
+        let first_permit = permit.clone();
+        let (transcript, read, _first_permit) = tokio::task::spawn_blocking(move || {
             let read = StagedRead::new(state);
             let transcript = reader.transcript(&tasks, &read.state);
-            (transcript, read)
+            (transcript, read, first_permit)
         })
         .await
         .map_err(|error| format!("Internal failure while reading: {error}."))?;
@@ -1543,7 +1626,7 @@ impl Service {
                 )));
         }
         let logged = Arc::clone(&task);
-        let (window, read) = tokio::task::spawn_blocking(move || {
+        let (window, read, _permit) = tokio::task::spawn_blocking(move || {
             let mut read = read;
             /// Reads the final lines into `builder`.
             fn read_into(
@@ -1581,7 +1664,7 @@ impl Service {
                     Ok(builder.finish())
                 }
             };
-            (window, read)
+            (window, read, permit)
         })
         .await
         .map_err(|error| format!("Internal failure while reading: {error}."))?;
@@ -1689,13 +1772,14 @@ impl Service {
         view: View,
         ended: WaitEnd,
         startup_warning: Option<ProbeWarning>,
+        permit: Option<Arc<OwnedSemaphorePermit>>,
     ) -> Result<CallToolResult, String> {
         // A finished state, taken first, means the screen below holds all output.
         let snapshot = task.snapshot_held();
         let screen = task.screen()?;
         // The stream counts as read up to the output the screen shows.
         let (reader, until) = (Arc::clone(&task), screen.log_end);
-        let (window, read) = tokio::task::spawn_blocking(move || {
+        let (window, read, _permit) = tokio::task::spawn_blocking(move || {
             let mut read = StagedRead::new(state);
             let window = reader.read_window(
                 &mut read.state,
@@ -1707,7 +1791,7 @@ impl Service {
                 reader.encoding,
                 Some(until),
             );
-            (window, read)
+            (window, read, permit)
         })
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
@@ -2283,6 +2367,7 @@ mod tests {
             call_id: None,
             nested,
             started: None,
+            render_slot: None,
         }
     }
 

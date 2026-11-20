@@ -85,15 +85,6 @@ jobs:
       - name: build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # The binary must start and report the release version over MCP stdio.
-      - name: smoke test
-        run: |
-          request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
-          initialized='{"jsonrpc":"2.0","method":"notifications/initialized"}'
-          reply="$(printf '%s\n%s\n' "$request" "$initialized" | env -u FASTEXEC_DAEMON "$BIN")"
-          echo "$reply"
-          grep -F "\"serverInfo\":{\"name\":\"fastexec\",\"version\":\"$VERSION\"}" <<< "$reply"
-
       - name: package
         env:
           COPYFILE_DISABLE: "1"
@@ -109,6 +100,28 @@ jobs:
           else
             tar -czf "$name.tar.gz" "$name"
           fi
+
+      - name: smoke test extracted macOS and Windows archives
+        if: startsWith(matrix.name, 'macos-') || startsWith(matrix.name, 'windows-')
+        env:
+          ARCHIVE_PLATFORM: ${{ matrix.name }}
+        run: |
+          name="fastexec-$VERSION-$ARCHIVE_PLATFORM"
+          probe=$(mktemp -d release-smoke.XXXXXX)
+          trap 'rm -rf "$probe"' EXIT
+          if [ "$RUNNER_OS" = Windows ]; then
+            SMOKE_ARCHIVE="dist/$name.zip" SMOKE_DESTINATION="$probe" \
+              pwsh -NoProfile -NonInteractive -Command 'Expand-Archive -LiteralPath $env:SMOKE_ARCHIVE -DestinationPath $env:SMOKE_DESTINATION'
+            extracted="$probe/$name/fastexec.exe"
+          else
+            tar -xzf "dist/$name.tar.gz" -C "$probe"
+            extracted="$probe/$name/fastexec"
+          fi
+          request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
+          initialized='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+          reply="$(printf '%s\n%s\n' "$request" "$initialized" | env -u FASTEXEC_DAEMON "$extracted")"
+          echo "$reply"
+          grep -F "\"serverInfo\":{\"name\":\"fastexec\",\"version\":\"$VERSION\"}" <<< "$reply"
 
       - name: smoke test Linux archive on Alpine
         if: startsWith(matrix.name, 'linux-')

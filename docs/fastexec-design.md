@@ -4,6 +4,137 @@ Authoritative runtime usage rules live in
 [`src/description.md`](../src/description.md) and request validation in
 [`src/service.rs`](../src/service.rs).
 
+## 0. Build and deployment
+
+### Platform notes
+
+Linux release binaries link musl statically and run on Alpine without a glibc
+compatibility package. Install GNU bash with `apk add bash` on Alpine or
+`pkg install bash` on FreeBSD. The Linux kernel and process requirements are in
+[process-tree ownership](#5-bash-launch-and-process-tree-ownership).
+
+Builds require Rust 1.92 or newer (Rust 2024 edition) and a C compiler.
+Linux musl builds need `musl-tools`. FreeBSD source builds need FreeBSD 15.1 or
+newer, `llvm`, and `LIBCLANG_PATH` set to its library directory, such as
+`/usr/local/llvm21/lib`. The FreeBSD archive is built and tested on 15.1.
+Shared runtime directories need atomic no-replace directory renames; UFS and
+ZFS are tested.
+
+The macOS binaries are unsigned. After verifying the archive checksum, use
+`xattr -d com.apple.quarantine fastexec` if macOS blocks the extracted binary
+because the browser marked it as quarantined.
+
+### Several servers in Pi
+
+One config can hold a local stdio server and a remote HTTP one under different
+keys. Pi treats `-` and `_` in server names as the same character, so names that
+differ only in those collide.
+
+```json
+{
+  "mcpServers": {
+    "fastexec_local": {
+      "command": "/absolute/path/to/fastexec",
+      "exposure": "direct"
+    },
+    "remote_linux": {
+      "url": "https://build.example.com/mcp",
+      "headers": {"Authorization": "Bearer ${FASTEXEC_TOKEN}"},
+      "exposure": "deferred"
+    }
+  }
+}
+```
+
+`${NAME}` reads a variable from Pi's environment. Use Pi's `codemode` or
+`deferred` exposure for a remote server. If a `direct` server misses the first
+prompt's 10-second wait, Pi adds its tools mid-session.
+
+### Run HTTP under a service manager
+
+A systemd user unit shares `XDG_RUNTIME_DIR` with the user's shells, so
+`fastexec daemon status` and `stop` reach the daemon it started:
+
+```ini
+# ~/.config/systemd/user/fastexec.service
+[Unit]
+Description=fastexec daemon
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/fastexec daemon run --http 127.0.0.1:8765
+EnvironmentFile=%h/.config/fastexec.env
+WorkingDirectory=%h
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+`~/.config/fastexec.env` holds `FASTEXEC_HTTP_TOKEN=<token>` and
+`FASTEXEC_HTTP_ALLOW_REMOTE=1`. Then:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now fastexec
+loginctl enable-linger <user>
+```
+
+`loginctl enable-linger` starts the unit without a login session.
+
+On Windows, [nssm](https://nssm.cc/usage) runs it under the user's own account
+rather than LocalSystem:
+
+```powershell
+nssm install fastexec "C:\path\to\fastexec.exe" "daemon run --http 127.0.0.1:8765"
+nssm set fastexec AppDirectory "C:\Users\<user>"
+nssm set fastexec AppEnvironmentExtra "FASTEXEC_HTTP_TOKEN=<token>" "FASTEXEC_HTTP_ALLOW_REMOTE=1" "LOCALAPPDATA=C:\Users\<user>\AppData\Local"
+nssm edit fastexec
+nssm start fastexec
+```
+
+`nssm edit` sets the Log on account without putting a password on the command
+line. Every environment entry goes in one `AppEnvironmentExtra` command, because
+a later one replaces the block. The runtime root comes from `LOCALAPPDATA`, so
+the service and the user's shell must see the same value: set it explicitly
+rather than inherit an administrator's profile. A service runs in Session 0
+without a desktop, so an app that needs a visible window belongs in Task
+Scheduler "at logon" instead.
+
+### Behind a proxy
+
+If the proxy forwards the public `Host`, set `FASTEXEC_HTTP_ALLOW_REMOTE=1`
+even on a loopback bind. Strip the external path prefix so `/mcp` and
+`/t/<id>` reach the daemon.
+
+To serve several machines on one domain, give each daemon a path prefix.
+Set `FASTEXEC_HTTP_TOKEN` in the daemon's environment before running this
+example. `FASTEXEC_PUBLIC_URL` sets the public root for transfer links:
+
+```bash
+FASTEXEC_TRANSFER=true \
+FASTEXEC_PUBLIC_URL=https://example.com/mac/ \
+FASTEXEC_HTTP_ALLOW_REMOTE=1 \
+fastexec daemon start --http 127.0.0.1:8765
+```
+
+```nginx
+location /mac/ {
+    proxy_pass http://127.0.0.1:8765/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 4m;
+}
+```
+
+Use a separate prefix and port for each daemon. MCP clients use `<root>mcp`,
+for example `https://example.com/mac/mcp`.
+
+Cloudflare reaches the daemon through a named tunnel; Quick Tunnels do not
+support server-sent events. Plan limits are in
+[Cloudflare's connection limits](https://developers.cloudflare.com/fundamentals/reference/connection-limits/).
+
 ## 1. Tool Actions and Parameter Limits
 
 Each tool accepts a single JSON object (`deny_unknown_fields`, `camelCase`),
@@ -374,6 +505,21 @@ startup; invalid values exit with status `1`. They shape tool results across
 every tool call to the namespace's daemon (section 6). The value is read at
 startup; an invalid value exits with status `1`.
 
+The daemon builds up to two ordinary IPC results at once. `kill` and `list`
+each have their own slot. Starting and waiting for tasks take no slot. If no
+ordinary slot is free when output is ready, the result gives the reader handle
+and log path without advancing the reader. Poll that handle for output only or read
+the log. Do not replay a start, script, or poll input. You can request a
+transcript again with the same handle. File and transfer calls can be cancelled
+while they wait for a slot, before they start.
+
+A slot stays occupied through encoding, or until a cancelled blocking read
+releases its output. The task text window still tops out at 4 MiB, with up to
+64 MiB of pending transcript data before windowing. The frame queue has
+128 MiB for serialized results and control replies, including 8 MiB reserved
+for small management and control frames. Each result payload can be up to
+64 MiB. These limits cover output, not total daemon memory.
+
 ### `FASTEXEC_CODEMODE`
 
 `"false"` (default) omits the `codemode` route. `"true"` registers it and adds
@@ -426,10 +572,11 @@ without blocking `daemon status` or `daemon stop`.
 
 `"false"` (default) keeps each tool's default MCP `annotations` hints.
 `"true"` sets `readOnlyHint: true`, `destructiveHint: false`,
-`idempotentHint: false`, and `openWorldHint: false` on every exposed tool
-while keeping each tool's `title`. The value is read at startup by the MCP
-server process (stdio, daemon endpoint, and HTTP daemon); an invalid value
-exits with status `1`.
+`idempotentHint: false`, and `openWorldHint: false` on the exposed tools while
+keeping each tool's `title`. The `instructions` tool is exempt and retains its
+native read-only, non-destructive, idempotent, and non-open-world hints. The
+value is read at startup by the MCP server process (stdio, daemon endpoint,
+and HTTP daemon); an invalid value exits with status `1`.
 
 ### `FASTEXEC_INSTRUCTIONS_FILE`
 
@@ -443,9 +590,10 @@ Windows named pipes or reserved DOS device names.
 The server reads at most `16,385` raw bytes without pre-checking file metadata
 and validates in order: size cap (`16,384` raw bytes), absence of NUL bytes,
 and valid UTF-8. It normalizes CRLF and lone CR to LF and strips leading UTF-8
-BOM characters. Whitespace-only or BOM-only files leave the built-in
-instructions unchanged; otherwise the normalized text is appended after a blank
-line (`\n\n`) with leading indentation and trailing whitespace preserved.
+BOM characters. Whitespace-only or BOM-only files supply no extra text.
+Nonempty normalized text retains leading indentation and trailing whitespace.
+The default protocol composition appends it after a blank line (`\n\n`);
+`FASTEXEC_INSTRUCTIONS_TOOL=move` instead puts it in the tool, as described below.
 Empty, non-UTF-8, unreadable, or invalid values exit with status `1`.
 
 Each serving process captures one immutable `Arc<str>` snapshot at startup;
@@ -456,6 +604,27 @@ responses. Local stdio (`FASTEXEC_DAEMON=off`), daemon stdio endpoints
 reading the file when reusing one, pre-validating it only on a cold HTTP start.
 Non-HTTP `daemon start` and `daemon run`, plus `daemon status` and
 `daemon stop`, leave the variable unread. The IPC protocol version is unchanged.
+
+### `FASTEXEC_INSTRUCTIONS_TOOL`
+
+This optional serving-process setting takes exact lowercase `off` (default),
+`move`, or `copy`:
+
+| Mode | Protocol `instructions` | Tool description and result |
+| --- | --- | --- |
+| `off` | Built-in lines plus extra text, if any | Tool absent |
+| `move` | Built-in lines plus a pointer when there is extra text | Extra text only; built-in lines if no extra text |
+| `copy` | Built-in lines plus extra text, if any | Same composed string as the protocol field |
+
+The zero-argument tool returns one text block verbatim, independent of output
+formatting and without task or file operations. Its discovery description is
+already populated before the call; client display or truncation is up to the
+client. On HTTP both snapshots and the router are shared across sessions; a
+stdio endpoint has its own snapshot. The flag is validated only at MCP serving
+startup and during cold HTTP preflight; healthy HTTP reuse and non-serving
+daemon commands ignore the caller's flag. Changes take effect when the serving
+process restarts. Do not include secrets: clients allowed to discover tools
+can receive the description as part of discovery.
 
 A nonzero command `exitCode` is a normal result (`ok: true`). Operational
 failures set `isError` and `ok: false`; schema-decoding errors may have no
@@ -812,9 +981,11 @@ omitted on final serialization unless noted as always-present below.
   `FASTEXEC_HTTP_ALLOWED_ORIGINS`, where an entry without a port matches any
   port. This is request Origin validation, not CORS support: browser cross-origin
   preflights and CORS response headers are not provided. HTTP sessions run with
-  the daemon's own environment. The `60` minute (`3600` s) inactivity TTL expires idle
-  legacy HTTP sessions without bounding their count or memory; principal
-  sessions last until the listener stops.
+  the daemon's own environment. The listener retains up to `256` legacy HTTP
+  sessions; at capacity it rejects new legacy initializations. Idle legacy
+  sessions expire after `60` minutes, and DELETE also releases the slot. The
+  cap is a count, not a memory or namespace-wide quota. Principal sessions
+  do not use this cap and last until the listener stops.
   The HTTP listener admits at most `128` concurrent connections and allows
   `10` seconds to receive request headers. Extra connections are closed without
   queueing; management through the local daemon socket has its own capacity.
@@ -833,8 +1004,11 @@ omitted on final serialization unless noted as always-present below.
   `HEAD` answers the current size. `PUT` writes the body at `?offset=` (default
   `0`), truncating the file to that offset before reading the body, refusing an
   offset past the end with `409`, and answering the new size on success. A
-  truncated or malformed body returns `400`; the received prefix is retained,
-  so `HEAD` and a later upload can resume from the actual size. Uploads to the
+  truncated or malformed body returns `400`. An upload that waits `30` seconds
+  for more body data returns `408`. This inactivity deadline applies while
+  waiting for the network, not to disk writes or the total upload time. In
+  either case, the accepted prefix is retained so `HEAD` and a later upload
+  can resume from its actual size. Uploads to the
   same open file identity serialize even across distinct capability URLs,
   symlinks, and hard links; uploads to different files remain independent. A
   disconnected upload waiting for that lock releases its open file and waiter.

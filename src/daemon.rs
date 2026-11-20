@@ -4,7 +4,7 @@
 use crate::http::{self, Http};
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::runtime;
-use crate::service::{Call, OutputMode, Render, Service};
+use crate::service::{Call, OutputMode, Render, RenderSlot, Service};
 use crate::session::{LaunchContext, Session};
 use crate::tasks::{Limits, Tasks};
 use crate::transfer::Transfers;
@@ -38,13 +38,13 @@ pub const MAX_CONNECTIONS: usize = 128;
 /// How long a stopping daemon waits for admitted starts to end their tasks.
 pub const STOP_WAIT: Duration = Duration::from_secs(5);
 /// How many bytes of queued, serialized frames the daemon holds across every connection.
-///
-/// shortcut: materialized CallToolResults are not budgeted; add design §7 render-stage permits
-/// and retained fallback receipt metadata with that work.
 pub const BUDGET: usize = 128 << 20;
 /// The share of the budget `kill` and `list` results use, so a queue full of large results cannot
 /// hold up the calls that clear it.
 pub const RESERVED: usize = 8 << 20;
+/// Normal renders can coexist, but neither they nor one management action consume the slots
+/// reserved for the other management action. This bounds render concurrency, not daemon RSS.
+const RENDER_SLOTS: usize = 2;
 
 /// What a daemon is run with.
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +97,9 @@ pub struct Daemon {
     budget: Arc<Semaphore>,
     /// The permits `kill` and `list` results use.
     reserved: Arc<Semaphore>,
+    render: Arc<Semaphore>,
+    render_kill: Arc<Semaphore>,
+    render_list: Arc<Semaphore>,
     config: Config,
     /// Who is admitted, and whether the daemon is stopping.
     gate: Mutex<Gate>,
@@ -210,6 +213,9 @@ impl Daemon {
             sessions: Mutex::new(HashMap::new()),
             budget: Arc::new(Semaphore::new(BUDGET - RESERVED)),
             reserved: Arc::new(Semaphore::new(RESERVED)),
+            render: Arc::new(Semaphore::new(RENDER_SLOTS)),
+            render_kill: Arc::new(Semaphore::new(1)),
+            render_list: Arc::new(Semaphore::new(1)),
             config,
             gate: Mutex::default(),
             stopped: CancellationToken::new(),
@@ -845,11 +851,29 @@ async fn run_call(
     in_flight: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     outgoing: mpsc::UnboundedSender<Outgoing>,
 ) {
-    let management = tool == "exec"
-        && matches!(
-            arguments.get("action").and_then(|action| action.as_str()),
-            Some("kill" | "list")
-        );
+    let render_pool = match (
+        tool.as_str(),
+        arguments.get("action").and_then(|action| action.as_str()),
+    ) {
+        ("exec", Some("kill")) => &daemon.render_kill,
+        ("exec", Some("list")) => &daemon.render_list,
+        _ => &daemon.render,
+    };
+    let management = !Arc::ptr_eq(render_pool, &daemon.render);
+    let render_slot = RenderSlot::new(render_pool);
+    let cancelled_before_dispatch = if tool != "exec" && tool != "codemode" {
+        tokio::select! {
+            biased;
+            _ = connection.cancelled() => {
+                lock(&in_flight).remove(&id);
+                return;
+            }
+            _ = token.cancelled() => true,
+            _ = render_slot.hold() => false,
+        }
+    } else {
+        false
+    };
     let (progress, latest) = watch::channel(None);
     let forwarder = Forwarder(tokio::spawn(forward_progress(id, latest, outgoing.clone())));
     let call = Call {
@@ -861,9 +885,12 @@ async fn run_call(
         call_id: Some(id),
         nested: false,
         started: None,
+        render_slot: Some(&render_slot),
     };
     let transfer = session.launch.var("FASTEXEC_TRANSFER") == Some(std::ffi::OsStr::new("true"));
-    let result = if tool == "exec" {
+    let result = if cancelled_before_dispatch {
+        error("Cancelled before the operation started; nothing was executed.".into())
+    } else if tool == "exec" {
         daemon.service.call_json(arguments, call).await
     } else if tool == "codemode" {
         match serde_json::from_value::<crate::codemode::Request>(arguments) {
@@ -942,7 +969,10 @@ async fn run_call(
         },
     };
     // The room for these bytes was reserved before they existed.
-    if let Ok(bytes) = ipc::encode_frame(&message) {
+    let bytes = ipc::encode_measured(&message, length);
+    drop(message);
+    drop(render_slot);
+    if let Ok(bytes) = bytes {
         let _ = outgoing.send(Outgoing {
             bytes,
             _permit: Some(permit),
@@ -2163,6 +2193,172 @@ mod tests {
             }
             other => panic!("expected the waiting result, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn held_render_slots_leave_a_receipt_and_do_not_block_kill_or_list() {
+        let fixture = fixture();
+        let daemon = &fixture.daemon;
+        let mut client = connect(daemon).await;
+        client.welcome("sessrender", 1).await;
+        let held = Arc::clone(&daemon.render)
+            .acquire_many_owned(RENDER_SLOTS as u32)
+            .await
+            .unwrap();
+
+        let requests = [
+            #[cfg(windows)]
+            (
+                "exec",
+                json!({"action": "start", "command": "printf render-slot-test", "waitMs": 5000}),
+            ),
+            (
+                "codemode",
+                json!({"code": r#"const x = await tools.exec({action: "list"}); return Array.isArray(x.tasks) ? "render-slot-test" : "list failed";"#, "waitMs": 5000}),
+            ),
+        ];
+        for (index, (tool, arguments)) in requests.into_iter().enumerate() {
+            let call_id = (index as u64) * 4 + 1;
+            client
+                .send(&ToDaemon::Call {
+                    id: call_id,
+                    tool: tool.into(),
+                    request_id: call_id.to_string(),
+                    arguments,
+                })
+                .await;
+            let receipt = client.result(call_id).await;
+            assert_eq!(receipt.is_error, Some(true));
+            let structured = json_of(&receipt);
+            let receipt = text_of(&receipt);
+            assert_eq!(structured["error"], receipt);
+            assert_eq!(
+                structured["action"],
+                if tool == "exec" { "start" } else { tool }
+            );
+            let mut lines = receipt.lines();
+            assert!(
+                lines
+                    .next()
+                    .unwrap()
+                    .contains("The task exists and may still be running"),
+                "{tool}: {receipt}"
+            );
+            let handle = lines.next().unwrap().strip_prefix("taskId: ").unwrap();
+            let path = lines.next().unwrap().strip_prefix("logPath: ").unwrap();
+            assert!(receipt.contains("Its output was not read"));
+            assert!(
+                lines
+                    .next()
+                    .unwrap()
+                    .contains("Do not replay the original operation")
+            );
+
+            client
+                .send(&call(call_id + 1, json!({"action": "list"})))
+                .await;
+            let listed = json_of(&client.result(call_id + 1).await);
+            let (task_id, _) = handle.split_once('.').unwrap();
+            let task = listed["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["taskId"] == task_id)
+                .expect("task is listed");
+            assert_eq!(task["logPath"], path);
+
+            client
+                .send(&call(
+                    call_id + 3,
+                    json!({"action": "poll", "taskId": handle, "waitMs": 0}),
+                ))
+                .await;
+            let poll_receipt = client.result(call_id + 3).await;
+            assert_eq!(poll_receipt.is_error, Some(true));
+            assert!(text_of(&poll_receipt).contains("Do not resend input, keys, or resize."));
+
+            // Read the same handle through the separate kill lane. The cursor was not advanced,
+            // and a codemode callback ran even though the ordinary render slots were held.
+            client
+                .send(&call(
+                    call_id + 2,
+                    json!({"action": "kill", "taskId": handle}),
+                ))
+                .await;
+            let killed = json_of(&client.result(call_id + 2).await);
+            assert_eq!(killed["action"], "kill");
+            assert!(
+                killed["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("render-slot-test"),
+                "{killed:?}"
+            );
+        }
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn cancelling_waiting_file_work_does_not_dispatch_it() {
+        let fixture = fixture();
+        let daemon = &fixture.daemon;
+        let mut client = connect(daemon).await;
+        client.welcome("sesscancelwrite", 1).await;
+        let held = Arc::clone(&daemon.render)
+            .acquire_many_owned(RENDER_SLOTS as u32)
+            .await
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "fastexec-cancel-render-write-{}-{}.txt",
+            std::process::id(),
+            crate::tasks::random_chars(12).unwrap(),
+        ));
+        assert!(!path.exists());
+        client
+            .send(&ToDaemon::Call {
+                id: 1,
+                tool: "write".into(),
+                request_id: "1".into(),
+                arguments: json!({"path": path, "content": "not written"}),
+            })
+            .await;
+        client.send(&ToDaemon::Cancel { id: 1 }).await;
+        let result = client.result(1).await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            text_of(&result),
+            "Cancelled before the operation started; nothing was executed."
+        );
+        assert!(!path.exists());
+        drop(held);
+
+        client.send(&call(2, json!({"action": "list"}))).await;
+        assert_eq!(json_of(&client.result(2).await)["action"], "list");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn the_materialization_slot_is_not_released_while_detached_work_can_keep_its_value() {
+        let pool = Arc::new(Semaphore::new(1));
+        let slot = RenderSlot::new(&pool);
+        let permit = slot.hold().await;
+        let (start, started) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _ = start.send(());
+            wait.recv_timeout(Duration::from_secs(10))
+                .expect("the test releases the worker");
+            (String::from("rendered output"), permit)
+        });
+
+        started.await.unwrap();
+        drop(slot);
+        assert!(pool.try_acquire().is_err());
+        release.send(()).unwrap();
+        let value = worker.await.unwrap();
+        assert!(pool.try_acquire().is_err());
+        drop(value);
+        assert!(pool.try_acquire().is_ok());
     }
 
     #[tokio::test]

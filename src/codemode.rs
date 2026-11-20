@@ -588,6 +588,7 @@ impl Host {
                                 call_id,
                                 nested: true,
                                 started: Some(&script),
+                                render_slot: None,
                             },
                         )
                         .await

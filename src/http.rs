@@ -15,7 +15,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, SessionConfig};
+use rmcp::transport::streamable_http_server::session::local::SessionConfig;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
@@ -30,13 +30,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+
+mod sessions;
+use sessions::Sessions;
 /// The largest request body the daemon reads: a call carries its arguments, not a file.
 pub const LIMIT: usize = 4 << 20;
 /// HTTP has its own connection budget, so unauthenticated peers cannot consume the daemon
 /// socket's management capacity or exhaust the process's file descriptors.
 const MAX_CONNECTIONS: usize = 128;
-/// Only request headers are timed: streaming bodies, SSE and long tool calls may take longer.
+/// Legacy HTTP sessions survive individual connections and have a separate count cap.
+const MAX_HTTP_SESSIONS: usize = 256;
+/// The deadline for a complete HTTP request header.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// An upload may continue indefinitely while it delivers data, but not hold a file idle.
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The value that names the address clients reach, when a proxy stands in front of the listener.
 pub const PUBLIC_URL: &str = "FASTEXEC_PUBLIC_URL";
@@ -241,7 +248,11 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         extra_instructions.as_deref(),
         instructions_tool,
     );
-    let router = Server::build_router(&launch, tools, tool_instructions.as_deref());
+    let router = Arc::new(Server::build_router(
+        &launch,
+        tools,
+        tool_instructions.as_deref(),
+    ));
     let factory = {
         let table = Arc::clone(&table);
         let public_root = public_root.clone();
@@ -260,7 +271,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
             });
             let mut server = Server::with_shared(
                 backend,
-                router.clone(),
+                Arc::clone(&router),
                 Arc::clone(&instructions),
                 tool_instructions.clone(),
                 transfer,
@@ -290,18 +301,14 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     session_config.sse_retry = None;
     session_config.completed_cache_ttl = Duration::from_secs(60);
     session_config.init_timeout = Some(Duration::from_secs(60));
-    let mut sessions = LocalSessionManager::default();
-    sessions.session_config = session_config;
-    // shortcut: HTTP sessions and their bodies are not counted against the daemon's byte budget or
-    // MAX_SESSIONS; rmcp holds the bodies and drops a session after `keep_alive` instead. Add shared
-    // accounting for both before promising a namespace-wide HTTP quota. rmcp also treats a
-    // configured origin that names no port as a wildcard for every port of that host, while an
-    // origin that names a port is matched exactly; giving a port-less configured origin this
-    // listener's own port is the upgrade, so no configured origin stays port-agnostic.
+    // shortcut: rmcp retains session bodies outside the daemon's byte budget. The count cap
+    // below is HTTP-only; it isn't a namespace-wide memory quota.
+    let sessions = Sessions::new(session_config, MAX_HTTP_SESSIONS);
     let inner = StreamableHttpService::new(factory, Arc::new(sessions), config);
     let layer = Bearer {
         digests: digests.into(),
         table,
+        stopped: stopped.clone(),
         inner,
     };
     serve_connections(listener, layer, stopped).await;
@@ -313,7 +320,11 @@ pub async fn serve_transfers(
     table: Arc<Transfers>,
     stopped: CancellationToken,
 ) {
-    serve_connections(listener, TransferOnly { table }, stopped).await;
+    let layer = TransferOnly {
+        table,
+        stopped: stopped.clone(),
+    };
+    serve_connections(listener, layer, stopped).await;
 }
 
 async fn serve_connections<S>(listener: TcpListener, service: S, stopped: CancellationToken)
@@ -370,6 +381,7 @@ where
 #[derive(Clone)]
 struct TransferOnly {
     table: Arc<Transfers>,
+    stopped: CancellationToken,
 }
 
 impl tower_service::Service<Request<Incoming>> for TransferOnly {
@@ -383,9 +395,10 @@ impl tower_service::Service<Request<Incoming>> for TransferOnly {
 
     fn call(&mut self, request: Request<Incoming>) -> Self::Future {
         let table = Arc::clone(&self.table);
+        let stopped = self.stopped.clone();
         Box::pin(async move {
             if request.uri().path().starts_with("/t/") {
-                return Ok(serve_transfer(request, table).await);
+                return Ok(serve_transfer(request, table, stopped).await);
             }
             Ok(refusal(StatusCode::NOT_FOUND, ""))
         })
@@ -480,7 +493,8 @@ struct Bearer {
     digests: Arc<[[u8; 32]]>,
     /// The files this listener publishes under `/t/`.
     table: Arc<Transfers>,
-    inner: StreamableHttpService<Server, LocalSessionManager>,
+    stopped: CancellationToken,
+    inner: StreamableHttpService<Server, Sessions>,
 }
 
 impl tower_service::Service<Request<Incoming>> for Bearer {
@@ -496,10 +510,11 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
         let mut inner = self.inner.clone();
         let digests = Arc::clone(&self.digests);
         let table = Arc::clone(&self.table);
+        let stopped = self.stopped.clone();
         Box::pin(async move {
             // A transfer is its own front door: no token, no body cap, and never a session.
             if request.uri().path().starts_with("/t/") {
-                return Ok(serve_transfer(request, table).await);
+                return Ok(serve_transfer(request, table, stopped).await);
             }
             let Some(principal) = authorized(request.headers(), &digests) else {
                 return Ok(refusal(StatusCode::UNAUTHORIZED, "Bearer"));
@@ -592,7 +607,11 @@ fn authorized(headers: &HeaderMap, digests: &[[u8; 32]]) -> Option<usize> {
 const CHUNK: usize = 32 * 1024;
 
 /// Answers one `/t/` request: a download, the size of a file, or an upload.
-async fn serve_transfer(request: Request<Incoming>, table: Arc<Transfers>) -> Reply {
+async fn serve_transfer(
+    request: Request<Incoming>,
+    table: Arc<Transfers>,
+    stopped: CancellationToken,
+) -> Reply {
     let id = request
         .uri()
         .path()
@@ -611,7 +630,7 @@ async fn serve_transfer(request: Request<Incoming>, table: Arc<Transfers>) -> Re
     match *request.method() {
         Method::GET => transfer_get(request.headers(), admitted).await,
         Method::HEAD => transfer_head(admitted).await,
-        Method::PUT => transfer_put(request, admitted).await,
+        Method::PUT => transfer_put(request, admitted, stopped).await,
         _ => transfer_empty(
             StatusCode::METHOD_NOT_ALLOWED,
             &[(header::ALLOW.as_str(), "GET, HEAD, PUT")],
@@ -638,26 +657,25 @@ async fn presence(path: &Path) -> Presence {
 
 /// Downloads a file, or the one range of it that was asked for.
 async fn transfer_get(headers: &HeaderMap, admitted: Admitted) -> Reply {
-    match presence(admitted.path()).await {
-        Presence::File(_) => {}
-        Presence::Failed => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
-        Presence::Missing | Presence::NotAFile => {
-            return transfer_empty(StatusCode::NOT_FOUND, &[]);
-        }
-    }
-    let mut file = match tokio::fs::File::open(admitted.path()).await {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return transfer_empty(StatusCode::NOT_FOUND, &[]);
-        }
-        Err(_) => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
-    };
-    // Atomic saves may replace the path after the precheck; size and bytes share this handle.
-    let size = match file.metadata().await {
-        Ok(metadata) if metadata.is_file() => metadata.len(),
-        Ok(_) => return transfer_empty(StatusCode::NOT_FOUND, &[]),
-        Err(_) => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
-    };
+    let path = admitted.path().to_path_buf();
+    let (file, metadata) =
+        match tokio::task::spawn_blocking(move || crate::files::open_regular(&path)).await {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::IsADirectory
+                        | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                return transfer_empty(StatusCode::NOT_FOUND, &[]);
+            }
+            _ => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+        };
+    let mut file = tokio::fs::File::from_std(file);
+    // Atomic saves may replace the path; the reported size and bytes share this handle.
+    let size = metadata.len();
     let range = match ranges(headers) {
         Some(value) => transfer::parse_range(&value, size),
         None => transfer::Range::Whole,
@@ -717,7 +735,11 @@ async fn transfer_head(admitted: Admitted) -> Reply {
 }
 
 /// Uploads one part of a file at `offset`.
-async fn transfer_put(request: Request<Incoming>, admitted: Admitted) -> Reply {
+async fn transfer_put(
+    request: Request<Incoming>,
+    admitted: Admitted,
+    stopped: CancellationToken,
+) -> Reply {
     let offset = match offset_of(request.uri().query()) {
         Ok(offset) => offset,
         Err(()) => return transfer_empty(StatusCode::BAD_REQUEST, &[]),
@@ -731,7 +753,8 @@ async fn transfer_put(request: Request<Incoming>, admitted: Admitted) -> Reply {
     let body = request.into_body();
     // Only an actual writer is detached: a disconnect must not drop a write before its accepted
     // bytes are flushed, or release the lock while that flush is still in flight.
-    let task = tokio::spawn(async move { write_upload(admitted, target, offset, body).await });
+    let task =
+        tokio::spawn(async move { write_upload(admitted, target, offset, body, stopped).await });
     match task.await {
         Ok(reply) => reply,
         Err(_) => transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
@@ -761,13 +784,24 @@ async fn prepare_upload(admitted: &Admitted, offset: u64) -> Result<UploadFile, 
     }
     // Opening without truncation lets aliases discover the same file identity, including a
     // file which did not exist when its URLs were minted. All mutations happen under its lock.
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(offset == 0)
-        .truncate(false)
-        .open(&path)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let file = match tokio::task::spawn_blocking(move || {
+        crate::files::open_regular_for_upload(&path, offset == 0)
+    })
+    .await
+    {
+        Ok(Ok((file, _))) => tokio::fs::File::from_std(file),
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
     let turn = admitted
         .upload(&file)
         .await
@@ -785,12 +819,16 @@ async fn write_upload(
     _admitted: Admitted,
     target: UploadFile,
     offset: u64,
-    mut body: Incoming,
+    mut body: impl hyper::body::Body<Data = Bytes> + Unpin,
+    stopped: CancellationToken,
 ) -> Reply {
     let UploadFile {
         mut file,
         turn: _turn,
     } = target;
+    if stopped.is_cancelled() {
+        return transfer_empty(StatusCode::SERVICE_UNAVAILABLE, &[]);
+    }
     // The part replaces whatever followed `offset`, and nothing of the body is read before that.
     if file.set_len(offset).await.is_err()
         || file.seek(std::io::SeekFrom::Start(offset)).await.is_err()
@@ -800,24 +838,39 @@ async fn write_upload(
     // A write that fails is remembered to the end: a later flush can succeed on its own and must
     // not turn a rejected part into a success.
     let mut refused = false;
-    let mut incomplete = false;
-    while let Some(frame) = body.frame().await {
-        let frame = match frame {
-            Ok(frame) => frame,
+    let mut body_failure = None;
+    let mut deadline = tokio::time::Instant::now() + UPLOAD_IDLE_TIMEOUT;
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = stopped.cancelled() => {
+                body_failure = Some(StatusCode::SERVICE_UNAVAILABLE);
+                break;
+            }
+            next = tokio::time::timeout_at(deadline, body.frame()) => next,
+        };
+        let frame = match next {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(None) => break,
+            Err(_) => {
+                body_failure = Some(StatusCode::REQUEST_TIMEOUT);
+                break;
+            }
             // Keep the accepted prefix for HEAD/resume, but an invalid chunk or a premature
             // EOF is not a successful upload of the body the client declared.
-            Err(_) => {
-                incomplete = true;
+            Ok(Some(Err(_))) => {
+                body_failure = Some(StatusCode::BAD_REQUEST);
                 break;
             }
         };
-        if let Some(data) = frame.data_ref() {
+        if let Some(data) = frame.data_ref().filter(|data| !data.is_empty()) {
             // Each accepted part is flushed before the next frame is waited for, so a body that
             // fails later never leaves an earlier write in flight.
             if file.write_all(data).await.is_err() || file.flush().await.is_err() {
                 refused = true;
                 break;
             }
+            deadline = tokio::time::Instant::now() + UPLOAD_IDLE_TIMEOUT;
         }
     }
     // Flushed before the answer and before the upload lock is released with this task.
@@ -825,10 +878,10 @@ async fn write_upload(
     let size = file.metadata().await.map(|metadata| metadata.len());
     drop(file);
     match size {
-        Ok(_) if !refused && flushed.is_ok() && incomplete => {
-            transfer_empty(StatusCode::BAD_REQUEST, &[])
-        }
-        Ok(size) if !refused && flushed.is_ok() => transfer_text(StatusCode::OK, size.to_string()),
+        Ok(size) if !refused && flushed.is_ok() => match body_failure {
+            Some(status) => transfer_empty(status, &[]),
+            None => transfer_text(StatusCode::OK, size.to_string()),
+        },
         // The disk refused part of the upload, or its size cannot be read: nothing to report.
         _ => transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
     }
@@ -961,62 +1014,88 @@ impl hyper::body::Body for FileBody {
 mod tests {
     use super::*;
 
-    #[test]
-    fn downloads_size_the_file_opened_after_an_atomic_replacement() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .max_blocking_threads(1)
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let directory = std::env::temp_dir().join(format!(
-                "fastexec-transfer-replace-{}",
-                crate::tasks::random_chars(12).unwrap()
-            ));
-            std::fs::create_dir(&directory).unwrap();
-            let path = directory.join("file.txt");
-            let replacement = directory.join("replacement.txt");
-            let table = Arc::new(Transfers::new());
-            let id = table.create(path.clone()).unwrap();
-            for partial in [false, true] {
-                std::fs::write(&path, b"old").unwrap();
-                std::fs::write(&replacement, b"replacement").unwrap();
-                let mut headers = HeaderMap::new();
-                if partial {
-                    headers.insert(header::RANGE, "bytes=3-".parse().unwrap());
-                }
-                let mut download = Box::pin(transfer_get(&headers, table.admit(&id).unwrap()));
-                let (release, blocked) = std::sync::mpsc::channel();
-                let blocker = tokio::task::spawn_blocking(move || {
-                    blocked.recv_timeout(Duration::from_secs(5)).unwrap();
-                });
-                assert!(
-                    std::future::poll_fn(|context| {
-                        Poll::Ready(download.as_mut().poll(context).is_pending())
-                    })
-                    .await
-                );
-                release.send(()).unwrap();
-                blocker.await.unwrap();
-                // One blocking worker drains the queued path metadata before this marker.
-                tokio::task::spawn_blocking(|| {}).await.unwrap();
-                std::fs::rename(&replacement, &path).unwrap();
-                let response = download.await;
-                let (status, length, body) = if partial {
-                    assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 3-10/11");
-                    (StatusCode::PARTIAL_CONTENT, "8", &b"lacement"[..])
-                } else {
-                    (StatusCode::OK, "11", &b"replacement"[..])
-                };
-                assert_eq!(response.status(), status);
-                assert_eq!(response.headers()[header::CONTENT_LENGTH], length);
-                assert_eq!(
-                    response.into_body().collect().await.unwrap().to_bytes(),
-                    body
-                );
+    // Windows may refuse replacing a destination with an open handle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloads_size_the_same_open_handle_it_streams() {
+        let directory = std::env::temp_dir().join(format!(
+            "fastexec-transfer-replace-{}",
+            crate::tasks::random_chars(12).unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("file.txt");
+        let replacement = directory.join("replacement.txt");
+        let table = Arc::new(Transfers::new());
+        let id = table.create(path.clone()).unwrap();
+        for partial in [false, true] {
+            std::fs::write(&path, b"original").unwrap();
+            std::fs::write(&replacement, b"new").unwrap();
+            let mut headers = HeaderMap::new();
+            if partial {
+                headers.insert(header::RANGE, "bytes=3-".parse().unwrap());
             }
-            std::fs::remove_dir_all(directory).unwrap();
-        });
+            let response = transfer_get(&headers, table.admit(&id).unwrap()).await;
+            std::fs::rename(&replacement, &path).unwrap();
+            let (status, length, body) = if partial {
+                assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 3-7/8");
+                (StatusCode::PARTIAL_CONTENT, "5", &b"ginal"[..])
+            } else {
+                (StatusCode::OK, "8", &b"original"[..])
+            };
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], length);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                body
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_upload_flushes_accepted_prefix_and_releases_turn() {
+        use hyper::body::Frame;
+        struct Stalled(Option<Bytes>);
+        impl hyper::body::Body for Stalled {
+            type Data = Bytes;
+            type Error = Infallible;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+                match self.0.take() {
+                    Some(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                    None => Poll::Pending,
+                }
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "fastexec-transfer-idle-{}",
+            crate::tasks::random_chars(12).unwrap()
+        ));
+        let path = directory.join("file.txt");
+        let table = Arc::new(Transfers::new());
+        let id = table.create(path.clone()).unwrap();
+        let admitted = table.admit(&id).unwrap();
+        let target = prepare_upload(&admitted, 0).await.unwrap();
+        let input = Stalled(Some(Bytes::from_static(b"accepted")));
+        let response = write_upload(admitted, target, 0, input, CancellationToken::new()).await;
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(std::fs::read(&path).unwrap(), b"accepted");
+        let admitted = table.admit(&id).unwrap();
+        let resume = prepare_upload(&admitted, 8).await.unwrap();
+        let response = write_upload(
+            admitted,
+            resume,
+            8,
+            Full::new(Bytes::from_static(b"!")),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(&path).unwrap(), b"accepted!");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn headers(value: &str) -> HeaderMap {
