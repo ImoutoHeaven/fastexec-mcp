@@ -572,11 +572,9 @@ without blocking `daemon status` or `daemon stop`.
 
 `"false"` (default) keeps each tool's default MCP `annotations` hints.
 `"true"` sets `readOnlyHint: true`, `destructiveHint: false`,
-`idempotentHint: false`, and `openWorldHint: false` on the exposed tools while
-keeping each tool's `title`. The `instructions` tool is exempt and retains its
-native read-only, non-destructive, idempotent, and non-open-world hints. The
-value is read at startup by the MCP server process (stdio, daemon endpoint,
-and HTTP daemon); an invalid value exits with status `1`.
+`idempotentHint: false`, and `openWorldHint: false` on every exposed tool and
+keeps each tool's `title`. The MCP server reads this setting at startup in all
+modes and exits with status `1` if the value is invalid.
 
 ### `FASTEXEC_INSTRUCTIONS_FILE`
 

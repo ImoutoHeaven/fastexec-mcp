@@ -250,7 +250,8 @@ impl Server {
                 .expect("object schema")
                 .clone(),
             );
-            router = router.with_route((prepare_tool(instructions, false), Self::instructions));
+            router =
+                router.with_route((prepare_tool(instructions, tools.yolo), Self::instructions));
         }
         router
     }
@@ -2868,7 +2869,7 @@ mod instructions_tool_tests {
             assert_eq!(annotations.title.as_deref(), Some("Server instructions"));
             assert_eq!(annotations.read_only_hint, Some(true));
             assert_eq!(annotations.destructive_hint, Some(false));
-            assert_eq!(annotations.idempotent_hint, Some(true));
+            assert_eq!(annotations.idempotent_hint, Some(!yolo));
             assert_eq!(annotations.open_world_hint, Some(false));
         }
     }

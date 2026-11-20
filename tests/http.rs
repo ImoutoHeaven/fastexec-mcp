@@ -2498,7 +2498,7 @@ fn freebsd_fixture_fallback_cleanup_owns_its_daemon() {
 }
 
 #[test]
-fn yolo_overrides_all_five_http_tools_and_rejects_invalid_values() {
+fn yolo_overrides_all_http_tools_and_rejects_invalid_values() {
     let core_defaults = [
         (
             "edit",
@@ -2561,7 +2561,18 @@ fn yolo_overrides_all_five_http_tools_and_rejects_invalid_values() {
     {
         let mut fixture = Fixture::bare("yolo-on")
             .with_transfer("true")
+            .with_codemode("true")
+            .with_instructions_tool("copy")
             .with_yolo("true");
+        let all_titles = [
+            ("codemode", "Run JavaScript"),
+            ("edit", "Edit file"),
+            ("exec", "Run bash command"),
+            ("instructions", "Server instructions"),
+            ("read", "Read file"),
+            ("transfer", "Transfer file"),
+            ("write", "Write file"),
+        ];
         fixture.start();
         let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
         let modern_listed = modern.modern("tools/list", json!({}));
@@ -2573,13 +2584,13 @@ fn yolo_overrides_all_five_http_tools_and_rejects_invalid_values() {
 
         for tools_value in [&modern_listed["tools"], &legacy_tools] {
             let tools = tools_value.as_array().unwrap();
-            assert_eq!(tools.len(), 5, "{tools_value}");
-            for (name, expected) in &with_transfer_defaults {
-                let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
+            assert_eq!(tools.len(), all_titles.len(), "{tools_value}");
+            for (name, title) in all_titles {
+                let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
                 assert_eq!(
                     tool["annotations"],
                     json!({
-                        "title": expected["title"],
+                        "title": title,
                         "readOnlyHint": true,
                         "destructiveHint": false,
                         "idempotentHint": false,

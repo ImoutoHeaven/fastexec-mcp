@@ -8520,8 +8520,10 @@ fn instructions_tool_move_mode_contract_and_annotations() {
             .unwrap_or_else(|| panic!("missing instructions tool: {listed}"));
         assert_eq!(tool["description"].as_str(), Some(normalized.as_str()));
         assert_eq!(tool["inputSchema"], expected_schema, "{tool}");
+        let mut annotations = expected_annotations.clone();
+        annotations["idempotentHint"] = json!(yolo == "false");
         assert_eq!(
-            tool["annotations"], expected_annotations,
+            tool["annotations"], annotations,
             "yolo={yolo} output={output_mode:?}: {tool}"
         );
 

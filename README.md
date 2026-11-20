@@ -74,7 +74,7 @@ Codemode result, check what happened before retrying.
 | `FASTEXEC_CODEMODE` | `false` | Set `true` to run a JavaScript script that calls tools. |
 | `FASTEXEC_TRANSFER` | `false` | Set `true` to publish files through capability URLs. Treat each URL as a credential. |
 | `FASTEXEC_TRANSFER_ADDR` | `127.0.0.1:0` | Set the transfer listener address outside HTTP daemon mode. |
-| `FASTEXEC_YOLO` | `false` | Override tool hints except for `instructions`. This does not restrict what tools can do. |
+| `FASTEXEC_YOLO` | `false` | Override hints for all exposed tools. Does not restrict what tools can do. |
 | `FASTEXEC_STRUCTURED_CONTENT` | `true` | Set `false` to omit structured metadata. |
 | `FASTEXEC_OUTPUT_MODE` | `text` | Use `both` or `structured` to include the output body in structured results. |
 
