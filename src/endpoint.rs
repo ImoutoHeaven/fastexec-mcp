@@ -20,8 +20,8 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, OnceCell, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-/// How long a call may spend waiting for the writer and sending its frame.
-const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Total deadline for queueing on the request writer and sending a call frame (not response read).
+const WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long `bye` may take, locks and write together.
 const BYE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long a `Cancel` may take, the writer lock included.
@@ -64,8 +64,9 @@ struct Link {
 
 /// A call waiting for its result.
 struct Pending {
-    result: oneshot::Sender<CallToolResult>,
+    result: oneshot::Sender<(CallToolResult, Option<crate::lease::Lease>)>,
     progress: Option<watch::Sender<Option<wait::Progress>>>,
+    control: bool,
 }
 
 /// Removes the result routing entry even if the caller's future is dropped.
@@ -154,7 +155,16 @@ impl Endpoint {
         }
     }
 
+    pub(crate) fn memory(&self) -> &Arc<crate::lease::BytePool> {
+        self.launch.memory()
+    }
+
+    pub(crate) fn control_memory(&self) -> &Arc<crate::lease::BytePool> {
+        self.launch.control_memory()
+    }
+
     /// Runs one call on the daemon and answers with its result.
+    #[cfg(test)]
     pub async fn call(
         &self,
         tool: &str,
@@ -164,6 +174,23 @@ impl Endpoint {
         cancel: CancellationToken,
         progress: Option<watch::Sender<Option<wait::Progress>>>,
     ) -> CallToolResult {
+        let mut tracked = self
+            .call_tracked(tool, arguments, request_id, client_name, cancel, progress)
+            .await;
+        drop(tracked.lease.take());
+        tracked.result
+    }
+
+    pub async fn call_tracked(
+        &self,
+        tool: &str,
+        arguments: serde_json::Value,
+        request_id: String,
+        client_name: &str,
+        cancel: CancellationToken,
+        progress: Option<watch::Sender<Option<wait::Progress>>>,
+    ) -> crate::files::TrackedResult {
+        let plain_err = |msg: String| crate::files::TrackedResult::plain(error(msg));
         let action = arguments
             .get("action")
             .and_then(|action| action.as_str())
@@ -173,13 +200,13 @@ impl Endpoint {
         // and the caller would have waited for a connection to hear that.
         match serde_json::to_vec(&arguments) {
             Ok(body) if body.len() > ipc::CALL_LIMIT => {
-                return error(format!(
+                return plain_err(format!(
                     "The call is {} bytes; calls are limited to 3 MiB.",
                     body.len()
                 ));
             }
             Ok(_) => {}
-            Err(problem) => return error(format!("cannot serialize the call: {problem}")),
+            Err(problem) => return plain_err(format!("cannot serialize the call: {problem}")),
         }
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let deadline = std::time::Instant::now() + runtime::START_WAIT;
@@ -192,11 +219,11 @@ impl Endpoint {
         };
         let link = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return error("Cancelled before the call was sent."),
+            _ = cancel.cancelled() => return plain_err("Cancelled before the call was sent.".into()),
             linked = connecting => match linked {
                 Ok(link) => link,
                 Err(message) => {
-                    return error(format!("Cannot reach the fastexec daemon: {message}"));
+                    return plain_err(format!("Cannot reach the fastexec daemon: {message}"));
                 }
             }
         };
@@ -208,6 +235,7 @@ impl Endpoint {
                 Pending {
                     result: sender,
                     progress,
+                    control: tool == "exec" && matches!(action.as_str(), "list" | "kill"),
                 },
             );
         }
@@ -218,7 +246,16 @@ impl Endpoint {
             request_id: request_id.clone(),
             arguments,
         };
-        let lost = || self.lost(&link, tool, &action, id, &request_id);
+        let lost =
+            || crate::files::TrackedResult::plain(self.lost(&link, tool, &action, id, &request_id));
+        let to_tracked = |(result, lease): (CallToolResult, Option<crate::lease::Lease>)| {
+            crate::files::TrackedResult {
+                result,
+                lease,
+                overload: false,
+                task_meta: None,
+            }
+        };
         let mut attempted = false;
         let sent = tokio::select! {
             biased;
@@ -231,27 +268,27 @@ impl Endpoint {
         };
         if let Err(reason) = sent {
             if !attempted {
-                return error(reason);
+                return plain_err(reason.into());
             }
             // The write guard closed the link. A result received before EOF still wins.
-            return answer.await.unwrap_or_else(|_| lost());
+            return answer.await.map(to_tracked).unwrap_or_else(|_| lost());
         }
         tokio::select! {
             biased;
-            answer = &mut answer => answer.unwrap_or_else(|_| lost()),
+            answer = &mut answer => answer.map(to_tracked).unwrap_or_else(|_| lost()),
             _ = cancel.cancelled() => {
                 let mut attempted = false;
                 let frame = ToDaemon::Cancel { id };
                 // Finish a Cancel frame already in progress even if the call's result arrives
                 // meanwhile. Interrupting that frame would sacrifice unrelated pending calls.
                 let sent = tokio::time::timeout(CANCEL_WAIT, link.send(&frame, &mut attempted)).await;
-                if let Ok(result) = answer.try_recv() {
-                    return result;
+                if let Ok(pair) = answer.try_recv() {
+                    return to_tracked(pair);
                 }
                 match sent {
-                    Ok(true) => error("Cancelled; the task keeps running."),
+                    Ok(true) => plain_err("Cancelled; the task keeps running.".into()),
                     Err(_) if !attempted && !link.closed.is_cancelled() => {
-                        error("The call was sent, but Cancel timed out before it was sent. The call's result is unknown.")
+                        plain_err("The call was sent, but Cancel timed out before it was sent. The call's result is unknown.".into())
                     }
                     _ => lost(),
                 }
@@ -328,7 +365,13 @@ impl Endpoint {
             pending: std::sync::Mutex::new(HashMap::new()),
             closed: CancellationToken::new(),
         });
-        tokio::spawn(read_loop(Arc::clone(&link), reader, Arc::clone(&self.link)));
+        tokio::spawn(read_loop(
+            Arc::clone(&link),
+            reader,
+            Arc::clone(&self.link),
+            Arc::clone(self.launch.memory()),
+            Arc::clone(self.launch.control_memory()),
+        ));
         *slot = Some(Arc::clone(&link));
         Ok(link)
     }
@@ -388,33 +431,55 @@ async fn read_loop(
     link: Arc<Link>,
     mut reader: ReadHalf<transport::Client>,
     slot: Arc<Mutex<Option<Arc<Link>>>>,
+    pool: Arc<crate::lease::BytePool>,
+    control_pool: Arc<crate::lease::BytePool>,
 ) {
     loop {
         // Selecting on `closed` is what lets a closing link wake a reader that is waiting for
-        // bytes: a flag alone would leave it parked in `read_frame`.
+        // bytes: a flag alone would leave it parked in `read_endpoint_frame_leased`.
         let frame = tokio::select! {
             _ = link.closed.cancelled() => None,
-            frame = ipc::read_frame::<_, ToEndpoint>(&mut reader, ipc::RESPONSE_LIMIT) => {
-                frame.ok().flatten()
-            }
+            frame = ipc::read_endpoint_frame_leased(
+                &mut reader,
+                ipc::RESPONSE_LIMIT,
+                &pool,
+                &control_pool,
+                |id| lock(&link.pending).get(&id).is_some_and(|entry| entry.control),
+            ) => frame.ok(),
         };
         match frame {
-            Some(ToEndpoint::Progress {
-                id,
-                seconds,
-                message,
-            }) => {
+            Some(ipc::LeasedEndpointFrame::Frame(
+                ToEndpoint::Progress {
+                    id,
+                    seconds,
+                    message,
+                },
+                _lease,
+            )) => {
                 let pending = lock(&link.pending);
                 if let Some(progress) = pending.get(&id).and_then(|entry| entry.progress.as_ref()) {
                     progress.send_replace(Some((seconds, message)));
                 }
             }
-            Some(ToEndpoint::Result { id, result }) => {
+            Some(ipc::LeasedEndpointFrame::Frame(ToEndpoint::Result { id, result }, lease)) => {
                 // A call that was cancelled is no longer pending, and its late result is not
                 // anyone's answer.
                 let entry = lock(&link.pending).remove(&id);
                 if let Some(entry) = entry {
-                    let _ = entry.result.send(result);
+                    let _ = entry.result.send((result, Some(lease)));
+                }
+            }
+            Some(ipc::LeasedEndpointFrame::OverloadProgress) => {}
+            Some(ipc::LeasedEndpointFrame::OverloadResult { id: Some(id) }) => {
+                let entry = lock(&link.pending).remove(&id);
+                if let Some(entry) = entry {
+                    let _ = entry.result.send((
+                        error(format!(
+                            "Endpoint active memory budget ({} bytes) is full while receiving daemon response; use action list or poll once in-flight transfers complete.",
+                            pool.limit()
+                        )),
+                        None,
+                    ));
                 }
             }
             // Nothing else belongs on this connection after the Welcome.
@@ -620,6 +685,10 @@ mod tests {
         if let ToEndpoint::Welcome { protocol, .. } = &mut wrong_protocol {
             *protocol = ipc::PROTOCOL + 1;
         }
+        let mut legacy_protocol = welcome(&identity);
+        if let ToEndpoint::Welcome { protocol, .. } = &mut legacy_protocol {
+            *protocol = ipc::PROTOCOL - 1;
+        }
         let mut wrong_namespace = welcome(&identity);
         if let ToEndpoint::Welcome { namespace, .. } = &mut wrong_namespace {
             *namespace = "ffffffffffffffff".to_owned();
@@ -631,6 +700,7 @@ mod tests {
         let cases = [
             (welcome(&identity), None),
             (wrong_protocol, Some("speaks protocol")),
+            (legacy_protocol, Some("speaks protocol")),
             (wrong_namespace, Some("serves namespace")),
             (wrong_build, Some("runs build")),
         ];

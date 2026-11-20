@@ -2,11 +2,12 @@
 //! of the stdio endpoint or the namespace's pipe.
 
 use crate::daemon::Daemon;
+use crate::lease::Lease;
 use crate::service::Render;
 use crate::session::{LaunchContext, Session};
 use crate::transfer::{self, Admitted, Transfers};
 use crate::{Backend, InstructionsToolMode, Server, Tools, TransferEndpoint};
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http::header::HeaderName;
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use http_body_util::combinators::BoxBody;
@@ -232,6 +233,12 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     // Shared with the daemon so both HTTP sessions and stdio endpoints connected to it serve
     // capabilities through this `/t/` route.
     let table = daemon.transfers();
+    let launch = Arc::new(
+        launch
+            .for_session()
+            .with_memory(Arc::clone(daemon.memory()))
+            .with_control_memory(Arc::clone(daemon.control_memory())),
+    );
     let principals: Arc<[Arc<Session>]> = (0..digests.len())
         .map(|index| {
             let id = format!("t{}", index + 1);
@@ -485,6 +492,118 @@ fn client_fault(error: &hyper::Error) -> bool {
 #[derive(Clone, Copy)]
 pub struct Principal(pub usize);
 
+#[derive(Default)]
+struct ResponseLeaseState {
+    closed: bool,
+    leases: Vec<Lease>,
+}
+
+/// Holds active-byte leases across background SSE streaming until the HTTP response ends or drops.
+#[derive(Default)]
+pub(crate) struct ResponseLease(std::sync::Mutex<ResponseLeaseState>);
+
+impl ResponseLease {
+    pub(crate) fn attach(&self, lease: Lease) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            drop(state);
+            drop(lease);
+        } else {
+            state.leases.push(lease);
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        let dropped = {
+            let mut state = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.closed = true;
+            std::mem::take(&mut state.leases)
+        };
+        drop(dropped);
+    }
+}
+
+const LEASED_BODY_CHUNK: usize = 16 * 1024;
+
+/// Copies out at most `LEASED_BODY_CHUNK` bytes and drops `pending` once exhausted so
+/// downstream `WriteBuf` tail chunks never share the large buffer's reference count.
+fn next_copied_chunk(pending: &mut Bytes) -> Bytes {
+    let take = pending.len().min(LEASED_BODY_CHUNK);
+    let chunk = Bytes::copy_from_slice(&pending[..take]);
+    pending.advance(take);
+    if pending.is_empty() {
+        *pending = Bytes::new();
+    }
+    chunk
+}
+
+struct LeasedBody<B> {
+    inner: B,
+    pending: Bytes,
+    lease: Arc<ResponseLease>,
+}
+
+impl<B> Drop for LeasedBody<B> {
+    fn drop(&mut self) {
+        self.lease.close();
+    }
+}
+
+impl<B> hyper::body::Body for LeasedBody<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if !self.pending.is_empty() {
+            let chunk = next_copied_chunk(&mut self.pending);
+            return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
+        }
+        let poll = Pin::new(&mut self.inner).poll_frame(cx);
+        match poll {
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) if data.is_empty() => {
+                    Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::new()))))
+                }
+                Ok(mut data) => {
+                    let chunk = next_copied_chunk(&mut data);
+                    self.pending = data;
+                    Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
+                }
+                Err(non_data) => Poll::Ready(Some(Ok(non_data))),
+            },
+            Poll::Ready(None) => {
+                self.lease.close();
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.pending.is_empty() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        if self.pending.is_empty() {
+            self.inner.size_hint()
+        } else {
+            hyper::body::SizeHint::default()
+        }
+    }
+}
+
 /// The token check and the body cap, in front of rmcp: a request without a token never reaches
 /// a session, and one over the cap is refused before it is read.
 #[derive(Clone)]
@@ -531,6 +650,8 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
             }
             let (mut parts, body) = request.into_parts();
             parts.extensions.insert(Principal(principal));
+            let response_lease = Arc::new(ResponseLease::default());
+            parts.extensions.insert(Arc::clone(&response_lease));
             let request = Request::from_parts(parts, Limited::new(body, LIMIT));
             let answer = inner
                 .call(request)
@@ -542,10 +663,12 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
                 HeaderName::from_static("x-accel-buffering"),
                 "no".parse().expect("a header value"),
             );
-            Ok(Response::from_parts(
-                parts,
-                body.map_err(|never: Infallible| match never {}).boxed(),
-            ))
+            let leased = LeasedBody {
+                inner: body.map_err(|never: Infallible| match never {}),
+                pending: Bytes::new(),
+                lease: response_lease,
+            };
+            Ok(Response::from_parts(parts, leased.boxed()))
         })
     }
 }
@@ -1272,5 +1395,134 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn response_lease_holds_deferred_sse_bytes_until_stream_end_and_drops_on_early_close() {
+        struct TwoFrameStream {
+            step: u8,
+        }
+        impl hyper::body::Body for TwoFrameStream {
+            type Data = Bytes;
+            type Error = Infallible;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+                self.step += 1;
+                match self.step {
+                    1 => Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                        b"data: part1\n\n",
+                    ))))),
+                    2 => Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                        b"data: part2\n\n",
+                    ))))),
+                    _ => Poll::Ready(None),
+                }
+            }
+        }
+
+        let pool = crate::lease::BytePool::new(1024);
+        let shared = Arc::new(ResponseLease::default());
+        // Wrap body BEFORE the background tool call attaches its lease (SSE mode).
+        let mut body = LeasedBody {
+            inner: TwoFrameStream { step: 0 },
+            pending: Bytes::new(),
+            lease: Arc::clone(&shared),
+        };
+        assert_eq!(pool.used(), 0);
+
+        // Background tool call finishes and attaches its lease after body was created.
+        shared.attach(pool.try_acquire(600).unwrap());
+        assert_eq!(pool.used(), 600);
+
+        // Slow client reads frame 1 and pauses: lease stays held!
+        let f1 = body.frame().await;
+        assert!(f1.is_some());
+        assert_eq!(pool.used(), 600);
+
+        // Frame 2: still held until end-of-stream!
+        let f2 = body.frame().await;
+        assert!(f2.is_some());
+        assert_eq!(pool.used(), 600);
+
+        // Stream hits Poll::Ready(None): lease is released immediately.
+        assert!(body.frame().await.is_none());
+        assert_eq!(pool.used(), 0);
+
+        // Client disconnects early before background tool attaches its lease: attach drops at once.
+        let early_closed = Arc::new(ResponseLease::default());
+        let dropped_body = LeasedBody {
+            inner: TwoFrameStream { step: 0 },
+            pending: Bytes::new(),
+            lease: Arc::clone(&early_closed),
+        };
+        drop(dropped_body);
+        early_closed.attach(pool.try_acquire(400).unwrap());
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn leased_body_drops_source_buffer_before_lease_even_when_tail_chunks_remain_held() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TrackedOwner {
+            bytes: Vec<u8>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl AsRef<[u8]> for TrackedOwner {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for TrackedOwner {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let source_dropped = Arc::new(AtomicBool::new(false));
+        let raw_len = LEASED_BODY_CHUNK * 3 + 512;
+        let payload = Bytes::from_owner(TrackedOwner {
+            bytes: vec![b'A'; raw_len],
+            dropped: Arc::clone(&source_dropped),
+        });
+        let pool = crate::lease::BytePool::new(256 * 1024);
+        let shared = Arc::new(ResponseLease::default());
+        shared.attach(pool.try_acquire(raw_len).unwrap());
+
+        let mut body = LeasedBody {
+            inner: Full::new(payload),
+            pending: Bytes::new(),
+            lease: Arc::clone(&shared),
+        };
+
+        let mut downstream_write_buf = Vec::new();
+        for idx in 0..3 {
+            let chunk = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(chunk.len(), LEASED_BODY_CHUNK, "chunk {idx}");
+            assert!(!source_dropped.load(Ordering::SeqCst));
+            assert_eq!(pool.used(), raw_len);
+            downstream_write_buf.push(chunk);
+        }
+
+        // Pulling the final 512-byte tail chunk frees the underlying large source buffer immediately,
+        // while the lease remains held until end-of-stream (`Poll::Ready(None)`).
+        let tail = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(tail.len(), 512);
+        downstream_write_buf.push(tail);
+        assert!(
+            source_dropped.load(Ordering::SeqCst),
+            "source buffer must drop before lease closes even while downstream holds tail chunks"
+        );
+        assert_eq!(pool.used(), raw_len);
+
+        // End-of-stream now releases the lease while `downstream_write_buf` still holds every chunk.
+        assert!(body.frame().await.is_none());
+        assert_eq!(pool.used(), 0);
+        assert_eq!(
+            downstream_write_buf.iter().map(Bytes::len).sum::<usize>(),
+            raw_len
+        );
     }
 }

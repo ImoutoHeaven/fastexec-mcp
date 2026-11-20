@@ -3,6 +3,7 @@
 
 use crate::http::{self, Http};
 use crate::ipc::{self, ToDaemon, ToEndpoint};
+use crate::lease::{self, BytePool, Lease};
 use crate::runtime;
 use crate::service::{Call, OutputMode, Render, RenderSlot, Service};
 use crate::session::{LaunchContext, Session};
@@ -27,8 +28,8 @@ pub const MAX_SESSIONS: usize = 256;
 pub const MAX_IN_FLIGHT: usize = 32;
 /// How long a connection has to send its Hello.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a write may stall before its connection is closed.
-pub const WRITE_STALL: Duration = Duration::from_secs(30);
+/// How long a write may go without positive progress before its connection is closed.
+pub const WRITE_STALL: Duration = Duration::from_secs(60);
 /// How often the daemon looks at its own state: expired sessions, expired tasks, idleness.
 pub const TICK: Duration = Duration::from_secs(60);
 /// How long the daemon must be idle before it exits.
@@ -37,19 +38,16 @@ pub const IDLE_AFTER: Duration = Duration::from_secs(600);
 pub const MAX_CONNECTIONS: usize = 128;
 /// How long a stopping daemon waits for admitted starts to end their tasks.
 pub const STOP_WAIT: Duration = Duration::from_secs(5);
-/// How many bytes of queued, serialized frames the daemon holds across every connection.
-pub const BUDGET: usize = 128 << 20;
-/// The share of the budget `kill` and `list` results use, so a queue full of large results cannot
-/// hold up the calls that clear it.
-pub const RESERVED: usize = 8 << 20;
+/// Independent control-plane reserve for `list`, short `kill` receipts, and overload receipts.
+pub const RESERVED: usize = lease::CONTROL_LIMIT;
 /// Normal renders can coexist, but neither they nor one management action consume the slots
 /// reserved for the other management action. This bounds render concurrency, not daemon RSS.
 const RENDER_SLOTS: usize = 2;
 
 /// What a daemon is run with.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Config {
-    /// How long a write may stall before its connection is closed.
+    /// How long a write may go without positive progress before its connection is closed.
     pub write_stall: Duration,
     /// How often the daemon looks at its own state.
     pub tick: Duration,
@@ -57,6 +55,8 @@ pub struct Config {
     pub idle_after: Duration,
     /// Whether it exits at all when idle.
     pub idle_exit: bool,
+    /// Optional override for the shared active-byte pool (used in unit tests).
+    pub memory: Option<Arc<BytePool>>,
 }
 
 impl Default for Config {
@@ -66,6 +66,7 @@ impl Default for Config {
             tick: TICK,
             idle_after: IDLE_AFTER,
             idle_exit: false,
+            memory: None,
         }
     }
 }
@@ -93,9 +94,11 @@ pub struct Daemon {
     public_root: Option<Arc<str>>,
     transfer_listener: tokio::sync::OnceCell<std::net::SocketAddr>,
     sessions: Mutex<HashMap<String, Entry>>,
-    /// One permit per byte of queued result, `BUDGET - RESERVED` of them.
-    budget: Arc<Semaphore>,
-    /// The permits `kill` and `list` results use.
+    /// Active byte pool shared by ordinary outbound frames, media reads, and codemode packing.
+    memory: Arc<BytePool>,
+    /// Independent 8 MiB control-plane byte pool shared with HTTP sessions.
+    control_memory: Arc<BytePool>,
+    /// Independent control-plane permits for `kill`, `list`, and overload error receipts.
     reserved: Arc<Semaphore>,
     render: Arc<Semaphore>,
     render_kill: Arc<Semaphore>,
@@ -160,10 +163,15 @@ struct Entry {
     detached_at: Option<Instant>,
 }
 
-/// A frame on its way out, with the permits its bytes hold until it is written.
+enum OutgoingPermit {
+    Main(#[allow(dead_code)] Lease),
+    Reserved(#[allow(dead_code)] OwnedSemaphorePermit),
+}
+
+/// A frame on its way out, with the lease or control permit its bytes hold until written.
 struct Outgoing {
     bytes: Vec<u8>,
-    _permit: Option<OwnedSemaphorePermit>,
+    _permit: Option<OutgoingPermit>,
     /// Signalled once the frame is written. A progress forwarder waits on it, so at most one
     /// progress frame per call is queued and the latest wins.
     written: Option<oneshot::Sender<()>>,
@@ -199,8 +207,18 @@ impl Daemon {
         build: String,
         http: Option<String>,
         public_root: Option<Arc<str>>,
-        config: Config,
+        mut config: Config,
     ) -> Arc<Self> {
+        let isolated = config.memory.is_some();
+        let memory = config
+            .memory
+            .take()
+            .unwrap_or_else(|| Arc::clone(lease::process_pool()));
+        let control_memory = if isolated {
+            BytePool::new(RESERVED)
+        } else {
+            Arc::clone(lease::control_pool())
+        };
         Arc::new(Self {
             service: Arc::new(Service::new(Arc::clone(&tasks), true)),
             tasks,
@@ -211,7 +229,8 @@ impl Daemon {
             public_root,
             transfer_listener: tokio::sync::OnceCell::new(),
             sessions: Mutex::new(HashMap::new()),
-            budget: Arc::new(Semaphore::new(BUDGET - RESERVED)),
+            memory,
+            control_memory,
             reserved: Arc::new(Semaphore::new(RESERVED)),
             render: Arc::new(Semaphore::new(RENDER_SLOTS)),
             render_kill: Arc::new(Semaphore::new(1)),
@@ -220,6 +239,14 @@ impl Daemon {
             gate: Mutex::default(),
             stopped: CancellationToken::new(),
         })
+    }
+
+    pub fn memory(&self) -> &Arc<BytePool> {
+        &self.memory
+    }
+
+    pub fn control_memory(&self) -> &Arc<BytePool> {
+        &self.control_memory
     }
 
     /// The service every connection's calls run on.
@@ -624,13 +651,14 @@ impl Daemon {
         // like every other, and it also gives way to a replacement or a close, so the session is
         // handed back instead of held for the whole stall.
         let written = {
-            let writing = async { ipc::write_frame(writer, &welcome).await };
+            let stall = self.config.write_stall;
+            let writing = async { ipc::write_frame_idle(writer, &welcome, stall).await };
             tokio::pin!(writing);
             tokio::select! {
                 biased;
                 _ = guard.attached.token.cancelled() => false,
                 _ = self.stopped.cancelled() => false,
-                result = timeout(self.config.write_stall, &mut writing) => matches!(result, Ok(Ok(()))),
+                result = &mut writing => result.is_ok(),
             }
         };
         // A Welcome that could not be written drops the guard, which hands the session back.
@@ -686,6 +714,9 @@ impl Daemon {
             }
         }
         let label = format!("{client_name}-{}", short(session_id));
+        let launch = launch
+            .with_memory(Arc::clone(&self.memory))
+            .with_control_memory(Arc::clone(&self.control_memory));
         let session = Session::new(session_id.to_owned(), label, Arc::new(launch));
         sessions.insert(
             session_id.to_owned(),
@@ -888,17 +919,24 @@ async fn run_call(
         render_slot: Some(&render_slot),
     };
     let transfer = session.launch.var("FASTEXEC_TRANSFER") == Some(std::ffi::OsStr::new("true"));
-    let result = if cancelled_before_dispatch {
-        error("Cancelled before the operation started; nothing was executed.".into())
+    let mut tracked = if cancelled_before_dispatch {
+        crate::files::TrackedResult::plain(error(
+            "Cancelled before the operation started; nothing was executed.".into(),
+        ))
     } else if tool == "exec" {
-        daemon.service.call_json(arguments, call).await
+        daemon.service.call_json_tracked(arguments, call).await
     } else if tool == "codemode" {
         match serde_json::from_value::<crate::codemode::Request>(arguments) {
-            Ok(request) => daemon.service.codemode(request, call, transfer).await,
-            Err(problem) => error(problem.to_string()),
+            Ok(request) => {
+                daemon
+                    .service
+                    .codemode_tracked(request, call, transfer)
+                    .await
+            }
+            Err(problem) => crate::files::TrackedResult::plain(error(problem.to_string())),
         }
     } else if tool == "transfer" {
-        if !transfer {
+        let res = if !transfer {
             crate::transfer_error(
                 "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
                 render,
@@ -911,31 +949,51 @@ async fn run_call(
                     render,
                 ),
             }
-        }
+        };
+        crate::files::TrackedResult::plain(res)
     } else {
         // File tools run in the daemon process using the calling session's launch context.
         let launch = Arc::clone(&session.launch);
-        crate::files::call(&tool, arguments, launch, transfer, render).await
+        crate::files::call_tracked(
+            &tool,
+            arguments,
+            launch,
+            transfer,
+            render,
+            Some(token.clone()),
+        )
+        .await
     };
     // The result goes out last. Aborting the forwarder is not enough on its own: one already
     // inside an encode or a send could still queue a frame after the result, so this waits for
     // it to be gone.
     forwarder.stop().await;
 
+    let task_meta = tracked.task_meta.take();
+    let mut overload = tracked.overload;
+    let mut lease = tracked.lease.take();
+    let result = std::mem::replace(&mut tracked.result, CallToolResult::success(Vec::new()));
     let mut message = ToEndpoint::Result { id, result };
     let Some(mut length) = measure(&message) else {
         lock(&in_flight).remove(&id);
         return;
     };
     if length > ipc::RESPONSE_LIMIT + 4 {
-        // The call ran: saying so, and where to look, is what a caller can act on.
-        let text = format!(
-            "The result was {length} bytes, over the 64 MiB frame limit; the call ran, and list shows its task and logPath."
-        );
+        drop(lease.take());
+        let text = match &task_meta {
+            Some(m) => format!(
+                "The result was {length} bytes, over the 512 MiB frame limit; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId with a smaller maxBytes or read logPath.",
+                m.bare_task_id, m.log_path
+            ),
+            None => format!(
+                "The result was {length} bytes, over the 512 MiB frame limit; the call ran, and list shows its task and logPath."
+            ),
+        };
         message = ToEndpoint::Result {
             id,
             result: error(text),
         };
+        overload = true;
         match measure(&message) {
             Some(smaller) => length = smaller,
             None => {
@@ -944,23 +1002,96 @@ async fn run_call(
             }
         }
     }
-    // A small `kill` or `list` result takes the reserved share; everything else, and any result
-    // too large for that share, takes the main budget, which holds one whole frame.
-    let (semaphore, capacity) = if management && length <= RESERVED {
-        (&daemon.reserved, RESERVED)
-    } else {
-        (&daemon.budget, BUDGET - RESERVED)
+
+    if (management || overload) && length <= RESERVED {
+        let want = u32::try_from(length).unwrap_or(u32::MAX);
+        let permit = tokio::select! {
+            biased;
+            _ = connection.cancelled() => {
+                lock(&in_flight).remove(&id);
+                return;
+            }
+            permit = Arc::clone(&daemon.reserved).acquire_many_owned(want) => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    lock(&in_flight).remove(&id);
+                    return;
+                }
+            },
+        };
+        let bytes = ipc::encode_measured(&message, length);
+        drop(message);
+        drop(lease);
+        drop(render_slot);
+        if let Ok(bytes) = bytes {
+            let _ = outgoing.send(Outgoing {
+                bytes,
+                _permit: Some(OutgoingPermit::Reserved(permit)),
+                written: None,
+            });
+        }
+        lock(&in_flight).remove(&id);
+        return;
+    }
+
+    let b64_bytes = match &message {
+        ToEndpoint::Result { result, .. } => crate::service::content_b64_bytes(result),
+        _ => 0,
     };
-    let want = u32::try_from(length.min(capacity)).unwrap_or(u32::MAX);
+    let frame_lease = match lease.take() {
+        Some(mut held) => b64_bytes
+            .checked_add(length)
+            .filter(|&peak| held.try_resize(peak))
+            .map(|_| {
+                let outbound_lease = held.split_off(length);
+                (outbound_lease, Some(held))
+            }),
+        None => daemon.memory.try_acquire(length).map(|fl| (fl, None)),
+    };
+    if let Some((frame_lease, staging_lease)) = frame_lease {
+        let bytes = ipc::encode_measured(&message, length);
+        drop(message);
+        drop(staging_lease);
+        drop(render_slot);
+        if let Ok(bytes) = bytes {
+            let _ = outgoing.send(Outgoing {
+                bytes,
+                _permit: Some(OutgoingPermit::Main(frame_lease)),
+                written: None,
+            });
+        }
+        lock(&in_flight).remove(&id);
+        return;
+    }
+
+    // Active memory cannot fit the outbound frame without blocking; release the uncommitted result
+    // and send a short overload receipt through the independent RESERVED control pool.
+    let overload_text = match &task_meta {
+        Some(meta) => crate::service::overload_task_message(daemon.memory.limit(), meta),
+        None => format!(
+            "Server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
+            daemon.memory.limit()
+        ),
+    };
+    drop(tracked);
+    drop(message);
+    drop(render_slot);
+    let fallback = ToEndpoint::Result {
+        id,
+        result: error(overload_text),
+    };
+    let Some(fallback_len) = measure(&fallback).filter(|&len| len <= RESERVED) else {
+        lock(&in_flight).remove(&id);
+        return;
+    };
+    let want = u32::try_from(fallback_len).unwrap_or(u32::MAX);
     let permit = tokio::select! {
         biased;
         _ = connection.cancelled() => {
-            // The connection is gone, so the result has nowhere to go. This is the connection's
-            // token, not the call's: a cancelled call still has a result to send.
             lock(&in_flight).remove(&id);
             return;
         }
-        permit = Arc::clone(semaphore).acquire_many_owned(want) => match permit {
+        permit = Arc::clone(&daemon.reserved).acquire_many_owned(want) => match permit {
             Ok(permit) => permit,
             Err(_) => {
                 lock(&in_flight).remove(&id);
@@ -968,14 +1099,10 @@ async fn run_call(
             }
         },
     };
-    // The room for these bytes was reserved before they existed.
-    let bytes = ipc::encode_measured(&message, length);
-    drop(message);
-    drop(render_slot);
-    if let Ok(bytes) = bytes {
+    if let Ok(bytes) = ipc::encode_measured(&fallback, fallback_len) {
         let _ = outgoing.send(Outgoing {
             bytes,
-            _permit: Some(permit),
+            _permit: Some(OutgoingPermit::Reserved(permit)),
             written: None,
         });
     }
@@ -1066,12 +1193,12 @@ async fn write_loop(
         // The write gives way to the connection token as well as to the stall: a replacement or
         // a close drops this half, the queued frames, and their permits at once.
         let sent = {
-            let writing = async { ipc::write_raw(&mut writer, &bytes).await };
+            let writing = async { ipc::write_raw_idle(&mut writer, &bytes, stall).await };
             tokio::pin!(writing);
             tokio::select! {
                 biased;
                 _ = closing.cancelled() => false,
-                result = timeout(stall, &mut writing) => matches!(result, Ok(Ok(()))),
+                result = &mut writing => result.is_ok(),
             }
         };
         if !sent {
@@ -1123,7 +1250,7 @@ fn queue_frame(
     if let Ok(bytes) = ipc::encode_frame(message) {
         let _ = outgoing.send(Outgoing {
             bytes,
-            _permit: Some(permit),
+            _permit: Some(OutgoingPermit::Reserved(permit)),
             written: None,
         });
     }
@@ -1142,11 +1269,11 @@ async fn reject(
     message: String,
 ) -> Option<Attachment> {
     let message = ToEndpoint::Reject { message };
-    let writing = ipc::write_frame(writer, &message);
+    let writing = ipc::write_frame_idle(writer, &message, stall);
     tokio::select! {
         biased;
         _ = stopped.cancelled() => {}
-        _ = timeout(stall, writing) => {}
+        _ = writing => {}
     }
     None
 }
@@ -2161,38 +2288,297 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_kill_or_list_result_uses_the_reserved_share_and_others_wait_for_the_budget() {
-        let fixture = fixture();
+    async fn a_kill_or_list_or_overload_receipt_uses_reserved_when_main_memory_is_full() {
+        let pool = BytePool::new(64 * 1024);
+        let fixture = fixture_with_config(Config {
+            memory: Some(Arc::clone(&pool)),
+            ..Config::default()
+        });
         let daemon = &fixture.daemon;
         let mut client = connect(daemon).await;
         client.welcome("sess88", 1).await;
-        // Hold the whole budget without allocating a byte of it.
-        let held = Arc::clone(&daemon.budget)
-            .acquire_many_owned((BUDGET - RESERVED) as u32)
-            .await
-            .expect("the budget is free");
 
-        // An action that does not exist fails at once, and its error result takes the budget,
-        // which is held, so it waits.
+        // Start a codemode script that stores a small image and pauses, while memory is still free.
+        let pixel = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            2,
+            image::Rgb([1, 2, 3]),
+        ));
+        let mut png = Vec::new();
+        pixel
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            crate::media::encode_base64(&png)
+        );
         client
-            .send(&call(1, json!({"action": "no-such-action"})))
+            .send(&ToDaemon::Call {
+                id: 1,
+                tool: "codemode".into(),
+                request_id: "1".into(),
+                arguments: json!({
+                    "code": format!("attach({data_url:?}); await sleep(30000);"),
+                    "waitMs": 50
+                }),
+            })
             .await;
-        // A list result takes the reserved share, so it goes out while the other waits.
-        client.send(&call(2, json!({"action": "list"}))).await;
-        match client.next().await {
-            Some(ToEndpoint::Result { id, .. }) => {
-                assert_eq!(id, 2, "the reserved share carries list past a held budget")
-            }
-            other => panic!("expected the list result, got {other:?}"),
-        }
+        let started = client.result(1).await;
+        let started_json = json_of(&started);
+        let handle = started_json["taskId"].as_str().unwrap().to_owned();
+        let bare = handle.split_once('.').unwrap().0.to_owned();
+        // Wait until the attachment is stored on the task.
+        let task = daemon.tasks.find(&bare).unwrap();
+        until(|| task.unseen_attachment_count(0) > 0).await;
+
+        // Occupy 100% of the main active-byte pool.
+        let held = pool.try_acquire(pool.limit()).expect("main pool free");
+
+        // 1. Ordinary call fails fast without deadlocking and delivers its overload receipt via RESERVED.
+        client
+            .send(&call(2, json!({"action": "no-such-action"})))
+            .await;
+        let overloaded = client.result(2).await;
+        assert_eq!(overloaded.is_error, Some(true));
+        assert!(
+            text_of(&overloaded).contains("active memory budget"),
+            "{}",
+            text_of(&overloaded)
+        );
+
+        // 2. `list` succeeds via RESERVED despite 0 bytes in main pool.
+        client.send(&call(3, json!({"action": "list"}))).await;
+        let listed = client.result(3).await;
+        assert_eq!(listed.is_error, Some(false));
+
+        // 3. `kill` on a fresh reader with an unseen attachment terminates the script, defers
+        //    the attachment so it stays unread, and returns its short receipt via RESERVED.
+        client
+            .send(&call(4, json!({"action": "kill", "taskId": bare})))
+            .await;
+        let killed = client.result(4).await;
+        assert_eq!(killed.is_error, Some(false), "{killed:?}");
+        let killed_json = json_of(&killed);
+        assert_eq!(killed_json["state"], "killed");
+        let kill_handle = killed_json["taskId"].as_str().unwrap().to_owned();
+        assert_eq!(
+            killed
+                .content
+                .iter()
+                .filter(|b| b.as_image().is_some())
+                .count(),
+            0,
+            "attachment stays deferred while main pool is full"
+        );
+        assert!(
+            text_of(&killed).contains("poll taskId without input"),
+            "{}",
+            text_of(&killed)
+        );
+
+        // 4. Once main memory frees up, an inputless `poll` on that same reader handle retrieves the attachment!
         drop(held);
-        match client.next().await {
-            Some(ToEndpoint::Result { id, result }) => {
-                assert_eq!(id, 1, "the held budget released its call");
-                assert!(text_of(&result).contains("no-such-action"), "{result:?}");
-            }
-            other => panic!("expected the waiting result, got {other:?}"),
+        client
+            .send(&call(
+                5,
+                json!({"action": "poll", "taskId": kill_handle, "waitMs": 0}),
+            ))
+            .await;
+        let polled = client.result(5).await;
+        assert_eq!(polled.is_error, Some(false), "{polled:?}");
+        assert_eq!(
+            polled
+                .content
+                .iter()
+                .filter(|b| b.as_image().is_some())
+                .count(),
+            1,
+            "deferred attachment delivered on subsequent inputless poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_narrows_over_reserved_dual_frame_and_overload_preserves_cursor_and_bare_id() {
+        let pool = BytePool::new(32 * 1024);
+        let fixture = fixture_with_config(Config {
+            memory: Some(Arc::clone(&pool)),
+            ..Config::default()
+        });
+        let daemon = &fixture.daemon;
+
+        // Client with output_mode="both" and structured_content=false? First test output_mode="both"
+        // (structured_content=true) so 4 MiB body + 4 MiB structuredContent.output > 8 MiB RESERVED.
+        let mut both_client = connect(daemon).await;
+        let mut h = hello("bothkill", 1);
+        if let ToDaemon::Hello { output_mode, .. } = &mut h {
+            *output_mode = "both".into();
         }
+        both_client.send(&h).await;
+        assert!(matches!(
+            both_client.next().await,
+            Some(ToEndpoint::Welcome { .. })
+        ));
+
+        // Start a codemode script whose dual-written JSON-escaped output (~11.5 MiB) exceeds 8 MiB RESERVED.
+        both_client
+            .send(&ToDaemon::Call {
+                id: 1,
+                tool: "codemode".into(),
+                request_id: "1".into(),
+                arguments: json!({
+                    "code": "for (let i = 0; i < 16; i++) text('\\x01'.repeat(60000)); await sleep(30000);",
+                    "waitMs": 50,
+                    "maxBytes": 100
+                }),
+            })
+            .await;
+        let started = both_client.result(1).await;
+        assert_eq!(started.is_error, Some(false), "{started:?}");
+        let start_handle = json_of(&started)["taskId"].as_str().unwrap().to_owned();
+        let bare_id = start_handle.split_once('.').unwrap().0.to_owned();
+        let task = daemon.tasks.find(&bare_id).unwrap();
+        until(|| task.snapshot().lines >= 16).await;
+
+        // Exhaust 100% of main pool: kill with maxBytes=4194304 in `both` mode would exceed 8 MiB
+        // RESERVED (~8.4 MiB), so kill must narrow its window to fit RESERVED and still succeed!
+        let held = pool.try_acquire(pool.limit()).unwrap();
+        both_client
+            .send(&call(
+                2,
+                json!({
+                    "action": "kill",
+                    "taskId": bare_id,
+                    "maxBytes": 4_194_304
+                }),
+            ))
+            .await;
+        let killed = both_client.result(2).await;
+        assert_eq!(killed.is_error, Some(false), "{killed:?}");
+        let killed_sc = json_of(&killed);
+        assert_eq!(killed_sc["state"], "killed");
+        assert!(
+            text_of(&killed).contains("narrowed to fit the 8 MiB control reserve"),
+            "{}",
+            text_of(&killed)
+        );
+        drop(held);
+
+        // Now connect a session with FASTEXEC_STRUCTURED_CONTENT=false: when start/poll hits
+        // active-memory overload, read.commit() must NOT advance the cursor, and the error
+        // receipt must name the bare taskId (never advising a blind retry of start).
+        let mut nosc_client = connect(daemon).await;
+        let mut h2 = hello("nosc01", 1);
+        if let ToDaemon::Hello {
+            structured_content, ..
+        } = &mut h2
+        {
+            *structured_content = false;
+        }
+        nosc_client.send(&h2).await;
+        assert!(matches!(
+            nosc_client.next().await,
+            Some(ToEndpoint::Welcome { .. })
+        ));
+
+        let held_most = pool.try_acquire(pool.limit() - 64).unwrap();
+        nosc_client
+            .send(&ToDaemon::Call {
+                id: 10,
+                tool: "codemode".into(),
+                request_id: "10".into(),
+                arguments: json!({
+                    "code": "text('exact-preserved-line');",
+                    "waitMs": 5000
+                }),
+            })
+            .await;
+        let overloaded = nosc_client.result(10).await;
+        assert_eq!(overloaded.is_error, Some(true));
+        assert!(overloaded.structured_content.is_none());
+        let err_msg = text_of(&overloaded);
+        assert!(
+            err_msg.contains("Do not retry start or resend input"),
+            "{err_msg}"
+        );
+        // Extract bare taskId from `(taskId: <id>, logPath: ...)` and confirm it has no `.reader` suffix.
+        let after_tid = err_msg.split_once("taskId: ").unwrap().1;
+        let reported_tid = after_tid.split_once(',').unwrap().0;
+        assert!(
+            !reported_tid.contains('.'),
+            "expected bare taskId, got {reported_tid}"
+        );
+
+        drop(held_most);
+        nosc_client
+            .send(&call(
+                11,
+                json!({"action": "poll", "taskId": reported_tid, "waitMs": 0}),
+            ))
+            .await;
+        let recovered = nosc_client.result(11).await;
+        assert_eq!(recovered.is_error, Some(false), "{recovered:?}");
+        assert!(
+            text_of(&recovered).contains("exact-preserved-line"),
+            "cursor must not have been consumed on overload: {}",
+            text_of(&recovered)
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_progress_write_stall_disconnects_reclaims_lease_and_recovers_via_bare_task_id() {
+        let pool = BytePool::new(256 * 1024);
+        let fixture = fixture_with_config(Config {
+            write_stall: Duration::from_millis(80),
+            memory: Some(Arc::clone(&pool)),
+            ..Config::default()
+        });
+        let daemon = &fixture.daemon;
+
+        // 64-byte duplex pipe: client stops reading after Welcome so a >2 KiB result stalls completely.
+        let mut stalled = connect_to(daemon, 64).await;
+        stalled.welcome("stallrec", 1).await;
+        stalled
+            .send(&ToDaemon::Call {
+                id: 1,
+                tool: "codemode".into(),
+                request_id: "1".into(),
+                arguments: json!({
+                    "code": "text('RECOVER_LINE_' + 'X'.repeat(3000));",
+                    "waitMs": 5000
+                }),
+            })
+            .await;
+        let serving = stalled.serving.take().expect("duplex served");
+        timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("zero-progress write_stall closed connection")
+            .expect("handler exited cleanly");
+        until(|| pool.used() == 0).await;
+
+        // Fresh client reconnects, discovers the bare taskId via `list`, and recovers full output.
+        let mut fresh = connect(daemon).await;
+        fresh.welcome("recover1", 1).await;
+        fresh
+            .send(&call(1, json!({"action": "list", "scope": "all"})))
+            .await;
+        let listed = json_of(&fresh.result(1).await);
+        let bare_id = listed["tasks"][0]["taskId"].as_str().unwrap().to_owned();
+        assert!(!bare_id.contains('.'));
+
+        fresh
+            .send(&call(
+                2,
+                json!({"action": "poll", "taskId": bare_id, "waitMs": 5000}),
+            ))
+            .await;
+        let polled = fresh.result(2).await;
+        assert_eq!(polled.is_error, Some(false));
+        assert!(
+            text_of(&polled).contains(&format!("RECOVER_LINE_{}", "X".repeat(3000))),
+            "{}",
+            text_of(&polled)
+        );
+        assert_eq!(pool.used(), 0);
     }
 
     #[tokio::test]
@@ -2363,15 +2749,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_reader_refusal_with_no_reserved_room_closes_the_connection() {
-        let fixture = fixture();
+        let pool = BytePool::new(64 * 1024);
+        let fixture = fixture_with_config(Config {
+            memory: Some(Arc::clone(&pool)),
+            ..Config::default()
+        });
         let daemon = &fixture.daemon;
         let mut client = connect(daemon).await;
         client.welcome("sess99", 1).await;
-        // Hold both shares, and keep one call waiting on the budget.
-        let budget = Arc::clone(&daemon.budget)
-            .acquire_many_owned((BUDGET - RESERVED) as u32)
-            .await
-            .expect("the budget is free");
+        // Hold both shares, and send a duplicate ID so the reader refuses with no reserved room.
+        let budget = pool.try_acquire(pool.limit()).expect("the budget is free");
         let reserved = Arc::clone(&daemon.reserved)
             .acquire_many_owned(RESERVED as u32)
             .await
@@ -2420,6 +2807,82 @@ mod tests {
             .read_to_end(&mut drained)
             .await
             .expect("the drained bytes end");
+    }
+
+    #[tokio::test]
+    async fn slow_forward_progress_outlives_write_stall_and_protocol_mismatch_is_rejected() {
+        let stall = Duration::from_millis(80);
+        let fixture = fixture_with_write_stall(stall);
+        let daemon = &fixture.daemon;
+
+        // 1. Old protocol (2) Hello is rejected immediately at handshake.
+        let mut old_client = connect(daemon).await;
+        let mut bad_hello = hello("oldproto", 1);
+        if let ToDaemon::Hello { protocol, .. } = &mut bad_hello {
+            *protocol = 2;
+        }
+        old_client.send(&bad_hello).await;
+        match old_client.next().await {
+            Some(ToEndpoint::Reject { message }) => {
+                assert!(message.contains("protocol 2 is not 3"), "{message}");
+            }
+            other => panic!("expected Reject for protocol 2, got {other:?}"),
+        }
+
+        // 2. Slow reader draining 16 bytes every 25ms across > 250ms (> 3 * stall) still completes.
+        let dir = std::env::temp_dir().join(format!(
+            "fastexec-slow-stall-{}",
+            crate::tasks::random_chars(8).unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "line1234567890\n".repeat(40)).unwrap();
+
+        let mut slow_client = connect_to(daemon, 32).await;
+        let mut h = hello("slowread", 1);
+        if let ToDaemon::Hello { cwd, .. } = &mut h {
+            *cwd = OsText::from(dir.as_os_str());
+        }
+        slow_client.send(&h).await;
+        assert!(matches!(
+            slow_client.next().await,
+            Some(ToEndpoint::Welcome { .. })
+        ));
+        slow_client
+            .send(&ToDaemon::Call {
+                id: 1,
+                tool: "read".into(),
+                request_id: "1".into(),
+                arguments: json!({"path": "notes.txt"}),
+            })
+            .await;
+
+        let started = Instant::now();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 16];
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let n = slow_client.reader.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed despite steady progress");
+            raw.extend_from_slice(&buf[..n]);
+            if raw.len() >= 4 {
+                let body_len = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+                if raw.len() >= 4 + body_len {
+                    break;
+                }
+            }
+        }
+        assert!(
+            started.elapsed() > stall * 2,
+            "elapsed {:?} should exceed 2 * stall {:?}",
+            started.elapsed(),
+            stall
+        );
+        let decoded: Option<ToEndpoint> =
+            ipc::read_frame(&mut std::io::Cursor::new(raw), ipc::RESPONSE_LIMIT)
+                .await
+                .unwrap();
+        assert!(matches!(decoded, Some(ToEndpoint::Result { id: 1, .. })));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// What a Hello and a Welcome must agree on.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// The largest frame the daemon accepts. A Hello carries the endpoint's whole environment, which
 /// is the reason this is larger than a call.
@@ -19,7 +19,9 @@ pub const CALL_LIMIT: usize = 3 << 20;
 
 /// The largest frame the endpoint accepts. Results are sized to fit, so a larger one is a bug and
 /// the endpoint closes the connection.
-pub const RESPONSE_LIMIT: usize = 64 << 20;
+pub const RESPONSE_LIMIT: usize = 512 << 20;
+
+const WRITE_CHUNK: usize = 64 * 1024;
 
 /// A message as the bytes a frame holds: the u32 little-endian length and its JSON. Encoding
 /// stands apart from writing so a caller can size the bytes it will send before it queues them.
@@ -61,10 +63,8 @@ where
     Ok(bytes)
 }
 
-/// The bytes a frame of `message` occupies, counted without holding them: the length prefix and
-/// the JSON. A caller that must reserve room for a frame before it exists measures it here, so
-/// no encoded buffer is ever held without the room for it.
-pub fn frame_len<T>(message: &T) -> std::io::Result<usize>
+/// Counts the serialized JSON bytes of `message` without allocating a buffer.
+pub fn json_len<T>(message: &T) -> std::io::Result<usize>
 where
     T: Serialize + ?Sized,
 {
@@ -84,7 +84,17 @@ where
     let mut count = Count(0);
     serde_json::to_writer(&mut count, message)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    Ok(4 + count.0)
+    Ok(count.0)
+}
+
+/// The bytes a frame of `message` occupies, counted without holding them: the length prefix and
+/// the JSON. A caller that must reserve room for a frame before it exists measures it here, so
+/// no encoded buffer is ever held without the room for it.
+pub fn frame_len<T>(message: &T) -> std::io::Result<usize>
+where
+    T: Serialize + ?Sized,
+{
+    Ok(4 + json_len(message)?)
 }
 
 /// Writes bytes that are already a frame, then flushes them: a frame a reader waits on is never
@@ -104,6 +114,85 @@ where
     T: Serialize + ?Sized,
 {
     write_raw(writer, &encode_frame(message)?).await
+}
+
+/// Writes a pre-encoded frame in chunks, resetting `idle` only when positive bytes are written.
+pub async fn write_raw_idle<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    idle: std::time::Duration,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut written = 0;
+    let mut deadline = tokio::time::Instant::now() + idle;
+    while written < bytes.len() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "write stalled",
+            ));
+        }
+        let end = (written + WRITE_CHUNK).min(bytes.len());
+        match tokio::time::timeout_at(deadline, writer.write(&bytes[written..end])).await {
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "write returned 0 bytes",
+                ));
+            }
+            Ok(Ok(count)) => {
+                written += count;
+                deadline = tokio::time::Instant::now() + idle;
+            }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                tokio::task::yield_now().await;
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "write stalled",
+                ));
+            }
+        }
+    }
+    let flush_deadline = tokio::time::Instant::now() + idle;
+    loop {
+        if tokio::time::Instant::now() >= flush_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "flush stalled",
+            ));
+        }
+        match tokio::time::timeout_at(flush_deadline, writer.flush()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                tokio::task::yield_now().await;
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "flush stalled",
+                ));
+            }
+        }
+    }
+}
+
+/// Encodes `message` as one frame and writes it under per-chunk idle timeout `idle`.
+pub async fn write_frame_idle<W, T>(
+    writer: &mut W,
+    message: &T,
+    idle: std::time::Duration,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize + ?Sized,
+{
+    write_raw_idle(writer, &encode_frame(message)?, idle).await
 }
 
 /// Reads one frame, or `None` when the reader ended cleanly before a length. A reader that ends
@@ -151,6 +240,185 @@ where
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+#[derive(Debug)]
+pub enum LeasedEndpointFrame {
+    Frame(ToEndpoint, crate::lease::Lease),
+    OverloadResult { id: Option<u64> },
+    OverloadProgress,
+    Eof,
+}
+
+async fn read_exact_slice<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+) -> std::io::Result<()> {
+    let total = buf.len();
+    let mut filled = 0;
+    while filled < total {
+        match reader.read(&mut buf[filled..]).await {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("the frame ended after {filled} of {total} bytes"),
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+async fn drain_exact_bytes<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    mut remaining: usize,
+    total: usize,
+) -> std::io::Result<()> {
+    let mut scratch = [0u8; 8192];
+    while remaining > 0 {
+        let want = remaining.min(scratch.len());
+        match reader.read(&mut scratch[..want]).await {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("the frame ended with {remaining} of {total} bytes unread"),
+                ));
+            }
+            Ok(n) => remaining -= n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Reads and deserializes one `ToEndpoint` frame under `main_pool` (falling back to `control_pool`
+/// for `<= 8 MiB` `Progress`, short error receipts, and `list`/`kill` control calls), and drains
+/// un-admitted frames in small chunks so an overload fails only that call without breaking IPC.
+pub async fn read_endpoint_frame_leased<R, F>(
+    reader: &mut R,
+    max: usize,
+    main_pool: &std::sync::Arc<crate::lease::BytePool>,
+    control_pool: &std::sync::Arc<crate::lease::BytePool>,
+    is_control_call: F,
+) -> std::io::Result<LeasedEndpointFrame>
+where
+    R: AsyncRead + Unpin,
+    F: Fn(u64) -> bool,
+{
+    let mut header = [0u8; 4];
+    let mut filled = 0;
+    while filled < header.len() {
+        match reader.read(&mut header[filled..]).await {
+            Ok(0) if filled == 0 => return Ok(LeasedEndpointFrame::Eof),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("the input ended after {filled} of 4 length bytes"),
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    let length = u32::from_le_bytes(header) as usize;
+    if length > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a frame of {length} bytes is over the {max} byte limit"),
+        ));
+    }
+    if let Some(mut lease) = length
+        .checked_mul(2)
+        .and_then(|peak| main_pool.try_acquire(peak))
+    {
+        let mut body = vec![0u8; length];
+        read_exact_slice(reader, &mut body).await?;
+        let decoded: ToEndpoint = serde_json::from_slice(&body)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        drop(body);
+        lease.shrink_to(length);
+        return Ok(LeasedEndpointFrame::Frame(decoded, lease));
+    }
+    if length
+        .checked_mul(2)
+        .is_some_and(|peak| peak <= crate::lease::CONTROL_LIMIT)
+    {
+        let prefix_len = length.min(256);
+        let mut head = [0u8; 256];
+        read_exact_slice(reader, &mut head[..prefix_len]).await?;
+        let sniffed = sniff_endpoint_overload(&head[..prefix_len]);
+        let skip_control_pool = length > 64 * 1024
+            && matches!(
+                sniffed,
+                LeasedEndpointFrame::OverloadResult { id } if !id.is_some_and(&is_control_call)
+            );
+        if !skip_control_pool && let Some(mut clease) = control_pool.try_acquire(length * 2) {
+            let mut body = vec![0u8; length];
+            body[..prefix_len].copy_from_slice(&head[..prefix_len]);
+            read_exact_slice(reader, &mut body[prefix_len..]).await?;
+            let decoded: ToEndpoint = serde_json::from_slice(&body)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            drop(body);
+            match &decoded {
+                ToEndpoint::Progress { .. } => {
+                    clease.shrink_to(length);
+                    return Ok(LeasedEndpointFrame::Frame(decoded, clease));
+                }
+                ToEndpoint::Result { id, result }
+                    if result.is_error == Some(true) || is_control_call(*id) =>
+                {
+                    clease.shrink_to(length);
+                    return Ok(LeasedEndpointFrame::Frame(decoded, clease));
+                }
+                ToEndpoint::Result { id, .. } => {
+                    let id = *id;
+                    drop(decoded);
+                    drop(clease);
+                    return Ok(LeasedEndpointFrame::OverloadResult { id: Some(id) });
+                }
+                _ => {
+                    clease.shrink_to(length);
+                    return Ok(LeasedEndpointFrame::Frame(decoded, clease));
+                }
+            }
+        }
+        drain_exact_bytes(reader, length - prefix_len, length).await?;
+        return Ok(sniffed);
+    }
+    let prefix_len = length.min(256);
+    let mut head = [0u8; 256];
+    read_exact_slice(reader, &mut head[..prefix_len]).await?;
+    drain_exact_bytes(reader, length - prefix_len, length).await?;
+    Ok(sniff_endpoint_overload(&head[..prefix_len]))
+}
+
+fn sniff_endpoint_overload(head: &[u8]) -> LeasedEndpointFrame {
+    // `head` may cut through a multibyte UTF-8 sequence at byte 256; keep the valid prefix so
+    // ASCII JSON header fields (`"type"` and `"id"`) at the front of the frame still parse.
+    let text = match std::str::from_utf8(head) {
+        Ok(valid) => valid,
+        Err(err) => std::str::from_utf8(&head[..err.valid_up_to()]).unwrap_or(""),
+    };
+    if text.contains("\"type\":\"progress\"") {
+        return LeasedEndpointFrame::OverloadProgress;
+    }
+    if !text.contains("\"type\":\"result\"") {
+        return LeasedEndpointFrame::OverloadResult { id: None };
+    }
+    let id = text.split_once("\"id\":").and_then(|(_, rest)| {
+        let digits: String = rest
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    });
+    LeasedEndpointFrame::OverloadResult { id }
 }
 
 /// An OS string as the wire carries it: a JSON string when it is valid Unicode, and its native
@@ -697,5 +965,304 @@ mod tests {
             OutputMode::parse("Text").unwrap_err(),
             "unknown output mode \"Text\""
         );
+    }
+
+    #[tokio::test]
+    async fn idle_writes_reset_on_forward_progress_and_fail_on_stall() {
+        assert_eq!(PROTOCOL, 3);
+        assert_eq!(RESPONSE_LIMIT, 512 << 20);
+
+        let payload = vec![b'x'; 256];
+        let idle = std::time::Duration::from_millis(80);
+        let (mut writer, mut reader) = tokio::io::duplex(32);
+        let reading = async {
+            let mut received = Vec::with_capacity(payload.len());
+            let mut chunk = [0_u8; 32];
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                let n = reader.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+            }
+            received
+        };
+        let started = std::time::Instant::now();
+        let writing = async {
+            write_raw_idle(&mut writer, &payload, idle).await.unwrap();
+            drop(writer);
+        };
+        let (received, ()) = tokio::join!(reading, writing);
+        assert!(started.elapsed() > idle * 2);
+        assert_eq!(received, payload);
+
+        let (mut stalled_writer, _unreading_peer) = tokio::io::duplex(16);
+        let err = write_raw_idle(
+            &mut stalled_writer,
+            &payload,
+            std::time::Duration::from_millis(40),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        struct InterruptingWriter {
+            written: Vec<u8>,
+            interrupts_left: usize,
+            always_interrupt: bool,
+        }
+        impl AsyncWrite for InterruptingWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                if self.always_interrupt || self.interrupts_left > 0 {
+                    if !self.always_interrupt {
+                        self.interrupts_left -= 1;
+                    }
+                    cx.waker().wake_by_ref();
+                    return std::task::Poll::Ready(Err(std::io::Error::from(
+                        std::io::ErrorKind::Interrupted,
+                    )));
+                }
+                let take = buf.len().min(32);
+                self.written.extend_from_slice(&buf[..take]);
+                std::task::Poll::Ready(Ok(take))
+            }
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.interrupts_left > 0 {
+                    self.interrupts_left -= 1;
+                    cx.waker().wake_by_ref();
+                    return std::task::Poll::Ready(Err(std::io::Error::from(
+                        std::io::ErrorKind::Interrupted,
+                    )));
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut transient = InterruptingWriter {
+            written: Vec::new(),
+            interrupts_left: 5,
+            always_interrupt: false,
+        };
+        write_raw_idle(
+            &mut transient,
+            &payload,
+            std::time::Duration::from_millis(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(transient.written, payload);
+
+        let mut endless_eintr = InterruptingWriter {
+            written: Vec::new(),
+            interrupts_left: 0,
+            always_interrupt: true,
+        };
+        let err = write_raw_idle(
+            &mut endless_eintr,
+            &payload,
+            std::time::Duration::from_millis(35),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn read_endpoint_frame_leased_routes_control_and_handles_split_utf8_or_progress() {
+        let main_pool = crate::lease::BytePool::new(500);
+        let control_pool = crate::lease::BytePool::new(2048);
+
+        // 1. Ordinary non-error result when `main_pool` cannot fit `2 * len` must NOT steal `control_pool`.
+        let big = ToEndpoint::Result {
+            id: 77,
+            result: rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "x".repeat(260),
+            )]),
+        };
+        // 2. Control result (`is_control_call(78) == true`) succeeds via `control_pool` even with `main_pool` full.
+        let held_main = main_pool.try_acquire(500).unwrap();
+        let control_res = ToEndpoint::Result {
+            id: 78,
+            result: rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "list output",
+            )]),
+        };
+        // 3. Error receipt (`is_error == Some(true)`) succeeds via `control_pool` while `main_pool` is full.
+        let err_res = ToEndpoint::Result {
+            id: 79,
+            result: rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                "taskId: t-1234",
+            )]),
+        };
+
+        let mut wire = encode_frame(&big).unwrap();
+        let control_wire = encode_frame(&control_res).unwrap();
+        let err_wire = encode_frame(&err_res).unwrap();
+        wire.extend_from_slice(&control_wire);
+        wire.extend_from_slice(&err_wire);
+        let mut cursor = std::io::Cursor::new(wire);
+
+        match read_endpoint_frame_leased(
+            &mut cursor,
+            RESPONSE_LIMIT,
+            &main_pool,
+            &control_pool,
+            |id| id == 78,
+        )
+        .await
+        .unwrap()
+        {
+            LeasedEndpointFrame::OverloadResult { id } => assert_eq!(id, Some(77)),
+            other => panic!("expected OverloadResult(77), got {other:?}"),
+        }
+        assert_eq!(control_pool.used(), 0);
+
+        match read_endpoint_frame_leased(
+            &mut cursor,
+            RESPONSE_LIMIT,
+            &main_pool,
+            &control_pool,
+            |id| id == 78,
+        )
+        .await
+        .unwrap()
+        {
+            LeasedEndpointFrame::Frame(ToEndpoint::Result { id, .. }, lease) => {
+                assert_eq!(id, 78);
+                assert_eq!(lease.bytes(), control_wire.len() - 4);
+                assert_eq!(control_pool.used(), lease.bytes());
+                drop(lease);
+                assert_eq!(control_pool.used(), 0);
+            }
+            other => panic!("expected control Frame(78), got {other:?}"),
+        }
+
+        match read_endpoint_frame_leased(
+            &mut cursor,
+            RESPONSE_LIMIT,
+            &main_pool,
+            &control_pool,
+            |_| false,
+        )
+        .await
+        .unwrap()
+        {
+            LeasedEndpointFrame::Frame(ToEndpoint::Result { id, result }, lease) => {
+                assert_eq!(id, 79);
+                assert_eq!(result.is_error, Some(true));
+                drop(lease);
+            }
+            other => panic!("expected error Frame(79), got {other:?}"),
+        }
+
+        // 4. When both pools are full, draining a `Progress` frame yields `OverloadProgress` and
+        // draining a `Result` frame whose multibyte UTF-8 text is cut at byte 256 still extracts `id`.
+        let _held_ctrl = control_pool.try_acquire(2048).unwrap();
+        let progress = ToEndpoint::Progress {
+            id: 98,
+            seconds: 1.5,
+            message: "中".repeat(200),
+        };
+        let utf8_result = ToEndpoint::Result {
+            id: 99,
+            result: rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "汉".repeat(300),
+            )]),
+        };
+        let utf8_wire = encode_frame(&utf8_result).unwrap();
+        // Verify byte 256 of the body actually lands mid-codepoint (`std::str::from_utf8` fails).
+        assert!(std::str::from_utf8(&utf8_wire[4..4 + 256]).is_err());
+
+        let mut drain_wire = encode_frame(&progress).unwrap();
+        drain_wire.extend_from_slice(&utf8_wire);
+        drop(held_main);
+        let tail_ok = ToEndpoint::Result {
+            id: 100,
+            result: rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "ok",
+            )]),
+        };
+        drain_wire.extend_from_slice(&encode_frame(&tail_ok).unwrap());
+
+        let rem_main = main_pool.try_acquire(500).unwrap();
+        let mut drain_cursor = std::io::Cursor::new(drain_wire);
+        assert!(matches!(
+            read_endpoint_frame_leased(
+                &mut drain_cursor,
+                RESPONSE_LIMIT,
+                &main_pool,
+                &control_pool,
+                |_| false,
+            )
+            .await
+            .unwrap(),
+            LeasedEndpointFrame::OverloadProgress
+        ));
+        match read_endpoint_frame_leased(
+            &mut drain_cursor,
+            RESPONSE_LIMIT,
+            &main_pool,
+            &control_pool,
+            |_| false,
+        )
+        .await
+        .unwrap()
+        {
+            LeasedEndpointFrame::OverloadResult { id } => assert_eq!(id, Some(99)),
+            other => panic!("expected OverloadResult(99), got {other:?}"),
+        }
+        drop(rem_main);
+        match read_endpoint_frame_leased(
+            &mut drain_cursor,
+            RESPONSE_LIMIT,
+            &main_pool,
+            &control_pool,
+            |_| false,
+        )
+        .await
+        .unwrap()
+        {
+            LeasedEndpointFrame::Frame(ToEndpoint::Result { id, .. }, _) => assert_eq!(id, 100),
+            other => panic!("expected Frame(100), got {other:?}"),
+        }
+
+        // 5. Non-control `Result` frames larger than 64 KiB under `main_pool` overload drain on the
+        // stack without borrowing `control_pool` or parsing the oversized body.
+        let full_main = main_pool.try_acquire(500).unwrap();
+        let roomy_control = crate::lease::BytePool::new(crate::lease::CONTROL_LIMIT);
+        let mut over_64k_body = br#"{"type":"result","id":101,"result":"#.to_vec();
+        over_64k_body.resize(70 * 1024, b'!');
+        let mut over_64k_wire = (over_64k_body.len() as u32).to_le_bytes().to_vec();
+        over_64k_wire.extend_from_slice(&over_64k_body);
+        let mut over_64k_cursor = std::io::Cursor::new(over_64k_wire);
+        match read_endpoint_frame_leased(
+            &mut over_64k_cursor,
+            RESPONSE_LIMIT,
+            &main_pool,
+            &roomy_control,
+            |_| false,
+        )
+        .await
+        .unwrap()
+        {
+            LeasedEndpointFrame::OverloadResult { id } => assert_eq!(id, Some(101)),
+            other => panic!("expected OverloadResult(101), got {other:?}"),
+        }
+        assert_eq!(roomy_control.used(), 0);
+        drop(full_main);
     }
 }

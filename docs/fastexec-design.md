@@ -83,7 +83,7 @@ loginctl enable-linger <user>
 `loginctl enable-linger` starts the unit without a login session.
 
 On Windows, [nssm](https://nssm.cc/usage) runs it under the user's own account
-rather than LocalSystem:
+instead of LocalSystem:
 
 ```powershell
 nssm install fastexec "C:\path\to\fastexec.exe" "daemon run --http 127.0.0.1:8765"
@@ -96,8 +96,8 @@ nssm start fastexec
 `nssm edit` sets the Log on account without putting a password on the command
 line. Every environment entry goes in one `AppEnvironmentExtra` command, because
 a later one replaces the block. The runtime root comes from `LOCALAPPDATA`, so
-the service and the user's shell must see the same value: set it explicitly
-rather than inherit an administrator's profile. A service runs in Session 0
+the service and the user's shell must see the same value: set it explicitly so
+the service does not inherit an administrator's profile. A service runs in Session 0
 without a desktop, so an app that needs a visible window belongs in Task
 Scheduler "at logon" instead.
 
@@ -149,7 +149,7 @@ execution, naming `exec` actions in lowercase.
 | --- | --- | --- |
 | `exec` | the action table below | Runs bash commands as tasks. |
 | `codemode` | `code`, `cwd`, `waitMs`, `returnWhen`, `killAfterMs`, `truncate`, `maxBytes` | Runs async JavaScript as a task when `FASTEXEC_CODEMODE=true`. |
-| `read` | `path`, `offset`, `limit` | Shows a text file, or an image inline. |
+| `read` | `path`, `offset`, `limit` | Reads a text file, or attaches an image, audio, PDF, or video file. |
 | `write` | `path`, `content` | Saves a complete replacement of a regular file. |
 | `edit` | `path`, `edits` | Applies exact text replacements to a UTF-8 file. |
 | `transfer` | `path` | Publishes one regular file at a `/t/<id>` URL when `FASTEXEC_TRANSFER=true`, returning `{ ok, url, path, bytes }`. |
@@ -158,10 +158,10 @@ execution, naming `exec` actions in lowercase.
 
 | Action | Allowed Parameters | Summary |
 | --- | --- | --- |
-| `start` | `command`, `cwd`, `pty`, `loginShell`, `input`, `eof`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Rejects NUL bytes in `command` before execution, then spawns it in GNU bash (`loginShell: false` default with the session's login-environment snapshot; `loginShell: true` runs `bash -l -c`) and waits up to `waitMs` (default `30000`, range `0–240000` on direct calls; unbounded by default without `returnWhen` in nested `codemode` calls). Pipe mode defaults stdin to `/dev/null`, writes `input` (`<= 1` MiB UTF-8) and closes stdin unless `eof: false`, or keeps stdin open with `eof: false`; PTY mode rejects `input` and `eof: true` on `start` (`eof: false` is a no-op) and defaults size to `120×30`. |
+| `start` | `command`, `cwd`, `pty`, `loginShell`, `input`, `eof`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Rejects NUL bytes in `command` before execution, then spawns it in GNU bash (`loginShell: false` default with the session's login-environment snapshot; `loginShell: true` runs `bash -l -c`) and waits up to `waitMs` (default `30000`, range `0-240000` on direct calls; unbounded by default without `returnWhen` in nested `codemode` calls). Pipe mode defaults stdin to `/dev/null`, writes `input` (`<= 1` MiB UTF-8) and closes stdin unless `eof: false`, or keeps stdin open with `eof: false`; PTY mode rejects `input` and `eof: true` on `start` (`eof: false` is a no-op) and defaults size to `120x30`. |
 | `poll` | `taskId`, `cols`, `rows`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Normalizes `keys: []` (and any accompanying `keyDelayMs`) to absent before validation, resizes the terminal (PTY only), writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only, idempotent when already closed), waits (`2000` ms with a resize, `input`, or `keys` and no `returnWhen`; `30000` ms on direct calls or with `returnWhen`; unbounded by default on nested `codemode` waits without `returnWhen` or input), and returns unseen output. |
 | `kill` | `taskId`, `truncate`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns unseen output through the reader gate without `waitEndedBy` (`head_tail` / `16384` B default on direct calls; `head` / `4194304` B default on nested calls). On a finished `keepTree` task, ends held processes while keeping the root exit result. |
-| `list` | `scope`, `state`, `limit`, `truncate`, `maxBytes` | Lists bare task IDs newest first filtered by `scope` (`"session"` default or `"all"`), `state` (`"active"` or `"finished"`; omitted lists both), and `limit` (`1–500`, default `20`), reporting `totalCount` before `limit`; creates no readers and marks only delivered entries. |
+| `list` | `scope`, `state`, `limit`, `truncate`, `maxBytes` | Lists bare task IDs newest first filtered by `scope` (`"session"` default or `"all"`), `state` (`"active"` or `"finished"`; omitted lists both), and `limit` (`1-500`, default `20`), reporting `totalCount` before `limit`; creates no readers and marks only delivered entries. |
 | `transcript` | `taskId`, `truncate` (default `"tail"`), `maxBytes`, `waitMs` (ignored) | Reads a UTF-8 PTY task's terminal transcript from the first unseen final line, followed by pending lines. Does not wait or advance the `poll` cursor. |
 
 ### Key Parameter Rules
@@ -184,24 +184,24 @@ execution, naming `exec` actions in lowercase.
   cursors and decoding state commit only after complete rendering succeeds;
   failed or cancelled reads leave unseen output available for the next call.
   Retention and output limits apply to each reader.
-- **`waitMs` vs. `killAfterMs`**: `waitMs` (`0–240000`) bounds only the current
+- **`waitMs` vs. `killAfterMs`**: `waitMs` (`0-240000`) bounds only the current
   call's wait. A call that hits `waitMs`, matches `returnWhen`, or is cancelled
   leaves the task running (use `list` to recover the `taskId` of a cancelled
   `start`). `killAfterMs` on `start` arms an independent timer that kills the
   owned tree, including kept processes. Expiry while the root runs reports
   `state: "killed"` and `lifetimeExpired: true`; after root exit, held processes
-  end but the root's original result stays.
+  end and the root's original result stays.
 - **`returnWhen`**: Ends the wait early when any condition holds (`waitEndedBy`
   reports `{ condition, text? }`):
-  - `outputContains`: `1–16` literal case-sensitive strings (`1–4096` bytes
+  - `outputContains`: `1-16` literal case-sensitive strings (`1-4096` bytes
     each, no line breaks) matched against unseen output lines: cleaned for bash
     (including text before a carriage return overwrites it), unchanged for codemode.
   - `screenContains`, `screenAppears`, `screenGone` (UTF-8 PTY only): match
     against the live screen at the task's size (`screenAppears` and `screenGone`
     compare against the screen captured before the call's resize and `input`).
-  - `quietMs`: `10–60000` ms without output after `input` and `keys` finish.
+  - `quietMs`: `10-60000` ms without output after `input` and `keys` finish.
 - **Window and encoding options**:
-  - `maxBytes`: `100–4194304` (`4` MiB; default `16384` on direct `exec` and
+  - `maxBytes`: `100-4194304` (`4` MiB; default `16384` on direct `exec` and
     outer `codemode`, `4194304` on nested `tools.exec`). Bounds the output body
     (`structuredContent.output`) only; the status line, background footer (`<= 512`
     bytes), metadata, JSON framing, errors, and correctness warnings stay outside
@@ -230,10 +230,10 @@ execution, naming `exec` actions in lowercase.
     stream read up to that point. Cannot combine with `truncate`, `raw`, or
     `encoding`.
   - `cols`, `rows` (PTY only): the terminal's size. `start` takes them,
-    defaulting `120×30`; `poll` takes them too, because a resize is
+    defaulting `120x30`; `poll` takes them too, because a resize is
     terminal-side input: a poll applies the resize, then `input`, then `keys`,
     then waits. Either axis may come alone and an omitted axis keeps its value;
-    bounds are `cols` `20–500` and `rows` `5–200`; an unchanged size is a no-op.
+    bounds are `cols` `20-500` and `rows` `5-200`; an unchanged size is a no-op.
     A pipe task refuses both.
 
 ### Codemode
@@ -244,7 +244,7 @@ function body with top-level `await` and `return`, up to 256 KiB of UTF-8,
 nonempty after trimming and without NUL bytes. Unknown parameters are refused.
 It shares `exec start`'s directory, wait, and output options except `raw`:
 `cwd`, `waitMs`, `killAfterMs`, `truncate` (default `head_tail`, keeping lines
-uncut up to `maxBytes`), `maxBytes` (`100–4194304`, default `16384`), and
+uncut up to `maxBytes`), `maxBytes` (`100-4194304`, default `16384`), and
 `returnWhen` (`outputContains`, `quietMs`). Schema-decoding failures return a tool error
 without `structuredContent`; parameter validation and admission failures return
 `isError: true` with `structuredContent` (`ok: false`, `action: "codemode"`)
@@ -252,21 +252,21 @@ without creating a task.
 
 A script is a task with `kind: "codemode"`. The start result has
 `action: "codemode"`; later `exec poll`, `kill`, and `list` use the same task
-and reader handles (`kill` also attaches pending `image()` outputs in the
-committed cursor range). A list command is `[codemode] <code>`, flattened and
+and reader handles (`kill` keeps short status receipts within the `8` MiB
+control reserve and defers larger pending attachments to inputless `poll`). A list command is `[codemode] <code>`, flattened and
 truncated like bash commands. A script poll rejects `input` (including an empty
 string), `keys`, `keyDelayMs`, resize, `encoding`, and true values for `eof`,
 `screen`, or `raw`. Optional fields accept `null`. Scripts have no terminal
 or process tree and reject `transcript` requests.
 
-The VM uses synchronous rquickjs 0.14.0 on a dedicated thread, with 128 MiB
+The VM uses synchronous rquickjs 0.14.0 on a dedicated thread, with 256 MiB
 of VM memory, a 512 KiB JavaScript stack, and a 2 MiB thread stack. A local
 server admits four scripts and a daemon eight, within the existing total task
 limit. The VM, output reader and capture workers are prepared before admission
 is published; a failed preparation returns its capacity and files.
 
 The script globals are `tools.exec/read/write/edit`, `sleep`, `sh.quote`, `text`,
-`console`, `image`, `exit`, and UTF-8 `TextEncoder`/`TextDecoder` (alongside
+`console`, `attach`, `exit`, and UTF-8 `TextEncoder`/`TextDecoder` (alongside
 QuickJS's built-in `atob`/`btoa`). `sleep(ms)` returns a `Promise<void>` without
 spawning a process (yielding once when `ms <= 0` and throwing `TypeError` for
 non-finite numbers). `sh` is frozen; `sh.quote(value)` formats a
@@ -298,17 +298,17 @@ the whole UTF-8 file up to `4` MiB or rejects with `ToolError` when larger or
 non-UTF-8, and with `offset` or `limit` reads a slice up to `4` MiB (no line cap,
 marking invalid UTF-8 with `lossy: true`), always returning `{kind: "text", path,
 text, startLine, endLine, shownLines, totalLines, truncated, nextOffset,
-lineTooLong, lossy}`; image `read` returns
-`{kind: "image", path, mimeType, attached: true, originalWidth, originalHeight,
-width, height, image: {type: "image", data, mimeType}}` or `{kind: "image",
-path, mimeType, attached: false, originalWidth, originalHeight, width, height,
-note}` (`image()` throws `TypeError` with `note` when `attached` is `false`); `write` returns `{path, bytes}`; and `edit` returns
+lineTooLong, lossy}`; media `read` (image, audio, PDF, video) returns a
+lightweight descriptor `{kind, path, mimeType, bytes, attachable: true}` or
+`{kind, path, mimeType, sourceBytes?, attachable: false, note}` without sending
+base64 into QuickJS (`attach()` throws `TypeError` with `note` when `attachable`
+is `false`); `write` returns `{path, bytes}`; and `edit` returns
 `{path, replacements, edits}`. Each script has `8` `exec start` slots and `8`
 file/transcript I/O slots (`read`, `write`, and `edit` hold their slot inside the
 blocking worker until disk I/O finishes; `poll`, `kill`, `list`, and `sleep` take
 no slot), within `1024` pending calls. Starts waiting for a slot are admitted in
 script submission order. Additional calls past the pending limit reject with `RangeError`.
-Pending tool arguments and results have a separate 128 MiB budget per script;
+Pending tool arguments and results have a separate 256 MiB budget per script;
 exceeding it rejects the call with `RangeError`. A completed result that cannot
 fit rejects after the operation ran; its error identifies this case, and the
 operation remains in effect. A script awaiting a promise with no pending tool
@@ -329,8 +329,9 @@ start calls, counting calls that later fail or are cancelled. Further starts
 reject with RangeError, so the complete startedTasks history stays bounded.
 
 Script output streams through the existing pipe capture and task log. The
-64 MiB per-script limit includes text and image files, with 4 KiB reserved
-for final diagnostics. Normal completion and `exit()` have exit code 0;
+64 MiB per-script text limit reserves 4 KiB for final diagnostics, while stored
+attachments count separately under the 4 GiB server task quota and 1024-entry
+per-task cap. Normal completion and `exit()` have exit code 0;
 syntax errors, uncaught exceptions, unhandled rejection, stalled promises
 and resource failures have exit code 1 with a `Script error:` line. These are
 normal task results (`isError: false`). Stop has state `killed`, null exitCode,
@@ -346,26 +347,34 @@ on termination, and `codemode.startedTasks` lists all registered handles with
 states queried at each response. Status lines show up to three still-running
 handles and report when a kill has waited five seconds without completion.
 
-`image()` accepts an image block, base64 data URL or tool result containing
-an image. Detection uses the bytes, ignores a claimed MIME type, and shares
-read's normalization to at most 2000 by 2000 pixels and less than 4718592
-base64 bytes. Conversion failures write an omission line. A script saves up
-to 64 images next to its log; file sizes count toward the per-script and total
-log budgets. A completed file and its marker's ending byte position are
-registered before the marker is written, so a concurrent reader cannot miss it.
+`attach(value)` accepts an opaque task attachment handle from nested `exec poll`
+or `kill`, a file path string or `{path}` media descriptor, an inline MCP
+`image`/`audio`/`resource(blob)` block, or a base64 `data:` URL, and returns
+`{index, kind, mimeType, bytes}` with a monotonic 1-based task-local `index`.
+Path inputs reopen the regular file from byte 0; inline inputs verify 8 KiB
+container evidence and allow a declared MIME only as a controlled container hint,
+rejecting conflicts. When `FASTEXEC_IMAGE_COMPRESS=true` for the session,
+compressible images scale to at most 2000 pixels on the long side within 4.5 MiB
+of base64; otherwise every supported media type is stored verbatim up to
+`FASTEXEC_MAX_MEDIA_BYTES` (`100` MiB default, `1` MiB to `360` MiB). Each task
+stores up to `1024` attachments within the `4` GiB total task output quota.
 
-A response selects images whose marker endings fall within its committed
-reader cursor range, even when the text window omits those lines. Each reader
-gets an image at most once. Direct results place the image blocks after the
-text in log order. Nested `exec poll` and `kill` put the same blocks in
-`result.codemode.images` when images are attached. Both forms carry at most
-four images and 4718592 base64 bytes per result. The fields
-`codemode.imagesAttached` and `codemode.imagesNotAttached` explain attachment;
-the latter contains `{index, path, reason}` with `budget`, `log_dropped`, or
-`evicted`; an evicted entry omits its unavailable path. Budget warnings
-preserve paths for a later read. Cursor and image
-state commit together; cancelled reads do not consume them. Eviction and task
-retirement remove image files and reclaim their quota along with logs.
+Outer responses pack unseen attachments greedily in contiguous `index` order
+under the `512` MiB outbound frame ceiling (`8` MiB control reserve on `kill`)
+and the `1` GiB process active-byte pool, committing the text cursor and
+`attachments_seen` watermark atomically before transport delivery. Remaining
+attachments stay queued for subsequent inputless `exec poll` calls even after
+text reaches EOF. A single attachment that exceeds the outbound frame ceiling on
+its own advances the watermark only alongside a visible warning naming its
+`index` and retained path. When `FASTEXEC_STRUCTURED_CONTENT=true`,
+`codemode.attachmentsDelivered` lists `[{index, kind, mimeType, bytes}]` in
+`content[]` block order; when `false`, the text summary appends `Attached:
+#<index> (<mime>, <bytes> B)`. Nested `exec poll` and `kill` return unforgeable
+script-scoped handles in `result.codemode.attachments`, holding short-term read
+leases across source-task eviction until the calling script exits or cancels. If
+a transport write is interrupted, attaching a fresh reader via the bare `taskId`
+re-reads retained output and attachments from index `1` for deduplication by
+`index`.
 
 ### File Tools
 
@@ -382,13 +391,18 @@ retirement remove image files and reclaim their quota along with logs.
   have `totalLines: 1`, and `offset: 1` on an empty file returns `""` with
   `startLine: 1`, `endLine: null`, `shownLines: 0`, `truncated: false`), preserving original line
   terminators in the returned slice and emitting truncation or lossy notices
-  without leading blank lines when the body is empty. A recognized image
-  (JPEG, PNG, GIF, WebP) comes back inline, up to `2000`×`2000` pixels and
-  `4718592` bytes of base64; a BMP is re-encoded as PNG, or as JPEG when the
-  resize needs it, and a file over `512` MiB, or an image whose conversion or
-  resize cannot fit, returns `attached: false` and the note as text instead of
-  an image. Images ignore `offset` and `limit`. A non-regular file, and one
-  that is not a recognized image and has a NUL byte in its first `8` KiB, are
+  without leading blank lines when the body is empty. Recognized media files
+  (PDF, PNG, JPEG, GIF, WebP, BMP, TIFF, HEIC/HEIF, WAV, FLAC, AIFF, Ogg
+  Vorbis/Opus/FLAC/Speex, MP3, ADTS AAC, M4A, MP4, QuickTime MOV, 3GP, WebM, and
+  AVI, classified from bounded `8` KiB container/brand headers) attach directly
+  up to `FASTEXEC_MAX_MEDIA_BYTES` (`100` MiB default, `1` MiB to `360` MiB),
+  returning verbatim bytes by default (`FASTEXEC_IMAGE_COMPRESS=false`) or
+  scaling compressible images when `FASTEXEC_IMAGE_COMPRESS=true`. Files over
+  `FASTEXEC_MAX_MEDIA_BYTES` or rejected during opt-in compression return
+  `attached: false` with `note` (and `sourceBytes` when exact) without `bytes`,
+  while genuine I/O failures return `isError: true`. Media reads ignore valid
+  `offset` and `limit` values. A non-regular file, and one
+  that is not a recognized media format and has a NUL byte in its first `8` KiB, are
   refused (binary files suggest `exec`, and also `transfer` when
   `FASTEXEC_TRANSFER=true` for that session). Slices report invalid UTF-8 with
   replacements and a note. A nested whole-file read requires valid UTF-8
@@ -403,8 +417,8 @@ retirement remove image files and reclaim their quota along with logs.
   and files with multiple hard links are refused: use `exec` for a deliberate
   in-place update of those files. On Windows, a caller unable to retain a
   different owner or group gets an error before replacement. If native file
-  replacement and its rollback both fail, the original is retained at the
-  recovery path named in the error rather than deleting the only remaining copy.
+  replacement and its rollback both fail, the original stays at the recovery
+  path named in the error so the last copy is not deleted.
   macOS saves use native ACL APIs: private staging suppresses inherited grants
   during creation, then owner, group, mode, and the complete original ACL are
   restored together. A volume that ignores ownership or cannot provide the
@@ -433,8 +447,8 @@ retirement remove image files and reclaim their quota along with logs.
   `20` out-of-range candidate start lines in `lines`. Every `oldText`
   must match at least once (`not_found`), be unique over every start position in
   range including overlapping ones (`ambiguous`, reporting `lines` in match order with
-  repeats kept), and not overlap any other matched span (`overlap`, sweeping
-  across all overlapping spans rather than only adjacent ones and listing
+  repeats kept), and not overlap any other matched span (`overlap`, checking
+  every pair of overlapping spans and listing
   partner indices in `with`). `lines` and `with` cap at `20` items (`more`
   counts any remainder), and a batch that matches uniquely without overlap but
   leaves the file unchanged fails with `failures: []`. Instead of stopping at
@@ -515,10 +529,11 @@ while they wait for a slot, before they start.
 
 A slot stays occupied through encoding, or until a cancelled blocking read
 releases its output. The task text window still tops out at 4 MiB, with up to
-64 MiB of pending transcript data before windowing. The frame queue has
-128 MiB for serialized results and control replies, including 8 MiB reserved
-for small management and control frames. Each result payload can be up to
-64 MiB. These limits cover output, not total daemon memory.
+64 MiB of pending transcript data before windowing. Ordinary outbound buffers and
+queued frames share the 1 GiB process active-byte pool alongside an independent
+8 MiB control reserve for `list`, short `kill` receipts, progress, and overload
+errors. Each IPC result payload can be up to 512 MiB, with a 60 s no-progress
+idle write timeout separated from the endpoint's 60 s request send deadline.
 
 ### `FASTEXEC_CODEMODE`
 
@@ -567,6 +582,28 @@ without blocking `daemon status` or `daemon stop`.
   the same daemon. Non-loopback `FASTEXEC_TRANSFER_ADDR` values require
   `FASTEXEC_HTTP_ALLOW_REMOTE=1`, and setting `FASTEXEC_TRANSFER_ADDR` alongside
   `--http` fails startup with exit `1`.
+
+### `FASTEXEC_IMAGE_COMPRESS` and `FASTEXEC_MAX_MEDIA_BYTES`
+
+Both settings validate at MCP serving startup (and per endpoint session on a
+shared daemon, where HTTP uses the daemon's environment and each stdio endpoint
+sends its own values in `Hello`; `daemon status` and `daemon stop` ignore them).
+
+- **`FASTEXEC_IMAGE_COMPRESS`**: `"false"` (default) sends recognized images,
+  audio, PDF, and video verbatim. `"true"` decodes PNG, JPEG, GIF, WebP, and
+  BMP (excluding APNG and JPEG-LS), scales dimensions over `2000` pixels down
+  to at most `2000` on the long side, and searches PNG or JPEG quality until
+  the encoded payload fits `4,718,592` base64 bytes (`3.5` MiB raw), while
+  rejecting images past `32768` pixels per side or `64` megapixels and leaving
+  APNG, JPEG-LS, TIFF, HEIC/HEIF, audio, PDF, and video verbatim.
+- **`FASTEXEC_MAX_MEDIA_BYTES`**: Maximum raw byte size per media file or
+  `codemode` attachment (`104857600` default, accepted range `1048576` to
+  `377487360`, or `1` MiB to `360` MiB so `4/3` base64 plus JSON framing fits a
+  `512` MiB outbound frame). Live media reads and outbound frames share a
+  `1` GiB process active-byte pool (`src/lease.rs`) with non-blocking peak
+  reservations covering concurrent raw, base64, and serialized frame buffers,
+  leaving an independent `8` MiB control reserve so `list`, short `kill`
+  receipts, progress, and overload errors never stall behind slow readers.
 
 ### `FASTEXEC_YOLO`
 
@@ -653,11 +690,11 @@ omitted on final serialization unless noted as always-present below.
   `state`, `exitCode`, `pty`, `elapsedMs`, `logPath`, `transcriptPath`,
   `transcriptLines`, `finalLines`, and `firstLine`, plus non-default window and
   task diagnostics when set.
-- **`codemode` report**: Included when any counter or array is non-empty
-  (`imagesAttached`, `imagesNotAttached`, `cancelledCalls`, `startedTasks`).
+- **`codemode` report**: Included when any array is non-empty
+  (`attachmentsDelivered`, nested `attachments`, `cancelledCalls`, `startedTasks`).
 - **`read`**: Keeps its data fields unchanged (`endLine: null`,
   `nextOffset: null`, `lineTooLong`, `lossy`, and `attached: false` are data;
-  nested calls strip `ok` and attach `image` or `note` on image reads).
+  nested calls strip `ok` and return `{attachable, ...}` media descriptors without base64).
 - **`list`**: Always includes `ok` (outer), `action`, `tasks` (built after
   `limit`), and `totalCount`; each entry always carries `taskId` as a bare task
   ID, `kind`, `state`, `exitCode`, `pty`, `elapsedMs`, `command` up to 120
@@ -701,8 +738,8 @@ omitted on final serialization unless noted as always-present below.
   children. Shared runtime names are published only after those checks, from a
   random sibling with FreeBSD 15.1 `renameat2(RENAME_NOREPLACE)`, so concurrent
   starters cannot use a partially initialized directory. Existing destinations
-  are never replaced; unsupported filesystems are refused rather than using an
-  overwrite-capable fallback. UFS and ZFS are tested. Existing directories with
+  are never replaced; unsupported filesystems are refused without falling back
+  to an overwrite-capable rename. UFS and ZFS are tested. Existing directories with
   non-trivial access ACLs or inheritable POSIX default ACLs are refused without
   changing those ACLs. Its executable cache
   and short-path sockets each sit inside an additional private directory created
@@ -711,8 +748,9 @@ omitted on final serialization unless noted as always-present below.
   an existing directory's owner, DACL, and reparse
   status. `on` mode logs under
   `<runtime root>/ns/<namespace>/logs/` (section 6). Each task log caps at `64`
-  MiB, and all logs on a server cap at `1` GiB total (evicting oldest finished
-  task logs first). Past a cap or write error, capture keeps draining output
+  MiB, and all logs, transcripts, and stored attachments on a server cap at `4`
+  GiB total (evicting oldest finished task files first and refunding quota only
+  when file deletion succeeds or reports `NotFound`). Past a cap or write error, capture keeps draining output
   and the status line reports dropped bytes. The default mode allows at most
   `16` running tasks (including `keepTree` tasks still holding processes) and
   retains the `64` most recently finished tasks without expiry. `on` mode allows
@@ -731,7 +769,7 @@ omitted on final serialization unless noted as always-present below.
   task's size (`src/terminal.rs`, `src/frames.rs`) that answers terminal queries
   (`ESC[6n`, `ESC[c`), tracks keyboard modes, serves `screen: true`, and
   continuously spools `<taskId>.transcript.txt` (up to `64` MiB, counted under
-  the `1` GiB total limit). A resize settles the transcript at the old size,
+  the `4` GiB total limit). A resize settles the transcript at the old size,
   reflows at the new one, and starts the recorder fresh, so transcript text is
   never lost on either screen, and rows still visible after the resize may appear
   twice; arbitrary application redraws keep today's best effort. Lines scrolled off the normal screen and merged frames from
@@ -755,14 +793,14 @@ omitted on final serialization unless noted as always-present below.
 
 - **Key names and modes (`src/keys.rs`)**: `keys` uses case-insensitive tmux
   `send-keys` names (`Enter`, `Tab`, `BTab`, `Escape`, `Space`, `BSpace`,
-  arrows, `Home`, `End`, `PageUp`/`PageDown`, `Insert`, `Delete`, `F1`–`F12`,
-  keypad keys, `[NUL]`–`[US]`, `0xHH`, or single characters) with `C-`, `M-`,
+  arrows, `Home`, `End`, `PageUp`/`PageDown`, `Insert`, `Delete`, `F1` to `F12`,
+  keypad keys, `[NUL]` to `[US]`, `0xHH`, or single characters) with `C-`, `M-`,
   `S-`, and `^` modifiers. Keys encode according to the program's active
   keyboard mode: standard xterm/tmux sequences (respecting DECCKM cursor and
   DECKPAM keypad modes) or the kitty keyboard protocol when enabled. Initial
   validation rejects unknown or unencodable keys before input delivery; a later
   keyboard-mode change can fail a key after earlier input has been sent.
-- **Key pacing**: `keyDelayMs` (`0–2000`, default `150`; requested pauses per
+- **Key pacing**: `keyDelayMs` (`0-2000`, default `150`; requested pauses per
   poll capped at `30000` ms) waits for stdin to accept prior bytes (up to `5` s).
   When input or another key precedes a key, the delay separates it from a paste.
   Zero sends input and keys together. Each write waits for the writer's completion
@@ -836,7 +874,7 @@ omitted on final serialization unless noted as always-present below.
     nested reapers; `PROC_REAP_KILL` lets the kernel select signal targets
     without a numeric PID-reuse race. Detached sessions and double forks stay
     owned, without procfs. Partial kills and native permission errors keep the
-    host alive and are reported rather than treated as an empty tree. The
+    host alive and are reported instead of counting as an empty tree. The
     lifeline cleanup preserves reaper ownership while an unkillable descendant
     remains. PTY allocation uses `posix_openpt` and `ptsname_r` with a separate
     path buffer for each call; FreeBSD's `openpty` uses shared `ptsname` storage
@@ -919,7 +957,7 @@ omitted on final serialization unless noted as always-present below.
   call whose serialized arguments pass `3` MiB before writing it (sizing for up
   to `1` MiB of JSON-escaped `start` `input`), a request frame
   is at most `4` MiB (a `Hello` carries the endpoint's environment), a response
-  frame at most `64` MiB, one connection carries at most `32` concurrent calls,
+  frame at most `512` MiB (protocol version `3`), one connection carries at most `32` concurrent calls,
   and the daemon serves at most `128` connections.
 - **Sessions**: Each endpoint process holds one random session ID with its own
   task entries and readers, and a reconnect keeps them. An endpoint session with
@@ -1016,4 +1054,4 @@ omitted on final serialization unless noted as always-present below.
   before the bearer check and before the `4` MiB body cap that applies to
   `/mcp`. `/mcp` is the only other route: a path behind the bearer check that
   is not `/mcp` answers `404`, so a proxy that forwards its prefix unstripped
-  fails at `initialize` rather than at a later download.
+  fails at `initialize` instead of waiting until a later download.

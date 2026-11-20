@@ -1297,7 +1297,10 @@ fn read_answers_a_png_with_a_text_block_and_an_image_block() {
     let content = result["content"].as_array().expect("content blocks");
     assert_eq!(content.len(), 2, "{message}");
     assert_eq!(content[0]["type"], json!("text"));
-    assert_eq!(content[0]["text"], json!("Read image file [image/png]"));
+    assert_eq!(
+        content[0]["text"],
+        json!(format!("Read image file [image/png] ({} B)", png.len()))
+    );
     assert_eq!(content[1]["type"], json!("image"));
     assert_eq!(content[1]["mimeType"], json!("image/png"));
     assert_eq!(
@@ -1313,13 +1316,13 @@ fn read_answers_a_png_with_a_text_block_and_an_image_block() {
 fn read_omits_an_image_past_the_encoded_ceiling_without_loading_it() {
     let dir = Scratch::new("image-oversized");
     std::fs::create_dir_all(&*dir).unwrap();
-    // Sparse: a PNG signature and the IHDR chunk it is recognized by at the front, and a length
-    // past the ceiling a read loads, so creating it costs nothing and reading it whole would
-    // cost the ceiling.
+    // Sparse: a PNG signature and IHDR at the front, with size exceeding FASTEXEC_MAX_MEDIA_BYTES
+    // (default 100 MiB), so stat refuses it without loading the sparse body.
     let path = dir.join("huge.png");
     let mut file = std::fs::File::create(&path).unwrap();
     std::io::Write::write_all(&mut file, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
-    file.set_len((512 << 20) + 1).unwrap();
+    let size: u64 = (100 << 20) + 1;
+    file.set_len(size).unwrap();
     drop(file);
     let mut server = Server::start_with(|command| {
         command.current_dir(&*dir);
@@ -1332,10 +1335,188 @@ fn read_omits_an_image_past_the_encoded_ceiling_without_loading_it() {
     assert_eq!(result["isError"], json!(false), "{message}");
     let content = result["content"].as_array().expect("content blocks");
     assert_eq!(content.len(), 1, "no image is attached: {message}");
-    assert_eq!(
-        content[0]["text"],
-        json!("Read image file [image/png]\n[Image omitted: the file is larger than 512 MiB.]")
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("exceeds FASTEXEC_MAX_MEDIA_BYTES (104857600 bytes)")
+            && text.contains("Inspect it with exec."),
+        "{text}"
     );
+    let sc = &result["structuredContent"];
+    assert_eq!(sc["ok"], json!(true));
+    assert_eq!(sc["kind"], json!("image"));
+    assert_eq!(sc["mimeType"], json!("image/png"));
+    assert_eq!(sc["attached"], json!(false));
+    assert_eq!(sc["sourceBytes"], json!(size));
+    assert!(
+        sc.get("bytes").is_none(),
+        "unattached media must omit bytes: {sc}"
+    );
+}
+
+#[test]
+fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() {
+    let dir = Scratch::new("multimodal-e2e");
+    std::fs::create_dir_all(&*dir).unwrap();
+
+    // Invalid FASTEXEC_IMAGE_COMPRESS and FASTEXEC_MAX_MEDIA_BYTES exit 1 at stdio startup.
+    for (var, bad) in [
+        ("FASTEXEC_IMAGE_COMPRESS", "yes"),
+        ("FASTEXEC_MAX_MEDIA_BYTES", "1048575"),
+        ("FASTEXEC_MAX_MEDIA_BYTES", "377487361"),
+        ("FASTEXEC_MAX_MEDIA_BYTES", "abc"),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_fastexec"))
+            .env(var, bad)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{var}={bad}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(var), "{stderr}");
+    }
+
+    let pdf = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+    std::fs::write(dir.join("spec #1.pdf"), pdf).unwrap();
+
+    let mut wav = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00".to_vec();
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&44_100u32.to_le_bytes());
+    wav.extend_from_slice(&[0u8; 8]);
+    std::fs::write(dir.join("clip.wav"), &wav).unwrap();
+
+    let mut mp4 = Vec::new();
+    mp4.extend_from_slice(&20u32.to_be_bytes());
+    mp4.extend_from_slice(b"ftypisom\0\0\0\0mp42");
+    std::fs::write(dir.join("movie.mp4"), &mp4).unwrap();
+
+    let wide_img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        2400,
+        40,
+        image::Rgb([20, 40, 60]),
+    ));
+    let mut wide_png = Vec::new();
+    wide_img
+        .write_to(
+            &mut std::io::Cursor::new(&mut wide_png),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    std::fs::write(dir.join("wide.png"), &wide_png).unwrap();
+
+    let b64 = |raw: &[u8]| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw);
+
+    // Check output modes (`text`, `both`, `structured`) and `FASTEXEC_STRUCTURED_CONTENT=false`
+    // with default `FASTEXEC_IMAGE_COMPRESS=false` (exact byte passthrough even for 2400x40 PNG).
+    for (mode, sc_enabled) in [
+        ("text", "true"),
+        ("both", "true"),
+        ("structured", "true"),
+        ("both", "false"),
+    ] {
+        let mut server = Server::start_with(|cmd| {
+            cmd.current_dir(&*dir)
+                .env("FASTEXEC_OUTPUT_MODE", mode)
+                .env("FASTEXEC_STRUCTURED_CONTENT", sc_enabled);
+        });
+
+        let pdf_res = &server.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "spec #1.pdf", "offset": 2, "limit": 5}}),
+        )["result"];
+        assert_eq!(pdf_res["isError"], json!(false), "{pdf_res}");
+        assert_eq!(pdf_res["content"][1]["type"], json!("resource"));
+        assert_eq!(
+            pdf_res["content"][1]["resource"]["mimeType"],
+            json!("application/pdf")
+        );
+        assert_eq!(pdf_res["content"][1]["resource"]["blob"], json!(b64(pdf)));
+        let uri = pdf_res["content"][1]["resource"]["uri"].as_str().unwrap();
+        assert!(
+            uri.starts_with("file:///") && uri.ends_with("spec%20%231.pdf"),
+            "{uri}"
+        );
+
+        let wav_res = &server.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "clip.wav"}}),
+        )["result"];
+        assert_eq!(wav_res["content"][1]["type"], json!("audio"));
+        assert_eq!(wav_res["content"][1]["mimeType"], json!("audio/wav"));
+        assert_eq!(wav_res["content"][1]["data"], json!(b64(&wav)));
+
+        let mp4_res = &server.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "movie.mp4"}}),
+        )["result"];
+        assert_eq!(mp4_res["content"][1]["type"], json!("resource"));
+        assert_eq!(
+            mp4_res["content"][1]["resource"]["mimeType"],
+            json!("video/mp4")
+        );
+        assert_eq!(mp4_res["content"][1]["resource"]["blob"], json!(b64(&mp4)));
+
+        let png_res = &server.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "wide.png"}}),
+        )["result"];
+        assert_eq!(png_res["content"][1]["data"], json!(b64(&wide_png)));
+        if sc_enabled == "true" {
+            assert!(png_res["structuredContent"].get("text").is_none());
+            assert!(png_res["structuredContent"].get("width").is_none());
+            assert_eq!(png_res["structuredContent"]["bytes"], json!(wide_png.len()));
+        } else {
+            assert!(png_res.get("structuredContent").is_none());
+        }
+    }
+
+    // With FASTEXEC_IMAGE_COMPRESS=true, wide.png is scaled down and reports original/displayed metadata.
+    let mut compressing = Server::start_with(|cmd| {
+        cmd.current_dir(&*dir)
+            .env("FASTEXEC_IMAGE_COMPRESS", "true");
+    });
+    let scaled = &compressing.request(
+        "tools/call",
+        json!({"name": "read", "arguments": {"path": "wide.png"}}),
+    )["result"];
+    assert!(
+        scaled["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("original 2400x40, displayed at 2000x33"),
+        "{scaled}"
+    );
+    assert_eq!(
+        scaled["structuredContent"]["originalBytes"],
+        json!(wide_png.len())
+    );
+    assert_eq!(scaled["structuredContent"]["originalWidth"], json!(2400));
+    assert_eq!(scaled["structuredContent"]["width"], json!(2000));
+
+    #[cfg(debug_assertions)]
+    {
+        let mut tight = Server::start_with(|cmd| {
+            cmd.current_dir(&*dir)
+                .env("FASTEXEC_TEST_MEMORY_LIMIT", "4096");
+        });
+        let overloaded = &tight.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "wide.png"}}),
+        )["result"];
+        assert_eq!(overloaded["isError"], json!(true), "{overloaded}");
+        assert!(
+            overloaded["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("server active memory budget (4096 bytes) is full"),
+            "{overloaded}"
+        );
+        let fits = &tight.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "spec #1.pdf"}}),
+        )["result"];
+        assert_eq!(fits["isError"], json!(false), "{fits}");
+        assert_eq!(fits["structuredContent"]["attached"], json!(true));
+    }
 }
 
 #[test]
@@ -5724,54 +5905,289 @@ fn codemode_script_admission_limit_is_released_after_kill() {
 }
 
 #[test]
-fn codemode_images_follow_each_readers_cursor_even_when_text_is_truncated() {
-    let mut server = codemode_server();
-    let code = format!(
-        "for(let i=0;i<6;i++) image({}); text('tail');",
-        json!(image_data_url(8, 6))
+fn codemode_attach_packs_across_eof_polls_dedups_bare_task_id_and_skips_oversize() {
+    let med_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        vec![0x41u8; 1800],
     );
-    let result = code_result(
-        &mut server,
-        json!({"code":code,"truncate":"tail","maxBytes":100}),
-    );
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
-    assert_eq!(image_count(&result), 4, "{result}");
-    assert_eq!(
-        result["structuredContent"]["codemode"]["imagesAttached"], 4,
-        "{result}"
-    );
-    let omitted = result["structuredContent"]["codemode"]["imagesNotAttached"]
-        .as_array()
-        .unwrap();
-    assert_eq!(omitted.len(), 2, "{result}");
-    assert_eq!(omitted[0]["reason"], "budget", "{result}");
-    let path = omitted[0]["path"].as_str().unwrap();
-    let read = server.request(
-        "tools/call",
-        json!({"name":"read","arguments":{"path":path}}),
-    );
-    assert_eq!(image_count(&read["result"]), 1, "{read}");
-    let handle = result["structuredContent"]["taskId"].as_str().unwrap();
-    let poll = server.request(
-        "tools/call",
-        json!({"name":"exec","arguments":{"action":"poll","taskId":handle,"waitMs":0}}),
-    );
-    assert_eq!(image_count(&poll["result"]), 0, "{poll}");
-    let fresh = server.request("tools/call", json!({"name":"exec","arguments":{"action":"poll","taskId":bare_id(handle),"waitMs":0,"truncate":"head","maxBytes":4194304}}));
-    assert_eq!(image_count(&fresh["result"]), 4, "{fresh}");
+    let med_mp4 = {
+        let mut raw = Vec::with_capacity(1800);
+        raw.extend_from_slice(&20u32.to_be_bytes());
+        raw.extend_from_slice(b"ftypmp42");
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        raw.extend_from_slice(b"isom");
+        raw.resize(1800, 0x55);
+        format!(
+            "data:video/mp4;base64,{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw)
+        )
+    };
+    let _ = med_b64;
+    let huge_pdf = {
+        let mut raw = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        raw.resize(4000, b' ');
+        format!(
+            "data:application/pdf;base64,{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw)
+        )
+    };
+    let small_png = image_data_url(4, 4);
+
+    for structured in [true, false] {
+        let mut server = Server::start_with(|command| {
+            command
+                .env("FASTEXEC_CODEMODE", "true")
+                .env(
+                    "FASTEXEC_STRUCTURED_CONTENT",
+                    if structured { "true" } else { "false" },
+                )
+                .env("FASTEXEC_TEST_OUTBOUND_LIMIT", "4600");
+        });
+        let code = format!(
+            "attach({med_mp4:?}); attach({med_mp4:?}); attach({huge_pdf:?}); attach({small_png:?}); text('tail');"
+        );
+        let first = code_result(
+            &mut server,
+            json!({"code": code, "truncate": "tail", "maxBytes": 100}),
+        );
+        assert_eq!(first["isError"], false, "{first}");
+        let blocks1 = first["content"].as_array().unwrap();
+        assert_eq!(
+            blocks1.iter().filter(|b| b["type"] == "resource").count(),
+            1,
+            "{first}"
+        );
+        let text1 = code_text(&first);
+        assert!(text1.contains("tail"), "{text1}");
+        let handle = if structured {
+            assert_eq!(
+                first["structuredContent"]["codemode"]["attachmentsDelivered"],
+                json!([{"index": 1, "kind": "video", "mimeType": "video/mp4", "bytes": 1800}]),
+                "{first}"
+            );
+            first["structuredContent"]["taskId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            assert!(first["structuredContent"].is_null(), "{first}");
+            assert!(
+                text1.contains("Attached: #1 (video/mp4, 1800 B)"),
+                "{text1}"
+            );
+            text1
+                .lines()
+                .find(|line| line.starts_with("[exited 0] "))
+                .unwrap()
+                .split_whitespace()
+                .nth(2)
+                .unwrap()
+                .to_owned()
+        };
+
+        // Text reached EOF in `first`; inputless poll #1 delivers byte-identical attachment #2.
+        let poll1 = server.request(
+            "tools/call",
+            json!({"name": "exec", "arguments": {"action": "poll", "taskId": handle, "waitMs": 0}}),
+        )["result"]
+            .clone();
+        assert_eq!(poll1["isError"], false, "{poll1}");
+        assert_eq!(
+            poll1["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|b| b["type"] == "resource")
+                .count(),
+            1,
+            "{poll1}"
+        );
+        if structured {
+            assert_eq!(
+                poll1["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 2,
+                "{poll1}"
+            );
+        } else {
+            assert!(
+                code_text(&poll1).contains("Attached: #2 (video/mp4, 1800 B)"),
+                "{poll1}"
+            );
+        }
+
+        // Inputless poll #2 delivers #4; across poll #1 and poll #2, oversized #3 is skipped once
+        // with a visible warning naming #3.
+        let poll2 = server.request(
+            "tools/call",
+            json!({"name": "exec", "arguments": {"action": "poll", "taskId": handle, "waitMs": 0}}),
+        )["result"]
+            .clone();
+        assert_eq!(poll2["isError"], false, "{poll2}");
+        assert_eq!(image_count(&poll2), 1, "{poll2}");
+        let combined_poll_text = format!("{}\n{}\n{}", text1, code_text(&poll1), code_text(&poll2));
+        assert_eq!(
+            combined_poll_text
+                .matches("attachment #3 [application/pdf]")
+                .count(),
+            1,
+            "{combined_poll_text}"
+        );
+        if structured {
+            assert_eq!(
+                poll2["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 4,
+                "{poll2}"
+            );
+        } else {
+            assert!(
+                code_text(&poll2).contains("Attached: #4 (image/png,"),
+                "{poll2}"
+            );
+        }
+
+        // Inputless poll #3 is caught up.
+        let poll3 = server.request(
+            "tools/call",
+            json!({"name": "exec", "arguments": {"action": "poll", "taskId": handle, "waitMs": 0}}),
+        )["result"]
+            .clone();
+        assert_eq!(poll3["content"].as_array().unwrap().len(), 1, "{poll3}");
+
+        // Bare taskId attaches a fresh reader from index 1 for deterministic deduplication.
+        let fresh = server.request(
+            "tools/call",
+            json!({"name": "exec", "arguments": {"action": "poll", "taskId": bare_id(&handle), "waitMs": 0}}),
+        )["result"]
+            .clone();
+        assert!(code_text(&fresh).contains("new reader"), "{fresh}");
+        if structured {
+            assert_eq!(
+                fresh["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 1,
+                "{fresh}"
+            );
+        } else {
+            assert!(
+                code_text(&fresh).contains("Attached: #1 (video/mp4, 1800 B)"),
+                "{fresh}"
+            );
+        }
+    }
 }
 
 #[test]
-fn codemode_images_resize_and_survive_structured_only_output() {
+fn codemode_attach_covers_compress_mode_r4_4_parity_and_nested_opaque_handles() {
+    let (dir, _guard) = scratch("codemode-multimodal-e2e");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let mp4_bytes = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&20u32.to_be_bytes());
+        v.extend_from_slice(b"ftypmp42");
+        v.extend_from_slice(&0u32.to_be_bytes());
+        v.extend_from_slice(b"isom");
+        v.extend_from_slice(&[0u8; 32]);
+        v
+    };
+    let webm_bytes = {
+        let mut v = vec![0x1A, 0x45, 0xDF, 0xA3, 0x93, 0x42, 0x82, 0x84];
+        v.extend_from_slice(b"webm");
+        v.extend_from_slice(&[0u8; 24]);
+        v
+    };
+    std::fs::write(dir.join("clip.mp4"), &mp4_bytes).unwrap();
+    std::fs::write(dir.join("clip.webm"), &webm_bytes).unwrap();
+    let mp4_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &mp4_bytes);
+    let webm_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &webm_bytes);
+
     let mut server = Server::start_with(|command| {
         command
+            .current_dir(&*dir)
             .env("FASTEXEC_CODEMODE", "true")
             .env("FASTEXEC_OUTPUT_MODE", "structured");
     });
-    let code = format!("image({});", json!(image_data_url(2400, 6)));
-    let result = code_result(&mut server, json!({"code":code}));
-    assert_eq!(image_count(&result), 1, "{result}");
-    let block = result["content"]
+
+    // 1. Six attachments deliver in one call (no legacy 4-image limit); R4-4 parity across
+    //    local path, MCP resource(blob), and data URL for MP4 + WebM; conflicting MIME rejects.
+    let producer_code = format!(
+        r#"
+        if (typeof globalThis.image !== "undefined") throw new Error("image() still exposed");
+        const rMp4 = await tools.read({{ path: "clip.mp4" }});
+        if (rMp4.attachable !== true || rMp4.data !== undefined) throw new Error("bad descriptor");
+        const a1 = attach(rMp4);
+        const a2 = attach({{ type: "resource", resource: {{ blob: {mp4_b64:?}, mimeType: "video/mp4", uri: "file:///clip.mp4" }} }});
+        const a3 = attach("data:video/mp4;base64," + {mp4_b64:?});
+        const a4 = attach("clip.webm");
+        const a5 = attach({{ type: "resource", resource: {{ blob: {webm_b64:?}, mimeType: "video/webm" }} }});
+        const a6 = attach("data:video/webm;base64," + {webm_b64:?});
+        if (a1.mimeType !== a2.mimeType || a2.mimeType !== a3.mimeType) throw new Error("mp4 mismatch");
+        if (a4.mimeType !== a5.mimeType || a5.mimeType !== a6.mimeType) throw new Error("webm mismatch");
+        let conflict = false;
+        try {{
+            attach({{ type: "image", data: {mp4_b64:?}, mimeType: "image/png" }});
+        }} catch (_e) {{
+            conflict = true;
+        }}
+        if (!conflict) throw new Error("expected MIME conflict rejection");
+        return [a1.index, a6.index];
+        "#
+    );
+    let prod = code_result(&mut server, json!({"code": producer_code}));
+    assert_eq!(prod["structuredContent"]["exitCode"], 0, "{prod}");
+    assert_eq!(
+        prod["structuredContent"]["codemode"]["attachmentsDelivered"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6,
+        "{prod}"
+    );
+    let prod_bare = bare_id(prod["structuredContent"]["taskId"].as_str().unwrap()).to_owned();
+
+    // 2. Nested `poll` receives unforgeable opaque handles in `codemode.attachments` that can be
+    //    re-attached multiple times while forged JSON clones throw TypeError.
+    let consumer_code = format!(
+        r#"
+        const polled = await tools.exec({{ action: "poll", taskId: {prod_bare:?}, waitMs: 0 }});
+        const handles = polled.codemode.attachments;
+        if (!Array.isArray(handles) || handles.length !== 6) throw new Error("expected 6 handles");
+        let forgedFailed = false;
+        try {{
+            attach(JSON.parse(JSON.stringify(handles[0])));
+        }} catch (e) {{
+            forgedFailed = e instanceof TypeError;
+        }}
+        if (!forgedFailed) throw new Error("forged handle must throw TypeError");
+        const c1 = attach(handles[0]);
+        const c2 = attach(handles[0]);
+        return [c1.index, c2.index, c1.mimeType];
+        "#
+    );
+    let cons = code_result(&mut server, json!({"code": consumer_code}));
+    assert_eq!(cons["structuredContent"]["exitCode"], 0, "{cons}");
+    assert_eq!(
+        cons["structuredContent"]["output"], "[1,2,\"video/mp4\"]",
+        "{cons}"
+    );
+    assert_eq!(
+        cons["structuredContent"]["codemode"]["attachmentsDelivered"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{cons}"
+    );
+
+    // 3. Opt-in `FASTEXEC_IMAGE_COMPRESS=true` scales 2400x6 PNG to <= 2000px while structured
+    //    output omits legacy `[image 1:]` stdout markers and carries `attachmentsDelivered`.
+    let mut compressed = Server::start_with(|command| {
+        command
+            .env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_IMAGE_COMPRESS", "true")
+            .env("FASTEXEC_OUTPUT_MODE", "structured");
+    });
+    let comp_res = code_result(
+        &mut compressed,
+        json!({"code": format!("attach({}); text('clean-body');", json!(image_data_url(2400, 6)))}),
+    );
+    assert_eq!(image_count(&comp_res), 1, "{comp_res}");
+    let block = comp_res["content"]
         .as_array()
         .unwrap()
         .iter()
@@ -5782,20 +6198,15 @@ fn codemode_images_resize_and_survive_structured_only_output() {
         block["data"].as_str().unwrap(),
     )
     .unwrap();
-    let image = image::load_from_memory(&data).unwrap();
-    assert!(
-        image.width() <= 2000 && image.height() <= 2000,
-        "{}x{}",
-        image.width(),
-        image.height()
+    let decoded = image::load_from_memory(&data).unwrap();
+    assert!(decoded.width() <= 2000 && decoded.height() <= 2000);
+    assert_eq!(
+        comp_res["structuredContent"]["output"], "clean-body",
+        "{comp_res}"
     );
-    assert!(!code_text(&result).contains("[image 1:"), "{result}");
-    assert!(
-        result["structuredContent"]["output"]
-            .as_str()
-            .unwrap()
-            .contains("[image 1:"),
-        "{result}"
+    assert_eq!(
+        comp_res["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 1,
+        "{comp_res}"
     );
 }
 
@@ -6814,7 +7225,7 @@ fn kill_delivers_unseen_output_gates_concurrent_polls_and_attaches_codemode_imag
         &mut server,
         json!({
             "code": format!(
-                "image({url:?}); await tools.exec({{action:'start', loginShell:false, command:'sleep 30'}});"
+                "attach({url:?}); await tools.exec({{action:'start', loginShell:false, command:'sleep 30'}});"
             ),
             "waitMs": 200
         }),

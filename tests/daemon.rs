@@ -1271,7 +1271,10 @@ fn an_image_read_crosses_the_daemon_link() {
     let content = result["content"].as_array().expect("content blocks");
     assert_eq!(content.len(), 2, "{message}");
     assert_eq!(content[0]["type"], json!("text"));
-    assert_eq!(content[0]["text"], json!("Read image file [image/png]"));
+    assert_eq!(
+        content[0]["text"],
+        json!(format!("Read image file [image/png] ({} B)", png.len()))
+    );
     assert_eq!(content[1]["type"], json!("image"));
     assert_eq!(content[1]["mimeType"], json!("image/png"));
     assert_eq!(
@@ -1900,6 +1903,16 @@ fn invalid_yolo_refuses_start_without_blocking_status_or_stop() {
             "bogus",
             "invalid FASTEXEC_STRUCTURED_CONTENT \"bogus\"; expected true or false",
         ),
+        (
+            "FASTEXEC_IMAGE_COMPRESS",
+            "on",
+            "invalid FASTEXEC_IMAGE_COMPRESS \"on\"; expected true or false",
+        ),
+        (
+            "FASTEXEC_MAX_MEDIA_BYTES",
+            "1024",
+            "invalid FASTEXEC_MAX_MEDIA_BYTES \"1024\"; expected an integer in 1048576..=377487360",
+        ),
     ] {
         let output = fixture
             .command(&["daemon", "start"])
@@ -2033,9 +2046,63 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
     )["result"]
         .clone();
     assert_eq!(read_img["structuredContent"]["kind"], "image", "{read_img}");
-    assert_eq!(read_img["structuredContent"]["width"], 8, "{read_img}");
+    assert_eq!(
+        read_img["structuredContent"]["bytes"],
+        png.len(),
+        "{read_img}"
+    );
+    assert_eq!(
+        read_img["structuredContent"]["attached"], true,
+        "{read_img}"
+    );
+
+    // Per-session scoping on the same daemon: an endpoint with FASTEXEC_IMAGE_COMPRESS=true
+    // scales oversized images while `enabled` (default false) passes original bytes through.
+    let wide = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        2400,
+        20,
+        image::Rgb([11, 22, 33]),
+    ));
+    let mut wide_png = Vec::new();
+    wide.write_to(
+        &mut std::io::Cursor::new(&mut wide_png),
+        image::ImageFormat::Png,
+    )
+    .unwrap();
+    std::fs::write(fixture.runtime.join("wide.png"), &wide_png).unwrap();
+    let mut compressing = Endpoint::start_with(&fixture, |command| {
+        command
+            .current_dir(&fixture.runtime)
+            .env("FASTEXEC_IMAGE_COMPRESS", "true");
+    });
+    let raw_wide = enabled.request(
+        "tools/call",
+        json!({"name":"read","arguments":{"path":"wide.png"}}),
+    )["result"]
+        .clone();
+    assert_eq!(
+        raw_wide["structuredContent"]["bytes"],
+        wide_png.len(),
+        "{raw_wide}"
+    );
+    assert!(raw_wide["structuredContent"].get("width").is_none());
+    let scaled_wide = compressing.request(
+        "tools/call",
+        json!({"name":"read","arguments":{"path":"wide.png"}}),
+    )["result"]
+        .clone();
+    assert_eq!(
+        scaled_wide["structuredContent"]["width"], 2000,
+        "{scaled_wide}"
+    );
+    assert_eq!(
+        scaled_wide["structuredContent"]["originalBytes"],
+        wide_png.len(),
+        "{scaled_wide}"
+    );
+    compressing.close();
     let result = enabled.request("tools/call", json!({"name":"codemode","arguments":{
-        "code":"image(await tools.read({path:'shot.png'})); const child = await tools.exec({action:'start',command:'printf nested',loginShell:false}); text(child.taskId); return child.output;"
+        "code":"attach(await tools.read({path:'shot.png'})); const child = await tools.exec({action:'start',command:'printf nested',loginShell:false}); text(child.taskId); return child.output;"
     }}))["result"].clone();
     assert_eq!(result["isError"], false, "{result}");
     assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
@@ -2073,6 +2140,10 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
     assert_eq!(
         block["data"],
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png),
+        "{fresh}"
+    );
+    assert_eq!(
+        fresh["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 1,
         "{fresh}"
     );
     let (listed, text, error) = enabled.call(json!({"action":"list"}));
@@ -2398,7 +2469,7 @@ fn daemon_delivers_4mib_both_mode_window_and_probes_login_profile_once_per_sessi
     drop(ep2);
 
     // 4 MiB body in FASTEXEC_OUTPUT_MODE=both carries both text and structuredContent.output
-    // comfortably within ipc::RESPONSE_LIMIT (64 MiB).
+    // comfortably within ipc::RESPONSE_LIMIT (512 MiB).
     let (four_mib, _, four_err) = ep1.call(json!({
         "action": "start",
         "maxBytes": 4194304,
@@ -3005,4 +3076,100 @@ fn non_http_foreground_daemon_ignores_invalid_instructions_tool() {
         .wait_exit(Duration::from_secs(30))
         .expect("daemon did not exit after stop");
     assert!(status.success(), "{status}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn endpoint_list_kill_and_overload_receipt_succeed_via_control_reserve_when_main_pool_is_full() {
+    let fixture = Fixture::new("endpoint-control-reserve");
+    let work = fixture.runtime.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("note.txt"), "ordinary output\n").unwrap();
+
+    // Start daemon with 1-byte main pool (`FASTEXEC_TEST_MEMORY_LIMIT=1`).
+    let started_daemon = fixture
+        .command(&["daemon", "start"])
+        .env("FASTEXEC_TEST_MEMORY_LIMIT", "1")
+        .output()
+        .unwrap();
+    let d_out = String::from_utf8_lossy(&started_daemon.stdout);
+    let d_err = String::from_utf8_lossy(&started_daemon.stderr);
+    assert_eq!(started_daemon.status.code(), Some(0), "{d_out}{d_err}");
+    fixture.pid.set(pid_of(&d_out));
+
+    // Start stdio `Endpoint` (`FASTEXEC_DAEMON=on`) ALSO with `FASTEXEC_TEST_MEMORY_LIMIT=1`.
+    let mut ep = Endpoint::start_with(&fixture, |cmd| {
+        cmd.current_dir(&work)
+            .env("FASTEXEC_TEST_MEMORY_LIMIT", "1");
+    });
+
+    // 1. `start` runs the task; its overload receipt (`taskId: <bare_id>`) passes through Daemon
+    // `RESERVED`, Endpoint `control_pool`, and `StdioTransport` `control_pool`.
+    let (_, start_text, start_err) = ep.call(json!({
+        "action": "start",
+        "command": "sleep 30",
+        "waitMs": 50
+    }));
+    assert!(start_err, "{start_text}");
+    assert!(start_text.contains("taskId: "), "{start_text}");
+
+    // 2. Ordinary non-control `read` is rejected on overload without breaking the Endpoint link.
+    let read_res = ep.request(
+        "tools/call",
+        json!({
+            "name": "read",
+            "arguments": {"path": "note.txt"}
+        }),
+    );
+    assert_eq!(read_res["result"]["isError"], json!(true), "{read_res}");
+
+    // 3. `list` succeeds (`isError: false`) through all three 8 MiB control reserves!
+    let (listed, list_text, list_err) = ep.call(json!({
+        "action": "list",
+        "scope": "all"
+    }));
+    assert!(!list_err, "{list_text}");
+    let tasks = listed["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1, "{listed}");
+    let bare_id = tasks[0]["taskId"].as_str().unwrap().to_owned();
+    assert!(start_text.contains(&bare_id), "{start_text}");
+
+    // 4. `kill` succeeds (`isError: false`) through all three 8 MiB control reserves!
+    let (killed, kill_text, kill_err) = ep.call(json!({
+        "action": "kill",
+        "taskId": bare_id
+    }));
+    assert!(!kill_err, "{kill_text}");
+    assert_eq!(killed["state"], json!("killed"));
+    drop(ep);
+
+    // 5. Standalone stdio (`FASTEXEC_DAEMON=off`) with `FASTEXEC_TEST_MEMORY_LIMIT=1` also
+    // delivers `start` overload receipts plus `list` and `kill` through its 8 MiB control pool.
+    let mut local_stdio = Endpoint::start_with(&fixture, |cmd| {
+        cmd.current_dir(&work)
+            .env("FASTEXEC_DAEMON", "off")
+            .env("FASTEXEC_TEST_MEMORY_LIMIT", "1");
+    });
+    let (_, local_start_text, local_start_err) = local_stdio.call(json!({
+        "action": "start",
+        "command": "sleep 30",
+        "waitMs": 50
+    }));
+    assert!(local_start_err, "{local_start_text}");
+    let (local_listed, local_list_text, local_list_err) = local_stdio.call(json!({
+        "action": "list",
+        "scope": "all"
+    }));
+    assert!(!local_list_err, "{local_list_text}");
+    let local_id = local_listed["tasks"][0]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(local_start_text.contains(&local_id), "{local_start_text}");
+    let (local_killed, local_kill_text, local_kill_err) = local_stdio.call(json!({
+        "action": "kill",
+        "taskId": local_id
+    }));
+    assert!(!local_kill_err, "{local_kill_text}");
+    assert_eq!(local_killed["state"], json!("killed"));
 }

@@ -75,6 +75,8 @@ Codemode result, check what happened before retrying.
 | `FASTEXEC_TRANSFER` | `false` | Set `true` to publish files through capability URLs. Treat each URL as a credential. |
 | `FASTEXEC_TRANSFER_ADDR` | `127.0.0.1:0` | Set the transfer listener address outside HTTP daemon mode. |
 | `FASTEXEC_YOLO` | `false` | Override hints for all exposed tools. Does not restrict what tools can do. |
+| `FASTEXEC_IMAGE_COMPRESS` | `false` | Set `true` to scale and re-encode compressible images for size-constrained hosts. |
+| `FASTEXEC_MAX_MEDIA_BYTES` | `104857600` | Set the maximum raw size per media file or attachment (`1 MiB` to `360 MiB`). |
 | `FASTEXEC_STRUCTURED_CONTENT` | `true` | Set `false` to omit structured metadata. |
 | `FASTEXEC_OUTPUT_MODE` | `text` | Use `both` or `structured` to include the output body in structured results. |
 
@@ -101,18 +103,21 @@ not put secrets in the file.
 Pass the body of an async function as `codemode`'s `code`:
 
 ```javascript
-const [run, file] = await Promise.all([
+const [run, file, shot] = await Promise.all([
   tools.exec({action: "start", command: "printf ready"}),
-  tools.read({path: "README.md", limit: 5})
+  tools.read({path: "README.md", limit: 5}),
+  tools.read({path: "shot.png"})
 ]);
 text(run.output);
 text(file.text);
+attach(shot);
 ```
 
-Poll or stop the script with `exec`. Stopping the script cancels pending tool
-calls but leaves Bash tasks it already started running. Set `killAfterMs` to
-bound the script itself. See the [Codemode tool contract](src/description-codemode.md)
-for arguments and limits.
+`attach` adds a media file, `read` descriptor, inline media block, or nested
+task attachment to the result. Poll or stop the script with `exec`. Stopping
+the script cancels pending tool calls and leaves Bash tasks it already started
+running. Set `killAfterMs` to bound the script itself. See the
+[Codemode tool contract](src/description-codemode.md) for arguments and limits.
 
 ### Shared daemon and remote HTTP
 

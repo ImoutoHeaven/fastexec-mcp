@@ -1,7 +1,7 @@
 //! JavaScript tasks and their asynchronous bridge to the four host tools.
 
 use crate::files;
-use crate::images;
+use crate::media::{self, CompressFailure, MediaKind};
 use crate::output::Truncate;
 use crate::service::{self, Call, OutputMode, Render, Service};
 use crate::session::{LaunchContext, Session, parse_handle};
@@ -26,13 +26,12 @@ use tokio_util::sync::CancellationToken;
 const SCRIPT_PREFIX: &str = "(async () => {\n";
 const SLEEP_CHUNK_MS: u64 = 1_u64 << 40;
 const MAX_CODE: usize = 256 * 1024;
-const MEMORY_LIMIT: usize = 128 * 1024 * 1024;
-const BRIDGE_LIMIT: usize = 128 * 1024 * 1024;
+const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+const BRIDGE_LIMIT: usize = 256 * 1024 * 1024;
 const BRIDGE_ERROR: &str =
-    "Script tool-call bridge exceeds 128 MiB of pending arguments and results.";
+    "Script tool-call bridge exceeds 256 MiB of pending arguments and results.";
 const DIAGNOSTIC_RESERVE: u64 = 4096;
-const MAX_IMAGES: usize = 64;
-const BRIDGE_RESULT_ERROR: &str = "The tool call completed, but its result does not fit in the 128 MiB pending bridge budget; the operation was not undone.";
+const BRIDGE_RESULT_ERROR: &str = "The tool call completed, but its result does not fit in the 256 MiB pending bridge budget; the operation was not undone.";
 const START_PERMITS: usize = 8;
 const IO_PERMITS: usize = 8;
 const PENDING_CALLS: usize = 1024;
@@ -49,11 +48,11 @@ pub struct Request {
     /// Working directory for nested exec (when it omits cwd) and relative paths in read, write, and edit. Omit for the session's default working directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Wait up to this many milliseconds for the script (0–240000, default 30000). Use exec poll to continue waiting.
+    /// Wait up to this many milliseconds for the script (0-240000, default 30000). Use exec poll to continue waiting.
     #[schemars(range(min = 0, max = 240000))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
-    /// Return when script output matches a condition. Use 1–16 case-sensitive literals of 1–4096 bytes each, without line breaks.
+    /// Return when script output matches a condition. Use 1-16 case-sensitive literals of 1-4096 bytes each, without line breaks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_when: Option<ReturnWhen>,
     /// Stop the script after this many milliseconds. Zero or omitted disables the deadline. Tasks the script already started keep running.
@@ -62,7 +61,7 @@ pub struct Request {
     /// Placement within the script output. Defaults to head_tail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncate: Option<Truncate>,
-    /// Script output body budget in UTF-8 bytes, 100–4194304 (default 16384). Status, footer, errors, and warnings are additional.
+    /// Script output body budget in UTF-8 bytes, 100-4194304 (default 16384). Status, footer, errors, and warnings are additional.
     #[schemars(range(min = 100, max = 4194304))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
@@ -73,7 +72,7 @@ pub struct Request {
 pub struct ReturnWhen {
     /// Match a substring within one unseen line of script output.
     pub output_contains: Option<Vec<String>>,
-    /// 10–60000 ms of silence since the wait began or the script last produced output, whichever is later.
+    /// 10-60000 ms of silence since the wait began or the script last produced output, whichever is later.
     #[schemars(range(min = 10, max = 60000))]
     pub quiet_ms: Option<u64>,
 }
@@ -193,6 +192,8 @@ struct Control {
     wake: mpsc::Sender<Wake>,
     report: Mutex<Report>,
     in_flight: (Mutex<usize>, Condvar),
+    held_attachments: Mutex<HashMap<u64, crate::tasks::AttachmentLease>>,
+    next_attachment_handle: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -248,6 +249,20 @@ impl ScriptHandle {
         lock(&self.0.report).started_ids.contains(task_id)
     }
 
+    pub(crate) fn register_attachment(&self, lease: crate::tasks::AttachmentLease) -> u64 {
+        let id = self
+            .0
+            .next_attachment_handle
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        lock(&self.0.held_attachments).insert(id, lease);
+        id
+    }
+
+    fn get_attachment(&self, id: u64) -> Option<crate::tasks::AttachmentLease> {
+        lock(&self.0.held_attachments).get(&id).cloned()
+    }
+
     fn cancel_and_drain(&self) {
         self.0.cancel.cancel();
         let (count, idle) = &self.0.in_flight;
@@ -257,6 +272,8 @@ impl ScriptHandle {
     }
 
     fn finish(&self) -> Vec<CallInfo> {
+        let dropped = std::mem::take(&mut *lock(&self.0.held_attachments));
+        drop(dropped);
         let mut report = lock(&self.0.report);
         report.cancelled = report
             .pending
@@ -303,6 +320,8 @@ pub fn prepare(runtime: Handle) -> Result<(ScriptHandle, ScriptWorker), String> 
         wake,
         report: Mutex::new(Report::default()),
         in_flight: (Mutex::new(0), Condvar::new()),
+        held_attachments: Mutex::new(HashMap::new()),
+        next_attachment_handle: std::sync::atomic::AtomicU64::new(0),
     }));
     let (sender, job) = mpsc::sync_channel(1);
     let control = script.clone();
@@ -321,13 +340,11 @@ pub fn prepare(runtime: Handle) -> Result<(ScriptHandle, ScriptWorker), String> 
 struct Output {
     writer: PipeWriter,
     written: u64,
-    image_bytes: u64,
-    images: usize,
 }
 
 impl Output {
     fn capacity(&self, bytes: u64) -> Result<(), String> {
-        if self.written + self.image_bytes + bytes > TASK_LOG_LIMIT - DIAGNOSTIC_RESERVE {
+        if self.written + bytes > TASK_LOG_LIMIT - DIAGNOSTIC_RESERVE {
             Err("Script output exceeds 64 MiB (4 KiB is reserved for diagnostics).".into())
         } else {
             Ok(())
@@ -349,7 +366,7 @@ impl Output {
     }
 
     fn diagnostic(&mut self, text: &str) {
-        let left = TASK_LOG_LIMIT.saturating_sub(self.written + self.image_bytes);
+        let left = TASK_LOG_LIMIT.saturating_sub(self.written);
         if left == 0 {
             return;
         }
@@ -656,26 +673,6 @@ fn nested_envelope(result: rmcp::model::CallToolResult) -> serde_json::Value {
     if map.remove("ok") == Some(serde_json::Value::Bool(false)) {
         ok = false;
     }
-    let mut images = result.content.iter().filter_map(|block| {
-        let image = block.as_image()?;
-        Some(json!({"type": "image", "data": image.data, "mimeType": image.mime_type}))
-    });
-    match map.get("kind").and_then(serde_json::Value::as_str) {
-        Some("image") => {
-            if let Some(image) = images.next() {
-                map.insert("image".into(), image);
-            } else if let Some(note) = result.content.first().and_then(|block| block.as_text()) {
-                map.insert("note".into(), json!(note.text));
-            }
-        }
-        Some("codemode") => {
-            let blocks: Vec<_> = images.collect();
-            if !blocks.is_empty() {
-                map.entry("codemode").or_insert_with(|| json!({}))["images"] = blocks.into();
-            }
-        }
-        _ => {}
-    }
     json!({ "ok": ok, "value": map })
 }
 
@@ -732,12 +729,7 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
         tasks,
         captured,
     } = work;
-    let output = Rc::new(RefCell::new(Output {
-        writer,
-        written: 0,
-        image_bytes: 0,
-        images: 0,
-    }));
+    let output = Rc::new(RefCell::new(Output { writer, written: 0 }));
     let host = Rc::new(RefCell::new(Host {
         service,
         session,
@@ -908,6 +900,7 @@ fn run_vm(
                     .map_err(|error| Exception::throw_range(&ctx, &error))
             })
             .map_err(|error| js_error(&ctx, error))?;
+            let launch_ctx = Arc::clone(&host.borrow().launch);
             let call = Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, tool: String, args: String| {
@@ -924,71 +917,276 @@ fn run_vm(
                 },
             )
             .map_err(|error| js_error(&ctx, error))?;
-            let imaging = Rc::clone(&output);
             let task = Arc::clone(task);
             let tasks = Arc::clone(tasks);
             let control = script.clone();
-            let image = Function::new(ctx.clone(), move |ctx: Ctx<'_>, data: String| {
-                if control.interrupted() {
-                    return Err(Exception::throw_message(&ctx, "The script is ending."));
-                }
-                let mut output = imaging.borrow_mut();
-                if output.images >= MAX_IMAGES {
-                    return Err(Exception::throw_range(
-                        &ctx,
-                        "A script may emit at most 64 images.",
-                    ));
-                }
-                let cleaned: String = data.chars().filter(|ch| !is_js_whitespace(*ch)).collect();
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(cleaned)
-                    .map_err(|_| {
-                        Exception::throw_type(&ctx, "The image data is not valid base64.")
-                    })?;
-                let index = output.images + 1;
-                let inline = match images::inline(bytes) {
-                    Ok(image) => image,
-                    Err(message) => {
-                        output
-                            .write(&format!("[image {index} omitted: {message}]"))
-                            .map_err(|error| Exception::throw_range(&ctx, &error))?;
-                        output.images = index;
-                        return Ok(());
+            let attach = Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>,
+                      mode: u8,
+                      payload: String,
+                      declared_mime: String,
+                      expected_kind: String|
+                      -> rquickjs::Result<String> {
+                    if control.interrupted() {
+                        return Err(Exception::throw_message(&ctx, "The script is ending."));
                     }
-                };
-                let path = task.image_path(index, &inline.mime);
-                let mut marker = format!(
-                    "[image {index}: {} ({}, {}x{}, {} bytes)]",
-                    files::display_path(&path),
-                    inline.mime,
-                    inline.width,
-                    inline.height,
-                    inline.bytes.len()
-                );
-                for hint in &inline.hints {
-                    marker.push(' ');
-                    marker.push_str(hint);
-                }
-                let bytes = inline.bytes.len() as u64;
-                output
-                    .capacity(bytes + marker.len() as u64 + 1)
-                    .map_err(|error| Exception::throw_range(&ctx, &error))?;
-                let end_byte = output.written + marker.len() as u64 + 1;
-                tasks
-                    .store_image(&task, index, &inline.bytes, &inline.mime, end_byte)
-                    .map_err(|error| Exception::throw_range(&ctx, &error))?;
-                output.image_bytes += bytes;
-                output.images = index;
-                if let Err(error) = output.line(&marker) {
-                    tasks.remove_image(&task, index);
-                    output.image_bytes -= bytes;
-                    return Err(Exception::throw_message(
-                        &ctx,
-                        &format!("Cannot write image marker: {error}"),
-                    ));
-                }
-                Ok(())
-            })
+                    let max_bytes = launch_ctx
+                        .max_media_bytes()
+                        .map_err(|err| Exception::throw_type(&ctx, &err))?;
+                    let compress = launch_ctx
+                        .image_compress()
+                        .map_err(|err| Exception::throw_type(&ctx, &err))?;
+
+                    let (bytes, mut lease, kind, mime): (
+                        Vec<u8>,
+                        crate::lease::Lease,
+                        MediaKind,
+                        String,
+                    ) = match mode {
+                        0 => {
+                            let hid: u64 = payload.parse().map_err(|_| {
+                                Exception::throw_type(&ctx, "Invalid attachment handle.")
+                            })?;
+                            let Some(att_lease) = control.get_attachment(hid) else {
+                                return Err(Exception::throw_type(
+                                    &ctx,
+                                    "Invalid or expired attachment handle.",
+                                ));
+                            };
+                            let src_meta = att_lease.meta().clone();
+                            let mut file = std::fs::File::open(&src_meta.path).map_err(|err| {
+                                Exception::throw_type(
+                                    &ctx,
+                                    &format!("Cannot read source attachment: {err}."),
+                                )
+                            })?;
+                            let (loaded, loaded_lease) = match files::read_media_from_zero(
+                                &mut file,
+                                src_meta.size,
+                                files::MediaStart::Rewind,
+                                max_bytes,
+                                launch_ctx.memory(),
+                                None,
+                                Some(&control.0.cancel),
+                            ) {
+                                Ok(files::MediaBytes::Loaded { bytes, lease }) => (bytes, lease),
+                                Ok(files::MediaBytes::Oversized { .. }) => {
+                                    return Err(Exception::throw_range(
+                                        &ctx,
+                                        &format!(
+                                            "Attachment exceeds FASTEXEC_MAX_MEDIA_BYTES ({max_bytes} bytes)."
+                                        ),
+                                    ));
+                                }
+                                Err(files::MediaReadError::Overload) => {
+                                    return Err(Exception::throw_range(
+                                        &ctx,
+                                        "Server active memory budget is full.",
+                                    ));
+                                }
+                                Err(files::MediaReadError::Cancelled) => {
+                                    return Err(Exception::throw_message(
+                                        &ctx,
+                                        "The script is ending.",
+                                    ));
+                                }
+                                Err(files::MediaReadError::Io(err)) => {
+                                    return Err(Exception::throw_type(
+                                        &ctx,
+                                        &format!("Cannot read source attachment: {err}."),
+                                    ));
+                                }
+                            };
+                            drop(att_lease);
+                            if loaded.len() as u64 != src_meta.size {
+                                return Err(Exception::throw_type(
+                                    &ctx,
+                                    "Source attachment size changed on disk.",
+                                ));
+                            }
+                            (loaded, loaded_lease, src_meta.kind, src_meta.mime)
+                        }
+                        1 => {
+                            let resolved = files::resolve(&payload, &launch_ctx)
+                                .map_err(|err| Exception::throw_type(&ctx, &err))?;
+                            let shown = files::display_path(&resolved);
+                            let (mut file, meta) =
+                                files::open_regular(&resolved).map_err(|err| {
+                                    Exception::throw_type(
+                                        &ctx,
+                                        &format!("Cannot read {shown}: {err}."),
+                                    )
+                                })?;
+                            let mut prefix = [0u8; media::SNIFF];
+                            let mut sniffed = 0;
+                            while sniffed < prefix.len() {
+                                match std::io::Read::read(&mut file, &mut prefix[sniffed..]) {
+                                    Ok(0) => break,
+                                    Ok(n) => sniffed += n,
+                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        return Err(Exception::throw_type(
+                                            &ctx,
+                                            &format!("Cannot read {shown}: {err}."),
+                                        ));
+                                    }
+                                }
+                            }
+                            let Some(det) =
+                                media::detect_path(&prefix[..sniffed], Some(&resolved))
+                            else {
+                                return Err(Exception::throw_type(
+                                    &ctx,
+                                    &format!(
+                                        "Cannot attach {shown}: file is not a supported image, audio, PDF, or video format."
+                                    ),
+                                ));
+                            };
+                            match files::read_media_from_zero(
+                                &mut file,
+                                meta.len(),
+                                files::MediaStart::Prefix(&prefix[..sniffed]),
+                                max_bytes,
+                                launch_ctx.memory(),
+                                None,
+                                Some(&control.0.cancel),
+                            ) {
+                                Ok(files::MediaBytes::Loaded { bytes, lease }) => {
+                                    (bytes, lease, det.kind, det.mime.to_owned())
+                                }
+                                Ok(files::MediaBytes::Oversized { .. }) => {
+                                    return Err(Exception::throw_range(
+                                        &ctx,
+                                        &format!(
+                                            "Cannot attach {shown}: exceeds FASTEXEC_MAX_MEDIA_BYTES ({max_bytes} bytes)."
+                                        ),
+                                    ));
+                                }
+                                Err(files::MediaReadError::Overload) => {
+                                    return Err(Exception::throw_range(
+                                        &ctx,
+                                        "Server active memory budget is full.",
+                                    ));
+                                }
+                                Err(files::MediaReadError::Cancelled) => {
+                                    return Err(Exception::throw_message(
+                                        &ctx,
+                                        "The script is ending.",
+                                    ));
+                                }
+                                Err(files::MediaReadError::Io(err)) => {
+                                    return Err(Exception::throw_type(
+                                        &ctx,
+                                        &format!("Cannot read {shown}: {err}."),
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {
+                            // Borrow `&str` directly when free of whitespace to avoid a second Base64 copy.
+                            let cleaned_owned: Option<String> = payload
+                                .chars()
+                                .any(is_js_whitespace)
+                                .then(|| {
+                                    payload.chars().filter(|ch| !is_js_whitespace(*ch)).collect()
+                                });
+                            let b64_str = cleaned_owned.as_deref().unwrap_or(payload.as_str());
+                            let unpadded_len = b64_str.trim_end_matches('=').len();
+                            let min_decoded = (unpadded_len / 4)
+                                .saturating_mul(3)
+                                .saturating_add((unpadded_len % 4).saturating_sub(1));
+                            if min_decoded as u64 > max_bytes {
+                                return Err(Exception::throw_range(
+                                    &ctx,
+                                    &format!(
+                                        "Inline media exceeds FASTEXEC_MAX_MEDIA_BYTES ({max_bytes} bytes)."
+                                    ),
+                                ));
+                            }
+                            let est_decoded =
+                                (b64_str.len() / 4).saturating_mul(3).saturating_add(3);
+                            let Some(mut inline_lease) = b64_str
+                                .len()
+                                .checked_add(est_decoded)
+                                .and_then(|peak| launch_ctx.memory().try_acquire(peak))
+                            else {
+                                return Err(Exception::throw_range(
+                                    &ctx,
+                                    "Server active memory budget is full.",
+                                ));
+                            };
+                            let raw = base64::engine::general_purpose::STANDARD
+                                .decode(b64_str)
+                                .map_err(|_| {
+                                    Exception::throw_type(
+                                        &ctx,
+                                        "Inline media data is not valid base64.",
+                                    )
+                                })?;
+                            drop(cleaned_owned);
+                            drop(payload);
+                            inline_lease.shrink_to(raw.len());
+                            if raw.len() as u64 > max_bytes {
+                                return Err(Exception::throw_range(
+                                    &ctx,
+                                    &format!(
+                                        "Inline media exceeds FASTEXEC_MAX_MEDIA_BYTES ({max_bytes} bytes)."
+                                    ),
+                                ));
+                            }
+                            let hint = (!declared_mime.is_empty()).then_some(declared_mime.as_str());
+                            let det = media::detect_inline(&raw, hint)
+                                .map_err(|err| Exception::throw_type(&ctx, &err))?;
+                            if !expected_kind.is_empty() && det.kind.as_str() != expected_kind {
+                                return Err(Exception::throw_type(
+                                    &ctx,
+                                    &format!(
+                                        "MCP {expected_kind} block contains {} ({}) bytes.",
+                                        det.kind.as_str(),
+                                        det.mime
+                                    ),
+                                ));
+                            }
+                            (raw, inline_lease, det.kind, det.mime.to_owned())
+                        }
+                    };
+
+                    let (final_bytes, final_mime) = if compress
+                        && kind == MediaKind::Image
+                        && media::is_compressible_image(&mime, &bytes)
+                    {
+                        match media::compress_image(bytes, &mime, &mut lease) {
+                            Ok(img) => (img.bytes, img.mime),
+                            Err(CompressFailure::Overload) => {
+                                return Err(Exception::throw_range(
+                                    &ctx,
+                                    "Server active memory budget is full.",
+                                ));
+                            }
+                            Err(CompressFailure::Rejected(reason)) => {
+                                return Err(Exception::throw_type(&ctx, &reason));
+                            }
+                        }
+                    } else {
+                        (bytes, mime)
+                    };
+                    let stored = tasks
+                        .store_attachment(&task, kind, &final_mime, &final_bytes)
+                        .map_err(|error| Exception::throw_range(&ctx, &error))?;
+                    drop(final_bytes);
+                    drop(lease);
+                    Ok(json!({
+                        "index": stored.index,
+                        "kind": stored.kind.as_str(),
+                        "mimeType": stored.mime,
+                        "bytes": stored.size,
+                    })
+                    .to_string())
+                },
+            )
             .map_err(|error| js_error(&ctx, error))?;
             let control = script.clone();
             let exit = Function::new(ctx.clone(), move || {
@@ -996,7 +1194,7 @@ fn run_vm(
             })
             .map_err(|error| js_error(&ctx, error))?;
             let api: Object = factory
-                .call((write, call, image, exit))
+                .call((write, call, attach, exit))
                 .map_err(|error| js_error(&ctx, error))?;
             let mut options = EvalOptions::default();
             options.filename = Some("codemode.js".into());
@@ -1087,7 +1285,7 @@ fn run_vm(
     result
 }
 
-const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
+const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
     const parse = Function.prototype.call.bind(JSON.parse, JSON);
     const stringify = Function.prototype.call.bind(JSON.stringify, JSON);
     const get = Function.prototype.call.bind(Map.prototype.get);
@@ -1385,36 +1583,98 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
         return out + "'";
     }
     const sh = objectFreeze({ quote });
-    function extractDataUrlBase64(value) {
-        if (value.length < 13) return undefined;
+    const attachmentHandles = new WeakMap();
+    function parseDataUrl(value) {
+        if (value.length < 12) return undefined;
         if (stringToLowerCase(stringSlice(value, 0, 5)) !== "data:") return undefined;
         const comma = stringIndexOf(value, ",", 5);
-        if (comma < 12) return undefined;
-        if (stringToLowerCase(stringSlice(value, comma - 7, comma)) !== ";base64") return undefined;
-        return stringSlice(value, comma + 1);
+        if (comma < 12) {
+            throw new TypeErrorCtor("attach data URL must include ';base64,'.");
+        }
+        const header = stringSlice(value, 5, comma);
+        if (stringToLowerCase(stringSlice(header, header.length - 7)) !== ";base64") {
+            throw new TypeErrorCtor("attach data URL must use ;base64 encoding.");
+        }
+        return {
+            mime: stringSlice(header, 0, header.length - 7),
+            data: stringSlice(value, comma + 1),
+        };
     }
-    function image(value) {
-        if (value && typeof value === "object" && value.kind === "image") {
-            if (value.attached === false) {
+    function attach(value) {
+        if (value !== null && typeof value === "object" && !isArray(value)) {
+            const hid = weakMapGet(attachmentHandles, value);
+            if (hid !== undefined) {
+                return parse(__attach(0, StringCtor(hid), "", ""));
+            }
+            if (value.attachable === false) {
                 const note = typeof value.note === "string" && value.note.length > 0
                     ? value.note
-                    : "The image could not be attached.";
+                    : "The media file cannot be attached.";
                 throw new TypeErrorCtor(note);
             }
-            if (value.attached === true && value.image && typeof value.image === "object") {
-                value = value.image;
+            if (typeof value.path === "string" && value.type === undefined) {
+                return parse(__attach(1, value.path, "", ""));
+            }
+            if ((value.type === "image" || value.type === "audio") && typeof value.data === "string") {
+                if (value.mimeType !== undefined && typeof value.mimeType !== "string") {
+                    throw new TypeErrorCtor("MCP " + value.type + " block mimeType must be a string.");
+                }
+                return parse(__attach(2, value.data, value.mimeType || "", value.type));
+            }
+            if (
+                value.type === "resource" &&
+                value.resource !== null &&
+                typeof value.resource === "object" &&
+                typeof value.resource.blob === "string"
+            ) {
+                const res = value.resource;
+                if (res.mimeType !== undefined && typeof res.mimeType !== "string") {
+                    throw new TypeErrorCtor("MCP resource block mimeType must be a string.");
+                }
+                if (res.uri !== undefined && typeof res.uri !== "string") {
+                    throw new TypeErrorCtor("MCP resource block uri must be a string.");
+                }
+                return parse(__attach(2, res.blob, res.mimeType || "", ""));
             }
         }
-        let data;
-        if (value && typeof value === "object" && value.type === "image" && typeof value.data === "string") {
-            data = value.data;
-        } else if (typeof value === "string") {
-            data = extractDataUrlBase64(value);
+        if (typeof value === "string") {
+            const dataUrl = parseDataUrl(value);
+            if (dataUrl !== undefined) {
+                return parse(__attach(2, dataUrl.data, dataUrl.mime, ""));
+            }
+            return parse(__attach(1, value, "", ""));
         }
-        if (typeof data !== "string") {
-            throw new TypeErrorCtor("image expects an attached image read result, an image block, or a base64 data URL.");
+        throw new TypeErrorCtor(
+            "attach expects a file path, a read media descriptor, an opaque task attachment handle, an MCP image/audio/resource(blob) block, or a base64 data URL."
+        );
+    }
+    function sealNestedAttachments(val) {
+        if (
+            val !== null &&
+            typeof val === "object" &&
+            val.codemode !== null &&
+            typeof val.codemode === "object" &&
+            isArray(val.codemode.attachments)
+        ) {
+            const rawList = val.codemode.attachments;
+            const out = [];
+            for (let i = 0; i < rawList.length; i++) {
+                const item = rawList[i];
+                const hid = item.__hid;
+                const handle = objectFreeze({
+                    index: item.index,
+                    kind: item.kind,
+                    mimeType: item.mimeType,
+                    bytes: item.bytes,
+                });
+                if (typeof hid === "number") {
+                    weakMapSet(attachmentHandles, handle, hid);
+                }
+                out[i] = handle;
+            }
+            val.codemode.attachments = objectFreeze(out);
         }
-        __image(data);
+        return val;
     }
     function exit() {
         __exit();
@@ -1817,7 +2077,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
     globalThis.sh = sh;
     globalThis.console = console;
     globalThis.text = text;
-    globalThis.image = image;
+    globalThis.attach = attach;
     globalThis.sleep = sleep;
     globalThis.exit = exit;
     return {
@@ -1862,7 +2122,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __image, __exit) {
             let envelope;
             try { envelope = parse(payload); } catch (error) { entry.reject(withCallStack(error, entry.stack)); return; }
             if (envelope.ok) {
-                entry.resolve(envelope.value);
+                entry.resolve(sealNestedAttachments(envelope.value));
             } else {
                 entry.reject(withCallStack(new ToolError(entry.tool, envelope.value), entry.stack));
             }
@@ -2360,53 +2620,254 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_output_uses_detected_mime_and_enforces_count() {
+    async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() {
         let fixture = Fixture::new();
-        let mut bytes = std::io::Cursor::new(Vec::new());
+        let mut png_bytes = Vec::new();
         image::DynamicImage::new_rgb8(1, 1)
-            .write_to(&mut bytes, image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
-        let data = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
-        let spaced = format!(
-            "DATA:IMAGE/JPEG;BASE64,\n  {}\r\n\t\u{feff}{}",
-            &data[..8],
-            &data[8..]
+        let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+        // Minimal ISO BMFF `ftyp` MP4 and EBML WebM payloads for R4-4 parity checks.
+        let mut mp4_bytes = Vec::new();
+        mp4_bytes.extend_from_slice(&20u32.to_be_bytes());
+        mp4_bytes.extend_from_slice(b"ftypisom");
+        mp4_bytes.extend_from_slice(&0u32.to_be_bytes());
+        mp4_bytes.extend_from_slice(b"mp42");
+        std::fs::write(fixture.dir.join("clip.mp4"), &mp4_bytes).unwrap();
+        let mp4_b64 = base64::engine::general_purpose::STANDARD.encode(&mp4_bytes);
+
+        let webm_bytes: Vec<u8> = vec![
+            0x1A, 0x45, 0xDF, 0xA3, 0x8B, 0x42, 0x82, 0x84, b'w', b'e', b'b', b'm', 0x42, 0x87,
+            0x81, 0x02,
+        ];
+        std::fs::write(fixture.dir.join("clip.webm"), &webm_bytes).unwrap();
+        let webm_b64 = base64::engine::general_purpose::STANDARD.encode(&webm_bytes);
+
+        // 1. R4-4 parity: identical kind, MIME, and raw bytes across local path, MCP resource, and data URL;
+        //    conflicting declared MIME (`video/mp4` on PNG bytes) and old `image()` global are rejected.
+        let r4_code = format!(
+            r#"
+            RegExp.prototype.exec = String.prototype.replace = () => {{ throw new Error("patched"); }};
+            if (typeof globalThis.image !== "undefined") throw new Error("legacy image() must be gone");
+
+            const mp4Desc = await tools.read({{path: "clip.mp4"}});
+            if (mp4Desc.attachable !== true || mp4Desc.kind !== "video" || mp4Desc.mimeType !== "video/mp4" || mp4Desc.bytes !== {mp4_len}) {{
+                throw new Error("mp4Desc: " + JSON.stringify(mp4Desc));
+            }}
+            const a1 = attach("clip.mp4");
+            const a2 = attach({{ type: "resource", resource: {{ blob: {mp4_b64:?}, mimeType: "video/mp4" }} }});
+            const a3 = attach("data:video/mp4;base64," + {mp4_b64:?});
+            for (const [idx, item] of [[1, a1], [2, a2], [3, a3]]) {{
+                if (item.index !== idx || item.kind !== "video" || item.mimeType !== "video/mp4" || item.bytes !== {mp4_len}) {{
+                    throw new Error("mp4 mismatch at " + idx + ": " + JSON.stringify(item));
+                }}
+            }}
+
+            const w1 = attach(await tools.read({{path: "clip.webm"}}));
+            const w2 = attach({{ type: "resource", resource: {{ blob: {webm_b64:?}, mimeType: "video/webm" }} }});
+            const w3 = attach("DATA:VIDEO/WEBM;BASE64,\n  " + {webm_b64:?});
+            for (const [idx, item] of [[4, w1], [5, w2], [6, w3]]) {{
+                if (item.index !== idx || item.kind !== "video" || item.mimeType !== "video/webm" || item.bytes !== {webm_len}) {{
+                    throw new Error("webm mismatch at " + idx + ": " + JSON.stringify(item));
+                }}
+            }}
+
+            let conflictRejected = false;
+            try {{
+                attach("data:video/mp4;base64," + {png_b64:?});
+            }} catch (e) {{
+                if (e instanceof TypeError && e.message.includes("conflicts")) conflictRejected = true;
+            }}
+            if (!conflictRejected) throw new Error("conflicting MIME must reject");
+            return "r4-4-ok";
+            "#,
+            mp4_len = mp4_bytes.len(),
+            webm_len = webm_bytes.len(),
         );
-        let task = fixture.start(
-            &format!(
-                "RegExp.prototype.exec = String.prototype.replace = () => {{ throw new Error('patched'); }}; image({});",
-                json!(spaced)
-            ),
-            None,
-        );
-        complete(&task).await;
-        assert_eq!(task.snapshot().exit_code, Some(0));
-        let path = task.image_path(1, "image/png");
-        assert!(path.is_file());
-        let output = std::fs::read_to_string(&task.log_path).unwrap();
-        assert!(output.contains("image/png, 1x1"), "{output}");
-        for action in ["poll", "kill"] {
-            let (status, log) = fixture.result(&format!(r#"
-                const r = await tools.exec({{action: {action:?}, taskId: {id:?}}});
-                if (r.codemode.images.length !== r.codemode.imagesAttached) throw Error("image count");
-                const block = r.codemode.images[0];
-                if (block.data !== {data:?} || block.mimeType !== "image/png") throw Error("image data");
-                image(block);
-                const next = await tools.exec({{action: "poll", taskId: r.taskId}});
-                if (next.codemode?.images) throw Error("image delivered twice");
-            "#, id = task.id)).await;
-            assert_eq!(status.exit_code, Some(0), "{action}: {log}");
-            assert!(log.contains("image/png, 1x1"), "{action}: {log}");
+        let r4_task = fixture.start(&r4_code, Some(5000));
+        complete(&r4_task).await;
+        let r4_out = std::fs::read_to_string(&r4_task.log_path).unwrap();
+        assert_eq!(r4_task.snapshot().exit_code, Some(0), "{r4_out}");
+        assert_eq!(r4_out, "r4-4-ok\n");
+        for idx in 1..=3 {
+            assert_eq!(
+                std::fs::read(r4_task.attachment_path(idx, "video/mp4")).unwrap(),
+                mp4_bytes
+            );
         }
-        let (state, output) = fixture
+        for idx in 4..=6 {
+            assert_eq!(
+                std::fs::read(r4_task.attachment_path(idx, "video/webm")).unwrap(),
+                webm_bytes
+            );
+        }
+
+        // 2. Opaque task attachment handles from nested `poll` and `kill`: reusable without consumption,
+        //    unforgeable against clones/spoofed `__hid`, and `AttachmentLease` pins source files across
+        //    source-task eviction until the consumer script exits or is cancelled!
+        for action in ["poll", "kill"] {
+            let producer = fixture.start(
+                &format!("attach('data:image/png;base64,{png_b64}'); attach('clip.mp4');"),
+                Some(5000),
+            );
+            complete(&producer).await;
+            let src_att1 = producer.attachment_path(1, "image/png");
+            assert!(src_att1.is_file());
+
+            let consumer = fixture.start(
+                &format!(
+                    r#"
+                    const r = await tools.exec({{action: {action:?}, taskId: {pid:?}}});
+                    const list = r.codemode.attachments;
+                    if (!Array.isArray(list) || list.length !== 2) throw new Error("expected 2 handles");
+                    const h = list[0];
+                    if (h.index !== 1 || h.kind !== "image" || h.mimeType !== "image/png" || h.bytes !== {png_len}) {{
+                        throw new Error("handle meta: " + JSON.stringify(h));
+                    }}
+                    if ("__hid" in h || !Object.isFrozen(h)) throw new Error("handle must be opaque & frozen");
+
+                    // Attaching twice does NOT consume the handle.
+                    const c1 = attach(h);
+                    const c2 = attach(h);
+                    if (c1.index !== 1 || c2.index !== 2 || c2.bytes !== {png_len}) {{
+                        throw new Error("reuse failed");
+                    }}
+
+                    // Forged or cloned objects cannot spoof an attachment handle.
+                    for (const fake of [{{ ...h }}, {{ index: 1, kind: "image", mimeType: "video/mp4", bytes: 1, __hid: 1 }}]) {{
+                        let rejected = false;
+                        try {{ attach(fake); }} catch (e) {{ if (e instanceof TypeError) rejected = true; }}
+                        if (!rejected) throw new Error("forged handle accepted");
+                    }}
+
+                    const next = await tools.exec({{action: "poll", taskId: r.taskId, waitMs: 0}});
+                    if (next.codemode?.attachments) throw new Error("handles delivered twice");
+
+                    text("PINNED");
+                    await sleep(30000);
+                    "#,
+                    pid = producer.id,
+                    png_len = png_bytes.len(),
+                ),
+                Some(10000),
+            );
+
+            // Wait until `consumer` reaches `PINNED`.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if std::fs::read_to_string(&consumer.log_path)
+                    .unwrap_or_default()
+                    .contains("PINNED")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                std::fs::read_to_string(&consumer.log_path)
+                    .unwrap()
+                    .contains("PINNED")
+            );
+
+            // Evict `producer` while `consumer` is still running: `src_att1` stays pinned on disk!
+            fixture.tasks.evict_log(&producer);
+            assert!(
+                src_att1.exists(),
+                "AttachmentLease must pin source file while consumer script runs"
+            );
+
+            // Cancel/kill `consumer`: once `consumer` exits, its `AttachmentLease` drops and unlinks `src_att1`!
+            consumer.kill().unwrap();
+            complete(&consumer).await;
+            assert!(
+                !src_att1.exists(),
+                "killing consumer script must release AttachmentLease and unlink evicted file"
+            );
+            assert_eq!(
+                std::fs::read(consumer.attachment_path(1, "image/png")).unwrap(),
+                png_bytes
+            );
+            assert_eq!(
+                std::fs::read(consumer.attachment_path(2, "image/png")).unwrap(),
+                png_bytes
+            );
+        }
+
+        // 3. Per-task 1024 attachment cap (above old 64 cap) and disk-quota pre-write rejection with zero residue.
+        let (many_state, many_out) = fixture
             .result(&format!(
-                "for(let i=0;i<65;i++) image({});",
-                json!({"type":"image","data":data,"mimeType":"image/png"})
+                r#"
+                for (let i = 1; i <= 1024; i++) {{
+                    const r = attach("data:image/png;base64,{png_b64}");
+                    if (r.index !== i) throw new Error("index " + r.index);
+                }}
+                let capHit = false;
+                try {{ attach("data:image/png;base64,{png_b64}"); }}
+                catch (e) {{ if (e instanceof RangeError && e.message.includes("1024")) capHit = true; }}
+                if (!capHit) throw new Error("expected 1025th attach to throw RangeError");
+                return "cap-1024-ok";
+                "#
             ))
             .await;
-        assert_eq!(state.exit_code, Some(1), "{output}");
-        assert!(output.contains("RangeError"));
-        assert!(output.contains("64 images"));
+        assert_eq!(many_state.exit_code, Some(0), "{many_out}");
+        assert_eq!(many_out, "cap-1024-ok\n");
+
+        // Tight disk quota rejects oversized attachment before writing any orphan file.
+        let quota_dir = std::env::temp_dir().join(format!(
+            "fastexec-script-quota-{}",
+            tasks::random_chars(12).unwrap()
+        ));
+        let mut tight_tasks = Tasks::new_in(Limits::OFF, quota_dir.clone()).unwrap();
+        Arc::get_mut(&mut tight_tasks).unwrap().set_log_limit(256);
+        let tight_service = Arc::new(Service::new(Arc::clone(&tight_tasks), false));
+        let tight_session = Session::new(
+            "tight-quota".into(),
+            "tight-quota".into(),
+            Arc::new(LaunchContext::new(
+                quota_dir.clone(),
+                std::env::vars_os().collect(),
+            )),
+        );
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode({
+            let mut big_png = png_bytes.clone();
+            big_png.resize(512, 0);
+            big_png
+        });
+        let (tight_task, _, _) = tight_tasks
+            .start_script(
+                ScriptArgs {
+                    code: format!(
+                        r#"
+                        let quotaRejected = false;
+                        try {{ attach("data:image/png;base64,{payload_b64}"); }}
+                        catch (e) {{ if (e instanceof RangeError && e.message.includes("4 GiB")) quotaRejected = true; }}
+                        if (!quotaRejected) throw new Error("expected disk quota RangeError");
+                        return "quota-ok";
+                        "#
+                    ),
+                    launch: Arc::clone(&tight_session.launch),
+                    kill_after_ms: Some(5000),
+                    transfer: false,
+                    call_id: None,
+                    service: tight_service,
+                },
+                &tight_session,
+                "q001".into(),
+            )
+            .unwrap();
+        complete(&tight_task).await;
+        let tight_out = std::fs::read_to_string(&tight_task.log_path).unwrap();
+        assert_eq!(tight_task.snapshot().exit_code, Some(0), "{tight_out}");
+        assert!(
+            !tight_task.attachment_path(1, "image/png").exists(),
+            "rejected attachment must leave no orphan file"
+        );
+        tight_tasks.shutdown();
+        let _ = std::fs::remove_dir_all(&quota_dir);
     }
 
     #[tokio::test]
@@ -2744,7 +3205,7 @@ mod tests {
     #[tokio::test]
     async fn sh_quote_image_notes_queue_cap_and_integrity_tool_errors() {
         let fixture = Fixture::new();
-        // Create a small PNG and an oversized >10 MiB fake PNG header for note-only read.
+        // Create a small PNG and a sparse >100 MiB PNG header for unattachable descriptor read.
         let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
             4,
             4,
@@ -2754,9 +3215,12 @@ mod tests {
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         std::fs::write(fixture.dir.join("ok.png"), &png).unwrap();
-        let mut huge = png[..32].to_vec();
-        huge.resize(11 * 1024 * 1024, 0);
-        std::fs::write(fixture.dir.join("huge.png"), &huge).unwrap();
+        {
+            use std::io::Write;
+            let mut huge = std::fs::File::create(fixture.dir.join("huge.png")).unwrap();
+            huge.write_all(&png[..33]).unwrap();
+            huge.set_len(105 * 1024 * 1024).unwrap();
+        }
 
         let (state, output) = fixture
             .result(
@@ -2781,16 +3245,19 @@ mod tests {
                     if (!threw) throw new Error("expected TypeError for " + String(bad));
                 }
                 const okImg = await tools.read({path: "ok.png"});
-                image(okImg);
+                if (okImg.attachable !== true || okImg.bytes === undefined || okImg.data !== undefined) {
+                    throw new Error("okImg descriptor shape: " + JSON.stringify(okImg));
+                }
+                attach(okImg);
                 const bigImg = await tools.read({path: "huge.png"});
-                if (bigImg.attached !== false || typeof bigImg.note !== "string" || !bigImg.note.includes("Image omitted")) {
+                if (bigImg.attachable !== false || bigImg.bytes !== undefined || bigImg.sourceBytes !== 105 * 1024 * 1024 || typeof bigImg.note !== "string" || !bigImg.note.includes("exceeds FASTEXEC_MAX_MEDIA_BYTES")) {
                     throw new Error("bigImg shape: " + JSON.stringify(bigImg));
                 }
                 let noteThrown = false;
-                try { image(bigImg); } catch (e) {
+                try { attach(bigImg); } catch (e) {
                     if (e instanceof TypeError && e.message === bigImg.note) noteThrown = true;
                 }
-                if (!noteThrown) throw new Error("expected image(bigImg) to throw bigImg.note");
+                if (!noteThrown) throw new Error("expected attach(bigImg) to throw bigImg.note");
                 return "helpers-ok";
                 "#,
             )

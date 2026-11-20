@@ -1,6 +1,7 @@
 //! Task registry: spawn, log capture, unseen-output cursors, input queues, and shutdown.
 
 use crate::codemode;
+use crate::media::MediaKind;
 use crate::output::{
     Matcher, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix,
     incomplete_utf8_suffix,
@@ -14,7 +15,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{oneshot, watch};
@@ -51,7 +52,8 @@ impl Limits {
 }
 
 pub(crate) const TASK_LOG_LIMIT: u64 = 64 << 20;
-const TOTAL_LOG_LIMIT: u64 = 1 << 30;
+pub(crate) const MAX_TASK_ATTACHMENTS: usize = 1024;
+const TOTAL_LOG_LIMIT: u64 = 4 << 30;
 const INPUT_QUEUE_LIMIT: usize = 1 << 20;
 const INPUT_WRITE_LIMIT: Duration = Duration::from_secs(5);
 /// Output that pauses this long has finished a frame: the chunks of one redraw arrive within
@@ -77,6 +79,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+struct PendingDelete {
+    path: PathBuf,
+    bytes: u64,
+}
+
+#[cfg(test)]
+type RemoveHook = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+
 pub struct Tasks {
     dir: PathBuf,
     /// Arms `killAfterMs`: the deadline belongs to the Core, not to the starting request.
@@ -90,8 +100,13 @@ pub struct Tasks {
     limits: Limits,
     log_bytes: AtomicU64,
     /// [`TOTAL_LOG_LIMIT`]; debug builds take a smaller one from
-    /// `FASTEXEC_TEST_TOTAL_LOG_LIMIT`, so tests reach it without writing 1 GiB.
+    /// `FASTEXEC_TEST_TOTAL_LOG_LIMIT`, so tests reach it without writing 4 GiB.
     log_limit: u64,
+    /// Files whose unlink failed keep their byte charge here until a later unlink succeeds.
+    pending_deletes: Mutex<Vec<PendingDelete>>,
+    delete_retry_gate: Mutex<()>,
+    #[cfg(test)]
+    remove_hook: Mutex<Option<RemoveHook>>,
 }
 
 #[derive(Default)]
@@ -417,7 +432,7 @@ pub fn is_valid_task_id(id: &str) -> bool {
 
 /// The error a transcript read returns for a task whose files the total log limit evicted.
 pub const EVICTED_TRANSCRIPT: &str =
-    "The files of this task were evicted under the 1 GiB total limit; its transcript is gone.";
+    "The files of this task were evicted under the 4 GiB total limit; its transcript is gone.";
 
 enum Root {
     Process(Tree),
@@ -450,14 +465,90 @@ impl Root {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct StoredImage {
+#[derive(Clone, Debug)]
+pub(crate) struct AttachmentMeta {
     pub index: usize,
-    pub end_byte: u64,
-    pub path: PathBuf,
+    pub kind: MediaKind,
     pub mime: String,
-    pub base64_len: usize,
+    pub path: PathBuf,
     pub size: u64,
+    pub base64_len: usize,
+}
+
+struct AttachmentSlotState {
+    in_task: bool,
+    leases: usize,
+    reclaimed: bool,
+}
+
+pub(crate) struct AttachmentSlot {
+    tasks: Weak<Tasks>,
+    pub meta: AttachmentMeta,
+    state: Mutex<AttachmentSlotState>,
+}
+
+impl AttachmentSlot {
+    fn try_lease(self: &Arc<Self>) -> Option<AttachmentLease> {
+        let mut state = lock(&self.state);
+        if state.reclaimed {
+            return None;
+        }
+        state.leases += 1;
+        drop(state);
+        Some(AttachmentLease(Arc::clone(self)))
+    }
+
+    fn detach_from_task(&self) {
+        let reclaim = {
+            let mut state = lock(&self.state);
+            state.in_task = false;
+            if state.leases == 0 && !state.reclaimed {
+                state.reclaimed = true;
+                true
+            } else {
+                false
+            }
+        };
+        if reclaim && let Some(tasks) = self.tasks.upgrade() {
+            tasks.reclaim_file(self.meta.path.clone(), self.meta.size);
+        }
+    }
+}
+
+/// Short-term read lease pinning an attachment file on disk across task eviction until dropped.
+pub(crate) struct AttachmentLease(Arc<AttachmentSlot>);
+
+impl AttachmentLease {
+    pub fn meta(&self) -> &AttachmentMeta {
+        &self.0.meta
+    }
+}
+
+impl Clone for AttachmentLease {
+    fn clone(&self) -> Self {
+        let mut state = lock(&self.0.state);
+        state.leases += 1;
+        drop(state);
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl Drop for AttachmentLease {
+    fn drop(&mut self) {
+        let reclaim = {
+            let mut state = lock(&self.0.state);
+            state.leases = state.leases.saturating_sub(1);
+            if !state.in_task && state.leases == 0 && !state.reclaimed {
+                state.reclaimed = true;
+                true
+            } else {
+                false
+            }
+        };
+        if reclaim && let Some(tasks) = self.0.tasks.upgrade() {
+            tasks.reclaim_file(self.0.meta.path.clone(), self.0.meta.size);
+        }
+    }
 }
 
 pub struct Task {
@@ -500,6 +591,8 @@ pub struct Task {
     /// records. Its replies to terminal queries, such as the cursor-position report and device
     /// attributes ConPTY waits for at startup, go to the program as input.
     terminal: Option<Mutex<Pty>>,
+    /// Open handle for `<id>.transcript.txt`, isolated from `terminal` so `evict_log` never locks `terminal`.
+    transcript_file: Mutex<Option<File>>,
     /// The terminal's size, columns first, as the program's terminal has it.
     size: Mutex<(u16, u16)>,
     /// A PTY task's size control, taken when the tree ends so a resize that arrives then fails
@@ -520,8 +613,6 @@ struct Pty {
 /// A PTY task's transcript file: the final lines, those the terminal wrote out, then the
 /// pending lines as the last `transcript` read them.
 struct Spool {
-    /// `None` for a task started with an encoding, or once the log was evicted.
-    file: Option<File>,
     /// Bytes and lines of the final lines.
     bytes: u64,
     lines: u64,
@@ -581,8 +672,9 @@ struct Output {
     last_output: Option<Instant>,
     /// Bytes the transcript file holds, counted under the total log limit.
     transcript: u64,
-    image_bytes: u64,
-    images: Vec<StoredImage>,
+    next_attachment_index: usize,
+    pending_attachments: usize,
+    attachments: Vec<Arc<AttachmentSlot>>,
 }
 
 #[derive(Clone)]
@@ -722,7 +814,21 @@ impl Tasks {
                 .and_then(|limit| limit.parse().ok())
                 .filter(|limit| cfg!(debug_assertions) && (1..=TOTAL_LOG_LIMIT).contains(limit))
                 .unwrap_or(TOTAL_LOG_LIMIT),
+            pending_deletes: Mutex::default(),
+            delete_retry_gate: Mutex::new(()),
+            #[cfg(test)]
+            remove_hook: Mutex::new(None),
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_log_limit(&mut self, limit: u64) {
+        self.log_limit = limit;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_remove_hook(&self, hook: Option<RemoveHook>) {
+        *lock(&self.remove_hook) = hook;
     }
 
     pub fn find(&self, id: &str) -> Option<Arc<Task>> {
@@ -955,9 +1061,9 @@ impl Tasks {
                 .expect("input_rx is held in this frame");
         }
         let writer_done = WriterDone::new(!need_input_worker);
+        let mut initial_transcript_file = None;
         let terminal = args.pty.then(|| {
             let mut spool = Spool {
-                file: None,
                 bytes: 0,
                 lines: 0,
                 pending: 0,
@@ -965,7 +1071,7 @@ impl Tasks {
             };
             if args.encoding == encoding_rs::UTF_8 {
                 match private_file(&self.dir.join(format!("{id}.transcript.txt"))) {
-                    Ok(file) => spool.file = Some(file),
+                    Ok(file) => initial_transcript_file = Some(file),
                     Err(error) => spool.stopped = Some(format!("it cannot be created: {error}")),
                 }
             }
@@ -1001,6 +1107,7 @@ impl Tasks {
             queued: AtomicUsize::new(initial_queued),
             input_gate: tokio::sync::Mutex::new(()),
             terminal,
+            transcript_file: Mutex::new(initial_transcript_file),
             size: Mutex::new((args.cols, args.rows)),
             pty_control: Mutex::new(spawned.pty),
             size_error: Mutex::new(None),
@@ -1112,6 +1219,7 @@ impl Tasks {
             queued: AtomicUsize::new(0),
             input_gate: tokio::sync::Mutex::new(()),
             terminal: None,
+            transcript_file: Mutex::new(None),
             size: Mutex::new((0, 0)),
             pty_control: Mutex::new(None),
             size_error: Mutex::new(None),
@@ -1189,59 +1297,130 @@ impl Tasks {
         task.done.send_replace(true);
     }
 
-    /// Saves and publishes metadata before the marker can reach a reader.
-    pub(crate) fn store_image(
-        &self,
+    /// Saves an attachment with a monotonic 1-based task-local index under the 4 GiB and 1024-entry caps.
+    pub(crate) fn store_attachment(
+        self: &Arc<Self>,
         task: &Task,
-        index: usize,
-        bytes: &[u8],
+        kind: MediaKind,
         mime: &str,
-        end_byte: u64,
-    ) -> Result<PathBuf, String> {
+        bytes: &[u8],
+    ) -> Result<AttachmentMeta, String> {
+        let index = {
+            let mut out = lock(&task.out);
+            if out.evicted {
+                return Err("The task log and attachments have been evicted.".into());
+            }
+            if out.attachments.len() + out.pending_attachments >= MAX_TASK_ATTACHMENTS {
+                return Err(format!(
+                    "A task may store at most {MAX_TASK_ATTACHMENTS} attachments."
+                ));
+            }
+            out.pending_attachments += 1;
+            out.next_attachment_index += 1;
+            out.next_attachment_index
+        };
+        let release_pending = || {
+            let mut out = lock(&task.out);
+            out.pending_attachments = out.pending_attachments.saturating_sub(1);
+        };
         let size = bytes.len() as u64;
         if !self.reserve(size) {
-            return Err("Image exceeds the 1 GiB total task output limit.".into());
+            release_pending();
+            return Err("Attachment exceeds the 4 GiB total task output limit.".into());
         }
-        let path = task.image_path(index, mime);
+        let path = task.attachment_path(index, mime);
         let mut file = match private_file(&path) {
             Ok(file) => file,
             Err(error) => {
                 self.log_bytes.fetch_sub(size, Ordering::SeqCst);
-                return Err(format!("Cannot create the image: {error}."));
+                release_pending();
+                return Err(format!("Cannot create the attachment: {error}."));
             }
         };
         if let Err(error) = file.write_all(bytes) {
-            self.log_bytes.fetch_sub(size, Ordering::SeqCst);
             drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(format!("Cannot save the image: {error}."));
+            release_pending();
+            self.reclaim_file(path, size);
+            return Err(format!("Cannot save the attachment: {error}."));
         }
         drop(file);
-        let mut out = lock(&task.out);
-        if out.evicted {
-            self.log_bytes.fetch_sub(size, Ordering::SeqCst);
-            let _ = std::fs::remove_file(&path);
-            return Err("The task log and images have been evicted.".into());
-        }
-        out.image_bytes += size;
-        out.images.push(StoredImage {
+        let meta = AttachmentMeta {
             index,
-            end_byte,
-            path: path.clone(),
+            kind,
             mime: mime.to_owned(),
-            base64_len: bytes.len().div_ceil(3) * 4,
+            path: path.clone(),
             size,
+            base64_len: bytes.len().div_ceil(3) * 4,
+        };
+        let slot = Arc::new(AttachmentSlot {
+            tasks: Arc::downgrade(self),
+            meta: meta.clone(),
+            state: Mutex::new(AttachmentSlotState {
+                in_task: true,
+                leases: 0,
+                reclaimed: false,
+            }),
         });
-        Ok(path)
+        let mut out = lock(&task.out);
+        out.pending_attachments = out.pending_attachments.saturating_sub(1);
+        if out.evicted {
+            drop(out);
+            self.reclaim_file(path, size);
+            return Err("The task log and attachments have been evicted.".into());
+        }
+        let pos = out
+            .attachments
+            .partition_point(|existing| existing.meta.index < index);
+        out.attachments.insert(pos, slot);
+        drop(out);
+        task.activity.send_replace(());
+        Ok(meta)
     }
 
-    pub(crate) fn remove_image(&self, task: &Task, index: usize) {
-        let mut out = lock(&task.out);
-        if let Some(position) = out.images.iter().position(|image| image.index == index) {
-            let image = out.images.remove(position);
-            out.image_bytes -= image.size;
-            self.log_bytes.fetch_sub(image.size, Ordering::SeqCst);
-            let _ = std::fs::remove_file(image.path);
+    fn unlink_file(&self, path: &Path) -> bool {
+        #[cfg(test)]
+        if let Some(hook) = lock(&self.remove_hook).clone() {
+            return match hook(path) {
+                Ok(()) => true,
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            };
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
+    /// Refunds `bytes` only when `path` is confirmed gone; otherwise keeps `bytes` charged for retry.
+    fn reclaim_file(&self, path: PathBuf, bytes: u64) {
+        if self.unlink_file(&path) {
+            if bytes > 0 {
+                self.log_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            }
+        } else {
+            lock(&self.pending_deletes).push(PendingDelete { path, bytes });
+        }
+    }
+
+    /// Retries deferred unlinks, refunding each file's bytes at most once when deletion succeeds.
+    pub(crate) fn retry_pending_deletes(&self) {
+        let _gate = lock(&self.delete_retry_gate);
+        let pending = std::mem::take(&mut *lock(&self.pending_deletes));
+        if pending.is_empty() {
+            return;
+        }
+        let mut still_pending = Vec::new();
+        for item in pending {
+            if self.unlink_file(&item.path) {
+                if item.bytes > 0 {
+                    self.log_bytes.fetch_sub(item.bytes, Ordering::SeqCst);
+                }
+            } else {
+                still_pending.push(item);
+            }
+        }
+        if !still_pending.is_empty() {
+            lock(&self.pending_deletes).extend(still_pending);
         }
     }
 
@@ -1277,6 +1456,7 @@ impl Tasks {
     /// Removes every finished task that ended at least `finished_ttl` before `now`, deleting its
     /// log as `retire_finished` does. Pending or unconfirmed tree completion keeps the task.
     pub fn expire_finished(&self, now: Instant) {
+        self.retry_pending_deletes();
         let Some(ttl) = self.limits.finished_ttl else {
             return;
         };
@@ -1313,20 +1493,30 @@ impl Tasks {
         lock(&self.registry).pending
     }
 
-    fn evict_log(&self, task: &Task) {
-        let mut out = lock(&task.out);
-        if !out.evicted {
-            out.evicted = true;
-            self.log_bytes.fetch_sub(
-                out.written + out.transcript + out.image_bytes,
-                Ordering::SeqCst,
-            );
-            let _ = std::fs::remove_file(&task.log_path);
-            let _ = std::fs::remove_file(task.transcript_path());
-            for image in out.images.drain(..) {
-                let _ = std::fs::remove_file(image.path);
+    pub(crate) fn evict_log(&self, task: &Task) {
+        let (written, transcript, has_transcript, attachments) = {
+            let mut out = lock(&task.out);
+            if out.evicted {
+                return;
             }
-            out.image_bytes = 0;
+            out.evicted = true;
+            let written = out.written;
+            let transcript = out.transcript;
+            let has_transcript = task.pty || transcript > 0;
+            let attachments = std::mem::take(&mut out.attachments);
+            (written, transcript, has_transcript, attachments)
+        };
+        // Drop our open handle outside `task.terminal` so eviction from `capture` or `resize`
+        // cannot self-deadlock on the non-reentrant terminal mutex.
+        let closed_transcript = lock(&task.transcript_file).take();
+        drop(closed_transcript);
+
+        self.reclaim_file(task.log_path.clone(), written);
+        if has_transcript {
+            self.reclaim_file(task.transcript_path(), transcript);
+        }
+        for slot in attachments {
+            slot.detach_from_task();
         }
     }
 
@@ -1334,6 +1524,10 @@ impl Tasks {
     /// A tree whose completion is pending or unconfirmed may still write to its log.
     fn reserve(&self, bytes: u64) -> bool {
         if self.log_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes <= self.log_limit {
+            return true;
+        }
+        self.retry_pending_deletes();
+        if self.log_bytes.load(Ordering::SeqCst) <= self.log_limit {
             return true;
         }
         let mut candidates: Vec<(Instant, Arc<Task>)> = lock(&self.registry)
@@ -1359,14 +1553,15 @@ impl Tasks {
         false
     }
 
-    /// Counts `bytes` a task's transcript file took, reserved before; an evicted task's files
-    /// are gone, and the bytes go back.
-    fn hold(&self, task: &Task, bytes: u64) {
+    /// Counts `bytes` written to a task's transcript file; returns `false` without refunding when
+    /// the task was concurrently evicted so the caller closes the handle and runs `reclaim_file`.
+    fn hold(&self, task: &Task, bytes: u64) -> bool {
         let mut out = lock(&task.out);
         if out.evicted {
-            self.log_bytes.fetch_sub(bytes, Ordering::SeqCst);
+            false
         } else {
             out.transcript += bytes;
+            true
         }
     }
 
@@ -1740,15 +1935,23 @@ impl Spool {
     /// Writes `text` after the final lines in place of the pending lines, as final lines or as
     /// the new pending lines; returns whether the file holds `text`.
     fn write(&mut self, text: &[u8], as_final: bool, task: &Task, shared: &Tasks) -> bool {
-        let Some(file) = &mut self.file else {
-            return false;
-        };
         if lock(&task.out).evicted {
-            self.file = None;
+            *lock(&task.transcript_file) = None;
+            return false;
+        }
+        if lock(&task.transcript_file).is_none() {
             return false;
         }
         if self.pending > 0 {
-            if let Err(error) = file.set_len(self.bytes) {
+            let truncated = {
+                let mut file_guard = lock(&task.transcript_file);
+                let Some(file) = file_guard.as_mut() else {
+                    self.pending = 0;
+                    return false;
+                };
+                file.set_len(self.bytes)
+            };
+            if let Err(error) = truncated {
                 self.stopped = Some(format!("writing it failed: {error}"));
                 return false;
             }
@@ -1760,15 +1963,31 @@ impl Spool {
             return true;
         }
         if !shared.reserve(size) {
-            self.stopped = Some("the 1 GiB total log limit is reached".into());
+            self.stopped = Some("the 4 GiB total log limit is reached".into());
             return false;
         }
-        match file
-            .seek(SeekFrom::Start(self.bytes))
-            .and_then(|_| file.write_all(text))
-        {
+        let write_result = {
+            let mut file_guard = lock(&task.transcript_file);
+            match file_guard.as_mut() {
+                Some(file) => Some(
+                    file.seek(SeekFrom::Start(self.bytes))
+                        .and_then(|_| file.write_all(text)),
+                ),
+                None => None,
+            }
+        };
+        let Some(write_result) = write_result else {
+            shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+            return false;
+        };
+        match write_result {
             Ok(()) => {
-                shared.hold(task, size);
+                if !shared.hold(task, size) {
+                    let closed = lock(&task.transcript_file).take();
+                    drop(closed);
+                    shared.reclaim_file(task.transcript_path(), size);
+                    return false;
+                }
                 if as_final {
                     self.bytes += size;
                     self.lines += text.iter().filter(|&&byte| byte == b'\n').count() as u64;
@@ -1778,7 +1997,13 @@ impl Spool {
                 true
             }
             Err(error) => {
-                shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                if lock(&task.out).evicted {
+                    let closed = lock(&task.transcript_file).take();
+                    drop(closed);
+                    shared.reclaim_file(task.transcript_path(), size);
+                } else {
+                    shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                }
                 self.stopped = Some(format!("writing it failed: {error}"));
                 false
             }
@@ -1987,11 +2212,12 @@ fn capture(
         if write_error.is_some() {
             out.log_error = write_error;
         }
-        // An eviction since the room check, its own reservation's included, already gave back
-        // what the log held; the chunk's reservation goes back too.
-        if stored && out.evicted {
-            shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+        // An eviction since the room check may not have known about these bytes yet; drop the
+        // handle and reclaim the file after recording dropped bytes and output activity.
+        let reclaim_evicted = stored && out.evicted;
+        if reclaim_evicted {
             stored = false;
+            log = None;
         }
         let stored = if stored { keep } else { &[] };
         if !stored.is_empty() {
@@ -2005,6 +2231,9 @@ fn capture(
         out.last_output = Some(arrived);
         drop(out);
         drop(terminal);
+        if reclaim_evicted {
+            shared.reclaim_file(task.log_path.clone(), size);
+        }
         task.activity.send_replace(());
     }
     // No later output can end a synchronized update; the screen shows what it held, and that
@@ -2068,39 +2297,35 @@ impl Task {
         }
     }
 
-    pub(crate) fn image_path(&self, index: usize, mime: &str) -> PathBuf {
-        let extension = match mime {
-            "image/jpeg" => "jpg",
-            "image/gif" => "gif",
-            "image/webp" => "webp",
-            _ => "png",
-        };
+    pub(crate) fn attachment_path(&self, index: usize, mime: &str) -> PathBuf {
+        let extension = crate::media::extension_for_mime(mime);
         self.log_path
-            .with_file_name(format!("{}-img-{index}.{extension}", self.id))
+            .with_file_name(format!("{}-att-{index}.{extension}", self.id))
     }
 
-    pub(crate) fn images_between(
-        &self,
-        start: u64,
-        end: u64,
-        seen: usize,
-    ) -> Vec<(StoredImage, bool)> {
+    pub(crate) fn unseen_attachments(&self, seen: usize) -> Vec<AttachmentLease> {
         let out = lock(&self.out);
-        out.images
+        if out.evicted {
+            return Vec::new();
+        }
+        out.attachments
             .iter()
-            .filter_map(|image| {
-                if image.index <= seen {
-                    return None;
-                }
-                if start < image.end_byte && image.end_byte <= end {
-                    Some((image.clone(), false))
-                } else if out.dropped > 0 && end >= out.written && image.end_byte > out.written {
-                    Some((image.clone(), true))
-                } else {
-                    None
-                }
-            })
+            .filter(|slot| slot.meta.index > seen)
+            .filter_map(AttachmentSlot::try_lease)
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unseen_attachment_count(&self, seen: usize) -> usize {
+        let out = lock(&self.out);
+        if out.evicted {
+            0
+        } else {
+            out.attachments
+                .iter()
+                .filter(|slot| slot.meta.index > seen)
+                .count()
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -2445,7 +2670,7 @@ impl Task {
             return Err(EVICTED_TRANSCRIPT.into());
         }
         let Pty { live, spool } = &mut *pty;
-        if spool.file.is_none() {
+        if lock(&self.transcript_file).is_none() {
             let reason = spool.stopped.as_deref().unwrap_or("it is gone");
             return Err(format!("The transcript file is missing: {reason}."));
         }
@@ -4126,7 +4351,7 @@ mod script_tests {
     }
 
     #[test]
-    fn stored_images_follow_byte_ranges_and_release_their_quota_on_eviction() {
+    fn stored_attachments_track_seen_watermarks_and_release_quota_on_eviction() {
         let (runtime, tasks, session) = fixture(Limits::OFF);
         let (task, _, _) = tasks
             .start_script(script_args(&tasks), &session, "1234".into())
@@ -4139,82 +4364,261 @@ mod script_tests {
         });
         let before = tasks.log_bytes.load(Ordering::SeqCst);
         let first = tasks
-            .store_image(&task, 1, b"one", "image/png", 10)
+            .store_attachment(&task, MediaKind::Image, "image/png", b"one")
             .unwrap();
-        assert!(
-            tasks
-                .store_image(&task, 1, b"replacement", "image/png", 10)
-                .is_err()
-        );
-        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(first.index, 1);
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"one");
         let second = tasks
-            .store_image(&task, 2, b"two", "image/png", 20)
+            .store_attachment(&task, MediaKind::Document, "application/pdf", b"two")
             .unwrap();
+        assert_eq!(second.index, 2);
         assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), before + 6);
-        assert!(task.images_between(0, 9, 0).is_empty());
-        assert_eq!(task.images_between(9, 10, 0)[0].0.index, 1);
-        assert_eq!(task.images_between(10, 20, 1)[0].0.index, 2);
-        assert!(task.images_between(20, 20, 2).is_empty());
-        {
-            let mut out = lock(&task.out);
-            out.dropped = 1;
-        }
-        let missing = task.images_between(0, 0, 1);
-        assert_eq!((missing[0].0.index, missing[0].1), (2, true));
-        assert!(task.images_between(0, 0, 2).is_empty());
-        let service = crate::service::Service::new(Arc::clone(&tasks), false);
-        let call = || crate::service::Call {
-            session: &session,
-            launch: None,
-            render: crate::service::Render {
-                output_mode: crate::service::OutputMode::Both,
-                structured_content: true,
-            },
-            cancel: CancellationToken::new(),
-            progress: None,
-            call_id: None,
-            nested: false,
-            started: None,
-            render_slot: None,
-        };
-        runtime.block_on(async {
-            let request = serde_json::json!({
-                "action":"poll","taskId":format!("{}.1234", task.id),"waitMs":0,
-            });
-            let first = service.call_json(request.clone(), call()).await;
-            let first = first.structured_content.unwrap();
-            let omitted = first["codemode"]["imagesNotAttached"].as_array().unwrap();
-            assert_eq!(omitted.len(), 2);
-            assert!(omitted.iter().all(|image| image["reason"] == "log_dropped"));
-            assert!(
-                first["warnings"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|warning| warning.as_str().unwrap().contains("image(s) not attached"))
-            );
-            let second = service.call_json(request, call()).await;
-            let second = second.structured_content.unwrap();
-            assert!(
-                second
-                    .get("codemode")
-                    .and_then(|cm| cm.get("imagesNotAttached"))
-                    .is_none()
-            );
-            assert!(
-                second
-                    .get("warnings")
-                    .and_then(serde_json::Value::as_array)
-                    .is_none_or(|warnings| warnings.iter().all(|warning| !warning
-                        .as_str()
-                        .unwrap()
-                        .contains("image(s) not attached")))
-            );
-        });
+        assert_eq!(task.unseen_attachment_count(0), 2);
+        assert_eq!(task.unseen_attachments(0)[0].meta().index, 1);
+        assert_eq!(task.unseen_attachments(1)[0].meta().index, 2);
+        assert!(task.unseen_attachments(2).is_empty());
+
+        let pinned = task.unseen_attachments(1).pop().unwrap();
         tasks.evict_log(&task);
-        assert!(!first.exists() && !second.exists());
-        assert!(task.images_between(0, 20, 0).is_empty());
+        assert!(!first.path.exists());
+        assert!(
+            second.path.exists(),
+            "pinned attachment must survive eviction until lease drops"
+        );
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 3);
+        drop(pinned);
+        assert!(!second.path.exists());
         assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn failed_unlink_retains_disk_quota_across_task_retirement_and_refunds_once_on_retry() {
+        let (runtime, mut tasks, session) = fixture(Limits {
+            max_running: 16,
+            max_scripts: 4,
+            max_finished: 1,
+            finished_ttl: Some(Duration::from_millis(1)),
+        });
+        Arc::get_mut(&mut tasks).unwrap().set_log_limit(1024);
+        let (task1, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "0001".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task1.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        let baseline = tasks.log_bytes.load(Ordering::SeqCst);
+        assert!(baseline < 900, "unexpected baseline={baseline}");
+        let att_len = (1024 - baseline - 30) as usize;
+        let att1 = tasks
+            .store_attachment(
+                &task1,
+                MediaKind::Document,
+                "application/pdf",
+                &vec![b'x'; att_len],
+            )
+            .unwrap();
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 994);
+
+        let pin = task1.unseen_attachments(0).pop().expect("leased");
+        let fail_deletes = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&fail_deletes);
+        tasks.set_remove_hook(Some(Arc::new(move |path| {
+            if flag.load(Ordering::SeqCst) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "sharing violation",
+                ))
+            } else {
+                std::fs::remove_file(path)
+            }
+        })));
+
+        std::thread::sleep(Duration::from_millis(5));
+        tasks.expire_finished(Instant::now());
+        assert!(
+            tasks.find(&task1.id).is_none(),
+            "task1 removed from registry"
+        );
+        assert!(att1.path.exists(), "read lease kept attachment on disk");
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 994);
+
+        drop(pin);
+        assert!(att1.path.exists());
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 994);
+
+        assert!(!tasks.reserve(40), "must not admit past 1024-byte limit");
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 994);
+
+        fail_deletes.store(false, Ordering::SeqCst);
+        assert!(tasks.reserve(40), "freed pending delete makes room");
+        assert!(!att1.path.exists());
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 40);
+
+        tasks.retry_pending_deletes();
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 40);
+        tasks.log_bytes.fetch_sub(40, Ordering::SeqCst);
+        tasks.set_remove_hook(None);
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn per_task_attachment_cap_stops_at_1024_before_creating_extra_files() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let (task, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "cap1".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        for i in 1..=MAX_TASK_ATTACHMENTS {
+            let meta = tasks
+                .store_attachment(&task, MediaKind::Image, "image/png", b"x")
+                .unwrap();
+            assert_eq!(meta.index, i);
+        }
+        let err = tasks
+            .store_attachment(&task, MediaKind::Image, "image/png", b"x")
+            .unwrap_err();
+        assert!(err.contains("1024"), "{err}");
+        assert!(
+            !task
+                .attachment_path(MAX_TASK_ATTACHMENTS + 1, "image/png")
+                .exists()
+        );
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn pty_eviction_under_terminal_lock_does_not_deadlock_and_concurrent_spool_evict_tracks_delete()
+    {
+        let (_runtime, mut tasks, _session) = fixture(Limits::OFF);
+        Arc::get_mut(&mut tasks).unwrap().set_log_limit(64);
+
+        let make_finished_pty_task = |tasks: &Arc<Tasks>| -> Arc<Task> {
+            let id = tasks.next_id();
+            let log_path = tasks.dir.join(format!("{id}.log"));
+            let _log = private_file(&log_path).unwrap();
+            let transcript_path = tasks.dir.join(format!("{id}.transcript.txt"));
+            let tfile = private_file(&transcript_path).unwrap();
+            let ended_at = OnceLock::new();
+            let _ = ended_at.set(Instant::now());
+            let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
+            let task = Arc::new(Task {
+                id,
+                command: "pty-sim".into(),
+                pty: true,
+                log_path,
+                encoding: encoding_rs::UTF_8,
+                keep: false,
+                owner: "pty-test".into(),
+                started_by: None,
+                started: Instant::now(),
+                root: Root::Script(script),
+                tree_done: watch::Sender::new(true),
+                tree_ended_at: ended_at,
+                kill_error: Mutex::new(None),
+                kill_requested: AtomicBool::new(false),
+                expired: AtomicBool::new(false),
+                out: Mutex::default(),
+                end: Mutex::new(Some(Final {
+                    exit_code: Some(0),
+                    killed: false,
+                    expired: false,
+                    forced_end: false,
+                    elapsed: Duration::ZERO,
+                    output_open: true,
+                    leftovers: Vec::new(),
+                    kept: false,
+                })),
+                done: watch::Sender::new(true),
+                activity: watch::Sender::new(()),
+                input: Mutex::new(None),
+                writer_done: WriterDone::new(true),
+                input_warning: Mutex::new(None),
+                input_error: Mutex::new(None),
+                queued: AtomicUsize::new(0),
+                input_gate: tokio::sync::Mutex::new(()),
+                terminal: Some(Mutex::new(Pty {
+                    live: Live::at(80, 24),
+                    spool: Spool {
+                        bytes: 0,
+                        lines: 0,
+                        pending: 0,
+                        stopped: None,
+                    },
+                })),
+                transcript_file: Mutex::new(Some(tfile)),
+                size: Mutex::new((80, 24)),
+                pty_control: Mutex::new(None),
+                size_error: Mutex::new(None),
+            });
+            lock(&tasks.registry).tasks.push(Arc::clone(&task));
+            task
+        };
+
+        let task = make_finished_pty_task(&tasks);
+        assert!(task.is_finished());
+        // Seed initial transcript bytes while under the 64-byte limit.
+        {
+            let mut pty = lock(task.terminal.as_ref().unwrap());
+            assert!(pty.spool.write(b"first-line\n", true, &task, &tasks));
+        }
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 11);
+
+        // Hold `task.terminal` (exact state of `capture` with open output or `resize`) and write
+        // 60 more bytes (11 + 60 > 64), forcing `reserve` -> `evict_log(&task)` on this thread!
+        {
+            let mut pty = lock(task.terminal.as_ref().unwrap());
+            assert!(!pty.spool.write(&[b'z'; 60], true, &task, &tasks));
+        }
+        assert!(task.evicted());
+        assert!(lock(&task.transcript_file).is_none());
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+
+        // Verify concurrent eviction during `Spool::write` closes `transcript_file` and records
+        // `pending_deletes` when unlinking fails (R4-7).
+        let task2 = make_finished_pty_task(&tasks);
+        let fail_deletes = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&fail_deletes);
+        tasks.set_remove_hook(Some(Arc::new(move |path| {
+            if flag.load(Ordering::SeqCst) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "locked",
+                ))
+            } else {
+                std::fs::remove_file(path)
+            }
+        })));
+        // Hold `task2.out` on a helper thread that flips `out.evicted = true` right after
+        // `Spool::write` finishes writing bytes to disk and waits to call `shared.hold`!
+        assert!(tasks.reserve(20));
+        {
+            let mut fg = lock(&task2.transcript_file);
+            fg.as_mut().unwrap().write_all(&[b'a'; 20]).unwrap();
+        }
+        lock(&task2.out).evicted = true;
+        assert!(!tasks.hold(&task2, 20));
+        let closed = lock(&task2.transcript_file).take();
+        drop(closed);
+        tasks.reclaim_file(task2.transcript_path(), 20);
+        assert_eq!(
+            tasks.log_bytes.load(Ordering::SeqCst),
+            20,
+            "failed unlink must keep transcript bytes charged"
+        );
+        fail_deletes.store(false, Ordering::SeqCst);
+        tasks.retry_pending_deletes();
+        assert!(!task2.transcript_path().exists());
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        tasks.set_remove_hook(None);
         tasks.shutdown();
     }
 
@@ -4287,6 +4691,46 @@ mod script_tests {
         );
         assert!(snap.input_error.is_none(), "{:?}", snap.input_error);
 
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn self_evicting_chunk_records_dropped_bytes_last_output_and_reclaims_quota() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let mut args = script_args(&tasks);
+        args.code = "text('abc')".into();
+        let (task, _, _) = tasks.start_script(args, &session, "ev01".into()).unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while task.is_running() || !task.output_closed() {
+            assert!(Instant::now() < deadline, "script capture never closed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let written_before = lock(&task.out).written;
+        assert!(written_before >= 3);
+
+        let before = tasks.log_limit - 97;
+        tasks.log_bytes.store(before, Ordering::SeqCst);
+        let log = File::create(tasks.dir.join("extra.log")).unwrap();
+        let (chunks, received) = mpsc::sync_channel(1);
+        let arrived = Instant::now() + Duration::from_secs(1);
+        chunks.send(Ok((arrived, vec![b'x'; 99]))).unwrap();
+        drop(chunks);
+        capture(&tasks, &task, received, log, None);
+        let out = lock(&task.out);
+        assert!(out.evicted);
+        assert_eq!((out.written, out.dropped), (written_before, 99));
+        assert_eq!(out.last_output, Some(arrived));
+        assert_eq!(
+            tasks.log_bytes.load(Ordering::SeqCst),
+            before - written_before
+        );
+        drop(out);
         tasks.shutdown();
     }
 }

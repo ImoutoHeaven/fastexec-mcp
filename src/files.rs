@@ -4,7 +4,8 @@
 //! holds a runtime thread. Read streams a file and keeps only the window it may show; write and
 //! edit hold the whole file, because they rewrite it.
 
-use crate::images;
+use crate::lease::{BytePool, Lease};
+use crate::media::{self, CompressFailure, DetectedMedia, MediaKind};
 use crate::service::{self, OutputMode, Render};
 use crate::session::LaunchContext;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -26,8 +27,9 @@ const MAX_LINES: u64 = 2000;
 const MAX_BYTES: u64 = 50 * 1024;
 /// The most bytes a nested codemode read shows.
 const NESTED_MAX_BYTES: u64 = 4 << 20;
-/// How much of a file is sniffed before deciding whether it is text.
-const SNIFF: usize = 8 * 1024;
+/// How much of a file is sniffed before deciding whether it is media or text.
+const SNIFF: usize = media::SNIFF;
+const MEDIA_READ_CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReadLimits {
@@ -111,40 +113,81 @@ pub struct Edit {
     pub end_line: Option<u64>,
 }
 
+#[derive(Debug)]
+pub struct TaskMeta {
+    pub bare_task_id: String,
+    pub log_path: String,
+}
+
+pub struct TrackedResult {
+    pub result: CallToolResult,
+    pub lease: Option<Lease>,
+    pub overload: bool,
+    pub task_meta: Option<TaskMeta>,
+}
+
+impl TrackedResult {
+    pub fn plain(result: CallToolResult) -> Self {
+        Self {
+            result,
+            lease: None,
+            overload: false,
+            task_meta: None,
+        }
+    }
+}
+
 /// Runs one file tool from raw arguments, the way a daemon receives them, with the same
 /// validation and errors as a local call.
-pub async fn call(
+pub async fn call_tracked(
     tool: &str,
     arguments: Value,
     launch: Arc<LaunchContext>,
     transfer: bool,
     render: Render,
-) -> CallToolResult {
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) -> TrackedResult {
     match tool {
         "read" => match serde_json::from_value::<ReadRequest>(arguments) {
-            Ok(request) => read(request, launch, transfer, render).await,
-            Err(error) => schema_failed(format!("failed to deserialize parameters: {error}")),
+            Ok(request) => read_tracked(request, launch, transfer, render, cancel).await,
+            Err(error) => TrackedResult::plain(schema_failed(format!(
+                "failed to deserialize parameters: {error}"
+            ))),
         },
         "write" => match serde_json::from_value::<WriteRequest>(arguments) {
-            Ok(request) => write(request, launch, render).await,
-            Err(error) => schema_failed(format!("failed to deserialize parameters: {error}")),
+            Ok(request) => TrackedResult::plain(write(request, launch, render).await),
+            Err(error) => TrackedResult::plain(schema_failed(format!(
+                "failed to deserialize parameters: {error}"
+            ))),
         },
         "edit" => match serde_json::from_value::<EditRequest>(arguments) {
-            Ok(request) => edit(request, launch, render).await,
-            Err(error) => schema_failed(format!("failed to deserialize parameters: {error}")),
+            Ok(request) => TrackedResult::plain(edit(request, launch, render).await),
+            Err(error) => TrackedResult::plain(schema_failed(format!(
+                "failed to deserialize parameters: {error}"
+            ))),
         },
-        other => schema_failed(format!("unknown tool {other}")),
+        other => TrackedResult::plain(schema_failed(format!("unknown tool {other}"))),
     }
 }
 
-/// Reads one file: its text, or the message saying why it is not shown.
-pub async fn read(
+/// Reads one file: its text, media attachment, or the message saying why it is not shown.
+pub async fn read_tracked(
     request: ReadRequest,
     launch: Arc<LaunchContext>,
     transfer: bool,
     render: Render,
-) -> CallToolResult {
-    read_with_limits(request, launch, transfer, render, ReadLimits::DIRECT).await
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) -> TrackedResult {
+    read_with_limits_and_permit(
+        request,
+        launch,
+        transfer,
+        render,
+        ReadLimits::DIRECT,
+        None,
+        cancel,
+    )
+    .await
 }
 
 /// Reads one file for an in-process codemode script: whole-file when neither `offset` nor
@@ -168,16 +211,7 @@ pub(crate) async fn read_nested(
         Some(cancel),
     )
     .await
-}
-
-async fn read_with_limits(
-    request: ReadRequest,
-    launch: Arc<LaunchContext>,
-    transfer: bool,
-    render: Render,
-    limits: ReadLimits,
-) -> CallToolResult {
-    read_with_limits_and_permit(request, launch, transfer, render, limits, None, None).await
+    .result
 }
 
 async fn read_with_limits_and_permit(
@@ -188,50 +222,77 @@ async fn read_with_limits_and_permit(
     limits: ReadLimits,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     cancel: Option<tokio_util::sync::CancellationToken>,
-) -> CallToolResult {
+) -> TrackedResult {
     let effective = render.effective();
-    let result = match tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        read_text_cancellable(&request, &launch, transfer, limits, cancel.as_ref())
+        read_cancellable(&request, &launch, transfer, limits, cancel.as_ref())
     })
     .await
     {
-        Ok(Ok(outcome)) => outcome.into_result(effective),
-        Ok(Err(message)) => failed(message),
-        Err(error) => failed(format!("the file operation did not finish: {error}")),
-    };
-    service::suppress(result, effective)
+        Ok(Ok(outcome)) => outcome.into_tracked(effective),
+        Ok(Err(ReadFailure::Overload(message))) => TrackedResult {
+            result: service::suppress(failed(message), effective),
+            lease: None,
+            overload: true,
+            task_meta: None,
+        },
+        Ok(Err(ReadFailure::Error(message))) => {
+            TrackedResult::plain(service::suppress(failed(message), effective))
+        }
+        Err(error) => TrackedResult::plain(service::suppress(
+            failed(format!("the file operation did not finish: {error}")),
+            effective,
+        )),
+    }
 }
 
-/// What a read answers with: its text, and the image that text names when the file is an image.
+enum ReadFailure {
+    Error(String),
+    Overload(String),
+}
+
+impl From<String> for ReadFailure {
+    fn from(message: String) -> Self {
+        Self::Error(message)
+    }
+}
+
+/// What a read answers with: its text, and its media block when a media file is attached.
 pub struct Outcome {
     pub text: String,
     pub notice: String,
     pub body: Option<String>,
-    pub image: Option<(String, String)>,
+    pub attachment: Option<ContentBlock>,
+    pub lease: Option<Lease>,
     pub structured: Value,
 }
 
 impl Outcome {
-    fn into_result(self, render: Render) -> CallToolResult {
+    fn into_tracked(self, render: Render) -> TrackedResult {
         let mut structured = self.structured;
         if render.output_mode != OutputMode::Text
             && let Some(body) = self.body
         {
             structured["text"] = json!(body);
         }
-        let shown = if render.output_mode == OutputMode::Structured && self.image.is_none() {
+        let shown = if render.output_mode == OutputMode::Structured && self.attachment.is_none() {
             self.notice
         } else {
             self.text
         };
         let mut blocks = vec![ContentBlock::text(shown)];
-        if let Some((data, mime)) = self.image {
-            blocks.push(ContentBlock::image(data, mime));
+        if let Some(attachment) = self.attachment {
+            blocks.push(attachment);
         }
         let mut result = CallToolResult::success(blocks);
         result.structured_content = Some(structured);
-        result
+        TrackedResult {
+            result: service::suppress(result, render),
+            lease: self.lease,
+            overload: false,
+            task_meta: None,
+        }
     }
 }
 
@@ -599,7 +660,9 @@ fn read_text(
     transfer: bool,
     limits: ReadLimits,
 ) -> Result<Outcome, String> {
-    read_text_cancellable(request, launch, transfer, limits, None)
+    read_cancellable(request, launch, transfer, limits, None).map_err(|failure| match failure {
+        ReadFailure::Error(msg) | ReadFailure::Overload(msg) => msg,
+    })
 }
 
 fn count_lines_streaming(
@@ -635,70 +698,473 @@ fn bytecount_lf(bytes: &[u8]) -> u64 {
     bytes.iter().filter(|&&b| b == b'\n').count() as u64
 }
 
-fn read_text_cancellable(
+pub(crate) enum MediaStart<'a> {
+    Prefix(&'a [u8]),
+    Rewind,
+}
+
+pub(crate) enum MediaBytes {
+    Loaded { bytes: Vec<u8>, lease: Lease },
+    Oversized { exact_source_bytes: Option<u64> },
+}
+
+#[derive(Debug)]
+pub(crate) enum MediaReadError {
+    Io(io::Error),
+    Cancelled,
+    Overload,
+}
+
+const BASE_MEDIA_FRAME_OVERHEAD: usize = 1024;
+
+fn media_frame_overhead(path_len: usize) -> usize {
+    BASE_MEDIA_FRAME_OVERHEAD.saturating_add(path_len.saturating_mul(10))
+}
+
+fn peak_media_lease(raw_len: usize, frame_overhead: Option<usize>) -> Option<usize> {
+    if let Some(overhead) = frame_overhead {
+        let b64 = raw_len.checked_add(2)?.checked_div(3)?.checked_mul(4)?;
+        let read_peak = raw_len.checked_add(b64)?;
+        let outbound_peak = b64.checked_mul(2)?.checked_add(overhead)?;
+        Some(read_peak.max(outbound_peak))
+    } else {
+        Some(raw_len)
+    }
+}
+
+/// Reads a regular file from byte 0 (either reusing an already-read prefix or rewinding via
+/// `seek(0)`), bounded to `max_media_bytes + 1` total bytes so growth past the limit is detected
+/// without loading the rest of the file.
+pub(crate) fn read_media_from_zero(
+    reader: &mut (impl Read + Seek),
+    initial_len: u64,
+    start: MediaStart<'_>,
+    max_media_bytes: u64,
+    pool: &Arc<BytePool>,
+    frame_overhead: Option<usize>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<MediaBytes, MediaReadError> {
+    if initial_len > max_media_bytes {
+        return Ok(MediaBytes::Oversized {
+            exact_source_bytes: Some(initial_len),
+        });
+    }
+    let max = usize::try_from(max_media_bytes).unwrap_or(usize::MAX - 1);
+    let prefix_len = match start {
+        MediaStart::Prefix(prefix) => prefix.len(),
+        MediaStart::Rewind => 0,
+    };
+    if prefix_len > max {
+        return Ok(MediaBytes::Oversized {
+            exact_source_bytes: None,
+        });
+    }
+    let expected = (initial_len as usize).max(prefix_len);
+    let initial_peak =
+        peak_media_lease(expected, frame_overhead).ok_or(MediaReadError::Overload)?;
+    let mut lease = pool
+        .try_acquire(initial_peak)
+        .ok_or(MediaReadError::Overload)?;
+    let mut raw = Vec::with_capacity(expected);
+    let mut remaining = match start {
+        MediaStart::Prefix(prefix) => {
+            raw.extend_from_slice(prefix);
+            (max + 1) - prefix.len()
+        }
+        MediaStart::Rewind => {
+            if let Err(err) = reader.seek(SeekFrom::Start(0)) {
+                drop(raw);
+                drop(lease);
+                return Err(MediaReadError::Io(err));
+            }
+            max + 1
+        }
+    };
+    let mut chunk = vec![0_u8; MEDIA_READ_CHUNK];
+    while remaining > 0 {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            drop(chunk);
+            drop(raw);
+            drop(lease);
+            return Err(MediaReadError::Cancelled);
+        }
+        let want = remaining.min(chunk.len());
+        let read = match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                drop(chunk);
+                drop(raw);
+                drop(lease);
+                return Err(MediaReadError::Io(err));
+            }
+        };
+        let next_len = raw.len() + read;
+        if next_len > max {
+            drop(chunk);
+            drop(raw);
+            drop(lease);
+            return Ok(MediaBytes::Oversized {
+                exact_source_bytes: None,
+            });
+        }
+        let Some(needed_peak) = peak_media_lease(next_len, frame_overhead) else {
+            drop(chunk);
+            drop(raw);
+            drop(lease);
+            return Err(MediaReadError::Overload);
+        };
+        if needed_peak > lease.bytes() && !lease.try_resize(needed_peak) {
+            drop(chunk);
+            drop(raw);
+            drop(lease);
+            return Err(MediaReadError::Overload);
+        }
+        raw.extend_from_slice(&chunk[..read]);
+        remaining -= read;
+    }
+    drop(chunk);
+    let final_peak = peak_media_lease(raw.len(), frame_overhead).unwrap_or(lease.bytes());
+    lease.shrink_to(final_peak);
+    Ok(MediaBytes::Loaded { bytes: raw, lease })
+}
+
+fn action_hint(transfer: bool) -> &'static str {
+    if transfer {
+        " Inspect it with exec or download it with transfer."
+    } else {
+        " Inspect it with exec."
+    }
+}
+
+fn oversized_note(
+    kind: MediaKind,
+    shown_path: &str,
+    mime: &str,
+    source_bytes: Option<u64>,
+    max_media_bytes: u64,
+    transfer: bool,
+) -> String {
+    let hint = action_hint(transfer);
+    match source_bytes {
+        Some(size) => format!(
+            "Cannot attach {} file {shown_path} [{mime}]: its size ({size} bytes) exceeds FASTEXEC_MAX_MEDIA_BYTES ({max_media_bytes} bytes).{hint}",
+            kind.as_str()
+        ),
+        None => format!(
+            "Cannot attach {} file {shown_path} [{mime}]: it grew past FASTEXEC_MAX_MEDIA_BYTES ({max_media_bytes} bytes) while reading.{hint}",
+            kind.as_str()
+        ),
+    }
+}
+
+fn unattached_outcome(
+    kind: MediaKind,
+    shown_path: String,
+    mime: String,
+    source_bytes: Option<u64>,
+    note: String,
+    nested: bool,
+) -> Outcome {
+    let flag_key = if nested { "attachable" } else { "attached" };
+    let mut map = serde_json::Map::new();
+    map.insert("ok".into(), json!(true));
+    map.insert("kind".into(), json!(kind.as_str()));
+    map.insert("path".into(), json!(shown_path));
+    map.insert("mimeType".into(), json!(mime));
+    map.insert(flag_key.into(), json!(false));
+    if let Some(size) = source_bytes {
+        map.insert("sourceBytes".into(), json!(size));
+    }
+    map.insert("note".into(), json!(note.clone()));
+    Outcome {
+        notice: note.clone(),
+        text: note,
+        body: None,
+        attachment: None,
+        lease: None,
+        structured: Value::Object(map),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_media_outcome(
+    file: &mut File,
+    initial_len: u64,
+    prefix: &[u8],
+    resolved: &Path,
+    shown_path: String,
+    detected: DetectedMedia,
+    launch: &LaunchContext,
+    transfer: bool,
+    limits: ReadLimits,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Outcome, ReadFailure> {
+    let max_media_bytes = launch.max_media_bytes().map_err(ReadFailure::Error)?;
+    let compress = launch.image_compress().map_err(ReadFailure::Error)?;
+    if limits == ReadLimits::NESTED {
+        if initial_len > max_media_bytes {
+            let exact = file
+                .metadata()
+                .ok()
+                .map(|m| m.len())
+                .filter(|&len| len == initial_len);
+            let note = oversized_note(
+                detected.kind,
+                &shown_path,
+                detected.mime,
+                exact,
+                max_media_bytes,
+                transfer,
+            );
+            return Ok(unattached_outcome(
+                detected.kind,
+                shown_path,
+                detected.mime.to_owned(),
+                exact,
+                note,
+                true,
+            ));
+        }
+        let structured = json!({
+            "ok": true,
+            "kind": detected.kind.as_str(),
+            "path": shown_path,
+            "mimeType": detected.mime,
+            "bytes": initial_len,
+            "attachable": true,
+        });
+        let summary = format!(
+            "Read {} file [{}] ({} B)",
+            detected.kind.as_str(),
+            detected.mime,
+            initial_len
+        );
+        return Ok(Outcome {
+            notice: summary.clone(),
+            text: summary,
+            body: None,
+            attachment: None,
+            lease: None,
+            structured,
+        });
+    }
+
+    let frame_overhead = media_frame_overhead(shown_path.len().max(resolved.as_os_str().len()));
+    let loaded = match read_media_from_zero(
+        file,
+        initial_len,
+        MediaStart::Prefix(prefix),
+        max_media_bytes,
+        launch.memory(),
+        Some(frame_overhead),
+        cancel,
+    ) {
+        Ok(MediaBytes::Loaded { bytes, lease }) => (bytes, lease),
+        Ok(MediaBytes::Oversized { exact_source_bytes }) => {
+            let exact = exact_source_bytes
+                .filter(|&len| file.metadata().ok().map(|m| m.len()) == Some(len));
+            let note = oversized_note(
+                detected.kind,
+                &shown_path,
+                detected.mime,
+                exact,
+                max_media_bytes,
+                transfer,
+            );
+            return Ok(unattached_outcome(
+                detected.kind,
+                shown_path,
+                detected.mime.to_owned(),
+                exact,
+                note,
+                false,
+            ));
+        }
+        Err(MediaReadError::Io(error)) => {
+            return Err(ReadFailure::Error(format!(
+                "Cannot read {shown_path}: {error}."
+            )));
+        }
+        Err(MediaReadError::Cancelled) => {
+            return Err(ReadFailure::Error("Cancelled while reading file.".into()));
+        }
+        Err(MediaReadError::Overload) => {
+            return Err(ReadFailure::Overload(format!(
+                "Cannot read {shown_path}: server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
+                launch.memory().limit()
+            )));
+        }
+    };
+
+    let (raw, mut lease) = loaded;
+    if compress
+        && detected.kind == MediaKind::Image
+        && media::is_compressible_image(detected.mime, &raw)
+    {
+        let source_len = raw.len() as u64;
+        match media::compress_image(raw, detected.mime, &mut lease) {
+            Ok(compressed) => {
+                let sent_bytes = compressed.bytes.len() as u64;
+                let b64_len = compressed.bytes.len().div_ceil(3) * 4;
+                let outbound_peak = b64_len.saturating_mul(2).saturating_add(frame_overhead);
+                let needed = compressed
+                    .bytes
+                    .len()
+                    .saturating_add(b64_len)
+                    .max(outbound_peak);
+                if needed > lease.bytes() && !lease.try_resize(needed) {
+                    drop(compressed);
+                    drop(lease);
+                    return Err(ReadFailure::Overload(format!(
+                        "Cannot read {shown_path}: server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
+                        launch.memory().limit()
+                    )));
+                }
+                let encoded = media::encode_base64(&compressed.bytes);
+                drop(compressed.bytes);
+                lease.shrink_to(outbound_peak);
+                let mut text = format!("Read image file [{}] ({sent_bytes} B)", compressed.mime);
+                for hint in &compressed.hints {
+                    text.push('\n');
+                    text.push_str(hint);
+                }
+                let mut map = serde_json::Map::new();
+                map.insert("ok".into(), json!(true));
+                map.insert("kind".into(), json!("image"));
+                map.insert("path".into(), json!(shown_path));
+                map.insert("mimeType".into(), json!(compressed.mime.clone()));
+                map.insert("bytes".into(), json!(sent_bytes));
+                map.insert("attached".into(), json!(true));
+                if compressed.transformed {
+                    map.insert("originalBytes".into(), json!(compressed.original_bytes));
+                    map.insert("originalWidth".into(), json!(compressed.original_width));
+                    map.insert("originalHeight".into(), json!(compressed.original_height));
+                    map.insert("width".into(), json!(compressed.width));
+                    map.insert("height".into(), json!(compressed.height));
+                }
+                let block =
+                    media::content_block(MediaKind::Image, &compressed.mime, encoded, resolved);
+                return Ok(Outcome {
+                    notice: text.clone(),
+                    text,
+                    body: None,
+                    attachment: Some(block),
+                    lease: Some(lease),
+                    structured: Value::Object(map),
+                });
+            }
+            Err(CompressFailure::Overload) => {
+                drop(lease);
+                return Err(ReadFailure::Overload(format!(
+                    "Cannot read {shown_path}: server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
+                    launch.memory().limit()
+                )));
+            }
+            Err(CompressFailure::Rejected(reason)) => {
+                drop(lease);
+                let hint = action_hint(transfer);
+                let note = format!(
+                    "Cannot attach image file {shown_path} [{}] ({source_len} bytes): {reason}{hint}",
+                    detected.mime
+                );
+                return Ok(unattached_outcome(
+                    MediaKind::Image,
+                    shown_path,
+                    detected.mime.to_owned(),
+                    Some(source_len),
+                    note,
+                    false,
+                ));
+            }
+        }
+    }
+
+    let sent_bytes = raw.len() as u64;
+    let encoded = media::encode_base64(&raw);
+    drop(raw);
+    let outbound_peak = encoded
+        .len()
+        .saturating_mul(2)
+        .saturating_add(frame_overhead);
+    lease.shrink_to(outbound_peak);
+    let text = format!(
+        "Read {} file [{}] ({sent_bytes} B)",
+        detected.kind.as_str(),
+        detected.mime
+    );
+    let block = media::content_block(detected.kind, detected.mime, encoded, resolved);
+    let structured = json!({
+        "ok": true,
+        "kind": detected.kind.as_str(),
+        "path": shown_path,
+        "mimeType": detected.mime,
+        "bytes": sent_bytes,
+        "attached": true,
+    });
+    Ok(Outcome {
+        notice: text.clone(),
+        text,
+        body: None,
+        attachment: Some(block),
+        lease: Some(lease),
+        structured,
+    })
+}
+
+fn read_cancellable(
     request: &ReadRequest,
     launch: &LaunchContext,
     transfer: bool,
     limits: ReadLimits,
     cancel: Option<&tokio_util::sync::CancellationToken>,
-) -> Result<Outcome, String> {
+) -> Result<Outcome, ReadFailure> {
+    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Err(ReadFailure::Error("Cancelled while reading file.".into()));
+    }
     if request.offset == Some(0) {
-        return Err("offset must be non-zero (1-indexed from start, or negative from end).".into());
+        return Err(ReadFailure::Error(
+            "offset must be non-zero (1-indexed from start, or negative from end).".into(),
+        ));
     }
     if request.limit == Some(0) {
-        return Err("limit must be at least 1.".into());
+        return Err(ReadFailure::Error("limit must be at least 1.".into()));
     }
-    let resolved = resolve(&request.path, launch)?;
+    let resolved = resolve(&request.path, launch).map_err(ReadFailure::Error)?;
     let shown_path = display_path(&resolved);
     let (mut file, metadata) = open_regular(&resolved).map_err(|error| {
         if error.kind() == io::ErrorKind::IsADirectory {
-            format!("Cannot read {shown_path}: {error}; list it with exec.")
+            ReadFailure::Error(format!(
+                "Cannot read {shown_path}: {error}; list it with exec."
+            ))
         } else {
-            format!("Cannot read {shown_path}: {error}.")
+            ReadFailure::Error(format!("Cannot read {shown_path}: {error}."))
         }
     })?;
     let mut sniff = vec![0u8; SNIFF];
     let sniffed = read_upto(&mut file, &mut sniff)
-        .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
-    if let Some(mime) = images::detect(&sniff[..sniffed]) {
-        // The encoded image is read within the ceiling the decoder allocates under, so a file
-        // far larger than any inline image is never loaded.
-        let bytes = images::read_encoded(&mut file, metadata.len())
-            .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
-        let processed = match bytes {
-            Some(bytes) => images::process(bytes, mime),
-            None => images::oversized(mime),
-        };
-        let attached = processed.image.is_some();
-        let structured = json!({
-            "ok": true,
-            "kind": "image",
-            "path": shown_path,
-            "mimeType": processed.mime,
-            "attached": attached,
-            "originalWidth": processed.original_width,
-            "originalHeight": processed.original_height,
-            "width": processed.width,
-            "height": processed.height,
-        });
-        return Ok(Outcome {
-            notice: processed.text.clone(),
-            text: processed.text,
-            body: None,
-            image: processed.image,
-            structured,
-        });
+        .map_err(|error| ReadFailure::Error(format!("Cannot read {shown_path}: {error}.")))?;
+    if let Some(detected) = media::detect_path(&sniff[..sniffed], Some(&resolved)) {
+        return read_media_outcome(
+            &mut file,
+            metadata.len(),
+            &sniff[..sniffed],
+            &resolved,
+            shown_path,
+            detected,
+            launch,
+            transfer,
+            limits,
+            cancel,
+        );
     }
     if sniff[..sniffed].contains(&0) {
-        let hint = if transfer {
-            " Inspect it with exec or download it with transfer."
-        } else {
-            " Inspect it with exec."
-        };
-        return Err(format!(
+        let hint = action_hint(transfer);
+        return Err(ReadFailure::Error(format!(
             "{shown_path} is a binary file ({} bytes).{hint}",
             metadata.len()
-        ));
+        )));
     }
     if limits == ReadLimits::NESTED && request.offset.is_none() && request.limit.is_none() {
         return read_whole_utf8(
@@ -708,12 +1174,13 @@ fn read_text_cancellable(
             &shown_path,
             limits.max_bytes,
             cancel,
-        );
+        )
+        .map_err(ReadFailure::Error);
     }
     let tail = if let Some(offset) = request.offset.filter(|off| *off < 0) {
         Some((
             offset.unsigned_abs(),
-            count_lines_streaming(&mut file, &shown_path, cancel)?,
+            count_lines_streaming(&mut file, &shown_path, cancel).map_err(ReadFailure::Error)?,
         ))
     } else {
         None
@@ -729,15 +1196,15 @@ fn read_text_cancellable(
         )
     };
     let (start_line, window) = if let Some((distance, total)) = tail {
-        scan_from_end(distance, total, &shown_path, scan)?
+        scan_from_end(distance, total, &shown_path, scan).map_err(ReadFailure::Error)?
     } else {
         let start = request.offset.unwrap_or(1) as u64;
-        let window = scan(start)?;
+        let window = scan(start).map_err(ReadFailure::Error)?;
         if start > 1 && start > window.total_lines {
-            return Err(format!(
+            return Err(ReadFailure::Error(format!(
                 "Offset {start} is beyond end of file ({} lines total)",
                 window.total_lines
-            ));
+            )));
         }
         (start, window)
     };
@@ -830,7 +1297,8 @@ fn read_whole_utf8(
         text: body.clone(),
         notice,
         body: Some(body),
-        image: None,
+        attachment: None,
+        lease: None,
         structured,
     })
 }
@@ -1284,7 +1752,8 @@ impl Window {
             text,
             notice,
             body: Some(body),
-            image: None,
+            attachment: None,
+            lease: None,
             structured,
         }
     }
@@ -6048,27 +6517,33 @@ mod tests {
         let outcome = read_text(
             &ReadRequest {
                 path,
-                offset: None,
-                limit: None,
+                offset: Some(5),
+                limit: Some(10),
             },
             &launch,
             false,
             ReadLimits::DIRECT,
         )
         .unwrap();
-        assert_eq!(outcome.text, "Read image file [image/png]");
-        let (data, mime) = outcome.image.expect("the image travels with the text");
-        assert_eq!(mime, "image/png");
         assert_eq!(
-            data,
+            outcome.text,
+            format!("Read image file [image/png] ({} B)", png.len())
+        );
+        assert_eq!(outcome.structured["bytes"], png.len() as u64);
+        assert_eq!(outcome.structured["attached"], true);
+        assert!(outcome.structured.get("width").is_none());
+        let block = outcome.attachment.expect("the image travels with the text");
+        let img = block.as_image().expect("image block");
+        assert_eq!(img.mime_type, "image/png");
+        assert_eq!(
+            img.data,
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png)
         );
     }
 
     #[test]
-    fn read_reports_an_animated_png_as_a_binary_file() {
+    fn read_attaches_animated_png_by_default_and_passes_through_under_compress_mode() {
         let scratch = Scratch::new("animated");
-        let launch = context(&scratch.0, &scratch.0);
         let png = png_bytes(4, 4);
         let mut animated = png[..33].to_vec();
         animated.extend_from_slice(&[0, 0, 0, 8]);
@@ -6078,19 +6553,284 @@ mod tests {
         animated.extend_from_slice(&png[33..]);
         scratch.file("moving.png", &animated);
         let path = scratch.path("moving.png");
-        let message = read_text(
-            &ReadRequest {
-                path,
-                offset: None,
-                limit: None,
-            },
-            &launch,
-            false,
-            ReadLimits::DIRECT,
-        )
-        .err()
-        .expect("an animated PNG is not an image a model reads");
-        assert!(message.contains("is a binary file"), "{message}");
+
+        for compress in ["false", "true"] {
+            let launch = LaunchContext::new(
+                scratch.0.clone(),
+                vec![
+                    ("HOME".into(), scratch.0.as_os_str().to_owned()),
+                    ("FASTEXEC_IMAGE_COMPRESS".into(), compress.into()),
+                ],
+            );
+            let outcome = read_text(
+                &ReadRequest {
+                    path: path.clone(),
+                    offset: None,
+                    limit: None,
+                },
+                &launch,
+                false,
+                ReadLimits::DIRECT,
+            )
+            .unwrap();
+            assert_eq!(outcome.structured["attached"], true);
+            assert_eq!(outcome.structured["bytes"], animated.len() as u64);
+            let img = outcome.attachment.unwrap();
+            assert_eq!(
+                img.as_image().unwrap().data,
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &animated)
+            );
+        }
+    }
+
+    #[test]
+    fn media_reads_count_from_byte_zero_for_both_prefix_and_rewind_and_handle_growth_and_io_errors()
+    {
+        // Test exact N-1, N pass and N+1 reject from byte 0 on both Prefix and Rewind paths.
+        let total = 10_000usize;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let pool = BytePool::new(1 << 20);
+
+        for use_prefix in [true, false] {
+            for (max_cap, expect_ok) in [
+                ((total + 1) as u64, true),
+                (total as u64, true),
+                ((total - 1) as u64, false),
+            ] {
+                let mut cursor = std::io::Cursor::new(payload.clone());
+                let mut prefix = vec![0u8; SNIFF];
+                let sniffed = cursor.read(&mut prefix).unwrap();
+                assert_eq!(sniffed, SNIFF);
+                let start = if use_prefix {
+                    MediaStart::Prefix(&prefix[..sniffed])
+                } else {
+                    MediaStart::Rewind
+                };
+                // Pass initial_len = SNIFF as u64 when testing N+1 growth detection so the streaming
+                // loop exercises the exact max + 1 - sniffed / max + 1 byte cap from byte 0.
+                let initial_len = if expect_ok {
+                    payload.len() as u64
+                } else {
+                    SNIFF as u64
+                };
+                match read_media_from_zero(
+                    &mut cursor,
+                    initial_len,
+                    start,
+                    max_cap,
+                    &pool,
+                    Some(BASE_MEDIA_FRAME_OVERHEAD),
+                    None,
+                )
+                .unwrap()
+                {
+                    MediaBytes::Loaded { bytes, lease } => {
+                        assert!(expect_ok, "expected rejection for max_cap={max_cap}");
+                        assert_eq!(bytes, payload);
+                        drop(bytes);
+                        drop(lease);
+                    }
+                    MediaBytes::Oversized { exact_source_bytes } => {
+                        assert!(!expect_ok, "expected pass for max_cap={max_cap}");
+                        assert_eq!(
+                            exact_source_bytes, None,
+                            "concurrent growth past limit must not claim sample length as exact"
+                        );
+                    }
+                }
+                assert_eq!(pool.used(), 0);
+            }
+        }
+
+        // True I/O failure mid-stream returns MediaReadError::Io, never Oversized/unattached.
+        struct MidFailReader {
+            emitted: usize,
+        }
+        impl Read for MidFailReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.emitted == 0 {
+                    buf[0] = 1;
+                    self.emitted = 1;
+                    Ok(1)
+                } else {
+                    Err(io::Error::other("disk read fault"))
+                }
+            }
+        }
+        impl Seek for MidFailReader {
+            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+                Ok(0)
+            }
+        }
+        let mut failing = MidFailReader { emitted: 0 };
+        assert!(matches!(
+            read_media_from_zero(
+                &mut failing,
+                100,
+                MediaStart::Rewind,
+                1000,
+                &pool,
+                Some(BASE_MEDIA_FRAME_OVERHEAD),
+                None,
+            ),
+            Err(MediaReadError::Io(_))
+        ));
+        assert_eq!(pool.used(), 0);
+
+        // Cancellation mid-stream aborts at the 64 KiB chunk boundary and releases the lease.
+        let token = tokio_util::sync::CancellationToken::new();
+        struct CancelAfterFirstChunkReader {
+            read_calls: usize,
+            token: tokio_util::sync::CancellationToken,
+        }
+        impl Read for CancelAfterFirstChunkReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.read_calls += 1;
+                buf.fill(0x55);
+                if self.read_calls == 1 {
+                    self.token.cancel();
+                }
+                Ok(buf.len())
+            }
+        }
+        impl Seek for CancelAfterFirstChunkReader {
+            fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+                Ok(0)
+            }
+        }
+        let mut cancellable = CancelAfterFirstChunkReader {
+            read_calls: 0,
+            token: token.clone(),
+        };
+        assert!(matches!(
+            read_media_from_zero(
+                &mut cancellable,
+                256 * 1024,
+                MediaStart::Rewind,
+                1024 * 1024,
+                &pool,
+                Some(BASE_MEDIA_FRAME_OVERHEAD),
+                Some(&token),
+            ),
+            Err(MediaReadError::Cancelled)
+        ));
+        assert_eq!(
+            cancellable.read_calls, 1,
+            "must stop at next 64 KiB chunk boundary"
+        );
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn multimodal_read_enforces_zero_guards_nested_descriptors_and_output_modes() {
+        let scratch = Scratch::new("multimodal-modes");
+        let pdf = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        scratch.file("doc.pdf", pdf);
+        let mut wav = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00".to_vec();
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&44_100u32.to_le_bytes());
+        wav.extend_from_slice(&[0u8; 8]);
+        scratch.file("tone.wav", &wav);
+        let mut mp4 = Vec::new();
+        mp4.extend_from_slice(&20u32.to_be_bytes());
+        mp4.extend_from_slice(b"ftypisom\0\0\0\0mp42");
+        scratch.file("clip.mp4", &mp4);
+
+        let launch = context(&scratch.0, &scratch.0);
+
+        // offset: 0 and limit: 0 fail on media files just like text files.
+        assert!(
+            read_text(
+                &ReadRequest {
+                    path: scratch.path("doc.pdf"),
+                    offset: Some(0),
+                    limit: None
+                },
+                &launch,
+                false,
+                ReadLimits::DIRECT
+            )
+            .is_err()
+        );
+        assert!(
+            read_text(
+                &ReadRequest {
+                    path: scratch.path("doc.pdf"),
+                    offset: None,
+                    limit: Some(0)
+                },
+                &launch,
+                false,
+                ReadLimits::DIRECT
+            )
+            .is_err()
+        );
+
+        // Valid offset/limit are silently ignored on PDF, WAV, and MP4, and all output modes omit structured["text"].
+        for (file, expected_kind, expected_mime) in [
+            ("doc.pdf", "document", "application/pdf"),
+            ("tone.wav", "audio", "audio/wav"),
+            ("clip.mp4", "video", "video/mp4"),
+        ] {
+            for mode in [OutputMode::Text, OutputMode::Both, OutputMode::Structured] {
+                for sc in [true, false] {
+                    let out = read_text(
+                        &ReadRequest {
+                            path: scratch.path(file),
+                            offset: Some(-5),
+                            limit: Some(2),
+                        },
+                        &launch,
+                        true,
+                        ReadLimits::DIRECT,
+                    )
+                    .unwrap();
+                    let tracked = out.into_tracked(
+                        Render {
+                            output_mode: mode,
+                            structured_content: sc,
+                        }
+                        .effective(),
+                    );
+                    assert_eq!(tracked.result.content.len(), 2);
+                    let head = tracked.result.content[0].as_text().unwrap();
+                    assert!(
+                        head.text
+                            .starts_with(&format!("Read {expected_kind} file [{expected_mime}]")),
+                        "{}",
+                        head.text
+                    );
+                    if sc {
+                        let meta = tracked.result.structured_content.as_ref().unwrap();
+                        assert_eq!(meta["kind"], expected_kind);
+                        assert_eq!(meta["mimeType"], expected_mime);
+                        assert_eq!(meta["attached"], true);
+                        assert!(meta.get("text").is_none());
+                    } else {
+                        assert!(tracked.result.structured_content.is_none());
+                    }
+                }
+            }
+
+            // Nested codemode read returns attachable descriptor without base64 attachment.
+            let nested = read_text(
+                &ReadRequest {
+                    path: scratch.path(file),
+                    offset: None,
+                    limit: None,
+                },
+                &launch,
+                false,
+                ReadLimits::NESTED,
+            )
+            .unwrap();
+            assert!(nested.attachment.is_none());
+            assert_eq!(nested.structured["kind"], expected_kind);
+            assert_eq!(nested.structured["mimeType"], expected_mime);
+            assert_eq!(nested.structured["attachable"], true);
+            assert!(nested.structured["bytes"].as_u64().is_some());
+        }
     }
 
     #[test]

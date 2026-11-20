@@ -35,6 +35,7 @@ struct Fixture {
     transfer: Option<String>,
     instructions_file: Option<String>,
     instructions_tool: Option<String>,
+    memory_limit: Option<String>,
     /// An explicitly chosen launch directory for path-alias regression tests.
     cwd: Option<PathBuf>,
     /// The turn this fixture holds until it ends: held, never read.
@@ -120,6 +121,7 @@ impl Fixture {
             transfer: None,
             instructions_file: None,
             instructions_tool: None,
+            memory_limit: None,
             cwd: None,
             starting,
         }
@@ -166,6 +168,9 @@ impl Fixture {
         }
         if let Some(value) = &self.instructions_tool {
             command.env("FASTEXEC_INSTRUCTIONS_TOOL", value);
+        }
+        if let Some(value) = &self.memory_limit {
+            command.env("FASTEXEC_TEST_MEMORY_LIMIT", value);
         }
         command
     }
@@ -2744,7 +2749,7 @@ fn codemode_http_runs_nested_tools_and_attaches_images() {
         .unwrap();
     assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
     assert_eq!(tool["annotations"]["destructiveHint"], false, "{tool}");
-    let code = "const result = await tools.exec({action:'start',command:'printf http-codemode',loginShell:false}); text(result.output); image(await tools.read({path:'shot.png'}));";
+    let code = "const result = await tools.exec({action:'start',command:'printf http-codemode',loginShell:false}); text(result.output); attach(await tools.read({path:'shot.png'}));";
     let result = modern.modern(
         "tools/call",
         json!({"name":"codemode","arguments":{"code":code}}),
@@ -2767,6 +2772,10 @@ fn codemode_http_runs_nested_tools_and_attaches_images() {
     assert_eq!(
         block["data"],
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png),
+        "{result}"
+    );
+    assert_eq!(
+        result["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 1,
         "{result}"
     );
     let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
@@ -3540,4 +3549,158 @@ fn shared_namespace_isolates_http_and_stdio_instructions_tool_modes() {
         json!({"name": "instructions", "arguments": {}}),
     );
     assert_http_instructions_result(&http_call_after, http_tool_text, "http after stdio");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops() {
+    let mut fixture = Fixture::bare("slow-sse-lease");
+    let workdir = fixture.runtime.join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    // 12 MiB PDF -> 16 MiB Base64 (> kernel tcp_wmem + tcp_rmem loopback buffer), ~32 MiB peak.
+    let mut pdf = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+    pdf.resize(12 * 1024 * 1024, b' ');
+    std::fs::write(workdir.join("big.pdf"), &pdf).unwrap();
+
+    // 36 MiB pool: fits one 12 MiB PDF SSE response (~32 MiB peak), refuses a concurrent second.
+    fixture.cwd = Some(workdir);
+    fixture.memory_limit = Some((36 * 1024 * 1024).to_string());
+    fixture.start();
+
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
+    client.initialize();
+
+    let body = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "read",
+            "arguments": {"path": "big.pdf"}
+        }
+    }))
+    .unwrap();
+    let mut slow = TcpStream::connect(fixture.addr).unwrap();
+    slow.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        slow,
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMcp-Session-Id: {}\r\nContent-Length: {}\r\n\r\n{}",
+        fixture.addr,
+        fixture.tokens[0],
+        client.session.as_deref().expect("legacy session id"),
+        body.len(),
+        body
+    )
+    .unwrap();
+    slow.flush().unwrap();
+
+    // Read past HTTP headers into the first 64 bytes of the SSE `data:` event, then stop reading.
+    let mut reader = std::io::BufReader::with_capacity(256, slow);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).unwrap();
+        assert!(n > 0, "unexpected EOF before headers ended");
+        if line == "\r\n" {
+            break;
+        }
+    }
+    let mut peek = [0u8; 64];
+    reader.read_exact(&mut peek).unwrap();
+    assert!(
+        std::str::from_utf8(&peek).unwrap().contains("data:"),
+        "expected SSE data prefix, got {:?}",
+        String::from_utf8_lossy(&peek)
+    );
+
+    // While `slow` holds `LeasedBody` mid-stream in legacy_session_mode SSE POST, a second `read`
+    // of `big.pdf` must fail fast on the shared active memory budget!
+    let second = client.modern(
+        "tools/call",
+        json!({"name": "read", "arguments": {"path": "big.pdf"}}),
+    );
+    assert_eq!(
+        second["isError"],
+        json!(true),
+        "expected overload while slow SSE is open: {second}"
+    );
+    assert!(
+        second["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("active memory budget"),
+        "{second}"
+    );
+
+    // Drop the slow client connection: hyper aborts the stream, dropping `LeasedBody` and freeing the lease.
+    drop(reader);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut recovered = false;
+    while Instant::now() < deadline {
+        let third = client.modern(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "big.pdf"}}),
+        );
+        if third["isError"] == json!(false) {
+            assert_eq!(third["structuredContent"]["attached"], json!(true));
+            assert_eq!(third["structuredContent"]["bytes"], json!(pdf.len()));
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        recovered,
+        "active memory lease was not reclaimed after slow SSE client closed"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn http_list_kill_and_overload_receipt_succeed_via_control_reserve_when_main_pool_is_full() {
+    let mut fixture = Fixture::bare("http-control-reserve");
+    fixture.memory_limit = Some("1".to_owned());
+    fixture.start();
+
+    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
+    client.initialize();
+
+    // Main active-byte pool is 1 byte (0% room for ordinary responses): `start` runs the task
+    // and delivers a bare-taskId overload error receipt through the 8 MiB control reserve.
+    let started = client.modern(
+        "tools/call",
+        json!({
+            "name": "exec",
+            "arguments": {"action": "start", "command": "sleep 30", "waitMs": 50}
+        }),
+    );
+    assert_eq!(started["isError"], json!(true), "{started}");
+    let overload_text = started["content"][0]["text"].as_str().unwrap();
+    assert!(overload_text.contains("taskId: "), "{overload_text}");
+
+    // `list` succeeds via the 8 MiB control reserve while main pool remains completely full.
+    let listed = client.modern(
+        "tools/call",
+        json!({
+            "name": "exec",
+            "arguments": {"action": "list", "scope": "all"}
+        }),
+    );
+    assert_eq!(listed["isError"], json!(false), "{listed}");
+    let tasks = listed["structuredContent"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1, "{listed}");
+    let bare_id = tasks[0]["taskId"].as_str().unwrap().to_owned();
+    assert!(overload_text.contains(&bare_id), "{overload_text}");
+
+    // `kill` also succeeds via the 8 MiB control reserve and stops the task.
+    let killed = client.modern(
+        "tools/call",
+        json!({
+            "name": "exec",
+            "arguments": {"action": "kill", "taskId": bare_id}
+        }),
+    );
+    assert_eq!(killed["isError"], json!(false), "{killed}");
+    assert_eq!(killed["structuredContent"]["state"], json!("killed"));
 }

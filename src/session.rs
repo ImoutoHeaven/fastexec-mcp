@@ -1,5 +1,6 @@
 //! Session-scoped task notices and independent, bounded reader cursors.
 
+use crate::lease::{self, BytePool};
 use crate::output::Cleaner;
 use crate::tasks::{ALPHABET, Snapshot, Task, pids, random_chars};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -7,6 +8,41 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+pub const IMAGE_COMPRESS: &str = "FASTEXEC_IMAGE_COMPRESS";
+pub const MAX_MEDIA_BYTES: &str = "FASTEXEC_MAX_MEDIA_BYTES";
+pub const DEFAULT_MAX_MEDIA_BYTES: u64 = 100 << 20;
+pub const MIN_MAX_MEDIA_BYTES: u64 = 1 << 20;
+pub const MAX_MAX_MEDIA_BYTES: u64 = 360 << 20;
+
+pub fn parse_image_compress(value: Option<&OsStr>) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.to_str() {
+        Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        _ => Err(format!(
+            "invalid {IMAGE_COMPRESS} {value:?}; expected true or false"
+        )),
+    }
+}
+
+pub fn parse_max_media_bytes(value: Option<&OsStr>) -> Result<u64, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MAX_MEDIA_BYTES);
+    };
+    let parsed = value
+        .to_str()
+        .filter(|raw| !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|bytes| (MIN_MAX_MEDIA_BYTES..=MAX_MAX_MEDIA_BYTES).contains(bytes));
+    parsed.ok_or_else(|| {
+        format!(
+            "invalid {MAX_MEDIA_BYTES} {value:?}; expected an integer in {MIN_MAX_MEDIA_BYTES}..={MAX_MAX_MEDIA_BYTES}"
+        )
+    })
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -78,6 +114,19 @@ pub struct LaunchContext {
     /// login-profile snapshots as well.
     removed: Vec<String>,
     cache: Arc<LaunchCache>,
+    memory: Arc<BytePool>,
+    control_memory: Arc<BytePool>,
+    outbound_limit: usize,
+}
+
+fn default_outbound_limit() -> usize {
+    std::env::var("FASTEXEC_TEST_OUTBOUND_LIMIT")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|limit| {
+            cfg!(debug_assertions) && (1024..=crate::ipc::RESPONSE_LIMIT).contains(limit)
+        })
+        .unwrap_or(crate::ipc::RESPONSE_LIMIT)
 }
 
 impl LaunchContext {
@@ -88,6 +137,9 @@ impl LaunchContext {
             env,
             removed: Vec::new(),
             cache: Arc::new(LaunchCache::default()),
+            memory: Arc::clone(lease::process_pool()),
+            control_memory: Arc::clone(lease::control_pool()),
+            outbound_limit: default_outbound_limit(),
         }
     }
 
@@ -107,6 +159,9 @@ impl LaunchContext {
             session_cwd: self.session_cwd.clone(),
             removed: self.removed.clone(),
             cache: Arc::new(LaunchCache::default()),
+            memory: Arc::clone(&self.memory),
+            control_memory: Arc::clone(&self.control_memory),
+            outbound_limit: self.outbound_limit,
         }
     }
 
@@ -118,7 +173,47 @@ impl LaunchContext {
             session_cwd: self.session_cwd.clone(),
             removed: self.removed.clone(),
             cache: Arc::clone(&self.cache),
+            memory: Arc::clone(&self.memory),
+            control_memory: Arc::clone(&self.control_memory),
+            outbound_limit: self.outbound_limit,
         }
+    }
+
+    /// Attaches a shared active-byte pool (used by daemon sessions and unit tests).
+    pub fn with_memory(mut self, memory: Arc<BytePool>) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    pub fn with_control_memory(mut self, control_memory: Arc<BytePool>) -> Self {
+        self.control_memory = control_memory;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_outbound_limit(mut self, outbound_limit: usize) -> Self {
+        self.outbound_limit = outbound_limit;
+        self
+    }
+
+    pub fn memory(&self) -> &Arc<BytePool> {
+        &self.memory
+    }
+
+    pub fn control_memory(&self) -> &Arc<BytePool> {
+        &self.control_memory
+    }
+
+    pub fn outbound_limit(&self) -> usize {
+        self.outbound_limit
+    }
+
+    pub fn image_compress(&self) -> Result<bool, String> {
+        parse_image_compress(self.var(IMAGE_COMPRESS))
+    }
+
+    pub fn max_media_bytes(&self) -> Result<u64, String> {
+        parse_max_media_bytes(self.var(MAX_MEDIA_BYTES))
     }
 
     /// This context with `name` removed from its environment and future login snapshots, so the
@@ -482,8 +577,8 @@ impl Reader {
 #[derive(Clone, Default)]
 pub struct ReadState {
     pub cursor: u64,
-    /// Images returned or warned about, including markers lost with dropped log bytes.
-    pub images_seen: usize,
+    /// Attachments delivered or reported with a degradation receipt.
+    pub attachments_seen: usize,
     pub lines_before: u64,
     pub cleaner: Cleaner,
     /// Bytes and lines of the final transcript lines a result has shown.
@@ -752,6 +847,49 @@ mod tests {
             );
         }
         assert_eq!(context(&[]).home(), None);
+    }
+
+    #[test]
+    fn media_env_settings_validate_bounds_and_per_session_context() {
+        assert_eq!(parse_image_compress(None), Ok(false));
+        assert_eq!(parse_image_compress(Some(OsStr::new("false"))), Ok(false));
+        assert_eq!(parse_image_compress(Some(OsStr::new("true"))), Ok(true));
+        for bad in ["", "1", "0", "on", "off", "TRUE", " true "] {
+            let err = parse_image_compress(Some(OsStr::new(bad))).unwrap_err();
+            assert!(err.contains(IMAGE_COMPRESS), "{err}");
+        }
+
+        assert_eq!(parse_max_media_bytes(None), Ok(DEFAULT_MAX_MEDIA_BYTES));
+        assert_eq!(
+            parse_max_media_bytes(Some(OsStr::new("1048576"))),
+            Ok(MIN_MAX_MEDIA_BYTES)
+        );
+        assert_eq!(
+            parse_max_media_bytes(Some(OsStr::new("377487360"))),
+            Ok(MAX_MAX_MEDIA_BYTES)
+        );
+        for bad in [
+            "",
+            "0",
+            "1048575",
+            "377487361",
+            "+1048576",
+            "-1048576",
+            " 1048576",
+            "100MiB",
+            "18446744073709551616",
+        ] {
+            let err = parse_max_media_bytes(Some(OsStr::new(bad))).unwrap_err();
+            assert!(err.contains(MAX_MEDIA_BYTES), "{err}");
+        }
+
+        let default_ctx = context(&[]);
+        assert_eq!(default_ctx.image_compress(), Ok(false));
+        assert_eq!(default_ctx.max_media_bytes(), Ok(DEFAULT_MAX_MEDIA_BYTES));
+
+        let custom_ctx = context(&[(IMAGE_COMPRESS, "true"), (MAX_MEDIA_BYTES, "2097152")]);
+        assert_eq!(custom_ctx.image_compress(), Ok(true));
+        assert_eq!(custom_ctx.max_media_bytes(), Ok(2_097_152));
     }
 
     #[cfg(unix)]

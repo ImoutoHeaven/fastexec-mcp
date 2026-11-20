@@ -3,13 +3,13 @@
 //! calls it for IPC and HTTP callers.
 
 use crate::keys;
+use crate::lease::Lease;
 use crate::output::{self, Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
 use crate::process;
 use crate::session::{ProbeWarning, ReadState, Reader, Session, TaskEntry, parse_handle};
 use crate::tasks::{self, EVICTED_TRANSCRIPT, ScriptArgs, Snapshot, StartArgs, Task, Tasks};
 use crate::wait::{self, WaitEnd};
-use crate::{codemode, conpty, files, images};
-use base64::Engine;
+use crate::{codemode, conpty, files, media};
 use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -464,8 +464,7 @@ impl OutputMode {
         }
     }
 
-    /// The mode a wire name stands for. A name outside these three is refused, so a handshake
-    /// that misspells one is a reject rather than a silent default.
+    /// The mode a wire name stands for. Unknown names return an error on handshake.
     pub fn parse(name: &str) -> Result<Self, String> {
         match name {
             "text" => Ok(Self::Text),
@@ -618,49 +617,267 @@ pub struct Service {
     daemon: bool,
 }
 
+#[derive(Debug)]
+enum ServiceError {
+    Plain(String),
+    Overload(String, Option<files::TaskMeta>),
+}
+
+impl From<String> for ServiceError {
+    fn from(message: String) -> Self {
+        Self::Plain(message)
+    }
+}
+
+impl From<&str> for ServiceError {
+    fn from(message: &str) -> Self {
+        Self::Plain(message.to_owned())
+    }
+}
+
+impl std::ops::Deref for ServiceError {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Plain(s) | Self::Overload(s, _) => s,
+        }
+    }
+}
+
+pub(crate) fn content_b64_bytes(result: &CallToolResult) -> usize {
+    result
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Image(img) => img.data.len(),
+            ContentBlock::Audio(aud) => aud.data.len(),
+            ContentBlock::Resource(res) => match &res.resource {
+                rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => blob.len(),
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.len(),
+                _ => 0,
+            },
+            _ => 0,
+        })
+        .sum()
+}
+
+#[derive(serde::Serialize)]
+struct WireResultRef<'a> {
+    r#type: &'static str,
+    id: u64,
+    result: &'a CallToolResult,
+}
+
+fn wire_result_len(call_id: Option<u64>, result: &CallToolResult) -> Result<usize, String> {
+    crate::ipc::frame_len(&WireResultRef {
+        r#type: "result",
+        id: call_id.unwrap_or(0),
+        result,
+    })
+    .map_err(|err| format!("Cannot measure result frame: {err}."))
+}
+
+pub(crate) fn overload_task_message(limit: usize, meta: &files::TaskMeta) -> String {
+    format!(
+        "Server active memory budget ({limit} bytes) is full while encoding the response; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId without input once in-flight transfers complete.",
+        meta.bare_task_id, meta.log_path
+    )
+}
+
+fn admit_outbound(
+    call: &Call<'_>,
+    action: Action,
+    task: &Task,
+    suppressed: &CallToolResult,
+    mut held_lease: Option<Lease>,
+) -> Result<Option<Lease>, ServiceError> {
+    if call.nested {
+        return Ok(None);
+    }
+    let meta = || files::TaskMeta {
+        bare_task_id: task.id.clone(),
+        log_path: files::display_path(&task.log_path),
+    };
+    let pool = call.launch().memory();
+    let outbound_limit = call.launch().outbound_limit();
+    let b64_bytes = content_b64_bytes(suppressed);
+    if call.render_slot.is_some() {
+        let wire_len = wire_result_len(call.call_id, suppressed)?;
+        if action == Action::Kill || action == Action::List {
+            return Ok(held_lease);
+        }
+        if wire_len > outbound_limit.saturating_add(4) {
+            let m = meta();
+            return Err(ServiceError::Overload(
+                format!(
+                    "The result was {wire_len} bytes, over the 512 MiB frame limit; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId with a smaller maxBytes or read logPath.",
+                    m.bare_task_id, m.log_path
+                ),
+                Some(m),
+            ));
+        }
+        let Some(peak) = b64_bytes.checked_add(wire_len) else {
+            let m = meta();
+            return Err(ServiceError::Overload(
+                overload_task_message(pool.limit(), &m),
+                Some(m),
+            ));
+        };
+        let admitted = match held_lease.take() {
+            Some(mut lease) => lease.try_resize(peak).then_some(lease),
+            None => pool.try_acquire(peak),
+        };
+        match admitted {
+            Some(lease) => Ok(Some(lease)),
+            None => {
+                let m = meta();
+                Err(ServiceError::Overload(
+                    overload_task_message(pool.limit(), &m),
+                    Some(m),
+                ))
+            }
+        }
+    } else {
+        let json_len = crate::ipc::json_len(suppressed)
+            .map_err(|err| ServiceError::Plain(format!("Cannot measure result JSON: {err}.")))?;
+        let outbound = json_len.saturating_add(256);
+        if action != Action::Kill && action != Action::List && outbound > outbound_limit {
+            let m = meta();
+            return Err(ServiceError::Overload(
+                format!(
+                    "The result was {outbound} bytes, over the 512 MiB frame limit; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId with a smaller maxBytes or read logPath.",
+                    m.bare_task_id, m.log_path
+                ),
+                Some(m),
+            ));
+        }
+        let Some(peak) = b64_bytes.checked_add(outbound) else {
+            let m = meta();
+            return Err(ServiceError::Overload(
+                overload_task_message(pool.limit(), &m),
+                Some(m),
+            ));
+        };
+        let admitted = match held_lease.take() {
+            Some(mut lease) => lease.try_resize(peak).then_some(lease),
+            None => pool.try_acquire(peak).or_else(|| {
+                (action == Action::Kill && peak <= crate::lease::CONTROL_LIMIT)
+                    .then(|| call.launch().control_memory().try_acquire(peak))
+                    .flatten()
+            }),
+        };
+        match admitted {
+            Some(lease) => Ok(Some(lease)),
+            None => {
+                let m = meta();
+                Err(ServiceError::Overload(
+                    overload_task_message(pool.limit(), &m),
+                    Some(m),
+                ))
+            }
+        }
+    }
+}
+
 impl Service {
     pub fn new(tasks: Arc<Tasks>, daemon: bool) -> Self {
         Self { tasks, daemon }
     }
 
     /// Runs one call and renders its result.
-    pub async fn call(&self, request: Request, mut call: Call<'_>) -> CallToolResult {
+    pub async fn call(&self, request: Request, call: Call<'_>) -> CallToolResult {
+        let mut tracked = self.call_tracked(request, call).await;
+        drop(tracked.lease.take());
+        tracked.result
+    }
+
+    pub async fn call_tracked(&self, request: Request, mut call: Call<'_>) -> files::TrackedResult {
         // Entries of tasks that have retired are dropped here, so a call that never reaches the
         // background footer cannot keep them alive.
         self.tasks.prune_entries(call.session);
         call.render = call.render.effective();
         let action = request.action;
-        let result = match self.handle(request, &call).await {
-            Ok(result) => result,
-            Err(message) => error_result(action, &message),
-        };
-        suppress(result, call.render)
+        match self.handle(request, &call).await {
+            Ok((result, lease, task_meta)) => files::TrackedResult {
+                result: suppress(result, call.render),
+                lease,
+                overload: false,
+                task_meta,
+            },
+            Err(ServiceError::Plain(message)) => {
+                files::TrackedResult::plain(suppress(error_result(action, &message), call.render))
+            }
+            Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
+                result: suppress(error_result(action, &message), call.render),
+                lease: None,
+                overload: true,
+                task_meta,
+            },
+        }
     }
 
     /// Runs one call from raw arguments, the way a daemon receives them, with the same
     /// validation and errors.
+    #[cfg(test)]
     pub async fn call_json(&self, arguments: Value, call: Call<'_>) -> CallToolResult {
+        let mut tracked = self.call_json_tracked(arguments, call).await;
+        drop(tracked.lease.take());
+        tracked.result
+    }
+
+    pub async fn call_json_tracked(
+        &self,
+        arguments: Value,
+        call: Call<'_>,
+    ) -> files::TrackedResult {
         match serde_json::from_value::<Request>(arguments) {
-            Ok(request) => self.call(request, call).await,
-            Err(error) => CallToolResult::error(vec![ContentBlock::text(format!(
-                "failed to deserialize parameters: {error}"
-            ))]),
+            Ok(request) => self.call_tracked(request, call).await,
+            Err(error) => {
+                files::TrackedResult::plain(CallToolResult::error(vec![ContentBlock::text(
+                    format!("failed to deserialize parameters: {error}"),
+                )]))
+            }
         }
     }
 
+    #[cfg(test)]
     pub async fn codemode(
+        self: &Arc<Self>,
+        request: codemode::Request,
+        call: Call<'_>,
+        transfer: bool,
+    ) -> CallToolResult {
+        let mut tracked = self.codemode_tracked(request, call, transfer).await;
+        drop(tracked.lease.take());
+        tracked.result
+    }
+
+    pub async fn codemode_tracked(
         self: &Arc<Self>,
         request: codemode::Request,
         mut call: Call<'_>,
         transfer: bool,
-    ) -> CallToolResult {
+    ) -> files::TrackedResult {
         self.tasks.prune_entries(call.session);
         call.render = call.render.effective();
-        let result = match self.start_script(request, &call, transfer).await {
-            Ok(result) => result,
-            Err(message) => codemode_error(&message),
-        };
-        suppress(result, call.render)
+        match self.start_script(request, &call, transfer).await {
+            Ok((result, lease, task_meta)) => files::TrackedResult {
+                result: suppress(result, call.render),
+                lease,
+                overload: false,
+                task_meta,
+            },
+            Err(ServiceError::Plain(message)) => {
+                files::TrackedResult::plain(suppress(codemode_error(&message), call.render))
+            }
+            Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
+                result: suppress(codemode_error(&message), call.render),
+                lease: None,
+                overload: true,
+                task_meta,
+            },
+        }
     }
 
     async fn start_script(
@@ -668,7 +885,7 @@ impl Service {
         request: codemode::Request,
         call: &Call<'_>,
         transfer: bool,
-    ) -> Result<CallToolResult, String> {
+    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
         let base_launch = call.launch();
         let (start, resolved_cwd) = codemode::validate(&request, base_launch)?;
         let view = validate(&start, call.nested)?;
@@ -710,7 +927,7 @@ impl Service {
         when: Option<&wait::ReturnWhen>,
         view: View,
         call: &Call<'_>,
-    ) -> Result<CallToolResult, String> {
+    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
         let (task, entry, reader) = started;
         let state = read_gate(&reader, &call.cancel).await?;
         let mark = wait::mark(&task, &reader, &state, when)?;
@@ -747,7 +964,7 @@ impl Service {
         &self,
         mut request: Request,
         call: &Call<'_>,
-    ) -> Result<CallToolResult, String> {
+    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
         normalize_request(&mut request);
         if request.action == Action::Poll
             && let Ok((task, _)) = self.task(request.task_id.as_deref())
@@ -774,13 +991,43 @@ impl Service {
         match request.action {
             Action::List => {
                 let _permit = call.render_permit().await?;
-                Ok(self.list(
-                    &session,
-                    &view,
-                    request.scope.unwrap_or_default(),
-                    request.state,
-                    request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
-                ))
+                let listed = suppress(
+                    self.list(
+                        &session,
+                        &view,
+                        request.scope.unwrap_or_default(),
+                        request.state,
+                        request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
+                    ),
+                    call.render,
+                );
+                let lease = if !call.nested && call.render_slot.is_none() {
+                    let json_len = crate::ipc::json_len(&listed)
+                        .map_err(|err| format!("Cannot measure list JSON: {err}."))?;
+                    let outbound = json_len.saturating_add(256);
+                    Some(
+                        call.launch()
+                            .memory()
+                            .try_acquire(outbound)
+                            .or_else(|| {
+                                (outbound <= crate::lease::CONTROL_LIMIT)
+                                    .then(|| call.launch().control_memory().try_acquire(outbound))
+                                    .flatten()
+                            })
+                            .ok_or_else(|| {
+                                ServiceError::Overload(
+                                    format!(
+                                        "Server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
+                                        call.launch().memory().limit()
+                                    ),
+                                    None,
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                Ok((listed, lease, None))
             }
             Action::Start => {
                 let base_launch = call.launch();
@@ -853,14 +1100,16 @@ impl Service {
                 if let Some(name) = needs_pty.filter(|_| !task.pty) {
                     return Err(format!(
                         "{name} applies to PTY tasks only; in pipe mode, write text with input and end lines with a newline."
-                    ));
+                    )
+                    .into());
                 }
                 if let Some(name) = view.screen.then_some("screen").or(watches_screen)
                     && task.encoding != encoding_rs::UTF_8
                 {
                     return Err(format!(
                         "{name} needs UTF-8 output; this task was started with an encoding."
-                    ));
+                    )
+                    .into());
                 }
                 // A PTY has no stdin half-close, so eof is refused before this poll changes
                 // anything, a resize included.
@@ -1326,6 +1575,10 @@ impl StagedRead {
         Self { guard, state }
     }
 
+    fn into_guard(self) -> tokio::sync::OwnedMutexGuard<ReadState> {
+        self.guard
+    }
+
     fn commit(mut self) -> tokio::sync::OwnedMutexGuard<ReadState> {
         *self.guard = self.state;
         self.guard
@@ -1333,13 +1586,13 @@ impl StagedRead {
 }
 
 /// A cancelled render drops its staged state while its blocking read still owns the gate.
-async fn read_result(
+async fn read_result<T>(
     cancel: &CancellationToken,
-    result: impl std::future::Future<Output = Result<CallToolResult, String>>,
-) -> Result<CallToolResult, String> {
+    result: impl std::future::Future<Output = Result<T, ServiceError>>,
+) -> Result<T, ServiceError> {
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => Err("Cancelled while reading output; use poll to continue.".into()),
+        _ = cancel.cancelled() => Err(ServiceError::Plain("Cancelled while reading output; use poll to continue.".into())),
         result = result => result,
     }
 }
@@ -1411,12 +1664,13 @@ impl Service {
         view: View,
         ended: Option<WaitEnd>,
         startup_warning: Option<ProbeWarning>,
-    ) -> Result<CallToolResult, String> {
+    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
         let permit = call.task_render_permit(action, &task, &task_reader).await?;
         let render = call.render;
         if view.screen {
             return self
                 .screen_result(
+                    call,
                     render,
                     session,
                     action,
@@ -1432,6 +1686,8 @@ impl Service {
                 .await;
         }
         let reader = Arc::clone(&task);
+        let pool = Arc::clone(call.launch().memory());
+        let outbound_limit = call.launch().outbound_limit();
         let encoding = view.encoding.unwrap_or(task.encoding);
         // The state is taken before the read: a finished state means output reached EOF (or
         // stayed open, which the status line notes), so the window below holds all of it.
@@ -1439,33 +1695,33 @@ impl Service {
         let clean = !task.is_script();
         let keep_nul = view.nested;
         let budget = view.max_bytes;
-        let (window, images, read, _permit) = tokio::task::spawn_blocking(move || {
-            let mut read = StagedRead::new(state);
-            let start = read.state.cursor;
-            let window = reader.read_window(
-                &mut read.state,
-                view.truncate,
-                budget,
-                view.raw,
-                clean,
-                keep_nul,
-                encoding,
-                None,
-            );
-            let images = if window.is_ok() {
-                read_images(&reader, start, read.state.cursor, read.state.images_seen)
-            } else {
-                Ok(ImageRead::default())
-            };
-            if let Ok(images) = &images {
-                read.state.images_seen = images.seen;
-            }
-            (window, images, read, permit)
-        })
-        .await
-        .map_err(|error| format!("Internal failure while reading output: {error}."))?;
-        let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
-        let images = images?;
+        let initial_seen = state.attachments_seen;
+        let (window, unseen, had_new_text, mut read, permit) =
+            tokio::task::spawn_blocking(move || {
+                let mut read = StagedRead::new(state);
+                let start = read.state.cursor;
+                let window = reader.read_window(
+                    &mut read.state,
+                    view.truncate,
+                    budget,
+                    view.raw,
+                    clean,
+                    keep_nul,
+                    encoding,
+                    None,
+                );
+                let had_new_text = read.state.cursor > start;
+                let unseen = if window.is_ok() {
+                    reader.unseen_attachments(initial_seen)
+                } else {
+                    Vec::new()
+                };
+                (window, unseen, had_new_text, read, permit)
+            })
+            .await
+            .map_err(|error| format!("Internal failure while reading output: {error}."))?;
+        let mut window_val =
+            window.map_err(|error| format!("Cannot read the task log: {error}."))?;
         // Log metadata, such as an eviction during the read, is taken after it.
         let after = task.snapshot();
         let snapshot = Snapshot {
@@ -1478,57 +1734,476 @@ impl Service {
             input_error: after.input_error,
             ..before
         };
-        let script = script_report(&self.tasks, &task);
-        let mut status_with_log =
-            status_line(&task, &snapshot, &task_reader, true, script.as_ref());
-        let mut status_no_log = status_line(&task, &snapshot, &task_reader, false, script.as_ref());
-        let mut structured = task_json(action, &task, &snapshot, &task_reader);
-        if let Some(ended) = &ended {
-            let note = ended.note(view.conditions);
-            status_with_log.push_str(&note);
-            status_no_log.push_str(&note);
-            structured["waitEndedBy"] = ended.json();
-        } else if let Some(note) = kill_pending_note(&task, &snapshot) {
+        let delivered_warning = startup_warning.and_then(ProbeWarning::deliver);
+        let mut extra_kill_warnings: Vec<String> = Vec::new();
+        let build_candidate = |window_ref: &Window,
+                               bundle_ref: &AttachmentBundle,
+                               extra_warns: &[String],
+                               footer: &str,
+                               max_bytes: usize|
+         -> CallToolResult {
+            let script = script_report(&self.tasks, &task);
+            let mut status_with_log =
+                status_line(&task, &snapshot, &task_reader, true, script.as_ref());
+            let mut status_no_log =
+                status_line(&task, &snapshot, &task_reader, false, script.as_ref());
+            let mut structured = task_json(action, &task, &snapshot, &task_reader);
+            if let Some(ended) = &ended {
+                let note = ended.note(view.conditions);
+                status_with_log.push_str(&note);
+                status_no_log.push_str(&note);
+                structured["waitEndedBy"] = ended.json();
+            } else if let Some(note) = kill_pending_note(&task, &snapshot) {
+                structured["warnings"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(note));
+            }
+            let mut delivered_json = Vec::new();
+            let mut attached_summary = Vec::new();
+            let mut content_blocks = Vec::new();
+            let mut step_warnings = Vec::new();
+            for step in &bundle_ref.steps {
+                match step {
+                    PackStep::Delivered {
+                        index,
+                        kind,
+                        mime,
+                        bytes,
+                        block,
+                        ..
+                    } => {
+                        delivered_json.push(json!({
+                            "index": index,
+                            "kind": kind.as_str(),
+                            "mimeType": mime,
+                            "bytes": bytes,
+                        }));
+                        attached_summary.push(format!("#{index} ({mime}, {bytes} B)"));
+                        content_blocks.push((**block).clone());
+                    }
+                    PackStep::Degraded { warning, .. } => {
+                        step_warnings.push(warning.clone());
+                    }
+                }
+            }
+            if let Some(report) = script {
+                structured["codemode"] = report.value;
+                if !bundle_ref.nested_handles.is_empty() {
+                    structured["codemode"]["attachments"] =
+                        Value::Array(bundle_ref.nested_handles.clone());
+                }
+                if !delivered_json.is_empty() {
+                    structured["codemode"]["attachmentsDelivered"] = Value::Array(delivered_json);
+                }
+            }
             structured["warnings"]
                 .as_array_mut()
                 .unwrap()
-                .push(json!(note));
-        }
-        if let Some(report) = script {
-            structured["codemode"] = report.value;
-            structured["codemode"]["imagesAttached"] = json!(images.content.len());
-            structured["codemode"]["imagesNotAttached"] = json!(images.omitted);
+                .extend(step_warnings.into_iter().map(Value::String));
             structured["warnings"]
                 .as_array_mut()
                 .unwrap()
-                .extend(images.warnings.into_iter().map(Value::String));
-        }
-        if let Some(warning) = startup_warning.and_then(ProbeWarning::deliver) {
+                .extend(bundle_ref.tail_warnings.iter().cloned().map(Value::String));
             structured["warnings"]
                 .as_array_mut()
                 .unwrap()
-                .push(Value::String(warning));
+                .extend(extra_warns.iter().cloned().map(Value::String));
+            if let Some(warning) = &delivered_warning {
+                structured["warnings"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(Value::String(warning.clone()));
+            }
+            add_encoding_warning(&mut structured, window_ref);
+            let warnings = warning_text(&structured["warnings"]);
+            let mut suffix = String::new();
+            if !render.structured_content && !attached_summary.is_empty() {
+                suffix.push_str("\nAttached: ");
+                suffix.push_str(&attached_summary.join(", "));
+            }
+            suffix.push_str(&warnings);
+            let text = self.layout(
+                render,
+                window_ref,
+                status_with_log,
+                status_no_log,
+                &snapshot,
+                task_reader.is_fresh(),
+                footer,
+                max_bytes,
+                "(no new output)",
+                &mut structured,
+            );
+            let mut res = success(text, structured, &suffix);
+            res.content.extend(content_blocks);
+            suppress(res, render)
+        };
+
+        let mut active_max_bytes = view.max_bytes;
+
+        if call.nested {
+            let (background, claim) = self.background(session, &task.id, view.nested);
+            let footer = background
+                .as_ref()
+                .map_or(String::new(), |(line, _)| format!("\n{line}"));
+            let mut bundle = AttachmentBundle::default();
+            let mut final_seen = initial_seen;
+            if let Some(script) = call.started {
+                for att in unseen {
+                    let meta = att.meta().clone();
+                    let hid = script.register_attachment(att);
+                    bundle.nested_handles.push(json!({
+                        "index": meta.index,
+                        "kind": meta.kind.as_str(),
+                        "mimeType": meta.mime,
+                        "bytes": meta.size,
+                        "__hid": hid,
+                    }));
+                    final_seen = meta.index;
+                }
+            }
+            let suppressed = build_candidate(
+                &window_val,
+                &bundle,
+                &extra_kill_warnings,
+                &footer,
+                active_max_bytes,
+            );
+            read.state.attachments_seen = final_seen;
+            let state = read.commit();
+            task_reader.mark_delivered();
+            report(
+                session,
+                &entry,
+                &task_reader,
+                &snapshot,
+                background,
+                claim,
+                view.nested,
+                view.owned_by_script,
+            );
+            drop(state);
+            let meta = files::TaskMeta {
+                bare_task_id: task.id.clone(),
+                log_path: files::display_path(&task.log_path),
+            };
+            return Ok((suppressed, None, Some(meta)));
         }
-        add_encoding_warning(&mut structured, &window);
-        let warnings = warning_text(&structured["warnings"]);
+
+        let effective_cap = if action == Action::Kill {
+            (crate::daemon::RESERVED - 4).min(outbound_limit)
+        } else {
+            outbound_limit
+        };
+        let mut bundle = AttachmentBundle::default();
+        let pre_check = build_candidate(
+            &window_val,
+            &bundle,
+            &extra_kill_warnings,
+            "",
+            active_max_bytes,
+        );
+
+        if action == Action::Kill
+            && measure_outbound_len(call, &pre_check)?.saturating_add(516) > effective_cap
+        {
+            let state_guard = read.into_guard();
+            let reader_narrow = Arc::clone(&task);
+            let narrow_budget = view.max_bytes.min(64 * 1024);
+            let (narrow_win, narrow_read, narrow_permit) = tokio::task::spawn_blocking(move || {
+                let mut staged = StagedRead::new(state_guard);
+                let win = reader_narrow.read_window(
+                    &mut staged.state,
+                    view.truncate,
+                    narrow_budget,
+                    view.raw,
+                    clean,
+                    keep_nul,
+                    encoding,
+                    None,
+                );
+                (win, staged, permit)
+            })
+            .await
+            .map_err(|error| format!("Internal failure while narrowing kill output: {error}."))?;
+            window_val =
+                narrow_win.map_err(|error| format!("Cannot read the task log: {error}."))?;
+            read = narrow_read;
+            let _ = narrow_permit;
+            extra_kill_warnings.push(
+                "kill output window narrowed to fit the 8 MiB control reserve; poll taskId or read logPath for remaining output".into(),
+            );
+            active_max_bytes = narrow_budget;
+        }
+
+        let total_unseen = unseen.len();
+        if total_unseen > 0 {
+            let base_candidate = build_candidate(
+                &window_val,
+                &bundle,
+                &extra_kill_warnings,
+                "",
+                active_max_bytes,
+            );
+            let raw_base_wire = measure_outbound_len(call, &base_candidate)?;
+            let min_envelope_wire = if had_new_text { 512 } else { raw_base_wire };
+            let base_wire = raw_base_wire.saturating_add(516);
+            let mut running_wire = base_wire;
+            let mut total_b64 = 0usize;
+            let mut max_raw = 0usize;
+            let mut pack_lease = Lease::empty(&pool);
+            let mut planned: Vec<PlannedAttachment> = Vec::new();
+            let mut stopped_on_memory = false;
+
+            for att in unseen {
+                let meta = att.meta();
+                let shown_path = files::display_path(&meta.path);
+                let item_wire_delta = meta
+                    .base64_len
+                    .saturating_add(shown_path.len().saturating_mul(3))
+                    .saturating_add(256);
+                let solo_wire = min_envelope_wire.saturating_add(item_wire_delta);
+
+                let at_queue_head = planned
+                    .iter()
+                    .all(|p| matches!(p, PlannedAttachment::Degraded { .. }));
+                if action != Action::Kill && at_queue_head && solo_wire > outbound_limit {
+                    let msg = format!(
+                        "attachment #{} [{}] ({} B, {} base64 B) exceeds the {} B outbound frame limit and was skipped; inspect or transfer {shown_path}",
+                        meta.index, meta.mime, meta.size, meta.base64_len, outbound_limit
+                    );
+                    let warn_delta = msg.len().saturating_add(64);
+                    if running_wire.saturating_add(warn_delta) > effective_cap {
+                        break;
+                    }
+                    running_wire += warn_delta;
+                    planned.push(PlannedAttachment::Degraded {
+                        index: meta.index,
+                        warning: msg,
+                    });
+                    continue;
+                }
+
+                if running_wire.saturating_add(item_wire_delta) > effective_cap {
+                    break;
+                }
+
+                let raw_len = usize::try_from(meta.size).unwrap_or(usize::MAX);
+                let next_b64 = total_b64.checked_add(meta.base64_len);
+                let next_max_raw = max_raw.max(raw_len);
+                let next_wire = running_wire.saturating_add(item_wire_delta);
+                let needed_peak = next_b64.and_then(|b64| {
+                    let read_peak = b64.checked_add(next_max_raw)?;
+                    let out_peak = b64.checked_add(next_wire)?.checked_add(1024)?;
+                    Some(read_peak.max(out_peak))
+                });
+                if needed_peak.is_some_and(|target| pack_lease.try_resize(target)) {
+                    total_b64 = next_b64.unwrap();
+                    max_raw = next_max_raw;
+                    running_wire = next_wire;
+                    planned.push(PlannedAttachment::Select(att));
+                } else {
+                    stopped_on_memory = true;
+                    break;
+                }
+            }
+
+            if planned.is_empty() && stopped_on_memory && action != Action::Kill && !had_new_text {
+                let m = files::TaskMeta {
+                    bare_task_id: task.id.clone(),
+                    log_path: files::display_path(&task.log_path),
+                };
+                return Err(ServiceError::Overload(
+                    overload_task_message(pool.limit(), &m),
+                    Some(m),
+                ));
+            }
+
+            if !planned.is_empty() {
+                let task_for_pack = Arc::clone(&task);
+                let (encoded_steps, evicted_mid_pack) =
+                    tokio::task::spawn_blocking(move || -> Result<(Vec<PackStep>, bool), String> {
+                        let mut out = Vec::with_capacity(planned.len());
+                        let mut saw_eviction = false;
+                        for entry in planned {
+                            match entry {
+                                PlannedAttachment::Degraded { index, warning } => {
+                                    out.push(PackStep::Degraded { index, warning });
+                                }
+                                PlannedAttachment::Select(att) => {
+                                    let meta = att.meta();
+                                    let shown = files::display_path(&meta.path);
+                                    let mut data = Vec::new();
+                                    let read_res = File::open(&meta.path)
+                                        .and_then(|f| f.take(meta.size + 1).read_to_end(&mut data));
+                                    match read_res {
+                                        Ok(_) if data.len() as u64 == meta.size => {
+                                            let encoded = media::encode_base64(&data);
+                                            drop(data);
+                                            let block = media::content_block(
+                                                meta.kind, &meta.mime, encoded, &meta.path,
+                                            );
+                                            out.push(PackStep::Delivered {
+                                                index: meta.index,
+                                                kind: meta.kind,
+                                                mime: meta.mime.clone(),
+                                                bytes: meta.size,
+                                                base64_len: meta.base64_len,
+                                                shown_path: shown,
+                                                block: Box::new(block),
+                                            });
+                                        }
+                                        Ok(_) => {
+                                            return Err(format!(
+                                                "Cannot read stored attachment {shown}: attachment size changed; read its path directly."
+                                            ));
+                                        }
+                                        Err(_) if task_for_pack.evicted() => {
+                                            saw_eviction = true;
+                                            break;
+                                        }
+                                        Err(error) => {
+                                            return Err(format!(
+                                                "Cannot read stored attachment {shown}: {error}."
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok((out, saw_eviction))
+                    })
+                    .await
+                    .map_err(|error| {
+                        format!("Internal failure while encoding attachments: {error}.")
+                    })??;
+                bundle.steps = encoded_steps;
+                if evicted_mid_pack {
+                    bundle.tail_warnings.push(
+                        "log evicted under the 4 GiB total limit; remaining stored attachments are unavailable".into(),
+                    );
+                }
+                if pack_lease.bytes() > 0 {
+                    bundle.lease = Some(pack_lease);
+                }
+            }
+        }
+
         let (background, claim) = self.background(session, &task.id, view.nested);
         let footer = background
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
-        let text = self.layout(
-            render,
-            &window,
-            status_with_log,
-            status_no_log,
-            &snapshot,
-            task_reader.is_fresh(),
+        let mut suppressed = build_candidate(
+            &window_val,
+            &bundle,
+            &extra_kill_warnings,
             &footer,
-            view.max_bytes,
-            "(no new output)",
-            &mut structured,
+            active_max_bytes,
         );
-        let mut result = success(text, structured, &warnings);
-        result.content.extend(images.content);
+
+        if total_unseen > 0 {
+            let update_queued_warning = |steps: &[PackStep],
+                                         tail: &mut Vec<String>,
+                                         evicted: bool| {
+                tail.retain(|w| w.contains("evicted under the 4 GiB"));
+                if evicted {
+                    return;
+                }
+                let remaining = total_unseen.saturating_sub(steps.len());
+                if remaining > 0 {
+                    if action == Action::Kill {
+                        tail.push(
+                                "unseen attachment(s) deferred to fit the 8 MiB control reserve or active memory budget; poll taskId without input to retrieve them".into(),
+                            );
+                    } else {
+                        let seen_now = steps.last().map_or(initial_seen, PackStep::index);
+                        if seen_now > initial_seen {
+                            tail.push(format!(
+                                    "{remaining} attachment(s) remain queued after #{seen_now}; poll taskId without input to retrieve the next batch"
+                                ));
+                        } else {
+                            tail.push(format!(
+                                    "{remaining} attachment(s) remain queued; poll taskId without input to retrieve them"
+                                ));
+                        }
+                    }
+                }
+            };
+
+            let evicted_now = snapshot.evicted || task.evicted();
+            update_queued_warning(&bundle.steps, &mut bundle.tail_warnings, evicted_now);
+            suppressed = build_candidate(
+                &window_val,
+                &bundle,
+                &extra_kill_warnings,
+                &footer,
+                active_max_bytes,
+            );
+            while !bundle.steps.is_empty()
+                && measure_outbound_len(call, &suppressed)? > effective_cap
+            {
+                if bundle.steps.len() == 1
+                    && !had_new_text
+                    && action != Action::Kill
+                    && let PackStep::Delivered {
+                        index,
+                        mime,
+                        bytes,
+                        base64_len,
+                        shown_path,
+                        ..
+                    } = &bundle.steps[0]
+                {
+                    let msg = format!(
+                        "attachment #{index} [{mime}] ({bytes} B, {base64_len} base64 B) exceeds the {outbound_limit} B outbound frame limit and was skipped; inspect or transfer {shown_path}"
+                    );
+                    bundle.steps[0] = PackStep::Degraded {
+                        index: *index,
+                        warning: msg,
+                    };
+                    bundle.lease = None;
+                } else {
+                    bundle.steps.pop();
+                    if bundle.steps.is_empty() {
+                        bundle.lease = None;
+                    }
+                }
+                update_queued_warning(&bundle.steps, &mut bundle.tail_warnings, evicted_now);
+                suppressed = build_candidate(
+                    &window_val,
+                    &bundle,
+                    &extra_kill_warnings,
+                    &footer,
+                    active_max_bytes,
+                );
+                if matches!(bundle.steps.as_slice(), [PackStep::Degraded { .. }]) {
+                    break;
+                }
+            }
+        }
+
+        let lease = match admit_outbound(call, action, &task, &suppressed, bundle.lease.take()) {
+            Ok(lease) => lease,
+            Err(ServiceError::Overload(..))
+                if action == Action::Kill && !bundle.steps.is_empty() =>
+            {
+                bundle.steps.clear();
+                bundle.tail_warnings = vec![
+                    "unseen attachment(s) deferred because active media memory is full; poll taskId without input to retrieve them".into(),
+                ];
+                suppressed = build_candidate(
+                    &window_val,
+                    &bundle,
+                    &extra_kill_warnings,
+                    &footer,
+                    active_max_bytes,
+                );
+                admit_outbound(call, action, &task, &suppressed, None)?
+            }
+            Err(err) => return Err(err),
+        };
+        read.state.attachments_seen = bundle.steps.last().map_or(initial_seen, PackStep::index);
         let state = read.commit();
         task_reader.mark_delivered();
         report(
@@ -1542,7 +2217,11 @@ impl Service {
             view.owned_by_script,
         );
         drop(state);
-        Ok(result)
+        let meta = files::TaskMeta {
+            bare_task_id: task.id.clone(),
+            log_path: files::display_path(&task.log_path),
+        };
+        Ok((suppressed, lease, Some(meta)))
     }
 
     /// A PTY task's transcript from the first line no earlier read showed: its final lines,
@@ -1559,7 +2238,7 @@ impl Service {
         task_reader: Arc<Reader>,
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
-    ) -> Result<CallToolResult, String> {
+    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
         let permit = call
             .task_render_permit(Action::Transcript, &task, &task_reader)
             .await?;
@@ -1687,7 +2366,8 @@ impl Service {
             "(no transcript lines since the last read)",
             &mut structured,
         );
-        let result = success(text, structured, &warnings);
+        let suppressed = suppress(success(text, structured, &warnings), render);
+        let lease = admit_outbound(call, Action::Transcript, &task, &suppressed, None)?;
         let state = read.commit();
         task_reader.mark_delivered();
         report(
@@ -1701,7 +2381,11 @@ impl Service {
             view.owned_by_script,
         );
         drop(state);
-        Ok(result)
+        let meta = files::TaskMeta {
+            bare_task_id: task.id.clone(),
+            log_path: files::display_path(&task.log_path),
+        };
+        Ok((suppressed, lease, Some(meta)))
     }
 
     /// Combines the already-budgeted `window` body with the status line and background footer,
@@ -1762,6 +2446,7 @@ impl Service {
     #[allow(clippy::too_many_arguments)]
     async fn screen_result(
         &self,
+        call: &Call<'_>,
         render: Render,
         session: &Session,
         action: Action,
@@ -1773,7 +2458,7 @@ impl Service {
         ended: WaitEnd,
         startup_warning: Option<ProbeWarning>,
         permit: Option<Arc<OwnedSemaphorePermit>>,
-    ) -> Result<CallToolResult, String> {
+    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
         // A finished state, taken first, means the screen below holds all output.
         let snapshot = task.snapshot_held();
         let screen = task.screen()?;
@@ -1844,7 +2529,8 @@ impl Service {
         if render.output_mode != OutputMode::Text {
             structured["output"] = json!(body);
         }
-        let result = success(text, structured, &warnings);
+        let suppressed = suppress(success(text, structured, &warnings), render);
+        let lease = admit_outbound(call, action, &task, &suppressed, None)?;
         let state = read.commit();
         task_reader.mark_delivered();
         report(
@@ -1858,7 +2544,11 @@ impl Service {
             view.owned_by_script,
         );
         drop(state);
-        Ok(result)
+        let meta = files::TaskMeta {
+            bare_task_id: task.id.clone(),
+            log_path: files::display_path(&task.log_path),
+        };
+        Ok((suppressed, lease, Some(meta)))
     }
 }
 
@@ -1961,76 +2651,51 @@ fn members(members: &[process::Member]) -> String {
     text
 }
 
-#[derive(Default)]
-struct ImageRead {
-    content: Vec<ContentBlock>,
-    omitted: Vec<Value>,
-    warnings: Vec<String>,
-    seen: usize,
+fn measure_outbound_len(call: &Call<'_>, result: &CallToolResult) -> Result<usize, String> {
+    if call.render_slot.is_some() {
+        wire_result_len(call.call_id, result).map(|n| n.saturating_sub(4))
+    } else {
+        crate::ipc::json_len(result)
+            .map(|n| n.saturating_add(256))
+            .map_err(|err| format!("Cannot measure result JSON: {err}."))
+    }
 }
 
-fn read_images(task: &Task, start: u64, end: u64, seen: usize) -> Result<ImageRead, String> {
-    let mut result = ImageRead {
-        seen,
-        ..ImageRead::default()
-    };
-    let mut bytes = 0;
-    let mut unavailable = Vec::new();
-    for (image, dropped) in task.images_between(start, end, seen) {
-        result.seen = result.seen.max(image.index);
-        let reason = if dropped {
-            Some("log_dropped")
-        } else if result.content.len() == 4 || bytes + image.base64_len > images::MAX_BASE64 {
-            Some("budget")
-        } else {
-            None
-        };
-        let shown_image_path = files::display_path(&image.path);
-        if let Some(reason) = reason {
-            result
-                .omitted
-                .push(json!({"index": image.index, "path": shown_image_path, "reason": reason}));
-            unavailable.push(format!("#{} {shown_image_path}", image.index));
-            continue;
+enum PlannedAttachment {
+    Select(tasks::AttachmentLease),
+    Degraded { index: usize, warning: String },
+}
+
+enum PackStep {
+    Delivered {
+        index: usize,
+        kind: media::MediaKind,
+        mime: String,
+        bytes: u64,
+        base64_len: usize,
+        shown_path: String,
+        block: Box<ContentBlock>,
+    },
+    Degraded {
+        index: usize,
+        warning: String,
+    },
+}
+
+impl PackStep {
+    fn index(&self) -> usize {
+        match self {
+            Self::Delivered { index, .. } | Self::Degraded { index, .. } => *index,
         }
-        let read = || -> std::io::Result<String> {
-            let mut data = Vec::new();
-            File::open(&image.path)?
-                .take(image.size + 1)
-                .read_to_end(&mut data)?;
-            if data.len() as u64 != image.size {
-                return Err(std::io::Error::other(
-                    "image size changed; read its path directly",
-                ));
-            }
-            Ok(base64::engine::general_purpose::STANDARD.encode(data))
-        };
-        let encoded = match read() {
-            Ok(encoded) => encoded,
-            Err(_) if task.evicted() => {
-                result
-                    .omitted
-                    .push(json!({"index": image.index, "reason": "evicted"}));
-                continue;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "Cannot read stored image {shown_image_path}: {error}.",
-                ));
-            }
-        };
-        bytes += encoded.len();
-        result
-            .content
-            .push(ContentBlock::image(encoded, image.mime));
     }
-    if !unavailable.is_empty() {
-        result.warnings.push(format!(
-            "{} image(s) not attached (4 images or {} base64 bytes per result, or image markers lost from the log): {}; read their paths.",
-            unavailable.len(), images::MAX_BASE64, unavailable.join(", "),
-        ));
-    }
-    Ok(result)
+}
+
+#[derive(Default)]
+struct AttachmentBundle {
+    steps: Vec<PackStep>,
+    nested_handles: Vec<Value>,
+    tail_warnings: Vec<String>,
+    lease: Option<Lease>,
 }
 
 struct ScriptReport {
@@ -2062,8 +2727,8 @@ fn script_report(tasks: &Tasks, task: &Task) -> Option<ScriptReport> {
         cancelled: cancelled.len(),
         running,
         value: json!({
-            "cancelledCalls": cancelled, "startedTasks": started,
-            "imagesAttached": 0, "imagesNotAttached": [],
+            "cancelledCalls": cancelled,
+            "startedTasks": started,
         }),
     })
 }
@@ -2144,7 +2809,7 @@ fn task_warnings(snapshot: &Snapshot) -> Vec<String> {
     }
     if snapshot.evicted {
         warnings.push(
-            "log evicted under the 1 GiB total limit; stored output and images are unavailable"
+            "log evicted under the 4 GiB total limit; stored output and attachments are unavailable"
                 .into(),
         );
     }
@@ -2259,7 +2924,12 @@ fn prune_task_diagnostics(value: &mut Value) {
         }
     }
     if let Some(Value::Object(codemode)) = obj.get_mut("codemode") {
-        for key in ["cancelledCalls", "startedTasks", "imagesNotAttached"] {
+        for key in [
+            "cancelledCalls",
+            "startedTasks",
+            "attachmentsDelivered",
+            "attachments",
+        ] {
             if codemode
                 .get(key)
                 .and_then(Value::as_array)
@@ -2267,9 +2937,6 @@ fn prune_task_diagnostics(value: &mut Value) {
             {
                 codemode.remove(key);
             }
-        }
-        if codemode.get("imagesAttached").and_then(Value::as_u64) == Some(0) {
-            codemode.remove("imagesAttached");
         }
         if codemode.is_empty() {
             obj.remove("codemode");
@@ -2342,6 +3009,7 @@ fn error_named(action: &str, message: &str) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     fn script_fixture() -> (Arc<Service>, Arc<Tasks>, Arc<Session>) {
         let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
@@ -2396,9 +3064,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codemode_images_follow_readers_despite_truncated_or_structured_text() {
+    async fn codemode_attachments_deliver_all_without_count_cap_and_reattach_on_bare_id() {
         let (service, tasks, session) = script_fixture();
-        let code = format!("for(let i=0;i<6;i++) image({});", json!(pixel_url()));
+        let code = format!("for(let i=0;i<6;i++) attach({});", json!(pixel_url()));
         for mode in [OutputMode::Both, OutputMode::Structured] {
             let mut call = script_call(&session, false);
             call.render.output_mode = mode;
@@ -2413,16 +3081,15 @@ mod tests {
                 )
                 .await;
             assert_eq!(result.is_error, Some(false), "{result:?}");
-            assert_eq!(image_count(&result), 4, "{result:?}");
+            assert_eq!(image_count(&result), 6, "{result:?}");
             let data = result.structured_content.unwrap();
-            assert_eq!(data["codemode"]["imagesAttached"], 4);
-            assert_eq!(
-                data["codemode"]["imagesNotAttached"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                2
-            );
+            let delivered = data["codemode"]["attachmentsDelivered"].as_array().unwrap();
+            assert_eq!(delivered.len(), 6);
+            for (idx, item) in delivered.iter().enumerate() {
+                assert_eq!(item["index"], idx + 1);
+                assert_eq!(item["kind"], "image");
+                assert_eq!(item["mimeType"], "image/png");
+            }
             let handle = data["taskId"].as_str().unwrap();
             let empty = service
                 .call_json(
@@ -2438,98 +3105,176 @@ mod tests {
                     script_call(&session, false),
                 )
                 .await;
-            assert_eq!(image_count(&reread), 4);
+            assert_eq!(image_count(&reread), 6);
+            assert_eq!(
+                reread.structured_content.unwrap()["codemode"]["attachmentsDelivered"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                6
+            );
         }
         tasks.shutdown();
     }
 
     #[tokio::test]
-    async fn codemode_images_obey_the_combined_base64_budget() {
-        let (service, tasks, session) = script_fixture();
-        let mut bytes = base64::engine::general_purpose::STANDARD
+    async fn codemode_greedy_packing_eof_continuation_identical_dedup_and_single_oversize_skip() {
+        let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        // Tight 4600-byte outbound frame limit: fits ONE ~1600-byte PNG (~2136 B b64) per response,
+        // refuses two together, and skips a single ~3600-byte PNG (~4800 B b64 > 4600 B solo cap).
+        let launch = Arc::new(
+            crate::session::LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_outbound_limit(4600),
+        );
+        let session = Session::new("pack-test".into(), "pack-test".into(), launch);
+
+        let base_png = base64::engine::general_purpose::STANDARD
             .decode(pixel_url().split_once(',').unwrap().1)
             .unwrap();
-        bytes.resize(2 << 20, 0);
-        let encoded_size = bytes.len().div_ceil(3) * 4;
-        assert!(encoded_size < images::MAX_BASE64 && 2 * encoded_size > images::MAX_BASE64);
-        let path = std::env::temp_dir().join(format!(
-            "fastexec-image-budget-{}.png",
-            tasks::random_chars(8).unwrap()
-        ));
-        {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .unwrap();
-            file.write_all(&bytes).unwrap();
-        }
-        let code = format!(
-            "const pic = await tools.read({{path:{}}}); image(pic); image(pic);",
-            json!(path.to_str().unwrap())
+        let mut medium_png = base64::engine::general_purpose::STANDARD
+            .decode(pixel_url().split_once(',').unwrap().1)
+            .unwrap();
+        medium_png.resize(1600, 0);
+        let mut huge_png = base_png.clone();
+        huge_png.resize(3600, 0);
+
+        let med_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&medium_png)
         );
-        let result = service
+        let huge_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&huge_png)
+        );
+        let small_url = pixel_url();
+
+        // Attach TWO byte-identical medium PNGs (#1 and #2), ONE oversized PNG (#3), and ONE small PNG (#4).
+        let code = format!(
+            "text('done-line'); attach({med_url:?}); attach({med_url:?}); attach({huge_url:?}); attach({small_url:?});"
+        );
+        let first = service
             .codemode(
-                serde_json::from_value(json!({"code":code})).unwrap(),
+                serde_json::from_value(json!({"code": code})).unwrap(),
                 script_call(&session, false),
                 false,
             )
             .await;
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(result.is_error, Some(false), "{result:?}");
-        assert_eq!(image_count(&result), 1);
-        let data = result.structured_content.unwrap();
-        assert_eq!(data["exitCode"], 0);
-        assert_eq!(data["codemode"]["imagesAttached"], 1);
-        let omitted = data["codemode"]["imagesNotAttached"].as_array().unwrap();
-        assert_eq!(omitted.len(), 1);
-        assert_eq!(omitted[0]["index"], 2);
-        assert_eq!(omitted[0]["reason"], "budget");
-        let again = service
+        assert_eq!(first.is_error, Some(false), "{first:?}");
+        assert_eq!(image_count(&first), 1);
+        let sc1 = first.structured_content.unwrap();
+        assert_eq!(sc1["state"], "exited");
+        assert_eq!(sc1["output"], "done-line");
+        let del1 = sc1["codemode"]["attachmentsDelivered"].as_array().unwrap();
+        assert_eq!(del1.len(), 1);
+        assert_eq!(del1[0]["index"], 1);
+        let handle = sc1["taskId"].as_str().unwrap().to_owned();
+
+        // Text is ALREADY at EOF: inputless poll #1 delivers identical attachment #2!
+        let second = service
             .call_json(
-                json!({
-                    "action":"poll","taskId":data["taskId"],"waitMs":0,
-                }),
+                json!({"action": "poll", "taskId": handle, "waitMs": 0}),
                 script_call(&session, false),
             )
             .await;
-        assert_eq!(image_count(&again), 0);
-        assert!(
-            again
-                .structured_content
-                .unwrap()
-                .get("codemode")
-                .and_then(|cm| cm.get("imagesNotAttached"))
-                .is_none()
+        assert_eq!(second.is_error, Some(false), "{second:?}");
+        assert_eq!(image_count(&second), 1);
+        let sc2 = second.structured_content.unwrap();
+        let del2 = sc2["codemode"]["attachmentsDelivered"].as_array().unwrap();
+        assert_eq!(del2.len(), 1);
+        assert_eq!(del2[0]["index"], 2);
+
+        // Inputless poll #2: attachment #3 exceeds the 4600-byte outbound frame limit on its own,
+        // so it emits a visible degradation receipt naming #3 and advances straight through to #4!
+        let third = service
+            .call_json(
+                json!({"action": "poll", "taskId": handle, "waitMs": 0}),
+                script_call(&session, false),
+            )
+            .await;
+        assert_eq!(third.is_error, Some(false), "{third:?}");
+        assert_eq!(image_count(&third), 1);
+        let sc3 = third.structured_content.unwrap();
+        let del3 = sc3["codemode"]["attachmentsDelivered"].as_array().unwrap();
+        assert_eq!(del3.len(), 1);
+        assert_eq!(del3[0]["index"], 4);
+        let all_warnings: Vec<String> = [&sc1, &sc2, &sc3]
+            .into_iter()
+            .filter_map(|sc| sc["warnings"].as_array())
+            .flatten()
+            .filter_map(|w| w.as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            all_warnings
+                .iter()
+                .filter(|w| w.contains("attachment #3") && w.contains("exceeds"))
+                .count(),
+            1,
+            "{all_warnings:?}"
         );
-        let (id, _) = parse_handle(data["taskId"].as_str().unwrap()).unwrap();
-        let image_path = tasks.find(id).unwrap().image_path(1, "image/png");
-        let shorter = bytes.len() - 1;
-        assert_eq!(shorter.div_ceil(3) * 4, encoded_size);
+
+        // Inputless poll #3: nothing left.
+        let fourth = service
+            .call_json(
+                json!({"action": "poll", "taskId": handle, "waitMs": 0}),
+                script_call(&session, false),
+            )
+            .await;
+        assert_eq!(image_count(&fourth), 0);
+
+        // Re-attach via bare taskId with `structured_content: false`: visible `Attached: #<index>` summary!
+        let bare = parse_handle(&handle).unwrap().0;
+        let plain_render = Render {
+            output_mode: OutputMode::Text,
+            structured_content: false,
+        };
+        let make_plain_call = || Call {
+            session: &session,
+            launch: None,
+            render: plain_render,
+            cancel: CancellationToken::new(),
+            progress: None,
+            call_id: None,
+            nested: false,
+            started: None,
+            render_slot: None,
+        };
+        let p1 = service
+            .call_json(
+                json!({"action": "poll", "taskId": bare, "waitMs": 0}),
+                make_plain_call(),
+            )
+            .await;
+        assert!(p1.structured_content.is_none());
+        let p1_text = p1.content[0].as_text().unwrap().text.clone();
+        assert!(
+            p1_text.contains("Attached: #1 (image/png, 1600 B)"),
+            "{p1_text}"
+        );
+
+        // Corrupted attachment size leaves fresh reader uncommitted until restored.
+        let att1_path = tasks.find(bare).unwrap().attachment_path(1, "image/png");
         std::fs::OpenOptions::new()
             .write(true)
-            .open(&image_path)
+            .open(&att1_path)
             .unwrap()
-            .set_len(shorter as u64)
+            .set_len(1599)
             .unwrap();
-        let fresh = json!({"action":"poll","taskId":format!("{id}.5678"),"waitMs":0});
+        let fresh_req = json!({"action": "poll", "taskId": format!("{bare}.9999"), "waitMs": 0});
         let changed = service
-            .call_json(fresh.clone(), script_call(&session, false))
+            .call_json(fresh_req.clone(), script_call(&session, false))
             .await;
         assert_eq!(changed.is_error, Some(true));
         assert!(
             serde_json::to_string(&changed.content)
                 .unwrap()
-                .contains("image size changed")
+                .contains("attachment size changed")
         );
-        std::fs::write(&image_path, &bytes).unwrap();
-        let retried = service.call_json(fresh, script_call(&session, false)).await;
-        assert_eq!(
-            image_count(&retried),
-            1,
-            "a failed image read must leave its reader uncommitted"
-        );
+        std::fs::write(&att1_path, &medium_png).unwrap();
+        let recovered = service
+            .call_json(fresh_req, script_call(&session, false))
+            .await;
+        assert_eq!(image_count(&recovered), 1);
         tasks.shutdown();
     }
 
@@ -2898,7 +3643,7 @@ mod tests {
                     let window = read_payload(&mut read.state);
                     assert_eq!(window.text, "prefix");
                     read.state.shown = (77, 7);
-                    read.state.images_seen = 9;
+                    read.state.attachments_seen = 9;
                     entered.send(()).unwrap();
                     blocked.recv().unwrap();
                     read
@@ -2951,7 +3696,7 @@ mod tests {
         assert_eq!(state.cursor, 0);
         assert_eq!(state.lines_before, 0);
         assert_eq!(state.shown, (7, 2));
-        assert_eq!(state.images_seen, 0);
+        assert_eq!(state.attachments_seen, 0);
         assert_eq!(format!("{:?}", state.cleaner), initial_cleaner);
         assert!(reader.is_fresh());
         assert!(!reader.is_reported() && !entry.is_reported());
