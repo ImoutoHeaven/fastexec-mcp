@@ -3867,14 +3867,28 @@ fn closing_the_server_ends_running_tasks_and_removes_logs() {
 #[test]
 fn finishing_after_many_short_tasks_keeps_its_own_output() {
     let mut server = Server::start();
-    server.ok(json!({"action": "start", "eof": false, "command": "read -r x; echo final-$x", "waitMs": 0}));
+    server.ok(json!({"action": "start", "eof": false, "command": "read -r x; echo final-$x", "keepTree": true, "waitMs": 0}));
+    // A root exit is not a retention barrier. keepTree reports a pending tree as
+    // keptRunning until the ender confirms completion, even for these childless commands.
+    let await_tree = |server: &mut Server, mut out: Value| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while out["state"] != "exited" || out["keptRunning"] == true {
+            assert!(Instant::now() < deadline, "tree did not finish: {out}");
+            let (next, _) = server.ok(json!({
+                "action": "poll", "taskId": out["taskId"], "waitMs": 1000
+            }));
+            out = next;
+        }
+    };
     for _ in 0..65 {
-        server.ok(json!({"action": "start", "command": "true"}));
+        let (out, _) = server.ok(json!({"action": "start", "command": "true", "keepTree": true}));
+        await_tree(&mut server, out);
     }
     let (out, text) = server
         .ok(json!({"action": "poll", "taskId": server.id(1), "input": "ok\n", "waitMs": 10000}));
     assert_eq!(out["state"], "exited");
     assert!(text.starts_with("final-ok\n"), "{text}");
+    await_tree(&mut server, out);
     let (out, _) = server.ok(json!({"action": "list", "limit": 100}));
     let tasks = out["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 64, "{out}");
