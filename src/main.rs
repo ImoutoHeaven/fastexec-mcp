@@ -57,8 +57,19 @@ use tokio_util::sync::CancellationToken;
 pub const TRANSFER_ADDR: &str = "FASTEXEC_TRANSFER_ADDR";
 /// Optional path to a plain UTF-8 file appended to MCP server instructions at startup.
 pub const INSTRUCTIONS_FILE: &str = "FASTEXEC_INSTRUCTIONS_FILE";
+/// Controls whether server instructions are also exposed as an MCP tool (`off`, `move`, `copy`).
+pub const INSTRUCTIONS_TOOL: &str = "FASTEXEC_INSTRUCTIONS_TOOL";
 /// Maximum raw byte size accepted for `FASTEXEC_INSTRUCTIONS_FILE`.
 const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
+const MOVE_INSTRUCTIONS_POINTER: &str = "See the instructions tool for host-specific guidance.";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InstructionsToolMode {
+    #[default]
+    Off,
+    Move,
+    Copy,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tools {
@@ -111,6 +122,7 @@ impl schemars::JsonSchema for CodemodeArguments {
 struct Server {
     backend: Backend,
     instructions: Arc<str>,
+    tool_instructions: Option<Arc<str>>,
     /// This server's own routes: the tool list and the description of `exec` are built per
     /// server, because what they say about the host differs between servers.
     router: ToolRouter<Server>,
@@ -155,11 +167,23 @@ impl Server {
         transfer: Option<TransferEndpoint>,
         tools: Tools,
         extra_instructions: Option<&str>,
+        instructions_tool: InstructionsToolMode,
     ) -> Self {
-        let router = Self::build_router(launch, tools);
-        let instructions =
-            server_instructions(backend.daemon_owned(), tools.codemode, extra_instructions);
-        Self::with_shared(backend, router, instructions, transfer, tools)
+        let (instructions, tool_instructions) = compose_instructions(
+            backend.daemon_owned(),
+            tools.codemode,
+            extra_instructions,
+            instructions_tool,
+        );
+        let router = Self::build_router(launch, tools, tool_instructions.as_deref());
+        Self::with_shared(
+            backend,
+            router,
+            instructions,
+            tool_instructions,
+            transfer,
+            tools,
+        )
     }
 
     /// A server reusing a pre-built tool router and composed instructions snapshot.
@@ -167,12 +191,14 @@ impl Server {
         backend: Backend,
         router: ToolRouter<Self>,
         instructions: Arc<str>,
+        tool_instructions: Option<Arc<str>>,
         transfer: Option<TransferEndpoint>,
         tools: Tools,
     ) -> Self {
         Self {
             backend,
             instructions,
+            tool_instructions,
             router,
             transfer,
             tools,
@@ -180,7 +206,11 @@ impl Server {
         }
     }
 
-    pub(crate) fn build_router(launch: &LaunchContext, tools: Tools) -> ToolRouter<Self> {
+    pub(crate) fn build_router(
+        launch: &LaunchContext,
+        tools: Tools,
+        tool_instructions: Option<&str>,
+    ) -> ToolRouter<Self> {
         let mut exec = Self::exec_tool_attr();
         exec.description = Some(exec_description(launch, tools.codemode).into());
         let mut router = ToolRouter::new()
@@ -202,6 +232,22 @@ impl Server {
                 prepare_tool(Self::transfer_tool_attr(), tools.yolo),
                 Self::transfer,
             ));
+        }
+        if let Some(description) = tool_instructions {
+            let mut instructions = Self::instructions_tool_attr();
+            instructions.description = Some(description.to_owned().into());
+            // Pin the exact zero-arg schema so schemars root metadata (like `title`) cannot leak.
+            instructions.input_schema = Arc::new(
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                })
+                .as_object()
+                .expect("object schema")
+                .clone(),
+            );
+            router = router.with_route((prepare_tool(instructions, false), Self::instructions));
         }
         router
     }
@@ -280,6 +326,32 @@ pub(crate) fn server_instructions(
         text.push_str(extra);
     }
     Arc::from(text)
+}
+
+/// Composes the protocol `instructions` snapshot and optional `instructions` tool snapshot.
+pub(crate) fn compose_instructions(
+    daemon_owned: bool,
+    codemode: bool,
+    extra: Option<&str>,
+    mode: InstructionsToolMode,
+) -> (Arc<str>, Option<Arc<str>>) {
+    match mode {
+        InstructionsToolMode::Off => (server_instructions(daemon_owned, codemode, extra), None),
+        InstructionsToolMode::Move => match extra {
+            Some(extra) => (
+                server_instructions(daemon_owned, codemode, Some(MOVE_INSTRUCTIONS_POINTER)),
+                Some(Arc::from(extra)),
+            ),
+            None => {
+                let base = server_instructions(daemon_owned, codemode, None);
+                (Arc::clone(&base), Some(base))
+            }
+        },
+        InstructionsToolMode::Copy => {
+            let full = server_instructions(daemon_owned, codemode, extra);
+            (Arc::clone(&full), Some(full))
+        }
+    }
 }
 
 /// Loads and normalizes `FASTEXEC_INSTRUCTIONS_FILE` once at startup.
@@ -651,6 +723,37 @@ impl Server {
                     publish_transfer(request, Arc::clone(launch), table, &base, *render).await
                 }
             },
+        }
+    }
+
+    #[tool(
+        name = "instructions",
+        annotations(
+            title = "Server instructions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn instructions(
+        &self,
+        Parameters(arguments): Parameters<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if !arguments.is_empty() {
+            return Err(rmcp::ErrorData::invalid_params(
+                "instructions takes no arguments",
+                None,
+            ));
+        }
+        match &self.tool_instructions {
+            Some(text) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                text.as_ref(),
+            )])),
+            None => Err(rmcp::ErrorData::invalid_params(
+                "instructions tool is disabled",
+                None,
+            )),
         }
     }
 }
@@ -1337,13 +1440,16 @@ async fn cli_start(
     let (mut client, lock) = match within(deadline, connect_existing(paths)).await {
         Ok(Some(client)) => (client, None),
         Ok(None) => {
-            if flags.http.is_some()
-                && let Err(message) = {
+            if flags.http.is_some() {
+                if let Err(message) = instructions_tool_mode() {
+                    return fail(&message);
+                }
+                if let Err(message) = {
                     let launch = launch.for_session();
                     blocking_within(deadline, move || instructions_file(&launch)).await
+                } {
+                    return fail(&message);
                 }
-            {
-                return fail(&message);
             }
             match runtime::connect_or_start(identity, paths, deadline, &extra).await {
                 Ok(pair) => pair,
@@ -1629,6 +1735,27 @@ pub fn transfer() -> Result<bool, String> {
     )
 }
 
+/// How `FASTEXEC_INSTRUCTIONS_TOOL` exposes server instructions as an MCP tool.
+pub fn instructions_tool_mode() -> Result<InstructionsToolMode, String> {
+    instructions_tool_mode_of(std::env::var_os(INSTRUCTIONS_TOOL).as_deref())
+}
+
+fn instructions_tool_mode_of(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<InstructionsToolMode, String> {
+    let Some(value) = value else {
+        return Ok(InstructionsToolMode::Off);
+    };
+    match value.to_str() {
+        Some("off") => Ok(InstructionsToolMode::Off),
+        Some("move") => Ok(InstructionsToolMode::Move),
+        Some("copy") => Ok(InstructionsToolMode::Copy),
+        _ => Err(format!(
+            "invalid {INSTRUCTIONS_TOOL} {value:?}; expected off, move, or copy"
+        )),
+    }
+}
+
 fn parse_bool_env(
     name: &str,
     value: Option<&std::ffi::OsStr>,
@@ -1753,6 +1880,13 @@ async fn serve() {
             std::process::exit(1);
         }
     };
+    let instructions_tool = match instructions_tool_mode() {
+        Ok(mode) => mode,
+        Err(message) => {
+            eprintln!("fastexec: {message}");
+            std::process::exit(1);
+        }
+    };
     let transfer_cfg = if tools.transfer {
         let root = match http::public_root() {
             Ok(root) => root,
@@ -1871,6 +2005,7 @@ async fn serve() {
         transfer_endpoint,
         tools,
         extra_instructions.as_deref(),
+        instructions_tool,
     );
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
@@ -2282,6 +2417,7 @@ mod portable_schema_tests {
                 yolo: false,
             },
             None,
+            InstructionsToolMode::Off,
         );
         let tools = server.router.list_all();
         assert_eq!(tools.len(), 6);
@@ -2572,6 +2708,164 @@ mod instructions_file_tests {
             err.contains("it is not a regular file"),
             "unexpected FIFO error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod instructions_tool_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn parser_accepts_strict_lowercase_values_and_rejects_invalid() {
+        assert_eq!(
+            instructions_tool_mode_of(None),
+            Ok(InstructionsToolMode::Off)
+        );
+        assert_eq!(
+            instructions_tool_mode_of(Some(OsStr::new("off"))),
+            Ok(InstructionsToolMode::Off)
+        );
+        assert_eq!(
+            instructions_tool_mode_of(Some(OsStr::new("move"))),
+            Ok(InstructionsToolMode::Move)
+        );
+        assert_eq!(
+            instructions_tool_mode_of(Some(OsStr::new("copy"))),
+            Ok(InstructionsToolMode::Copy)
+        );
+
+        for bad in [
+            "", "true", "false", "on", "OFF", "Move", "COPY", " off ", "move\n", "1", "0",
+        ] {
+            let err = instructions_tool_mode_of(Some(OsStr::new(bad))).unwrap_err();
+            assert_eq!(
+                err,
+                format!("invalid {INSTRUCTIONS_TOOL} {bad:?}; expected off, move, or copy")
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let err = instructions_tool_mode_of(Some(OsStr::from_bytes(b"\xff"))).unwrap_err();
+            assert!(
+                err.starts_with(&format!("invalid {INSTRUCTIONS_TOOL} "))
+                    && err.ends_with("; expected off, move, or copy"),
+                "{err}"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let value = std::ffi::OsString::from_wide(&[0xD800]);
+            let err = instructions_tool_mode_of(Some(&value)).unwrap_err();
+            assert!(
+                err.starts_with(&format!("invalid {INSTRUCTIONS_TOOL} "))
+                    && err.ends_with("; expected off, move, or copy"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_instructions_matches_spec_matrix() {
+        let extra = "    host rule 1\n第二行\n";
+        for daemon_owned in [false, true] {
+            for codemode in [false, true] {
+                let base = server_instructions(daemon_owned, codemode, None);
+                let full = server_instructions(daemon_owned, codemode, Some(extra));
+
+                let (proto, tool) =
+                    compose_instructions(daemon_owned, codemode, None, InstructionsToolMode::Off);
+                assert_eq!(proto, base);
+                assert_eq!(tool, None);
+
+                let (proto, tool) = compose_instructions(
+                    daemon_owned,
+                    codemode,
+                    Some(extra),
+                    InstructionsToolMode::Off,
+                );
+                assert_eq!(proto, full);
+                assert_eq!(tool, None);
+
+                let (proto, tool) =
+                    compose_instructions(daemon_owned, codemode, None, InstructionsToolMode::Move);
+                assert_eq!(proto, base);
+                assert_eq!(tool.as_deref(), Some(base.as_ref()));
+
+                let (proto, tool) = compose_instructions(
+                    daemon_owned,
+                    codemode,
+                    Some(extra),
+                    InstructionsToolMode::Move,
+                );
+                assert_eq!(
+                    proto.as_ref(),
+                    format!("{base}\n\n{MOVE_INSTRUCTIONS_POINTER}")
+                );
+                assert_eq!(tool.as_deref(), Some(extra));
+
+                let (proto, tool) =
+                    compose_instructions(daemon_owned, codemode, None, InstructionsToolMode::Copy);
+                assert_eq!(proto, base);
+                assert_eq!(tool.as_deref(), Some(base.as_ref()));
+
+                let (proto, tool) = compose_instructions(
+                    daemon_owned,
+                    codemode,
+                    Some(extra),
+                    InstructionsToolMode::Copy,
+                );
+                assert_eq!(proto, full);
+                assert_eq!(tool.as_deref(), Some(full.as_ref()));
+            }
+        }
+    }
+
+    #[test]
+    fn build_router_registers_instructions_tool_with_exact_schema_and_annotations() {
+        let launch = LaunchContext::current().unwrap();
+        let expected_schema = json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        });
+        let description = "    host-specific directive\n第二行\n";
+
+        for yolo in [false, true] {
+            let tools = Tools {
+                codemode: false,
+                transfer: false,
+                yolo,
+            };
+
+            let absent = Server::build_router(&launch, tools, None);
+            assert!(
+                absent
+                    .list_all()
+                    .iter()
+                    .all(|tool| tool.name != "instructions")
+            );
+
+            let present = Server::build_router(&launch, tools, Some(description));
+            let tool = present
+                .list_all()
+                .into_iter()
+                .find(|tool| tool.name == "instructions")
+                .expect("instructions tool registered");
+            assert_eq!(tool.description.as_deref(), Some(description));
+            assert_eq!(Value::Object((*tool.input_schema).clone()), expected_schema);
+            let annotations = tool.annotations.expect("instructions annotations");
+            assert_eq!(annotations.title.as_deref(), Some("Server instructions"));
+            assert_eq!(annotations.read_only_hint, Some(true));
+            assert_eq!(annotations.destructive_hint, Some(false));
+            assert_eq!(annotations.idempotent_hint, Some(true));
+            assert_eq!(annotations.open_world_hint, Some(false));
+        }
     }
 }
 

@@ -8372,3 +8372,369 @@ fn instructions_file_appends_to_stdio_initialize_and_rejects_invalid_files() {
         );
     }
 }
+
+const MOVE_GUIDANCE_POINTER: &str = "See the instructions tool for host-specific guidance.";
+
+fn stdio_init_params() -> Value {
+    json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "probe", "version": "0"},
+    })
+}
+
+fn find_tool<'a>(listed: &'a Value, name: &str) -> Option<&'a Value> {
+    listed["result"]["tools"]
+        .as_array()
+        .expect("tools/list array")
+        .iter()
+        .find(|tool| tool["name"] == name)
+}
+
+fn assert_instructions_call_ok(message: &Value, expected: &str, context: &str) {
+    let result = &message["result"];
+    assert!(result.is_object(), "{context}: {message}");
+    assert_ne!(result["isError"], true, "{context}: {message}");
+    assert!(
+        result.get("structuredContent").is_none(),
+        "{context}: unexpected structuredContent in {message}"
+    );
+    let content = result["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: missing content array in {message}"));
+    assert_eq!(content.len(), 1, "{context}: {message}");
+    assert_eq!(content[0]["type"], "text", "{context}: {message}");
+    assert_eq!(content[0]["text"].as_str(), Some(expected), "{context}");
+}
+
+#[test]
+fn instructions_tool_off_and_unset_preserve_v070_behavior() {
+    let dir = Scratch::new("instructions-tool-off");
+    std::fs::create_dir_all(&*dir).unwrap();
+    let file = dir.join("extra.txt");
+    std::fs::write(&file, "    host note\r\nsecond line  \r\n").unwrap();
+
+    let mut plain = Server::start();
+    let base = plain.request("initialize", stdio_init_params())["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let listed = plain.request("tools/list", json!({}));
+    assert!(
+        find_tool(&listed, "instructions").is_none(),
+        "unset should omit instructions tool: {listed}"
+    );
+    drop(plain);
+
+    for mode in [None, Some("off")] {
+        for with_file in [false, true] {
+            let mut server = Server::start_with(|command| {
+                command.current_dir(&*dir);
+                if let Some(mode) = mode {
+                    command.env("FASTEXEC_INSTRUCTIONS_TOOL", mode);
+                }
+                if with_file {
+                    command.env("FASTEXEC_INSTRUCTIONS_FILE", "extra.txt");
+                }
+            });
+            let init = server.request("initialize", stdio_init_params())["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let expected = if with_file {
+                format!("{base}\n\n    host note\nsecond line  \n")
+            } else {
+                base.clone()
+            };
+            assert_eq!(init, expected, "mode={mode:?} with_file={with_file}");
+
+            let listed = server.request("tools/list", json!({}));
+            assert!(
+                find_tool(&listed, "instructions").is_none(),
+                "mode={mode:?} with_file={with_file} should omit instructions tool: {listed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn instructions_tool_move_mode_contract_and_annotations() {
+    let dir = Scratch::new("instructions-tool-move");
+    std::fs::create_dir_all(&*dir).unwrap();
+
+    // Include leading indentation, UTF-8 text, >512 bytes before the unique marker, and trailing spaces.
+    let marker = "MARKER-AFTER-512-BYTES-7c4e9b";
+    let padding = "x".repeat(540);
+    let raw =
+        format!("\u{feff}    Opening directive — 日本語 café  \r\n{padding}\r\n{marker}   \r\n");
+    let normalized = format!("    Opening directive — 日本語 café  \n{padding}\n{marker}   \n");
+    assert!(normalized.find(marker).unwrap() > 512);
+    std::fs::write(dir.join("host.txt"), raw).unwrap();
+
+    let mut plain = Server::start();
+    let base = plain.request("initialize", stdio_init_params())["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(plain);
+
+    let expected_proto = format!("{base}\n\n{MOVE_GUIDANCE_POINTER}");
+    let expected_annotations = json!({
+        "title": "Server instructions",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+    });
+    let expected_schema = json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+    });
+
+    for (yolo, output_mode) in [
+        ("false", None),
+        ("true", Some("structured")),
+        ("false", Some("both")),
+    ] {
+        let mut server = Server::start_with(|command| {
+            command
+                .current_dir(&*dir)
+                .env("FASTEXEC_INSTRUCTIONS_TOOL", "move")
+                .env("FASTEXEC_INSTRUCTIONS_FILE", "host.txt")
+                .env("FASTEXEC_YOLO", yolo);
+            if let Some(mode) = output_mode {
+                command.env("FASTEXEC_OUTPUT_MODE", mode);
+            }
+        });
+
+        let init = server.request("initialize", stdio_init_params())["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(init, expected_proto, "yolo={yolo} output={output_mode:?}");
+        assert!(!init.contains(marker), "file text leaked into initialize");
+
+        let listed = server.request("tools/list", json!({}));
+        let tool = find_tool(&listed, "instructions")
+            .unwrap_or_else(|| panic!("missing instructions tool: {listed}"));
+        assert_eq!(tool["description"].as_str(), Some(normalized.as_str()));
+        assert_eq!(tool["inputSchema"], expected_schema, "{tool}");
+        assert_eq!(
+            tool["annotations"], expected_annotations,
+            "yolo={yolo} output={output_mode:?}: {tool}"
+        );
+
+        for (label, params) in [
+            (
+                "empty object",
+                json!({"name": "instructions", "arguments": {}}),
+            ),
+            ("omitted arguments", json!({"name": "instructions"})),
+            (
+                "null arguments",
+                json!({"name": "instructions", "arguments": null}),
+            ),
+        ] {
+            let reply = server.request("tools/call", params);
+            assert_instructions_call_ok(
+                &reply,
+                &normalized,
+                &format!("yolo={yolo} output={output_mode:?} {label}"),
+            );
+        }
+
+        let extra_err = server.request(
+            "tools/call",
+            json!({"name": "instructions", "arguments": {"unexpected": true}}),
+        );
+        assert_eq!(
+            extra_err["error"]["code"],
+            json!(-32602),
+            "extra args must fail with -32602: {extra_err}"
+        );
+
+        // Calling instructions must not allocate or leave any tasks.
+        let (structured, text, is_error) = server.call(json!({"action": "list", "scope": "all"}));
+        assert!(!is_error, "{text}");
+        if output_mode.is_some() {
+            assert_eq!(structured["tasks"], json!([]), "{structured}");
+        } else {
+            assert!(text.contains("No tasks."), "unexpected tasks: {text}");
+        }
+    }
+
+    // move without FASTEXEC_INSTRUCTIONS_FILE returns built-in lines on both surfaces.
+    let mut no_file = Server::start_with(|command| {
+        command.env("FASTEXEC_INSTRUCTIONS_TOOL", "move");
+    });
+    let init = no_file.request("initialize", stdio_init_params())["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(init, base);
+    let listed = no_file.request("tools/list", json!({}));
+    let tool = find_tool(&listed, "instructions").expect("instructions tool");
+    assert_eq!(tool["description"].as_str(), Some(base.as_str()));
+    let reply = no_file.request(
+        "tools/call",
+        json!({"name": "instructions", "arguments": {}}),
+    );
+    assert_instructions_call_ok(&reply, &base, "move without file");
+}
+
+#[test]
+fn instructions_tool_copy_mode_with_and_without_file() {
+    let dir = Scratch::new("instructions-tool-copy");
+    std::fs::create_dir_all(&*dir).unwrap();
+    std::fs::write(dir.join("copy.txt"), "    copied guidance — naïve  \r\n").unwrap();
+
+    let mut plain = Server::start();
+    let base = plain.request("initialize", stdio_init_params())["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(plain);
+
+    for (with_file, expected) in [
+        (false, base.clone()),
+        (true, format!("{base}\n\n    copied guidance — naïve  \n")),
+    ] {
+        let mut server = Server::start_with(|command| {
+            command
+                .current_dir(&*dir)
+                .env("FASTEXEC_INSTRUCTIONS_TOOL", "copy");
+            if with_file {
+                command.env("FASTEXEC_INSTRUCTIONS_FILE", "copy.txt");
+            }
+        });
+
+        let init = server.request("initialize", stdio_init_params())["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(init, expected, "with_file={with_file}");
+
+        let listed = server.request("tools/list", json!({}));
+        let tool = find_tool(&listed, "instructions").expect("instructions tool");
+        assert_eq!(
+            tool["description"].as_str(),
+            Some(expected.as_str()),
+            "with_file={with_file}"
+        );
+
+        let reply = server.request(
+            "tools/call",
+            json!({"name": "instructions", "arguments": {}}),
+        );
+        assert_instructions_call_ok(&reply, &expected, &format!("copy with_file={with_file}"));
+    }
+}
+
+#[test]
+fn instructions_tool_16kib_boundary_and_snapshot_immutability() {
+    let dir = Scratch::new("instructions-tool-16k");
+    std::fs::create_dir_all(&*dir).unwrap();
+
+    let mut plain = Server::start();
+    let base = plain.request("initialize", stdio_init_params())["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(plain);
+
+    let prefix = "    exact-16k-head\n";
+    let suffix = "\nexact-16k-tail   \n";
+    let body = format!(
+        "{prefix}{}{suffix}",
+        "b".repeat(16_384 - prefix.len() - suffix.len())
+    );
+    assert_eq!(body.len(), 16_384);
+
+    for mode in ["move", "copy"] {
+        let file = dir.join(format!("{mode}.txt"));
+        std::fs::write(&file, &body).unwrap();
+
+        let mut server = Server::start_with(|command| {
+            command
+                .current_dir(&*dir)
+                .env("FASTEXEC_INSTRUCTIONS_TOOL", mode)
+                .env("FASTEXEC_INSTRUCTIONS_FILE", &file);
+        });
+
+        let expected_proto = if mode == "move" {
+            format!("{base}\n\n{MOVE_GUIDANCE_POINTER}")
+        } else {
+            format!("{base}\n\n{body}")
+        };
+        let expected_tool = if mode == "move" {
+            body.clone()
+        } else {
+            format!("{base}\n\n{body}")
+        };
+
+        let check = |server: &mut Server, stage: &str| {
+            let init = server.request("initialize", stdio_init_params())["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(init, expected_proto, "{mode} {stage} initialize");
+            let listed = server.request("tools/list", json!({}));
+            let tool = find_tool(&listed, "instructions").expect("instructions tool");
+            assert_eq!(
+                tool["description"].as_str(),
+                Some(expected_tool.as_str()),
+                "{mode} {stage} description"
+            );
+            let reply = server.request(
+                "tools/call",
+                json!({"name": "instructions", "arguments": {}}),
+            );
+            assert_instructions_call_ok(&reply, &expected_tool, &format!("{mode} {stage} call"));
+        };
+
+        check(&mut server, "initial");
+        std::fs::write(&file, "edited after startup\n").unwrap();
+        check(&mut server, "after edit");
+        std::fs::remove_file(&file).unwrap();
+        check(&mut server, "after delete");
+    }
+}
+
+#[test]
+fn instructions_tool_rejects_invalid_env_values() {
+    for bad in ["", "true", "false", "MOVE", " off", "copy "] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
+        let output = command
+            .env("FASTEXEC_INSTRUCTIONS_TOOL", bad)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "bad={bad:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("FASTEXEC_INSTRUCTIONS_TOOL"),
+            "bad={bad:?}: {stderr:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        support::scrub_fastexec_env(&mut command);
+        let output = command
+            .env("FASTEXEC_INSTRUCTIONS_TOOL", OsStr::from_bytes(&[0xff]))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "non-utf8");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("FASTEXEC_INSTRUCTIONS_TOOL"),
+            "non-utf8: {stderr:?}"
+        );
+    }
+}

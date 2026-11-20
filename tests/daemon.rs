@@ -2750,3 +2750,233 @@ fn non_http_daemon_cli_ignores_missing_instructions_file() {
         );
     }
 }
+
+fn daemon_http_modern(
+    addr: std::net::SocketAddr,
+    token: &str,
+    method: &str,
+    mut params: Value,
+) -> Value {
+    use std::io::Read;
+
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "daemon-warm-test", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    })
+    .to_string();
+    let mut headers = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Authorization: Bearer {token}\r\n\
+         MCP-Protocol-Version: 2026-07-28\r\n\
+         Mcp-Method: {method}\r\n",
+        body.len()
+    );
+    if let Some(name) = params["name"].as_str() {
+        headers.push_str(&format!("Mcp-Name: {name}\r\n"));
+    }
+    headers.push_str("\r\n");
+
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect http daemon");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream.write_all(headers.as_bytes()).unwrap();
+    stream.write_all(body.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+
+    let (head, payload) = raw.split_once("\r\n\r\n").expect("http response split");
+    assert!(head.starts_with("HTTP/1.1 200"), "{raw}");
+    let json_text = payload
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap_or(payload.trim());
+    let answer: Value = serde_json::from_str(json_text)
+        .unwrap_or_else(|e| panic!("invalid json-rpc body ({e}): {raw}"));
+    assert!(answer["result"].is_object(), "{answer}");
+    answer["result"].clone()
+}
+
+#[test]
+fn cold_http_daemon_invalid_instructions_tool_exits_without_deleting_logs() {
+    let fixture = Fixture::new("inst-tool-cold-http");
+    let (code, _, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "seed start failed: {err}");
+    let (code, _, err) = fixture.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "seed stop failed: {err}");
+
+    let ns_dir = std::fs::read_dir(fixture.runtime.join("ns"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("namespace directory");
+    let logs = ns_dir.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let sentinel = logs.join("preexisting.log");
+    std::fs::write(&sentinel, b"keep this log").unwrap();
+
+    for subcommand in ["start", "run"] {
+        for bad in ["", "true", "false", "MOVE"] {
+            let output = fixture
+                .command(&["daemon", subcommand, "--http", "127.0.0.1:0"])
+                .env("FASTEXEC_HTTP_TOKEN", "0123456789abcdef")
+                .env("FASTEXEC_INSTRUCTIONS_TOOL", bad)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "daemon {subcommand} --http bad={bad:?}"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("FASTEXEC_INSTRUCTIONS_TOOL"),
+                "daemon {subcommand} --http bad={bad:?}: {stderr:?}"
+            );
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"keep this log",
+                "daemon {subcommand} --http deleted pre-existing logs"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let output = fixture
+                .command(&["daemon", subcommand, "--http", "127.0.0.1:0"])
+                .env("FASTEXEC_HTTP_TOKEN", "0123456789abcdef")
+                .env("FASTEXEC_INSTRUCTIONS_TOOL", OsStr::from_bytes(&[0xff]))
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "daemon {subcommand} --http non-utf8"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("FASTEXEC_INSTRUCTIONS_TOOL"),
+                "daemon {subcommand} --http non-utf8: {stderr:?}"
+            );
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"keep this log",
+                "daemon {subcommand} --http non-utf8 deleted pre-existing logs"
+            );
+        }
+    }
+}
+
+#[test]
+fn warm_http_daemon_start_ignores_invalid_or_different_instructions_tool() {
+    let fixture = Fixture::new("inst-tool-warm-http");
+    let token = "0123456789abcdef";
+    let file = fixture.runtime.join("initial.txt");
+    std::fs::write(&file, "pinned warm guidance\n").unwrap();
+
+    let output = fixture
+        .command(&["daemon", "start", "--http", "127.0.0.1:0"])
+        .env("FASTEXEC_HTTP_TOKEN", token)
+        .env("FASTEXEC_INSTRUCTIONS_FILE", &file)
+        .env("FASTEXEC_INSTRUCTIONS_TOOL", "move")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "initial start: {out}{err}");
+    let original_pid = pid_of(&out).expect("initial daemon pid");
+    fixture.pid.set(Some(original_pid));
+    let addr: std::net::SocketAddr = out
+        .split_whitespace()
+        .skip_while(|word| *word != "http")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no http address in {out:?}"))
+        .parse()
+        .expect("http socket addr");
+
+    // Delete the file and re-run warm `daemon start --http` with invalid and different modes.
+    std::fs::remove_file(&file).unwrap();
+    for mode in ["bogus", "copy", "off"] {
+        let warm = fixture
+            .command(&["daemon", "start", "--http", "127.0.0.1:0"])
+            .env("FASTEXEC_HTTP_TOKEN", token)
+            .env("FASTEXEC_INSTRUCTIONS_TOOL", mode)
+            .output()
+            .unwrap();
+        let warm_out = String::from_utf8_lossy(&warm.stdout);
+        let warm_err = String::from_utf8_lossy(&warm.stderr);
+        assert_eq!(
+            warm.status.code(),
+            Some(0),
+            "warm start mode={mode}: {warm_out}{warm_err}"
+        );
+        assert_eq!(pid_of(&warm_out), Some(original_pid), "{warm_out}");
+        assert!(warm_out.contains(&format!("http {addr}")), "{warm_out}");
+    }
+
+    // Running daemon preserves its original live `move` snapshot.
+    let discover = daemon_http_modern(addr, token, "server/discover", json!({}));
+    let proto = discover["instructions"]
+        .as_str()
+        .expect("discover instructions");
+    assert!(
+        proto.ends_with("\n\nSee the instructions tool for host-specific guidance."),
+        "unexpected discover instructions: {proto:?}"
+    );
+    assert!(
+        !proto.contains("pinned warm guidance"),
+        "move mode leaked file into discover: {proto:?}"
+    );
+
+    let call = daemon_http_modern(
+        addr,
+        token,
+        "tools/call",
+        json!({"name": "instructions", "arguments": {}}),
+    );
+    assert_ne!(call["isError"], true, "{call}");
+    assert!(call.get("structuredContent").is_none(), "{call}");
+    assert_eq!(
+        call["content"][0]["text"].as_str(),
+        Some("pinned warm guidance\n"),
+        "{call}"
+    );
+}
+
+#[test]
+fn non_http_daemon_cli_ignores_invalid_instructions_tool() {
+    let fixture = Fixture::new("inst-tool-non-http");
+
+    for subcommand in ["start", "status", "stop"] {
+        let output = fixture
+            .command(&["daemon", subcommand])
+            .env("FASTEXEC_INSTRUCTIONS_TOOL", "bogus")
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        if let Some(pid) = pid_of(&out) {
+            fixture.pid.set(Some(pid));
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "daemon {subcommand} failed: {out}{err}"
+        );
+    }
+}

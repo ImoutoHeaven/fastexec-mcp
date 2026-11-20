@@ -34,6 +34,7 @@ struct Fixture {
     codemode: Option<String>,
     transfer: Option<String>,
     instructions_file: Option<String>,
+    instructions_tool: Option<String>,
     /// An explicitly chosen launch directory for path-alias regression tests.
     cwd: Option<PathBuf>,
     /// The turn this fixture holds until it ends: held, never read.
@@ -82,6 +83,11 @@ impl Fixture {
         self
     }
 
+    fn with_instructions_tool(mut self, value: impl Into<String>) -> Fixture {
+        self.instructions_tool = Some(value.into());
+        self
+    }
+
     /// A fixture with its runtime directory, and no daemon yet: the shape of a start that is
     /// expected to be refused.
     fn bare(tag: &str) -> Fixture {
@@ -113,6 +119,7 @@ impl Fixture {
             codemode: None,
             transfer: None,
             instructions_file: None,
+            instructions_tool: None,
             cwd: None,
             starting,
         }
@@ -156,6 +163,9 @@ impl Fixture {
         }
         if let Some(value) = &self.instructions_file {
             command.env("FASTEXEC_INSTRUCTIONS_FILE", value);
+        }
+        if let Some(value) = &self.instructions_tool {
+            command.env("FASTEXEC_INSTRUCTIONS_TOOL", value);
         }
         command
     }
@@ -3247,4 +3257,265 @@ fn idempotent_http_start_keeps_running_daemon_instructions() {
         client.modern("server/discover", json!({}))["instructions"].as_str(),
         Some(expected.as_str())
     );
+}
+
+const MOVE_GUIDANCE_POINTER: &str = "See the instructions tool for host-specific guidance.";
+
+fn http_list_tool(client: &mut Client, name: &str) -> Option<Value> {
+    client.next_id += 1;
+    let id = client.next_id;
+    let response = client.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}));
+    assert_eq!(response.status, 200, "{:?}", response.body);
+    response.answer(id)["result"]["tools"]
+        .as_array()
+        .expect("tools/list array")
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .cloned()
+}
+
+fn assert_http_instructions_result(result: &Value, expected: &str, context: &str) {
+    assert_ne!(result["isError"], true, "{context}: {result}");
+    assert!(
+        result.get("structuredContent").is_none(),
+        "{context}: unexpected structuredContent in {result}"
+    );
+    let content = result["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: missing content in {result}"));
+    assert_eq!(content.len(), 1, "{context}: {result}");
+    assert_eq!(content[0]["type"], "text", "{context}: {result}");
+    assert_eq!(content[0]["text"].as_str(), Some(expected), "{context}");
+}
+
+#[test]
+fn http_instructions_tool_move_and_copy_pin_snapshot_and_reject_extra_args() {
+    let marker = "HTTP-MARKER-AFTER-512-9a2f1d";
+    let padding = "h".repeat(540);
+    let raw = format!("\u{feff}    HTTP directive — 東京 café  \r\n{padding}\r\n{marker}   \r\n");
+    let normalized = format!("    HTTP directive — 東京 café  \n{padding}\n{marker}   \n");
+    assert!(normalized.find(marker).unwrap() > 512);
+
+    let expected_schema = json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+    });
+    let expected_annotations = json!({
+        "title": "Server instructions",
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+    });
+
+    for mode in ["move", "copy"] {
+        let mut fixture = Fixture::bare(&format!("inst-tool-{mode}"));
+        let file = fixture.runtime.join("extra.txt");
+        std::fs::write(&file, &raw).unwrap();
+        fixture = fixture
+            .with_instructions_file(file.to_string_lossy().into_owned())
+            .with_instructions_tool(mode);
+        fixture.start();
+
+        let expected_proto = if mode == "move" {
+            format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\n{MOVE_GUIDANCE_POINTER}")
+        } else {
+            format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\n{normalized}")
+        };
+        let expected_tool = if mode == "move" {
+            normalized.clone()
+        } else {
+            format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\n{normalized}")
+        };
+
+        let verify = |fixture: &Fixture, stage: &str| {
+            let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
+            let init = legacy.initialize();
+            assert_eq!(
+                init["instructions"].as_str(),
+                Some(expected_proto.as_str()),
+                "{mode} {stage} initialize"
+            );
+            if mode == "move" {
+                assert!(
+                    !init["instructions"].as_str().unwrap().contains(marker),
+                    "{mode} {stage} leaked file into initialize"
+                );
+            }
+
+            let tool = http_list_tool(&mut legacy, "instructions")
+                .unwrap_or_else(|| panic!("{mode} {stage}: missing instructions tool"));
+            assert_eq!(
+                tool["description"].as_str(),
+                Some(expected_tool.as_str()),
+                "{mode} {stage} description"
+            );
+            assert_eq!(tool["inputSchema"], expected_schema, "{mode} {stage}");
+            assert_eq!(tool["annotations"], expected_annotations, "{mode} {stage}");
+
+            let empty_res = legacy.call_tool("instructions", json!({}));
+            assert_http_instructions_result(
+                &empty_res,
+                &expected_tool,
+                &format!("{mode} {stage} legacy {{}}"),
+            );
+
+            // Also verify omitted and null arguments over legacy HTTP session.
+            for (label, params) in [
+                ("omitted", json!({"name": "instructions"})),
+                ("null", json!({"name": "instructions", "arguments": null})),
+            ] {
+                legacy.next_id += 1;
+                let id = legacy.next_id;
+                let resp = legacy.send(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": params,
+                }));
+                assert_eq!(resp.status, 200, "{mode} {stage} {label}: {}", resp.body);
+                assert_http_instructions_result(
+                    &resp.answer(id)["result"],
+                    &expected_tool,
+                    &format!("{mode} {stage} {label}"),
+                );
+            }
+
+            // Extra arguments must fail with JSON-RPC -32602.
+            legacy.next_id += 1;
+            let err_id = legacy.next_id;
+            let err_resp = legacy.send(json!({
+                "jsonrpc": "2.0",
+                "id": err_id,
+                "method": "tools/call",
+                "params": {"name": "instructions", "arguments": {"extra": 1}},
+            }));
+            assert_eq!(err_resp.status, 200, "{}", err_resp.body);
+            assert_eq!(
+                err_resp.answer(err_id)["error"]["code"],
+                json!(-32602),
+                "{mode} {stage} extra args: {}",
+                err_resp.body
+            );
+
+            // Sessionless modern server/discover + tools/call.
+            let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
+            let discover = modern.modern("server/discover", json!({}));
+            assert_eq!(
+                discover["instructions"].as_str(),
+                Some(expected_proto.as_str()),
+                "{mode} {stage} server/discover"
+            );
+            let modern_call = modern.modern(
+                "tools/call",
+                json!({"name": "instructions", "arguments": {}}),
+            );
+            assert_http_instructions_result(
+                &modern_call,
+                &expected_tool,
+                &format!("{mode} {stage} modern call"),
+            );
+        };
+
+        verify(&fixture, "initial");
+        std::fs::write(&file, "mutated after startup\n").unwrap();
+        verify(&fixture, "after edit");
+        std::fs::remove_file(&file).unwrap();
+        verify(&fixture, "after delete");
+    }
+}
+
+#[test]
+fn shared_namespace_isolates_http_and_stdio_instructions_tool_modes() {
+    let mut fixture = Fixture::bare("inst-tool-iso");
+    let file_a = fixture.runtime.join("a.txt");
+    let file_b = fixture.runtime.join("b.txt");
+    std::fs::write(&file_a, "alpha http move guidance\n").unwrap();
+    std::fs::write(&file_b, "beta stdio copy guidance\n").unwrap();
+    fixture = fixture
+        .with_instructions_file(file_a.to_string_lossy().into_owned())
+        .with_instructions_tool("move");
+    fixture.start();
+
+    let http_proto = format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\n{MOVE_GUIDANCE_POINTER}");
+    let http_tool_text = "alpha http move guidance\n";
+    let stdio_copy_text = format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\nbeta stdio copy guidance\n");
+
+    let mut http = Client::new(fixture.addr, fixture.tokens[0].clone());
+    assert_eq!(
+        http.initialize()["instructions"].as_str(),
+        Some(http_proto.as_str())
+    );
+    assert_eq!(
+        http_list_tool(&mut http, "instructions").unwrap()["description"].as_str(),
+        Some(http_tool_text)
+    );
+
+    // Stdio endpoint #1 in copy mode with file_b.
+    let mut stdio_copy = Stdio::start_with(&fixture, |cmd| {
+        cmd.env("FASTEXEC_INSTRUCTIONS_TOOL", "copy")
+            .env("FASTEXEC_INSTRUCTIONS_FILE", &file_b);
+    });
+    assert_eq!(stdio_copy.instructions, stdio_copy_text);
+    let listed_copy = stdio_copy.request("tools/list", json!({}));
+    let tool_copy = listed_copy["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "instructions")
+        .expect("stdio copy instructions tool");
+    assert_eq!(
+        tool_copy["description"].as_str(),
+        Some(stdio_copy_text.as_str())
+    );
+    let call_copy = stdio_copy.request(
+        "tools/call",
+        json!({"name": "instructions", "arguments": {}}),
+    );
+    assert_http_instructions_result(&call_copy["result"], &stdio_copy_text, "stdio copy call");
+
+    // Stdio endpoint #2 in off mode with file_b omits the instructions tool.
+    let mut stdio_off = Stdio::start_with(&fixture, |cmd| {
+        cmd.env("FASTEXEC_INSTRUCTIONS_TOOL", "off")
+            .env("FASTEXEC_INSTRUCTIONS_FILE", &file_b);
+    });
+    assert_eq!(stdio_off.instructions, stdio_copy_text);
+    let listed_off = stdio_off.request("tools/list", json!({}));
+    assert!(
+        listed_off["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["name"] != "instructions"),
+        "stdio off must omit instructions tool: {listed_off}"
+    );
+
+    // Stdio endpoint #3 in move mode with no file returns built-in lines on both surfaces.
+    let mut stdio_move_no_file = Stdio::start_with(&fixture, |cmd| {
+        cmd.env("FASTEXEC_INSTRUCTIONS_TOOL", "move")
+            .env_remove("FASTEXEC_INSTRUCTIONS_FILE");
+    });
+    assert_eq!(stdio_move_no_file.instructions, BUILTIN_DAEMON_INSTRUCTIONS);
+    let call_move_no_file = stdio_move_no_file.request(
+        "tools/call",
+        json!({"name": "instructions", "arguments": {}}),
+    );
+    assert_http_instructions_result(
+        &call_move_no_file["result"],
+        BUILTIN_DAEMON_INSTRUCTIONS,
+        "stdio move no file",
+    );
+
+    // HTTP daemon remains unaffected by stdio endpoints on the same namespace.
+    let mut http_after = Client::new(fixture.addr, fixture.tokens[0].clone());
+    assert_eq!(
+        http_after.modern("server/discover", json!({}))["instructions"].as_str(),
+        Some(http_proto.as_str())
+    );
+    let http_call_after = http_after.modern(
+        "tools/call",
+        json!({"name": "instructions", "arguments": {}}),
+    );
+    assert_http_instructions_result(&http_call_after, http_tool_text, "http after stdio");
 }

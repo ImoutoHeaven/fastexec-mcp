@@ -1271,6 +1271,13 @@ async fn serve_daemon(
                     return 1;
                 }
             };
+            let instructions_tool = match crate::instructions_tool_mode() {
+                Ok(mode) => mode,
+                Err(message) => {
+                    eprintln!("fastexec: {message}");
+                    return 1;
+                }
+            };
             let extra_instructions = match crate::instructions_file(&launch) {
                 Ok(extra) => extra,
                 Err(message) => {
@@ -1298,6 +1305,7 @@ async fn serve_daemon(
                     launch,
                     public_root: public_root.clone(),
                     extra_instructions,
+                    instructions_tool,
                 }),
                 None,
                 Config {

@@ -5,7 +5,7 @@ use crate::daemon::Daemon;
 use crate::service::Render;
 use crate::session::{LaunchContext, Session};
 use crate::transfer::{self, Admitted, Transfers};
-use crate::{Backend, Server, Tools, TransferEndpoint};
+use crate::{Backend, InstructionsToolMode, Server, Tools, TransferEndpoint};
 use bytes::Bytes;
 use http::header::HeaderName;
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
@@ -59,6 +59,8 @@ pub struct Http {
     pub public_root: Option<Arc<str>>,
     /// Normalized extra instructions loaded once at daemon startup.
     pub extra_instructions: Option<String>,
+    /// Whether HTTP sessions also expose server instructions as an MCP tool.
+    pub instructions_tool: InstructionsToolMode,
 }
 
 /// The root this process was started with: `None` when the variable is unset, the normalized root
@@ -216,6 +218,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         launch,
         public_root,
         extra_instructions,
+        instructions_tool,
     } = http;
     // The factory makes a server for each legacy session or inline-lifecycle request.
     let service = Arc::clone(&daemon.service());
@@ -232,9 +235,13 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
             )
         })
         .collect();
-    let router = Server::build_router(&launch, tools);
-    let instructions =
-        crate::server_instructions(true, tools.codemode, extra_instructions.as_deref());
+    let (instructions, tool_instructions) = crate::compose_instructions(
+        true,
+        tools.codemode,
+        extra_instructions.as_deref(),
+        instructions_tool,
+    );
+    let router = Server::build_router(&launch, tools, tool_instructions.as_deref());
     let factory = {
         let table = Arc::clone(&table);
         let public_root = public_root.clone();
@@ -255,6 +262,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
                 backend,
                 router.clone(),
                 Arc::clone(&instructions),
+                tool_instructions.clone(),
                 transfer,
                 tools,
             );
