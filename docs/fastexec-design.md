@@ -667,7 +667,12 @@ The checked Rust 1.92 and 1.100 implementations pass a null output buffer to
 `realpath`. Our caller-buffer route returns the native
 `ENAMETOOLONG` error when the resolved output cannot fit that platform limit.
 On Linux the caller buffer is 4096 bytes; macOS and FreeBSD use 1024. Native path
-bytes, including non-UTF-8 Unix names, are preserved.
+bytes, including non-UTF-8 Unix names, are preserved; native filesystem naming
+restrictions still apply. The raw-name filesystem round trip runs on Linux and
+FreeBSD. The macOS CI filesystem rejects its `0xFF` filename with `EILSEQ`, so
+all Unix hosts also test the native argument bytes and their lease directly,
+without creating that name. The Unicode canonical-path budget case runs on all
+platforms.
 
 Windows canonicalization reopens the current name with the same access mode and
 backup-semantics flag as the checked Rust 1.92 and 1.100 implementations. It queries

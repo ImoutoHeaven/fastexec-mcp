@@ -60,7 +60,8 @@ jobs:
           FASTEXEC_REQUIRE_ROOT_TEST: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: |
           python3 scripts/ci/run-tests.py --timeout 1200 \
-            --note "src/tasks.rs unit tests (cfg(all(test, windows)): a Unix unit-test binary is not the task host)"
+            --note "src/tasks.rs unit tests (cfg(all(test, windows)): a Unix unit-test binary is not the task host)" \
+            --note "non-UTF-8 filesystem-name round trip is Linux/FreeBSD-only; native argument byte preservation runs on every Unix host"
 
       - name: test (windows)
         if: runner.os == 'Windows'

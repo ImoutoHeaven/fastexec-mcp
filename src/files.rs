@@ -8792,6 +8792,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn native_path_arguments_preserve_non_utf8_bytes_until_released() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"ordinary-\xff.txt".to_vec()));
+        let pool = BytePool::new(64 * 1024);
+        let input = native_path_input(&path, &pool).unwrap();
+        assert_eq!(input.value.to_bytes(), path.as_os_str().as_bytes());
+        assert!(pool.used() > path.as_os_str().as_bytes().len());
+        drop(input);
+        assert_eq!(pool.used(), 0);
+    }
+
+    // The macOS CI filesystem rejects this name with EILSEQ before resolution.
+    // Byte preservation there is covered above without requiring a creatable filename.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
     fn canonical_and_link_outputs_keep_non_utf8_native_names() {
         use std::os::unix::ffi::OsStringExt;
         let scratch = Scratch::new("native-target-budget");
