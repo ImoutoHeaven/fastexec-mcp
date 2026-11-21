@@ -1535,6 +1535,47 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn output_matching_budget_refusal_precedes_poll_input() {
+    // Small request/output frames fit; the matcher also reserves decoding and growth.
+    let mut server = Server::start_with(|command| {
+        command
+            .env("FASTEXEC_STRUCTURED_CONTENT", "true")
+            .env("FASTEXEC_TEST_MEMORY_LIMIT", (512 * 1024).to_string());
+    });
+    let (started, _) = server.ok(json!({
+        "action": "start",
+        "command": "IFS= read -r value; printf '%s\\n' \"$value\"",
+        "eof": false,
+        "waitMs": 0,
+        "maxBytes": 100,
+        "killAfterMs": 30000
+    }));
+    let task = started["taskId"].as_str().unwrap();
+    let (_, text, failed) = server.call(json!({
+        "action": "poll",
+        "taskId": task,
+        "input": "refused\n",
+        "returnWhen": {"outputContains": ["accepted"]},
+        "waitMs": 1000,
+        "maxBytes": 100
+    }));
+    assert!(failed, "{text}");
+    assert!(text.contains("cannot fit output matching"), "{text}");
+    assert!(text.contains(bare_id(task)), "{text}");
+    let (accepted, text) = server.ok(json!({
+        "action": "poll",
+        "taskId": task,
+        "input": "accepted\n",
+        "eof": true,
+        "waitMs": 10000,
+        "maxBytes": 100
+    }));
+    assert_eq!(body_of(&text).trim(), "accepted", "{text}");
+    assert_eq!(accepted["exitCode"], 0, "{text}");
+}
+
 #[test]
 fn pipe_input_arrives_verbatim_and_eof_closes_stdin() {
     // Git for Windows' bin/bash.exe launcher retains an inherited stdin handle.

@@ -95,7 +95,7 @@ pub enum WaitEnd {
     TaskEnded,
     /// The processes a task held past its root's exit ended.
     TreeEnded,
-    OutputContains(String),
+    OutputContains(String, Lease),
     ScreenContains(String),
     ScreenAppears(String),
     ScreenGone(String),
@@ -108,7 +108,10 @@ impl WaitEnd {
         match self {
             WaitEnd::TaskEnded => ("task_ended", None),
             WaitEnd::TreeEnded => ("tree_ended", None),
-            WaitEnd::OutputContains(text) => ("output_contains", Some(text)),
+            WaitEnd::OutputContains(text, lease) => {
+                debug_assert_eq!(lease.bytes(), text.capacity());
+                ("output_contains", Some(text))
+            }
             WaitEnd::ScreenContains(text) => ("screen_contains", Some(text)),
             WaitEnd::ScreenAppears(text) => ("screen_appears", Some(text)),
             WaitEnd::ScreenGone(text) => ("screen_gone", Some(text)),
@@ -136,7 +139,7 @@ impl WaitEnd {
             format!("{short:?}")
         };
         match self {
-            WaitEnd::OutputContains(text) => format!(" · wait: output matched {}", quote(text)),
+            WaitEnd::OutputContains(text, _) => format!(" · wait: output matched {}", quote(text)),
             WaitEnd::ScreenContains(text) => format!(" · wait: screen matched {}", quote(text)),
             WaitEnd::ScreenAppears(text) => {
                 format!(" · wait: screen text appeared {}", quote(text))
@@ -159,6 +162,7 @@ pub struct Mark {
     root_reported: bool,
     memory: Arc<BytePool>,
     _lease: Option<Lease>,
+    matcher_lease: Option<Lease>,
 }
 
 pub fn mark(
@@ -168,6 +172,18 @@ pub fn mark(
     when: Option<&ReturnWhen>,
     memory: &Arc<BytePool>,
 ) -> Result<Mark, String> {
+    let matcher_lease = when
+        .and_then(|when| when.output_contains.as_deref())
+        .filter(|texts| !texts.is_empty())
+        .map(|texts| Matcher::reserve(texts, memory))
+        .transpose()
+        .map_err(|message| {
+            format!(
+                "{message} The task may have run (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId without input once in-flight transfers complete.",
+                reader.handle(&task.id),
+                crate::files::display_path(&task.log_path)
+            )
+        })?;
     let (cursor, cleaner) = (state.cursor, state.cleaner.clone());
     let compares =
         when.is_some_and(|when| when.screen_appears.is_some() || when.screen_gone.is_some());
@@ -184,6 +200,7 @@ pub fn mark(
         root_reported: reader.is_reported(),
         memory: Arc::clone(memory),
         _lease: lease,
+        matcher_lease,
     })
 }
 
@@ -326,11 +343,12 @@ pub async fn wait(
     let output_texts = when
         .and_then(|when| when.output_contains.as_deref())
         .unwrap_or_default();
-    let mut matcher = (!output_texts.is_empty()).then(|| {
+    let mut matcher = mark.matcher_lease.map(|lease| {
         Matcher::new(
             output_texts,
             encoding,
             (!task.is_script()).then_some(mark.cleaner),
+            lease,
         )
     });
     let mut scanned = mark.cursor;
@@ -389,7 +407,8 @@ pub async fn wait(
                 .map_err(|error| format!("Internal failure while reading output: {error}."))?;
                 let found = found.map_err(|error| format!("Cannot read the task log: {error}."))?;
                 if let Some(index) = found {
-                    break 'check Some(WaitEnd::OutputContains(output_texts[index].clone()));
+                    let (text, lease) = searching.into_match(index);
+                    break 'check Some(WaitEnd::OutputContains(text, lease));
                 }
                 (matcher, scanned) = (Some(searching), from);
             }
@@ -430,6 +449,89 @@ mod tests {
     use crate::service::Service;
     use crate::session::{LaunchContext, ReadState, Session};
     use crate::tasks::{Limits, ScriptArgs, Tasks};
+
+    #[tokio::test]
+    async fn mark_admits_the_matcher_peak_without_advancing_the_reader() {
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let launch = Arc::new(LaunchContext::current().unwrap());
+        let session = Session::new(
+            "match-budget".into(),
+            "match-budget".into(),
+            Arc::clone(&launch),
+        );
+        let (task, _, reader) = tasks
+            .start_script(
+                ScriptArgs {
+                    code: "await sleep(60000);".into(),
+                    launch: Arc::clone(&launch),
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::new(Service::new(Arc::clone(&tasks), false)),
+                    input_owner: Default::default(),
+                },
+                &session,
+                "r001".into(),
+            )
+            .unwrap();
+        let state = ReadState::default();
+        let when: ReturnWhen = serde_json::from_value(serde_json::json!({
+            "outputContains": ["accepted"]
+        }))
+        .unwrap();
+        let admitted = mark(&task, &reader, &state, Some(&when), launch.memory()).unwrap();
+        let needed = admitted.matcher_lease.as_ref().unwrap().bytes();
+        drop(admitted);
+        for limit in [needed - 1, needed, needed + 1] {
+            let memory = BytePool::new(limit);
+            let result = mark(&task, &reader, &state, Some(&when), &memory);
+            assert_eq!(result.is_ok(), limit >= needed);
+            assert_eq!(state.cursor, 0);
+            if let Err(message) = &result {
+                assert!(message.starts_with("Server active memory budget ("));
+                assert!(message.contains(&reader.handle(&task.id)));
+                assert!(message.contains(&crate::files::display_path(&task.log_path)));
+                assert!(message.contains("Do not retry start or resend input"));
+            } else {
+                assert_eq!(memory.used(), needed);
+            }
+            drop(result);
+            assert_eq!(
+                memory.used(),
+                0,
+                "a mark dropped before wait releases admission"
+            );
+        }
+        task.kill().unwrap();
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn matched_text_keeps_its_owner_and_wire_shape() {
+        let needles = ["ready 世界".to_owned()];
+        let memory = BytePool::new(2 << 20);
+        let mut matcher = Matcher::new(
+            &needles,
+            encoding_rs::UTF_8,
+            None,
+            Matcher::reserve(&needles, &memory).unwrap(),
+        );
+        assert_eq!(matcher.push("ready 世界".as_bytes()), Some(0));
+        let (text, lease) = matcher.into_match(0);
+        let retained = text.capacity();
+        let ended = WaitEnd::OutputContains(text, lease);
+        assert_eq!(memory.used(), retained);
+        assert_eq!(
+            ended.json(),
+            serde_json::json!({
+                "condition": "output_contains",
+                "text": "ready 世界"
+            })
+        );
+        assert_eq!(ended.note(true), " · wait: output matched \"ready 世界\"");
+        drop(ended);
+        assert_eq!(memory.used(), 0);
+    }
 
     #[test]
     fn screen_watch_keeps_the_snapshot_lease_with_its_rows() {

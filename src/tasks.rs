@@ -4,8 +4,8 @@ use crate::codemode;
 use crate::lease::{BytePool, Lease};
 use crate::media::MediaKind;
 use crate::output::{
-    Matcher, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix_reader,
-    incomplete_utf8_suffix,
+    MATCH_SCAN_BYTES, Matcher, Truncate, Window, WindowBuilder, WindowSpec,
+    incomplete_legacy_suffix_reader, incomplete_utf8_suffix,
 };
 use crate::process::{self, Launch, Member, Tree};
 use crate::session::{LaunchContext, ProbeWarning, ReadState, Reader, Session, TaskEntry};
@@ -2554,7 +2554,7 @@ impl Task {
     ) -> std::io::Result<()> {
         let mut file = File::open(&self.log_path)?;
         file.seek(SeekFrom::Start(*from))?;
-        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut buffer = vec![0_u8; MATCH_SCAN_BYTES];
         while *from < written && !cancel.is_cancelled() {
             let want = (written - *from).min(buffer.len() as u64) as usize;
             file.read_exact(&mut buffer[..want])?;
@@ -4001,10 +4001,12 @@ mod tests {
             .is_ok()
         );
         // So does the return_when scan.
+        let needles = ["abc".to_string()];
         let mut matcher = Matcher::new(
-            &["abc".to_string()],
+            &needles,
             encoding_rs::UTF_8,
             Some(Cleaner::default()),
+            Matcher::reserve(&needles, crate::lease::process_pool()).unwrap(),
         );
         let mut from = 0;
         assert_eq!(
@@ -4016,10 +4018,12 @@ mod tests {
         let live = start(&tasks, start_args()).unwrap();
         finish(&live);
         std::fs::remove_file(tasks.dir.join(format!("{}.log", live.id))).unwrap();
+        let needles = ["abc".to_string()];
         let mut matcher = Matcher::new(
-            &["abc".to_string()],
+            &needles,
             encoding_rs::UTF_8,
             Some(Cleaner::default()),
+            Matcher::reserve(&needles, crate::lease::process_pool()).unwrap(),
         );
         let mut from = 0;
         assert!(

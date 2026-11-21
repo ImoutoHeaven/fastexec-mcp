@@ -666,6 +666,33 @@ legacy encoding boundary checks stream through fixed buffers. The text workspace
 travels with blocking read and attachment workers, including after cancellation.
 The completed result retains a smaller owner for its text and structured strings.
 
+Output matching reserves its whole application workspace in `wait::mark`, before
+a poll resizes the terminal or sends input. With scan size `C = 64 KiB`, longest
+needle length `L`, retained UTF-8 tail `T = L + 3`, and cloned needle bytes plus
+`Vec<String>` slots `N`, the reservation is
+`N + C + G(C) + G(T + D)`, where `G(n) = 4 * (n + 8)` and `D = 3 * (C + 8)`.
+All size arithmetic is checked. The `G` terms cover old and replacement
+capacities during Vec/String growth, including concurrent pending bytes and
+decoded text; the separate `C` covers the log reader's buffer. The retained tail
+may start up to three bytes before its requested UTF-8 boundary. The matcher
+also splits larger feeds at `C` while keeping the same decoder and cleaner.
+
+The decoder bound is checked against encoding_rs 0.8.42, upstream commit
+[`a155adc`](https://github.com/hsivonen/encoding_rs/tree/a155adc7271c9e507556d053c95b459186671d2a/src).
+Its `Decoder` uses fixed state and starts in `Converting` with BOM handling off.
+The `max_utf8_buffer_length` formulas in `utf_8.rs` need at most
+`3 * (C + 3) + 3`; `utf_16.rs` needs at most `1 + 3 * ((C + 4) / 2)`.
+`gb18030.rs` has at most seven counted pending bytes and uses `1 + 3 * (C + 7)`.
+`iso_2022_jp.rs` adds at most four state units before its factor of three;
+`big5.rs` uses `3 + 3 * (C + 1)`. EUC-JP, EUC-KR and Shift-JIS add at most one
+lead byte, single-byte and x-user-defined decoders use `3 * C`, and the
+replacement decoder needs three bytes. Each bound fits `D`, including at EOF.
+The matcher owns the lease through queued and running blocking scans, returned
+scan tuples and error cleanup. Cancelling a waiter does not release a worker's
+live buffers. On a match, the existing needle String moves into `WaitEnd` with
+a split lease for its actual capacity; the other workspace is released.
+The wait's JSON fields, notes, match precedence and reader commit remain unchanged.
+
 File operations first reserve a shared path workspace before resolving, displaying,
 opening, or sniffing a path. The allowance is 32 times the borrowed request, cwd,
 and selected home source bytes, plus 4 KiB for fixed notices; reads also reserve

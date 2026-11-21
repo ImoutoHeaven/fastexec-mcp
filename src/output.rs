@@ -3,9 +3,13 @@
 //! The ANSI CSI/OSC state machine follows FastCtx `src/shell/normalize.rs` and the head/tail
 //! split follows FastCtx `src/shell/output.rs` (Apache-2.0, Copyright 2026 yc-duan), modified for fastexec.
 
+use crate::lease::{BytePool, Lease};
 use encoding_rs::Encoding;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+pub(crate) const MATCH_SCAN_BYTES: usize = 64 * 1024;
 
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq,
@@ -121,11 +125,51 @@ pub struct Matcher {
     line: String,
     /// Text bytes of the current line not decoded yet.
     pending: Vec<u8>,
+    _lease: Lease,
 }
 
 impl Matcher {
+    /// Admits copies and the scan/decode peak before a caller sends input or resizes a task.
+    pub fn reserve(needles: &[String], memory: &Arc<BytePool>) -> Result<Lease, String> {
+        Self::workspace_bytes(needles)
+            .and_then(|bytes| memory.try_acquire(bytes))
+            .ok_or_else(|| {
+                format!(
+                    "Server active memory budget ({}) cannot fit output matching; this wait was not started.",
+                    memory.limit()
+                )
+            })
+    }
+
+    fn workspace_bytes(needles: &[String]) -> Option<usize> {
+        let slots = needles.len().checked_mul(std::mem::size_of::<String>())?;
+        let copies = needles
+            .iter()
+            .try_fold(slots, |sum, text| sum.checked_add(text.len()))?;
+        let tail = needles
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+            .checked_add(3)?;
+        // encoding_rs 0.8.42 has at most seven pending bytes; all decoders fit 3*(C+8).
+        let decoded = MATCH_SCAN_BYTES.checked_add(8)?.checked_mul(3)?;
+        // Both the old capacity and its replacement can remain live during doubling.
+        let growth = |bytes: usize| bytes.checked_add(8)?.checked_mul(4);
+        copies
+            .checked_add(MATCH_SCAN_BYTES)?
+            .checked_add(growth(MATCH_SCAN_BYTES)?)?
+            .checked_add(growth(tail.checked_add(decoded)?)?)
+    }
+
     /// Continues the cleaning state where output starts, or matches unchanged bytes with `None`.
-    pub fn new(needles: &[String], encoding: &'static Encoding, cleaner: Option<Cleaner>) -> Self {
+    pub fn new(
+        needles: &[String],
+        encoding: &'static Encoding,
+        cleaner: Option<Cleaner>,
+        lease: Lease,
+    ) -> Self {
+        debug_assert!(Self::workspace_bytes(needles).is_some_and(|bytes| lease.bytes() >= bytes));
         Self {
             needles: needles.to_vec(),
             best: None,
@@ -135,12 +179,36 @@ impl Matcher {
             decoder: encoding.new_decoder_without_bom_handling(),
             line: String::new(),
             pending: Vec::new(),
+            _lease: lease,
         }
+    }
+
+    /// Moves the winning text into the wait result with its own retained capacity.
+    pub fn into_match(mut self, index: usize) -> (String, Lease) {
+        let lease = self._lease.split_off(self.needles[index].capacity());
+        let text = std::mem::take(&mut self.needles[index]);
+        drop(self);
+        (text, lease)
     }
 
     /// Feeds the next output bytes; returns the lowest index of a needle the output fed so far
     /// contains. Reading stops early only at the first needle, which nothing can precede.
     pub fn push(&mut self, bytes: &[u8]) -> Option<usize> {
+        if self.best == Some(0) {
+            return self.best;
+        }
+        for chunk in bytes.chunks(MATCH_SCAN_BYTES) {
+            if self.push_chunk(chunk) == Some(0) {
+                return self.best;
+            }
+        }
+        if bytes.is_empty() {
+            self.found(false);
+        }
+        self.best
+    }
+
+    fn push_chunk(&mut self, bytes: &[u8]) -> Option<usize> {
         for &byte in bytes {
             let (clear, step) = match &mut self.cleaner {
                 Some(cleaner) => cleaner.step(byte, false),
@@ -911,6 +979,15 @@ mod tests {
 
     const LARGE_BUDGET: usize = 4 << 20;
 
+    fn matcher(
+        needles: &[String],
+        encoding: &'static Encoding,
+        cleaner: Option<Cleaner>,
+    ) -> Matcher {
+        let lease = Matcher::reserve(needles, crate::lease::process_pool()).unwrap();
+        Matcher::new(needles, encoding, cleaner, lease)
+    }
+
     fn window(chunks: &[&[u8]], truncate: Truncate, budget: usize, raw: bool) -> Window {
         let mut cleaner = Cleaner::default();
         let spec = WindowSpec {
@@ -1232,7 +1309,7 @@ mod tests {
                 assert_eq!(clean.text, "visible");
                 let raw = window(&chunks, Truncate::Head, LARGE_BUDGET, true);
                 assert_eq!(raw.text.as_bytes(), chunks.concat());
-                let mut matcher = Matcher::new(
+                let mut matcher = matcher(
                     &["visible".to_owned()],
                     encoding_rs::UTF_8,
                     Some(Cleaner::default()),
@@ -1243,6 +1320,93 @@ mod tests {
                 assert_eq!(matcher.finish(), Some(0));
             }
         }
+    }
+
+    #[test]
+    fn matcher_reserves_the_peak_and_moves_the_winning_text() {
+        let needles = ["first".to_owned(), "second 世界".to_owned()];
+        let needed = Matcher::workspace_bytes(&needles).unwrap();
+        for limit in [needed - 1, needed, needed + 1] {
+            let memory = BytePool::new(limit);
+            let lease = Matcher::reserve(&needles, &memory);
+            if limit < needed {
+                assert!(
+                    lease
+                        .unwrap_err()
+                        .starts_with("Server active memory budget (")
+                );
+                assert_eq!(memory.used(), 0);
+                continue;
+            }
+            let mut matcher = Matcher::new(
+                &needles,
+                encoding_rs::UTF_8,
+                Some(Cleaner::default()),
+                lease.unwrap(),
+            );
+            let pointer = matcher.needles[1].as_ptr();
+            assert_eq!(memory.used(), needed);
+            assert_eq!(matcher.push("second 世界".as_bytes()), Some(1));
+            let (text, lease) = matcher.into_match(1);
+            assert_eq!(text, "second 世界");
+            assert_eq!(text.as_ptr(), pointer, "the matched text is moved");
+            assert_eq!(memory.used(), text.capacity());
+            assert_eq!(lease.bytes(), text.capacity());
+            drop(text);
+            drop(lease);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[test]
+    fn matcher_bounds_large_pushes_without_resetting_the_decoder_or_priority() {
+        let needles = ["界first".to_owned(), "second".to_owned()];
+        for encoding in [encoding_rs::UTF_8, encoding_rs::GBK] {
+            let mut text = "x".repeat(MATCH_SCAN_BYTES - 1);
+            text.push_str("界first\nsecond");
+            let bytes = encoding.encode(&text).0;
+            let mut matcher = matcher(&needles, encoding, Some(Cleaner::default()));
+            assert_eq!(matcher.push(&bytes), Some(0));
+            assert!(
+                matcher.line.capacity()
+                    <= 4 * (needles[0].len() + 3 + 3 * (MATCH_SCAN_BYTES + 8) + 8)
+            );
+            assert!(matcher.pending.capacity() <= 4 * (MATCH_SCAN_BYTES + 8));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_running_matcher_keeps_its_workspace_after_the_waiter_cancels() {
+        let needles = ["ready 世界".to_owned()];
+        let needed = Matcher::workspace_bytes(&needles).unwrap();
+        let memory = BytePool::new(needed);
+        let mut matcher = Matcher::new(
+            &needles,
+            encoding_rs::UTF_8,
+            None,
+            Matcher::reserve(&needles, &memory).unwrap(),
+        );
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            held.recv().unwrap();
+            assert_eq!(matcher.push("ready 世界".as_bytes()), Some(0));
+            drop(matcher);
+            finished.send(()).unwrap();
+        });
+        started.await.unwrap();
+        worker.abort();
+        drop(worker);
+        assert_eq!(
+            memory.used(),
+            needed,
+            "abort does not stop a running blocking worker"
+        );
+        release.send(()).unwrap();
+        done.await.unwrap();
+        assert_eq!(memory.used(), 0);
     }
 
     #[test]
@@ -1277,7 +1441,7 @@ mod tests {
         ];
         for (output, needles, encoding, expected) in cases {
             let needles: Vec<String> = needles.iter().map(|needle| needle.to_string()).collect();
-            let matcher = || Matcher::new(&needles, encoding, Some(Cleaner::default()));
+            let matcher = || matcher(&needles, encoding, Some(Cleaner::default()));
             for split in 0..=output.len() {
                 let mut two = matcher();
                 let found = two
@@ -1294,7 +1458,7 @@ mod tests {
             assert_eq!(found, expected, "{needles:?} byte by byte");
         }
         let needles = ["first".to_string(), "second".to_string()];
-        let mut matcher = Matcher::new(&needles, utf8, Some(Cleaner::default()));
+        let mut matcher = matcher(&needles, utf8, Some(Cleaner::default()));
         assert_eq!(matcher.push(b"second\nfirst\n"), Some(0));
     }
 
@@ -1308,7 +1472,7 @@ mod tests {
         ] {
             let needles = [needle.to_owned()];
             for split in 0..=output.len() {
-                let mut matcher = Matcher::new(&needles, encoding_rs::UTF_8, None);
+                let mut matcher = matcher(&needles, encoding_rs::UTF_8, None);
                 let found = matcher
                     .push(&output.as_bytes()[..split])
                     .or_else(|| matcher.push(&output.as_bytes()[split..]))
