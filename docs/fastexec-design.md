@@ -833,6 +833,12 @@ Admission failure uses the existing HTTP failure mapping. Parent creation alread
 reserves its own native target workspace. Native-library internals retain the
 separate opaque boundary described above.
 
+File downloads admit each application-created chunk before copying its bytes.
+The returned Bytes owner retains the chunk's actual capacity lease through the
+response frame and every cloned slice. Dropping the body does not release a
+retained frame's charge. A failed admission ends the body with an I/O error;
+the existing range, idle-entry and file-handle behavior remains unchanged.
+
 Nested callbacks borrow QuickJS-owned UTF-8 strings. Before parsing tool arguments,
 the Rust bridge reserves four times their UTF-8 length, including the tool name,
 for decoded values, escape scratch, typed requests, diagnostics and worker copies.

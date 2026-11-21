@@ -307,7 +307,6 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     session_config.sse_retry = None;
     session_config.completed_cache_ttl = Duration::from_secs(60);
     session_config.init_timeout = Some(Duration::from_secs(60));
-    // Result owners follow the SDK queue and replay cache into the returned body frames.
     // This independent count cap bounds HTTP session bookkeeping.
     let sessions = Sessions::new(session_config, MAX_HTTP_SESSIONS);
     let inner = StreamableHttpService::new(factory, Arc::new(sessions), config);
@@ -745,6 +744,7 @@ async fn transfer_get(headers: &HeaderMap, admitted: Admitted) -> Reply {
             FileBody {
                 // The length is fixed, so a file that grows while it is sent cannot overrun it.
                 file: Some(file.take(length)),
+                memory: Arc::clone(crate::lease::process_pool()),
                 _admitted: admitted,
             }
             .boxed(),
@@ -1001,10 +1001,48 @@ fn transfer_text(status: StatusCode, text: String) -> Reply {
         .expect("a response with a body")
 }
 
+struct DownloadChunk {
+    bytes: Vec<u8>,
+    // Free the copied bytes before returning their capacity to the shared pool.
+    _lease: crate::lease::Lease,
+}
+
+impl AsRef<[u8]> for DownloadChunk {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn copy_download_chunk(
+    source: &[u8],
+    memory: &Arc<crate::lease::BytePool>,
+) -> std::io::Result<Bytes> {
+    let refused = || {
+        std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "Server active memory budget is full while sending a transferred file.",
+        )
+    };
+    let mut lease = memory.try_acquire(source.len()).ok_or_else(refused)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(source.len())
+        .map_err(|_| refused())?;
+    if !lease.try_resize(bytes.capacity()) {
+        return Err(refused());
+    }
+    bytes.extend_from_slice(source);
+    Ok(Bytes::from_owner(DownloadChunk {
+        bytes,
+        _lease: lease,
+    }))
+}
+
 /// A file's bytes, read as the response is written, holding its entry open to the last byte.
 struct FileBody {
     /// The bytes left to send, or `None` once the body has ended, so its end stays an end.
     file: Option<tokio::io::Take<tokio::fs::File>>,
+    memory: Arc<crate::lease::BytePool>,
     _admitted: Admitted,
 }
 
@@ -1033,9 +1071,13 @@ impl hyper::body::Body for FileBody {
                 this.file = None;
                 Poll::Ready(None)
             }
-            Poll::Ready(Ok(())) => Poll::Ready(Some(Ok(hyper::body::Frame::data(
-                Bytes::copy_from_slice(read.filled()),
-            )))),
+            Poll::Ready(Ok(())) => match copy_download_chunk(read.filled(), &this.memory) {
+                Ok(bytes) => Poll::Ready(Some(Ok(hyper::body::Frame::data(bytes)))),
+                Err(error) => {
+                    this.file = None;
+                    Poll::Ready(Some(Err(error)))
+                }
+            },
         }
     }
 
@@ -1051,6 +1093,70 @@ impl hyper::body::Body for FileBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn download_fixture(
+        content: &[u8],
+        memory: Arc<crate::lease::BytePool>,
+    ) -> (PathBuf, Arc<Transfers>, FileBody) {
+        let directory = std::env::temp_dir().join(format!(
+            "fastexec-download-budget-{}",
+            crate::tasks::random_chars(12).unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("ordinary.txt");
+        std::fs::write(&path, content).unwrap();
+        let table = Arc::new(Transfers::new());
+        let id = table.create(path.clone()).unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let body = FileBody {
+            file: Some(file.take(content.len() as u64)),
+            memory,
+            _admitted: table.admit(&id).unwrap(),
+        };
+        (directory, table, body)
+    }
+
+    #[tokio::test]
+    async fn download_chunk_admission_ends_a_refused_body() {
+        const CONTENT: &[u8] = b"ordinary";
+        for cap in [CONTENT.len() - 1, CONTENT.len(), CONTENT.len() + 1] {
+            let memory = crate::lease::BytePool::new(cap);
+            let (directory, _table, mut body) =
+                download_fixture(CONTENT, Arc::clone(&memory)).await;
+            let frame = body.frame().await.unwrap();
+            if cap < CONTENT.len() {
+                assert_eq!(frame.unwrap_err().kind(), std::io::ErrorKind::OutOfMemory);
+                assert!(hyper::body::Body::is_end_stream(&body));
+                assert!(body.frame().await.is_none());
+            } else {
+                let bytes = frame.unwrap().into_data().unwrap();
+                assert_eq!(&bytes[..], CONTENT);
+                assert_eq!(memory.used(), CONTENT.len());
+                drop(bytes);
+            }
+            drop(body);
+            assert_eq!(memory.used(), 0);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn download_frame_slices_keep_their_lease_after_body_drop() {
+        const CONTENT: &[u8] = b"ordinary";
+        let memory = crate::lease::BytePool::new(CONTENT.len());
+        let (directory, table, mut body) = download_fixture(CONTENT, Arc::clone(&memory)).await;
+        let bytes = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        let retained = bytes.slice(1..);
+        assert_eq!(memory.used(), CONTENT.len());
+        drop(bytes);
+        drop(body);
+        assert!(table.is_idle(std::time::Instant::now() + transfer::IDLE));
+        assert_eq!(memory.used(), CONTENT.len());
+        assert_eq!(&retained[..], &CONTENT[1..]);
+        drop(retained);
+        assert_eq!(memory.used(), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn native_file_worker_admits_before_io_and_releases_success_and_error() {
