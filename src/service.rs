@@ -4682,13 +4682,24 @@ mod tests {
         let id = id.to_owned();
         drop(result);
         let task = tasks.find(&id).unwrap();
-        // A caller-owned report is released on cancellation; only the worker's
-        // buffers must remain charged while the attachment read is blocked.
+        // Caller report and metadata may release on cancellation; the blocked worker
+        // must keep its own buffers charged.
         let report_charge = {
             let before = pool.used();
             let report = task.script().unwrap().report(&pool, None).unwrap();
             let charge = pool.used() - before;
             drop(report);
+            assert_eq!(pool.used(), before);
+            charge
+        };
+        let metadata_charge = {
+            let before = pool.used();
+            let call = script_call(&session, false);
+            let mut metadata = RenderSnapshot::new(&task, &call, Action::Poll).unwrap();
+            metadata.refresh(&task, &call, Action::Poll).unwrap();
+            let charge = pool.used() - before;
+            assert!(charge > 0);
+            drop(metadata);
             assert_eq!(pool.used(), before);
             charge
         };
@@ -4730,7 +4741,7 @@ mod tests {
         .await
         .unwrap();
         let held = pool.used();
-        assert!(held > report_charge);
+        assert!(held > report_charge + metadata_charge);
         cancel.cancel();
         let cancelled = tokio::time::timeout(Duration::from_secs(5), response)
             .await
@@ -4739,8 +4750,8 @@ mod tests {
         assert_eq!(cancelled.is_error, Some(true));
         assert_eq!(
             pool.used(),
-            held - report_charge,
-            "only the caller's report may release before the blocking worker exits"
+            held - report_charge - metadata_charge,
+            "only the caller's report and metadata may release before the blocking worker exits"
         );
         assert!(reader.read_gate().try_lock_owned().is_err());
         drop(writer);
