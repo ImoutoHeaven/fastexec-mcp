@@ -625,13 +625,25 @@ handle and log path so the caller can retrieve output without repeating the acti
 
 Task lists reserve snapshot diagnostics, owner/session text, display paths and
 member names before copying them. Their rendering workspace covers 32 times the
-source text plus fixed row/member keys, including simultaneous snapshot, warning,
+source capacity plus fixed row/member keys, including simultaneous snapshot, warning,
 JSON and growing text buffers. Short lists use the independent control pool;
 larger candidates can move to the main pool after acquiring its replacement charge.
 Native member queries admit names and conversion buffers before allocation, then
 release their temporary scan allowance before rendering the selected names. Repeated
 queries reuse a live-byte high-water allowance. On macOS, a budget refusal drains
 the current native reply so subsequent queries remain aligned.
+
+Window, transcript and screen responses reserve the same metadata workspace before
+copying diagnostics or leftover process names under their state locks. Held-process
+queries use the same name/conversion admission callback as lists. The snapshot and
+its rendering allowance stay together until the final response payload takes over;
+only kill responses may use control space when the main pool is full. After reading
+a window, a smaller refresh copies only the four current I/O diagnostics and reads
+the line/drop/eviction scalars. It admits the new diagnostics before replacing the
+old copies, without cloning final state or process lists again. Cancellation drops
+the snapshot before its metadata lease; a queued body worker keeps its separate
+workspace until that worker finishes. Refusal leaves reader and attachment marks
+unchanged and retains the task handle and recovery instructions in the error.
 
 A list candidate checks the final frame limit and reserves its payload and
 application-owned wire before marking entries reported. HTTP reserves its payload

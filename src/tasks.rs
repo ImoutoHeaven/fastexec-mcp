@@ -717,6 +717,18 @@ struct Final {
     kept: bool,
 }
 
+impl Final {
+    fn clone_reserved(
+        &self,
+        reserve: &mut impl FnMut(usize) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        for member in &self.leftovers {
+            reserve(member.name.capacity().saturating_add(32))?;
+        }
+        Ok(self.clone())
+    }
+}
+
 struct Input {
     bytes: Vec<u8>,
     eof: bool,
@@ -748,10 +760,20 @@ pub struct Snapshot {
     pub kept: bool,
     /// The processes the task held past the root's exit have ended.
     pub tree_ended: bool,
-    /// The processes the task holds, when [`Task::snapshot_held`] took the snapshot.
+    /// The processes the task holds, when [`Task::snapshot_held_reserved`] took the snapshot.
     pub held: Vec<Member>,
     /// Why the last kill of the processes it holds failed.
     pub kill_error: Option<String>,
+}
+
+fn copy_snapshot_text(
+    value: &Option<String>,
+    reserve: &mut impl FnMut(usize) -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    if let Some(text) = value {
+        reserve(text.capacity().saturating_add(128))?;
+    }
+    Ok(value.clone())
 }
 
 pub type Started = (Arc<Task>, Arc<TaskEntry>, Arc<Reader>);
@@ -960,12 +982,11 @@ impl Tasks {
                         )
                         .saturating_add(512);
                     reserve(text)?;
-                    if let Some(end) = end.as_ref() {
-                        for member in &end.leftovers {
-                            reserve(member.name.len().saturating_add(32))?;
-                        }
-                    }
-                    (end.clone(), tree_done)
+                    let end = end
+                        .as_ref()
+                        .map(|end| end.clone_reserved(reserve))
+                        .transpose()?;
+                    (end, tree_done)
                 };
                 let snapshot = task.snapshot_at_reserved(end, tree_done, reserve)?;
                 selected.push((Arc::clone(task), snapshot));
@@ -2554,13 +2575,46 @@ impl Task {
         lock(&self.out).evicted
     }
 
-    /// A snapshot that also lists the processes the task holds.
-    pub fn snapshot_held(&self) -> Snapshot {
-        let mut snapshot = self.snapshot();
+    /// Reserves diagnostic copies under their locks and admits held-process names before reading.
+    pub fn snapshot_held_reserved(
+        &self,
+        reserve: &mut impl FnMut(usize) -> Result<(), String>,
+        members: &mut impl FnMut(&Tree) -> Result<Option<Vec<Member>>, String>,
+    ) -> Result<Snapshot, String> {
+        let end = lock(&self.end)
+            .as_ref()
+            .map(|end| end.clone_reserved(reserve))
+            .transpose()?;
+        let tree_done = *self.tree_done.borrow();
+        let mut snapshot = self.snapshot_at_reserved(end, tree_done, reserve)?;
         if snapshot.kept {
-            snapshot.held = self.root.members().unwrap_or_default();
+            snapshot.held = match &self.root {
+                Root::Process(tree) => members(tree)?.unwrap_or_default(),
+                Root::Script(_) => Vec::new(),
+            };
         }
-        snapshot
+        Ok(snapshot)
+    }
+
+    /// Refreshes only the output fields that can change while a window is read.
+    pub fn refresh_snapshot_output(
+        &self,
+        snapshot: &mut Snapshot,
+        reserve: &mut impl FnMut(usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let out = lock(&self.out);
+        let log_error = copy_snapshot_text(&out.log_error, reserve)?;
+        let capture_error = copy_snapshot_text(&out.capture_error, reserve)?;
+        let input_warning = copy_snapshot_text(&lock(&self.input_warning), reserve)?;
+        let input_error = copy_snapshot_text(&lock(&self.input_error), reserve)?;
+        snapshot.lines = out.lines;
+        snapshot.dropped = out.dropped;
+        snapshot.evicted = out.evicted;
+        snapshot.log_error = log_error;
+        snapshot.capture_error = capture_error;
+        snapshot.input_warning = input_warning;
+        snapshot.input_error = input_error;
+        Ok(())
     }
 
     /// State used by script reports, without copying logs or process diagnostics.
@@ -2594,12 +2648,6 @@ impl Task {
         tree_done: bool,
         reserve: &mut impl FnMut(usize) -> Result<(), String>,
     ) -> Result<Snapshot, String> {
-        let mut copy = |value: &Option<String>| {
-            if let Some(text) = value {
-                reserve(text.len())?;
-            }
-            Ok::<_, String>(value.clone())
-        };
         let held_past_exit = end.as_ref().is_some_and(|end| end.kept);
         let out = lock(&self.out);
         Ok(Snapshot {
@@ -2618,16 +2666,16 @@ impl Task {
             evicted: out.evicted,
             output_open: end.as_ref().is_some_and(|end| end.output_open) && !out.closed,
             expired: end.as_ref().is_some_and(|end| end.expired),
-            log_error: copy(&out.log_error)?,
-            capture_error: copy(&out.capture_error)?,
-            input_warning: copy(&lock(&self.input_warning))?,
-            input_error: copy(&lock(&self.input_error))?,
+            log_error: copy_snapshot_text(&out.log_error, reserve)?,
+            capture_error: copy_snapshot_text(&out.capture_error, reserve)?,
+            input_warning: copy_snapshot_text(&lock(&self.input_warning), reserve)?,
+            input_error: copy_snapshot_text(&lock(&self.input_error), reserve)?,
             // A kill can record an error after the ender confirms completion. Only an
             // unconfirmed tree can still need a retry.
             kill_error: if tree_done {
                 None
             } else {
-                copy(&lock(&self.kill_error))?
+                copy_snapshot_text(&lock(&self.kill_error), reserve)?
             },
             leftovers: end.map(|end| end.leftovers).unwrap_or_default(),
             kept: held_past_exit && !tree_done,
@@ -4430,6 +4478,150 @@ mod script_tests {
         });
         assert_eq!(task.snapshot().exit_code, Some(0));
         tasks.shutdown();
+    }
+
+    #[test]
+    fn response_snapshot_admits_source_capacity_before_cloning() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let (task, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "meta".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        let mut name = String::with_capacity(48);
+        name.push_str("worker");
+        let mut error = String::with_capacity(64);
+        error.push_str("write note");
+        let mut warning = String::with_capacity(96);
+        warning.push_str("input note");
+        let charges = [
+            name.capacity() + 32,
+            error.capacity() + 128,
+            warning.capacity() + 128,
+        ];
+        lock(&task.end)
+            .as_mut()
+            .unwrap()
+            .leftovers
+            .push(Member { pid: 7, name });
+        lock(&task.out).log_error = Some(error);
+        *lock(&task.input_warning) = Some(warning);
+        let required = charges.iter().sum::<usize>();
+        for limit in [required - 1, required, required + 1] {
+            let pool = BytePool::new(limit);
+            let mut lease = crate::lease::Lease::empty(&pool);
+            let mut requested = Vec::new();
+            let snapshot = task.snapshot_held_reserved(
+                &mut |bytes| {
+                    requested.push(bytes);
+                    lease
+                        .try_grow(bytes)
+                        .then_some(())
+                        .ok_or_else(|| "metadata full".into())
+                },
+                &mut |_| panic!("a script has no native process members"),
+            );
+            assert_eq!(requested, charges);
+            if limit < required {
+                assert!(snapshot.is_err());
+                assert_eq!(pool.used(), charges[0] + charges[1]);
+                drop(snapshot);
+                drop(lease);
+            } else {
+                let snapshot = snapshot.unwrap();
+                assert_eq!(snapshot.leftovers[0].name, "worker");
+                assert_eq!(snapshot.log_error.as_deref(), Some("write note"));
+                assert_eq!(snapshot.input_warning.as_deref(), Some("input note"));
+                let owned = crate::ipc::Owned::new(snapshot, crate::lease::Owner::new(lease));
+                assert_eq!(pool.used(), required);
+                drop(owned);
+            }
+            assert_eq!(pool.used(), 0);
+        }
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn response_snapshot_refresh_admits_diagnostics_without_recloning_final_state() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let (task, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "meta".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        let mut snapshot = task.snapshot();
+        snapshot.leftovers.push(Member {
+            pid: 7,
+            name: "worker".into(),
+        });
+        snapshot.kill_error = Some("previous tree note".into());
+        let member_ptr = snapshot.leftovers[0].name.as_ptr();
+        let kill_ptr = snapshot.kill_error.as_ref().unwrap().as_ptr();
+        let old_lines = snapshot.lines;
+        let diagnostic = |text: &str| {
+            let mut value = String::with_capacity(64);
+            value.push_str(text);
+            value
+        };
+        {
+            let mut out = lock(&task.out);
+            out.lines = 9;
+            out.dropped = 2;
+            out.log_error = Some(diagnostic("new log note"));
+            out.capture_error = Some(diagnostic("new capture note"));
+        }
+        *lock(&task.input_warning) = Some(diagnostic("new input warning"));
+        *lock(&task.input_error) = Some(diagnostic("new input note"));
+        let required = 4 * (64 + 128);
+        for limit in [required - 1, required] {
+            let pool = BytePool::new(limit);
+            let mut lease = crate::lease::Lease::empty(&pool);
+            let mut copies = 0;
+            let refreshed = task.refresh_snapshot_output(&mut snapshot, &mut |bytes| {
+                copies += 1;
+                assert_eq!(bytes, 64 + 128);
+                lease
+                    .try_grow(bytes)
+                    .then_some(())
+                    .ok_or_else(|| "metadata full".into())
+            });
+            assert_eq!(copies, 4);
+            if limit < required {
+                assert!(refreshed.is_err());
+                assert_eq!(snapshot.lines, old_lines);
+                assert!(snapshot.log_error.is_none());
+                assert!(snapshot.capture_error.is_none());
+                assert!(snapshot.input_warning.is_none());
+                assert!(snapshot.input_error.is_none());
+                drop(lease);
+            } else {
+                refreshed.unwrap();
+                assert_eq!((snapshot.lines, snapshot.dropped), (9, 2));
+                assert_eq!(snapshot.log_error.as_deref(), Some("new log note"));
+                assert_eq!(snapshot.capture_error.as_deref(), Some("new capture note"));
+                assert_eq!(snapshot.input_warning.as_deref(), Some("new input warning"));
+                assert_eq!(snapshot.input_error.as_deref(), Some("new input note"));
+                assert_eq!(snapshot.leftovers[0].name.as_ptr(), member_ptr);
+                assert_eq!(snapshot.kill_error.as_ref().unwrap().as_ptr(), kill_ptr);
+                // Keep the new diagnostic copies owned until the snapshot is destroyed below.
+                let owned = crate::ipc::Owned::new(snapshot, crate::lease::Owner::new(lease));
+                assert_eq!(pool.used(), required);
+                drop(owned);
+                assert_eq!(pool.used(), 0);
+                tasks.shutdown();
+                return;
+            }
+            assert_eq!(pool.used(), 0);
+        }
+        unreachable!();
     }
 
     #[test]

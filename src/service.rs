@@ -1023,42 +1023,54 @@ fn admit_outbound(
     }
 }
 
-/// Snapshot strings can coexist with warning/row formatting, cloned JSON fields,
-/// the joined body and its growing suffix. Thirty-two times their source text,
-/// including per-row/member keys, bounds those copies and geometric capacities.
-fn list_text_workspace(bytes: usize) -> usize {
+/// Snapshot strings can coexist with warning/status formatting, cloned JSON fields,
+/// the joined body and its growing suffix. Thirty-two times their source capacity,
+/// including per-member/diagnostic keys, bounds those copies and geometric capacities.
+fn metadata_workspace_bytes(bytes: usize) -> usize {
     bytes.saturating_mul(32)
 }
 
-fn resize_list_workspace(
+fn resize_metadata_workspace(
     workspace: &mut Lease,
     target: usize,
     call: &Call<'_>,
+    action: Action,
 ) -> Result<(), String> {
     if workspace.try_resize(target) {
         return Ok(());
     }
     let launch = call.launch();
-    let replacement = launch.memory().try_acquire(target)
-        .or_else(|| launch.control_memory().try_acquire(target))
-        .ok_or_else(|| format!(
-            "Server active memory budget ({} bytes) is full; retry list once in-flight transfers complete.",
-            launch.memory().limit()
-        ))?;
+    let replacement = launch
+        .memory()
+        .try_acquire(target)
+        .or_else(|| {
+            matches!(action, Action::List | Action::Kill)
+                .then(|| launch.control_memory().try_acquire(target))
+                .flatten()
+        })
+        .ok_or_else(|| {
+            format!(
+                "Server active memory budget ({} bytes) is full while preparing task metadata.",
+                launch.memory().limit()
+            )
+        })?;
     // Acquire the replacement before releasing the old pool's charge.
     *workspace = replacement;
     Ok(())
 }
 
-fn listed_members(
+fn metadata_members(
     tree: &process::Tree,
     workspace: &mut Lease,
     call: &Call<'_>,
+    action: Action,
 ) -> Result<Option<Vec<process::Member>>, String> {
     let retained = workspace.bytes();
     let (members, refused) = {
-        let mut reserve =
-            |bytes| resize_list_workspace(workspace, retained.saturating_add(bytes), call).is_ok();
+        let mut reserve = |bytes| {
+            resize_metadata_workspace(workspace, retained.saturating_add(bytes), call, action)
+                .is_ok()
+        };
         let mut budget = process::MemberBudget::new(&mut reserve);
         let members = tree.members_with_budget(&mut budget);
         (members, budget.refused())
@@ -1066,7 +1078,7 @@ fn listed_members(
     if refused {
         drop(members);
         workspace.shrink_to(retained);
-        return Err("Server active memory budget is full while listing kept processes; retry list once in-flight transfers complete.".into());
+        return Err("Server active memory budget is full while reading task process names.".into());
     }
     let text = members.as_ref().map_or(0, |members| {
         members
@@ -1075,17 +1087,83 @@ fn listed_members(
             .fold(0, usize::saturating_add)
     });
     // The native query's temporary scan/conversion strings have gone. Keep only
-    // the selected names and their later row/JSON rendering workspace.
-    if let Err(error) = resize_list_workspace(
+    // the selected names and their later status/JSON rendering workspace.
+    if let Err(error) = resize_metadata_workspace(
         workspace,
-        retained.saturating_add(list_text_workspace(text)),
+        retained.saturating_add(metadata_workspace_bytes(text)),
         call,
+        action,
     ) {
         drop(members);
         workspace.shrink_to(retained);
         return Err(error);
     }
     Ok(members)
+}
+
+// Snapshot text drops before the workspace, including on cancellation across an await.
+struct RenderSnapshot {
+    value: Snapshot,
+    workspace: Lease,
+}
+
+impl RenderSnapshot {
+    fn overload(call: &Call<'_>, task: &Task) -> ServiceError {
+        let meta = files::TaskMeta {
+            bare_task_id: task.id.clone(),
+            log_path: files::display_path(&task.log_path),
+        };
+        ServiceError::Overload(
+            overload_task_message(call.launch().memory().limit(), &meta),
+            Some(meta),
+        )
+    }
+
+    fn new(task: &Task, call: &Call<'_>, action: Action) -> Result<Self, ServiceError> {
+        let workspace = std::cell::RefCell::new(Lease::empty(call.launch().memory()));
+        let fixed = task
+            .id
+            .capacity()
+            .saturating_add(task.log_path.capacity().saturating_mul(3))
+            .saturating_add(512);
+        resize_metadata_workspace(
+            &mut workspace.borrow_mut(),
+            metadata_workspace_bytes(fixed),
+            call,
+            action,
+        )
+        .map_err(|_| Self::overload(call, task))?;
+        let value = task
+            .snapshot_held_reserved(
+                &mut |bytes| {
+                    let mut held = workspace.borrow_mut();
+                    let target = held.bytes().saturating_add(metadata_workspace_bytes(bytes));
+                    resize_metadata_workspace(&mut held, target, call, action)
+                },
+                &mut |tree| metadata_members(tree, &mut workspace.borrow_mut(), call, action),
+            )
+            .map_err(|_| Self::overload(call, task))?;
+        Ok(Self {
+            value,
+            workspace: workspace.into_inner(),
+        })
+    }
+
+    fn refresh(
+        &mut self,
+        task: &Task,
+        call: &Call<'_>,
+        action: Action,
+    ) -> Result<(), ServiceError> {
+        let workspace = &mut self.workspace;
+        task.refresh_snapshot_output(&mut self.value, &mut |bytes| {
+            let target = workspace
+                .bytes()
+                .saturating_add(metadata_workspace_bytes(bytes));
+            resize_metadata_workspace(workspace, target, call, action)
+        })
+        .map_err(|_| Self::overload(call, task))
+    }
 }
 
 impl Service {
@@ -1711,7 +1789,7 @@ impl Service {
         let session = call.session;
         // Declared before every candidate: all text drops before its workspace on error.
         let workspace = std::cell::RefCell::new(Lease::empty(call.launch().control_memory()));
-        resize_list_workspace(&mut workspace.borrow_mut(), 8192, call)
+        resize_metadata_workspace(&mut workspace.borrow_mut(), 8192, call, Action::List)
             .map_err(|message| ServiceError::Overload(message, None))?;
         let active_filter = state.map(|state| state == ListState::Active);
         let (total_count, selected) = self
@@ -1723,10 +1801,10 @@ impl Service {
                 limit,
                 &mut |bytes| {
                     let mut held = workspace.borrow_mut();
-                    let target = held.bytes().saturating_add(list_text_workspace(bytes));
-                    resize_list_workspace(&mut held, target, call)
+                    let target = held.bytes().saturating_add(metadata_workspace_bytes(bytes));
+                    resize_metadata_workspace(&mut held, target, call, Action::List)
                 },
-                &mut |tree| listed_members(tree, &mut workspace.borrow_mut(), call),
+                &mut |tree| metadata_members(tree, &mut workspace.borrow_mut(), call, Action::List),
             )
             .map_err(|message| ServiceError::Overload(message, None))?;
         let (listed, delivered) = {
@@ -1836,7 +1914,7 @@ impl Service {
         };
         let retained = payload.saturating_add(wire);
         if retained > workspace.borrow().bytes() {
-            resize_list_workspace(&mut workspace.borrow_mut(), retained, call)
+            resize_metadata_workspace(&mut workspace.borrow_mut(), retained, call, Action::List)
                 .map_err(|message| ServiceError::Overload(message, None))?;
         }
         if call.cancel.is_cancelled() {
@@ -2115,7 +2193,7 @@ impl Service {
         let encoding = view.encoding.unwrap_or(task.encoding);
         // The state is taken before the read: a finished state means output reached EOF (or
         // stayed open, which the status line notes), so the window below holds all of it.
-        let before = task.snapshot_held();
+        let mut metadata = RenderSnapshot::new(&task, call, action)?;
         let clean = !task.is_script();
         let keep_nul = view.nested;
         let budget = view.max_bytes;
@@ -2148,17 +2226,8 @@ impl Service {
         let mut window_val =
             window.map_err(|error| format!("Cannot read the task log: {error}."))?;
         // Log metadata, such as an eviction during the read, is taken after it.
-        let after = task.snapshot();
-        let snapshot = Snapshot {
-            lines: after.lines,
-            dropped: after.dropped,
-            evicted: after.evicted,
-            log_error: after.log_error,
-            capture_error: after.capture_error,
-            input_warning: after.input_warning,
-            input_error: after.input_error,
-            ..before
-        };
+        metadata.refresh(&task, call, action)?;
+        let snapshot = &metadata.value;
         let delivered_warning = startup_warning.and_then(ProbeWarning::deliver);
         let mut extra_kill_warnings: Vec<String> = Vec::new();
         if view.max_bytes < requested_max_bytes {
@@ -2175,16 +2244,16 @@ impl Service {
                                content_blocks: Vec<ContentBlock>|
          -> CallToolResult {
             let mut status_with_log =
-                status_line(&task, &snapshot, &task_reader, true, script.as_ref());
+                status_line(&task, snapshot, &task_reader, true, script.as_ref());
             let mut status_no_log =
-                status_line(&task, &snapshot, &task_reader, false, script.as_ref());
-            let mut structured = task_json(action, &task, &snapshot, &task_reader);
+                status_line(&task, snapshot, &task_reader, false, script.as_ref());
+            let mut structured = task_json(action, &task, snapshot, &task_reader);
             if let Some(ended) = &ended {
                 let note = ended.note(view.conditions);
                 status_with_log.push_str(&note);
                 status_no_log.push_str(&note);
                 structured["waitEndedBy"] = ended.json();
-            } else if let Some(note) = kill_pending_note(&task, &snapshot) {
+            } else if let Some(note) = kill_pending_note(&task, snapshot) {
                 structured["warnings"]
                     .as_array_mut()
                     .unwrap()
@@ -2256,7 +2325,7 @@ impl Service {
                 window_ref,
                 status_with_log,
                 status_no_log,
-                &snapshot,
+                snapshot,
                 task_reader.is_fresh(),
                 footer,
                 max_bytes,
@@ -2316,7 +2385,7 @@ impl Service {
                 session,
                 &entry,
                 &task_reader,
-                &snapshot,
+                snapshot,
                 background,
                 claim,
                 view.nested,
@@ -2707,7 +2776,7 @@ impl Service {
             session,
             &entry,
             &task_reader,
-            &snapshot,
+            snapshot,
             background,
             claim,
             view.nested,
@@ -2748,7 +2817,8 @@ impl Service {
             .task_render_permit(Action::Transcript, &task, &task_reader)
             .await?;
         let render = call.render;
-        let snapshot = task.snapshot_held();
+        let metadata = RenderSnapshot::new(&task, call, Action::Transcript)?;
+        let snapshot = &metadata.value;
         let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
         let first_permit = permit.clone();
         let memory = Arc::clone(call.launch().memory());
@@ -2777,9 +2847,9 @@ impl Service {
             " · transcript {total} lines, final through {}; this read starts at line {} · {shown_transcript_path}",
             transcript.lines, transcript.first_line,
         );
-        let mut status_with_log = status_line(&task, &snapshot, &task_reader, true, None);
+        let mut status_with_log = status_line(&task, snapshot, &task_reader, true, None);
         status_with_log.push_str(&transcript_note);
-        let mut status_no_log = status_line(&task, &snapshot, &task_reader, false, None);
+        let mut status_no_log = status_line(&task, snapshot, &task_reader, false, None);
         status_no_log.push_str(&transcript_note);
         let spec = WindowSpec {
             truncate: view.truncate,
@@ -2790,7 +2860,7 @@ impl Service {
             encoding: encoding_rs::UTF_8,
             source: "transcript",
         };
-        let mut structured = task_json(Action::Transcript, &task, &snapshot, &task_reader);
+        let mut structured = task_json(Action::Transcript, &task, snapshot, &task_reader);
         structured["transcriptPath"] = json!(shown_transcript_path);
         structured["transcriptLines"] = json!(total);
         structured["finalLines"] = json!(transcript.lines);
@@ -2880,7 +2950,7 @@ impl Service {
             &window,
             status_with_log,
             status_no_log,
-            &snapshot,
+            snapshot,
             task_reader.is_fresh(),
             &footer,
             view.max_bytes,
@@ -2898,7 +2968,7 @@ impl Service {
             session,
             &entry,
             &task_reader,
-            &snapshot,
+            snapshot,
             background,
             claim,
             view.nested,
@@ -2992,7 +3062,8 @@ impl Service {
         ServiceError,
     > {
         // A finished state, taken first, means the screen below holds all output.
-        let snapshot = task.snapshot_held();
+        let metadata = RenderSnapshot::new(&task, call, action)?;
+        let snapshot = &metadata.value;
         let screen = task
             .screen(call.launch().memory())
             .map_err(|error| task_read_error(error, &task))?;
@@ -3016,7 +3087,7 @@ impl Service {
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
         let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
-        let mut structured = task_json(action, &task, &snapshot, &task_reader);
+        let mut structured = task_json(action, &task, snapshot, &task_reader);
         if let Some(warning) = startup_warning.and_then(ProbeWarning::deliver) {
             structured["warnings"]
                 .as_array_mut()
@@ -3039,8 +3110,8 @@ impl Service {
         let room = view.max_bytes;
         let full_len = screen.rows.iter().map(String::len).sum::<usize>()
             + screen.rows.len().saturating_sub(1);
-        let need_log = needs_log_in_status(&snapshot, 0, None) || full_len > room;
-        let mut status = status_line(&task, &snapshot, &task_reader, need_log, None);
+        let need_log = needs_log_in_status(snapshot, 0, None) || full_len > room;
+        let mut status = status_line(&task, snapshot, &task_reader, need_log, None);
         status.push_str(&screen_note);
         if task_reader.is_fresh() {
             status.push_str(NEW_READER_NOTE);
@@ -3077,7 +3148,7 @@ impl Service {
             session,
             &entry,
             &task_reader,
-            &snapshot,
+            snapshot,
             background,
             claim,
             view.nested,
@@ -3662,6 +3733,125 @@ mod tests {
             .unwrap();
         assert!(!entry.is_reported());
         (service, tasks, session, entry)
+    }
+
+    #[tokio::test]
+    async fn response_snapshot_owns_its_workspace_and_uses_control_only_for_kill() {
+        let (_service, tasks, session, _entry) = list_fixture().await;
+        let task = tasks.all().pop().unwrap();
+        let probe =
+            RenderSnapshot::new(&task, &script_call(&session, false), Action::Poll).unwrap();
+        let required = probe.workspace.bytes();
+        assert!(required > 0);
+        drop(probe);
+        for limit in [required - 1, required, required + 1] {
+            let memory = crate::lease::BytePool::new(limit);
+            let control = crate::lease::BytePool::new(required);
+            let launch = Arc::new(
+                session
+                    .launch
+                    .for_session()
+                    .with_memory(Arc::clone(&memory))
+                    .with_control_memory(Arc::clone(&control)),
+            );
+            let mut call = script_call(&session, false);
+            call.launch = Some(&launch);
+            let snapshot = RenderSnapshot::new(&task, &call, Action::Poll);
+            assert_eq!(snapshot.is_ok(), limit >= required);
+            assert_eq!(control.used(), 0);
+            if limit >= required {
+                assert_eq!(memory.used(), required);
+            }
+            drop(snapshot);
+            assert_eq!(memory.used(), 0);
+        }
+        let memory = crate::lease::BytePool::new(0);
+        let control = crate::lease::BytePool::new(required);
+        let launch = Arc::new(
+            session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&memory))
+                .with_control_memory(Arc::clone(&control)),
+        );
+        let mut call = script_call(&session, false);
+        call.launch = Some(&launch);
+        for action in [Action::Start, Action::Poll, Action::Transcript] {
+            let error = RenderSnapshot::new(&task, &call, action).err().unwrap();
+            assert!(
+                matches!(&error, ServiceError::Overload(_, Some(meta)) if meta.bare_task_id == task.id)
+            );
+            assert!(error.contains("Do not retry start or resend input"));
+            assert_eq!((memory.used(), control.used()), (0, 0));
+        }
+        let snapshot = RenderSnapshot::new(&task, &call, Action::Kill).unwrap();
+        assert_eq!(snapshot.value.state, "exited");
+        assert_eq!(control.used(), required);
+        drop(snapshot);
+        assert_eq!((memory.used(), control.used()), (0, 0));
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn response_snapshot_cancellation_releases_metadata_but_keeps_queued_window_owned() {
+        use std::future::Future;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (service, tasks, session) = script_fixture();
+            let (task, entry, _) = tasks.start_script(tasks::ScriptArgs {
+                code: "text('hello');".into(),
+                launch: Arc::clone(&session.launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            }, &session, "meta".into()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await.unwrap().unwrap();
+            let reader = entry.reader(Some("9999")).unwrap();
+            assert!(reader.is_fresh());
+            let memory = crate::lease::BytePool::new(2 << 20);
+            let launch = Arc::new(session.launch.for_session().with_memory(Arc::clone(&memory)));
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = ready_tx.send(());
+                let _ = blocked.recv();
+            });
+            ready_rx.await.unwrap();
+            let mut call = script_call(&session, false);
+            call.launch = Some(&launch);
+            let mut operation = Box::pin(service.call_json_tracked(
+                json!({"action":"poll", "taskId":reader.handle(&task.id), "waitMs":0, "maxBytes":100}),
+                call,
+            ));
+            if let std::task::Poll::Ready(result) = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(operation.as_mut().poll(cx))
+            }).await {
+                panic!("the queued output worker must suspend: {:?}", result.result);
+            }
+            assert!(memory.used() > text_workspace_bytes(100));
+            drop(operation);
+            assert_eq!(memory.used(), text_workspace_bytes(100));
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while memory.used() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            let state = reader.read_gate().lock_owned().await;
+            assert_eq!((state.cursor, state.attachments_seen), (0, 0));
+            assert!(reader.is_fresh());
+            assert!(!entry.is_reported());
+            drop(state);
+            tasks.shutdown();
+        });
     }
 
     #[tokio::test]
