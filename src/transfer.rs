@@ -8,7 +8,7 @@ use crate::tasks::ALPHABET;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as Upload;
@@ -75,7 +75,7 @@ async fn file_identity(file: &tokio::fs::File) -> std::io::Result<FileIdentity> 
 
 struct Entry {
     /// The file as it was resolved when the URL was made.
-    path: PathBuf,
+    path: Arc<PathBuf>,
     /// When this entry was last used, for the idle sweep.
     last_used: Instant,
     /// Requests in progress, which keep the entry alive.
@@ -106,7 +106,7 @@ impl Transfers {
         let id = crate::tasks::random_chars(ID_LENGTH)
             .map_err(|error| format!("Cannot make a transfer id: {error}"))?;
         let entry = Entry {
-            path,
+            path: Arc::new(path),
             last_used: now,
             active: 0,
         };
@@ -133,7 +133,7 @@ impl Transfers {
         Some(Admitted {
             table: Arc::clone(self),
             id: id.to_owned(),
-            path: entry.path.clone(),
+            path: Arc::clone(&entry.path),
         })
     }
 
@@ -167,13 +167,13 @@ fn sweep(entries: &mut HashMap<String, Entry>, now: Instant) {
 pub struct Admitted {
     table: Arc<Transfers>,
     id: String,
-    path: PathBuf,
+    path: Arc<PathBuf>,
 }
 
 impl Admitted {
-    /// The file this entry names.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Shares the published path allocation with an admitted request or blocking worker.
+    pub fn path(&self) -> Arc<PathBuf> {
+        Arc::clone(&self.path)
     }
 
     /// Waits for writers to the same opened file, including writers using another capability,
@@ -286,6 +286,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn admitted_requests_share_the_published_path_allocation() {
+        let table = Arc::new(Transfers::new());
+        let path = PathBuf::from("relative/future/ordinary.txt");
+        let bytes = path.as_os_str().as_encoded_bytes().as_ptr();
+        let id = table.create(path).unwrap();
+        let first = table.admit(&id).unwrap();
+        let second = table.admit(&id).unwrap();
+        let shared = first.path();
+        let entries = lock(&table.entries);
+        let entry = entries.get(&id).unwrap();
+        assert!(Arc::ptr_eq(&entry.path, &shared));
+        assert!(Arc::ptr_eq(&shared, &second.path()));
+        assert_eq!(shared.as_os_str().as_encoded_bytes().as_ptr(), bytes);
+        assert_eq!(
+            shared.as_path(),
+            std::path::Path::new("relative/future/ordinary.txt")
+        );
+        assert_eq!(entry.active, 2);
+        drop(entries);
+        drop(first);
+        assert_eq!(lock(&table.entries).get(&id).unwrap().active, 1);
+        drop(second);
+        assert_eq!(lock(&table.entries).get(&id).unwrap().active, 0);
+        drop(shared);
+        assert!(table.is_idle(Instant::now() + IDLE));
+    }
+
+    #[test]
     fn an_id_has_the_generated_shape() {
         let table = Transfers::new();
         let id = table.create(PathBuf::from("/tmp/a")).unwrap();
@@ -348,7 +376,7 @@ mod tests {
         let held = table.admit_at(&id, start).unwrap();
         // A request in progress pins the entry, however long the gap looks.
         let later = table.admit_at(&id, start + IDLE * 3).unwrap();
-        assert_eq!(held.path(), Path::new("/tmp/a"));
+        assert_eq!(held.path().as_path(), std::path::Path::new("/tmp/a"));
         // A release records the moment it ended, not the moment it was admitted at, so the
         // entry outlives the admission it was made under.
         drop(later);

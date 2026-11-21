@@ -450,6 +450,7 @@ impl<'a> WindowBuilder<'a> {
         // including terminal padding beyond the retained prefix.
         let stored_padding = trailing_spaces.saturating_sub(dropped);
         prefix.truncate(prefix.len() - stored_padding);
+        prefix = prefix.into_boxed_str().into_string();
         dropped = dropped.saturating_sub(trailing_spaces);
         self.last_displayed = last;
         self.place(Candidate {
@@ -864,25 +865,44 @@ pub fn incomplete_utf8_suffix(tail: &[u8]) -> usize {
 
 /// Bytes still held by the decoder at a live window boundary. Earlier malformed sequences
 /// were already emitted as replacements and do not affect a later unfinished character.
-pub fn incomplete_legacy_suffix(line: &[u8], encoding: &'static encoding_rs::Encoding) -> usize {
+pub fn incomplete_legacy_suffix_reader(
+    mut reader: impl std::io::Read,
+    encoding: &'static encoding_rs::Encoding,
+) -> std::io::Result<usize> {
     let mut decoder = encoding.new_decoder_without_bom_handling();
-    let mut buffer = [0; 4096];
-    let mut input = line;
+    let mut source = [0; 4096];
+    let mut decoded = [0; 4096];
     loop {
-        let (result, consumed, _, _) = decoder.decode_to_utf8(input, &mut buffer, false);
-        input = &input[consumed..];
-        if result == encoding_rs::CoderResult::InputEmpty {
+        let count = match reader.read(&mut source) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        if count == 0 {
             break;
         }
+        let mut input = &source[..count];
+        loop {
+            let (result, consumed, _, _) = decoder.decode_to_utf8(input, &mut decoded, false);
+            input = &input[consumed..];
+            if result == encoding_rs::CoderResult::InputEmpty {
+                break;
+            }
+        }
     }
-    // Flushing now can only fail on the incomplete suffix.
-    match decoder
-        .decode_to_utf8_without_replacement(&[], &mut buffer, true)
-        .0
-    {
-        encoding_rs::DecoderResult::Malformed(len, _) => usize::from(len),
-        _ => 0,
-    }
+    Ok(
+        match decoder
+            .decode_to_utf8_without_replacement(&[], &mut decoded, true)
+            .0
+        {
+            encoding_rs::DecoderResult::Malformed(len, _) => usize::from(len),
+            _ => 0,
+        },
+    )
+}
+
+#[cfg(test)]
+fn incomplete_legacy_suffix(line: &[u8], encoding: &'static encoding_rs::Encoding) -> usize {
+    incomplete_legacy_suffix_reader(line, encoding).unwrap()
 }
 
 #[cfg(test)]
@@ -907,6 +927,70 @@ mod tests {
             builder.push(chunk);
         }
         builder.finish()
+    }
+
+    #[test]
+    fn retained_lines_release_capacity_after_padding_and_prefix_cuts() {
+        for truncate in [Truncate::Head, Truncate::Tail, Truncate::HeadTail] {
+            let mut cleaner = Cleaner::default();
+            let spec = WindowSpec {
+                truncate,
+                budget: 64,
+                raw: false,
+                clean: true,
+                keep_nul: false,
+                encoding: encoding_rs::UTF_8,
+                source: "log",
+            };
+            let mut builder = WindowBuilder::new(spec, &mut cleaner, 1);
+            for line in [
+                format!("x{}\n", " ".repeat(1024)),
+                format!("{}\n", "y".repeat(1024)),
+            ] {
+                builder.push(line.as_bytes());
+                for retained in builder.head.iter().chain(builder.tail.iter()) {
+                    assert_eq!(retained.prefix.capacity(), retained.prefix.len());
+                }
+            }
+            assert!(builder.finish().text.len() <= 64);
+        }
+    }
+
+    #[test]
+    fn legacy_suffix_streams_across_short_reads_without_losing_decoder_state() {
+        struct ShortReads<'a> {
+            bytes: &'a [u8],
+            size: usize,
+            interrupt: bool,
+        }
+        impl std::io::Read for ShortReads<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let count = buffer.len().min(self.size).min(self.bytes.len());
+                buffer[..count].copy_from_slice(&self.bytes[..count]);
+                self.bytes = &self.bytes[count..];
+                Ok(count)
+            }
+        }
+        let mut text = vec![b'a'; 4095];
+        text.extend_from_slice(&[0x81, 0x30, 0x81, 0x30]);
+        for held in 0..4 {
+            let mut input = text.clone();
+            input.extend_from_slice(&[0x81, 0x30, 0x81][..held]);
+            for size in [1, 2, 3, 4096] {
+                let reader = ShortReads {
+                    bytes: &input,
+                    size,
+                    interrupt: true,
+                };
+                assert_eq!(
+                    incomplete_legacy_suffix_reader(reader, encoding_rs::GB18030).unwrap(),
+                    held
+                );
+            }
+        }
     }
 
     #[test]

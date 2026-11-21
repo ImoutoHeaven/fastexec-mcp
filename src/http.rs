@@ -2,12 +2,11 @@
 //! of the stdio endpoint or the namespace's pipe.
 
 use crate::daemon::Daemon;
-use crate::lease::Lease;
 use crate::service::Render;
 use crate::session::{LaunchContext, Session};
 use crate::transfer::{self, Admitted, Transfers};
 use crate::{Backend, InstructionsToolMode, Server, Tools, TransferEndpoint};
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use http::header::HeaderName;
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use http_body_util::combinators::BoxBody;
@@ -22,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
@@ -35,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 mod sessions;
 use sessions::Sessions;
 /// The largest request body the daemon reads: a call carries its arguments, not a file.
-pub const LIMIT: usize = 4 << 20;
+pub(crate) const LIMIT: usize = 4 << 20;
 /// HTTP has its own connection budget, so unauthenticated peers cannot consume the daemon
 /// socket's management capacity or exhaust the process's file descriptors.
 const MAX_CONNECTIONS: usize = 128;
@@ -308,8 +307,8 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     session_config.sse_retry = None;
     session_config.completed_cache_ttl = Duration::from_secs(60);
     session_config.init_timeout = Some(Duration::from_secs(60));
-    // shortcut: rmcp retains session bodies outside the daemon's byte budget. The count cap
-    // below is HTTP-only; it isn't a namespace-wide memory quota.
+    // Result owners follow the SDK queue and replay cache into the returned body frames.
+    // This independent count cap bounds HTTP session bookkeeping.
     let sessions = Sessions::new(session_config, MAX_HTTP_SESSIONS);
     let inner = StreamableHttpService::new(factory, Arc::new(sessions), config);
     let layer = Bearer {
@@ -492,118 +491,6 @@ fn client_fault(error: &hyper::Error) -> bool {
 #[derive(Clone, Copy)]
 pub struct Principal(pub usize);
 
-#[derive(Default)]
-struct ResponseLeaseState {
-    closed: bool,
-    leases: Vec<Lease>,
-}
-
-/// Holds active-byte leases across background SSE streaming until the HTTP response ends or drops.
-#[derive(Default)]
-pub(crate) struct ResponseLease(std::sync::Mutex<ResponseLeaseState>);
-
-impl ResponseLease {
-    pub(crate) fn attach(&self, lease: Lease) {
-        let mut state = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.closed {
-            drop(state);
-            drop(lease);
-        } else {
-            state.leases.push(lease);
-        }
-    }
-
-    pub(crate) fn close(&self) {
-        let dropped = {
-            let mut state = self
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.closed = true;
-            std::mem::take(&mut state.leases)
-        };
-        drop(dropped);
-    }
-}
-
-const LEASED_BODY_CHUNK: usize = 16 * 1024;
-
-/// Copies out at most `LEASED_BODY_CHUNK` bytes and drops `pending` once exhausted so
-/// downstream `WriteBuf` tail chunks never share the large buffer's reference count.
-fn next_copied_chunk(pending: &mut Bytes) -> Bytes {
-    let take = pending.len().min(LEASED_BODY_CHUNK);
-    let chunk = Bytes::copy_from_slice(&pending[..take]);
-    pending.advance(take);
-    if pending.is_empty() {
-        *pending = Bytes::new();
-    }
-    chunk
-}
-
-struct LeasedBody<B> {
-    inner: B,
-    pending: Bytes,
-    lease: Arc<ResponseLease>,
-}
-
-impl<B> Drop for LeasedBody<B> {
-    fn drop(&mut self) {
-        self.lease.close();
-    }
-}
-
-impl<B> hyper::body::Body for LeasedBody<B>
-where
-    B: hyper::body::Body<Data = Bytes> + Unpin,
-{
-    type Data = Bytes;
-    type Error = B::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        if !self.pending.is_empty() {
-            let chunk = next_copied_chunk(&mut self.pending);
-            return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
-        }
-        let poll = Pin::new(&mut self.inner).poll_frame(cx);
-        match poll {
-            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                Ok(data) if data.is_empty() => {
-                    Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::new()))))
-                }
-                Ok(mut data) => {
-                    let chunk = next_copied_chunk(&mut data);
-                    self.pending = data;
-                    Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
-                }
-                Err(non_data) => Poll::Ready(Some(Ok(non_data))),
-            },
-            Poll::Ready(None) => {
-                self.lease.close();
-                Poll::Ready(None)
-            }
-            other => other,
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.pending.is_empty() && self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        if self.pending.is_empty() {
-            self.inner.size_hint()
-        } else {
-            hyper::body::SizeHint::default()
-        }
-    }
-}
-
 /// The token check and the body cap, in front of rmcp: a request without a token never reaches
 /// a session, and one over the cap is refused before it is read.
 #[derive(Clone)]
@@ -650,8 +537,6 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
             }
             let (mut parts, body) = request.into_parts();
             parts.extensions.insert(Principal(principal));
-            let response_lease = Arc::new(ResponseLease::default());
-            parts.extensions.insert(Arc::clone(&response_lease));
             let request = Request::from_parts(parts, Limited::new(body, LIMIT));
             let answer = inner
                 .call(request)
@@ -663,12 +548,10 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
                 HeaderName::from_static("x-accel-buffering"),
                 "no".parse().expect("a header value"),
             );
-            let leased = LeasedBody {
-                inner: body.map_err(|never: Infallible| match never {}),
-                pending: Bytes::new(),
-                lease: response_lease,
-            };
-            Ok(Response::from_parts(parts, leased.boxed()))
+            Ok(Response::from_parts(
+                parts,
+                body.map_err(|never: Infallible| match never {}).boxed(),
+            ))
         })
     }
 }
@@ -769,8 +652,33 @@ enum Presence {
     Failed,
 }
 
-async fn presence(path: &Path) -> Presence {
-    match tokio::fs::metadata(path).await {
+/// Reserve Rust's native path argument buffers inside the worker that uses them.
+async fn transfer_file<T: Send + 'static>(
+    path: Arc<PathBuf>,
+    pool: Arc<crate::lease::BytePool>,
+    operation: impl FnOnce(&Path) -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    tokio::task::spawn_blocking(move || {
+        let memory = || {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "Server active memory budget is full while preparing a transfer file operation.",
+            )
+        };
+        let bytes = crate::files::native_path_bytes(&path).ok_or_else(memory)?;
+        let _lease = pool.try_acquire(bytes).ok_or_else(memory)?;
+        operation(&path)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+async fn presence(path: Arc<PathBuf>) -> Presence {
+    match transfer_file(path, Arc::clone(crate::lease::process_pool()), |path| {
+        std::fs::metadata(path)
+    })
+    .await
+    {
         Ok(metadata) if metadata.is_file() => Presence::File(metadata.len()),
         Ok(_) => Presence::NotAFile,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Missing,
@@ -780,22 +688,27 @@ async fn presence(path: &Path) -> Presence {
 
 /// Downloads a file, or the one range of it that was asked for.
 async fn transfer_get(headers: &HeaderMap, admitted: Admitted) -> Reply {
-    let path = admitted.path().to_path_buf();
-    let (file, metadata) =
-        match tokio::task::spawn_blocking(move || crate::files::open_regular(&path)).await {
-            Ok(Ok(opened)) => opened,
-            Ok(Err(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::IsADirectory
-                        | std::io::ErrorKind::Unsupported
-                ) =>
-            {
-                return transfer_empty(StatusCode::NOT_FOUND, &[]);
-            }
-            _ => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
-        };
+    let path = admitted.path();
+    let (file, metadata) = match transfer_file(
+        path,
+        Arc::clone(crate::lease::process_pool()),
+        crate::files::open_regular,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return transfer_empty(StatusCode::NOT_FOUND, &[]);
+        }
+        _ => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+    };
     let mut file = tokio::fs::File::from_std(file);
     // Atomic saves may replace the path; the reported size and bytes share this handle.
     let size = metadata.len();
@@ -891,13 +804,13 @@ struct UploadFile {
 }
 
 async fn prepare_upload(admitted: &Admitted, offset: u64) -> Result<UploadFile, StatusCode> {
-    let path = admitted.path().to_path_buf();
-    match presence(&path).await {
+    let path = admitted.path();
+    match presence(Arc::clone(&path)).await {
         Presence::NotAFile => return Err(StatusCode::CONFLICT),
         Presence::Failed => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         Presence::Missing if offset > 0 => return Err(StatusCode::CONFLICT),
         Presence::Missing => {
-            let requested = path.clone();
+            let requested = Arc::clone(&path);
             tokio::task::spawn_blocking(move || crate::files::create_target_parents(&requested))
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -907,13 +820,15 @@ async fn prepare_upload(admitted: &Admitted, offset: u64) -> Result<UploadFile, 
     }
     // Opening without truncation lets aliases discover the same file identity, including a
     // file which did not exist when its URLs were minted. All mutations happen under its lock.
-    let file = match tokio::task::spawn_blocking(move || {
-        crate::files::open_regular_for_upload(&path, offset == 0)
-    })
+    let file = match transfer_file(
+        path,
+        Arc::clone(crate::lease::process_pool()),
+        move |path| crate::files::open_regular_for_upload(path, offset == 0),
+    )
     .await
     {
-        Ok(Ok((file, _))) => tokio::fs::File::from_std(file),
-        Ok(Err(error))
+        Ok((file, _)) => tokio::fs::File::from_std(file),
+        Err(error)
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::NotFound
@@ -1136,6 +1051,129 @@ impl hyper::body::Body for FileBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_file_worker_admits_before_io_and_releases_success_and_error() {
+        let directory = std::env::temp_dir().join(format!(
+            "fastexec-native-transfer-{}",
+            crate::tasks::random_chars(12).unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = Arc::new(directory.join("ordinary.txt"));
+        let required = crate::files::native_path_bytes(&path).unwrap();
+        for cap in [required - 1, required, required + 1] {
+            let pool = crate::lease::BytePool::new(cap);
+            let operation_pool = Arc::clone(&pool);
+            let result = transfer_file(Arc::clone(&path), Arc::clone(&pool), move |path| {
+                assert_eq!(operation_pool.used(), required);
+                std::fs::File::create(path)
+            })
+            .await;
+            if cap < required {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::OutOfMemory);
+                assert!(!path.exists(), "refusal must precede the native file call");
+            } else {
+                drop(result.unwrap());
+                assert!(path.exists());
+                std::fs::remove_file(path.as_path()).unwrap();
+            }
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = crate::lease::BytePool::new(required);
+        let operation_pool = Arc::clone(&pool);
+        let error = transfer_file(path, Arc::clone(&pool), move |path| {
+            assert_eq!(operation_pool.used(), required);
+            std::fs::metadata(path)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(pool.used(), 0);
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_file_worker_keeps_its_lease_after_waiter_cancellation() {
+        let path = Arc::new(std::env::temp_dir());
+        let required = crate::files::native_path_bytes(&path).unwrap();
+        let pool = crate::lease::BytePool::new(required);
+        let worker_pool = Arc::clone(&pool);
+        let operation_pool = Arc::clone(&pool);
+        let (ready, observed) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(async move {
+            transfer_file(path, worker_pool, move |path| {
+                assert_eq!(operation_pool.used(), required);
+                ready.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(operation_pool.used(), required);
+                std::fs::metadata(path)
+            })
+            .await
+        });
+        observed.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(pool.used(), required);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn metadata_worker_keeps_the_shared_path_after_its_waiter_is_dropped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let table = Arc::new(Transfers::new());
+            let id = table
+                .create(PathBuf::from(format!(
+                    "future-transfer-{}",
+                    crate::tasks::random_chars(12).unwrap()
+                )))
+                .unwrap();
+            let admitted = table.admit(&id).unwrap();
+            let shared = admitted.path();
+            let weak = Arc::downgrade(&shared);
+            let (ready, observed) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            observed.await.unwrap();
+            let mut pending = Box::pin(presence(shared));
+            std::future::poll_fn(|cx| {
+                assert!(pending.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(pending);
+            drop(admitted);
+            assert!(table.is_idle(std::time::Instant::now() + transfer::IDLE));
+            assert!(
+                weak.upgrade().is_some(),
+                "the queued worker still owns the path"
+            );
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while weak.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
 
     // Windows may refuse replacing a destination with an open handle.
     #[cfg(unix)]
@@ -1395,134 +1433,5 @@ mod tests {
                 "{message}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn response_lease_holds_deferred_sse_bytes_until_stream_end_and_drops_on_early_close() {
-        struct TwoFrameStream {
-            step: u8,
-        }
-        impl hyper::body::Body for TwoFrameStream {
-            type Data = Bytes;
-            type Error = Infallible;
-            fn poll_frame(
-                mut self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-            ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-                self.step += 1;
-                match self.step {
-                    1 => Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
-                        b"data: part1\n\n",
-                    ))))),
-                    2 => Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
-                        b"data: part2\n\n",
-                    ))))),
-                    _ => Poll::Ready(None),
-                }
-            }
-        }
-
-        let pool = crate::lease::BytePool::new(1024);
-        let shared = Arc::new(ResponseLease::default());
-        // Wrap body BEFORE the background tool call attaches its lease (SSE mode).
-        let mut body = LeasedBody {
-            inner: TwoFrameStream { step: 0 },
-            pending: Bytes::new(),
-            lease: Arc::clone(&shared),
-        };
-        assert_eq!(pool.used(), 0);
-
-        // Background tool call finishes and attaches its lease after body was created.
-        shared.attach(pool.try_acquire(600).unwrap());
-        assert_eq!(pool.used(), 600);
-
-        // Slow client reads frame 1 and pauses: lease stays held!
-        let f1 = body.frame().await;
-        assert!(f1.is_some());
-        assert_eq!(pool.used(), 600);
-
-        // Frame 2: still held until end-of-stream!
-        let f2 = body.frame().await;
-        assert!(f2.is_some());
-        assert_eq!(pool.used(), 600);
-
-        // Stream hits Poll::Ready(None): lease is released immediately.
-        assert!(body.frame().await.is_none());
-        assert_eq!(pool.used(), 0);
-
-        // Client disconnects early before background tool attaches its lease: attach drops at once.
-        let early_closed = Arc::new(ResponseLease::default());
-        let dropped_body = LeasedBody {
-            inner: TwoFrameStream { step: 0 },
-            pending: Bytes::new(),
-            lease: Arc::clone(&early_closed),
-        };
-        drop(dropped_body);
-        early_closed.attach(pool.try_acquire(400).unwrap());
-        assert_eq!(pool.used(), 0);
-    }
-
-    #[tokio::test]
-    async fn leased_body_drops_source_buffer_before_lease_even_when_tail_chunks_remain_held() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct TrackedOwner {
-            bytes: Vec<u8>,
-            dropped: Arc<AtomicBool>,
-        }
-        impl AsRef<[u8]> for TrackedOwner {
-            fn as_ref(&self) -> &[u8] {
-                &self.bytes
-            }
-        }
-        impl Drop for TrackedOwner {
-            fn drop(&mut self) {
-                self.dropped.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let source_dropped = Arc::new(AtomicBool::new(false));
-        let raw_len = LEASED_BODY_CHUNK * 3 + 512;
-        let payload = Bytes::from_owner(TrackedOwner {
-            bytes: vec![b'A'; raw_len],
-            dropped: Arc::clone(&source_dropped),
-        });
-        let pool = crate::lease::BytePool::new(256 * 1024);
-        let shared = Arc::new(ResponseLease::default());
-        shared.attach(pool.try_acquire(raw_len).unwrap());
-
-        let mut body = LeasedBody {
-            inner: Full::new(payload),
-            pending: Bytes::new(),
-            lease: Arc::clone(&shared),
-        };
-
-        let mut downstream_write_buf = Vec::new();
-        for idx in 0..3 {
-            let chunk = body.frame().await.unwrap().unwrap().into_data().unwrap();
-            assert_eq!(chunk.len(), LEASED_BODY_CHUNK, "chunk {idx}");
-            assert!(!source_dropped.load(Ordering::SeqCst));
-            assert_eq!(pool.used(), raw_len);
-            downstream_write_buf.push(chunk);
-        }
-
-        // Pulling the final 512-byte tail chunk frees the underlying large source buffer immediately,
-        // while the lease remains held until end-of-stream (`Poll::Ready(None)`).
-        let tail = body.frame().await.unwrap().unwrap().into_data().unwrap();
-        assert_eq!(tail.len(), 512);
-        downstream_write_buf.push(tail);
-        assert!(
-            source_dropped.load(Ordering::SeqCst),
-            "source buffer must drop before lease closes even while downstream holds tail chunks"
-        );
-        assert_eq!(pool.used(), raw_len);
-
-        // End-of-stream now releases the lease while `downstream_write_buf` still holds every chunk.
-        assert!(body.frame().await.is_none());
-        assert_eq!(pool.used(), 0);
-        assert_eq!(
-            downstream_write_buf.iter().map(Bytes::len).sum::<usize>(),
-            raw_len
-        );
     }
 }

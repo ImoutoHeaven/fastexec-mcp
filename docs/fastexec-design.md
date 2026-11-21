@@ -337,6 +337,14 @@ and resource failures have exit code 1 with a `Script error:` line. These are
 normal task results (`isError: false`). Stop has state `killed`, null exitCode,
 and a line naming cancelled calls; deadline stops also set lifetimeExpired.
 
+Error descriptions borrow QuickJS strings and copy at most 4 KiB into Rust,
+ending with `...` when truncated. Before the VM starts, the worker reserves
+12 KiB from the control pool for the description and pending-call summary;
+it holds that workspace until the VM has stopped and its final diagnostic has
+been written. The final diagnostic streams its segments without a second
+assembled copy and stays within the reserved 4 KiB of task output. If that
+workspace is unavailable, the script returns a fixed error without running.
+
 The script's cancellation token is independent of a request's waiting token.
 Kill, deadline, session end in local mode, or daemon stop interrupt bytecode
 and the job loop, cancel pending nested calls and wake an idle VM. The final
@@ -605,6 +613,394 @@ sends its own values in `Hello`; `daemon status` and `daemon stop` ignore them).
   leaving an independent `8` MiB control reserve so `list`, short `kill`
   receipts, progress, and overload errors never stall behind slow readers.
 
+### Active buffer ownership
+
+The process byte pool covers application-owned live payload buffers by allocated
+capacity, including replacement buffers while the old allocation is still alive.
+Official SDK allocations after handoff are outside this accounting. It is not a total RSS
+limit: Rust object headers, allocator bookkeeping, task state and terminal history
+have separate lifetimes. An admission failure leaves output cursors and attachment
+watermarks unchanged. A receipt for an operation that already ran includes its task
+handle and log path so the caller can retrieve output without repeating the action.
+
+Task lists reserve snapshot diagnostics, owner/session text, display paths and
+member names before copying them. Their rendering workspace covers 32 times the
+source text plus fixed row/member keys, including simultaneous snapshot, warning,
+JSON and growing text buffers. Short lists use the independent control pool;
+larger candidates can move to the main pool after acquiring its replacement charge.
+Native member queries admit names and conversion buffers before allocation, then
+release their temporary scan allowance before rendering the selected names. Repeated
+queries reuse a live-byte high-water allowance. On macOS, a budget refusal drains
+the current native reply so subsequent queries remain aligned.
+
+A list candidate checks the final frame limit and reserves its payload and
+application-owned wire before marking entries reported. HTTP reserves its payload
+until handler return; the SDK creates its own encoding afterward. Cancellation or refusal leaves those marks
+unchanged. Direct calls still mark only text rows that fit; nested calls mark every
+selected structured entry. The final result owns its payload, and daemon callers
+reserve only their IPC encoding while checking the eventual MCP envelope ceiling.
+
+Text windows reserve their working peak before entering a blocking reader. Retained
+line prefixes release unused capacity after truncation and terminal padding removal;
+legacy encoding boundary checks stream through fixed buffers. The text workspace
+travels with blocking read and attachment workers, including after cancellation.
+The completed result retains a smaller owner for its text and structured strings.
+
+File operations first reserve a shared path workspace before resolving, displaying,
+opening, or sniffing a path. The allowance is 32 times the borrowed request, cwd,
+and selected home source bytes, plus 4 KiB for fixed notices; reads also reserve
+the sniff buffer. Native and display conversions, path copies, and error/result
+formatting share this owner. Media configuration diagnostics reserve their source
+text before formatting. Missing paths, binary files, media results, write/edit
+results, and transfer inspection retain the owner through their returned result.
+Media and path failures do not require the text decoder allowance.
+
+The native path bounds below were checked against Rust 1.92 and 1.100 source.
+The package's `rust-version` is a minimum supported version, not a toolchain lock;
+CI selects stable Rust and used 1.100 during this review.
+
+Native target resolution has a separate budget because a short symlink can name
+a much longer target. Unix `canonical_target` supplies `realpath` with a
+`PATH_MAX` caller buffer, including the terminating NUL; it finds the NUL inside
+that buffer and moves the same byte Vec into an OsString without a UTF-8 copy.
+The checked Rust 1.92 and 1.100 implementations pass a null output buffer to
+`realpath`. Our caller-buffer route returns the native
+`ENAMETOOLONG` error when the resolved output cannot fit that platform limit.
+On Linux the caller buffer is 4096 bytes; macOS and FreeBSD use 1024. Native path
+bytes, including non-UTF-8 Unix names, are preserved.
+
+Windows canonicalization reopens the current name with the same access mode and
+backup-semantics flag as the checked Rust 1.92 and 1.100 implementations. It queries
+`GetFinalPathNameByHandleW(VOLUME_NAME_DOS)` for its actual UTF-16 size. The query
+includes NUL and a successful read excludes it. Each caller buffer is admitted
+before allocation; if a later query needs more space, the old buffer is dropped
+before its replacement. Conversion reserves three WTF-8 bytes per UTF-16 unit
+plus String growth while the wide buffer is still alive, preserving unpaired
+surrogates. No approximate Windows maximum path length is used as a memory bound.
+
+Unix final-link reads admit each caller-owned `readlink` buffer before use and
+grow from 256 bytes only when the result fills it. Windows retains the relative-link
+and junction semantics checked in Rust 1.92 and 1.100 `read_link`. Its native
+reparse buffer is 16 KiB. Eight times that size covers the fixed reparse buffer,
+the substitute-name UTF-16 Vec, WTF-8 conversion growth and the short (at most
+260 UTF-16 units) prefix check. This is derived from `sys/fs/windows.rs`,
+`sys/args/windows.rs` and `sys/path/windows.rs` in both checked versions. Native Win32
+internal allocations remain outside this allowance. The original forty-link walk and directory requirements
+remain unchanged.
+
+Canonical and followed targets carry their actual PathBuf-capacity lease through
+the source object or blocking upload-preparation result. Link concatenation also
+admits the old target, new result and temporary cleaned paths before copying.
+The common native-argument allowance is `16 * (source_bytes + 8) + 1024` for
+terminated strings, UTF-16 argument/normalized copies and their growth. After a
+target is known, write/edit and transfer inspection add
+`64 * (target_bytes + 64) + 4096` to the existing result owner. This covers up to
+four staging/default/backup paths (including FreeBSD's temporary directory),
+native arguments, lossy display expansion and error copies while these overlap.
+The 64-byte suffix allowance covers the generated staging name and child name;
+the larger multiplier includes geometric old/new capacities. All arithmetic is
+checked. A failed reservation happens before publication; target-derived error
+text keeps the outer owner. Save borrows the canonical target instead of cloning
+it. Edit verification still checks the current path and original file identities,
+rather than canonicalizing only the original handle.
+
+**WONT FIX: opaque native-library scratch.** glibc `realpath` maintains its own
+dynamic rname/extra/link scratch even with a caller buffer; a supplied `PATH_MAX`
+buffer does not bound those internal allocations. libc and WinAPI internals
+remain outside the application byte pool. We neither copy their implementations
+nor claim a whole-process RSS bound. Caller-owned buffers, owned targets and the
+application's derived paths remain budgeted as described above.
+
+Native implementation references: [Rust 1.92 Unix filesystem code](https://github.com/rust-lang/rust/blob/1.92.0/library/std/src/sys/fs/unix.rs), [Rust 1.92 Windows filesystem code](https://github.com/rust-lang/rust/blob/1.92.0/library/std/src/sys/fs/windows.rs), [Rust 1.100 Unix filesystem code](https://github.com/rust-lang/rust/blob/1.100.0/library/std/src/sys/fs/unix.rs), [Rust 1.100 Windows filesystem code](https://github.com/rust-lang/rust/blob/1.100.0/library/std/src/sys/fs/windows.rs), [Rust 1.100 path conversion](https://github.com/rust-lang/rust/blob/1.100.0/library/std/src/sys/args/windows.rs), [Rust 1.100 path normalization](https://github.com/rust-lang/rust/blob/1.100.0/library/std/src/sys/path/windows.rs), [glibc 2.39 canonicalize](https://github.com/bminor/glibc/blob/glibc-2.39/stdlib/canonicalize.c), and [Microsoft GetFinalPathNameByHandleW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew).
+
+File edits reserve the old file independently of the request arguments. The
+blocking reader uses an 8 KiB block and admits each replacement `Vec` before
+allocating it, while the old capacity is still charged. If geometric growth
+cannot fit, it tries the exact required capacity. `EditSource` keeps the final
+String's capacity lease in its last field, after the content. The fixed reader
+allowance is returned when the read helper ends. There is no separate file-size
+ceiling: the shared active budget decides whether the actual operation fits.
+
+The matching workspace uses checked counts and arithmetic throughout. A growing
+buffer with at most `n` elements of size `s` reserves `4 * (n + 8) * s`: two
+capacities of up to twice the logical length may coexist during growth, and the
+small floor covers initial capacities. This is a conservative payload and index
+buffer bound, not a measurement of allocator bookkeeping. Before matching, the
+reservation covers the LF strings, CRLF and original-line indexes, normalized
+old/new strings, restored insertion text, per-edit records, current search needle,
+KMP tables and bounded occurrence lists. The cached fuzzy text has its own space.
+
+Unicode bounds come from the locked `unicode-normalization 0.1.26` implementation,
+not a fixed expansion assumption. `char::decompose_compatible` in
+`src/normalize.rs` emits fully decomposed characters from static tables or the
+Hangul calculation without building a string. The preflight counts those
+characters, line breaks, the longest combining sequence and the largest expansion
+of one input character. Composition cannot increase the decomposed character
+count, so four UTF-8 bytes per character bounds a non-ASCII NFKC result; ASCII
+retains its original byte length. The longest sequence plus one expansion bounds
+the decomposition and recomposition buffers in `src/decompose.rs` and
+`src/recompose.rs`. Their element sizes, geometric growth and stable-sort scratch
+are reserved before running the normalizer. The fuzzy-form allowance also covers
+its NFKC String, line-slice vector, joined String and character-mapped String.
+
+The heavier source map is admitted only before its first use. It includes the
+source-unit vector, the four-offset unit records, untrimmed and trimmed forms,
+and the per-byte origin index. Checks of a match crossing a composition boundary
+separately preflight the actual borrowed context before `exact_survives_fuzzy`:
+its normalized tagged vector, both `tagged_nfkd` vectors, stable-sort scratch and
+accumulated text are all included. The largest temporary allowance remains
+reserved through matching, so clearing a temporary does not leave a later call
+using an uncharged retained capacity.
+
+Overlap entries are counted before their vectors are built. Replacement text is
+admitted against the original length plus every positive replacement increment,
+plus three bytes for a restored UTF-8 BOM. Summing only the final length would
+miss a reverse-order replacement that grows before another one shrinks it.
+The same capacity rule covers the old and new String during each replacement.
+
+Diagnostic construction is admitted before formatting or publication. Each error
+shows at most 20 line numbers or edit labels; 16 KiB per edit covers the bullets,
+joined error, JSON copy and temporary labels. A success reserves 512 bytes per
+edit and the fixed 8 KiB source-verification block used during save. Both paths
+add a path allowance and 4 KiB for fixed text. The successful response is built
+before `save` can stage or rename the replacement. Any failed admission therefore
+leaves the original file unchanged.
+
+Saving also reserves caller-owned native metadata buffers. On Linux and macOS,
+each extended-attribute size query precedes admission and allocation. The original
+and inherited name lists keep their capacity leases while the current value is
+copied and written; a value lease ends only after that write. FreeBSD also admits
+raw length-prefixed name lists, the converted CString arrays, each value and the
+final name-list recheck. Conversion covers the current Vec and boxed CString
+while both can exist, and each returned group keeps its own owner through use.
+The original query/read/query size check still rejects changed or truncated data.
+Windows queries `GetKernelObjectSecurity` on the same file handle, then admits a caller-owned
+buffer rounded to `usize` alignment. Owner, group and DACL pointers borrow that
+buffer. Both source and staging descriptors stay charged through
+`SetSecurityInfo`; no filesystem-specific descriptor size limit is assumed.
+Every buffer is destroyed before its lease. Refusal discards the staging file
+before publication and leaves the original unchanged. Internal allocations made
+by native APIs remain an opaque upstream boundary (WONT FIX); this budget covers
+our buffers and does not claim to bound total process RSS.
+
+Both the initial edit reader and the prepublication content verifier retry
+`Interrupted` reads, matching `Read::read_to_end`. Other I/O errors still return
+immediately.
+
+The workspace stays with the real blocking worker after its waiter is dropped.
+Once source and matching buffers have been destroyed, the returned outcome
+retains the larger of its path allowance and final text/JSON string payload.
+The display String uses its actual capacity; freshly constructed JSON copies are
+bounded by their encoded length. This owner covers successful replies and errors
+until the application passes the result onward.
+
+File text readers then extend the fixed read workspace to 512 KiB and reserve
+16 times the largest retained text span requested so far.
+The slice decoder reads explicit 8 KiB blocks; the fixed allowance covers its
+decoded text and replacement-position vectors, including old allocations during
+growth. Whole-file reads use the same allowance for their fixed read chunk. Each
+retained line, accumulated window, or whole-file buffer grows only after
+non-blocking admission. The workspace follows the blocking worker into its
+Outcome and tracked result, with payload fields dropped before the lease.
+File workers also return derived metadata and errors with their input owner,
+including after their waiter is cancelled, and move it into the final result.
+Transfer inspection likewise captures the input and owner together before the
+future is polled. Its blocking job and completed path or error retain that owner
+until the published result takes it; storing a path in the transfer table does
+not extend this accounting to persistent table state.
+
+The transfer table moves each published PathBuf into one Arc allocation. Admitted
+requests and their GET, HEAD and PUT blocking workers clone that Arc, so those
+application paths share the published PathBuf allocation.
+Metadata checks pass the Arc to an application blocking worker to avoid the
+PathBuf copy inside Tokio's generic metadata wrapper. A worker can retain that
+same allocation after its waiter is cancelled and the idle table entry is swept.
+The Admitted guard still controls active-request pins and idle timestamps; sharing
+the path does not extend that guard or the per-file upload lock.
+
+HTTP metadata checks and GET/PUT file opens additionally reserve
+`native_path_bytes` from the shared process pool inside their actual blocking
+worker, before calling the filesystem. The same allowance covers Rust's terminated
+Unix path argument or Windows UTF-16/normalization buffers. The worker keeps that
+lease through the call, including after its waiting request is cancelled; normal
+returns, I/O errors and unwinding release it after the native argument buffers.
+Admission failure uses the existing HTTP failure mapping. Parent creation already
+reserves its own native target workspace. Native-library internals retain the
+separate opaque boundary described above.
+
+Nested callbacks borrow QuickJS-owned UTF-8 strings. Before parsing tool arguments,
+the Rust bridge reserves four times their UTF-8 length, including the tool name,
+for decoded values, escape scratch, typed requests, diagnostics and worker copies.
+Short control arguments may use the control pool while being classified; ordinary
+calls, including sleep, must move to the main pool before dispatch. Only nested
+list/kill replies may also use that bounded reserve for their encoded wire String;
+the queue keeps the wire owner until the VM consumes or drops the reply. Workers and pending-call metadata
+keep the input owner through cancellation and final report construction. This
+does not change the separate QuickJS heap limit.
+
+Nested exec candidates reserve their actual payload capacity `P` plus
+`W = json_len(CallToolResult) + 256` before committing a reader cursor, attachment
+watermark or reported state. Moving fields into `{ok,value}` adds at most 64 encoded
+bytes, including the fixed missing-content fallback; 128 bytes cover new envelope
+keys and fallback text. The 256-byte allowance covers both that temporary workspace
+and the final encoding without a second admission after commit. The script report
+atomically replaces this pending call's argument/result quota with `W`; refusal
+preserves its previous charge. A failed memory growth likewise keeps the old lease
+until a replacement is acquired. Only short list/kill replies can use control space.
+Temporary opaque attachment handles are removed on every uncommitted exit.
+
+The result carries its payload owner separately from the prepaid wire lease. Host
+exec hands that lease to the bridge encoder; it stays intact until encoding finishes
+and the old envelope is dropped, then shrinks to the String's actual capacity. The
+report's quota shrinks from `W` to the final byte length. Nested file results retain
+their own payload lease and reserve a separate encoding. Wake queue items keep the
+wire owner through synchronous VM consumption or queue disposal.
+
+A refusal before commit leaves reader, attachment and reported state available for
+a later poll. Already-executed start/input operations are not rolled back or replayed.
+When the detailed error fits, it includes the task handle, log path and recovery
+instructions. If the remaining script quota cannot hold even that error, the
+existing fixed `RangeError` explains that the operation was not undone and must not
+be repeated. Accepted starts are recorded before waiting; their handles remain in
+the outer codemode report even in this small-quota case. This does not reserve an
+extra unbudgeted error frame.
+Result payload sizing includes resource URIs, MIME strings, annotations and
+metadata strings as well as text and Base64, and subtracts an existing payload
+lease when sizing additional delivery storage.
+
+Before committing a reader cursor or attachment watermark, the service includes
+the encoded outer JSON-RPC ID length in the frame ceiling. A daemon also checks
+its actual IPC envelope with the numeric call ID. Packing must fit both envelopes;
+the daemon reserves only its own IPC buffer, and the endpoint reserves its own
+later RPC encoding.
+
+Terminal snapshots reserve their payload workspace while holding the terminal
+lock, before copying rows or pending transcript history. Screen waits keep that
+owner with their comparison rows. Transcript reads carry both the snapshot owner
+and text-window workspace through each blocking worker; cancellation cannot free
+them while the worker still uses the snapshot. The final text owner is acquired
+before committing the reader cursor.
+Media packing moves Base64 blocks between candidates instead of cloning them.
+Payload and wire owners are split only after their corresponding buffers are gone.
+
+Fastexec uses the official registry `rmcp = 3.8.0` with the checked-in lockfile.
+There is no rmcp patch or local fork. The existing Windows ConPTY package remains
+under `vendor/conpty`.
+
+Application results carry a separate `TrackedResult.payload_owner`; SDK model
+structs have no added fields. File and transfer workers, terminal results, task
+lists, nested bridge envelopes and IPC encoders keep that owner with their actual
+payload. Payload fields precede their owner, including in unstarted worker closures
+and completed workers awaiting a consumer. Returning a bare `CallToolResult` to
+rmcp ends this application ownership boundary.
+
+Stdio records a conservative staging and wire reservation for a delivered request
+ID, carrying any existing application payload owner alongside it. Payload bytes
+already charged to that owner are not admitted a second time after reader state
+is committed. The transport takes these owners before returning its send future, so the
+application-owned send payload and encoded frame stay charged even if the future
+is never polled. Serialization consumes the model before releasing its staging
+reservation; the encoded frame keeps its own charge until the write ends. The
+request-ID table is a prepayment mechanism, not an observer of SDK clone/drop
+lifetimes. A reservation for a response the SDK never sends can remain until that
+session closes. No extra guard is leaked or retained indefinitely to infer SDK
+ownership.
+
+Daemon replies retain both their application model and frame charges during
+encoding; returned frames keep the wire charge while queued or partially written.
+Short control replies account for both buffers in the independent control reserve.
+The endpoint reserves five times the frame length plus a small fixed allowance
+before reading: raw bytes, decoded strings, escape scratch and the extra owned
+resource-content copy. After parsing, raw and scratch storage is dropped before
+the decoded payload owner is handed to its application consumer.
+
+The custom stdio input accumulator reserves old and replacement capacity together.
+Raw bytes, decoded JSON strings and escape scratch are admitted before parsing;
+four times the input length remains for model strings, metadata and application
+parameter conversion. Official public Request/Notification Extensions carry the
+application owner to handlers and their workers. Recent cancellation IDs retain
+only their transferred ID allowance. Short inputs up to 64 KiB may use the control
+reserve for classification. Ordinary calls and initialize metadata must move to
+the main pool before dispatch. Short list/kill, ping, discovery and cancellation
+or lifecycle control messages can remain in the reserve. A refused stdio admission
+sends a short overload error and closes that transport.
+
+At each public tool-handler entry, an existing application input owner is reused.
+When the official SDK supplied no owner, the handler counts the borrowed typed
+parameters and request ID, then reserves four times that encoded length before
+creating application copies or dispatching workers. Ordinary calls use the main
+pool; only short exec list/kill calls may fall back to control space. A refusal
+returns a fixed short receipt before dispatch. This allowance covers subsequent
+application copies and follows their real workers; it does not retroactively
+account for the SDK's earlier parsing or parameter conversion.
+
+Initialization, discovery, tool listings and the instructions tool reserve their
+application response-copy workspace before copying startup configuration, then
+release it at handler return. Tool listings count owned descriptions and metadata
+while sharing schema Arcs. Progress forwarding owns its input token and admits
+its application message String before copying. Stdio admits its separate encoded
+frame when the official SDK calls the transport.
+
+**WONT FIX in this repository: official SDK internal ownership.** Public rmcp APIs
+do not provide complete ownership hooks for all of the following paths:
+
+- HTTP body collection, JSON parsing, header decoding and validation scratch.
+  Fastexec retains its existing authentication, route and body-limit checks; the
+  SDK keeps its original HTTP validation order and error behavior.
+- Independently cloned request parameters, initialization peer information,
+  response models, handler cancellation and SDK queues after application handoff.
+- HTTP JSON/SSE encoding, response/replay caches, keepalive frames and returned
+  body slices, including errors and progress notifications.
+
+The former whole-HTTP budget guarantee, response-owner propagation, prepaid
+correlated SSE fallback and SDK clone/replay accounting are withdrawn. Fixing
+those SDK lifetimes requires upstream support. Fastexec does not replace or copy
+SDK internals into application code, and these exclusions do not exempt the file,
+media, IPC, terminal or nested buffers that the application actually owns. The
+process pool therefore limits those tracked active payload buffers, not total
+process memory or every allocation made by the SDK.
+
+The HTTP integration case
+`slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops`
+remains as an ignored upstream-dependent check. Its assertion requires the SDK's
+slow response body to retain a lease after the handler has returned its bare
+result. CI lists this case as ignored, not passed. Ordinary HTTP media delivery,
+application admission, cancellation and control checks remain enabled.
+
+IPC request senders count JSON without a temporary encoding, reserve the measured
+frame capacity, and encode directly into that allocation. The frame owns its
+reservation while waiting for the writer and during partial writes. A Hello also
+reserves its temporary environment and identity copies before constructing them.
+Daemon request readers reserve six times the declared body length: the raw body,
+a parsed Value, and four times the body length for borrowed-Value decoding and
+subsequent argument copies. The earlier escape-decoding scratch fits within that
+peak. After parsing, the raw body and Value are dropped before retaining the
+four-times allowance. This covers payload strings and native OS-string units,
+not JSON object metadata, persistent launch environments, task state or VM heap.
+Short Hello, Cancel, Bye, Status, Stop and list/kill requests may use the control
+reserve; ordinary calls must move to the main pool before dispatch. A refused
+call returns a short correlated receipt without running the operation. Handshake
+and CLI response readers use the same budgeted endpoint parser.
+
+The IPC input owner travels with the dispatched future and the call's worker
+arguments. File workers retain it after their waiter is dropped; stdin queue items
+keep it through actual writes, and script code keeps it through the VM invocation.
+Payload fields precede their owner, including in unstarted worker closures. Hello
+conversion releases its temporary owner after the handshake; the installed launch
+context retains its existing state lifetime. Reader and encoder boundaries are
+covered by small ordinary-request tests, including cancellation, native-unit
+conversion, and control operations with an unavailable main pool.
+
+Opt-in image compression reserves each codec stage before construction: retained
+input and metadata, decoded pixels, orientation copies, resize intermediates and
+one bounded encoder candidate. PNG candidates and JPEG quality attempts run
+sequentially. Header accounting includes PNG Exif copies and JPEG decoder-owned
+input; WebP uses the declared RIFF extent for both inspection and decoding. The
+locked WebP decoder needs a conservative workspace bound, so some otherwise valid
+lossless or alpha images can be refused when compression is enabled. Byte
+passthrough remains available with the default `FASTEXEC_IMAGE_COMPRESS=false`.
+These bounds must be reviewed when the locked image codec versions change.
+
 ### `FASTEXEC_YOLO`
 
 `"false"` (default) keeps each tool's default MCP `annotations` hints.
@@ -750,8 +1146,12 @@ omitted on final serialization unless noted as always-present below.
   `<runtime root>/ns/<namespace>/logs/` (section 6). Each task log caps at `64`
   MiB, and all logs, transcripts, and stored attachments on a server cap at `4`
   GiB total (evicting oldest finished task files first and refunding quota only
-  when file deletion succeeds or reports `NotFound`). Past a cap or write error, capture keeps draining output
-  and the status line reports dropped bytes. The default mode allows at most
+  when file deletion succeeds or reports `NotFound`). After a partial write,
+  the new reservation is refunded only if truncation to the confirmed prefix
+  succeeds. Otherwise the full reservation stays charged until file reclamation;
+  the uncertain tail never advances readable bytes or transcript lines. Past a
+  cap or write error, capture keeps draining output and the status line reports
+  dropped bytes. The default mode allows at most
   `16` running tasks (including `keepTree` tasks still holding processes) and
   retains the `64` most recently finished tasks without expiry. `on` mode allows
   `64` running and `256` finished tasks, drops a finished task after `24` hours,

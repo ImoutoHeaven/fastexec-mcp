@@ -2,6 +2,7 @@
 //! `returnWhen` condition holds. For a task that holds processes past its root's exit, the
 //! task ends when they do, once a result has shown the root's exit.
 
+use crate::lease::{BytePool, Lease};
 use crate::output::{Cleaner, Matcher};
 use crate::session::{ReadState, Reader};
 use crate::tasks::Task;
@@ -156,6 +157,8 @@ pub struct Mark {
     rows: Vec<String>,
     /// A result had shown the root's exit before this call, so the exit is not news to it.
     root_reported: bool,
+    memory: Arc<BytePool>,
+    _lease: Option<Lease>,
 }
 
 pub fn mark(
@@ -163,20 +166,24 @@ pub fn mark(
     reader: &Reader,
     state: &ReadState,
     when: Option<&ReturnWhen>,
+    memory: &Arc<BytePool>,
 ) -> Result<Mark, String> {
     let (cursor, cleaner) = (state.cursor, state.cleaner.clone());
     let compares =
         when.is_some_and(|when| when.screen_appears.is_some() || when.screen_gone.is_some());
-    let rows = if compares {
-        task.screen()?.rows
+    let (rows, lease) = if compares {
+        let screen = task.screen(memory)?;
+        (screen.rows, Some(screen._lease))
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     Ok(Mark {
         cursor,
         cleaner,
         rows,
         root_reported: reader.is_reported(),
+        memory: Arc::clone(memory),
+        _lease: lease,
     })
 }
 
@@ -232,11 +239,16 @@ struct ScreenWatch<'a> {
     before: HashMap<String, usize>,
     /// Per `gone` text: the screen has shown it.
     seen: Vec<bool>,
+    _lease: Option<Lease>,
 }
 
 impl<'a> ScreenWatch<'a> {
-    fn new(when: &'a ReturnWhen, before: Vec<String>) -> Option<Self> {
-        when.screen_condition()?;
+    fn new(when: &'a ReturnWhen, before: Vec<String>, lease: Option<Lease>) -> Option<Self> {
+        if when.screen_condition().is_none() {
+            drop(before);
+            drop(lease);
+            return None;
+        }
         let texts = |texts: &'a Option<Vec<String>>| texts.as_deref().unwrap_or_default();
         let gone = texts(&when.screen_gone);
         let seen = gone
@@ -253,6 +265,7 @@ impl<'a> ScreenWatch<'a> {
             gone,
             before: counts,
             seen,
+            _lease: lease,
         })
     }
 
@@ -321,7 +334,7 @@ pub async fn wait(
         )
     });
     let mut scanned = mark.cursor;
-    let mut screen = when.and_then(|when| ScreenWatch::new(when, mark.rows));
+    let mut screen = when.and_then(|when| ScreenWatch::new(when, mark.rows, mark._lease));
     let quiet = when
         .and_then(|when| when.quiet_ms)
         .map(Duration::from_millis);
@@ -355,7 +368,7 @@ pub async fn wait(
             // Capture stores a chunk before it releases the terminal, so the output scan below
             // reads at least the output this screen shows.
             let screen_met = match screen.as_mut() {
-                Some(screen) => screen.check(&task.screen()?.rows),
+                Some(screen) => screen.check(&task.screen(&mark.memory)?.rows),
                 None => None,
             };
             if let Some(mut searching) = matcher.take() {
@@ -419,6 +432,27 @@ mod tests {
     use crate::tasks::{Limits, ScriptArgs, Tasks};
 
     #[test]
+    fn screen_watch_keeps_the_snapshot_lease_with_its_rows() {
+        let memory = BytePool::new(64);
+        let lease = memory.try_acquire(64).unwrap();
+        let when = serde_json::from_value(serde_json::json!({
+            "screenAppears": ["ready"]
+        }))
+        .unwrap();
+        let mut watch =
+            ScreenWatch::new(&when, vec!["ready".into(), "ready".into()], Some(lease)).unwrap();
+        assert_eq!(memory.used(), 64);
+        assert!(watch.check(&["ready".into()]).is_none());
+        assert!(matches!(
+            watch.check(&["ready".into(), "ready".into(), "ready".into()]),
+            Some(WaitEnd::ScreenAppears(text)) if text == "ready"
+        ));
+        assert_eq!(memory.used(), 64);
+        drop(watch);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
     fn cancellation_interrupts_a_queued_log_scan_and_an_open_output_drain() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -438,6 +472,7 @@ mod tests {
                         transfer: false,
                         call_id: None,
                         service: Arc::new(Service::new(Arc::clone(&tasks), false)),
+                        input_owner: Default::default(),
                     },
                     &session,
                     "r001".into(),
@@ -456,7 +491,14 @@ mod tests {
                 "outputContains": ["never printed"]
             }))
             .unwrap();
-            let mark = mark(&task, &reader, &ReadState::default(), Some(&when)).unwrap();
+            let mark = mark(
+                &task,
+                &reader,
+                &ReadState::default(),
+                Some(&when),
+                crate::lease::process_pool(),
+            )
+            .unwrap();
             let cancel = CancellationToken::new();
             let mut scan = std::pin::pin!(wait(
                 &task,
@@ -500,12 +542,20 @@ mod tests {
                     transfer: false,
                     call_id: None,
                     service: Arc::clone(&service),
+                    input_owner: Default::default(),
                 },
                 &session,
                 "r001".into(),
             )
             .unwrap();
-        let m = mark(&task, &reader, &ReadState::default(), None).unwrap();
+        let m = mark(
+            &task,
+            &reader,
+            &ReadState::default(),
+            None,
+            crate::lease::process_pool(),
+        )
+        .unwrap();
         let cancel = CancellationToken::new();
         let end = wait(&task, None, None, m, encoding_rs::UTF_8, &cancel, None)
             .await
@@ -521,12 +571,20 @@ mod tests {
                     transfer: false,
                     call_id: None,
                     service,
+                    input_owner: Default::default(),
                 },
                 &session,
                 "r002".into(),
             )
             .unwrap();
-        let m2 = mark(&task2, &reader2, &ReadState::default(), None).unwrap();
+        let m2 = mark(
+            &task2,
+            &reader2,
+            &ReadState::default(),
+            None,
+            crate::lease::process_pool(),
+        )
+        .unwrap();
         let cancel2 = CancellationToken::new();
         let trigger = cancel2.clone();
         tokio::spawn(async move {

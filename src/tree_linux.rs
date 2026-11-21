@@ -1,6 +1,6 @@
 //! Linux subreaper ownership; pidfds keep a scanned PID from becoming an unrelated kill target.
 
-use crate::process::Member;
+use crate::process::{Member, MemberBudget};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -102,21 +102,69 @@ fn parse(pid: i32, bytes: &[u8]) -> io::Result<Entry> {
 }
 
 fn entry(pid: i32) -> io::Result<Option<Entry>> {
-    match std::fs::read(format!("/proc/{pid}/stat")) {
-        Ok(bytes) => parse(pid, &bytes).map(Some),
-        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(None),
-        Err(error) => Err(error),
+    entry_reserved(pid, &mut MemberBudget::unlimited())
+}
+
+fn entry_reserved(pid: i32, budget: &mut MemberBudget<'_>) -> io::Result<Option<Entry>> {
+    use std::io::Read;
+    let refused = || io::Error::other("member names exceed the active memory budget");
+    if !budget.temporary(128) {
+        return Err(refused());
     }
+    let mut file = match std::fs::File::open(format!("/proc/{pid}/stat")) {
+        Ok(file) => file,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let count = match file.read(&mut chunk) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        if count == 0 {
+            break;
+        }
+        let wanted = bytes.len().saturating_add(count);
+        if wanted > bytes.capacity() {
+            if !budget.temporary(bytes.capacity().saturating_add(wanted)) {
+                return Err(refused());
+            }
+            bytes
+                .try_reserve_exact(wanted - bytes.len())
+                .map_err(io::Error::other)?;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    // Lossy UTF-8 expands at most threefold and its String may grow geometrically.
+    // parse copies the final name while that conversion and the raw bytes coexist.
+    if !budget.temporary(
+        bytes
+            .capacity()
+            .saturating_add(bytes.len().saturating_mul(9)),
+    ) {
+        return Err(refused());
+    }
+    let parsed = parse(pid, &bytes)?;
+    budget.retain(parsed.name.capacity());
+    Ok(Some(parsed))
 }
 
 fn snapshot(host: i32) -> io::Result<Vec<Entry>> {
+    snapshot_reserved(host, &mut MemberBudget::unlimited())
+}
+
+fn snapshot_reserved(host: i32, budget: &mut MemberBudget<'_>) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for item in std::fs::read_dir("/proc")? {
         let item = item?;
         let Some(pid) = item.file_name().to_str().and_then(|name| name.parse().ok()) else {
             continue;
         };
-        if let Some(entry) = entry(pid)? {
+        if let Some(entry) = entry_reserved(pid, budget)? {
             entries.push(entry);
         }
     }
@@ -149,8 +197,8 @@ fn owned<'a>(
     inside
 }
 
-pub fn members(host: i32) -> io::Result<Vec<Member>> {
-    Ok(snapshot(host)?
+pub fn members(host: i32, budget: &mut MemberBudget<'_>) -> io::Result<Vec<Member>> {
+    Ok(snapshot_reserved(host, budget)?
         .into_iter()
         .map(|entry| Member {
             pid: entry.pid as u32,
@@ -225,6 +273,26 @@ mod tests {
         );
         assert_eq!(entry.name, "a ) \u{fffd} name");
         assert!(parse(27, b"27 (broken) S").is_err());
+    }
+
+    #[test]
+    fn member_names_reserve_before_read_and_conversion() {
+        let pid = std::process::id() as i32;
+        let mut deny = |_| false;
+        let mut denied = MemberBudget::new(&mut deny);
+        assert!(entry_reserved(pid, &mut denied).is_err());
+        assert!(denied.refused());
+
+        let mut peak = 0;
+        let mut allow = |bytes| {
+            peak = peak.max(bytes);
+            true
+        };
+        let observed = entry_reserved(pid, &mut MemberBudget::new(&mut allow))
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.name, entry(pid).unwrap().unwrap().name);
+        assert!(peak >= observed.name.capacity());
     }
 
     #[test]

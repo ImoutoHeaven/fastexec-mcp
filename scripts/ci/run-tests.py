@@ -85,23 +85,33 @@ def run(executable, args, timeout, env, sudo, log_path, handle):
             status = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             status = None
+            say(f"TIMEOUT after {timeout}s; cleaning up PID {process.pid}; output: {log_path}", handle)
+            cleanup = None
             if os.name == "nt":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                cleanup = ["taskkill", "/F", "/T", "/PID", str(process.pid)]
             elif sudo:
                 # A sudo child is root's: only root may signal its process group.
-                subprocess.run(["sudo", "kill", "-KILL", "--", f"-{process.pid}"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                cleanup = ["sudo", "kill", "-KILL", "--", f"-{process.pid}"]
             else:
                 try:
                     os.killpg(os.getpgid(process.pid), signal.SIGKILL)
                 except OSError:
                     pass
+            if cleanup:
+                try:
+                    subprocess.run(cleanup, timeout=15,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except subprocess.TimeoutExpired:
+                    say("process-tree cleanup exceeded 15s; trying the test process directly", handle)
             try:
-                process.wait(timeout=60)
+                process.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired as error:
+                    say(f"FAIL: test process did not exit after cleanup; see {log_path}", handle)
+                    raise RuntimeError("test process cleanup timed out") from error
     with open(log_path, errors="replace") as output:
         say(output.read().rstrip("\n"), handle)
     say(f"exit {status} after {time.time() - started:.1f}s", handle)

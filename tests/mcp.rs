@@ -1494,20 +1494,35 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
 
     #[cfg(debug_assertions)]
     {
+        // Leave room for the read chunk, paths and request workspace. The larger
+        // PDF stays below the file cap but cannot fit this active-memory pool.
+        let memory_limit = 256 * 1024;
+        let mut large_pdf = pdf.to_vec();
+        large_pdf.resize(memory_limit, b' ');
+        std::fs::write(dir.join("budget.pdf"), &large_pdf).unwrap();
         let mut tight = Server::start_with(|cmd| {
             cmd.current_dir(&*dir)
-                .env("FASTEXEC_TEST_MEMORY_LIMIT", "4096");
+                .env("FASTEXEC_MAX_MEDIA_BYTES", (1024 * 1024).to_string())
+                .env("FASTEXEC_TEST_MEMORY_LIMIT", memory_limit.to_string());
         });
+        let first = &tight.request(
+            "tools/call",
+            json!({"name": "read", "arguments": {"path": "spec #1.pdf"}}),
+        )["result"];
+        assert_eq!(first["isError"], json!(false), "{first}");
+        assert_eq!(first["structuredContent"]["bytes"], json!(pdf.len()));
         let overloaded = &tight.request(
             "tools/call",
-            json!({"name": "read", "arguments": {"path": "wide.png"}}),
+            json!({"name": "read", "arguments": {"path": "budget.pdf"}}),
         )["result"];
         assert_eq!(overloaded["isError"], json!(true), "{overloaded}");
         assert!(
             overloaded["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("server active memory budget (4096 bytes) is full"),
+                .contains(&format!(
+                    "server active memory budget ({memory_limit} bytes) is full"
+                )),
             "{overloaded}"
         );
         let fits = &tight.request(
@@ -1516,6 +1531,7 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
         )["result"];
         assert_eq!(fits["isError"], json!(false), "{fits}");
         assert_eq!(fits["structuredContent"]["attached"], json!(true));
+        assert_eq!(fits["content"][1]["resource"]["blob"], json!(b64(pdf)));
     }
 }
 

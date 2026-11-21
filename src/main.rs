@@ -14,6 +14,7 @@ mod freebsd_fs;
 #[cfg(unix)]
 mod host;
 mod http;
+mod ingress;
 mod ipc;
 mod keys;
 mod lease;
@@ -485,7 +486,13 @@ impl ServerHandler for Server {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, rmcp::ErrorData> {
-        let result = self.negotiate_initialize(&request)?;
+        let _response_workspace = reserve_response_content(
+            lease::process_pool(),
+            self.instructions.len().saturating_add(512),
+        )?;
+        let result = self
+            .negotiate_initialize(&request)?
+            .with_instructions(self.instructions.as_ref());
         context.peer.set_peer_info(request);
         if let Backend::Local {
             session, launch, ..
@@ -499,10 +506,46 @@ impl ServerHandler for Server {
         Ok(result)
     }
 
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::DiscoverResult, rmcp::ErrorData> {
+        let _response_workspace = reserve_response_content(
+            lease::process_pool(),
+            self.instructions.len().saturating_add(512),
+        )?;
+        Ok(rmcp::model::DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info()
+                .with_instructions(self.instructions.as_ref()),
+        ))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let bytes = self.router.map.values().fold(512usize, |bytes, route| {
+            bytes.saturating_add(tool_metadata_copy_bytes(&route.attr))
+        });
+        let _response_workspace = reserve_response_content(lease::process_pool(), bytes)?;
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools: self.router.list_all(),
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+            ..Default::default()
+        })
+    }
+
     fn get_info(&self) -> ServerConfig {
+        // Internal capability checks need no per-request instructions copy.
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fastexec", env!("CARGO_PKG_VERSION")))
-            .with_instructions(self.instructions.as_ref())
     }
 }
 
@@ -528,6 +571,28 @@ fn prepare_tool(mut attr: rmcp::model::Tool, yolo: bool) -> rmcp::model::Tool {
 }
 
 impl Server {
+    fn admit_tool_input<T: serde::Serialize>(
+        &self,
+        context: &mut RequestContext<RoleServer>,
+        parameters: &T,
+        is_control: bool,
+    ) -> Result<(), CallToolResult> {
+        let (pool, control) = match &self.backend {
+            Backend::Local { launch, .. } => (launch.memory(), launch.control_memory()),
+            Backend::Daemon(endpoint) => (endpoint.memory(), endpoint.control_memory()),
+        };
+        let owner = application_input_owner(
+            &(parameters, &context.id),
+            context.extensions.get::<lease::Owner>(),
+            pool,
+            control,
+            is_control,
+        )
+        .map_err(|message| CallToolResult::error(vec![ContentBlock::text(message)]))?;
+        context.extensions.insert(owner);
+        Ok(())
+    }
+
     #[doc = include_str!("description.md")]
     #[tool(
         name = "exec",
@@ -547,6 +612,10 @@ impl Server {
             request.action,
             service::Action::List | service::Action::Kill
         );
+        let mut context = context;
+        if let Err(error) = self.admit_tool_input(&mut context, &request, is_control) {
+            return error;
+        }
         match &self.backend {
             Backend::Daemon(endpoint) => {
                 let (progress, _forwarder) = progress(&context);
@@ -590,6 +659,9 @@ impl Server {
                         nested: false,
                         started: None,
                         render_slot: None,
+                        http_response: http_context(&context),
+                        rpc_id_bytes: ipc::json_len(&context.id).unwrap_or(usize::MAX),
+                        input_owner: request_input_owner(&context),
                     };
                     let tracked = service.call_tracked(request, call).await;
                     self.deliver_local(&context, tracked, launch, *render, is_control)
@@ -624,6 +696,10 @@ impl Server {
         Parameters(arguments): Parameters<CodemodeArguments>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let mut context = context;
+        if let Err(error) = self.admit_tool_input(&mut context, &arguments.0, false) {
+            return error;
+        }
         let request: codemode::Request = match serde_json::from_value(arguments.0) {
             Ok(request) => request,
             Err(error) => {
@@ -658,6 +734,9 @@ impl Server {
                     nested: false,
                     started: None,
                     render_slot: None,
+                    http_response: http_context(&context),
+                    rpc_id_bytes: ipc::json_len(&context.id).unwrap_or(usize::MAX),
+                    input_owner: request_input_owner(&context),
                 };
                 let tracked = service
                     .codemode_tracked(request, call, self.tools.transfer)
@@ -674,6 +753,10 @@ impl Server {
         Parameters(request): Parameters<files::ReadRequest>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let mut context = context;
+        if let Err(error) = self.admit_tool_input(&mut context, &request, false) {
+            return error;
+        }
         match &self.backend {
             Backend::Local { launch, render, .. } => {
                 let tracked = files::read_tracked(
@@ -682,6 +765,7 @@ impl Server {
                     self.tools.transfer,
                     *render,
                     Some(context.ct.clone()),
+                    request_input_owner(&context),
                 )
                 .await;
                 self.deliver_local(&context, tracked, launch, *render, false)
@@ -703,16 +787,20 @@ impl Server {
         Parameters(request): Parameters<files::WriteRequest>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let mut context = context;
+        if let Err(error) = self.admit_tool_input(&mut context, &request, false) {
+            return error;
+        }
         match &self.backend {
             Backend::Local { launch, render, .. } => {
-                let res = files::write(request, Arc::clone(launch), *render).await;
-                self.deliver_local(
-                    &context,
-                    files::TrackedResult::plain(res),
-                    launch,
+                let res = files::write_tracked(
+                    request,
+                    Arc::clone(launch),
                     *render,
-                    false,
+                    request_input_owner(&context),
                 )
+                .await;
+                self.deliver_local(&context, res, launch, *render, false)
             }
             Backend::Daemon(endpoint) => {
                 self.forward_daemon(endpoint, "write", &request, &context)
@@ -731,16 +819,20 @@ impl Server {
         Parameters(request): Parameters<files::EditRequest>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let mut context = context;
+        if let Err(error) = self.admit_tool_input(&mut context, &request, false) {
+            return error;
+        }
         match &self.backend {
             Backend::Local { launch, render, .. } => {
-                let res = files::edit(request, Arc::clone(launch), *render).await;
-                self.deliver_local(
-                    &context,
-                    files::TrackedResult::plain(res),
-                    launch,
+                let res = files::edit_tracked(
+                    request,
+                    Arc::clone(launch),
                     *render,
-                    false,
+                    request_input_owner(&context),
                 )
+                .await;
+                self.deliver_local(&context, res, launch, *render, false)
             }
             Backend::Daemon(endpoint) => {
                 self.forward_daemon(endpoint, "edit", &request, &context)
@@ -763,6 +855,10 @@ impl Server {
         Parameters(request): Parameters<transfer::Request>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let mut context = context;
+        if let Err(error) = self.admit_tool_input(&mut context, &request, false) {
+            return error;
+        }
         match &self.backend {
             Backend::Daemon(endpoint) => {
                 self.forward_daemon(endpoint, "transfer", &request, &context)
@@ -770,12 +866,20 @@ impl Server {
             }
             Backend::Local { launch, render, .. } => {
                 let res = match &self.transfer {
-                    None => transfer_error(
+                    None => files::TrackedResult::plain(transfer_error(
                         "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
                         *render,
-                    ),
+                    )),
                     Some(TransferEndpoint::Fixed { table, base }) => {
-                        publish_transfer(request, Arc::clone(launch), table, base, *render).await
+                        publish_transfer(
+                            request,
+                            Arc::clone(launch),
+                            table,
+                            base,
+                            *render,
+                            request_input_owner(&context),
+                        )
+                        .await
                     }
                     Some(TransferEndpoint::Http { table, public_root }) => {
                         let base = match public_root {
@@ -790,20 +894,23 @@ impl Server {
                         };
                         match base {
                             Ok(base) => {
-                                publish_transfer(request, Arc::clone(launch), table, &base, *render)
-                                    .await
+                                publish_transfer(
+                                    request,
+                                    Arc::clone(launch),
+                                    table,
+                                    &base,
+                                    *render,
+                                    request_input_owner(&context),
+                                )
+                                .await
                             }
-                            Err(message) => transfer_error(message, *render),
+                            Err(message) => {
+                                files::TrackedResult::plain(transfer_error(message, *render))
+                            }
                         }
                     }
                 };
-                self.deliver_local(
-                    &context,
-                    files::TrackedResult::plain(res),
-                    launch,
-                    *render,
-                    false,
-                )
+                self.deliver_local(&context, res, launch, *render, false)
             }
         }
     }
@@ -821,6 +928,7 @@ impl Server {
     async fn instructions(
         &self,
         Parameters(arguments): Parameters<serde_json::Map<String, serde_json::Value>>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if !arguments.is_empty() {
             return Err(rmcp::ErrorData::invalid_params(
@@ -829,9 +937,13 @@ impl Server {
             ));
         }
         match &self.tool_instructions {
-            Some(text) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                text.as_ref(),
-            )])),
+            Some(text) => {
+                let _response_workspace =
+                    reserve_response_content(lease::process_pool(), text.len())?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    text.as_ref(),
+                )]))
+            }
             None => Err(rmcp::ErrorData::invalid_params(
                 "instructions tool is disabled",
                 None,
@@ -849,38 +961,27 @@ impl Server {
         render: Render,
         is_control: bool,
     ) -> CallToolResult {
-        let http_slot = context
-            .extensions
-            .get::<::http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<Arc<http::ResponseLease>>());
-        if http_slot.is_none() && self.stdio_leases.is_none() {
-            drop(tracked.lease.take());
+        // Official rmcp owns HTTP response models and encodings after this
+        // handoff. Its internal copies and queues are outside the app budget.
+        if http_context(context) || self.stdio_leases.is_none() {
             return tracked.result;
         }
         let use_control = is_control || tracked.result.is_error == Some(true);
-        let b64_bytes = service::content_b64_bytes(&tracked.result);
-        let exact_json = ipc::json_len(&tracked.result).unwrap_or(0);
-        let outbound_bytes = exact_json.saturating_add(256);
-        let admitted =
-            b64_bytes
-                .checked_add(outbound_bytes)
-                .and_then(|peak| match tracked.lease.take() {
-                    Some(mut held) => {
-                        if held.try_resize(peak) {
-                            Some(held)
-                        } else if use_control && peak <= lease::CONTROL_LIMIT {
-                            drop(held);
-                            launch.control_memory().try_acquire(peak)
-                        } else {
-                            None
-                        }
-                    }
-                    None => launch.memory().try_acquire(peak).or_else(|| {
-                        (use_control && peak <= lease::CONTROL_LIMIT)
-                            .then(|| launch.control_memory().try_acquire(peak))
-                            .flatten()
-                    }),
-                });
+        let b64_bytes =
+            service::unleased_result_payload_capacity(&tracked.result, &tracked.payload_owner);
+        let exact_json = ipc::json_len(&tracked.result).unwrap_or(usize::MAX);
+        let id_bytes = ipc::json_len(&context.id).unwrap_or(usize::MAX);
+        let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
+        let encoded_peak = outbound_bytes;
+        let admitted = b64_bytes.checked_add(encoded_peak).and_then(|peak| {
+            admit_delivery(
+                &mut tracked.lease,
+                launch.memory(),
+                launch.control_memory(),
+                peak,
+                use_control,
+            )
+        });
         let Some(mut held) = admitted else {
             let meta = tracked.task_meta.take();
             drop(tracked);
@@ -895,29 +996,39 @@ impl Server {
             let mut err = CallToolResult::error(vec![ContentBlock::text(msg.clone())]);
             err.structured_content = Some(serde_json::json!({ "ok": false, "error": msg }));
             let suppressed = service::suppress(err, effective);
-            let err_outbound = ipc::json_len(&suppressed).unwrap_or(0).saturating_add(256);
-            if let Some(err_lease) = (err_outbound <= lease::CONTROL_LIMIT)
-                .then(|| launch.control_memory().try_acquire(err_outbound))
+            let err_outbound = ipc::json_len(&suppressed)
+                .unwrap_or(usize::MAX)
+                .saturating_add(id_bytes)
+                .saturating_add(256);
+            let err_peak =
+                service::result_payload_capacity(&suppressed).saturating_add(err_outbound);
+            if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
+                .then(|| launch.control_memory().try_acquire(err_peak))
                 .flatten()
+                && let Some(stdio) = &self.stdio_leases
             {
-                if let Some(slot) = http_slot {
-                    slot.attach(err_lease);
-                } else if let Some(stdio) = &self.stdio_leases {
-                    stdio.insert(
-                        context.id.clone(),
-                        &context.ct,
-                        lease::Lease::empty(launch.control_memory()),
-                        err_lease,
-                    );
-                }
+                let outbound = err_lease.split_off(err_outbound);
+                return stdio.deliver(
+                    context.id.clone(),
+                    &context.ct,
+                    suppressed,
+                    err_lease,
+                    outbound,
+                    Default::default(),
+                );
             }
             return suppressed;
         };
-        if let Some(slot) = http_slot {
-            slot.attach(held);
-        } else if let Some(stdio) = &self.stdio_leases {
+        if let Some(stdio) = &self.stdio_leases {
             let outbound = held.split_off(outbound_bytes.min(held.bytes()));
-            stdio.insert(context.id.clone(), &context.ct, held, outbound);
+            return stdio.deliver(
+                context.id.clone(),
+                &context.ct,
+                tracked.result,
+                held,
+                outbound,
+                tracked.payload_owner,
+            );
         }
         tracked.result
     }
@@ -936,52 +1047,50 @@ impl Server {
         let pool = endpoint.memory();
         let control_pool = endpoint.control_memory();
         let use_control = is_control || tracked.result.is_error == Some(true);
-        let b64_bytes = service::content_b64_bytes(&tracked.result);
-        let exact_json = ipc::json_len(&tracked.result).unwrap_or(0);
-        let outbound_bytes = exact_json.saturating_add(256);
-        let admitted =
-            b64_bytes
-                .checked_add(outbound_bytes)
-                .and_then(|peak| match tracked.lease.take() {
-                    Some(mut held) => {
-                        if held.try_resize(peak) {
-                            Some(held)
-                        } else if use_control && peak <= lease::CONTROL_LIMIT {
-                            drop(held);
-                            control_pool.try_acquire(peak)
-                        } else {
-                            None
-                        }
-                    }
-                    None => pool.try_acquire(peak).or_else(|| {
-                        (use_control && peak <= lease::CONTROL_LIMIT)
-                            .then(|| control_pool.try_acquire(peak))
-                            .flatten()
-                    }),
-                });
+        let b64_bytes =
+            service::unleased_result_payload_capacity(&tracked.result, &tracked.payload_owner);
+        let exact_json = ipc::json_len(&tracked.result).unwrap_or(usize::MAX);
+        let id_bytes = ipc::json_len(&context.id).unwrap_or(usize::MAX);
+        let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
+        let admitted = b64_bytes.checked_add(outbound_bytes).and_then(|peak| {
+            admit_delivery(&mut tracked.lease, pool, control_pool, peak, use_control)
+        });
         let Some(mut held) = admitted else {
             drop(tracked);
             let err = CallToolResult::error(vec![ContentBlock::text(format!(
                 "Endpoint active memory budget ({} bytes) is full while writing stdio response; use action list or poll once in-flight transfers complete.",
                 pool.limit()
             ))]);
-            let err_outbound = ipc::json_len(&err).unwrap_or(0).saturating_add(256);
-            if let Some(err_lease) = (err_outbound <= lease::CONTROL_LIMIT)
-                .then(|| control_pool.try_acquire(err_outbound))
+            let err_outbound = ipc::json_len(&err)
+                .unwrap_or(usize::MAX)
+                .saturating_add(id_bytes)
+                .saturating_add(256);
+            let err_peak = service::result_payload_capacity(&err).saturating_add(err_outbound);
+            if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
+                .then(|| control_pool.try_acquire(err_peak))
                 .flatten()
             {
-                stdio.insert(
+                let outbound = err_lease.split_off(err_outbound);
+                return stdio.deliver(
                     context.id.clone(),
                     &context.ct,
-                    lease::Lease::empty(control_pool),
+                    err,
                     err_lease,
+                    outbound,
+                    Default::default(),
                 );
             }
             return err;
         };
         let outbound = held.split_off(outbound_bytes.min(held.bytes()));
-        stdio.insert(context.id.clone(), &context.ct, held, outbound);
-        tracked.result
+        stdio.deliver(
+            context.id.clone(),
+            &context.ct,
+            tracked.result,
+            held,
+            outbound,
+            tracked.payload_owner,
+        )
     }
 
     async fn forward_daemon<T: serde::Serialize>(
@@ -1021,20 +1130,35 @@ pub(crate) fn transfer_error(message: String, render: Render) -> CallToolResult 
     service::suppress(result, effective)
 }
 
-pub(crate) async fn inspect_transfer_request(
+pub(crate) type TransferInspection = Result<(std::path::PathBuf, String, Option<u64>), String>;
+
+pub(crate) fn inspect_transfer_request(
     request: transfer::Request,
     launch: Arc<LaunchContext>,
-) -> Result<(std::path::PathBuf, String, Option<u64>), String> {
-    let inspected = tokio::task::spawn_blocking(move || {
-        let path = files::resolve(&request.path, &launch)?;
-        let shown = files::display_path(&path);
-        let bytes = inspect_transfer_target(&path, &shown)?;
-        Ok::<_, String>((path, shown, bytes))
-    })
-    .await;
-    match inspected {
-        Ok(result) => result,
-        Err(error) => Err(format!("the file operation did not finish: {error}")),
+    input_owner: crate::lease::Owner,
+) -> impl std::future::Future<Output = ipc::Owned<TransferInspection>> {
+    // Build the owner before creating the future, including its never-polled case.
+    let input = ipc::Owned::new(request, input_owner);
+    async move {
+        match tokio::task::spawn_blocking(move || {
+            input.flat_map(|request| {
+                files::with_path_workspace(&request.path, &launch, 0, |lease| {
+                    let path = files::resolve(&request.path, &launch)?;
+                    let shown = files::display_path(&path);
+                    let bytes = inspect_transfer_target(&path, &shown, launch.memory(), lease)?;
+                    Ok::<_, String>((path, shown, bytes))
+                })
+                .unwrap_or_else(|message| ipc::Owned::new(Err(message), Default::default()))
+            })
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => ipc::Owned::new(
+                Err(format!("the file operation did not finish: {error}")),
+                Default::default(),
+            ),
+        }
     }
 }
 
@@ -1066,18 +1190,26 @@ pub(crate) fn mint_transfer(
     service::suppress(result, effective)
 }
 
-async fn publish_transfer(
+fn publish_transfer<'a>(
     request: transfer::Request,
     launch: Arc<LaunchContext>,
-    table: &Arc<transfer::Transfers>,
-    base: &str,
+    table: &'a Arc<transfer::Transfers>,
+    base: &'a str,
     render: Render,
-) -> CallToolResult {
-    let (path, shown_path, bytes) = match inspect_transfer_request(request, launch).await {
-        Ok(inspected) => inspected,
-        Err(message) => return transfer_error(message, render),
-    };
-    mint_transfer(path, shown_path, bytes, table, base, render)
+    input_owner: crate::lease::Owner,
+) -> impl std::future::Future<Output = files::TrackedResult> + 'a {
+    let inspection = inspect_transfer_request(request, launch, input_owner);
+    async move {
+        let inspected = inspection.await;
+        let owner = inspected.owner.clone();
+        let result = inspected.run(|inspected| match inspected {
+            Ok((path, shown_path, bytes)) => {
+                mint_transfer(path, shown_path, bytes, table, base, render)
+            }
+            Err(message) => transfer_error(message, render),
+        });
+        files::TrackedResult::owned(result, owner)
+    }
 }
 
 /// Verifies that `path` is either an existing regular file (returning its byte size) or a
@@ -1086,6 +1218,8 @@ async fn publish_transfer(
 fn inspect_transfer_target(
     path: &std::path::Path,
     shown_path: &str,
+    pool: &Arc<crate::lease::BytePool>,
+    lease: &mut crate::lease::Lease,
 ) -> Result<Option<u64>, String> {
     let failed = |error: std::io::Error| {
         format!(
@@ -1101,8 +1235,9 @@ fn inspect_transfer_target(
             "Cannot transfer {shown_path}: it is not a regular file; pack directories or special files with tar through exec first."
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let target = files::write_target(path).map_err(failed)?;
-            for ancestor in target.ancestors().skip(1) {
+            let target = files::write_target(path, pool).map_err(failed)?;
+            files::reserve_target_workspace(&target.value, lease, pool).map_err(failed)?;
+            for ancestor in target.value.ancestors().skip(1) {
                 if ancestor.as_os_str().is_empty() {
                     break;
                 }
@@ -1318,15 +1453,109 @@ fn forwarded_scheme(headers: &::http::HeaderMap) -> &'static str {
     }
 }
 
-/// Tracks active-byte `(staging, outbound)` leases per in-flight JSON-RPC request ID on stdio.
+// A failed growth keeps the old lease until the caller drops the owned result.
+fn admit_delivery(
+    held: &mut Option<lease::Lease>,
+    pool: &Arc<lease::BytePool>,
+    control: &Arc<lease::BytePool>,
+    peak: usize,
+    use_control: bool,
+) -> Option<lease::Lease> {
+    if let Some(previous) = held.as_mut() {
+        if previous.try_resize(peak) {
+            return held.take();
+        }
+    } else if let Some(acquired) = pool.try_acquire(peak) {
+        return Some(acquired);
+    }
+    if use_control && peak <= lease::CONTROL_LIMIT {
+        let acquired = control.try_acquire(peak)?;
+        drop(held.take());
+        return Some(acquired);
+    }
+    None
+}
+
+fn tool_metadata_copy_bytes(tool: &rmcp::model::Tool) -> usize {
+    use std::borrow::Cow;
+    let owned = |text: &Cow<'static, str>| match text {
+        Cow::Borrowed(_) => 0,
+        Cow::Owned(text) => text.len(),
+    };
+    // Schemas are shared Arc values; list_all only clones the independent fields.
+    owned(&tool.name)
+        .saturating_add(tool.title.as_ref().map_or(0, String::len))
+        .saturating_add(tool.description.as_ref().map_or(0, owned))
+        .saturating_add(ipc::json_len(&tool.annotations).unwrap_or(usize::MAX))
+        .saturating_add(ipc::json_len(&tool.icons).unwrap_or(usize::MAX))
+        .saturating_add(ipc::json_len(&tool.meta).unwrap_or(usize::MAX))
+}
+
+fn reserve_response_content(
+    pool: &Arc<lease::BytePool>,
+    bytes: usize,
+) -> Result<lease::Lease, rmcp::ErrorData> {
+    pool.try_acquire(bytes).ok_or_else(|| {
+        rmcp::ErrorData::internal_error(
+            "Server active memory budget is full while preparing the response",
+            None,
+        )
+    })
+}
+
+// SDK parsing happened before this boundary. Reserve only the subsequent
+// application copies of parameters/IDs and pass this owner into actual workers.
+fn application_input_owner<T: serde::Serialize>(
+    parameters_and_id: &T,
+    existing: Option<&lease::Owner>,
+    pool: &Arc<lease::BytePool>,
+    control: &Arc<lease::BytePool>,
+    is_control: bool,
+) -> Result<lease::Owner, &'static str> {
+    if let Some(owner) = existing {
+        return Ok(owner.clone());
+    }
+    const REFUSED: &str = "Server active memory budget is full while preparing tool arguments; the operation was not dispatched.";
+    let length = ipc::json_len(parameters_and_id).map_err(|_| REFUSED)?;
+    let bytes = length.checked_mul(4).ok_or(REFUSED)?;
+    let held = pool
+        .try_acquire(bytes)
+        .or_else(|| {
+            (is_control && length <= ipc::SHORT_INPUT)
+                .then(|| control.try_acquire(bytes))
+                .flatten()
+        })
+        .ok_or(REFUSED)?;
+    Ok(lease::Owner::new(held))
+}
+
+fn request_input_owner(context: &RequestContext<RoleServer>) -> crate::lease::Owner {
+    context
+        .extensions
+        .get::<crate::lease::Owner>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn http_context(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .extensions
+        .get::<::http::request::Parts>()
+        .is_some_and(|parts| parts.extensions.get::<http::Principal>().is_some())
+}
+
+/// Prepaid application payload, staging and wire bytes for each stdio response ID.
 #[derive(Default)]
 struct RequestLeases(std::sync::Mutex<RequestLeaseState>);
 
 #[derive(Default)]
 struct RequestLeaseState {
     closed: bool,
-    entries: std::collections::HashMap<rmcp::model::RequestId, (lease::Lease, lease::Lease)>,
-    cancelled: std::collections::VecDeque<rmcp::model::RequestId>,
+    entries: std::collections::HashMap<
+        rmcp::model::RequestId,
+        (lease::Lease, lease::Lease, lease::Owner),
+    >,
+    cancelled: std::collections::VecDeque<(rmcp::model::RequestId, crate::lease::Owner)>,
 }
 
 const MAX_RECENT_CANCELLED: usize = 1024;
@@ -1337,26 +1566,59 @@ impl RequestLeases {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.cancelled.retain(|entry| entry != id);
+        state.cancelled.retain(|(entry, _)| entry != id);
     }
 
-    fn on_cancel(&self, id: &rmcp::model::RequestId) {
-        let removed = {
-            let mut state = self
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !state.closed && !state.cancelled.contains(id) {
-                if state.cancelled.len() >= MAX_RECENT_CANCELLED {
-                    state.cancelled.pop_front();
-                }
-                state.cancelled.push_back(id.clone());
+    // A complete queued response remains deliverable after a late cancellation.
+    #[cfg(test)]
+    fn on_cancel(&self, id: &rmcp::model::RequestId) -> bool {
+        self.on_cancel_owned(id, crate::lease::Owner::default())
+    }
+
+    fn on_cancel_owned(&self, id: &rmcp::model::RequestId, owner: crate::lease::Owner) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed || state.entries.contains_key(id) {
+            return false;
+        }
+        if !state.cancelled.iter().any(|(entry, _)| entry == id) {
+            if state.cancelled.len() >= MAX_RECENT_CANCELLED {
+                state.cancelled.pop_front();
             }
-            state.entries.remove(id)
-        };
-        drop(removed);
+            state
+                .cancelled
+                .push_back((id.clone(), ingress::retain_id(&owner, id)));
+        }
+        true
     }
 
+    fn deliver(
+        &self,
+        id: rmcp::model::RequestId,
+        cancel: &CancellationToken,
+        result: CallToolResult,
+        staging: lease::Lease,
+        outbound: lease::Lease,
+        payload_owner: lease::Owner,
+    ) -> CallToolResult {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed
+            || cancel.is_cancelled()
+            || state.cancelled.iter().any(|(entry, _)| entry == &id)
+        {
+            drop(state);
+            drop(result);
+            drop((staging, outbound, payload_owner));
+            return CallToolResult::error(vec![ContentBlock::text(
+                "Cancelled before the response was queued.",
+            )]);
+        }
+        let replaced = state.entries.insert(id, (staging, outbound, payload_owner));
+        drop(state);
+        drop(replaced);
+        result
+    }
+
+    #[cfg(test)]
     fn insert(
         &self,
         id: rmcp::model::RequestId,
@@ -1364,58 +1626,44 @@ impl RequestLeases {
         staging: lease::Lease,
         outbound: lease::Lease,
     ) {
-        if cancel.is_cancelled() {
-            drop((staging, outbound));
-            return;
-        }
-        let replaced = {
-            let mut state = self
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.closed || cancel.is_cancelled() || state.cancelled.contains(&id) {
-                drop(state);
-                drop((staging, outbound));
-                return;
-            }
-            state.entries.insert(id.clone(), (staging, outbound))
-        };
-        drop(replaced);
-        if cancel.is_cancelled() {
-            let _ = self.take(&id);
-        }
+        self.deliver(
+            id,
+            cancel,
+            CallToolResult::success(Vec::new()),
+            staging,
+            outbound,
+            Default::default(),
+        );
     }
 
-    fn take(&self, id: &rmcp::model::RequestId) -> Option<(lease::Lease, lease::Lease)> {
+    fn take(
+        &self,
+        id: &rmcp::model::RequestId,
+    ) -> Option<(lease::Lease, lease::Lease, lease::Owner)> {
         let mut state = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.cancelled.retain(|entry| entry != id);
+        state.cancelled.retain(|(entry, _)| entry != id);
         state.entries.remove(id)
     }
 
     fn close(&self) {
-        let dropped = {
-            let mut state = self
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.closed = true;
-            state.cancelled.clear();
-            std::mem::take(&mut state.entries)
-        };
-        drop(dropped);
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed = true;
+        state.cancelled.clear();
+        // The SDK may still own queued responses during shutdown. Their leases
+        // remain with the session until every producer and transport owner ends.
     }
 }
 
 const STDIO_MAX_LINE_BYTES: usize = 16 << 20;
-const STDIO_RETAINED_LINE_CAP: usize = 64 * 1024;
 const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";
 
 enum StdioLine {
     Line,
     Oversized,
+    Overloaded,
     End,
 }
 
@@ -1427,11 +1675,11 @@ enum StdioReadStep {
     OversizedNeedsDiscard,
 }
 
-/// Custom MCP stdio transport that pairs request-ID leases with single-pass `Vec<u8>` writes so
+/// Custom MCP stdio transport that pairs request-ID leases with exact-capacity `Vec<u8>` writes so
 /// cancelled calls, interleaved progress notifications, and large responses never leak capacity.
 struct StdioTransport<R, W> {
     read: tokio::io::BufReader<R>,
-    line_buf: Vec<u8>,
+    line_buf: ingress::Buffer,
     max_line_length: usize,
     discarding: bool,
     write: Arc<tokio::sync::Mutex<Option<W>>>,
@@ -1445,7 +1693,7 @@ where
     fn new(read: R, write: W, leases: Arc<RequestLeases>) -> Self {
         Self {
             read: tokio::io::BufReader::new(read),
-            line_buf: Vec::new(),
+            line_buf: ingress::Buffer::default(),
             max_line_length: STDIO_MAX_LINE_BYTES,
             discarding: false,
             write: Arc::new(tokio::sync::Mutex::new(Some(write))),
@@ -1454,11 +1702,7 @@ where
     }
 
     fn reset_line_buf(&mut self) {
-        if self.line_buf.capacity() > STDIO_RETAINED_LINE_CAP {
-            self.line_buf = Vec::new();
-        } else {
-            self.line_buf.clear();
-        }
+        self.line_buf = ingress::Buffer::default();
     }
 
     async fn read_line(&mut self) -> StdioLine {
@@ -1491,7 +1735,14 @@ where
                         },
                     )
                 } else {
-                    self.line_buf.extend_from_slice(&available[..take]);
+                    if self
+                        .line_buf
+                        .append(&available[..take], self.max_line_length)
+                        .is_err()
+                    {
+                        self.reset_line_buf();
+                        return StdioLine::Overloaded;
+                    }
                     (
                         take,
                         if newline.is_some() {
@@ -1513,6 +1764,24 @@ where
                     return StdioLine::Oversized;
                 }
             }
+        }
+    }
+}
+
+impl<R, W: tokio::io::AsyncWrite + Unpin> StdioTransport<R, W> {
+    async fn refuse_request_budget(&mut self) {
+        let Some(_lease) = lease::control_pool().try_acquire(1024) else {
+            return;
+        };
+        let reply = rmcp::service::TxJsonRpcMessage::<RoleServer>::error(
+            rmcp::model::ErrorData::internal_error(
+                "Server active memory budget is full while reading the request.",
+                None,
+            ),
+            None,
+        );
+        if let Ok(bytes) = encode_stdio_frame(&reply, None) {
+            let _ = write_stdio_frame(&self.write, &bytes).await;
         }
     }
 }
@@ -1563,29 +1832,6 @@ fn is_standard_mcp_method(method: &str) -> bool {
     ) || is_standard_mcp_notification(method)
 }
 
-fn parse_stdio_message(
-    raw_line: &[u8],
-) -> Result<Option<rmcp::service::RxJsonRpcMessage<RoleServer>>, serde_json::Error> {
-    let line = raw_line
-        .strip_prefix(UTF8_BOM.as_slice())
-        .unwrap_or(raw_line);
-    match serde_json::from_slice::<rmcp::service::RxJsonRpcMessage<RoleServer>>(line) {
-        Ok(msg) => Ok(Some(msg)),
-        Err(err) => {
-            if let Ok(line_str) = std::str::from_utf8(line)
-                && let Ok(val) = serde_json::from_str::<serde_json::Value>(line_str)
-                && let Some(method) = val.get("method").and_then(serde_json::Value::as_str)
-                && ((val.get("id").is_none() && !is_standard_mcp_method(method))
-                    || (method.starts_with("notifications/")
-                        && !is_standard_mcp_notification(method)))
-            {
-                return Ok(None);
-            }
-            Err(err)
-        }
-    }
-}
-
 async fn write_stdio_frame<W: tokio::io::AsyncWrite + Unpin>(
     write: &tokio::sync::Mutex<Option<W>>,
     bytes: &[u8],
@@ -1601,6 +1847,72 @@ async fn write_stdio_frame<W: tokio::io::AsyncWrite + Unpin>(
     tokio::io::AsyncWriteExt::flush(writer).await
 }
 
+fn encode_stdio_frame<T: serde::Serialize>(
+    item: &T,
+    outbound: Option<&mut lease::Lease>,
+) -> std::io::Result<Vec<u8>> {
+    let length = ipc::json_len(item)?.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "stdio frame is too large")
+    })?;
+    if length > ipc::RESPONSE_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stdio frame exceeds 512 MiB",
+        ));
+    }
+    if let Some(lease) = outbound
+        && !lease.try_resize(length)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "stdio frame exceeded active memory budget",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(length);
+    serde_json::to_writer(&mut bytes, item).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+struct StdioSendPayload {
+    item: rmcp::service::TxJsonRpcMessage<RoleServer>,
+    staging: Option<lease::Lease>,
+    outbound: Option<lease::Lease>,
+    payload_owner: lease::Owner,
+}
+
+struct StdioFrame {
+    bytes: Vec<u8>,
+    _lease: Option<lease::Lease>,
+}
+
+impl StdioSendPayload {
+    fn encode(mut self) -> std::io::Result<StdioFrame> {
+        if self.outbound.is_none() {
+            let size = ipc::json_len(&self.item)?.saturating_add(1);
+            self.outbound = lease::process_pool().try_acquire(size).or_else(|| {
+                (size <= 64 * 1024)
+                    .then(|| lease::control_pool().try_acquire(size))
+                    .flatten()
+            });
+            if self.outbound.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "stdio frame exceeded active memory budget",
+                ));
+            }
+        }
+        let bytes = encode_stdio_frame(&self.item, self.outbound.as_mut())?;
+        drop(self.item);
+        drop(self.staging);
+        drop(self.payload_owner);
+        Ok(StdioFrame {
+            bytes,
+            _lease: self.outbound,
+        })
+    }
+}
+
 impl<R, W> rmcp::transport::Transport<RoleServer> for StdioTransport<R, W>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -1614,25 +1926,25 @@ where
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
         let write = Arc::clone(&self.write);
         let leases = Arc::clone(&self.leases);
+        let response_id = match &item {
+            rmcp::model::JsonRpcMessage::Response(resp) => Some(&resp.id),
+            rmcp::model::JsonRpcMessage::Error(err) => err.id.as_ref(),
+            _ => None,
+        };
+        let (staging_lease, outbound_lease, payload_owner) =
+            match response_id.and_then(|id| leases.take(id)) {
+                Some((staging, outbound, owner)) => (Some(staging), Some(outbound), owner),
+                None => (None, None, Default::default()),
+            };
+        let payload = StdioSendPayload {
+            item,
+            staging: staging_lease,
+            outbound: outbound_lease,
+            payload_owner,
+        };
         async move {
-            let response_id = match &item {
-                rmcp::model::JsonRpcMessage::Response(resp) => Some(&resp.id),
-                rmcp::model::JsonRpcMessage::Error(err) => err.id.as_ref(),
-                _ => None,
-            };
-            let (staging_lease, outbound_lease) = match response_id.and_then(|id| leases.take(id)) {
-                Some((staging, outbound)) => (Some(staging), Some(outbound)),
-                None => (None, None),
-            };
-            let mut bytes = serde_json::to_vec(&item)
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-            drop(item);
-            drop(staging_lease);
-            bytes.push(b'\n');
-            let res = write_stdio_frame(&write, &bytes).await;
-            drop(bytes);
-            drop(outbound_lease);
-            res
+            let frame = payload.encode()?;
+            write_stdio_frame(&write, &frame.bytes).await
         }
     }
 
@@ -1641,23 +1953,16 @@ where
             match self.read_line().await {
                 StdioLine::Line => {}
                 StdioLine::Oversized => continue,
+                StdioLine::Overloaded => {
+                    self.refuse_request_budget().await;
+                    return None;
+                }
                 StdioLine::End => return None,
             }
-            let parsed = {
-                let without_nl = self.line_buf.strip_suffix(b"\n").unwrap_or(&self.line_buf);
-                let line = without_nl.strip_suffix(b"\r").unwrap_or(without_nl);
-                if line.is_empty() {
-                    None
-                } else {
-                    Some(parse_stdio_message(line))
-                }
-            };
-            self.reset_line_buf();
-            let Some(parsed) = parsed else {
-                continue;
-            };
+            let parsed = std::mem::take(&mut self.line_buf).parse(true);
             match parsed {
-                Ok(Some(msg)) => {
+                Ok(Some(parsed)) => {
+                    let msg = parsed.into_message();
                     match &msg {
                         rmcp::model::JsonRpcMessage::Request(req) => {
                             self.leases.on_request(&req.id);
@@ -1666,8 +1971,16 @@ where
                             if let rmcp::model::ClientNotification::CancelledNotification(cancel) =
                                 &noti.notification
                                 && let Some(id) = &cancel.params.request_id
+                                && !self.leases.on_cancel_owned(id, {
+                                    use rmcp::model::GetExtensions;
+                                    noti.notification
+                                        .extensions()
+                                        .get::<crate::lease::Owner>()
+                                        .cloned()
+                                        .unwrap_or_default()
+                                })
                             {
-                                self.leases.on_cancel(id);
+                                continue;
                             }
                         }
                         _ => {}
@@ -1675,22 +1988,23 @@ where
                     return Some(msg);
                 }
                 Ok(None) => continue,
-                Err(err) => match err.classify() {
-                    serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {}
-                    serde_json::error::Category::Data | serde_json::error::Category::Io => {
-                        let reply = rmcp::service::TxJsonRpcMessage::<RoleServer>::error(
-                            rmcp::model::ErrorData::invalid_request("Invalid request", None),
-                            None,
-                        );
-                        let Ok(mut bytes) = serde_json::to_vec(&reply) else {
-                            return None;
-                        };
-                        bytes.push(b'\n');
-                        if write_stdio_frame(&self.write, &bytes).await.is_err() {
-                            return None;
-                        }
+                Err(ingress::Failure::Budget) => {
+                    self.refuse_request_budget().await;
+                    return None;
+                }
+                Err(ingress::Failure::Syntax) => {}
+                Err(ingress::Failure::Data | ingress::Failure::Limit) => {
+                    let reply = rmcp::service::TxJsonRpcMessage::<RoleServer>::error(
+                        rmcp::model::ErrorData::invalid_request("Invalid request", None),
+                        None,
+                    );
+                    let Ok(bytes) = encode_stdio_frame(&reply, None) else {
+                        return None;
+                    };
+                    if write_stdio_frame(&self.write, &bytes).await.is_err() {
+                        return None;
                     }
-                },
+                }
             }
         }
     }
@@ -1714,20 +2028,54 @@ impl Drop for Forwarder {
 
 /// Sends each latest progress message. A transport that stalls only delays these; the call keeps
 /// watching its own futures, so completion and cancellation never queue behind progress.
+fn progress_notification(
+    token: &rmcp::model::ProgressToken,
+    seconds: f64,
+    message: &str,
+    input_owner: &crate::lease::Owner,
+    _http_response: bool,
+) -> Option<rmcp::model::ServerNotification> {
+    use rmcp::model::GetExtensions;
+    // This owns the application's message allocation. SDK encodings are outside
+    // the boundary; stdio acquires its own exact frame owner in Transport::send.
+    let held = lease::process_pool()
+        .try_acquire(message.len())
+        .or_else(|| {
+            (message.len() <= 64 * 1024)
+                .then(|| lease::control_pool().try_acquire(message.len()))
+                .flatten()
+        })?;
+    let mut notification = rmcp::model::ServerNotification::ProgressNotification(
+        rmcp::model::ProgressNotification::new(
+            rmcp::model::ProgressNotificationParam::new(token.clone(), seconds)
+                .with_message(message),
+        ),
+    );
+    notification
+        .extensions_mut()
+        .insert(crate::lease::Owner::new((input_owner.clone(), held)));
+    Some(notification)
+}
+
 async fn forward_progress(
     peer: rmcp::service::Peer<RoleServer>,
     token: rmcp::model::ProgressToken,
     mut latest: watch::Receiver<Option<wait::Progress>>,
+    owner: crate::lease::Owner,
+    http_response: bool,
 ) {
     while latest.changed().await.is_ok() {
-        // The watch borrow ends before the send awaits, so this future stays `Send`.
-        let next = latest.borrow_and_update().clone();
-        let Some((seconds, message)) = next else {
+        let notification = {
+            let latest = latest.borrow_and_update();
+            let Some((seconds, message)) = latest.as_ref() else {
+                continue;
+            };
+            progress_notification(&token, *seconds, message, &owner, http_response)
+        };
+        let Some(notification) = notification else {
             continue;
         };
-        let progress = rmcp::model::ProgressNotificationParam::new(token.clone(), seconds)
-            .with_message(message);
-        if peer.notify_progress(progress).await.is_err() {
+        if peer.send_notification(notification).await.is_err() {
             return;
         }
     }
@@ -1744,12 +2092,20 @@ fn progress(
     let Some(token) = context.meta.get_progress_token() else {
         return (None, None);
     };
+    let owner = context
+        .extensions
+        .get::<crate::lease::Owner>()
+        .cloned()
+        .unwrap_or_default();
     let (sender, latest) = watch::channel(None);
-    let forwarder = Forwarder(tokio::spawn(forward_progress(
+    let future = forward_progress(
         context.peer.clone(),
         token,
         latest,
-    )));
+        owner.clone(),
+        http_context(context),
+    );
+    let forwarder = Forwarder(tokio::spawn(owner.hold_future(future)));
     (Some(sender), Some(forwarder))
 }
 
@@ -2164,9 +2520,14 @@ async fn cli_stop(
     let epoch = match within(deadline, async {
         let hello = hello(identity, launch)?;
         let epoch = endpoint::handshake(&mut client, hello, identity).await?;
-        ipc::write_frame(&mut client, &ToDaemon::Stop)
-            .await
-            .map_err(|error| format!("cannot send Stop: {error}"))?;
+        ipc::write_request_frame(
+            &mut client,
+            &ToDaemon::Stop,
+            lease::process_pool(),
+            lease::control_pool(),
+        )
+        .await
+        .map_err(|error| format!("cannot send Stop: {error}"))?;
         // The daemon ends every connection and exits, so this one ends too.
         read_to_end(&mut client).await?;
         Ok(epoch)
@@ -2200,38 +2561,52 @@ async fn connect_existing(paths: &runtime::Paths) -> Result<Option<transport::Cl
 }
 
 /// The Hello a CLI command sends: a session of its own, one connection, and the launch context.
-fn hello(identity: &runtime::Identity, launch: &LaunchContext) -> Result<ToDaemon, String> {
+fn hello(
+    identity: &runtime::Identity,
+    launch: &LaunchContext,
+) -> Result<ipc::Owned<ToDaemon>, String> {
     let session =
         tasks::random_chars(26).map_err(|error| format!("cannot name the session: {error}"))?;
-    let (cwd, env) = launch.to_wire();
-    Ok(ToDaemon::Hello {
-        protocol: ipc::PROTOCOL,
-        namespace: identity.namespace.clone(),
-        build: identity.build.clone(),
-        session,
-        connection: 1,
-        client_name: "cli".to_owned(),
-        output_mode: "text".to_owned(),
-        structured_content: true,
-        cwd,
-        env,
-    })
+    endpoint::hello_owned(
+        launch,
+        identity,
+        &session,
+        1,
+        "cli",
+        service::Render {
+            output_mode: service::OutputMode::Text,
+            structured_content: true,
+        },
+    )
 }
 
 /// Says Bye and reads until the daemon ends the connection, so the session is gone before the CLI
 /// exits.
 async fn bye(client: &mut transport::Client) -> Result<(), String> {
-    ipc::write_frame(client, &ToDaemon::Bye)
-        .await
-        .map_err(|error| format!("cannot send Bye: {error}"))?;
+    ipc::write_request_frame(
+        client,
+        &ToDaemon::Bye,
+        lease::process_pool(),
+        lease::control_pool(),
+    )
+    .await
+    .map_err(|error| format!("cannot send Bye: {error}"))?;
     read_to_end(client).await
 }
 
 async fn read_to_end(client: &mut transport::Client) -> Result<(), String> {
     loop {
-        match ipc::read_frame::<_, ToEndpoint>(client, ipc::RESPONSE_LIMIT).await {
-            Ok(Some(_)) => continue,
-            Ok(None) => return Ok(()),
+        match ipc::read_endpoint_frame_leased(
+            client,
+            ipc::RESPONSE_LIMIT,
+            lease::process_pool(),
+            lease::control_pool(),
+            |_| false,
+        )
+        .await
+        {
+            Ok(ipc::LeasedEndpointFrame::Eof) => return Ok(()),
+            Ok(_) => continue,
             Err(error) => return Err(format!("cannot read the daemon's answer: {error}")),
         }
     }
@@ -2246,28 +2621,46 @@ struct DaemonStatus {
     tasks: usize,
     /// The address it serves Streamable HTTP on, when it serves it.
     http: Option<String>,
+    _owner: lease::Lease,
 }
 
 /// Asks the daemon for its state, after the Welcome.
 async fn request_status(client: &mut transport::Client) -> Result<DaemonStatus, String> {
-    ipc::write_frame(client, &ToDaemon::Status)
-        .await
-        .map_err(|error| format!("cannot send Status: {error}"))?;
-    match ipc::read_frame::<_, ToEndpoint>(client, ipc::RESPONSE_LIMIT).await {
-        Ok(Some(ToEndpoint::Status {
+    ipc::write_request_frame(
+        client,
+        &ToDaemon::Status,
+        lease::process_pool(),
+        lease::control_pool(),
+    )
+    .await
+    .map_err(|error| format!("cannot send Status: {error}"))?;
+    match ipc::read_endpoint_frame_leased(
+        client,
+        ipc::RESPONSE_LIMIT,
+        lease::process_pool(),
+        lease::control_pool(),
+        |_| false,
+    )
+    .await
+    {
+        Ok(ipc::LeasedEndpointFrame::Frame(
+            ToEndpoint::Status {
+                epoch,
+                build,
+                pid,
+                sessions,
+                tasks,
+                http,
+            },
+            owner,
+        )) => Ok(DaemonStatus {
             epoch,
             build,
             pid,
             sessions,
             tasks,
             http,
-        })) => Ok(DaemonStatus {
-            epoch,
-            build,
-            pid,
-            sessions,
-            tasks,
-            http,
+            _owner: owner,
         }),
         Ok(other) => Err(format!("the daemon answered Status with {other:?}")),
         Err(error) => Err(format!("cannot read Status: {error}")),
@@ -2798,6 +3191,164 @@ mod http_token_tests {
         .unwrap_err();
         assert!(error.contains("token 2"), "{error}");
         assert!(!error.contains("abcdef"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod transfer_owner_tests {
+    use super::*;
+    use std::future::Future;
+    use std::time::Duration;
+
+    fn launch() -> Arc<LaunchContext> {
+        Arc::new(LaunchContext::new(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            Vec::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn transfer_owner_survives_unpolled_future_and_completed_inspection() {
+        let pool = lease::BytePool::new(64);
+        let request = || transfer::Request {
+            path: "Cargo.toml".into(),
+        };
+        let pending = inspect_transfer_request(
+            request(),
+            launch(),
+            crate::lease::Owner::new(pool.try_acquire(64).unwrap()),
+        );
+        assert_eq!(pool.used(), 64);
+        drop(pending);
+        assert_eq!(pool.used(), 0);
+
+        for path in ["Cargo.toml", "."] {
+            let inspected = inspect_transfer_request(
+                transfer::Request { path: path.into() },
+                launch(),
+                crate::lease::Owner::new(pool.try_acquire(64).unwrap()),
+            )
+            .await;
+            assert_eq!(inspected.value.is_ok(), path == "Cargo.toml");
+            assert_eq!(pool.used(), 64);
+            drop(inspected);
+            assert_eq!(pool.used(), 0);
+        }
+
+        let table = Arc::new(transfer::Transfers::new());
+        let result = publish_transfer(
+            request(),
+            launch(),
+            &table,
+            "http://localhost/",
+            Render {
+                output_mode: service::OutputMode::Both,
+                structured_content: true,
+            },
+            crate::lease::Owner::new(pool.try_acquire(64).unwrap()),
+        )
+        .await;
+        assert_eq!(result.result.is_error, Some(false));
+        assert_eq!(pool.used(), 64);
+        drop(result);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn transfer_path_workspace_retains_success_and_error_until_consumed() {
+        for path in ["Cargo.toml", "missing-transfer-file", "."] {
+            let pool = lease::BytePool::new(64 * 1024);
+            let context = Arc::new(
+                LaunchContext::new(
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                    Vec::new(),
+                )
+                .with_memory(Arc::clone(&pool)),
+            );
+            let result = inspect_transfer_request(
+                transfer::Request { path: path.into() },
+                context,
+                Default::default(),
+            )
+            .await;
+            assert_eq!(result.value.is_ok(), path != ".");
+            if path == "missing-transfer-file" {
+                assert_eq!(result.value.as_ref().unwrap().2, None);
+            }
+            assert!(pool.used() > 0);
+            drop(result);
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = lease::BytePool::new(0);
+        let context = Arc::new(
+            LaunchContext::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                Vec::new(),
+            )
+            .with_memory(Arc::clone(&pool)),
+        );
+        let result = inspect_transfer_request(
+            transfer::Request {
+                path: "Cargo.toml".into(),
+            },
+            context,
+            Default::default(),
+        )
+        .await;
+        assert!(
+            result
+                .value
+                .as_ref()
+                .unwrap_err()
+                .contains("not dispatched")
+        );
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn transfer_owner_stays_with_a_queued_worker_after_waiter_cancellation() {
+        struct Released(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started, running) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            running.await.unwrap();
+            let pool = lease::BytePool::new(64);
+            let (released, retired) = tokio::sync::oneshot::channel();
+            let owner =
+                crate::lease::Owner::new((pool.try_acquire(64).unwrap(), Released(Some(released))));
+            let mut inspection = Box::pin(inspect_transfer_request(
+                transfer::Request {
+                    path: "Cargo.toml".into(),
+                },
+                launch(),
+                owner,
+            ));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(inspection.as_mut().poll(&mut context).is_pending());
+            drop(inspection);
+            assert_eq!(pool.used(), 64);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), retired)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pool.used(), 0);
+        });
     }
 }
 
@@ -3486,6 +4037,59 @@ mod instructions_tool_tests {
 }
 
 #[cfg(test)]
+mod metadata_budget_tests {
+    use super::*;
+
+    #[test]
+    fn application_input_admission_precedes_copies_and_keeps_control_for_management() {
+        let args = serde_json::json!({"action":"sleep","path":"sample.txt"});
+        let id = rmcp::model::RequestId::String("ordinary-id".into());
+        let borrowed = (&args, &id);
+        let needed = 4 * ipc::json_len(&borrowed).unwrap();
+        for (limit, fits) in [(needed - 1, false), (needed, true)] {
+            let pool = lease::BytePool::new(limit);
+            let control = lease::BytePool::new(needed);
+            let result = application_input_owner(&borrowed, None, &pool, &control, false);
+            assert_eq!(result.is_ok(), fits);
+            assert_eq!(control.used(), 0, "ordinary tools cannot use control space");
+            drop(result);
+            assert_eq!(pool.used(), 0);
+        }
+        let full = lease::BytePool::new(0);
+        let control = lease::BytePool::new(needed);
+        let held = application_input_owner(&borrowed, None, &full, &control, true).unwrap();
+        assert_eq!(control.used(), needed);
+        let inherited =
+            application_input_owner(&borrowed, Some(&held), &full, &full, false).unwrap();
+        drop(held);
+        assert_eq!(
+            control.used(),
+            needed,
+            "an existing owner is shared, not recharged"
+        );
+        drop(inherited);
+        assert_eq!(control.used(), 0);
+    }
+
+    #[test]
+    fn metadata_workspace_refuses_before_copy_and_releases_at_handoff() {
+        let pool = lease::BytePool::new(32);
+        let held = reserve_response_content(&pool, 32).unwrap();
+        assert!(reserve_response_content(&pool, 1).is_err());
+        let result = CallToolResult::success(vec![ContentBlock::text("ordinary metadata")]);
+        assert_eq!(pool.used(), 32);
+        // Returning this official SDK value does not transfer the application's
+        // workspace. SDK-owned later allocations are explicitly out of scope.
+        drop(held);
+        assert_eq!(pool.used(), 0);
+        assert_eq!(
+            result.content[0].as_text().unwrap().text,
+            "ordinary metadata"
+        );
+    }
+}
+
+#[cfg(test)]
 mod cli_deadline_tests {
     use super::*;
 
@@ -3594,25 +4198,35 @@ mod stdio_transport_tests {
             "progress notification must not consume staged tool response leases"
         );
 
-        // 3. Client sends `notifications/cancelled` for request 1: its 700-byte lease frees immediately,
-        // even though rmcp will drop the response and never call `transport.send` for id 1!
-        client_write
-            .write_all(
-                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n",
-            )
+        // A completed response remains charged and deliverable after a late cancellation.
+        client_write.write_all(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"ping\"}\n",
+        ).as_bytes()).await.unwrap();
+        let next = transport.receive().await.unwrap();
+        assert!(matches!(next, rmcp::model::JsonRpcMessage::Request(_)));
+        assert_eq!(pool.used(), 1500);
+        transport
+            .send(rmcp::model::ServerJsonRpcMessage::response(
+                rmcp::model::ServerResult::CallToolResult(CallToolResult::success(Vec::new())),
+                rmcp::model::RequestId::Number(1),
+            ))
             .await
             .unwrap();
-        let cancel_msg = transport.receive().await.expect("cancelled notification");
-        assert!(matches!(
-            cancel_msg,
-            rmcp::model::JsonRpcMessage::Notification(_)
-        ));
         assert_eq!(pool.used(), 800);
 
-        // Late `insert` racing after `notifications/cancelled` for id 1 also drops immediately.
+        // Cancellation before a complete response is registered still reaches RMCP.
+        client_write.write_all(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":10}}\n"
+        ).await.unwrap();
+        let cancelled = transport.receive().await.unwrap();
+        assert!(matches!(
+            cancelled,
+            rmcp::model::JsonRpcMessage::Notification(_)
+        ));
         let late = pool.try_acquire(100).unwrap();
         leases.insert(
-            rmcp::model::RequestId::Number(1),
+            rmcp::model::RequestId::Number(10),
             &cancel1,
             lease::Lease::empty(&pool),
             late,
@@ -3635,7 +4249,7 @@ mod stdio_transport_tests {
         assert!(text.contains("\"notifications/progress\""), "{text}");
         assert!(text.contains("\"id\":2"), "{text}");
 
-        // 5. Closing transport clears any remaining in-flight leases.
+        // Closing rejects new work but retains queued leases until session owners end.
         let leftover = pool.try_acquire(300).unwrap();
         leases.insert(
             rmcp::model::RequestId::Number(3),
@@ -3645,6 +4259,165 @@ mod stdio_transport_tests {
         );
         assert_eq!(pool.used(), 300);
         transport.close().await.unwrap();
+        assert_eq!(pool.used(), 300);
+        drop(transport);
+        assert_eq!(pool.used(), 300);
+        drop(leases);
+        assert_eq!(pool.used(), 0);
+    }
+    #[tokio::test]
+    async fn stdio_send_claims_lease_before_first_poll() {
+        use rmcp::transport::Transport;
+        let pool = lease::BytePool::new(1 << 20);
+        let leases = Arc::new(RequestLeases::default());
+        let mut transport =
+            StdioTransport::new(tokio::io::empty(), tokio::io::sink(), Arc::clone(&leases));
+        let id = rmcp::model::RequestId::Number(7);
+        let held = pool.try_acquire(128 << 10).unwrap();
+        leases.insert(
+            id.clone(),
+            &CancellationToken::new(),
+            lease::Lease::empty(&pool),
+            held,
+        );
+        let result = CallToolResult::success(vec![ContentBlock::text("ordinary response")]);
+        let sending = transport.send(rmcp::model::ServerJsonRpcMessage::response(
+            rmcp::model::ServerResult::CallToolResult(result),
+            id.clone(),
+        ));
+        leases.on_cancel(&id);
+        assert_eq!(
+            pool.used(),
+            128 << 10,
+            "the unpolled send still owns the response"
+        );
+        drop(sending);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_stdio_response_ignores_late_cancellation() {
+        use rmcp::transport::Transport;
+        use tokio::io::AsyncWriteExt;
+        let pool = lease::BytePool::new(4096);
+        let leases = Arc::new(RequestLeases::default());
+        let (mut input, read) = tokio::io::duplex(4096);
+        let mut transport = StdioTransport::new(read, tokio::io::sink(), Arc::clone(&leases));
+        let id = rmcp::model::RequestId::Number(7);
+        leases.insert(
+            id.clone(),
+            &CancellationToken::new(),
+            lease::Lease::empty(&pool),
+            pool.try_acquire(1000).unwrap(),
+        );
+        input.write_all(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":7}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}\n"
+        ).as_bytes()).await.unwrap();
+        let next = transport.receive().await.unwrap();
+        assert!(
+            matches!(next, rmcp::model::JsonRpcMessage::Request(_)),
+            "a completed result must stay queued instead of forwarding a late cancellation"
+        );
+        assert_eq!(pool.used(), 1000);
+        drop(leases.take(&id));
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn stdio_handoff_keeps_prepaid_payload_without_second_admission() {
+        for send in [false, true] {
+            let result = CallToolResult::success(vec![ContentBlock::text("already admitted")]);
+            let id = rmcp::model::RequestId::Number(7);
+            let payload_bytes = service::result_payload_capacity(&result);
+            let wire_bytes = ipc::json_len(&result).unwrap() + ipc::json_len(&id).unwrap() + 256;
+            let pool = lease::BytePool::new(payload_bytes + wire_bytes);
+            let launch = Arc::new(
+                LaunchContext::new(std::env::current_dir().unwrap(), Vec::new())
+                    .with_memory(Arc::clone(&pool))
+                    .with_control_memory(lease::BytePool::new(0)),
+            );
+            let tasks = Tasks::new(Limits::OFF).unwrap();
+            let render = Render {
+                output_mode: service::OutputMode::Both,
+                structured_content: true,
+            };
+            let leases = Arc::new(RequestLeases::default());
+            let mut server = Server::new(
+                Backend::Local {
+                    service: Arc::new(Service::new(tasks, false)),
+                    render,
+                    session: Arc::new(OnceLock::new()),
+                    launch: Arc::clone(&launch),
+                    daemon: false,
+                },
+                &launch,
+                None,
+                Tools::default(),
+                None,
+                InstructionsToolMode::Off,
+            );
+            server.stdio_leases = Some(Arc::clone(&leases));
+            let (_input, read) = tokio::io::duplex(64);
+            let mut peer = rmcp::service::serve_directly(
+                server.clone(),
+                StdioTransport::new(read, tokio::io::sink(), Arc::new(RequestLeases::default())),
+                None,
+            );
+            let context = RequestContext::new(id.clone(), peer.peer().clone());
+            let tracked = files::TrackedResult {
+                result,
+                overload: false,
+                task_meta: None,
+                lease: pool.try_acquire(wire_bytes),
+                payload_owner: lease::Owner::new(pool.try_acquire(payload_bytes).unwrap()),
+            };
+            assert_eq!(pool.used(), pool.limit());
+            let result = server.deliver_local(&context, tracked, &launch, render, false);
+            assert_eq!(result.is_error, Some(false), "{result:?}");
+            assert_eq!(
+                result.content[0].as_text().unwrap().text,
+                "already admitted"
+            );
+            assert_eq!(
+                pool.used(),
+                pool.limit(),
+                "handoff transfers existing payment"
+            );
+
+            let mut transport =
+                StdioTransport::new(tokio::io::empty(), tokio::io::sink(), Arc::clone(&leases));
+            let sending = transport.send(rmcp::model::ServerJsonRpcMessage::response(
+                rmcp::model::ServerResult::CallToolResult(result),
+                id,
+            ));
+            assert_eq!(
+                pool.used(),
+                pool.limit(),
+                "an unpolled send owns the payload"
+            );
+            if send {
+                sending.await.unwrap();
+            } else {
+                drop(sending);
+            }
+            assert_eq!(pool.used(), 0);
+            peer.close().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn stdio_encoding_keeps_exact_capacity_charged() {
+        let item = serde_json::json!({"text": "x".repeat(65_535)});
+        let expected = ipc::json_len(&item).unwrap() + 1;
+        let pool = lease::BytePool::new(expected);
+        let mut lease = lease::Lease::empty(&pool);
+        let bytes = encode_stdio_frame(&item, Some(&mut lease)).unwrap();
+        assert_eq!(bytes.len(), expected);
+        assert_eq!(bytes.capacity(), lease.bytes());
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        drop(bytes);
+        drop(lease);
         assert_eq!(pool.used(), 0);
     }
 }

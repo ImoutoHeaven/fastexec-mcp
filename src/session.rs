@@ -231,6 +231,32 @@ impl LaunchContext {
         var_in(&self.env, name)
     }
 
+    /// Borrowed source bytes that resolving this request can copy or expand.
+    pub(crate) fn path_source_bytes(&self, path: &str) -> usize {
+        let mut bytes = path
+            .len()
+            .saturating_add(self.cwd.as_os_str().as_encoded_bytes().len());
+        let home =
+            path == "~" || path.starts_with("~/") || cfg!(windows) && path.starts_with("~\\");
+        if home {
+            bytes = bytes.saturating_add(self.session_cwd.as_os_str().as_encoded_bytes().len());
+            let value = |name| self.var(name).filter(|value| !value.is_empty());
+            let home_bytes = if cfg!(windows) && value("USERPROFILE").is_some() {
+                value("USERPROFILE").unwrap().as_encoded_bytes().len()
+            } else if cfg!(windows) && value("HOMEDRIVE").is_some() && value("HOMEPATH").is_some() {
+                value("HOMEDRIVE")
+                    .unwrap()
+                    .as_encoded_bytes()
+                    .len()
+                    .saturating_add(value("HOMEPATH").unwrap().as_encoded_bytes().len())
+            } else {
+                value("HOME").map_or(0, |value| value.as_encoded_bytes().len())
+            };
+            bytes = bytes.saturating_add(home_bytes);
+        }
+        bytes
+    }
+
     /// The absolute home directory for file tools and the Host description.
     pub fn home(&self) -> Option<PathBuf> {
         self.env_home()

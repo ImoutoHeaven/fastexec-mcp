@@ -3,6 +3,54 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+/// Shared ownership used only by application-owned buffers, jobs and queues.
+/// Official rmcp values do not carry this owner after a response is handed off.
+#[derive(Clone, Default)]
+pub(crate) struct Owner(Option<Arc<dyn std::any::Any + Send + Sync>>);
+
+impl std::fmt::Debug for Owner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Owner")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl Owner {
+    pub fn new(value: impl std::any::Any + Send + Sync) -> Self {
+        Self(Some(Arc::new(value)))
+    }
+
+    pub fn get<T: std::any::Any>(&self) -> Option<&T> {
+        self.0.as_ref()?.downcast_ref()
+    }
+
+    pub fn hold_future<F: std::future::Future>(self, future: F) -> OwnedFuture<F> {
+        OwnedFuture {
+            future: Box::pin(future),
+            _owner: self,
+        }
+    }
+}
+
+// Field order also covers futures dropped before their first poll.
+pub(crate) struct OwnedFuture<F> {
+    future: std::pin::Pin<Box<F>>,
+    _owner: Owner,
+}
+
+impl<F: std::future::Future> std::future::Future for OwnedFuture<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(cx)
+    }
+}
+
 /// Default per-process active byte budget: 1 GiB.
 pub const DEFAULT_LIMIT: usize = 1 << 30;
 /// Independent control-plane byte budget for `list`, short `kill`, progress, and error receipts.
@@ -177,6 +225,34 @@ impl Drop for Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn app_owner_holds_future_payload_until_drop_even_before_poll() {
+        struct Payload(Arc<BytePool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                assert_eq!(self.0.used(), 64, "payload must drop before its owner");
+            }
+        }
+        for poll in [false, true] {
+            let pool = BytePool::new(64);
+            let payload = Payload(Arc::clone(&pool));
+            let owner = Owner::new(pool.try_acquire(64).unwrap());
+            let mut future = Box::pin(owner.hold_future(async move {
+                let _payload = payload;
+                std::future::pending::<()>().await;
+            }));
+            if poll {
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+            }
+            drop(future);
+            assert_eq!(pool.used(), 0);
+        }
+    }
 
     #[test]
     fn leases_admit_grow_handoff_and_reclaim_without_blocking() {

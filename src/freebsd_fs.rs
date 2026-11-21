@@ -1,5 +1,7 @@
 //! FreeBSD native ACLs and extended attributes, including private staging on ACL-inheriting volumes.
 
+use crate::ipc::Owned;
+use crate::lease::{BytePool, Owner};
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -7,6 +9,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::sync::Arc;
 
 const ACL_TYPE_ACCESS: c_int = 2;
 const ACL_TYPE_DEFAULT: c_int = 3;
@@ -268,13 +271,35 @@ fn publish_private_directory(dir: &Path) -> io::Result<()> {
     ))
 }
 
+fn attribute_memory_error(pool: &BytePool) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "Server active memory budget ({} bytes) is full while preserving file metadata; the original file was not replaced.",
+            pool.limit()
+        ),
+    )
+}
+
 /// FreeBSD extattr reads may return a truncated prefix instead of ERANGE.
-fn read_sized(mut read: impl FnMut(*mut c_void, usize) -> isize) -> io::Result<Vec<u8>> {
+fn read_sized(
+    mut read: impl FnMut(*mut c_void, usize) -> isize,
+    pool: &Arc<BytePool>,
+) -> io::Result<Owned<Vec<u8>>> {
     let size = read(std::ptr::null_mut(), 0);
     if size < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut bytes = vec![0u8; size as usize];
+    let memory = || attribute_memory_error(pool);
+    let mut lease = pool.try_acquire(size as usize).ok_or_else(memory)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size as usize)
+        .map_err(|_| memory())?;
+    if !lease.try_resize(bytes.capacity()) {
+        return Err(memory());
+    }
+    bytes.resize(size as usize, 0);
     let copied = read(bytes.as_mut_ptr().cast(), bytes.len());
     if copied < 0 {
         return Err(io::Error::last_os_error());
@@ -288,29 +313,78 @@ fn read_sized(mut read: impl FnMut(*mut c_void, usize) -> isize) -> io::Result<V
             "an extended attribute changed while it was being copied",
         ));
     }
-    Ok(bytes)
+    Ok(Owned::new(bytes, Owner::new(lease)))
 }
 
-fn attribute_names(bytes: &[u8]) -> io::Result<Vec<CString>> {
-    let mut names = Vec::new();
+fn attribute_names(bytes: &[u8], pool: &Arc<BytePool>) -> io::Result<Owned<Vec<CString>>> {
+    let mut count = 0usize;
+    let mut longest = 0usize;
     let mut remaining = bytes;
     while let Some((&length, tail)) = remaining.split_first() {
         let length = usize::from(length);
         if length == 0 || length > tail.len() {
             return Err(io::Error::other("a truncated extended attribute name list"));
         }
-        names.push(CString::new(&tail[..length]).map_err(io::Error::other)?);
+        if tail[..length].contains(&0) {
+            return Err(io::Error::other(
+                "an extended attribute name contains a NUL byte",
+            ));
+        }
+        count += 1;
+        longest = longest.max(length + 1);
         remaining = &tail[length..];
     }
-    Ok(names)
+    let memory = || attribute_memory_error(pool);
+    // Each length prefix becomes a NUL. CString conversion may briefly own
+    // both its Vec and boxed slice, alongside all completed names and the raw list.
+    let peak = count
+        .checked_mul(std::mem::size_of::<CString>())
+        .and_then(|backing| backing.checked_add(bytes.len()))
+        .and_then(|retained| retained.checked_add(longest))
+        .ok_or_else(memory)?;
+    let mut lease = pool.try_acquire(peak).ok_or_else(memory)?;
+    let mut names = Vec::new();
+    names.try_reserve_exact(count).map_err(|_| memory())?;
+    let retained = names
+        .capacity()
+        .checked_mul(std::mem::size_of::<CString>())
+        .and_then(|backing| backing.checked_add(bytes.len()))
+        .ok_or_else(memory)?;
+    let peak = retained.checked_add(longest).ok_or_else(memory)?;
+    if !lease.try_resize(peak) {
+        return Err(memory());
+    }
+    let mut remaining = bytes;
+    while let Some((&length, tail)) = remaining.split_first() {
+        let length = usize::from(length);
+        let mut name = Vec::new();
+        name.try_reserve_exact(length + 1).map_err(|_| memory())?;
+        if !lease.try_grow(name.capacity().saturating_sub(length + 1)) {
+            return Err(memory());
+        }
+        name.extend_from_slice(&tail[..length]);
+        name.push(0);
+        names.push(CString::from_vec_with_nul(name).expect("the name has one trailing NUL"));
+        lease.shrink_to(peak);
+        remaining = &tail[length..];
+    }
+    lease.shrink_to(retained);
+    Ok(Owned::new(names, Owner::new(lease)))
 }
 
-fn list_attributes(file: &File, namespace: c_int) -> io::Result<Vec<CString>> {
-    let bytes = read_sized(|buffer, size| {
-        // SAFETY: file is live and read_sized supplies valid query/read buffers.
-        unsafe { libc::extattr_list_fd(file.as_raw_fd(), namespace, buffer, size) }
-    })?;
-    attribute_names(&bytes)
+fn list_attributes(
+    file: &File,
+    namespace: c_int,
+    pool: &Arc<BytePool>,
+) -> io::Result<Owned<Vec<CString>>> {
+    let bytes = read_sized(
+        |buffer, size| {
+            // SAFETY: file is live and read_sized supplies valid query/read buffers.
+            unsafe { libc::extattr_list_fd(file.as_raw_fd(), namespace, buffer, size) }
+        },
+        pool,
+    )?;
+    attribute_names(&bytes.value, pool)
 }
 
 fn native_acl_attribute(name: &CString, namespace: c_int) -> bool {
@@ -350,14 +424,19 @@ fn mac_labels_present() -> io::Result<bool> {
     Ok(labeled & 0x4 != 0)
 }
 
-fn preserve_attributes(source: &File, target: &File, preserve_system: bool) -> io::Result<()> {
+fn preserve_attributes(
+    source: &File,
+    target: &File,
+    preserve_system: bool,
+    pool: &Arc<BytePool>,
+) -> io::Result<()> {
     for namespace in [libc::EXTATTR_NAMESPACE_USER, libc::EXTATTR_NAMESPACE_SYSTEM] {
         if namespace == libc::EXTATTR_NAMESPACE_SYSTEM && !preserve_system {
             // A new vnode already has the kernel's creation label. Copying a probe's persistent
             // MAC attributes would change storage without updating that in-memory label.
             continue;
         }
-        let names = match list_attributes(source, namespace) {
+        let names = match list_attributes(source, namespace, pool) {
             Ok(names) => names,
             Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => continue,
             Err(error)
@@ -370,8 +449,9 @@ fn preserve_attributes(source: &File, target: &File, preserve_system: bool) -> i
             }
             Err(error) => return Err(error),
         };
-        for name in list_attributes(target, namespace)? {
-            if native_acl_attribute(&name, namespace) || names.contains(&name) {
+        let inherited = list_attributes(target, namespace, pool)?;
+        for name in &inherited.value {
+            if native_acl_attribute(name, namespace) || names.value.contains(name) {
                 continue;
             }
             // SAFETY: the descriptor and terminated name remain valid for the call.
@@ -380,36 +460,47 @@ fn preserve_attributes(source: &File, target: &File, preserve_system: bool) -> i
                 return Err(io::Error::last_os_error());
             }
         }
-        for name in &names {
+        drop(inherited);
+        for name in &names.value {
             if native_acl_attribute(name, namespace) {
                 continue;
             }
-            let bytes = read_sized(|buffer, size| {
-                // SAFETY: the descriptor/name are live and the supplied buffer is writable.
-                unsafe {
-                    libc::extattr_get_fd(source.as_raw_fd(), namespace, name.as_ptr(), buffer, size)
-                }
-            })?;
+            let bytes = read_sized(
+                |buffer, size| {
+                    // SAFETY: the descriptor/name are live and the supplied buffer is writable.
+                    unsafe {
+                        libc::extattr_get_fd(
+                            source.as_raw_fd(),
+                            namespace,
+                            name.as_ptr(),
+                            buffer,
+                            size,
+                        )
+                    }
+                },
+                pool,
+            )?;
             // SAFETY: the descriptor, terminated name and complete value stay live.
             let copied = unsafe {
                 libc::extattr_set_fd(
                     target.as_raw_fd(),
                     namespace,
                     name.as_ptr(),
-                    bytes.as_ptr().cast(),
-                    bytes.len(),
+                    bytes.value.as_ptr().cast(),
+                    bytes.value.len(),
                 )
             };
             if copied < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if copied as usize != bytes.len() {
+            if copied as usize != bytes.value.len() {
                 return Err(io::Error::other(
                     "an extended attribute was not saved completely",
                 ));
             }
         }
-        if list_attributes(source, namespace)? != names {
+        let after = list_attributes(source, namespace, pool)?;
+        if after.value != names.value {
             return Err(io::Error::other(
                 "extended attribute names changed while being copied",
             ));
@@ -420,7 +511,12 @@ fn preserve_attributes(source: &File, target: &File, preserve_system: bool) -> i
 
 /// Restore access only after all content is complete. chmod precedes the ACL because ZFS
 /// aclmode=discard would otherwise remove the original named grants.
-pub fn preserve(source: &File, target: &File, existing: bool) -> io::Result<()> {
+pub fn preserve(
+    source: &File,
+    target: &File,
+    existing: bool,
+    pool: &Arc<BytePool>,
+) -> io::Result<()> {
     // Copying persistent SYSTEM attributes does not relabel the target's in-memory vnode.
     // Even a privileged caller cannot preserve active MAC policy through this atomic replacement.
     let mac_labels = mac_labels_present()?;
@@ -431,7 +527,7 @@ pub fn preserve(source: &File, target: &File, existing: bool) -> io::Result<()> 
         ));
     }
     let acl = access_acl(source)?;
-    preserve_attributes(source, target, !mac_labels)?;
+    preserve_attributes(source, target, !mac_labels, pool)?;
     let original = source.metadata()?;
     let current = target.metadata()?;
     if original.uid() != current.uid() || original.gid() != current.gid() {
@@ -564,34 +660,181 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn read_attribute_fixture(bytes: &[u8], pool: &Arc<BytePool>) -> io::Result<Owned<Vec<u8>>> {
+        read_sized(
+            |buffer, length| {
+                if !buffer.is_null() {
+                    assert_eq!(length, bytes.len());
+                    // SAFETY: the queried length is the complete fixture length.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast(), bytes.len())
+                    };
+                }
+                bytes.len() as isize
+            },
+            pool,
+        )
+    }
+
+    fn names_fixture(bytes: &[u8], pool: &Arc<BytePool>) -> io::Result<Owned<Vec<CString>>> {
+        let raw = read_attribute_fixture(bytes, pool)?;
+        attribute_names(&raw.value, pool)
+    }
+
+    #[test]
+    fn freebsd_attribute_buffers_admit_before_read_and_release_after_failure() {
+        for limit in [3, 4, 5] {
+            let pool = BytePool::new(limit);
+            let mut calls = 0;
+            let result = read_sized(
+                |buffer, length| {
+                    calls += 1;
+                    if !buffer.is_null() {
+                        assert_eq!(length, 4);
+                        assert_eq!(pool.used(), 4);
+                        // SAFETY: read_sized supplied the queried four-byte buffer.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(b"data".as_ptr(), buffer.cast(), 4)
+                        };
+                    }
+                    4
+                },
+                &pool,
+            );
+            if limit < 4 {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+                assert_eq!(calls, 1, "refusal precedes the native copy");
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.value, b"data");
+                assert_eq!(pool.used(), result.value.capacity());
+                assert_eq!(calls, 3);
+                drop(result);
+            }
+            assert_eq!(pool.used(), 0);
+        }
+        for fail_at in [2, 3] {
+            let pool = BytePool::new(4);
+            let mut calls = 0;
+            let result = read_sized(
+                |_, _| {
+                    calls += 1;
+                    if calls == fail_at { -1 } else { 4 }
+                },
+                &pool,
+            );
+            assert!(result.is_err());
+            assert_eq!(calls, fail_at);
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = BytePool::new(0);
+        assert!(read_attribute_fixture(b"", &pool).unwrap().value.is_empty());
+        assert!(attribute_names(b"", &pool).unwrap().value.is_empty());
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn freebsd_attribute_names_admit_conversion_peak_and_keep_actual_capacity() {
+        let bytes = b"\x03one\x03two";
+        let retained = 2 * std::mem::size_of::<CString>() + bytes.len();
+        let peak = bytes.len() + retained + 4;
+        for limit in [peak - 1, peak, peak + 1] {
+            let pool = BytePool::new(limit);
+            let raw = read_attribute_fixture(bytes, &pool).unwrap();
+            let names = attribute_names(&raw.value, &pool);
+            if limit < peak {
+                assert_eq!(names.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+                assert_eq!(pool.used(), raw.value.capacity());
+                drop(raw);
+            } else {
+                let names = names.unwrap();
+                assert_eq!(
+                    names.value,
+                    [CString::new("one").unwrap(), CString::new("two").unwrap()]
+                );
+                let actual = names.value.capacity() * std::mem::size_of::<CString>()
+                    + names
+                        .value
+                        .iter()
+                        .map(|name| name.to_bytes_with_nul().len())
+                        .sum::<usize>();
+                assert_eq!(actual, retained);
+                assert_eq!(pool.used(), raw.value.capacity() + actual);
+                drop(raw);
+                assert_eq!(pool.used(), actual);
+                drop(names);
+            }
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn freebsd_attribute_groups_and_values_hold_independent_leases() {
+        let bytes = b"\x03one";
+        let retained = std::mem::size_of::<CString>() + bytes.len();
+        let peak = 3 * retained + 2 + bytes.len() + 4;
+        for limit in [peak - 1, peak, peak + 1] {
+            let pool = BytePool::new(limit);
+            let source = names_fixture(bytes, &pool).unwrap();
+            let target = names_fixture(bytes, &pool).unwrap();
+            let value = read_attribute_fixture(b"ok", &pool).unwrap();
+            assert_eq!(pool.used(), 2 * retained + 2);
+            let after = names_fixture(bytes, &pool);
+            if limit < peak {
+                assert_eq!(after.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+            } else {
+                let after = after.unwrap();
+                assert_eq!(after.value, source.value);
+                assert_eq!(pool.used(), 3 * retained + 2);
+                drop(after);
+            }
+            assert_eq!(pool.used(), 2 * retained + 2);
+            drop(value);
+            assert_eq!(pool.used(), 2 * retained);
+            drop(target);
+            assert_eq!(pool.used(), retained);
+            drop(source);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
     #[test]
     fn freebsd_attribute_names_reject_partial_or_invalid_entries() {
+        let pool = BytePool::new(128);
+        let names = attribute_names(b"\x03one\x03two", &pool).unwrap();
         assert_eq!(
-            attribute_names(b"\x03one\x03two").unwrap(),
+            names.value,
             [CString::new("one").unwrap(), CString::new("two").unwrap()]
         );
+        drop(names);
         for malformed in [b"\x03on".as_slice(), b"\x00", b"\x03o\0e"] {
-            assert!(attribute_names(malformed).is_err(), "{malformed:?}");
+            assert!(attribute_names(malformed, &pool).is_err(), "{malformed:?}");
+            assert_eq!(pool.used(), 0);
         }
     }
 
     #[test]
     fn freebsd_attribute_growth_is_not_saved_as_a_truncated_value() {
+        let pool = BytePool::new(2);
         let mut calls = 0;
-        let result = read_sized(|buffer, length| {
-            calls += 1;
-            if calls == 1 {
-                return 2;
-            }
-            if length != 0 {
-                // SAFETY: read_sized allocated this two-byte buffer.
-                unsafe { std::ptr::copy_nonoverlapping(b"ab".as_ptr(), buffer.cast(), 2) };
-                2
-            } else {
-                3
-            }
-        });
+        let result = read_sized(
+            |buffer, length| {
+                calls += 1;
+                if calls == 1 {
+                    return 2;
+                }
+                if length != 0 {
+                    // SAFETY: read_sized allocated this two-byte buffer.
+                    unsafe { std::ptr::copy_nonoverlapping(b"ab".as_ptr(), buffer.cast(), 2) };
+                    2
+                } else {
+                    3
+                }
+            },
+            &pool,
+        );
         assert!(result.is_err());
         assert_eq!(calls, 3);
+        assert_eq!(pool.used(), 0);
     }
 }

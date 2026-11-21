@@ -318,33 +318,47 @@ impl Daemon {
         request: crate::transfer::Request,
         launch: &Arc<LaunchContext>,
         render: Render,
-    ) -> CallToolResult {
+        input_owner: crate::lease::Owner,
+    ) -> crate::files::TrackedResult {
         let session_root = match http::root_of(launch.var(http::PUBLIC_URL)) {
             Ok(root) => root,
-            Err(message) => return crate::transfer_error(message, render),
+            Err(message) => {
+                return crate::files::TrackedResult::plain(crate::transfer_error(message, render));
+            }
         };
         let public_root = session_root.or_else(|| self.public_root.as_deref().map(str::to_owned));
         if let Some(http_addr) = &self.http {
             if launch.var(crate::TRANSFER_ADDR).is_some() {
-                return crate::transfer_error(
+                return crate::files::TrackedResult::plain(crate::transfer_error(
                     format!(
                         "cannot set {} with --http; --http already serves /t/",
                         crate::TRANSFER_ADDR
                     ),
                     render,
-                );
+                ));
             }
             if public_root.is_none()
                 && let Ok(addr) = http_addr.parse::<std::net::SocketAddr>()
                 && let Err(message) = crate::check_routable_addr("--http", addr, false)
             {
-                return crate::transfer_error(message, render);
+                return crate::files::TrackedResult::plain(crate::transfer_error(message, render));
             }
         }
-        let (path, shown_path, bytes) =
-            match crate::inspect_transfer_request(request, Arc::clone(launch)).await {
-                Ok(inspected) => inspected,
-                Err(message) => return crate::transfer_error(message, render),
+        let inspected =
+            match crate::inspect_transfer_request(request, Arc::clone(launch), input_owner).await {
+                ipc::Owned {
+                    value: Ok(target),
+                    owner,
+                } => ipc::Owned::new(target, owner),
+                ipc::Owned {
+                    value: Err(message),
+                    owner,
+                } => {
+                    return crate::files::TrackedResult::owned(
+                        crate::transfer_error(message, render),
+                        owner,
+                    );
+                }
             };
         let base = match (public_root, &self.http) {
             (Some(root), Some(_)) => root,
@@ -355,12 +369,20 @@ impl Daemon {
                     .await
                 {
                     Ok(addr) => addr,
-                    Err(message) => return crate::transfer_error(message, render),
+                    Err(message) => {
+                        return crate::files::TrackedResult::plain(crate::transfer_error(
+                            message, render,
+                        ));
+                    }
                 };
                 public_root.unwrap_or_else(|| format!("http://{bound}/"))
             }
         };
-        crate::mint_transfer(path, shown_path, bytes, &self.transfers, &base, render)
+        let owner = inspected.owner.clone();
+        let result = inspected.run(|(path, shown_path, bytes)| {
+            crate::mint_transfer(path, shown_path, bytes, &self.transfers, &base, render)
+        });
+        crate::files::TrackedResult::owned(result, owner)
     }
 
     /// Takes a place for a connection, or refuses it: the daemon is stopping, or it already
@@ -532,13 +554,29 @@ impl Daemon {
     ) -> Option<Attachment> {
         let first = timeout(
             HANDSHAKE_TIMEOUT,
-            ipc::read_frame::<_, ToDaemon>(reader, ipc::REQUEST_LIMIT),
+            ipc::read_daemon_frame_owned(
+                reader,
+                ipc::REQUEST_LIMIT,
+                &self.memory,
+                &self.control_memory,
+            ),
         )
         .await;
         let message = match first {
-            Ok(Ok(Some(message))) => message,
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return None,
+            Ok(Ok(ipc::DaemonFrame::Message(message))) => message,
+            _ => return None,
         };
+        message
+            .owner
+            .hold_future(self.handshake_message(writer, message.value))
+            .await
+    }
+
+    async fn handshake_message(
+        self: &Arc<Self>,
+        writer: &mut Writer,
+        message: ToDaemon,
+    ) -> Option<Attachment> {
         let ToDaemon::Hello {
             protocol,
             namespace,
@@ -745,18 +783,30 @@ impl Daemon {
                 _ = attached.token.cancelled() => return,
                 // A stop ends the connection even when no entry holds its token any more.
                 _ = self.stopped.cancelled() => return,
-                frame = ipc::read_frame::<_, ToDaemon>(reader, ipc::REQUEST_LIMIT) => match frame {
-                    Ok(Some(message)) => message,
-                    Ok(None) | Err(_) => return,
+                frame = ipc::read_daemon_frame_owned(reader, ipc::REQUEST_LIMIT, &self.memory, &self.control_memory) => match frame {
+                    Ok(ipc::DaemonFrame::Message(message)) => message,
+                    Ok(ipc::DaemonFrame::Overload { id: Some(id) }) => {
+                        queue_result(outgoing, &self.reserved, &attached.token, id,
+                            error(ipc::input_budget_error().to_string()));
+                        continue;
+                    }
+                    _ => return,
                 },
             };
+            let ipc::Owned {
+                value: message,
+                owner,
+            } = message;
             match message {
                 ToDaemon::Call {
                     id,
                     tool,
                     arguments,
-                    ..
+                    request_id,
                 } => {
+                    // The endpoint preserves string IDs here; numeric IDs are
+                    // conservatively charged for their surrounding quotes too.
+                    let rpc_id_bytes = ipc::json_len(&request_id).unwrap_or(usize::MAX);
                     let token = {
                         let mut calls = lock(in_flight);
                         if calls.contains_key(&id) || calls.len() >= MAX_IN_FLIGHT {
@@ -769,7 +819,7 @@ impl Daemon {
                     };
                     match token {
                         Some(token) => {
-                            tokio::spawn(run_call(
+                            tokio::spawn(owner.clone().hold_future(run_call(
                                 Arc::clone(self),
                                 Arc::clone(&attached.session),
                                 attached.render,
@@ -780,7 +830,9 @@ impl Daemon {
                                 arguments,
                                 Arc::clone(in_flight),
                                 outgoing.clone(),
-                            ));
+                                rpc_id_bytes,
+                                owner,
+                            )));
                         }
                         None => {
                             let message = if lock(in_flight).contains_key(&id) {
@@ -881,6 +933,8 @@ async fn run_call(
     arguments: serde_json::Value,
     in_flight: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     outgoing: mpsc::UnboundedSender<Outgoing>,
+    rpc_id_bytes: usize,
+    input_owner: crate::lease::Owner,
 ) {
     let render_pool = match (
         tool.as_str(),
@@ -917,6 +971,9 @@ async fn run_call(
         nested: false,
         started: None,
         render_slot: Some(&render_slot),
+        http_response: false,
+        rpc_id_bytes,
+        input_owner: input_owner.clone(),
     };
     let transfer = session.launch.var("FASTEXEC_TRANSFER") == Some(std::ffi::OsStr::new("true"));
     let mut tracked = if cancelled_before_dispatch {
@@ -936,21 +993,24 @@ async fn run_call(
             Err(problem) => crate::files::TrackedResult::plain(error(problem.to_string())),
         }
     } else if tool == "transfer" {
-        let res = if !transfer {
-            crate::transfer_error(
+        if !transfer {
+            crate::files::TrackedResult::plain(crate::transfer_error(
                 "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
                 render,
-            )
+            ))
         } else {
             match serde_json::from_value::<crate::transfer::Request>(arguments) {
-                Ok(request) => daemon.transfer(request, &session.launch, render).await,
-                Err(problem) => crate::transfer_error(
+                Ok(request) => {
+                    daemon
+                        .transfer(request, &session.launch, render, input_owner.clone())
+                        .await
+                }
+                Err(problem) => crate::files::TrackedResult::plain(crate::transfer_error(
                     format!("failed to deserialize parameters: {problem}"),
                     render,
-                ),
+                )),
             }
-        };
-        crate::files::TrackedResult::plain(res)
+        }
     } else {
         // File tools run in the daemon process using the calling session's launch context.
         let launch = Arc::clone(&session.launch);
@@ -961,6 +1021,7 @@ async fn run_call(
             transfer,
             render,
             Some(token.clone()),
+            input_owner.clone(),
         )
         .await
     };
@@ -979,7 +1040,6 @@ async fn run_call(
         return;
     };
     if length > ipc::RESPONSE_LIMIT + 4 {
-        drop(lease.take());
         let text = match &task_meta {
             Some(m) => format!(
                 "The result was {length} bytes, over the 512 MiB frame limit; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId with a smaller maxBytes or read logPath.",
@@ -993,6 +1053,7 @@ async fn run_call(
             id,
             result: error(text),
         };
+        drop(lease.take());
         overload = true;
         match measure(&message) {
             Some(smaller) => length = smaller,
@@ -1003,9 +1064,16 @@ async fn run_call(
         }
     }
 
-    if (management || overload) && length <= RESERVED {
-        let want = u32::try_from(length).unwrap_or(u32::MAX);
-        let permit = tokio::select! {
+    let payload_bytes = match &message {
+        ToEndpoint::Result { result, .. } => {
+            crate::service::unleased_result_payload_capacity(result, &tracked.payload_owner)
+        }
+        _ => 0,
+    };
+    let peak = payload_bytes.saturating_add(length);
+    if (management || overload) && peak <= RESERVED {
+        let want = u32::try_from(peak).unwrap_or(u32::MAX);
+        let mut permit = tokio::select! {
             biased;
             _ = connection.cancelled() => {
                 lock(&in_flight).remove(&id);
@@ -1023,10 +1091,14 @@ async fn run_call(
         drop(message);
         drop(lease);
         drop(render_slot);
+        let outbound = permit
+            .split(length)
+            .expect("reserved peak includes the frame");
+        drop(permit);
         if let Ok(bytes) = bytes {
             let _ = outgoing.send(Outgoing {
                 bytes,
-                _permit: Some(OutgoingPermit::Reserved(permit)),
+                _permit: Some(OutgoingPermit::Reserved(outbound)),
                 written: None,
             });
         }
@@ -1034,21 +1106,16 @@ async fn run_call(
         return;
     }
 
-    let b64_bytes = match &message {
-        ToEndpoint::Result { result, .. } => crate::service::content_b64_bytes(result),
-        _ => 0,
+    let admitted = match lease.as_mut() {
+        Some(held) => held.try_resize(peak),
+        None => {
+            lease = daemon.memory.try_acquire(peak);
+            lease.is_some()
+        }
     };
-    let frame_lease = match lease.take() {
-        Some(mut held) => b64_bytes
-            .checked_add(length)
-            .filter(|&peak| held.try_resize(peak))
-            .map(|_| {
-                let outbound_lease = held.split_off(length);
-                (outbound_lease, Some(held))
-            }),
-        None => daemon.memory.try_acquire(length).map(|fl| (fl, None)),
-    };
-    if let Some((frame_lease, staging_lease)) = frame_lease {
+    if admitted {
+        let mut staging_lease = lease.take().expect("admitted result has an owner");
+        let frame_lease = staging_lease.split_off(length);
         let bytes = ipc::encode_measured(&message, length);
         drop(message);
         drop(staging_lease);
@@ -1073,8 +1140,9 @@ async fn run_call(
             daemon.memory.limit()
         ),
     };
-    drop(tracked);
     drop(message);
+    drop(tracked);
+    drop(lease);
     drop(render_slot);
     let fallback = ToEndpoint::Result {
         id,
@@ -1084,8 +1152,17 @@ async fn run_call(
         lock(&in_flight).remove(&id);
         return;
     };
-    let want = u32::try_from(fallback_len).unwrap_or(u32::MAX);
-    let permit = tokio::select! {
+    let fallback_payload = match &fallback {
+        ToEndpoint::Result { result, .. } => crate::service::result_payload_capacity(result),
+        _ => 0,
+    };
+    let fallback_peak = fallback_len.saturating_add(fallback_payload);
+    if fallback_peak > RESERVED {
+        lock(&in_flight).remove(&id);
+        return;
+    }
+    let want = u32::try_from(fallback_peak).unwrap_or(u32::MAX);
+    let mut permit = tokio::select! {
         biased;
         _ = connection.cancelled() => {
             lock(&in_flight).remove(&id);
@@ -1099,10 +1176,16 @@ async fn run_call(
             }
         },
     };
-    if let Ok(bytes) = ipc::encode_measured(&fallback, fallback_len) {
+    let bytes = ipc::encode_measured(&fallback, fallback_len);
+    drop(fallback);
+    let outbound = permit
+        .split(fallback_len)
+        .expect("reserved peak includes the frame");
+    drop(permit);
+    if let Ok(bytes) = bytes {
         let _ = outgoing.send(Outgoing {
             bytes,
-            _permit: Some(OutgoingPermit::Reserved(permit)),
+            _permit: Some(OutgoingPermit::Reserved(outbound)),
             written: None,
         });
     }
@@ -1177,7 +1260,7 @@ async fn write_loop(
     stall: Duration,
 ) {
     loop {
-        let item = tokio::select! {
+        let mut item = tokio::select! {
             biased;
             _ = closing.cancelled() => return,
             item = outgoing.recv() => match item {
@@ -1185,15 +1268,10 @@ async fn write_loop(
                 None => return,
             },
         };
-        let Outgoing {
-            bytes,
-            _permit,
-            written,
-        } = item;
         // The write gives way to the connection token as well as to the stall: a replacement or
         // a close drops this half, the queued frames, and their permits at once.
         let sent = {
-            let writing = async { ipc::write_raw_idle(&mut writer, &bytes, stall).await };
+            let writing = async { ipc::write_raw_idle(&mut writer, &item.bytes, stall).await };
             tokio::pin!(writing);
             tokio::select! {
                 biased;
@@ -1205,7 +1283,7 @@ async fn write_loop(
             closing.cancel();
             return;
         }
-        if let Some(written) = written {
+        if let Some(written) = item.written.take() {
             let _ = written.send(());
         }
     }
@@ -1898,6 +1976,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipc_ingress_control_round_trip_survives_full_main_pool() {
+        let pool = BytePool::new(0);
+        let fixture = fixture_with_config(Config {
+            memory: Some(Arc::clone(&pool)),
+            ..Config::default()
+        });
+        let daemon = &fixture.daemon;
+        let mut client = connect(daemon).await;
+        client.welcome("control", 1).await;
+        client
+            .send(&call(
+                1,
+                json!({"action":"start", "command":"printf hello"}),
+            ))
+            .await;
+        let rejected = client.result(1).await;
+        assert_eq!(rejected.is_error, Some(true));
+        assert!(text_of(&rejected).contains("not dispatched"));
+        assert!(daemon.tasks.all().is_empty());
+        client.send(&call(2, json!({"action":"list"}))).await;
+        assert_eq!(client.result(2).await.is_error, Some(false));
+        client.send(&ToDaemon::Cancel { id: 1 }).await;
+        client.send(&ToDaemon::Status).await;
+        assert!(matches!(
+            client.next().await,
+            Some(ToEndpoint::Status { tasks: 0, .. })
+        ));
+        client.send(&ToDaemon::Stop).await;
+        assert!(client.next().await.is_none());
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
     async fn a_hello_is_answered_with_the_epoch_or_a_reject_naming_the_field() {
         let fixture = fixture();
         let daemon = &fixture.daemon;
@@ -2105,6 +2216,8 @@ mod tests {
                 json!({"action": "list"}),
                 Arc::clone(&in_flight),
                 outgoing.clone(),
+                0,
+                Default::default(),
             )
             .await;
             assert!(
@@ -2289,7 +2402,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_kill_or_list_or_overload_receipt_uses_reserved_when_main_memory_is_full() {
-        let pool = BytePool::new(64 * 1024);
+        // Leave room for the admitted text workspace; each pressure step below
+        // still fills the whole pool (or leaves only the stated 64 bytes).
+        let pool = BytePool::new(1 << 20);
         let fixture = fixture_with_config(Config {
             memory: Some(Arc::clone(&pool)),
             ..Config::default()
@@ -2332,7 +2447,9 @@ mod tests {
         until(|| task.unseen_attachment_count(0) > 0).await;
 
         // Occupy 100% of the main active-byte pool.
-        let held = pool.try_acquire(pool.limit()).expect("main pool free");
+        let held = pool
+            .try_acquire(pool.limit() - pool.used())
+            .expect("remaining main capacity");
 
         // 1. Ordinary call fails fast without deadlocking and delivers its overload receipt via RESERVED.
         client
@@ -2399,7 +2516,9 @@ mod tests {
 
     #[tokio::test]
     async fn kill_narrows_over_reserved_dual_frame_and_overload_preserves_cursor_and_bare_id() {
-        let pool = BytePool::new(32 * 1024);
+        // Leave room for the admitted text workspace; each pressure step below
+        // still fills the whole pool (or leaves only the stated 64 bytes).
+        let pool = BytePool::new(1 << 20);
         let fixture = fixture_with_config(Config {
             memory: Some(Arc::clone(&pool)),
             ..Config::default()
@@ -2441,7 +2560,7 @@ mod tests {
 
         // Exhaust 100% of main pool: kill with maxBytes=4194304 in `both` mode would exceed 8 MiB
         // RESERVED (~8.4 MiB), so kill must narrow its window to fit RESERVED and still succeed!
-        let held = pool.try_acquire(pool.limit()).unwrap();
+        let held = pool.try_acquire(pool.limit() - pool.used()).unwrap();
         both_client
             .send(&call(
                 2,
@@ -2480,18 +2599,23 @@ mod tests {
             Some(ToEndpoint::Welcome { .. })
         ));
 
-        let held_most = pool.try_acquire(pool.limit() - 64).unwrap();
-        nosc_client
-            .send(&ToDaemon::Call {
-                id: 10,
-                tool: "codemode".into(),
-                request_id: "10".into(),
-                arguments: json!({
-                    "code": "text('exact-preserved-line');",
-                    "waitMs": 5000
-                }),
-            })
-            .await;
+        let request = ToDaemon::Call {
+            id: 10,
+            tool: "codemode".into(),
+            request_id: "10".into(),
+            arguments: json!({
+                "code": "text('exact-preserved-line');",
+                "waitMs": 5000
+            }),
+        };
+        // Admit this normal input first; the remaining response allowance is
+        // still far below the 128 KiB text workspace, so this checks post-start
+        // overload and cursor preservation rather than pre-dispatch rejection.
+        let input_peak = ipc::json_len(&request).unwrap() * 6;
+        let held_most = pool
+            .try_acquire(pool.limit() - pool.used() - input_peak - 64)
+            .unwrap();
+        nosc_client.send(&request).await;
         let overloaded = nosc_client.result(10).await;
         assert_eq!(overloaded.is_error, Some(true));
         assert!(overloaded.structured_content.is_none());
@@ -2526,7 +2650,8 @@ mod tests {
 
     #[tokio::test]
     async fn zero_progress_write_stall_disconnects_reclaims_lease_and_recovers_via_bare_task_id() {
-        let pool = BytePool::new(256 * 1024);
+        // Leave room for text rendering; the 64-byte pipe independently creates write pressure.
+        let pool = BytePool::new(1 << 20);
         let fixture = fixture_with_config(Config {
             write_stall: Duration::from_millis(80),
             memory: Some(Arc::clone(&pool)),
@@ -3122,6 +3247,8 @@ mod tests {
             json!({"path": "file.bin"}),
             Arc::new(Mutex::new(HashMap::new())),
             outgoing.clone(),
+            0,
+            Default::default(),
         )
         .await;
         let disabled_frame = queued.recv().await.unwrap();
@@ -3163,6 +3290,8 @@ mod tests {
             json!({"unexpected": 1}),
             Arc::new(Mutex::new(HashMap::new())),
             outgoing,
+            0,
+            Default::default(),
         )
         .await;
         let bad_args_frame = queued.recv().await.unwrap();
@@ -3195,9 +3324,10 @@ mod tests {
                 crate::transfer::Request { path: ".".into() },
                 &enabled_launch,
                 text_render,
+                Default::default(),
             )
             .await;
-        assert_eq!(dir_result.is_error, Some(true));
+        assert_eq!(dir_result.result.is_error, Some(true));
         assert!(
             daemon.transfer_listener.get().is_none(),
             "directory target must not bind /t/ listener"
@@ -3219,11 +3349,12 @@ mod tests {
                 },
                 &unspec_no_root,
                 text_render,
+                Default::default(),
             )
             .await;
-        assert_eq!(unspec_err.is_error, Some(true));
+        assert_eq!(unspec_err.result.is_error, Some(true));
         assert!(
-            unspec_err.structured_content.as_ref().unwrap()["error"]
+            unspec_err.result.structured_content.as_ref().unwrap()["error"]
                 .as_str()
                 .unwrap()
                 .contains("is an unspecified address; set FASTEXEC_PUBLIC_URL")
@@ -3239,9 +3370,10 @@ mod tests {
                 },
                 &enabled_launch,
                 text_render,
+                Default::default(),
             )
             .await;
-        assert_eq!(minted.is_error, Some(false));
+        assert_eq!(minted.result.is_error, Some(false));
         let bound = *daemon.transfer_listener.get().expect("listener bound");
         assert_eq!(bound.ip(), std::net::Ipv4Addr::LOCALHOST);
 
@@ -3264,11 +3396,12 @@ mod tests {
                 },
                 &conflict_launch,
                 text_render,
+                Default::default(),
             )
             .await;
-        assert_eq!(conflict.is_error, Some(true));
+        assert_eq!(conflict.result.is_error, Some(true));
         assert_eq!(
-            conflict.structured_content.as_ref().unwrap()["error"],
+            conflict.result.structured_content.as_ref().unwrap()["error"],
             json!(format!(
                 "the daemon already serves /t/ on {bound}, not 0.0.0.0:0; stop it first"
             ))
@@ -3292,11 +3425,12 @@ mod tests {
                 },
                 &enabled_launch,
                 text_render,
+                Default::default(),
             )
             .await;
-        assert_eq!(wildcard_err.is_error, Some(true));
+        assert_eq!(wildcard_err.result.is_error, Some(true));
         assert_eq!(
-            wildcard_err.structured_content.as_ref().unwrap()["error"],
+            wildcard_err.result.structured_content.as_ref().unwrap()["error"],
             json!(
                 "--http 0.0.0.0:8765 is an unspecified address; set FASTEXEC_PUBLIC_URL to the URL clients reach"
             )

@@ -397,6 +397,57 @@ impl Live {
         std::mem::take(&mut self.recorder.out)
     }
 
+    fn screen_text_bytes(&self) -> usize {
+        let (cols, rows) = self.recorder.size();
+        // One base character and 32 combining characters, at most four UTF-8 bytes each.
+        cols.saturating_mul(rows)
+            .saturating_mul(4 * (1 + CELL_COMBINING_LIMIT))
+            .saturating_add(rows)
+    }
+
+    /// Text workspace for rows, joins, rendered copies, and String growth.
+    pub(crate) fn screen_snapshot_bytes(&self) -> usize {
+        if self.stopped {
+            return 0;
+        }
+        self.screen_text_bytes()
+            .saturating_mul(8)
+            .saturating_add(128 << 10)
+    }
+
+    /// Text workspace for the pending snapshot's clones, reconciliation, and final join.
+    pub(crate) fn pending_snapshot_bytes(&self) -> usize {
+        if self.stopped {
+            return 0;
+        }
+        let recorder = &self.recorder;
+        let retained = if recorder.alternate() {
+            recorder
+                .session
+                .as_ref()
+                .map_or(0, History::snapshot_text_bytes)
+        } else {
+            let held = match &recorder.reprint {
+                Reprint::Anchoring { held, .. } => held.iter().fold(0usize, |bytes, text| {
+                    bytes.saturating_add(text.capacity()).saturating_add(1)
+                }),
+                _ => 0,
+            };
+            held.saturating_add(
+                recorder
+                    .partial
+                    .as_ref()
+                    .map_or(0, |(text, _)| text.capacity().saturating_add(1)),
+            )
+        };
+        // Capacity and a newline per retained string cover empty rows too. The factor
+        // covers each phase's text copies and geometric String growth, not total RSS.
+        retained
+            .saturating_add(self.screen_text_bytes())
+            .saturating_mul(16)
+            .saturating_add(128 << 10)
+    }
+
     /// The lines not written out yet, as they would be written if the output ended now, each
     /// ending in a newline.
     pub fn pending(&mut self) -> String {

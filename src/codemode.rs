@@ -1,6 +1,7 @@
 //! JavaScript tasks and their asynchronous bridge to the four host tools.
 
 use crate::files;
+use crate::lease::{BytePool, Lease};
 use crate::media::{self, CompressFailure, MediaKind};
 use crate::output::Truncate;
 use crate::service::{self, Call, OutputMode, Render, Service};
@@ -27,11 +28,13 @@ const SCRIPT_PREFIX: &str = "(async () => {\n";
 const SLEEP_CHUNK_MS: u64 = 1_u64 << 40;
 const MAX_CODE: usize = 256 * 1024;
 const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
-const BRIDGE_LIMIT: usize = 256 * 1024 * 1024;
+pub(crate) const BRIDGE_LIMIT: usize = 256 * 1024 * 1024;
 const BRIDGE_ERROR: &str =
     "Script tool-call bridge exceeds 256 MiB of pending arguments and results.";
 const DIAGNOSTIC_RESERVE: u64 = 4096;
-const BRIDGE_RESULT_ERROR: &str = "The tool call completed, but its result does not fit in the 256 MiB pending bridge budget; the operation was not undone.";
+// One bounded description and pending-call text coexist until diagnostics finish writing.
+const DIAGNOSTIC_WORKSPACE: usize = 3 * DIAGNOSTIC_RESERVE as usize;
+const BRIDGE_RESULT_ERROR: &str = "The tool call completed, but its result does not fit in the 256 MiB pending bridge budget; the operation was not undone. Do not retry start or resend input; find started task handles in the outer codemode report.";
 const START_PERMITS: usize = 8;
 const IO_PERMITS: usize = 8;
 const PENDING_CALLS: usize = 1024;
@@ -126,13 +129,22 @@ pub struct CallInfo {
     pub task_id: Option<String>,
 }
 
+pub(crate) struct ReportSnapshot {
+    pub cancelled: Vec<CallInfo>,
+    pub started: Vec<String>,
+    pub _lease: Lease,
+}
+
 struct PendingCall {
     info: CallInfo,
     bytes: usize,
+    input_owner: crate::lease::Owner,
 }
 
 #[derive(Default)]
 struct Report {
+    #[cfg(test)]
+    limit: Option<usize>,
     pending: BTreeMap<u64, PendingCall>,
     bridge_bytes: usize,
     cancelled: Vec<CallInfo>,
@@ -141,28 +153,69 @@ struct Report {
 }
 
 impl Report {
-    fn admit(&mut self, id: u64, info: CallInfo, bytes: usize) -> Result<(), String> {
+    fn limit(&self) -> usize {
+        #[cfg(test)]
+        if let Some(limit) = self.limit {
+            return limit;
+        }
+        BRIDGE_LIMIT
+    }
+
+    fn snapshot_bytes(&self) -> usize {
+        let cancelled = self.cancelled.iter().fold(0usize, |bytes, call| {
+            bytes
+                .saturating_add(call.tool.capacity())
+                .saturating_add(call.action.as_ref().map_or(0, String::capacity))
+                .saturating_add(call.task_id.as_ref().map_or(0, String::capacity))
+        });
+        let strings = self.started.iter().fold(cancelled, |bytes, handle| {
+            bytes.saturating_add(handle.capacity())
+        });
+        // Per-item field names and state strings, plus the outer report keys.
+        let fields = self.cancelled.len().saturating_add(self.started.len());
+        // Raw snapshots, JSON values, a candidate copy, and String growth coexist.
+        strings
+            .saturating_add(fields.saturating_mul(32))
+            .saturating_add(64)
+            .saturating_mul(6)
+    }
+
+    fn admit(
+        &mut self,
+        id: u64,
+        info: CallInfo,
+        bytes: usize,
+        input_owner: crate::lease::Owner,
+    ) -> Result<(), String> {
         if self.pending.len() >= PENDING_CALLS {
             return Err("At most 1024 calls may be pending per script.".into());
         }
-        if bytes > BRIDGE_LIMIT - self.bridge_bytes {
+        if bytes > self.limit().saturating_sub(self.bridge_bytes) {
             return Err(BRIDGE_ERROR.into());
         }
         self.bridge_bytes += bytes;
-        self.pending.insert(id, PendingCall { info, bytes });
+        self.pending.insert(
+            id,
+            PendingCall {
+                info,
+                bytes,
+                input_owner,
+            },
+        );
         Ok(())
     }
 
     fn result(&mut self, id: u64, bytes: usize) -> bool {
+        let limit = self.limit();
         let Some(pending) = self.pending.get_mut(&id) else {
             return false;
         };
-        self.bridge_bytes -= pending.bytes;
-        pending.bytes = 0;
-        if bytes > BRIDGE_LIMIT - self.bridge_bytes {
+        let other_bytes = self.bridge_bytes - pending.bytes;
+        if bytes > limit.saturating_sub(other_bytes) {
             return false;
         }
-        self.bridge_bytes += bytes;
+        // Admission failure preserves the old reservation and total together.
+        self.bridge_bytes = other_bytes + bytes;
         pending.bytes = bytes;
         true
     }
@@ -175,10 +228,13 @@ impl Report {
 }
 
 enum Outcome {
-    Value(String),
-    Error(String),
+    Value(crate::ipc::Owned<String>),
+    Error(&'static str),
     Limit,
+    Memory,
 }
+
+const BRIDGE_MEMORY_RESULT_ERROR: &str = "The tool call completed, but its result does not fit in the process active memory budget; the operation was not undone. Do not retry start or resend input; use exec list to locate a started task.";
 
 enum Wake {
     Settled { id: u64, outcome: Outcome },
@@ -198,6 +254,12 @@ struct Control {
 
 #[derive(Clone)]
 pub struct ScriptHandle(Arc<Control>);
+
+#[derive(Clone, Copy)]
+pub(crate) struct NestedCall<'a> {
+    pub script: &'a ScriptHandle,
+    pub pending_id: u64,
+}
 
 struct InFlightGuard(ScriptHandle);
 
@@ -220,6 +282,38 @@ impl Drop for InFlightGuard {
 }
 
 impl ScriptHandle {
+    pub(crate) fn reserve_result(&self, id: u64, bytes: usize) -> bool {
+        lock(&self.0.report).result(id, bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_result(&self, id: u64, bytes: usize, limit: usize) {
+        let mut report = lock(&self.0.report);
+        report.limit = Some(limit);
+        report
+            .admit(
+                id,
+                CallInfo {
+                    tool: "exec".into(),
+                    action: None,
+                    task_id: None,
+                },
+                bytes,
+                Default::default(),
+            )
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_bridge_bytes(&self) -> usize {
+        lock(&self.0.report).bridge_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_bridge_limit(&self, limit: usize) {
+        lock(&self.0.report).limit = Some(limit);
+    }
+
     pub fn kill(&self) {
         self.0.stopped.store(true, Ordering::Release);
         self.0.cancel.cancel();
@@ -230,9 +324,21 @@ impl ScriptHandle {
         self.0.stopped.load(Ordering::Acquire) || self.0.exited.load(Ordering::Acquire)
     }
 
-    pub fn report(&self) -> (Vec<CallInfo>, Vec<String>) {
+    pub fn report(
+        &self,
+        memory: &Arc<BytePool>,
+        control: Option<&Arc<BytePool>>,
+    ) -> Option<ReportSnapshot> {
         let report = lock(&self.0.report);
-        (report.cancelled.clone(), report.started.clone())
+        let bytes = report.snapshot_bytes();
+        let lease = memory
+            .try_acquire(bytes)
+            .or_else(|| control.and_then(|pool| pool.try_acquire(bytes)))?;
+        Some(ReportSnapshot {
+            cancelled: report.cancelled.clone(),
+            started: report.started.clone(),
+            _lease: lease,
+        })
     }
 
     pub fn record_started(&self, handle: String) {
@@ -259,6 +365,16 @@ impl ScriptHandle {
         id
     }
 
+    pub(crate) fn unregister_attachment(&self, id: u64) {
+        let removed = lock(&self.0.held_attachments).remove(&id);
+        drop(removed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_attachment_count(&self) -> usize {
+        lock(&self.0.held_attachments).len()
+    }
+
     fn get_attachment(&self, id: u64) -> Option<crate::tasks::AttachmentLease> {
         lock(&self.0.held_attachments).get(&id).cloned()
     }
@@ -271,7 +387,7 @@ impl ScriptHandle {
         drop(idle.wait_while(active, |&mut active| active > 0));
     }
 
-    fn finish(&self) -> Vec<CallInfo> {
+    fn finish(&self) -> crate::ipc::Owned<Vec<CallInfo>> {
         let dropped = std::mem::take(&mut *lock(&self.0.held_attachments));
         drop(dropped);
         let mut report = lock(&self.0.report);
@@ -280,10 +396,15 @@ impl ScriptHandle {
             .values()
             .map(|pending| pending.info.clone())
             .collect();
+        let owners: Vec<_> = report
+            .pending
+            .values()
+            .map(|call| call.input_owner.clone())
+            .collect();
         report.pending.clear();
         report.bridge_bytes = 0;
         self.0.cancel.cancel();
-        report.cancelled.clone()
+        crate::ipc::Owned::new(report.cancelled.clone(), crate::lease::Owner::new(owners))
     }
 }
 
@@ -298,6 +419,7 @@ pub struct Work {
     pub task: Arc<Task>,
     pub tasks: Arc<Tasks>,
     pub captured: mpsc::Receiver<()>,
+    pub input_owner: crate::lease::Owner,
 }
 
 pub struct ScriptWorker(mpsc::SyncSender<Work>);
@@ -365,16 +487,42 @@ impl Output {
         Ok(())
     }
 
-    fn diagnostic(&mut self, text: &str) {
-        let left = TASK_LOG_LIMIT.saturating_sub(self.written);
+    fn diagnostic(&mut self, parts: &[&str]) {
+        let left = TASK_LOG_LIMIT
+            .saturating_sub(self.written)
+            .min(DIAGNOSTIC_RESERVE);
         if left == 0 {
             return;
         }
-        let mut end = text.len().min(left.saturating_sub(1) as usize);
-        while !text.is_char_boundary(end) {
-            end -= 1;
+        let room = left.saturating_sub(1) as usize;
+        let total = parts
+            .iter()
+            .fold(0usize, |n, part| n.saturating_add(part.len()));
+        let truncated = total > room && room >= 3;
+        let mut remaining = room - usize::from(truncated) * 3;
+        for part in parts {
+            let mut end = part.len().min(remaining);
+            while !part.is_char_boundary(end) {
+                end -= 1;
+            }
+            if self.writer.write_all(&part.as_bytes()[..end]).is_err() {
+                return;
+            }
+            self.written += end as u64;
+            remaining -= end;
+            if end < part.len() {
+                break;
+            }
         }
-        let _ = self.line(&text[..end]);
+        if truncated {
+            if self.writer.write_all(b"...").is_err() {
+                return;
+            }
+            self.written += 3;
+        }
+        if self.writer.write_all(b"\n").is_ok() {
+            self.written += 1;
+        }
     }
 }
 
@@ -480,21 +628,49 @@ fn queue_permit(pool: Arc<Semaphore>) -> impl Future<Output = tokio::sync::Owned
 }
 
 impl Host {
-    fn call(&mut self, tool: String, arguments: String) -> Result<u64, String> {
+    fn call(&mut self, tool: &str, arguments: &str) -> Result<u64, crate::ipc::Owned<String>> {
         if self.script.interrupted() || self.script.0.cancel.is_cancelled() {
-            return Err("The script is ending; no new tool calls can start.".into());
+            return Err(crate::ipc::Owned::new(
+                "The script is ending; no new tool calls can start.".into(),
+                Default::default(),
+            ));
         }
+        // QuickJS owns the borrowed UTF-8 input. Reserve before creating Rust
+        // Value strings, escape scratch, typed arguments and worker copies.
+        let bytes = arguments.len().saturating_add(tool.len()).saturating_mul(4);
+        let (lease, control) = if let Some(lease) = self.launch.memory().try_acquire(bytes) {
+            (lease, false)
+        } else if arguments.len().saturating_add(tool.len()) <= crate::ipc::SHORT_INPUT {
+            (
+                self.launch
+                    .control_memory()
+                    .try_acquire(bytes)
+                    .ok_or_else(|| {
+                        crate::ipc::Owned::new(bridge_input_error(), Default::default())
+                    })?,
+                true,
+            )
+        } else {
+            return Err(crate::ipc::Owned::new(
+                bridge_input_error(),
+                Default::default(),
+            ));
+        };
+        let mut input_owner = crate::lease::Owner::new(lease);
         let id = self.next;
         self.next += 1;
-        lock(&self.script.0.report).admit(
-            id,
-            CallInfo {
-                tool: tool.clone(),
-                action: None,
-                task_id: None,
-            },
-            arguments.len(),
-        )?;
+        lock(&self.script.0.report)
+            .admit(
+                id,
+                CallInfo {
+                    tool: tool.to_owned(),
+                    action: None,
+                    task_id: None,
+                },
+                arguments.len(),
+                input_owner.clone(),
+            )
+            .map_err(|error| crate::ipc::Owned::new(error, input_owner.clone()))?;
         let parsed = (|| {
             if tool == "sleep" {
                 let ms = arguments
@@ -505,9 +681,9 @@ impl Host {
                 return Ok(ToolCall::Sleep(ms.max(0.0)));
             }
             let value: serde_json::Value =
-                serde_json::from_str(&arguments).map_err(|error| error.to_string())?;
+                serde_json::from_str(arguments).map_err(|error| error.to_string())?;
             let info = CallInfo {
-                tool: tool.clone(),
+                tool: tool.to_owned(),
                 action: value
                     .get("action")
                     .and_then(|v| v.as_str())
@@ -517,7 +693,7 @@ impl Host {
                     .and_then(|v| v.as_str())
                     .map(str::to_owned),
             };
-            let request = ToolCall::parse(&tool, value)?;
+            let request = ToolCall::parse(tool, value)?;
             lock(&self.script.0.report)
                 .pending
                 .get_mut(&id)
@@ -529,20 +705,34 @@ impl Host {
             Ok(request) => request,
             Err(error) => {
                 lock(&self.script.0.report).remove(id);
-                return Err(error);
+                return Err(crate::ipc::Owned::new(error, input_owner));
             }
         };
+        let is_control = matches!(&request,
+            ToolCall::Exec(request) if matches!(request.action, service::Action::Kill | service::Action::List)
+        );
+        if control && !is_control {
+            let Some(lease) = self.launch.memory().try_acquire(bytes) else {
+                lock(&self.script.0.report).remove(id);
+                return Err(crate::ipc::Owned::new(bridge_input_error(), input_owner));
+            };
+            input_owner = crate::lease::Owner::new(lease);
+            lock(&self.script.0.report)
+                .pending
+                .get_mut(&id)
+                .unwrap()
+                .input_owner = input_owner.clone();
+        }
         if let ToolCall::Exec(request) = &request
             && request.action == service::Action::Start
             && service::validate(request, true).is_ok()
         {
             if self.starts >= MAX_STARTS {
                 lock(&self.script.0.report).remove(id);
-                return Err(STARTS_ERROR.into());
+                return Err(crate::ipc::Owned::new(STARTS_ERROR.into(), input_owner));
             }
             self.starts += 1;
         }
-        drop(arguments);
         let permit_pool = match &request {
             ToolCall::Exec(req) => match req.action {
                 service::Action::Start => Some(Arc::clone(&self.start_permits)),
@@ -567,7 +757,9 @@ impl Host {
             output_mode: OutputMode::Structured,
             structured_content: true,
         };
-        self.runtime.spawn(async move {
+        let response_pool = Arc::clone(launch.memory());
+        let response_control = is_control.then(|| Arc::clone(launch.control_memory()));
+        self.runtime.spawn(input_owner.clone().hold_future(async move {
             let _in_flight = in_flight;
             let permit = match permit_wait {
                 Some(wait) => Some(tokio::select! {
@@ -577,7 +769,8 @@ impl Host {
                 }),
                 None => None,
             };
-            let result = match request {
+            let exec_result = matches!(&request, ToolCall::Exec(_));
+            let mut result = match request {
                 ToolCall::Sleep(ms) => {
                     tokio::select! {
                         biased;
@@ -587,14 +780,14 @@ impl Host {
                     let _ = lock(&script.0.report).result(id, 0);
                     let _ = script.0.wake.send(Wake::Settled {
                         id,
-                        outcome: Outcome::Value(String::new()),
+                        outcome: Outcome::Value(crate::ipc::Owned::new(String::new(), Default::default())),
                     });
                     return;
                 }
                 ToolCall::Exec(request) => {
                     let _permit = permit;
                     service
-                        .call(
+                        .call_tracked(
                             *request,
                             Call {
                                 session: &session,
@@ -604,8 +797,11 @@ impl Host {
                                 progress: None,
                                 call_id,
                                 nested: true,
-                                started: Some(&script),
+                                started: Some(NestedCall { script: &script, pending_id: id }),
                                 render_slot: None,
+                                http_response: false,
+                                rpc_id_bytes: 0,
+                                input_owner: input_owner.clone(),
                             },
                         )
                         .await
@@ -616,7 +812,7 @@ impl Host {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        result = files::read_nested(request, launch, transfer, nested_render, permit, read_cancel) => result,
+                        result = files::read_nested(request, launch, transfer, nested_render, permit, read_cancel, input_owner.clone()) => result,
                     }
                 }
                 ToolCall::Write(request) => {
@@ -624,7 +820,7 @@ impl Host {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        result = files::write_nested(request, launch, nested_render, permit) => result,
+                        result = files::write_nested(request, launch, nested_render, permit, input_owner.clone()) => result,
                     }
                 }
                 ToolCall::Edit(request) => {
@@ -632,40 +828,46 @@ impl Host {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        result = files::edit_nested(request, launch, nested_render, permit) => result,
+                        result = files::edit_nested(request, launch, nested_render, permit, input_owner.clone()) => result,
                     }
                 }
             };
-            let envelope = nested_envelope(result);
-            let mut outcome = match serde_json::to_string(&envelope) {
-                Ok(value) => Outcome::Value(value),
-                Err(error) => Outcome::Error(error.to_string()),
-            };
+            // Only exec's reader/report commit prepaid its wire. File leases
+            // still own the file payload and must stay with the envelope.
+            let prepaid = exec_result.then(|| result.lease.take()).flatten();
+            let mut outcome = encode_nested_result(result, &response_pool, response_control.as_ref(), prepaid);
             let bytes = match &outcome {
-                Outcome::Value(value) | Outcome::Error(value) => value.len(),
-                Outcome::Limit => 0,
+                Outcome::Value(value) => value.value.len(),
+                Outcome::Error(error) => error.len(),
+                Outcome::Limit | Outcome::Memory => 0,
             };
             if !lock(&script.0.report).result(id, bytes) {
                 outcome = Outcome::Limit;
             }
             let _ = script.0.wake.send(Wake::Settled { id, outcome });
-        });
+        }));
         Ok(id)
     }
 }
 
-fn nested_envelope(result: rmcp::model::CallToolResult) -> serde_json::Value {
-    let mut ok = !result.is_error.unwrap_or(false);
-    let mut map = match result.structured_content {
+fn bridge_input_error() -> String {
+    "Server active memory budget is full while copying nested tool arguments; the call was not dispatched.".into()
+}
+
+fn nested_envelope(mut tracked: files::TrackedResult) -> crate::ipc::Owned<serde_json::Value> {
+    let prior = std::mem::take(&mut tracked.payload_owner);
+    let owner = crate::lease::Owner::new((prior, tracked.lease.take()));
+    let mut result = crate::ipc::Owned::new(tracked.result, owner);
+    let mut ok = !result.value.is_error.unwrap_or(false);
+    let mut map = match result.value.structured_content.take() {
         Some(serde_json::Value::Object(map)) => map,
         _ => {
-            let text = result
-                .content
-                .first()
-                .and_then(|block| block.as_text())
-                .map_or_else(|| "Tool operation failed.".to_owned(), |t| t.text.clone());
+            let text = match std::mem::take(&mut result.value.content).into_iter().next() {
+                Some(rmcp::model::ContentBlock::Text(text)) => text.text,
+                _ => "Tool operation failed.".to_owned(),
+            };
             let mut fallback = serde_json::Map::new();
-            fallback.insert("error".into(), json!(text));
+            fallback.insert("error".into(), serde_json::Value::String(text));
             ok = false;
             fallback
         }
@@ -673,7 +875,51 @@ fn nested_envelope(result: rmcp::model::CallToolResult) -> serde_json::Value {
     if map.remove("ok") == Some(serde_json::Value::Bool(false)) {
         ok = false;
     }
-    json!({ "ok": ok, "value": map })
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("ok".into(), serde_json::Value::Bool(ok));
+    envelope.insert("value".into(), serde_json::Value::Object(map));
+    crate::ipc::Owned::new(serde_json::Value::Object(envelope), result.owner)
+}
+
+fn encode_nested_result(
+    result: files::TrackedResult,
+    pool: &Arc<BytePool>,
+    control: Option<&Arc<BytePool>>,
+    prepaid: Option<Lease>,
+) -> Outcome {
+    // The service reserves exec's envelope workspace and wire before committing
+    // its reader. Keep that full allowance until the old payload is gone.
+    let precommitted = prepaid.is_some();
+    let Some(mut wire) =
+        prepaid.or_else(|| pool.try_acquire(128).or_else(|| control?.try_acquire(128)))
+    else {
+        return Outcome::Memory;
+    };
+    let envelope = nested_envelope(result);
+    let Ok(length) = crate::ipc::json_len(&envelope.value) else {
+        return Outcome::Error("Cannot measure the nested tool result.");
+    };
+    let peak = length.saturating_add(128);
+    if wire.bytes() < peak {
+        // A committed exec result must never need another admission here.
+        if precommitted {
+            return Outcome::Memory;
+        }
+        if !wire.try_grow(peak - wire.bytes()) {
+            let Some(replacement) = control.and_then(|pool| pool.try_acquire(peak)) else {
+                return Outcome::Memory;
+            };
+            wire = replacement;
+        }
+    }
+    let mut bytes = Vec::with_capacity(length);
+    if serde_json::to_writer(&mut bytes, &envelope.value).is_err() {
+        return Outcome::Error("Cannot encode the nested tool result.");
+    }
+    let text = String::from_utf8(bytes).expect("JSON serialization emits UTF-8");
+    drop(envelope);
+    wire.shrink_to(text.capacity());
+    Outcome::Value(crate::ipc::Owned::new(text, crate::lease::Owner::new(wire)))
 }
 
 fn pending_text(calls: &[CallInfo]) -> String {
@@ -728,8 +974,18 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
         task,
         tasks,
         captured,
+        input_owner,
     } = work;
+    let code = crate::ipc::Owned::new(code, input_owner);
     let output = Rc::new(RefCell::new(Output { writer, written: 0 }));
+    let Some(diagnostic_lease) = launch.control_memory().try_acquire(DIAGNOSTIC_WORKSPACE) else {
+        output.borrow_mut().diagnostic(&[
+            "Script error: diagnostic memory budget is full; the script was not started.",
+        ]);
+        drop(output);
+        tasks.finish_script(&task, Some(1), captured);
+        return;
+    };
     let host = Rc::new(RefCell::new(Host {
         service,
         session,
@@ -745,7 +1001,7 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
     }));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_vm(
-            &code,
+            &code.value,
             &script,
             receiver,
             Rc::clone(&host),
@@ -759,36 +1015,66 @@ fn run(work: Work, script: ScriptHandle, receiver: mpsc::Receiver<Wake>, runtime
     script.cancel_and_drain();
     let pending = script.finish();
     let exit_code = if script.0.stopped.load(Ordering::Acquire) {
-        output.borrow_mut().diagnostic(&format!(
-            "Script stopped: cancelled {} pending call(s): {}",
-            pending.len(),
-            pending_text(&pending)
-        ));
+        let count = pending.value.len().to_string();
+        let pending = pending_text(&pending.value);
+        output.borrow_mut().diagnostic(&[
+            "Script stopped: cancelled ",
+            &count,
+            " pending call(s): ",
+            &pending,
+        ]);
         None
     } else if script.0.exited.load(Ordering::Acquire) {
         Some(0)
-    } else if let Err(message) = result {
-        let suffix = if pending.is_empty() {
-            String::new()
+    } else if let Err(message) = &result {
+        let pending = pending_text(&pending.value);
+        let prefix = if pending.is_empty() {
+            ""
         } else {
-            format!("\nPending calls: {}", pending_text(&pending))
+            "\nPending calls: "
         };
         output
             .borrow_mut()
-            .diagnostic(&format!("Script error: {message}{suffix}"));
+            .diagnostic(&["Script error: ", message, prefix, &pending]);
         Some(1)
     } else {
         Some(0)
     };
+    drop(result);
     drop(output);
+    drop(diagnostic_lease);
     tasks.finish_script(&task, exit_code, captured);
+}
+
+fn push_diagnostic(text: &mut String, part: &str) -> bool {
+    let room = (DIAGNOSTIC_RESERVE as usize).saturating_sub(text.len());
+    if part.len() <= room {
+        text.push_str(part);
+        return true;
+    }
+    let mut end = part.len().min(room);
+    while !part.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.push_str(&part[..end]);
+    let mut end = text.len().min(DIAGNOSTIC_RESERVE as usize - 3);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("...");
+    false
 }
 
 fn describe<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
     use rquickjs::{Coerced, FromJs};
-    let prop = |object: &Object<'js>, key: &str| -> Option<String> {
-        match object.get::<_, Option<Coerced<String>>>(key) {
-            Ok(value) => value.map(|coerced| coerced.0),
+    // CString remains owned by QuickJS; only the bounded description is copied to Rust.
+    let prop = |object: &Object<'js>, key: &str| -> Option<rquickjs::CString<'js>> {
+        let result = object
+            .get::<_, Option<Coerced<rquickjs::String<'js>>>>(key)
+            .and_then(|value| value.map(|coerced| coerced.0.to_cstring()).transpose());
+        match result {
+            Ok(value) => value,
             Err(error) => {
                 if error.is_exception() {
                     let _ = ctx.catch();
@@ -797,31 +1083,46 @@ fn describe<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> String {
             }
         }
     };
+    let mut text = String::with_capacity(DIAGNOSTIC_RESERVE as usize);
     if let Some(exception) = value.as_exception() {
         let object = exception.as_object();
-        let name = prop(object, "name").unwrap_or_else(|| "Error".into());
-        let message = prop(object, "message").unwrap_or_default();
-        let stack = prop(object, "stack").unwrap_or_default();
-        let mut text = format!("{name}: {message}");
-        for line in stack
-            .lines()
-            .filter(|line| !line.contains("codemode-prelude.js"))
+        if !push_diagnostic(
+            &mut text,
+            prop(object, "name").as_deref().unwrap_or("Error"),
+        ) || !push_diagnostic(&mut text, ": ")
+            || !push_diagnostic(&mut text, prop(object, "message").as_deref().unwrap_or(""))
         {
-            text.push('\n');
-            text.push_str(line);
+            return text;
         }
-        text
+        if let Some(stack) = prop(object, "stack") {
+            for line in stack
+                .lines()
+                .filter(|line| !line.contains("codemode-prelude.js"))
+            {
+                if !push_diagnostic(&mut text, "\n") || !push_diagnostic(&mut text, line) {
+                    break;
+                }
+            }
+        }
     } else {
-        Coerced::<String>::from_js(ctx, value).map_or_else(
-            |error| {
+        match Coerced::<rquickjs::String>::from_js(ctx, value)
+            .and_then(|value| value.0.to_cstring())
+        {
+            Ok(value) => {
+                push_diagnostic(&mut text, &value);
+            }
+            Err(error) => {
                 if error.is_exception() {
                     let _ = ctx.catch();
                 }
-                "The script threw a value that cannot be described.".into()
-            },
-            |value| value.0,
-        )
+                push_diagnostic(
+                    &mut text,
+                    "The script threw a value that cannot be described.",
+                );
+            }
+        }
     }
+    text
 }
 
 fn is_js_whitespace(ch: char) -> bool {
@@ -890,7 +1191,7 @@ fn run_vm(
                 .map_err(|error| js_error(&ctx, error))?;
             let writing = Rc::clone(&output);
             let control = script.clone();
-            let write = Function::new(ctx.clone(), move |ctx: Ctx<'_>, text: String| {
+            let write = Function::new(ctx.clone(), move |ctx: Ctx<'_>, text: rquickjs::CString<'_>| {
                 if control.interrupted() {
                     return Err(Exception::throw_message(&ctx, "The script is ending."));
                 }
@@ -903,15 +1204,16 @@ fn run_vm(
             let launch_ctx = Arc::clone(&host.borrow().launch);
             let call = Function::new(
                 ctx.clone(),
-                move |ctx: Ctx<'_>, tool: String, args: String| {
-                    host.borrow_mut().call(tool, args).map_err(|error| {
-                        if error.starts_with("At most")
-                            || error == BRIDGE_ERROR
-                            || error == STARTS_ERROR
+                move |ctx: Ctx<'_>, tool: rquickjs::CString<'_>, args: rquickjs::CString<'_>| {
+                    host.borrow_mut().call(tool.as_str(), args.as_str()).map_err(|error| {
+                        let message = &error.value;
+                        if message.starts_with("At most")
+                            || message == BRIDGE_ERROR
+                            || message == STARTS_ERROR
                         {
-                            Exception::throw_range(&ctx, &error)
+                            Exception::throw_range(&ctx, message)
                         } else {
-                            Exception::throw_type(&ctx, &error)
+                            Exception::throw_type(&ctx, message)
                         }
                     })
                 },
@@ -924,13 +1226,23 @@ fn run_vm(
                 ctx.clone(),
                 move |ctx: Ctx<'_>,
                       mode: u8,
-                      payload: String,
-                      declared_mime: String,
-                      expected_kind: String|
+                      payload: rquickjs::CString<'_>,
+                      declared_mime: rquickjs::CString<'_>,
+                      expected_kind: rquickjs::CString<'_>|
                       -> rquickjs::Result<String> {
                     if control.interrupted() {
                         return Err(Exception::throw_message(&ctx, "The script is ending."));
                     }
+                    // The callback borrows VM strings. Path and MIME diagnostics
+                    // can create Rust copies independently of the media bytes.
+                    let copied = declared_mime.len()
+                        .saturating_add(expected_kind.len())
+                        .saturating_add(if mode == 1 { payload.len() } else { 0 });
+                    let _argument_workspace = launch_ctx.memory()
+                        .try_acquire(copied.saturating_mul(16).saturating_add(4096))
+                        .ok_or_else(|| Exception::throw_range(
+                            &ctx, "Server active memory budget is full."
+                        ))?;
                     let max_bytes = launch_ctx
                         .max_media_bytes()
                         .map_err(|err| Exception::throw_type(&ctx, &err))?;
@@ -1000,6 +1312,8 @@ fn run_vm(
                             };
                             drop(att_lease);
                             if loaded.len() as u64 != src_meta.size {
+                                drop(loaded);
+                                drop(loaded_lease);
                                 return Err(Exception::throw_type(
                                     &ctx,
                                     "Source attachment size changed on disk.",
@@ -1086,15 +1400,14 @@ fn run_vm(
                             }
                         }
                         _ => {
-                            // Borrow `&str` directly when free of whitespace to avoid a second Base64 copy.
-                            let cleaned_owned: Option<String> = payload
-                                .chars()
-                                .any(is_js_whitespace)
-                                .then(|| {
-                                    payload.chars().filter(|ch| !is_js_whitespace(*ch)).collect()
-                                });
-                            let b64_str = cleaned_owned.as_deref().unwrap_or(payload.as_str());
-                            let unpadded_len = b64_str.trim_end_matches('=').len();
+                            let clean_len: usize = payload.chars()
+                                .filter(|ch| !is_js_whitespace(*ch))
+                                .map(char::len_utf8).sum();
+                            let needs_cleaning = clean_len != payload.len();
+                            let unpadded_len: usize = payload.chars().rev()
+                                .skip_while(|ch| is_js_whitespace(*ch) || *ch == '=')
+                                .filter(|ch| !is_js_whitespace(*ch))
+                                .map(char::len_utf8).sum();
                             let min_decoded = (unpadded_len / 4)
                                 .saturating_mul(3)
                                 .saturating_add((unpadded_len % 4).saturating_sub(1));
@@ -1107,9 +1420,8 @@ fn run_vm(
                                 ));
                             }
                             let est_decoded =
-                                (b64_str.len() / 4).saturating_mul(3).saturating_add(3);
-                            let Some(mut inline_lease) = b64_str
-                                .len()
+                                (clean_len / 4).saturating_mul(3).saturating_add(3);
+                            let Some(mut inline_lease) = (if needs_cleaning { clean_len } else { 0usize })
                                 .checked_add(est_decoded)
                                 .and_then(|peak| launch_ctx.memory().try_acquire(peak))
                             else {
@@ -1118,6 +1430,12 @@ fn run_vm(
                                     "Server active memory budget is full.",
                                 ));
                             };
+                            let cleaned_owned = needs_cleaning.then(|| {
+                                let mut cleaned = String::with_capacity(clean_len);
+                                cleaned.extend(payload.chars().filter(|ch| !is_js_whitespace(*ch)));
+                                cleaned
+                            });
+                            let b64_str = cleaned_owned.as_deref().unwrap_or(payload.as_str());
                             let raw = base64::engine::general_purpose::STANDARD
                                 .decode(b64_str)
                                 .map_err(|_| {
@@ -1127,8 +1445,7 @@ fn run_vm(
                                     )
                                 })?;
                             drop(cleaned_owned);
-                            drop(payload);
-                            inline_lease.shrink_to(raw.len());
+                            inline_lease.shrink_to(raw.capacity());
                             if raw.len() as u64 > max_bytes {
                                 return Err(Exception::throw_range(
                                     &ctx,
@@ -1140,11 +1457,12 @@ fn run_vm(
                             let hint = (!declared_mime.is_empty()).then_some(declared_mime.as_str());
                             let det = media::detect_inline(&raw, hint)
                                 .map_err(|err| Exception::throw_type(&ctx, &err))?;
-                            if !expected_kind.is_empty() && det.kind.as_str() != expected_kind {
+                            if !expected_kind.is_empty() && det.kind.as_str() != expected_kind.as_str() {
                                 return Err(Exception::throw_type(
                                     &ctx,
                                     &format!(
-                                        "MCP {expected_kind} block contains {} ({}) bytes.",
+                                        "MCP {} block contains {} ({}) bytes.",
+                                        expected_kind.as_str(),
                                         det.kind.as_str(),
                                         det.mime
                                     ),
@@ -1264,10 +1582,11 @@ fn run_vm(
                             .map_err(|error| js_error(&ctx, error))?;
                         let settle: Function =
                             api.get("settle").map_err(|error| js_error(&ctx, error))?;
-                        let (ok, range, payload) = match outcome {
-                            Outcome::Value(value) => (true, false, value),
-                            Outcome::Error(error) => (false, false, error),
-                            Outcome::Limit => (false, true, BRIDGE_RESULT_ERROR.into()),
+                        let (ok, range, payload) = match &outcome {
+                            Outcome::Value(value) => (true, false, value.value.as_str()),
+                            Outcome::Error(error) => (false, false, *error),
+                            Outcome::Limit => (false, true, BRIDGE_RESULT_ERROR),
+                            Outcome::Memory => (false, true, BRIDGE_MEMORY_RESULT_ERROR),
                         };
                         settle
                             .call::<_, ()>((id, ok, payload, range))
@@ -2180,6 +2499,7 @@ mod tests {
                         transfer: false,
                         call_id: None,
                         service: Arc::clone(&self.service),
+                        input_owner: Default::default(),
                     },
                     &self.session,
                     tasks::random_chars(4).unwrap(),
@@ -2217,6 +2537,369 @@ mod tests {
     }
 
     #[test]
+    fn nested_precommit_prepaid_wire_covers_envelope_and_needs_no_new_admission() {
+        let mut structured = rmcp::model::CallToolResult::success(Vec::new());
+        structured.structured_content =
+            Some(json!({"ok":true,"text":"hello λ\n","nested":{"value":"quote\""}}));
+        let cases = [
+            (
+                structured,
+                json!({"ok":true,"value":{"text":"hello λ\n","nested":{"value":"quote\""}}}),
+            ),
+            (
+                rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                    "ordinary error",
+                )]),
+                json!({"ok":false,"value":{"error":"ordinary error"}}),
+            ),
+            (
+                rmcp::model::CallToolResult::success(Vec::new()),
+                json!({"ok":false,"value":{"error":"Tool operation failed."}}),
+            ),
+        ];
+        for (result, expected) in cases {
+            let encoded = serde_json::to_string(&expected).unwrap();
+            let wire = crate::ipc::json_len(&result).unwrap() + 256;
+            assert!(128 + encoded.len() <= wire);
+            let payload = service::result_payload_capacity(&result);
+            let pool = BytePool::new(payload + wire);
+            let tracked = files::TrackedResult::owned(
+                result,
+                crate::lease::Owner::new(pool.try_acquire(payload).unwrap()),
+            );
+            let prepaid = pool.try_acquire(wire).unwrap();
+            assert!(pool.try_acquire(1).is_none());
+            let outcome = encode_nested_result(tracked, &pool, None, Some(prepaid));
+            let Outcome::Value(value) = outcome else {
+                panic!("the prepaid result must encode");
+            };
+            assert_eq!(value.value, encoded);
+            assert_eq!(pool.used(), value.value.capacity());
+            let (sender, receiver) = mpsc::channel();
+            sender.send(value).unwrap();
+            drop(sender);
+            assert_eq!(pool.used(), encoded.len());
+            drop(receiver);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn nested_precommit_small_quota_replacement_is_atomic() {
+        let info = || CallInfo {
+            tool: "exec".into(),
+            action: None,
+            task_id: None,
+        };
+        let mut report = Report {
+            limit: Some(20),
+            ..Default::default()
+        };
+        report.admit(1, info(), 8, Default::default()).unwrap();
+        report.admit(2, info(), 2, Default::default()).unwrap();
+        assert!(report.result(1, 18));
+        assert_eq!(report.bridge_bytes, 20);
+        assert!(!report.result(1, 19));
+        assert_eq!((report.bridge_bytes, report.pending[&1].bytes), (20, 18));
+        assert!(report.result(1, 3));
+        assert_eq!(report.bridge_bytes, 5);
+        report.remove(1);
+        report.remove(2);
+        assert_eq!(report.bridge_bytes, 0);
+    }
+
+    #[test]
+    fn text_buffer_nested_envelope_moves_existing_strings() {
+        let pool = BytePool::new(512);
+        let mut body = String::with_capacity(128);
+        body.push_str("hello");
+        let pointer = body.as_ptr();
+        let mut fields = serde_json::Map::new();
+        fields.insert("text".into(), serde_json::Value::String(body));
+        let mut result = rmcp::model::CallToolResult::success(Vec::new());
+        result.structured_content = Some(serde_json::Value::Object(fields));
+        let tracked = files::TrackedResult {
+            result,
+            lease: pool.try_acquire(160),
+            overload: false,
+            task_meta: None,
+            payload_owner: Default::default(),
+        };
+        let workspace = pool.try_acquire(128).unwrap();
+        let envelope = nested_envelope(tracked);
+        assert_eq!(
+            envelope.value["value"]["text"].as_str().unwrap().as_ptr(),
+            pointer
+        );
+        assert_eq!(pool.used(), 288);
+        drop(envelope);
+        assert_eq!(pool.used(), 128);
+        drop(workspace);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() {
+        let expected = serde_json::to_string(&json!({
+            "ok": false, "value": { "error": "hello λ\n" }
+        }))
+        .unwrap();
+        for (budget, fits) in [
+            (128 + 128 + expected.len() - 1, false),
+            (128 + 128 + expected.len(), true),
+        ] {
+            let pool = BytePool::new(budget);
+            let mut body = String::with_capacity(128);
+            body.push_str("hello λ\n");
+            let tracked = files::TrackedResult {
+                result: rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                    body,
+                )]),
+                lease: pool.try_acquire(128),
+                overload: false,
+                task_meta: None,
+                payload_owner: Default::default(),
+            };
+            let outcome = encode_nested_result(tracked, &pool, None, None);
+            if !fits {
+                assert!(matches!(outcome, Outcome::Memory));
+                assert_eq!(pool.used(), 0);
+                continue;
+            }
+            let (sender, receiver) = mpsc::channel();
+            assert!(sender.send(Wake::Settled { id: 1, outcome }).is_ok());
+            drop(sender);
+            assert_eq!(pool.used(), expected.len());
+            let Wake::Settled {
+                outcome: Outcome::Value(payload),
+                ..
+            } = receiver.recv().unwrap()
+            else {
+                panic!("a completed bridge result");
+            };
+            assert_eq!(payload.value, expected);
+            let runtime = Runtime::new().unwrap();
+            let context = Context::full(&runtime).unwrap();
+            context.with(|ctx| {
+                let parse: Function = ctx
+                    .eval("(value) => JSON.parse(value).value.error === 'hello λ\\n'")
+                    .unwrap();
+                assert!(parse.call::<_, bool>((payload.value.as_str(),)).unwrap());
+                assert_eq!(pool.used(), expected.len());
+            });
+            drop(payload);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn nested_control_wire_uses_bounded_reserve_and_keeps_queue_owner() {
+        let expected = serde_json::to_string(&json!({"ok":true,"value":{"tasks":[]}})).unwrap();
+        for main_limit in [0, 128] {
+            for extra in [-1isize, 0, 1] {
+                let mut result = rmcp::model::CallToolResult::success(Vec::new());
+                result.structured_content = Some(json!({"ok":true,"tasks":[]}));
+                let payload = service::result_payload_capacity(&result);
+                let pool = BytePool::new(main_limit);
+                let needed = payload + 128 + expected.len();
+                let control = BytePool::new(needed.saturating_add_signed(extra));
+                let result = files::TrackedResult::owned(
+                    result,
+                    crate::lease::Owner::new(control.try_acquire(payload).unwrap()),
+                );
+                let outcome = encode_nested_result(result, &pool, Some(&control), None);
+                if extra < 0 {
+                    assert!(matches!(outcome, Outcome::Memory));
+                    assert_eq!((pool.used(), control.used()), (0, 0));
+                    continue;
+                }
+                let (sender, receiver) = mpsc::channel();
+                sender.send(Wake::Settled { id: 1, outcome }).unwrap();
+                drop(sender);
+                assert_eq!(pool.used(), 0);
+                assert_eq!(control.used(), expected.len());
+                let Wake::Settled {
+                    outcome: Outcome::Value(value),
+                    ..
+                } = receiver.recv().unwrap()
+                else {
+                    panic!("a control response");
+                };
+                assert_eq!(value.value, expected);
+                drop(value);
+                assert_eq!(control.used(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_control_replies_complete_with_main_full_and_sleep_stays_ordinary() {
+        let mut fixture = Fixture::new();
+        let main = BytePool::new(0);
+        let control = BytePool::new(8 << 20);
+        fixture.session = Session::new(
+            "control".into(),
+            "control".into(),
+            Arc::new(
+                fixture
+                    .session
+                    .launch
+                    .for_session()
+                    .with_memory(Arc::clone(&main))
+                    .with_control_memory(Arc::clone(&control)),
+            ),
+        );
+        let (snapshot, output) = fixture.result(
+            "const listed = await tools.exec({action:'list',scope:'all'});\n\
+             if(!Array.isArray(listed.tasks)) throw new Error('list did not return');\n\
+             try { await tools.exec({action:'kill',taskId:'aaaaaaaa-1'}); throw new Error('expected unknown task'); }\n\
+             catch(e) { if(!String(e).includes('Unknown taskId')) throw e; }\n\
+             try { await sleep(0); throw new Error('sleep used control reserve'); }\n\
+             catch(e) { if(!String(e).includes('not dispatched')) throw e; }\n\
+             text('control-complete');"
+        ).await;
+        assert_eq!(snapshot.exit_code, Some(0), "{output}");
+        assert_eq!(output, "control-complete\n");
+        assert_eq!((main.used(), control.used()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn text_buffer_nested_file_round_trip_releases_rust_staging() {
+        let mut fixture = Fixture::new();
+        let pool = BytePool::new(2 << 20);
+        fixture.session = Session::new(
+            "text-bridge".into(),
+            "text-bridge".into(),
+            Arc::new(
+                fixture
+                    .session
+                    .launch
+                    .for_session()
+                    .with_memory(Arc::clone(&pool)),
+            ),
+        );
+        let (snapshot, output) = fixture.result(
+            "await tools.write({path:'small.txt',content:'alpha\\nbeta\\n'});\n\
+             const whole = await tools.read({path:'small.txt'});\n\
+             const slice = await tools.read({path:'small.txt',offset:2,limit:1});\n\
+             if(whole.text !== 'alpha\\nbeta\\n' || slice.text !== 'beta\\n') throw new Error('text changed');\n\
+             text('text-round-trip');"
+        ).await;
+        assert_eq!(snapshot.exit_code, Some(0), "{output}");
+        assert_eq!(output, "text-round-trip\n");
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn text_buffer_bridge_control_classification_preserves_main_admission() {
+        let fixture = Fixture::new();
+        let memory = BytePool::new(0);
+        let control = BytePool::new(4096);
+        let launch = Arc::new(
+            fixture
+                .session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&memory))
+                .with_control_memory(Arc::clone(&control)),
+        );
+        let (script, worker) = prepare(Handle::current()).unwrap();
+        let mut host = Host {
+            service: Arc::clone(&fixture.service),
+            session: Arc::clone(&fixture.session),
+            launch,
+            transfer: false,
+            call_id: None,
+            runtime: Handle::current(),
+            script: script.clone(),
+            start_permits: Arc::new(Semaphore::new(0)),
+            io_permits: Arc::new(Semaphore::new(0)),
+            next: 1,
+            starts: 0,
+        };
+        let error = host.call("read", r#"{"path":"small.txt"}"#).unwrap_err();
+        assert!(error.value.contains("not dispatched"));
+        assert!(lock(&script.0.report).pending.is_empty());
+        assert!(
+            control.used() > 0,
+            "the synchronous error still owns its input workspace"
+        );
+        drop(error);
+        assert_eq!(control.used(), 0);
+        let sleep_error = host.call("sleep", "0").unwrap_err();
+        assert!(sleep_error.value.contains("not dispatched"));
+        assert!(lock(&script.0.report).pending.is_empty());
+        drop(sleep_error);
+        assert_eq!(control.used(), 0);
+        host.call("exec", r#"{"action":"kill","taskId":"aaaaaaaa-1"}"#)
+            .unwrap();
+        assert!(control.used() > 0);
+        script.kill();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *lock(&script.0.in_flight.0) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let pending = script.finish();
+        assert!(
+            control.used() > 0,
+            "temporary report strings still hold their input allowance"
+        );
+        drop(pending);
+        drop(host);
+        drop(worker);
+        // The waiting VM thread drops its receiver after the worker channel closes;
+        // a completed control reply keeps its wire owner until that happens.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while control.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(memory.used(), 0);
+        assert_eq!(control.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn report_snapshot_reserves_spare_capacity_and_retains_its_owner() {
+        let (script, _worker) = prepare(Handle::current()).unwrap();
+        let mut tool = String::with_capacity(128);
+        tool.push_str("read");
+        let mut handle = String::with_capacity(256);
+        handle.push_str("task-1.abcd");
+        {
+            let mut report = lock(&script.0.report);
+            report.cancelled.push(CallInfo {
+                tool,
+                action: None,
+                task_id: None,
+            });
+            report.started.push(handle);
+        }
+        let memory = BytePool::new(1024);
+        let control = BytePool::new(4096);
+        assert!(script.report(&memory, None).is_none());
+        assert_eq!(memory.used(), 0);
+        let snapshot = script.report(&memory, Some(&control)).unwrap();
+        assert!(control.used() > memory.limit());
+        assert_eq!(snapshot.cancelled[0].tool, "read");
+        assert_eq!(snapshot.started, ["task-1.abcd"]);
+        script.record_started("task-2.abcd".into());
+        assert_eq!(snapshot.started, ["task-1.abcd"]);
+        assert_eq!(lock(&script.0.report).started.len(), 2);
+        let retained = control.used();
+        assert!(retained > 0);
+        assert!(script.report(&memory, Some(&control)).is_none());
+        assert_eq!(control.used(), retained);
+        drop(snapshot);
+        assert_eq!(control.used(), 0);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
     fn bridge_budget_replaces_arguments_with_results_and_releases_them() {
         let info = || CallInfo {
             tool: "read".into(),
@@ -2224,10 +2907,18 @@ mod tests {
             task_id: None,
         };
         let mut report = Report::default();
-        report.admit(1, info(), BRIDGE_LIMIT - 4).unwrap();
-        report.admit(2, info(), 4).unwrap();
-        assert_eq!(report.admit(3, info(), 1).unwrap_err(), BRIDGE_ERROR);
+        report
+            .admit(1, info(), BRIDGE_LIMIT - 4, Default::default())
+            .unwrap();
+        report.admit(2, info(), 4, Default::default()).unwrap();
+        assert_eq!(
+            report.admit(3, info(), 1, Default::default()).unwrap_err(),
+            BRIDGE_ERROR
+        );
         assert!(!report.result(1, BRIDGE_LIMIT));
+        assert_eq!(report.bridge_bytes, BRIDGE_LIMIT);
+        assert_eq!(report.pending[&1].bytes, BRIDGE_LIMIT - 4);
+        report.remove(1);
         assert_eq!(report.bridge_bytes, 4);
         assert!(report.result(2, BRIDGE_LIMIT));
         assert_eq!(report.bridge_bytes, BRIDGE_LIMIT);
@@ -2235,7 +2926,7 @@ mod tests {
         assert_eq!(report.bridge_bytes, 0);
         report.remove(1);
         assert!(report.pending.is_empty());
-        report.admit(3, info(), 8).unwrap();
+        report.admit(3, info(), 8, Default::default()).unwrap();
         assert!(report.result(3, 12));
         assert_eq!(report.bridge_bytes, 12);
         report.remove(3);
@@ -2280,19 +2971,16 @@ mod tests {
             starts: MAX_STARTS - 1,
         };
         let args = json!({"action":"start","command":"true"}).to_string();
-        host.call("exec".into(), args.clone()).unwrap();
+        host.call("exec", &args).unwrap();
         assert_eq!(host.starts, MAX_STARTS);
-        assert_eq!(host.call("exec".into(), args).unwrap_err(), STARTS_ERROR);
+        assert_eq!(host.call("exec", &args).unwrap_err().value, STARTS_ERROR);
         assert_eq!(host.starts, MAX_STARTS);
         // Unvalidated start requests resolve as tool errors without consuming start slots.
-        host.call(
-            "exec".into(),
-            json!({"action":"start","command":""}).to_string(),
-        )
-        .unwrap();
+        host.call("exec", &json!({"action":"start","command":""}).to_string())
+            .unwrap();
         assert_eq!(host.starts, MAX_STARTS);
         assert_eq!(lock(&script.0.report).pending.len(), 2);
-        host.call("read".into(), json!({"path":"missing"}).to_string())
+        host.call("read", &json!({"path":"missing"}).to_string())
             .unwrap();
         assert_eq!(host.starts, MAX_STARTS);
         script.kill();
@@ -2405,6 +3093,75 @@ mod tests {
             assert_eq!(state.exit_code, Some(0), "{output}");
             assert_eq!(output, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_bounded_before_rust_copy_and_admitted_before_vm() {
+        for fits in [false, true] {
+            let mut fixture = Fixture::new();
+            let control = BytePool::new(DIAGNOSTIC_WORKSPACE - usize::from(!fits));
+            fixture.session = Session::new(
+                "diagnostic".into(),
+                "diagnostic".into(),
+                Arc::new(
+                    fixture
+                        .session
+                        .launch
+                        .for_session()
+                        .with_control_memory(Arc::clone(&control)),
+                ),
+            );
+            for code in [
+                "throw 'é'.repeat(2100);",
+                "const e = new Error('é'.repeat(2100)); e.stack = 'stack'.repeat(1100); throw e;",
+            ] {
+                let (state, output) = fixture.result(code).await;
+                assert_eq!(state.exit_code, Some(1), "{output}");
+                assert!(output.len() <= DIAGNOSTIC_RESERVE as usize, "{output}");
+                if fits {
+                    assert!(output.starts_with("Script error: "));
+                    assert!(output.contains('é'));
+                    assert!(output.ends_with("...\n"));
+                } else {
+                    assert_eq!(
+                        output,
+                        "Script error: diagnostic memory budget is full; the script was not started.\n"
+                    );
+                }
+                assert_eq!(control.used(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_workspace_stays_with_running_vm_until_final_output() {
+        let mut fixture = Fixture::new();
+        let control = BytePool::new(DIAGNOSTIC_WORKSPACE);
+        fixture.session = Session::new(
+            "diagnostic".into(),
+            "diagnostic".into(),
+            Arc::new(
+                fixture
+                    .session
+                    .launch
+                    .for_session()
+                    .with_control_memory(Arc::clone(&control)),
+            ),
+        );
+        let task = fixture.start("await sleep(60000);", Some(5000));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while control.used() != DIAGNOSTIC_WORKSPACE {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!*task.done().borrow());
+        task.kill().unwrap();
+        complete(&task).await;
+        let output = std::fs::read_to_string(&task.log_path).unwrap();
+        assert!(output.starts_with("Script stopped: "));
+        assert_eq!(control.used(), 0);
     }
 
     #[tokio::test]
@@ -2525,10 +3282,10 @@ mod tests {
         assert_eq!(task.snapshot().exit_code, Some(0));
         let script = task.script().unwrap();
         assert!(script.0.cancel.is_cancelled());
-        let (cancelled, started) = script.report();
-        assert_eq!(cancelled.len(), 20);
-        assert!(cancelled.iter().all(|call| call.tool == "read"));
-        assert!(started.is_empty());
+        let report = script.report(crate::lease::process_pool(), None).unwrap();
+        assert_eq!(report.cancelled.len(), 20);
+        assert!(report.cancelled.iter().all(|call| call.tool == "read"));
+        assert!(report.started.is_empty());
         assert_eq!(std::fs::read_to_string(&task.log_path).unwrap(), "done\n");
     }
 
@@ -2548,6 +3305,7 @@ mod tests {
                     task_id: None,
                 },
                 0,
+                Default::default(),
             )
             .unwrap();
         task.kill().unwrap();
@@ -2563,7 +3321,13 @@ mod tests {
             still_running,
             "script finished before the admitted start registered"
         );
-        assert_eq!(script.report().1, vec![handle]);
+        assert_eq!(
+            script
+                .report(crate::lease::process_pool(), None)
+                .unwrap()
+                .started,
+            vec![handle]
+        );
         assert_eq!(task.snapshot().state, "killed");
     }
 
@@ -2617,6 +3381,32 @@ mod tests {
             assert!(output.contains("Script error:"));
             assert!(output.len() <= TASK_LOG_LIMIT as usize);
         }
+    }
+
+    #[tokio::test]
+    async fn inline_whitespace_copy_is_admitted_before_allocation() {
+        let mut fixture = Fixture::new();
+        let pool = crate::lease::BytePool::new(4096);
+        fixture.session = Session::new(
+            "inline-budget".into(),
+            "inline-budget".into(),
+            Arc::new(
+                LaunchContext::new(fixture.dir.clone(), Vec::new()).with_memory(Arc::clone(&pool)),
+            ),
+        );
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let code = format!("attach('data:image/png;base64,' + ' '.repeat(8192) + {encoded:?});");
+        let (state, output) = fixture.result(&code).await;
+        assert_eq!(state.exit_code, Some(1), "{output}");
+        assert!(output.contains("active memory budget is full"), "{output}");
+        assert_eq!(pool.used(), 0);
     }
 
     #[tokio::test]
@@ -2854,6 +3644,7 @@ mod tests {
                     transfer: false,
                     call_id: None,
                     service: tight_service,
+                    input_owner: Default::default(),
                 },
                 &tight_session,
                 "q001".into(),
@@ -3324,7 +4115,7 @@ mod tests {
             "output": "captured-before-err",
             "inputError": "INPUT_WRITE_FAILED: broken pipe",
         }));
-        let parsed = nested_envelope(synth);
+        let parsed = nested_envelope(files::TrackedResult::plain(synth)).value;
         assert_eq!(parsed["ok"], false);
         assert!(parsed["value"].get("ok").is_none());
         assert_eq!(parsed["value"]["output"], "captured-before-err");
@@ -3534,9 +4325,13 @@ mod tests {
         complete(&sleeping).await;
         assert!(kill_t.elapsed() < Duration::from_secs(3));
         assert_eq!(sleeping.snapshot().state, "killed");
-        let (cancelled, _) = sleeping.script().unwrap().report();
-        assert_eq!(cancelled.len(), 1);
-        assert_eq!(cancelled[0].tool, "sleep");
+        let report = sleeping
+            .script()
+            .unwrap()
+            .report(crate::lease::process_pool(), None)
+            .unwrap();
+        assert_eq!(report.cancelled.len(), 1);
+        assert_eq!(report.cancelled[0].tool, "sleep");
     }
 
     #[tokio::test]

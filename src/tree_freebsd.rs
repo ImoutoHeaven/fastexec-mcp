@@ -1,6 +1,6 @@
 //! FreeBSD's kernel reaper owns detached descendants and selects signal targets itself.
 
-use crate::process::Member;
+use crate::process::{Member, MemberBudget};
 use std::io;
 
 // The public, padded ABI in <sys/procctl.h>; libc exposes the commands but not these records.
@@ -262,8 +262,9 @@ fn info(pid: libc::pid_t) -> io::Result<Option<libc::kinfo_proc>> {
     Ok(Some(value))
 }
 
-pub fn members(host: libc::pid_t) -> io::Result<Vec<Member>> {
+pub fn members(host: libc::pid_t, budget: &mut MemberBudget<'_>) -> io::Result<Vec<Member>> {
     'scan: for _ in 0..8 {
+        budget.reset();
         let root = match host_status(host)? {
             HostReaper::Active(status) => status,
             HostReaper::CleanExit => return Ok(Vec::new()),
@@ -290,6 +291,11 @@ pub fn members(host: libc::pid_t) -> io::Result<Vec<Member>> {
                             }
                             continue;
                         }
+                        if !budget.temporary(info.ki_comm.len().saturating_mul(11)) {
+                            return Err(io::Error::other(
+                                "member names exceed the active memory budget",
+                            ));
+                        }
                         let bytes: Vec<u8> = info
                             .ki_comm
                             .iter()
@@ -311,8 +317,16 @@ pub fn members(host: libc::pid_t) -> io::Result<Vec<Member>> {
                         continue;
                     }
                     // A process hidden by credential policy is still owned and must stay visible as held.
-                    Err(_) => "unknown".into(),
+                    Err(_) => {
+                        if !budget.temporary(7) {
+                            return Err(io::Error::other(
+                                "member names exceed the active memory budget",
+                            ));
+                        }
+                        "unknown".into()
+                    }
                 };
+                budget.retain(name.capacity());
                 members.push(Member {
                     pid: pid.pid as u32,
                     name,
@@ -363,7 +377,11 @@ mod tests {
         clean.stdout.take().unwrap().read_to_end(&mut eof).unwrap();
         let clean_pid = clean.id() as libc::pid_t;
         assert!(matches!(host_exit(clean_pid, true), HostExit::Clean));
-        assert!(members(clean_pid).unwrap().is_empty());
+        assert!(
+            members(clean_pid, &mut MemberBudget::unlimited())
+                .unwrap()
+                .is_empty()
+        );
         assert!(matches!(kill(clean_pid).unwrap(), KillResult::EmptyHost));
         assert!(clean.wait().unwrap().success());
 
@@ -375,7 +393,7 @@ mod tests {
         killed.stdout.take().unwrap().read_to_end(&mut eof).unwrap();
         let killed_pid = killed.id() as libc::pid_t;
         assert!(matches!(host_exit(killed_pid, true), HostExit::Abnormal));
-        assert!(members(killed_pid).is_err());
+        assert!(members(killed_pid, &mut MemberBudget::unlimited()).is_err());
         assert!(matches!(kill(killed_pid).unwrap(), KillResult::HostGone));
         assert!(!killed.wait().unwrap().success());
     }

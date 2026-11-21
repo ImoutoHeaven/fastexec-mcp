@@ -1,9 +1,10 @@
 //! Task registry: spawn, log capture, unseen-output cursors, input queues, and shutdown.
 
 use crate::codemode;
+use crate::lease::{BytePool, Lease};
 use crate::media::MediaKind;
 use crate::output::{
-    Matcher, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix,
+    Matcher, Truncate, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix_reader,
     incomplete_utf8_suffix,
 };
 use crate::process::{self, Launch, Member, Tree};
@@ -86,6 +87,10 @@ struct PendingDelete {
 
 #[cfg(test)]
 type RemoveHook = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+#[cfg(test)]
+type LogWriteHook = Arc<dyn Fn(&mut File, &[u8]) -> std::io::Result<()> + Send + Sync>;
+#[cfg(test)]
+type LogTruncateHook = Arc<dyn Fn(&File, u64) -> std::io::Result<()> + Send + Sync>;
 
 pub struct Tasks {
     dir: PathBuf,
@@ -107,6 +112,10 @@ pub struct Tasks {
     delete_retry_gate: Mutex<()>,
     #[cfg(test)]
     remove_hook: Mutex<Option<RemoveHook>>,
+    #[cfg(test)]
+    log_write_hook: Mutex<Option<LogWriteHook>>,
+    #[cfg(test)]
+    log_truncate_hook: Mutex<Option<LogTruncateHook>>,
 }
 
 #[derive(Default)]
@@ -610,6 +619,15 @@ struct Pty {
     spool: Spool,
 }
 
+fn terminal_memory_error(memory: &BytePool, task: &Task) -> String {
+    format!(
+        "Server active memory budget ({} bytes) cannot fit the terminal snapshot; the operation may have run (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId without input once in-flight transfers complete.",
+        memory.limit(),
+        task.id,
+        crate::files::display_path(&task.log_path)
+    )
+}
+
 /// A PTY task's transcript file: the final lines, those the terminal wrote out, then the
 /// pending lines as the last `transcript` read them.
 struct Spool {
@@ -638,6 +656,8 @@ pub struct Transcript {
     pub cut: bool,
     /// Why the file takes no more lines.
     pub stopped: Option<String>,
+    /// Keeps snapshot buffers charged until the caller finishes consuming them.
+    pub(crate) _lease: Lease,
 }
 
 /// The rendered terminal of a PTY task.
@@ -651,11 +671,15 @@ pub struct Screen {
     pub cursor: (u16, u16),
     /// End of the readable log at the moment the screen was taken.
     pub log_end: u64,
+    /// Keeps snapshot buffers charged until the caller finishes consuming them.
+    pub(crate) _lease: Lease,
 }
 
 #[derive(Default)]
 struct Output {
     written: u64,
+    /// Reserved bytes past the confirmed prefix when a failed write could not be truncated.
+    log_tail: u64,
     /// End of the readable log: excludes an unfinished UTF-8 sequence while output continues.
     readable: u64,
     lines: u64,
@@ -670,7 +694,7 @@ struct Output {
     /// When the last output byte arrived, stored or not, or the end of a synchronized update by
     /// timeout or end of output showed the frame it held.
     last_output: Option<Instant>,
-    /// Bytes the transcript file holds, counted under the total log limit.
+    /// Transcript charge, including any failed write whose rollback was not confirmed.
     transcript: u64,
     next_attachment_index: usize,
     pending_attachments: usize,
@@ -698,6 +722,7 @@ struct Input {
     eof: bool,
     initial: bool,
     done: Option<oneshot::Sender<Result<(), String>>>,
+    _input_owner: crate::lease::Owner,
 }
 
 /// Task state for rendering.
@@ -730,6 +755,7 @@ pub struct Snapshot {
 }
 
 pub type Started = (Arc<Task>, Arc<TaskEntry>, Arc<Reader>);
+pub type ListedTasks = (usize, Vec<(Arc<Task>, Snapshot)>);
 
 pub struct StartArgs {
     pub command: String,
@@ -752,6 +778,7 @@ pub struct StartArgs {
     pub started_by: Option<(String, u64)>,
     /// What the task inherits: its environment, and the bash found in it.
     pub launch: Arc<LaunchContext>,
+    pub input_owner: crate::lease::Owner,
 }
 
 pub(crate) struct ScriptArgs {
@@ -761,6 +788,7 @@ pub(crate) struct ScriptArgs {
     pub transfer: bool,
     pub call_id: Option<u64>,
     pub service: Arc<crate::service::Service>,
+    pub input_owner: crate::lease::Owner,
 }
 
 /// The process-backed tests serialize their shared fixtures.
@@ -818,6 +846,10 @@ impl Tasks {
             delete_retry_gate: Mutex::new(()),
             #[cfg(test)]
             remove_hook: Mutex::new(None),
+            #[cfg(test)]
+            log_write_hook: Mutex::new(None),
+            #[cfg(test)]
+            log_truncate_hook: Mutex::new(None),
         }))
     }
 
@@ -829,6 +861,22 @@ impl Tasks {
     #[cfg(test)]
     pub(crate) fn set_remove_hook(&self, hook: Option<RemoveHook>) {
         *lock(&self.remove_hook) = hook;
+    }
+
+    fn write_log(&self, file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = lock(&self.log_write_hook).clone() {
+            return hook(file, bytes);
+        }
+        file.write_all(bytes)
+    }
+
+    fn truncate_log(&self, file: &File, bytes: u64) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = lock(&self.log_truncate_hook).clone() {
+            return hook(file, bytes);
+        }
+        file.set_len(bytes)
     }
 
     pub fn find(&self, id: &str) -> Option<Arc<Task>> {
@@ -865,45 +913,84 @@ impl Tasks {
         all_scope: bool,
         active_filter: Option<bool>,
         limit: usize,
-    ) -> (usize, Vec<(Arc<Task>, Snapshot)>) {
+        reserve: &mut impl FnMut(usize) -> Result<(), String>,
+        members: &mut impl FnMut(&Tree) -> Result<Option<Vec<Member>>, String>,
+    ) -> Result<ListedTasks, String> {
         let (total_count, mut selected) = {
             let registry = lock(&self.registry);
             let touched = session.touched(&registry.tasks);
             let mut total_count = 0usize;
             let mut selected = Vec::with_capacity(limit.min(registry.tasks.len()));
-            let mut consider = |task: &Arc<Task>| {
+            let mut consider = |task: &Arc<Task>| -> Result<(), String> {
                 let (end, tree_done) = {
                     let end = lock(&task.end);
                     let tree_done = *task.tree_done.borrow();
                     let active = end.as_ref().is_none_or(|end| end.kept && !tree_done);
                     if active_filter.is_some_and(|want| want != active) {
-                        return;
+                        return Ok(());
                     }
                     total_count += 1;
                     if selected.len() == limit {
-                        return;
+                        return Ok(());
+                    }
+                    // Immutable text and per-row keys are admitted before any snapshot,
+                    // display path, JSON field or formatted row copies them.
+                    let text = task
+                        .owner
+                        .len()
+                        .saturating_add(task.id.len())
+                        .saturating_add(
+                            task.started_by
+                                .as_ref()
+                                .map_or(0, |(session, _)| session.len()),
+                        )
+                        .saturating_add(
+                            task.command
+                                .chars()
+                                .take(120)
+                                .map(char::len_utf8)
+                                .sum::<usize>(),
+                        )
+                        .saturating_add(
+                            task.log_path
+                                .as_os_str()
+                                .as_encoded_bytes()
+                                .len()
+                                .saturating_mul(3),
+                        )
+                        .saturating_add(512);
+                    reserve(text)?;
+                    if let Some(end) = end.as_ref() {
+                        for member in &end.leftovers {
+                            reserve(member.name.len().saturating_add(32))?;
+                        }
                     }
                     (end.clone(), tree_done)
                 };
-                selected.push((Arc::clone(task), task.snapshot_at(end, tree_done)));
+                let snapshot = task.snapshot_at_reserved(end, tree_done, reserve)?;
+                selected.push((Arc::clone(task), snapshot));
+                Ok(())
             };
             if all_scope {
                 for task in registry.tasks.iter().rev() {
-                    consider(task);
+                    consider(task)?;
                 }
             } else {
                 for (task, _) in &touched {
-                    consider(task);
+                    consider(task)?;
                 }
             }
             (total_count, selected)
         };
         for (task, snapshot) in &mut selected {
             if snapshot.kept {
-                snapshot.held = task.root.members().unwrap_or_default();
+                snapshot.held = match &task.root {
+                    Root::Process(tree) => members(tree)?.unwrap_or_default(),
+                    Root::Script(_) => Vec::new(),
+                };
             }
         }
-        (total_count, selected)
+        Ok((total_count, selected))
     }
 
     /// Takes a place against [`Limits::max_running`] and the next task ID. The guard gives the
@@ -1057,6 +1144,7 @@ impl Tasks {
                     eof,
                     initial: true,
                     done: None,
+                    _input_owner: args.input_owner.clone(),
                 })
                 .expect("input_rx is held in this frame");
         }
@@ -1267,6 +1355,7 @@ impl Tasks {
             task: Arc::clone(&task),
             tasks: Arc::clone(self),
             captured,
+            input_owner: args.input_owner,
         });
         Ok((task, entry, reader))
     }
@@ -1500,7 +1589,7 @@ impl Tasks {
                 return;
             }
             out.evicted = true;
-            let written = out.written;
+            let written = out.written + out.log_tail;
             let transcript = out.transcript;
             let has_transcript = task.pty || transcript > 0;
             let attachments = std::mem::take(&mut out.attachments);
@@ -1949,7 +2038,7 @@ impl Spool {
                     self.pending = 0;
                     return false;
                 };
-                file.set_len(self.bytes)
+                shared.truncate_log(file, self.bytes)
             };
             if let Err(error) = truncated {
                 self.stopped = Some(format!("writing it failed: {error}"));
@@ -1969,14 +2058,18 @@ impl Spool {
         let write_result = {
             let mut file_guard = lock(&task.transcript_file);
             match file_guard.as_mut() {
-                Some(file) => Some(
-                    file.seek(SeekFrom::Start(self.bytes))
-                        .and_then(|_| file.write_all(text)),
-                ),
+                Some(file) => {
+                    let result = file
+                        .seek(SeekFrom::Start(self.bytes))
+                        .and_then(|_| shared.write_log(file, text));
+                    let rolled_back =
+                        result.is_err() && shared.truncate_log(file, self.bytes).is_ok();
+                    Some((result, rolled_back))
+                }
                 None => None,
             }
         };
-        let Some(write_result) = write_result else {
+        let Some((write_result, rolled_back)) = write_result else {
             shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
             return false;
         };
@@ -1997,13 +2090,15 @@ impl Spool {
                 true
             }
             Err(error) => {
-                if lock(&task.out).evicted {
+                if rolled_back {
+                    shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                } else if !shared.hold(task, size) {
                     let closed = lock(&task.transcript_file).take();
                     drop(closed);
                     shared.reclaim_file(task.transcript_path(), size);
-                } else {
-                    shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
                 }
+                // Unconfirmed bytes stay charged, but never become final or pending lines.
+                // Stopping also prevents later transcript refreshes from overwriting this tail.
                 self.stopped = Some(format!("writing it failed: {error}"));
                 false
             }
@@ -2107,6 +2202,7 @@ fn answer_program(task: &Task, answer: &mpsc::Sender<Input>, reply: Vec<u8>) {
             eof: false,
             initial: false,
             done: None,
+            _input_owner: Default::default(),
         })
     {
         task.queued.fetch_sub(error.0.bytes.len(), Ordering::SeqCst);
@@ -2181,28 +2277,32 @@ fn capture(
         }
         // Storing stops at the first byte that does not fit, so the log stays a prefix of the
         // output: a later chunk that would fit is not stored after the gap.
-        let room = {
+        let (room, prefix) = {
             let out = lock(&task.out);
-            if out.evicted || out.dropped > 0 {
+            let room = if out.evicted || out.dropped > 0 {
                 0
             } else {
                 TASK_LOG_LIMIT - out.written
-            }
+            };
+            (room, out.written)
         };
         let keep = &chunk[..chunk.len().min(room as usize)];
         let size = keep.len() as u64;
         let mut stored = false;
+        let mut retained_tail = false;
         let mut write_error = None;
         if size > 0
             && let Some(file) = log.as_mut()
             && shared.reserve(size)
         {
-            match file.write_all(keep) {
+            match shared.write_log(file, keep) {
                 Ok(()) => stored = true,
                 Err(error) => {
-                    // A partial write leaves bytes past `written`; storing nothing more keeps
-                    // every readable offset valid.
-                    shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                    if shared.truncate_log(file, prefix).is_ok() {
+                        shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                    } else {
+                        retained_tail = true;
+                    }
                     log = None;
                     write_error = Some(error.to_string());
                 }
@@ -2214,10 +2314,12 @@ fn capture(
         }
         // An eviction since the room check may not have known about these bytes yet; drop the
         // handle and reclaim the file after recording dropped bytes and output activity.
-        let reclaim_evicted = stored && out.evicted;
+        let reclaim_evicted = (stored || retained_tail) && out.evicted;
         if reclaim_evicted {
             stored = false;
             log = None;
+        } else if retained_tail {
+            out.log_tail += size;
         }
         let stored = if stored { keep } else { &[] };
         if !stored.is_empty() {
@@ -2461,6 +2563,20 @@ impl Task {
         snapshot
     }
 
+    /// State used by script reports, without copying logs or process diagnostics.
+    pub fn report_state(&self) -> (&'static str, bool) {
+        let (state, held_past_exit) = {
+            let end = lock(&self.end);
+            let state = match end.as_ref() {
+                None => "running",
+                Some(end) if end.killed => "killed",
+                Some(_) => "exited",
+            };
+            (state, end.as_ref().is_some_and(|end| end.kept))
+        };
+        (state, held_past_exit && !*self.tree_done.borrow())
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let end = lock(&self.end).clone();
         let tree_done = *self.tree_done.borrow();
@@ -2468,9 +2584,25 @@ impl Task {
     }
 
     fn snapshot_at(&self, end: Option<Final>, tree_done: bool) -> Snapshot {
+        self.snapshot_at_reserved(end, tree_done, &mut |_| Ok(()))
+            .expect("unrestricted snapshot")
+    }
+
+    fn snapshot_at_reserved(
+        &self,
+        end: Option<Final>,
+        tree_done: bool,
+        reserve: &mut impl FnMut(usize) -> Result<(), String>,
+    ) -> Result<Snapshot, String> {
+        let mut copy = |value: &Option<String>| {
+            if let Some(text) = value {
+                reserve(text.len())?;
+            }
+            Ok::<_, String>(value.clone())
+        };
         let held_past_exit = end.as_ref().is_some_and(|end| end.kept);
         let out = lock(&self.out);
-        Snapshot {
+        Ok(Snapshot {
             state: match &end {
                 None => "running",
                 Some(end) if end.killed => "killed",
@@ -2486,22 +2618,22 @@ impl Task {
             evicted: out.evicted,
             output_open: end.as_ref().is_some_and(|end| end.output_open) && !out.closed,
             expired: end.as_ref().is_some_and(|end| end.expired),
-            log_error: out.log_error.clone(),
-            capture_error: out.capture_error.clone(),
-            input_warning: lock(&self.input_warning).clone(),
-            input_error: lock(&self.input_error).clone(),
+            log_error: copy(&out.log_error)?,
+            capture_error: copy(&out.capture_error)?,
+            input_warning: copy(&lock(&self.input_warning))?,
+            input_error: copy(&lock(&self.input_error))?,
             // A kill can record an error after the ender confirms completion. Only an
             // unconfirmed tree can still need a retry.
             kill_error: if tree_done {
                 None
             } else {
-                lock(&self.kill_error).clone()
+                copy(&lock(&self.kill_error))?
             },
             leftovers: end.map(|end| end.leftovers).unwrap_or_default(),
             kept: held_past_exit && !tree_done,
             tree_ended: held_past_exit && tree_done,
             held: Vec::new(),
-        }
+        })
     }
 
     /// Reserves room in the input queue for `size` bytes.
@@ -2630,13 +2762,16 @@ impl Task {
     }
 
     /// The rendered terminal of a PTY task.
-    pub fn screen(&self) -> Result<Screen, String> {
+    pub fn screen(&self, memory: &Arc<BytePool>) -> Result<Screen, String> {
         self.check_size()?;
         let terminal = lock(
             self.terminal
                 .as_ref()
                 .ok_or("screen applies to PTY tasks only.")?,
         );
+        let lease = memory
+            .try_acquire(terminal.live.screen_snapshot_bytes())
+            .ok_or_else(|| terminal_memory_error(memory, self))?;
         let (rows, cursor) = terminal.live.screen()?;
         let log_end = lock(&self.out).readable.min(terminal.live.shown());
         // The screen and its dimensions are one snapshot of the emulator's grid: another call's
@@ -2648,6 +2783,7 @@ impl Task {
             rows,
             cursor,
             log_end,
+            _lease: lease,
         })
     }
 
@@ -2660,7 +2796,12 @@ impl Task {
     /// Writes the pending lines into the transcript file after its final lines, and returns
     /// what this read covers: the final lines no earlier read of this session has shown, then
     /// the pending lines. The caller commits the next position only after reading them.
-    pub fn transcript(&self, shared: &Tasks, state: &ReadState) -> Result<Transcript, String> {
+    pub fn transcript(
+        &self,
+        shared: &Tasks,
+        state: &ReadState,
+        memory: &Arc<BytePool>,
+    ) -> Result<Transcript, String> {
         let terminal = self
             .terminal
             .as_ref()
@@ -2676,6 +2817,13 @@ impl Task {
         }
         // The result shows the pending lines only as the file holds them, those that fit the
         // per-task limit.
+        let lease = if spool.stopped.is_none() {
+            memory
+                .try_acquire(live.pending_snapshot_bytes())
+                .ok_or_else(|| terminal_memory_error(memory, self))?
+        } else {
+            Lease::empty(memory)
+        };
         let mut pending = String::new();
         let mut cut = false;
         if spool.stopped.is_none() {
@@ -2707,6 +2855,7 @@ impl Task {
             pending,
             cut,
             stopped,
+            _lease: lease,
         })
     }
 
@@ -2716,8 +2865,9 @@ impl Task {
         input: Option<&[u8]>,
         eof: bool,
         cancel: &CancellationToken,
+        input_owner: crate::lease::Owner,
     ) -> Result<(), String> {
-        let Some(done) = self.queue_input(input, eof)? else {
+        let Some(done) = self.queue_input(input, eof, input_owner)? else {
             return Ok(());
         };
         let uncertain = tokio::select! {
@@ -2745,6 +2895,7 @@ impl Task {
         &self,
         input: Option<&[u8]>,
         eof: bool,
+        input_owner: crate::lease::Owner,
     ) -> Result<Option<oneshot::Receiver<Result<(), String>>>, String> {
         // A pipe write, including an explicit empty string, requires writable stdin.
         let data = input.filter(|bytes| !self.pty || !bytes.is_empty());
@@ -2802,6 +2953,7 @@ impl Task {
                 eof,
                 initial: false,
                 done: Some(done),
+                _input_owner: input_owner,
             })
             .is_err()
         {
@@ -2990,10 +3142,8 @@ impl Task {
             }
             from = chunk_start;
         }
-        let mut tail = vec![0_u8; (end - from) as usize];
         file.seek(SeekFrom::Start(from))?;
-        file.read_exact(&mut tail)?;
-        Ok(incomplete_legacy_suffix(&tail, encoding) as u64)
+        incomplete_legacy_suffix_reader(file.take(end - from), encoding).map(|held| held as u64)
     }
 }
 
@@ -3435,6 +3585,7 @@ mod tests {
             owner: "test-client".into(),
             started_by: None,
             launch: launch(),
+            input_owner: Default::default(),
         }
     }
 
@@ -3508,10 +3659,13 @@ mod tests {
             progress: None,
             call_id: None,
             nested: false,
+            http_response: false,
+            rpc_id_bytes: 0,
             started: None,
             render_slot: None,
+            input_owner: Default::default(),
         };
-        runtime.block_on(service.call(request, call));
+        runtime.block_on(service.call_tracked(request, call));
         assert!(
             session.existing(retired).is_none(),
             "a retired task's entry survived a list call"
@@ -3665,7 +3819,12 @@ mod tests {
         let quick = start(&tasks, start_args()).unwrap();
         finish(&quick);
         runtime
-            .block_on(slow.send(Some(b"done\n"), false, &CancellationToken::new()))
+            .block_on(slow.send(
+                Some(b"done\n"),
+                false,
+                &CancellationToken::new(),
+                Default::default(),
+            ))
             .unwrap();
         finish(&slow);
         // Registry order is start order here, and the end times are the other way round.
@@ -3810,8 +3969,11 @@ mod tests {
             progress: None,
             call_id: None,
             nested: false,
+            http_response: false,
+            rpc_id_bytes: 0,
             started: None,
             render_slot: None,
+            input_owner: Default::default(),
         };
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         // A pipe task and a PTY task see the same environment and the same default directory.
@@ -3998,7 +4160,7 @@ mod tests {
         let task = start(&tasks, args).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !task
-            .screen()
+            .screen(crate::lease::process_pool())
             .map(|screen| screen.rows.iter().any(|row| row.contains("tail-marker")))
             .unwrap_or(false)
         {
@@ -4010,7 +4172,7 @@ mod tests {
         }
         // Nothing else changes from here: the program is waiting for input.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let before = task.screen().unwrap();
+        let before = task.screen(crate::lease::process_pool()).unwrap();
         let mut activity = task.activity();
         while activity.has_changed().unwrap_or(false) {
             activity.borrow_and_update();
@@ -4023,7 +4185,7 @@ mod tests {
         });
         assert!(woke.is_ok(), "the resize woke the pending wait");
         resizer.join().unwrap().expect("the resize applies");
-        let screen = task.screen().unwrap();
+        let screen = task.screen(crate::lease::process_pool()).unwrap();
         assert_eq!(
             (screen.cols, screen.rows_count),
             (60, 10),
@@ -4178,7 +4340,70 @@ mod script_tests {
             transfer: false,
             call_id: None,
             service: Arc::new(crate::service::Service::new(Arc::clone(tasks), false)),
+            input_owner: Default::default(),
         }
+    }
+
+    #[test]
+    fn ipc_ingress_script_code_keeps_owner_until_vm_exits() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let pool = crate::lease::BytePool::new(64);
+        let mut args = script_args(&tasks);
+        args.code = "await sleep(60000);".into();
+        args.input_owner = crate::lease::Owner::new(pool.try_acquire(64).unwrap());
+        let (task, _, _) = tasks.start_script(args, &session, "ownr".into()).unwrap();
+        assert_eq!(
+            pool.used(),
+            64,
+            "VM still owns the admitted code after start returns"
+        );
+        task.kill().unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                task.done().wait_for(|done| *done).await.unwrap();
+                while pool.used() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn ipc_ingress_stdin_queue_keeps_owner_after_wait_is_dropped() {
+        use std::future::Future;
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let (task, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "ownr".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+            let pool = crate::lease::BytePool::new(64);
+            let owner = crate::lease::Owner::new(pool.try_acquire(64).unwrap());
+            let (sender, receiver) = mpsc::channel();
+            *lock(&task.input) = Some(sender);
+            let cancel = CancellationToken::new();
+            let mut sending = Box::pin(task.send(Some(b"hello"), false, &cancel, owner));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    sending.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+            drop(sending);
+            assert_eq!(pool.used(), 64);
+            let message = receiver.recv().unwrap();
+            assert_eq!(message.bytes, b"hello");
+            task.queued.fetch_sub(message.bytes.len(), Ordering::SeqCst);
+            drop(message);
+            assert_eq!(pool.used(), 0);
+        });
+        tasks.shutdown();
     }
 
     #[test]
@@ -4495,75 +4720,352 @@ mod script_tests {
         tasks.shutdown();
     }
 
+    fn finished_pty_task(tasks: &Arc<Tasks>, cols: u16, rows: u16) -> Arc<Task> {
+        let id = tasks.next_id();
+        let log_path = tasks.dir.join(format!("{id}.log"));
+        let _log = private_file(&log_path).unwrap();
+        let transcript_path = tasks.dir.join(format!("{id}.transcript.txt"));
+        let tfile = private_file(&transcript_path).unwrap();
+        let ended_at = OnceLock::new();
+        let _ = ended_at.set(Instant::now());
+        let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
+        let task = Arc::new(Task {
+            id,
+            command: "pty-sim".into(),
+            pty: true,
+            log_path,
+            encoding: encoding_rs::UTF_8,
+            keep: false,
+            owner: "pty-test".into(),
+            started_by: None,
+            started: Instant::now(),
+            root: Root::Script(script),
+            tree_done: watch::Sender::new(true),
+            tree_ended_at: ended_at,
+            kill_error: Mutex::new(None),
+            kill_requested: AtomicBool::new(false),
+            expired: AtomicBool::new(false),
+            out: Mutex::default(),
+            end: Mutex::new(Some(Final {
+                exit_code: Some(0),
+                killed: false,
+                expired: false,
+                forced_end: false,
+                elapsed: Duration::ZERO,
+                output_open: true,
+                leftovers: Vec::new(),
+                kept: false,
+            })),
+            done: watch::Sender::new(true),
+            activity: watch::Sender::new(()),
+            input: Mutex::new(None),
+            writer_done: WriterDone::new(true),
+            input_warning: Mutex::new(None),
+            input_error: Mutex::new(None),
+            queued: AtomicUsize::new(0),
+            input_gate: tokio::sync::Mutex::new(()),
+            terminal: Some(Mutex::new(Pty {
+                live: Live::at(cols, rows),
+                spool: Spool {
+                    bytes: 0,
+                    lines: 0,
+                    pending: 0,
+                    stopped: None,
+                },
+            })),
+            transcript_file: Mutex::new(Some(tfile)),
+            size: Mutex::new((cols, rows)),
+            pty_control: Mutex::new(None),
+            size_error: Mutex::new(None),
+        });
+        lock(&tasks.registry).tasks.push(Arc::clone(&task));
+        task
+    }
+
+    fn partial_log_write(tasks: &Tasks, rollback_fails: bool) {
+        *lock(&tasks.log_write_hook) = Some(Arc::new(|file, bytes| {
+            file.write_all(&bytes[..bytes.len().min(2)])?;
+            Err(std::io::Error::other("injected partial write"))
+        }));
+        *lock(&tasks.log_truncate_hook) = rollback_fails.then(|| {
+            Arc::new(|_: &File, _: u64| Err(std::io::Error::other("injected truncate failure")))
+                as LogTruncateHook
+        });
+    }
+
+    fn delay_log_delete(tasks: &Tasks) -> Arc<AtomicBool> {
+        let delayed = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&delayed);
+        tasks.set_remove_hook(Some(Arc::new(move |path| {
+            if flag.load(Ordering::SeqCst) {
+                Err(std::io::Error::other("injected delete delay"))
+            } else {
+                std::fs::remove_file(path)
+            }
+        })));
+        delayed
+    }
+
+    fn seed_capture_prefix(tasks: &Tasks, task: &Task) -> File {
+        let mut file = File::options().write(true).open(&task.log_path).unwrap();
+        file.write_all(b"ok\n").unwrap();
+        assert!(tasks.reserve(3));
+        let mut out = lock(&task.out);
+        out.written = 3;
+        out.readable = 3;
+        out.lines = 1;
+        file
+    }
+
+    fn capture_small_tail(tasks: &Tasks, task: &Task, log: File) {
+        let (chunks, received) = mpsc::sync_channel(2);
+        chunks
+            .send(Ok((Instant::now(), b"tail\n".to_vec())))
+            .unwrap();
+        chunks
+            .send(Ok((Instant::now(), b"later\n".to_vec())))
+            .unwrap();
+        drop(chunks);
+        capture(tasks, task, received, log, None);
+    }
+
+    #[test]
+    fn log_tail_capture_refunds_only_after_confirmed_rollback() {
+        for rollback_fails in [false, true] {
+            let (_runtime, tasks, _session) = fixture(Limits::OFF);
+            let task = finished_pty_task(&tasks, 4, 2);
+            let log = seed_capture_prefix(&tasks, &task);
+            partial_log_write(&tasks, rollback_fails);
+            capture_small_tail(&tasks, &task, log);
+            let charge = if rollback_fails { 8 } else { 3 };
+            {
+                let out = lock(&task.out);
+                assert_eq!((out.written, out.readable, out.lines), (3, 3, 1));
+                assert_eq!(out.dropped, 11);
+                assert_eq!(out.log_tail, charge - 3);
+                assert!(out.log_error.is_some());
+            }
+            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+            assert_eq!(
+                std::fs::read(&task.log_path).unwrap(),
+                if rollback_fails {
+                    &b"ok\nta"[..]
+                } else {
+                    &b"ok\n"[..]
+                },
+            );
+            let delayed = delay_log_delete(&tasks);
+            tasks.evict_log(&task);
+            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+            delayed.store(false, Ordering::SeqCst);
+            tasks.retry_pending_deletes();
+            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+            tasks.retry_pending_deletes();
+            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+            assert!(!task.log_path.exists());
+            tasks.shutdown();
+        }
+    }
+
+    #[test]
+    fn log_tail_spool_keeps_failed_tail_out_of_later_transcripts() {
+        for rollback_fails in [false, true] {
+            let (_runtime, tasks, _session) = fixture(Limits::OFF);
+            let task = finished_pty_task(&tasks, 4, 2);
+            {
+                let mut pty = lock(task.terminal.as_ref().unwrap());
+                assert!(pty.spool.write(b"ok\n", true, &task, &tasks));
+            }
+            partial_log_write(&tasks, rollback_fails);
+            {
+                let mut pty = lock(task.terminal.as_ref().unwrap());
+                assert!(!pty.spool.write(b"tail\n", false, &task, &tasks));
+                pty.spool.append("later\n", &task, &tasks);
+                assert_eq!(
+                    (pty.spool.bytes, pty.spool.lines, pty.spool.pending),
+                    (3, 1, 0)
+                );
+                assert!(pty.spool.stopped.is_some());
+            }
+            let charge = if rollback_fails { 8 } else { 3 };
+            let memory = BytePool::new(1024);
+            for _ in 0..2 {
+                let transcript = task
+                    .transcript(&tasks, &ReadState::default(), &memory)
+                    .unwrap();
+                assert_eq!((transcript.bytes, transcript.lines), (3, 1));
+                assert!(transcript.pending.is_empty());
+                assert!(transcript.stopped.is_some());
+            }
+            assert_eq!(lock(&task.out).transcript, charge);
+            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+            assert_eq!(
+                std::fs::read(task.transcript_path()).unwrap(),
+                if rollback_fails {
+                    &b"ok\nta"[..]
+                } else {
+                    &b"ok\n"[..]
+                },
+            );
+            let delayed = delay_log_delete(&tasks);
+            tasks.evict_log(&task);
+            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+            delayed.store(false, Ordering::SeqCst);
+            tasks.retry_pending_deletes();
+            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+            tasks.retry_pending_deletes();
+            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+            assert!(!task.transcript_path().exists());
+            tasks.shutdown();
+        }
+    }
+
+    #[test]
+    fn log_tail_eviction_during_partial_write_reclaims_each_charge_once() {
+        for transcript in [false, true] {
+            for rollback_fails in [false, true] {
+                let (_runtime, tasks, _session) = fixture(Limits::OFF);
+                let task = finished_pty_task(&tasks, 4, 2);
+                let log = if transcript {
+                    let mut pty = lock(task.terminal.as_ref().unwrap());
+                    assert!(pty.spool.write(b"ok\n", true, &task, &tasks));
+                    None
+                } else {
+                    Some(seed_capture_prefix(&tasks, &task))
+                };
+                partial_log_write(&tasks, rollback_fails);
+                let delayed = delay_log_delete(&tasks);
+                let (writing, started) = mpsc::channel();
+                let observed = Arc::clone(&task);
+                *lock(&tasks.log_write_hook) = Some(Arc::new(move |file, bytes| {
+                    file.write_all(&bytes[..2])?;
+                    writing.send(()).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !observed.evicted() {
+                        assert!(Instant::now() < deadline, "eviction did not start");
+                        std::thread::yield_now();
+                    }
+                    Err(std::io::Error::other("injected partial write"))
+                }));
+                let evicting = Arc::clone(&tasks);
+                let removed = Arc::clone(&task);
+                let eviction = std::thread::spawn(move || {
+                    started.recv_timeout(Duration::from_secs(5)).unwrap();
+                    evicting.evict_log(&removed);
+                });
+                if transcript {
+                    let mut pty = lock(task.terminal.as_ref().unwrap());
+                    assert!(!pty.spool.write(b"tail\n", true, &task, &tasks));
+                    assert_eq!(
+                        (pty.spool.bytes, pty.spool.lines, pty.spool.pending),
+                        (3, 1, 0)
+                    );
+                } else {
+                    capture_small_tail(&tasks, &task, log.unwrap());
+                    let out = lock(&task.out);
+                    assert_eq!((out.written, out.readable, out.lines), (3, 3, 1));
+                    assert_eq!(out.log_tail, 0, "eviction owns the new reservation");
+                }
+                eviction.join().unwrap();
+                let charge = if rollback_fails { 8 } else { 3 };
+                assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+                assert_eq!(
+                    lock(&tasks.pending_deletes)
+                        .iter()
+                        .map(|entry| entry.bytes)
+                        .sum::<u64>(),
+                    charge
+                );
+                delayed.store(false, Ordering::SeqCst);
+                tasks.retry_pending_deletes();
+                assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+                tasks.retry_pending_deletes();
+                assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+                tasks.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_snapshots_hold_leases_and_refuse_before_changing_transcript() {
+        let (_runtime, tasks, _session) = fixture(Limits::OFF);
+        let task = finished_pty_task(&tasks, 12, 3);
+        let (screen_bytes, pending_bytes) = {
+            let mut pty = lock(task.terminal.as_ref().unwrap());
+            pty.live.process(b"first\r\nsecond", Instant::now(), None);
+            (
+                pty.live.screen_snapshot_bytes(),
+                pty.live.pending_snapshot_bytes(),
+            )
+        };
+
+        let memory = BytePool::new(screen_bytes);
+        let occupied = memory.try_acquire(1).unwrap();
+        let refused = task.screen(&memory).err().unwrap();
+        assert!(refused.starts_with("Server active memory budget ("));
+        assert!(refused.contains(&task.id));
+        assert!(refused.contains(&crate::files::display_path(&task.log_path)));
+        assert!(refused.contains("Do not retry start or resend input"));
+        assert!(refused.contains("poll taskId without input"));
+        assert_eq!(memory.used(), 1);
+        drop(occupied);
+        let screen = task.screen(&memory).unwrap();
+        assert_eq!(screen.rows, ["first", "second"]);
+        assert_eq!(memory.used(), screen_bytes);
+        assert!(task.screen(&memory).is_err());
+        drop(screen);
+        assert_eq!(memory.used(), 0);
+
+        let memory = BytePool::new(pending_bytes);
+        let occupied = memory.try_acquire(1).unwrap();
+        let state = ReadState::default();
+        let before = {
+            let pty = lock(task.terminal.as_ref().unwrap());
+            (pty.spool.bytes, pty.spool.lines, pty.spool.pending)
+        };
+        let path = task.transcript_path();
+        let file_before = std::fs::read(&path).unwrap();
+        let quota_before = tasks.log_bytes.load(Ordering::SeqCst);
+        assert!(
+            task.transcript(&tasks, &state, &memory)
+                .err()
+                .unwrap()
+                .contains("memory budget")
+        );
+        assert_eq!(memory.used(), 1);
+        assert_eq!(state.shown, (0, 0));
+        {
+            let pty = lock(task.terminal.as_ref().unwrap());
+            assert_eq!(
+                (pty.spool.bytes, pty.spool.lines, pty.spool.pending),
+                before
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), file_before);
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), quota_before);
+
+        drop(occupied);
+        let transcript = task.transcript(&tasks, &state, &memory).unwrap();
+        assert_eq!(transcript.pending, "first\nsecond\n");
+        assert_eq!(memory.used(), pending_bytes);
+        assert!(task.transcript(&tasks, &state, &memory).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), transcript.pending);
+        drop(transcript);
+        assert_eq!(memory.used(), 0);
+        let next = task.transcript(&tasks, &state, &memory).unwrap();
+        assert_eq!(next.pending, "first\nsecond\n");
+        drop(next);
+        assert_eq!(memory.used(), 0);
+        tasks.shutdown();
+    }
+
     #[test]
     fn pty_eviction_under_terminal_lock_does_not_deadlock_and_concurrent_spool_evict_tracks_delete()
     {
         let (_runtime, mut tasks, _session) = fixture(Limits::OFF);
         Arc::get_mut(&mut tasks).unwrap().set_log_limit(64);
 
-        let make_finished_pty_task = |tasks: &Arc<Tasks>| -> Arc<Task> {
-            let id = tasks.next_id();
-            let log_path = tasks.dir.join(format!("{id}.log"));
-            let _log = private_file(&log_path).unwrap();
-            let transcript_path = tasks.dir.join(format!("{id}.transcript.txt"));
-            let tfile = private_file(&transcript_path).unwrap();
-            let ended_at = OnceLock::new();
-            let _ = ended_at.set(Instant::now());
-            let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
-            let task = Arc::new(Task {
-                id,
-                command: "pty-sim".into(),
-                pty: true,
-                log_path,
-                encoding: encoding_rs::UTF_8,
-                keep: false,
-                owner: "pty-test".into(),
-                started_by: None,
-                started: Instant::now(),
-                root: Root::Script(script),
-                tree_done: watch::Sender::new(true),
-                tree_ended_at: ended_at,
-                kill_error: Mutex::new(None),
-                kill_requested: AtomicBool::new(false),
-                expired: AtomicBool::new(false),
-                out: Mutex::default(),
-                end: Mutex::new(Some(Final {
-                    exit_code: Some(0),
-                    killed: false,
-                    expired: false,
-                    forced_end: false,
-                    elapsed: Duration::ZERO,
-                    output_open: true,
-                    leftovers: Vec::new(),
-                    kept: false,
-                })),
-                done: watch::Sender::new(true),
-                activity: watch::Sender::new(()),
-                input: Mutex::new(None),
-                writer_done: WriterDone::new(true),
-                input_warning: Mutex::new(None),
-                input_error: Mutex::new(None),
-                queued: AtomicUsize::new(0),
-                input_gate: tokio::sync::Mutex::new(()),
-                terminal: Some(Mutex::new(Pty {
-                    live: Live::at(80, 24),
-                    spool: Spool {
-                        bytes: 0,
-                        lines: 0,
-                        pending: 0,
-                        stopped: None,
-                    },
-                })),
-                transcript_file: Mutex::new(Some(tfile)),
-                size: Mutex::new((80, 24)),
-                pty_control: Mutex::new(None),
-                size_error: Mutex::new(None),
-            });
-            lock(&tasks.registry).tasks.push(Arc::clone(&task));
-            task
-        };
-
-        let task = make_finished_pty_task(&tasks);
+        let task = finished_pty_task(&tasks, 80, 24);
         assert!(task.is_finished());
         // Seed initial transcript bytes while under the 64-byte limit.
         {
@@ -4584,7 +5086,7 @@ mod script_tests {
 
         // Verify concurrent eviction during `Spool::write` closes `transcript_file` and records
         // `pending_deletes` when unlinking fails (R4-7).
-        let task2 = make_finished_pty_task(&tasks);
+        let task2 = finished_pty_task(&tasks, 80, 24);
         let fail_deletes = Arc::new(AtomicBool::new(true));
         let flag = Arc::clone(&fail_deletes);
         tasks.set_remove_hook(Some(Arc::new(move |path| {
@@ -4651,6 +5153,7 @@ mod script_tests {
                 eof: false,
                 initial: true,
                 done: None,
+                _input_owner: Default::default(),
             })
             .unwrap();
         let (eof_done_tx, eof_done_rx) = oneshot::channel();
@@ -4660,6 +5163,7 @@ mod script_tests {
                 eof: true,
                 initial: false,
                 done: Some(eof_done_tx),
+                _input_owner: Default::default(),
             })
             .unwrap();
         drop(input_tx);

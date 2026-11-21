@@ -133,7 +133,62 @@ pub struct Member {
     pub name: String,
 }
 
-/// The root of a task: bash itself on Windows, the task host (`src/host.rs`) on Unix.
+/// Per-query names and conversion workspace. The callback receives a live-byte
+/// high-water requirement, not an accumulated count of repeated native scans.
+pub(crate) struct MemberBudget<'a> {
+    reserve: Option<&'a mut dyn FnMut(usize) -> bool>,
+    retained: usize,
+    refused: bool,
+}
+
+impl<'a> MemberBudget<'a> {
+    pub(crate) fn new(reserve: &'a mut dyn FnMut(usize) -> bool) -> Self {
+        Self {
+            reserve: Some(reserve),
+            retained: 0,
+            refused: false,
+        }
+    }
+
+    pub(crate) fn unlimited() -> Self {
+        Self {
+            reserve: None,
+            retained: 0,
+            refused: false,
+        }
+    }
+
+    pub(crate) fn temporary(&mut self, bytes: usize) -> bool {
+        if self.refused {
+            return false;
+        }
+        let wanted = self.retained.saturating_add(bytes);
+        if self
+            .reserve
+            .as_mut()
+            .is_some_and(|reserve| !reserve(wanted))
+        {
+            self.refused = true;
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn retain(&mut self, bytes: usize) {
+        self.retained = self.retained.saturating_add(bytes);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    pub(crate) fn reset(&mut self) {
+        self.retained = 0;
+    }
+
+    pub(crate) fn refused(&self) -> bool {
+        self.refused
+    }
+}
+
+/// The root of a task: bash itself on Windows, the task host (src/host.rs) on Unix.
 #[cfg(windows)]
 pub enum Child {
     Pipe(std::process::Child),
@@ -1299,6 +1354,10 @@ impl Tree {
     /// console hosts; on Linux the host's descendants and the members of its session and
     /// group; on FreeBSD the kernel reaper's descendants, including nested reapers.
     pub fn members(&self) -> Option<Vec<Member>> {
+        self.members_with_budget(&mut MemberBudget::unlimited())
+    }
+
+    pub(crate) fn members_with_budget(&self, budget: &mut MemberBudget<'_>) -> Option<Vec<Member>> {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
@@ -1310,7 +1369,7 @@ impl Tree {
             let handle = process.as_raw_handle();
             // SAFETY: the held handle keeps this root's PID reserved during the query.
             let pid = unsafe { GetProcessId(handle) };
-            windows::job_members(self.job.as_raw_handle(), Some((pid, handle)))
+            windows::job_members_with_budget(self.job.as_raw_handle(), Some((pid, handle)), budget)
         }
         #[cfg(unix)]
         {
@@ -1322,18 +1381,19 @@ impl Tree {
             }
             #[cfg(target_os = "macos")]
             {
-                self.control.members()
+                self.control.members_with_budget(budget)
             }
             #[cfg(target_os = "freebsd")]
             {
-                crate::tree_freebsd::members(self.host).ok()
+                crate::tree_freebsd::members(self.host, budget).ok()
             }
             #[cfg(target_os = "linux")]
             {
-                crate::tree_linux::members(self.host).ok()
+                crate::tree_linux::members(self.host, budget).ok()
             }
             #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
             {
+                let _ = budget;
                 Some(unix_members(self.host))
             }
         }
@@ -1424,7 +1484,7 @@ pub const LOCALE: &str = if cfg!(target_os = "macos") {
 
 #[cfg(windows)]
 mod windows {
-    use super::Member;
+    use super::{Member, MemberBudget};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, GetLastError, INVALID_HANDLE_VALUE,
@@ -1477,7 +1537,16 @@ mod windows {
 
     /// The live processes of a job, without console hosts or exited processes. A failed or
     /// incomplete query stays unknown; a process this user may not query counts, named ?.
+    #[cfg(test)]
     pub fn job_members(job: RawHandle, root: Option<(u32, RawHandle)>) -> Option<Vec<Member>> {
+        job_members_with_budget(job, root, &mut MemberBudget::unlimited())
+    }
+
+    pub fn job_members_with_budget(
+        job: RawHandle,
+        root: Option<(u32, RawHandle)>,
+        budget: &mut MemberBudget<'_>,
+    ) -> Option<Vec<Member>> {
         let accounting = || {
             let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
             // SAFETY: info has the layout and size requested for this job query.
@@ -1511,21 +1580,27 @@ mod windows {
                 }
             })
         };
-        collect_job_members(accounting, ids, |pid| {
-            if let Some((root_pid, handle)) = root
-                && root_pid == pid
-            {
-                inspect_member(job, handle, true)
-            } else {
-                job_process(job, pid)
-            }
-        })
+        collect_job_members(
+            accounting,
+            ids,
+            |pid, budget| {
+                if let Some((root_pid, handle)) = root
+                    && root_pid == pid
+                {
+                    inspect_member(job, handle, true, budget)
+                } else {
+                    job_process(job, pid, budget)
+                }
+            },
+            budget,
+        )
     }
 
     fn collect_job_members(
         mut accounting: impl FnMut() -> Option<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>,
         mut ids: impl FnMut() -> Option<Vec<u32>>,
-        mut inspect: impl FnMut(u32) -> JobProcess,
+        mut inspect: impl FnMut(u32, &mut MemberBudget<'_>) -> JobProcess,
+        budget: &mut MemberBudget<'_>,
     ) -> Option<Vec<Member>> {
         let before = accounting()?;
         if before.ActiveProcesses == 0 {
@@ -1536,23 +1611,31 @@ mod windows {
         let initial = ids()?;
         let mut uncovered = false;
         for &pid in &initial {
-            match inspect(pid) {
-                JobProcess::Named(name) => live.push(Member { pid, name }),
+            let inspected = inspect(pid, budget);
+            if budget.refused() {
+                return None;
+            }
+            match inspected {
+                JobProcess::Named(name) => {
+                    budget.retain(name.capacity());
+                    live.push(Member { pid, name });
+                }
                 JobProcess::Unknown => unknown.push(pid),
                 JobProcess::Gone => {}
             }
         }
         if !unknown.is_empty() {
             let mut current: std::collections::HashSet<u32> = ids()?.into_iter().collect();
-            live.extend(
-                unknown
-                    .into_iter()
-                    .filter(|pid| current.contains(pid))
-                    .map(|pid| Member {
-                        pid,
-                        name: "?".into(),
-                    }),
-            );
+            for pid in unknown.into_iter().filter(|pid| current.contains(pid)) {
+                if !budget.temporary(1) {
+                    return None;
+                }
+                live.push(Member {
+                    pid,
+                    name: "?".into(),
+                });
+                budget.retain(1);
+            }
             for pid in initial {
                 current.remove(&pid);
             }
@@ -1614,7 +1697,7 @@ mod windows {
         Unknown,
     }
 
-    fn job_process(job: RawHandle, pid: u32) -> JobProcess {
+    fn job_process(job: RawHandle, pid: u32, budget: &mut MemberBudget<'_>) -> JobProcess {
         // SAFETY: every successful OpenProcess handle is owned and closed in this function.
         unsafe {
             let mut raw = OpenProcess(
@@ -1648,11 +1731,16 @@ mod windows {
                 };
             }
             let process = OwnedHandle::from_raw_handle(raw);
-            inspect_member(job, process.as_raw_handle(), can_wait)
+            inspect_member(job, process.as_raw_handle(), can_wait, budget)
         }
     }
 
-    fn inspect_member(job: RawHandle, process: RawHandle, can_wait: bool) -> JobProcess {
+    fn inspect_member(
+        job: RawHandle,
+        process: RawHandle,
+        can_wait: bool,
+        budget: &mut MemberBudget<'_>,
+    ) -> JobProcess {
         // SAFETY: both handles remain open and each buffer lives through its call.
         unsafe {
             if can_wait && WaitForSingleObject(process, 0) == WAIT_OBJECT_0 {
@@ -1662,6 +1750,9 @@ mod windows {
             let membership_known = IsProcessInJob(process, job, &mut in_job) != 0;
             if membership_known && in_job == 0 {
                 return JobProcess::Gone;
+            }
+            if !budget.temporary(32_768 * 2) {
+                return JobProcess::Unknown;
             }
             let mut buffer = vec![0_u16; 32_768];
             let mut size = buffer.len() as u32;
@@ -1678,6 +1769,9 @@ mod windows {
                 return JobProcess::Gone;
             }
             if named {
+                if !budget.temporary(buffer.capacity() * 2 + size as usize * 9) {
+                    return JobProcess::Unknown;
+                }
                 let path = String::from_utf16_lossy(&buffer[..size as usize]);
                 let name = path.rsplit('\\').next().unwrap_or(&path);
                 if name.eq_ignore_ascii_case("conhost.exe") {
@@ -1786,7 +1880,7 @@ mod windows {
                 let job = owned_job.as_raw_handle();
                 let root = Some((child.id(), handle));
                 assert!(matches!(
-                    job_process(job, std::process::id()),
+                    job_process(job, std::process::id(), &mut MemberBudget::unlimited()),
                     JobProcess::Gone
                 ));
                 assert!(
@@ -1798,7 +1892,7 @@ mod windows {
                 resume_threads(child.id()).unwrap();
                 assert_eq!(child.wait().unwrap().code(), Some(code));
                 assert!(matches!(
-                    inspect_member(job, handle, true),
+                    inspect_member(job, handle, true, &mut MemberBudget::unlimited()),
                     JobProcess::Gone
                 ));
                 assert!(job_members(job, root).unwrap().is_empty());
@@ -1824,7 +1918,8 @@ mod windows {
                 let members = collect_job_members(
                     || samples.next().unwrap(),
                     || Some(vec![21, 22]),
-                    |_| JobProcess::Gone,
+                    |_, _| JobProcess::Gone,
+                    &mut MemberBudget::unlimited(),
                 );
                 assert_eq!(members.map(|members| members.len()), empty.then_some(0));
             }
@@ -1850,13 +1945,40 @@ mod windows {
                 let members = collect_job_members(
                     || samples.next().unwrap(),
                     || lists.next(),
-                    |_| JobProcess::Unknown,
+                    |_, _| JobProcess::Unknown,
+                    &mut MemberBudget::unlimited(),
                 );
                 assert_eq!(members.as_ref().map(Vec::len), expected);
                 if expected == Some(1) {
                     assert_eq!(members.unwrap()[0].name, "?");
                 }
             }
+        }
+
+        #[test]
+        fn member_budget_refusal_is_distinct_from_an_empty_job() {
+            let mut deny = |_| false;
+            let mut budget = MemberBudget::new(&mut deny);
+            let result = collect_job_members(
+                || {
+                    Some(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
+                        TotalProcesses: 1,
+                        ActiveProcesses: 1,
+                        ..Default::default()
+                    })
+                },
+                || Some(vec![21]),
+                |_, budget| {
+                    if budget.temporary(6) {
+                        JobProcess::Named("worker".into())
+                    } else {
+                        JobProcess::Unknown
+                    }
+                },
+                &mut budget,
+            );
+            assert!(result.is_none());
+            assert!(budget.refused());
         }
 
         #[test]

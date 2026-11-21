@@ -1,9 +1,13 @@
 //! The wire between an endpoint and the daemon: length-prefixed JSON frames and the messages they
 //! carry.
 
+use crate::lease::Owner;
+use crate::lease::{BytePool, Lease};
+#[cfg(test)]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// What a Hello and a Welcome must agree on.
@@ -22,6 +26,214 @@ pub const CALL_LIMIT: usize = 3 << 20;
 pub const RESPONSE_LIMIT: usize = 512 << 20;
 
 const WRITE_CHUNK: usize = 64 * 1024;
+
+/// The payload is destroyed before its last process-local byte owner.
+#[derive(Debug)]
+pub(crate) struct Owned<T> {
+    pub value: T,
+    pub owner: Owner,
+}
+
+impl<T> Owned<T> {
+    pub fn new(value: T, owner: Owner) -> Self {
+        Self { value, owner }
+    }
+
+    /// A derived value may reserve additional buffers while keeping its input owner.
+    pub fn flat_map<U>(self, f: impl FnOnce(T) -> Owned<U>) -> Owned<U> {
+        let Self { value, owner } = self;
+        let result = f(value);
+        Owned::new(result.value, Owner::new((owner, result.owner)))
+    }
+
+    /// Capturing this whole wrapper also covers a blocking job that has not started.
+    pub fn run<U>(self, f: impl FnOnce(T) -> U) -> U {
+        let Self { value, owner } = self;
+        let result = f(value);
+        drop(owner);
+        result
+    }
+}
+
+pub(crate) struct EncodedFrame {
+    pub bytes: Vec<u8>,
+    _lease: Lease,
+}
+
+pub(crate) const SHORT_INPUT: usize = 64 * 1024;
+
+pub(crate) fn input_budget_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::OutOfMemory,
+        "Server active memory budget is full while preparing the IPC request; the operation was not dispatched",
+    )
+}
+
+fn input_lease(
+    bytes: usize,
+    main: &Arc<BytePool>,
+    control: &Arc<BytePool>,
+    short_control: bool,
+) -> Option<(Lease, bool)> {
+    main.try_acquire(bytes)
+        .map(|lease| (lease, false))
+        .or_else(|| {
+            short_control
+                .then(|| control.try_acquire(bytes).map(|lease| (lease, true)))
+                .flatten()
+        })
+}
+
+/// Measures and reserves the independent frame before its only encoding allocation.
+pub(crate) fn encode_frame_leased<T: Serialize + ?Sized>(
+    message: &T,
+    main: &Arc<BytePool>,
+    control: &Arc<BytePool>,
+    allow_control: bool,
+) -> std::io::Result<EncodedFrame> {
+    let length = frame_len(message)?;
+    let (mut lease, _) = input_lease(
+        length,
+        main,
+        control,
+        allow_control && length <= SHORT_INPUT,
+    )
+    .ok_or_else(input_budget_error)?;
+    let bytes = encode_measured(message, length)?;
+    // Vec::with_capacity uses exactly the requested element capacity here.
+    if !lease.try_resize(bytes.capacity()) {
+        return Err(input_budget_error());
+    }
+    Ok(EncodedFrame {
+        bytes,
+        _lease: lease,
+    })
+}
+
+pub(crate) fn daemon_control(message: &ToDaemon) -> bool {
+    match message {
+        ToDaemon::Cancel { .. }
+        | ToDaemon::Bye
+        | ToDaemon::Status
+        | ToDaemon::Stop
+        | ToDaemon::Hello { .. } => true,
+        ToDaemon::Call {
+            tool, arguments, ..
+        } => {
+            tool == "exec"
+                && arguments
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|action| matches!(action, "list" | "kill"))
+        }
+    }
+}
+
+pub(crate) async fn write_request_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &ToDaemon,
+    main: &Arc<BytePool>,
+    control: &Arc<BytePool>,
+) -> std::io::Result<()> {
+    let frame = encode_frame_leased(message, main, control, daemon_control(message))?;
+    write_raw(writer, &frame.bytes).await
+}
+
+pub(crate) enum DaemonFrame {
+    Message(Owned<ToDaemon>),
+    Overload { id: Option<u64> },
+    Eof,
+}
+
+fn daemon_call_id(head: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(head)
+        .unwrap_or_else(|error| std::str::from_utf8(&head[..error.valid_up_to()]).unwrap_or(""));
+    if !text.contains("\"type\":\"call\"") {
+        return None;
+    }
+    let digits = text.split_once("\"id\":")?.1.trim_start();
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].parse().ok()
+}
+
+/// Charges raw bytes, parsing, and the owned arguments through actual dispatch.
+/// Short control classification never leaves an ordinary call on the control pool.
+pub(crate) async fn read_daemon_frame_owned<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+    main: &Arc<BytePool>,
+    control: &Arc<BytePool>,
+) -> std::io::Result<DaemonFrame> {
+    let mut header = [0u8; 4];
+    let mut filled = 0;
+    while filled < header.len() {
+        match reader.read(&mut header[filled..]).await {
+            Ok(0) if filled == 0 => return Ok(DaemonFrame::Eof),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("the input ended after {filled} of 4 length bytes"),
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let length = u32::from_le_bytes(header) as usize;
+    if length > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a frame of {length} bytes is over the {max} byte limit"),
+        ));
+    }
+    // raw R + Value R + four R for borrowed-Value decoding and later typed
+    // argument copies. The earlier Value parse (R + R + 2R scratch) fits too.
+    let peak = length.checked_mul(6).ok_or_else(input_budget_error)?;
+    let Some((lease, in_control)) = input_lease(peak, main, control, length <= SHORT_INPUT) else {
+        let prefix_len = length.min(256);
+        let mut head = [0u8; 256];
+        read_exact_slice(reader, &mut head[..prefix_len]).await?;
+        drain_exact_bytes(reader, length - prefix_len, length).await?;
+        return Ok(DaemonFrame::Overload {
+            id: daemon_call_id(&head[..prefix_len]),
+        });
+    };
+    struct Raw {
+        bytes: Vec<u8>,
+        lease: Lease,
+    }
+    let mut raw = Raw {
+        bytes: vec![0; length],
+        lease,
+    };
+    read_exact_slice(reader, &mut raw.bytes).await?;
+    let value: serde_json::Value = serde_json::from_slice(&raw.bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let message = ToDaemon::deserialize(&value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    drop(value);
+    drop(std::mem::take(&mut raw.bytes));
+    let retained = length * 4;
+    raw.lease.shrink_to(retained);
+    if in_control && !daemon_control(&message) {
+        let Some(lease) = main.try_acquire(retained) else {
+            let id = match &message {
+                ToDaemon::Call { id, .. } => Some(*id),
+                _ => None,
+            };
+            drop(message);
+            return Ok(DaemonFrame::Overload { id });
+        };
+        raw.lease = lease;
+    }
+    Ok(DaemonFrame::Message(Owned::new(
+        message,
+        Owner::new(raw.lease),
+    )))
+}
 
 /// A message as the bytes a frame holds: the u32 little-endian length and its JSON. Encoding
 /// stands apart from writing so a caller can size the bytes it will send before it queues them.
@@ -108,6 +320,7 @@ where
 }
 
 /// Writes `message` as one frame.
+#[cfg(test)]
 pub async fn write_frame<W, T>(writer: &mut W, message: &T) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -198,6 +411,7 @@ where
 /// Reads one frame, or `None` when the reader ended cleanly before a length. A reader that ends
 /// inside a frame is an error, and so is a length over `max`: the body of an oversized frame is
 /// never allocated, because the length it claims is not trusted.
+#[cfg(test)]
 pub async fn read_frame<R, T>(reader: &mut R, max: usize) -> std::io::Result<Option<T>>
 where
     R: AsyncRead + Unpin,
@@ -295,6 +509,14 @@ async fn drain_exact_bytes<R: AsyncRead + Unpin>(
     Ok(())
 }
 
+// Exact raw bytes plus decoded strings, JSON escape scratch (up to 2R), and
+// the extra owned copy required by untagged ResourceContents. Internal-tagged
+// ToEndpoint/ContentBlock caches move their strings. The allowance is payload
+// storage, not Rust object metadata or allocator RSS.
+fn endpoint_parse_peak(length: usize) -> Option<usize> {
+    length.checked_mul(5)?.checked_add(256)
+}
+
 /// Reads and deserializes one `ToEndpoint` frame under `main_pool` (falling back to `control_pool`
 /// for `<= 8 MiB` `Progress`, short error receipts, and `list`/`kill` control calls), and drains
 /// un-admitted frames in small chunks so an overload fails only that call without breaking IPC.
@@ -332,10 +554,8 @@ where
             format!("a frame of {length} bytes is over the {max} byte limit"),
         ));
     }
-    if let Some(mut lease) = length
-        .checked_mul(2)
-        .and_then(|peak| main_pool.try_acquire(peak))
-    {
+    let parse_peak = endpoint_parse_peak(length);
+    if let Some(mut lease) = parse_peak.and_then(|peak| main_pool.try_acquire(peak)) {
         let mut body = vec![0u8; length];
         read_exact_slice(reader, &mut body).await?;
         let decoded: ToEndpoint = serde_json::from_slice(&body)
@@ -344,10 +564,7 @@ where
         lease.shrink_to(length);
         return Ok(LeasedEndpointFrame::Frame(decoded, lease));
     }
-    if length
-        .checked_mul(2)
-        .is_some_and(|peak| peak <= crate::lease::CONTROL_LIMIT)
-    {
+    if let Some(parse_peak) = parse_peak.filter(|&peak| peak <= crate::lease::CONTROL_LIMIT) {
         let prefix_len = length.min(256);
         let mut head = [0u8; 256];
         read_exact_slice(reader, &mut head[..prefix_len]).await?;
@@ -357,7 +574,7 @@ where
                 sniffed,
                 LeasedEndpointFrame::OverloadResult { id } if !id.is_some_and(&is_control_call)
             );
-        if !skip_control_pool && let Some(mut clease) = control_pool.try_acquire(length * 2) {
+        if !skip_control_pool && let Some(mut clease) = control_pool.try_acquire(parse_peak) {
             let mut body = vec![0u8; length];
             body[..prefix_len].copy_from_slice(&head[..prefix_len]);
             read_exact_slice(reader, &mut body[prefix_len..]).await?;
@@ -441,7 +658,9 @@ pub type Unit = u8;
 #[cfg(windows)]
 fn units_of(value: &OsStr) -> Vec<Unit> {
     use std::os::windows::ffi::OsStrExt;
-    value.encode_wide().collect()
+    let mut units = Vec::with_capacity(value.encode_wide().count());
+    units.extend(value.encode_wide());
+    units
 }
 
 #[cfg(unix)]
@@ -559,6 +778,30 @@ pub enum ToEndpoint {
 }
 
 impl crate::session::LaunchContext {
+    /// Payload capacity of the temporary wire copy, excluding the persistent environment.
+    pub(crate) fn wire_capacity(&self) -> usize {
+        fn copied(value: &OsStr) -> usize {
+            if let Some(text) = value.to_str() {
+                return text.len();
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                value.as_bytes().len()
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                value.encode_wide().count() * std::mem::size_of::<Unit>()
+            }
+        }
+        self.env
+            .iter()
+            .fold(copied(self.cwd.as_os_str()), |sum, (name, value)| {
+                sum.saturating_add(copied(name))
+                    .saturating_add(copied(value))
+            })
+    }
     /// The context a Hello describes, or the field that could not be read.
     pub fn from_wire(cwd: &OsText, env: &[(OsText, OsText)]) -> Result<Self, String> {
         let cwd = cwd
@@ -599,6 +842,191 @@ mod tests {
     use crate::service::OutputMode;
     use serde_json::json;
     use std::path::PathBuf;
+
+    fn ingress_call() -> ToDaemon {
+        ToDaemon::Call {
+            id: 7,
+            tool: "exec".into(),
+            request_id: "request 7".into(),
+            arguments: json!({"action":"start","command":"printf hello"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_ingress_reader_owns_normal_arguments_and_exact_admission() {
+        let message = ingress_call();
+        let frame = encode_frame(&message).unwrap();
+        let length = frame.len() - 4;
+        for (limit, fits) in [(6 * length - 1, false), (6 * length, true)] {
+            let pool = BytePool::new(limit);
+            let control = BytePool::new(0);
+            let mut reader = std::io::Cursor::new(&frame);
+            match read_daemon_frame_owned(&mut reader, REQUEST_LIMIT, &pool, &control)
+                .await
+                .unwrap()
+            {
+                DaemonFrame::Message(owned) => {
+                    assert!(fits);
+                    assert_eq!(owned.value, message);
+                    assert_eq!(pool.used(), 4 * length);
+                    let kept = owned.owner.clone();
+                    drop(owned);
+                    assert_eq!(pool.used(), 4 * length);
+                    drop(kept);
+                }
+                DaemonFrame::Overload { id } => {
+                    assert!(!fits);
+                    assert_eq!(id, Some(7));
+                }
+                DaemonFrame::Eof => panic!("one complete frame"),
+            }
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_ingress_control_classification_does_not_retain_regular_calls() {
+        let pool = BytePool::new(0);
+        let control = BytePool::new(4096);
+        let mut messages = vec![
+            ToDaemon::Cancel { id: 7 },
+            ToDaemon::Bye,
+            ToDaemon::Status,
+            ToDaemon::Stop,
+        ];
+        for action in ["list", "kill"] {
+            messages.push(ToDaemon::Call {
+                id: 7,
+                tool: "exec".into(),
+                request_id: "7".into(),
+                arguments: json!({"action":action,"taskId":"short-task"}),
+            });
+        }
+        for message in messages {
+            let frame = encode_frame(&message).unwrap();
+            let mut reader = std::io::Cursor::new(frame);
+            let DaemonFrame::Message(owned) =
+                read_daemon_frame_owned(&mut reader, REQUEST_LIMIT, &pool, &control)
+                    .await
+                    .unwrap()
+            else {
+                panic!("small control request admitted");
+            };
+            assert_eq!(owned.value, message);
+            assert!(control.used() > 0);
+            drop(owned);
+            assert_eq!(control.used(), 0);
+        }
+        let mut reader = std::io::Cursor::new(encode_frame(&ingress_call()).unwrap());
+        assert!(matches!(
+            read_daemon_frame_owned(&mut reader, REQUEST_LIMIT, &pool, &control)
+                .await
+                .unwrap(),
+            DaemonFrame::Overload { id: Some(7) }
+        ));
+        assert_eq!(control.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn ipc_ingress_partial_read_and_stalled_write_release_on_cancel() {
+        use std::future::Future;
+        let message = ingress_call();
+        let encoded = encode_frame(&message).unwrap();
+        let length = encoded.len() - 4;
+        let pool = BytePool::new(6 * length);
+        let control = BytePool::new(0);
+        let (mut writer, mut reader) = tokio::io::duplex(encoded.len());
+        writer.write_all(&encoded[..9]).await.unwrap();
+        let mut reading = Box::pin(read_daemon_frame_owned(
+            &mut reader,
+            REQUEST_LIMIT,
+            &pool,
+            &control,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                reading.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert_eq!(pool.used(), 6 * length);
+        drop(reading);
+        assert_eq!(pool.used(), 0);
+        let (mut writer, _reader) = tokio::io::duplex(8);
+        let mut writing = Box::pin(write_request_frame(&mut writer, &message, &pool, &control));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                writing.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        assert_eq!(pool.used(), encoded.len());
+        drop(writing);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn ipc_ingress_native_units_keep_owner_through_hello_conversion() {
+        let message = ToDaemon::Hello {
+            protocol: PROTOCOL,
+            namespace: "ns".into(),
+            build: "build".into(),
+            session: "s".into(),
+            connection: 1,
+            client_name: "test".into(),
+            output_mode: "text".into(),
+            structured_content: true,
+            cwd: OsText::Units {
+                units: vec![47, 119],
+            },
+            env: vec![(
+                OsText::Units { units: vec![65] },
+                OsText::Units { units: vec![66] },
+            )],
+        };
+        let frame = encode_frame(&message).unwrap();
+        let length = frame.len() - 4;
+        let pool = BytePool::new(6 * length);
+        let mut reader = std::io::Cursor::new(frame);
+        let DaemonFrame::Message(owned) =
+            read_daemon_frame_owned(&mut reader, REQUEST_LIMIT, &pool, &BytePool::new(0))
+                .await
+                .unwrap()
+        else {
+            panic!("normal native units admitted");
+        };
+        let ToDaemon::Hello { cwd, env, .. } = &owned.value else {
+            panic!("Hello");
+        };
+        let installed = crate::session::LaunchContext::from_wire(cwd, env).unwrap();
+        assert_eq!(installed.cwd, std::path::PathBuf::from("/w"));
+        assert_eq!(
+            installed.env,
+            vec![(std::ffi::OsString::from("A"), std::ffi::OsString::from("B"))]
+        );
+        assert_eq!(pool.used(), 4 * length);
+        drop(owned);
+        assert_eq!(
+            pool.used(),
+            0,
+            "installed launch state has its own lifetime"
+        );
+    }
+
+    #[test]
+    fn ipc_ingress_encoder_reserves_the_only_independent_frame() {
+        let message = ingress_call();
+        let length = frame_len(&message).unwrap();
+        let short = BytePool::new(length - 1);
+        assert!(encode_frame_leased(&message, &short, &BytePool::new(0), false).is_err());
+        assert_eq!(short.used(), 0);
+        let pool = BytePool::new(length);
+        let frame = encode_frame_leased(&message, &pool, &BytePool::new(0), false).unwrap();
+        assert_eq!(pool.used(), frame.bytes.capacity());
+        assert_eq!(frame.bytes, encode_frame(&message).unwrap());
+        drop(frame);
+        assert_eq!(pool.used(), 0);
+    }
 
     /// The bytes a frame occupies, as a reader would find them.
     async fn frame_bytes<T: Serialize>(message: &T) -> Vec<u8> {
@@ -1082,11 +1510,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_parse_reserves_scratch_before_reading_and_releases_it_after_decode() {
+        let message = ToEndpoint::Result {
+            id: 7,
+            result: rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "line one\nline two 世界".repeat(16),
+            )]),
+        };
+        let wire = encode_frame(&message).unwrap();
+        let length = wire.len() - 4;
+        let peak = endpoint_parse_peak(length).unwrap();
+        let pool = crate::lease::BytePool::new(peak);
+        let control = crate::lease::BytePool::new(0);
+        let occupied = pool.try_acquire(1).unwrap();
+        let mut input = std::io::Cursor::new(wire.clone());
+        assert!(matches!(
+            read_endpoint_frame_leased(&mut input, RESPONSE_LIMIT, &pool, &control, |_| false)
+                .await
+                .unwrap(),
+            LeasedEndpointFrame::OverloadResult { id: Some(7) }
+        ));
+        assert_eq!(
+            input.position() as usize,
+            wire.len(),
+            "unadmitted frames are drained"
+        );
+        assert_eq!(pool.used(), 1);
+        drop(occupied);
+        let mut input = std::io::Cursor::new(wire);
+        let LeasedEndpointFrame::Frame(decoded, lease) =
+            read_endpoint_frame_leased(&mut input, RESPONSE_LIMIT, &pool, &control, |_| false)
+                .await
+                .unwrap()
+        else {
+            panic!("exact peak must fit")
+        };
+        assert_eq!(decoded, message);
+        assert_eq!(
+            pool.used(),
+            length,
+            "the parser scratch and raw frame are gone"
+        );
+        drop(decoded);
+        drop(lease);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
     async fn read_endpoint_frame_leased_routes_control_and_handles_split_utf8_or_progress() {
-        let main_pool = crate::lease::BytePool::new(500);
+        let main_pool = crate::lease::BytePool::new(1024);
         let control_pool = crate::lease::BytePool::new(2048);
 
-        // 1. Ordinary non-error result when `main_pool` cannot fit `2 * len` must NOT steal `control_pool`.
+        // 1. Ordinary non-error result when `main_pool` cannot fit the complete parse peak must NOT steal `control_pool`.
         let big = ToEndpoint::Result {
             id: 77,
             result: rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
@@ -1094,7 +1569,7 @@ mod tests {
             )]),
         };
         // 2. Control result (`is_control_call(78) == true`) succeeds via `control_pool` even with `main_pool` full.
-        let held_main = main_pool.try_acquire(500).unwrap();
+        let held_main = main_pool.try_acquire(1024).unwrap();
         let control_res = ToEndpoint::Result {
             id: 78,
             result: rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
@@ -1198,7 +1673,7 @@ mod tests {
         };
         drain_wire.extend_from_slice(&encode_frame(&tail_ok).unwrap());
 
-        let rem_main = main_pool.try_acquire(500).unwrap();
+        let rem_main = main_pool.try_acquire(1024).unwrap();
         let mut drain_cursor = std::io::Cursor::new(drain_wire);
         assert!(matches!(
             read_endpoint_frame_leased(
@@ -1242,7 +1717,7 @@ mod tests {
 
         // 5. Non-control `Result` frames larger than 64 KiB under `main_pool` overload drain on the
         // stack without borrowing `control_pool` or parsing the oversized body.
-        let full_main = main_pool.try_acquire(500).unwrap();
+        let full_main = main_pool.try_acquire(1024).unwrap();
         let roomy_control = crate::lease::BytePool::new(crate::lease::CONTROL_LIMIT);
         let mut over_64k_body = br#"{"type":"result","id":101,"result":"#.to_vec();
         over_64k_body.resize(70 * 1024, b'!');

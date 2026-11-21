@@ -64,6 +64,7 @@ jobs:
 
       - name: test (windows)
         if: runner.os == 'Windows'
+        timeout-minutes: 50
         shell: pwsh
         run: |
           # GitHub's step Job forbids CREATE_BREAKAWAY_FROM_JOB (`Access is denied`), and the
@@ -72,6 +73,21 @@ jobs:
           $log = "$env:RUNNER_TEMP\windows-test.log"
           $done = "$env:RUNNER_TEMP\windows-test.exit"
           $cmd = "$env:RUNNER_TEMP\windows-test.cmd"
+          $seenLines = @{}
+          function Show-TestLogs {
+            $paths = @($log) + @(Get-ChildItem "$env:GITHUB_WORKSPACE\ci-*.log" -ErrorAction SilentlyContinue | ForEach-Object FullName)
+            foreach ($path in $paths) {
+              if (-not (Test-Path $path)) { continue }
+              $lines = @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
+              $seen = [int]$seenLines[$path]
+              if ($lines.Count -lt $seen) { $seen = 0 }
+              if ($lines.Count -gt $seen) {
+                Write-Host "--- $path ---"
+                $lines | Select-Object -Skip $seen
+                $seenLines[$path] = $lines.Count
+              }
+            }
+          }
           # The task runs as SYSTEM, whose profile holds no toolchain: name the runner's homes.
           $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }
           $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
@@ -91,6 +107,7 @@ jobs:
             # The run announces itself by opening its log in the workspace; without that the task
             # never started, and waiting for it would only burn the job timeout.
             for ($waited = 0; -not (Test-Path "$env:GITHUB_WORKSPACE\ci-test.log") -and $waited -lt 120; $waited += 5) {
+              Show-TestLogs
               Start-Sleep 5
             }
             if (-not (Test-Path "$env:GITHUB_WORKSPACE\ci-test.log")) {
@@ -98,15 +115,22 @@ jobs:
               throw 'the scheduled test run did not start'
             }
             for ($waited = 0; -not (Test-Path $done) -and $waited -lt 2400; $waited += 5) {
+              Show-TestLogs
               Start-Sleep 5
             }
-            if (Test-Path $log) { Get-Content $log }
+            Show-TestLogs
             if (-not (Test-Path $done)) { throw 'the scheduled test run did not finish' }
             exit [int](Get-Content $done)
           } finally {
             # Deleting a task leaves a running instance running: end it, then remove the task.
-            schtasks /end /tn fastexec-ci 2>&1 | Out-Null
-            schtasks /delete /tn fastexec-ci /f 2>&1 | Out-Null
+            Show-TestLogs
+            foreach ($arguments in @('/end /tn fastexec-ci', '/delete /tn fastexec-ci /f')) {
+              $cleanup = Start-Process schtasks -ArgumentList $arguments -PassThru -NoNewWindow
+              if (-not $cleanup.WaitForExit(15000)) {
+                $cleanup.Kill()
+                Write-Warning "scheduled-task cleanup exceeded 15s: $arguments"
+              }
+            }
           }
 
       # The setuid-root fixture needs root, a C compiler, and a suid-capable TMPDIR; with
@@ -127,13 +151,15 @@ jobs:
             -- processes_the_server_may_not_kill_stay_held_and_reported --exact --nocapture
 
       - name: test log
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-log-${{ matrix.os }}
           path: |
             ci-test.log
             ci-*.log
+            ${{ runner.temp }}/windows-test.log
+            ${{ runner.temp }}/windows-test.exit
           if-no-files-found: ignore
 
   alpine:

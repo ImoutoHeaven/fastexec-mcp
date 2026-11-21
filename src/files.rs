@@ -121,9 +121,10 @@ pub struct TaskMeta {
 
 pub struct TrackedResult {
     pub result: CallToolResult,
-    pub lease: Option<Lease>,
     pub overload: bool,
     pub task_meta: Option<TaskMeta>,
+    pub lease: Option<Lease>,
+    pub payload_owner: crate::lease::Owner,
 }
 
 impl TrackedResult {
@@ -133,6 +134,14 @@ impl TrackedResult {
             lease: None,
             overload: false,
             task_meta: None,
+            payload_owner: Default::default(),
+        }
+    }
+
+    pub fn owned(result: CallToolResult, payload_owner: crate::lease::Owner) -> Self {
+        Self {
+            payload_owner,
+            ..Self::plain(result)
         }
     }
 }
@@ -146,22 +155,25 @@ pub async fn call_tracked(
     transfer: bool,
     render: Render,
     cancel: Option<tokio_util::sync::CancellationToken>,
+    input_owner: crate::lease::Owner,
 ) -> TrackedResult {
     match tool {
         "read" => match serde_json::from_value::<ReadRequest>(arguments) {
-            Ok(request) => read_tracked(request, launch, transfer, render, cancel).await,
+            Ok(request) => {
+                read_tracked(request, launch, transfer, render, cancel, input_owner).await
+            }
             Err(error) => TrackedResult::plain(schema_failed(format!(
                 "failed to deserialize parameters: {error}"
             ))),
         },
         "write" => match serde_json::from_value::<WriteRequest>(arguments) {
-            Ok(request) => TrackedResult::plain(write(request, launch, render).await),
+            Ok(request) => write_tracked(request, launch, render, input_owner).await,
             Err(error) => TrackedResult::plain(schema_failed(format!(
                 "failed to deserialize parameters: {error}"
             ))),
         },
         "edit" => match serde_json::from_value::<EditRequest>(arguments) {
-            Ok(request) => TrackedResult::plain(edit(request, launch, render).await),
+            Ok(request) => edit_tracked(request, launch, render, input_owner).await,
             Err(error) => TrackedResult::plain(schema_failed(format!(
                 "failed to deserialize parameters: {error}"
             ))),
@@ -177,9 +189,10 @@ pub async fn read_tracked(
     transfer: bool,
     render: Render,
     cancel: Option<tokio_util::sync::CancellationToken>,
+    input_owner: crate::lease::Owner,
 ) -> TrackedResult {
     read_with_limits_and_permit(
-        request,
+        crate::ipc::Owned::new(request, input_owner),
         launch,
         transfer,
         render,
@@ -200,9 +213,10 @@ pub(crate) async fn read_nested(
     render: Render,
     permit: tokio::sync::OwnedSemaphorePermit,
     cancel: tokio_util::sync::CancellationToken,
-) -> CallToolResult {
+    input_owner: crate::lease::Owner,
+) -> TrackedResult {
     read_with_limits_and_permit(
-        request,
+        crate::ipc::Owned::new(request, input_owner),
         launch,
         transfer,
         render,
@@ -211,11 +225,10 @@ pub(crate) async fn read_nested(
         Some(cancel),
     )
     .await
-    .result
 }
 
 async fn read_with_limits_and_permit(
-    request: ReadRequest,
+    input: crate::ipc::Owned<ReadRequest>,
     launch: Arc<LaunchContext>,
     transfer: bool,
     render: Render,
@@ -226,19 +239,29 @@ async fn read_with_limits_and_permit(
     let effective = render.effective();
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        read_cancellable(&request, &launch, transfer, limits, cancel.as_ref())
+        input.flat_map(|request| {
+            read_cancellable(&request, &launch, transfer, limits, cancel.as_ref())
+        })
     })
     .await
     {
-        Ok(Ok(outcome)) => outcome.into_tracked(effective),
-        Ok(Err(ReadFailure::Overload(message))) => TrackedResult {
-            result: service::suppress(failed(message), effective),
-            lease: None,
-            overload: true,
-            task_meta: None,
-        },
-        Ok(Err(ReadFailure::Error(message))) => {
-            TrackedResult::plain(service::suppress(failed(message), effective))
+        Ok(outcome) => {
+            let owner = outcome.owner.clone();
+            let mut tracked = outcome.run(|outcome| match outcome {
+                Ok(outcome) => outcome.into_tracked(effective),
+                Err(ReadFailure::Overload(message)) => TrackedResult {
+                    result: service::suppress(failed(message), effective),
+                    lease: None,
+                    overload: true,
+                    task_meta: None,
+                    payload_owner: Default::default(),
+                },
+                Err(ReadFailure::Error(message)) => {
+                    TrackedResult::plain(service::suppress(failed(message), effective))
+                }
+            });
+            tracked.payload_owner = owner;
+            tracked
         }
         Err(error) => TrackedResult::plain(service::suppress(
             failed(format!("the file operation did not finish: {error}")),
@@ -254,7 +277,90 @@ enum ReadFailure {
 
 impl From<String> for ReadFailure {
     fn from(message: String) -> Self {
-        Self::Error(message)
+        if message.starts_with("Server active memory budget (") {
+            Self::Overload(message)
+        } else {
+            Self::Error(message)
+        }
+    }
+}
+
+fn path_workspace_bytes(path: &str, launch: &LaunchContext, extra: usize) -> usize {
+    // Resolution, home expansion, native/display conversions, response copies and
+    // growth can coexist. Borrow all source lengths before copying a path.
+    launch
+        .path_source_bytes(path)
+        .saturating_mul(32)
+        .saturating_add(extra)
+        .saturating_add(4096)
+}
+
+pub(crate) fn with_path_workspace<T>(
+    path: &str,
+    launch: &LaunchContext,
+    extra: usize,
+    operation: impl FnOnce(&mut Lease) -> T,
+) -> Result<crate::ipc::Owned<T>, String> {
+    let mut lease = launch.memory().try_acquire(path_workspace_bytes(path, launch, extra))
+        .ok_or_else(|| format!(
+            "Server active memory budget ({} bytes) is full while preparing the file path; the file operation was not dispatched.",
+            launch.memory().limit()
+        ))?;
+    let value = operation(&mut lease);
+    Ok(crate::ipc::Owned::new(
+        value,
+        crate::lease::Owner::new(lease),
+    ))
+}
+
+const TEXT_BLOCK: usize = 8 * 1024;
+const TEXT_FIXED_WORKSPACE: usize = 512 * 1024;
+
+struct TextWorkspace {
+    base: usize,
+    limit: usize,
+    lease: Lease,
+}
+
+impl TextWorkspace {
+    #[cfg(test)]
+    fn new(pool: &Arc<BytePool>, path_bytes: usize) -> Result<Self, String> {
+        Self::with_base(
+            pool,
+            TEXT_FIXED_WORKSPACE.saturating_add(path_bytes.saturating_mul(32)),
+        )
+    }
+
+    fn after_path(pool: &Arc<BytePool>) -> Result<Self, String> {
+        // The path owner already accounts for the sniff buffer and path copies.
+        Self::with_base(pool, TEXT_FIXED_WORKSPACE.saturating_sub(SNIFF))
+    }
+
+    fn with_base(pool: &Arc<BytePool>, base: usize) -> Result<Self, String> {
+        // At most one 8 KiB block plus a three-byte UTF-8 carry is decoded.
+        // The two Strings and two replacement-position vectors, including old
+        // allocations during growth, fit (16 + 5 * sizeof(usize)) * (B + 3) + B.
+        // 512 KiB also covers sniffing, the 64 KiB whole-file chunk, and notices.
+        let mut workspace = Self {
+            base,
+            limit: pool.limit(),
+            lease: Lease::empty(pool),
+        };
+        workspace.reserve(0)?;
+        Ok(workspace)
+    }
+
+    fn reserve(&mut self, retained: usize) -> Result<(), String> {
+        // Growing line and window buffers, render copies, and structured text
+        // coexist. Charge before each growth; retain the largest admitted peak.
+        let target = self.base.saturating_add(retained.saturating_mul(16));
+        if target > self.lease.bytes() && !self.lease.try_resize(target) {
+            return Err(format!(
+                "Server active memory budget ({} bytes) is full while reading file text; retry once in-flight transfers complete.",
+                self.limit
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -264,8 +370,9 @@ pub struct Outcome {
     pub notice: String,
     pub body: Option<String>,
     pub attachment: Option<ContentBlock>,
-    pub lease: Option<Lease>,
     pub structured: Value,
+    pub lease: Option<Lease>,
+    owner: crate::lease::Owner,
 }
 
 impl Outcome {
@@ -274,7 +381,7 @@ impl Outcome {
         if render.output_mode != OutputMode::Text
             && let Some(body) = self.body
         {
-            structured["text"] = json!(body);
+            structured["text"] = Value::String(body);
         }
         let shown = if render.output_mode == OutputMode::Structured && self.attachment.is_none() {
             self.notice
@@ -292,17 +399,19 @@ impl Outcome {
             lease: self.lease,
             overload: false,
             task_meta: None,
+            payload_owner: self.owner,
         }
     }
 }
 
 /// Writes one file, creating its parent directories.
-pub async fn write(
+pub async fn write_tracked(
     request: WriteRequest,
     launch: Arc<LaunchContext>,
     render: Render,
-) -> CallToolResult {
-    write_with_permit(request, launch, render, None).await
+    input_owner: crate::lease::Owner,
+) -> TrackedResult {
+    write_with_permit(request, launch, render, None, input_owner).await
 }
 
 pub(crate) async fn write_nested(
@@ -310,8 +419,9 @@ pub(crate) async fn write_nested(
     launch: Arc<LaunchContext>,
     render: Render,
     permit: tokio::sync::OwnedSemaphorePermit,
-) -> CallToolResult {
-    write_with_permit(request, launch, render, Some(permit)).await
+    input_owner: crate::lease::Owner,
+) -> TrackedResult {
+    write_with_permit(request, launch, render, Some(permit), input_owner).await
 }
 
 async fn write_with_permit(
@@ -319,28 +429,37 @@ async fn write_with_permit(
     launch: Arc<LaunchContext>,
     render: Render,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> CallToolResult {
+    input_owner: crate::lease::Owner,
+) -> TrackedResult {
     let effective = render.effective();
     let bytes = request.content.len();
+    let input = crate::ipc::Owned::new((request, permit), input_owner);
     let outcome = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        write_text(&request, &launch)
+        input.flat_map(|(request, _permit)| {
+            with_path_workspace(&request.path, &launch, 0, |lease| {
+                write_text_reserved(&request, &launch, lease)
+                    .map(|(text, path)| (text, json!({ "ok": true, "path": path, "bytes": bytes })))
+                    .map_err(|msg| (msg, None))
+            })
+            .unwrap_or_else(|message| {
+                crate::ipc::Owned::new(Err((message, None)), Default::default())
+            })
+        })
     })
     .await;
-    let result = finished(outcome.map(|res| {
-        res.map(|(text, path)| (text, json!({ "ok": true, "path": path, "bytes": bytes })))
-            .map_err(|msg| (msg, None))
-    }));
-    service::suppress(result, effective)
+    let mut tracked = finished_owned(outcome);
+    tracked.result = service::suppress(tracked.result, effective);
+    tracked
 }
 
 /// Applies targeted replacements to one file.
-pub async fn edit(
+pub async fn edit_tracked(
     request: EditRequest,
     launch: Arc<LaunchContext>,
     render: Render,
-) -> CallToolResult {
-    edit_with_permit(request, launch, render, None).await
+    input_owner: crate::lease::Owner,
+) -> TrackedResult {
+    edit_with_permit(request, launch, render, None, input_owner).await
 }
 
 pub(crate) async fn edit_nested(
@@ -348,8 +467,9 @@ pub(crate) async fn edit_nested(
     launch: Arc<LaunchContext>,
     render: Render,
     permit: tokio::sync::OwnedSemaphorePermit,
-) -> CallToolResult {
-    edit_with_permit(request, launch, render, Some(permit)).await
+    input_owner: crate::lease::Owner,
+) -> TrackedResult {
+    edit_with_permit(request, launch, render, Some(permit), input_owner).await
 }
 
 async fn edit_with_permit(
@@ -357,19 +477,46 @@ async fn edit_with_permit(
     launch: Arc<LaunchContext>,
     render: Render,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> CallToolResult {
+    input_owner: crate::lease::Owner,
+) -> TrackedResult {
     let effective = render.effective();
-    let result = finished(
+    let input = crate::ipc::Owned::new((request, permit), input_owner);
+    let mut tracked = finished_owned(
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            edit_outcome(&request, &launch)
+            input.flat_map(|(request, _permit)| edit_owned_outcome(&request, &launch))
         })
         .await,
     );
-    service::suppress(result, effective)
+    tracked.result = service::suppress(tracked.result, effective);
+    tracked
 }
 
 type BlockingOutcome = Result<(String, Value), (String, Option<Value>)>;
+
+fn finished_owned(
+    outcome: Result<crate::ipc::Owned<BlockingOutcome>, tokio::task::JoinError>,
+) -> TrackedResult {
+    match outcome {
+        Ok(outcome) => {
+            let owner = outcome.owner.clone();
+            let result = outcome.run(|outcome| finished(Ok(outcome)));
+            TrackedResult::owned(result, owner)
+        }
+        Err(error) => TrackedResult::plain(finished(Err(error))),
+    }
+}
+
+#[cfg(test)]
+async fn write(
+    request: WriteRequest,
+    launch: Arc<LaunchContext>,
+    render: Render,
+    input_owner: crate::lease::Owner,
+) -> CallToolResult {
+    write_tracked(request, launch, render, input_owner)
+        .await
+        .result
+}
 
 /// A blocking operation's answer: its text and structured metadata, or its message as an error.
 fn finished(outcome: Result<BlockingOutcome, tokio::task::JoinError>) -> CallToolResult {
@@ -660,9 +807,11 @@ fn read_text(
     transfer: bool,
     limits: ReadLimits,
 ) -> Result<Outcome, String> {
-    read_cancellable(request, launch, transfer, limits, None).map_err(|failure| match failure {
-        ReadFailure::Error(msg) | ReadFailure::Overload(msg) => msg,
-    })
+    read_cancellable(request, launch, transfer, limits, None)
+        .run(|read| read)
+        .map_err(|failure| match failure {
+            ReadFailure::Error(msg) | ReadFailure::Overload(msg) => msg,
+        })
 }
 
 fn count_lines_streaming(
@@ -721,14 +870,18 @@ fn media_frame_overhead(path_len: usize) -> usize {
     BASE_MEDIA_FRAME_OVERHEAD.saturating_add(path_len.saturating_mul(10))
 }
 
-fn peak_media_lease(raw_len: usize, frame_overhead: Option<usize>) -> Option<usize> {
+fn peak_media_lease(
+    raw_len: usize,
+    raw_capacity: usize,
+    frame_overhead: Option<usize>,
+) -> Option<usize> {
     if let Some(overhead) = frame_overhead {
         let b64 = raw_len.checked_add(2)?.checked_div(3)?.checked_mul(4)?;
-        let read_peak = raw_len.checked_add(b64)?;
+        let read_peak = raw_capacity.checked_add(b64)?;
         let outbound_peak = b64.checked_mul(2)?.checked_add(overhead)?;
         Some(read_peak.max(outbound_peak))
     } else {
-        Some(raw_len)
+        Some(raw_capacity)
     }
 }
 
@@ -760,8 +913,10 @@ pub(crate) fn read_media_from_zero(
         });
     }
     let expected = (initial_len as usize).max(prefix_len);
-    let initial_peak =
-        peak_media_lease(expected, frame_overhead).ok_or(MediaReadError::Overload)?;
+    let chunk_len = MEDIA_READ_CHUNK.min(max + 1);
+    let initial_peak = peak_media_lease(expected, expected, frame_overhead)
+        .and_then(|peak| peak.checked_add(chunk_len))
+        .ok_or(MediaReadError::Overload)?;
     let mut lease = pool
         .try_acquire(initial_peak)
         .ok_or(MediaReadError::Overload)?;
@@ -780,7 +935,7 @@ pub(crate) fn read_media_from_zero(
             max + 1
         }
     };
-    let mut chunk = vec![0_u8; MEDIA_READ_CHUNK];
+    let mut chunk = vec![0_u8; chunk_len];
     while remaining > 0 {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             drop(chunk);
@@ -809,23 +964,44 @@ pub(crate) fn read_media_from_zero(
                 exact_source_bytes: None,
             });
         }
-        let Some(needed_peak) = peak_media_lease(next_len, frame_overhead) else {
-            drop(chunk);
-            drop(raw);
-            drop(lease);
-            return Err(MediaReadError::Overload);
-        };
-        if needed_peak > lease.bytes() && !lease.try_resize(needed_peak) {
-            drop(chunk);
-            drop(raw);
-            drop(lease);
-            return Err(MediaReadError::Overload);
+        if next_len > raw.capacity() {
+            let preferred = raw.capacity().saturating_mul(2).max(next_len).min(max);
+            let mut admitted = None;
+            for capacity in [preferred, next_len] {
+                let needed = peak_media_lease(next_len, capacity, frame_overhead)
+                    .map(|peak| peak.max(raw.capacity().saturating_add(capacity)))
+                    .and_then(|peak| peak.checked_add(chunk.capacity()));
+                if needed.is_some_and(|peak| lease.try_resize(peak)) {
+                    admitted = Some(capacity);
+                    break;
+                }
+            }
+            let Some(capacity) = admitted else {
+                drop(chunk);
+                drop(raw);
+                drop(lease);
+                return Err(MediaReadError::Overload);
+            };
+            // Both allocations remain charged during replacement.
+            let mut replacement = Vec::with_capacity(capacity);
+            replacement.extend_from_slice(&raw);
+            raw = replacement;
+        } else {
+            let needed = peak_media_lease(next_len, raw.capacity(), frame_overhead)
+                .and_then(|peak| peak.checked_add(chunk.capacity()));
+            if !needed.is_some_and(|peak| lease.try_resize(peak)) {
+                drop(chunk);
+                drop(raw);
+                drop(lease);
+                return Err(MediaReadError::Overload);
+            }
         }
         raw.extend_from_slice(&chunk[..read]);
         remaining -= read;
     }
     drop(chunk);
-    let final_peak = peak_media_lease(raw.len(), frame_overhead).unwrap_or(lease.bytes());
+    let final_peak =
+        peak_media_lease(raw.len(), raw.capacity(), frame_overhead).unwrap_or(lease.bytes());
     lease.shrink_to(final_peak);
     Ok(MediaBytes::Loaded { bytes: raw, lease })
 }
@@ -879,6 +1055,7 @@ fn unattached_outcome(
     }
     map.insert("note".into(), json!(note.clone()));
     Outcome {
+        owner: Default::default(),
         notice: note.clone(),
         text: note,
         body: None,
@@ -942,6 +1119,7 @@ fn read_media_outcome(
             initial_len
         );
         return Ok(Outcome {
+            owner: Default::default(),
             notice: summary.clone(),
             text: summary,
             body: None,
@@ -1011,7 +1189,7 @@ fn read_media_outcome(
                 let outbound_peak = b64_len.saturating_mul(2).saturating_add(frame_overhead);
                 let needed = compressed
                     .bytes
-                    .len()
+                    .capacity()
                     .saturating_add(b64_len)
                     .max(outbound_peak);
                 if needed > lease.bytes() && !lease.try_resize(needed) {
@@ -1047,6 +1225,7 @@ fn read_media_outcome(
                 let block =
                     media::content_block(MediaKind::Image, &compressed.mime, encoded, resolved);
                 return Ok(Outcome {
+                    owner: Default::default(),
                     notice: text.clone(),
                     text,
                     body: None,
@@ -1104,6 +1283,7 @@ fn read_media_outcome(
         "attached": true,
     });
     Ok(Outcome {
+        owner: Default::default(),
         notice: text.clone(),
         text,
         body: None,
@@ -1119,6 +1299,29 @@ fn read_cancellable(
     transfer: bool,
     limits: ReadLimits,
     cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> crate::ipc::Owned<Result<Outcome, ReadFailure>> {
+    match with_path_workspace(&request.path, launch, SNIFF, |path_lease| {
+        read_cancellable_reserved(request, launch, transfer, limits, cancel, path_lease)
+    }) {
+        Ok(mut read) => {
+            if let Ok(outcome) = &mut read.value {
+                outcome.owner = read.owner.clone();
+            }
+            read
+        }
+        Err(message) => {
+            crate::ipc::Owned::new(Err(ReadFailure::Overload(message)), Default::default())
+        }
+    }
+}
+
+fn read_cancellable_reserved(
+    request: &ReadRequest,
+    launch: &LaunchContext,
+    transfer: bool,
+    limits: ReadLimits,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    path_lease: &mut Lease,
 ) -> Result<Outcome, ReadFailure> {
     if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
         return Err(ReadFailure::Error("Cancelled while reading file.".into()));
@@ -1131,6 +1334,7 @@ fn read_cancellable(
     if request.limit == Some(0) {
         return Err(ReadFailure::Error("limit must be at least 1.".into()));
     }
+    let mut workspace;
     let resolved = resolve(&request.path, launch).map_err(ReadFailure::Error)?;
     let shown_path = display_path(&resolved);
     let (mut file, metadata) = open_regular(&resolved).map_err(|error| {
@@ -1146,6 +1350,19 @@ fn read_cancellable(
     let sniffed = read_upto(&mut file, &mut sniff)
         .map_err(|error| ReadFailure::Error(format!("Cannot read {shown_path}: {error}.")))?;
     if let Some(detected) = media::detect_path(&sniff[..sniffed], Some(&resolved)) {
+        // Invalid media configuration may be echoed in a diagnostic. Reserve its
+        // borrowed native text before the validator formats that error.
+        let config_bytes = [
+            crate::session::IMAGE_COMPRESS,
+            crate::session::MAX_MEDIA_BYTES,
+        ]
+        .iter()
+        .filter_map(|name| launch.var(name))
+        .map(|value| value.as_encoded_bytes().len())
+        .fold(0, usize::saturating_add);
+        if !path_lease.try_grow(config_bytes.saturating_mul(16)) {
+            return Err(ReadFailure::Overload("Server active memory budget is full while preparing media configuration diagnostics.".into()));
+        }
         return read_media_outcome(
             &mut file,
             metadata.len(),
@@ -1166,16 +1383,20 @@ fn read_cancellable(
             metadata.len()
         )));
     }
+    workspace = TextWorkspace::after_path(launch.memory())?;
     if limits == ReadLimits::NESTED && request.offset.is_none() && request.limit.is_none() {
-        return read_whole_utf8(
+        let mut outcome = read_whole_utf8(
             &mut file,
             metadata.len(),
             &sniff[..sniffed],
             &shown_path,
             limits.max_bytes,
             cancel,
+            &mut workspace,
         )
-        .map_err(ReadFailure::Error);
+        .map_err(ReadFailure::from)?;
+        outcome.lease = Some(workspace.lease);
+        return Ok(outcome);
     }
     let tail = if let Some(offset) = request.offset.filter(|off| *off < 0) {
         Some((
@@ -1189,17 +1410,18 @@ fn read_cancellable(
         file.rewind()
             .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
         Window::scan(
-            Source::new(BufReader::new(&mut file), cancel),
+            Source::new(BufReader::with_capacity(TEXT_BLOCK, &mut file), cancel),
             start_line,
             request.limit,
             limits,
+            &mut workspace,
         )
     };
     let (start_line, window) = if let Some((distance, total)) = tail {
-        scan_from_end(distance, total, &shown_path, scan).map_err(ReadFailure::Error)?
+        scan_from_end(distance, total, &shown_path, scan).map_err(ReadFailure::from)?
     } else {
         let start = request.offset.unwrap_or(1) as u64;
-        let window = scan(start).map_err(ReadFailure::Error)?;
+        let window = scan(start).map_err(ReadFailure::from)?;
         if start > 1 && start > window.total_lines {
             return Err(ReadFailure::Error(format!(
                 "Offset {start} is beyond end of file ({} lines total)",
@@ -1208,7 +1430,9 @@ fn read_cancellable(
         }
         (start, window)
     };
-    Ok(window.render(start_line, request.limit, &shown_path, limits))
+    let mut outcome = window.render(start_line, request.limit, &shown_path, limits);
+    outcome.lease = Some(workspace.lease);
+    Ok(outcome)
 }
 
 /// A successful tail slice must start at the offset implied by its own observed line count.
@@ -1240,6 +1464,7 @@ fn read_whole_utf8(
     shown_path: &str,
     max_bytes: u64,
     cancel: Option<&tokio_util::sync::CancellationToken>,
+    workspace: &mut TextWorkspace,
 ) -> Result<Outcome, String> {
     if initial_len > max_bytes {
         return Err(format!(
@@ -1247,7 +1472,9 @@ fn read_whole_utf8(
         ));
     }
     let limit = max_bytes as usize;
-    let mut raw = Vec::with_capacity((initial_len as usize).min(limit).max(prefix.len()) + 1);
+    let capacity = (initial_len as usize).min(limit).max(prefix.len()) + 1;
+    workspace.reserve(capacity)?;
+    let mut raw = Vec::with_capacity(capacity);
     raw.extend_from_slice(prefix);
     let mut chunk = vec![0_u8; 64 * 1024];
     while raw.len() <= limit {
@@ -1261,6 +1488,7 @@ fn read_whole_utf8(
         if read == 0 {
             break;
         }
+        workspace.reserve(raw.len().saturating_add(read))?;
         raw.extend_from_slice(&chunk[..read]);
     }
     if raw.len() > limit {
@@ -1294,6 +1522,7 @@ fn read_whole_utf8(
         "lossy": false,
     });
     Ok(Outcome {
+        owner: Default::default(),
         text: body.clone(),
         notice,
         body: Some(body),
@@ -1422,7 +1651,7 @@ impl<'a> Source<'a> {
 
     /// The next line with its `\n` terminator when present, keeping at most `keep` bytes of it;
     /// `None` after the last line (including right after a final `\n` at EOF).
-    fn kept(&mut self, keep: usize) -> Result<Option<Line>, String> {
+    fn kept(&mut self, keep: usize, workspace: &mut TextWorkspace) -> Result<Option<Line>, String> {
         if self.done {
             return Ok(None);
         }
@@ -1435,7 +1664,7 @@ impl<'a> Source<'a> {
                     lossy = true;
                     self.mark_pos += 1;
                 }
-                line.push(&self.pending[self.pos..end], lossy, keep);
+                line.push(&self.pending[self.pos..end], lossy, keep, workspace)?;
                 self.pos = end;
                 if self.pos == self.pending.len() {
                     self.clear_pending();
@@ -1445,14 +1674,14 @@ impl<'a> Source<'a> {
             // No line end here, so all of it belongs to this line.
             if self.pos < self.pending.len() {
                 let lossy = self.mark_pos < self.marks.len();
-                line.push(&self.pending[self.pos..], lossy, keep);
+                line.push(&self.pending[self.pos..], lossy, keep, workspace)?;
                 self.clear_pending();
             }
             if self.fill()? {
                 // The end: the flushed unfinished character is the rest of this line.
                 if self.pos < self.pending.len() {
                     let lossy = self.mark_pos < self.marks.len();
-                    line.push(&self.pending[self.pos..], lossy, keep);
+                    line.push(&self.pending[self.pos..], lossy, keep, workspace)?;
                     self.clear_pending();
                 }
                 self.done = true;
@@ -1593,6 +1822,7 @@ impl Window {
         start_line: u64,
         limit: Option<u64>,
         limits: ReadLimits,
+        workspace: &mut TextWorkspace,
     ) -> Result<Self, String> {
         let start = start_line.saturating_sub(1);
         let end = limit.map_or(u64::MAX, |limit| start.saturating_add(limit));
@@ -1602,10 +1832,10 @@ impl Window {
         loop {
             let in_window = window.total_lines >= start && window.total_lines < end;
             if in_window && deciding {
-                let Some(line) = source.kept(keep)? else {
+                let Some(line) = source.kept(keep, workspace)? else {
                     break;
                 };
-                window.take_line(&line, &mut deciding, limits);
+                window.take_line(&line, &mut deciding, limits, workspace)?;
             } else {
                 let Some(length) = source.skipped()? else {
                     break;
@@ -1617,7 +1847,13 @@ impl Window {
     }
 
     /// Records a kept line: its counts, and its bytes when it fits the budget.
-    fn take_line(&mut self, line: &Line, deciding: &mut bool, limits: ReadLimits) {
+    fn take_line(
+        &mut self,
+        line: &Line,
+        deciding: &mut bool,
+        limits: ReadLimits,
+        workspace: &mut TextWorkspace,
+    ) -> Result<(), String> {
         self.total_lines += 1;
         self.window_lines += 1;
         self.window_bytes += line.length;
@@ -1630,13 +1866,15 @@ impl Window {
         if self.window_bytes > limits.max_bytes {
             self.stopped_on_bytes = true;
             *deciding = false;
-            return;
+            return Ok(());
         }
+        workspace.reserve(self.content.len().saturating_add(line.text.len()))?;
         self.content.push_str(&line.text);
         self.shown_lines += 1;
         if self.shown_lines >= limits.max_lines {
             *deciding = false;
         }
+        Ok(())
     }
 
     /// Records a line that is only counted, not shown.
@@ -1749,6 +1987,7 @@ impl Window {
             "lossy": self.lossy,
         });
         Outcome {
+            owner: Default::default(),
             text,
             notice,
             body: Some(body),
@@ -1772,22 +2011,30 @@ struct Line {
 
 impl Line {
     /// Adds decoded text, keeping at most `keep` bytes of it.
-    fn push(&mut self, bytes: &str, lossy: bool, keep: usize) {
+    fn push(
+        &mut self,
+        bytes: &str,
+        lossy: bool,
+        keep: usize,
+        workspace: &mut TextWorkspace,
+    ) -> Result<(), String> {
         if bytes.is_empty() {
-            return;
+            return Ok(());
         }
         self.length += bytes.len() as u64;
         self.lossy |= lossy;
         if self.text.len() >= keep {
-            return;
+            return Ok(());
         }
         let room = keep - self.text.len();
         let take = bytes.len().min(room);
         // A character cut by the cap leaves this line over the budget, so it is never shown and
         // the whole character is dropped rather than half of it kept.
         if bytes.is_char_boundary(take) {
+            workspace.reserve(self.text.len().saturating_add(take))?;
             self.text.push_str(&bytes[..take]);
         }
+        Ok(())
     }
 }
 
@@ -1848,35 +2095,308 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Writes one file, creating its parent directories and keeping an existing file's permissions.
+#[cfg(test)]
 fn write_text(request: &WriteRequest, launch: &LaunchContext) -> Result<(String, String), String> {
+    with_path_workspace(&request.path, launch, 0, |lease| {
+        write_text_reserved(request, launch, lease)
+    })?
+    .run(|result| result)
+}
+
+fn write_text_reserved(
+    request: &WriteRequest,
+    launch: &LaunchContext,
+    lease: &mut Lease,
+) -> Result<(String, String), String> {
     let resolved = resolve(&request.path, launch)?;
     let shown_path = display_path(&resolved);
     let _guard = lock();
-    let target = create_target_parents(&resolved)
+    let target = write_target(&resolved, launch.memory())
         .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
-    save_target(target, request.content.as_bytes(), None)
+    reserve_target_workspace(&target.value, lease, launch.memory())
         .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
+    create_target_directories(&target.value, launch.memory())
+        .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
+    save_target(
+        &target.value,
+        request.content.as_bytes(),
+        None,
+        launch.memory(),
+    )
+    .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
     Ok((format!("Successfully wrote to {shown_path}"), shown_path))
 }
 
-/// Creates the final target's parent directories for a write or an initial upload.
-pub(crate) fn create_target_parents(path: &Path) -> io::Result<PathBuf> {
-    let target = write_target(path)?;
-    if let Some(parent) = target
+/// Space for native path arguments and conversions, in addition to the owned path itself.
+/// UTF-16 input, normalized input and their growth can coexist on Windows. Unix's
+/// terminated input copy needs less. The fixed part covers the short native-path buffer.
+pub(crate) fn native_path_bytes(path: &Path) -> Option<usize> {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .checked_add(8)?
+        .checked_mul(16)?
+        .checked_add(1024)
+}
+
+fn target_memory_error(pool: &BytePool) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "Server active memory budget ({} bytes) is full while preparing the file target; the original file was not replaced.",
+            pool.limit()
+        ),
+    )
+}
+
+/// Saving may hold staging/default/backup paths, native argument buffers and formatted
+/// target errors together. Keep that allowance in the outer result owner, including on Err.
+pub(crate) fn reserve_target_workspace(
+    path: &Path,
+    lease: &mut Lease,
+    pool: &BytePool,
+) -> io::Result<()> {
+    let bytes = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .checked_add(64)
+        .and_then(|n| n.checked_mul(64))
+        .and_then(|n| n.checked_add(4096));
+    if bytes.is_some_and(|bytes| lease.try_grow(bytes)) {
+        Ok(())
+    } else {
+        Err(target_memory_error(pool))
+    }
+}
+
+#[cfg(unix)]
+fn native_path_input(
+    path: &Path,
+    pool: &Arc<BytePool>,
+) -> io::Result<crate::ipc::Owned<std::ffi::CString>> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = native_path_bytes(path).ok_or_else(|| target_memory_error(pool))?;
+    let lease = pool
+        .try_acquire(bytes)
+        .ok_or_else(|| target_memory_error(pool))?;
+    let value = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    Ok(crate::ipc::Owned::new(
+        value,
+        crate::lease::Owner::new(lease),
+    ))
+}
+
+/// Canonicalize into application-owned storage. Native-library internal scratch is
+/// opaque; this lease covers our caller buffer and the returned PathBuf.
+#[cfg(unix)]
+fn canonical_target(path: &Path, pool: &Arc<BytePool>) -> io::Result<crate::ipc::Owned<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
+    let input = native_path_input(path, pool)?;
+    // POSIX realpath's caller buffer includes its terminating NUL.
+    let mut buffer = SaveBuffer::<u8>::new(libc::PATH_MAX as usize, pool)?;
+    // SAFETY: input is terminated and the writable caller buffer has PATH_MAX bytes.
+    let result = unsafe { libc::realpath(input.value.as_ptr(), buffer.data.as_mut_ptr().cast()) };
+    if result.is_null() {
+        // Preserve errno before dropping any buffer or running another native call.
+        let error = io::Error::last_os_error();
+        return Err(error);
+    }
+    let end = buffer
+        .data
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| io::Error::other("the canonical path is not terminated"))?;
+    let SaveBuffer {
+        mut data,
+        _lease: lease,
+    } = buffer;
+    data.truncate(end);
+    let value = PathBuf::from(std::ffi::OsString::from_vec(data));
+    Ok(crate::ipc::Owned::new(
+        value,
+        crate::lease::Owner::new(lease),
+    ))
+}
+
+#[cfg(windows)]
+fn canonical_target(path: &Path, pool: &Arc<BytePool>) -> io::Result<crate::ipc::Owned<PathBuf>> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+    let input_bytes = native_path_bytes(path).ok_or_else(|| target_memory_error(pool))?;
+    let _input_lease = pool
+        .try_acquire(input_bytes)
+        .ok_or_else(|| target_memory_error(pool))?;
+    // Match std::fs::canonicalize: reopen the current name, with normalized DOS output.
+    let file = OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    // SAFETY: a zero-length call queries the required UTF-16 units, including NUL.
+    let mut required = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            VOLUME_NAME_DOS,
+        )
+    };
+    if required == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    loop {
+        let mut buffer = SaveBuffer::<u16>::new(required as usize, pool)?;
+        // SAFETY: this buffer owns the advertised UTF-16 units through the call.
+        let count = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.data.as_mut_ptr(),
+                required,
+                VOLUME_NAME_DOS,
+            )
+        };
+        if count == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if count >= required {
+            // The path changed after the query. Drop the old allocation before reserving
+            // its replacement; a successful count excludes the final NUL.
+            drop(buffer);
+            required = count;
+            continue;
+        }
+        // An unpaired surrogate needs three WTF-8 bytes; a pair needs four for two units.
+        // Include String growth while the complete UTF-16 buffer remains owned.
+        let bytes = (count as usize)
+            .checked_mul(3)
+            .and_then(|n| edit_growth(n, 1))
+            .ok_or_else(|| target_memory_error(pool))?;
+        let mut lease = pool
+            .try_acquire(bytes)
+            .ok_or_else(|| target_memory_error(pool))?;
+        let value = PathBuf::from(std::ffi::OsString::from_wide(
+            &buffer.data[..count as usize],
+        ));
+        drop(buffer);
+        lease.shrink_to(value.capacity());
+        return Ok(crate::ipc::Owned::new(
+            value,
+            crate::lease::Owner::new(lease),
+        ));
+    }
+}
+
+#[cfg(unix)]
+fn read_target_link(path: &Path, pool: &Arc<BytePool>) -> io::Result<crate::ipc::Owned<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
+    let input = native_path_input(path, pool)?;
+    let mut capacity = 256usize;
+    loop {
+        let mut buffer = SaveBuffer::<u8>::new(capacity, pool)?;
+        // SAFETY: input is terminated and buffer owns capacity writable bytes.
+        let count = unsafe {
+            libc::readlink(
+                input.value.as_ptr(),
+                buffer.data.as_mut_ptr().cast(),
+                capacity,
+            )
+        };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            return Err(error);
+        }
+        if count as usize == capacity {
+            drop(buffer);
+            capacity = capacity
+                .checked_mul(2)
+                .ok_or_else(|| target_memory_error(pool))?;
+            continue;
+        }
+        let SaveBuffer {
+            mut data,
+            _lease: lease,
+        } = buffer;
+        data.truncate(count as usize);
+        let value = PathBuf::from(std::ffi::OsString::from_vec(data));
+        return Ok(crate::ipc::Owned::new(
+            value,
+            crate::lease::Owner::new(lease),
+        ));
+    }
+}
+
+#[cfg(windows)]
+fn read_target_link(path: &Path, pool: &Arc<BytePool>) -> io::Result<crate::ipc::Owned<PathBuf>> {
+    use windows_sys::Win32::Storage::FileSystem::MAXIMUM_REPARSE_DATA_BUFFER_SIZE;
+    // Rust 1.92 uses one fixed reparse buffer, a UTF-16 substitute-name Vec, and a
+    // WTF-8 String. Eight reparse buffers cover those allocations and growth plus
+    // the <=260-unit prefix check. Retain std's relative/junction conversion rules.
+    let bytes = native_path_bytes(path)
+        .and_then(|n| n.checked_add(8 * MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize))
+        .ok_or_else(|| target_memory_error(pool))?;
+    let mut lease = pool
+        .try_acquire(bytes)
+        .ok_or_else(|| target_memory_error(pool))?;
+    let value = std::fs::read_link(path)?;
+    lease.shrink_to(value.capacity());
+    Ok(crate::ipc::Owned::new(
+        value,
+        crate::lease::Owner::new(lease),
+    ))
+}
+
+/// Creates the final target's parent directories for an initial upload. Its real
+/// blocking worker owns the resolved target even when the HTTP waiter is dropped.
+pub(crate) fn create_target_parents(path: &Path) -> io::Result<crate::ipc::Owned<PathBuf>> {
+    create_target_parents_in(path, crate::lease::process_pool())
+}
+
+fn create_target_parents_in(
+    path: &Path,
+    pool: &Arc<BytePool>,
+) -> io::Result<crate::ipc::Owned<PathBuf>> {
+    let target = write_target(path, pool)?;
+    create_target_directories(&target.value, pool)?;
+    Ok(target)
+}
+
+fn create_target_directories(path: &Path, pool: &Arc<BytePool>) -> io::Result<()> {
+    let native_bytes = native_path_bytes(path).ok_or_else(|| target_memory_error(pool))?;
+    let _native_lease = pool
+        .try_acquire(native_bytes)
+        .ok_or_else(|| target_memory_error(pool))?;
+    if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)?;
     }
-    Ok(target)
+    Ok(())
 }
 
-/// Follows a final-component symlink without replacing the link itself, including a dangling
-/// link whose target can be created. Parent-directory symlinks keep their normal filesystem
-/// meaning. A finite walk also refuses cycles before any file is changed.
-pub(crate) fn write_target(path: &Path) -> io::Result<PathBuf> {
+/// Follows final-component links, including dangling targets, retaining the original
+/// forty-step limit and native directory requirements.
+pub(crate) fn write_target(
+    path: &Path,
+    pool: &Arc<BytePool>,
+) -> io::Result<crate::ipc::Owned<PathBuf>> {
+    let initial = native_path_bytes(path).ok_or_else(|| target_memory_error(pool))?;
+    let mut lease = pool
+        .try_acquire(initial)
+        .ok_or_else(|| target_memory_error(pool))?;
     let mut target = path.to_path_buf();
     for depth in 0..=40 {
+        let working = native_path_bytes(&target)
+            .and_then(|n| n.checked_add(target.capacity()))
+            .ok_or_else(|| target_memory_error(pool))?;
+        if !lease.try_resize(working) {
+            return Err(target_memory_error(pool));
+        }
         if ends_in_directory(&target) {
             return Err(io::Error::other(
                 "the path requires a directory, not a regular file",
@@ -1884,23 +2404,50 @@ pub(crate) fn write_target(path: &Path) -> io::Result<PathBuf> {
         }
         match std::fs::symlink_metadata(&target) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                // Walking the final links individually would reset the OS's whole-path
-                // traversal limit on each step, including links in parent directories.
                 if depth == 0
                     && let Err(error) = std::fs::metadata(path)
                     && error.kind() != io::ErrorKind::NotFound
                 {
                     return Err(error);
                 }
-                let link = std::fs::read_link(&target)?;
-                target = if link.is_absolute() {
-                    link
+                let link = read_target_link(&target, pool)?;
+                let joined = target
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len()
+                    .checked_add(link.value.as_os_str().as_encoded_bytes().len())
+                    .and_then(|n| n.checked_add(8))
+                    .and_then(|n| n.checked_mul(16))
+                    .and_then(|n| n.checked_add(target.capacity()))
+                    .and_then(|n| n.checked_add(link.value.capacity()))
+                    .ok_or_else(|| target_memory_error(pool))?;
+                if !lease.try_resize(joined) {
+                    return Err(target_memory_error(pool));
+                }
+                target = if link.value.is_absolute() {
+                    // The new lease already covers the moved path before its old owner ends.
+                    link.run(|path| path)
                 } else {
-                    append_path(target.parent().unwrap_or_else(|| Path::new(".")), &link)
+                    append_path(
+                        target.parent().unwrap_or_else(|| Path::new(".")),
+                        &link.value,
+                    )
                 };
             }
-            Ok(_) => return Ok(target),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(target),
+            Ok(_) => {
+                lease.shrink_to(target.capacity());
+                return Ok(crate::ipc::Owned::new(
+                    target,
+                    crate::lease::Owner::new(lease),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                lease.shrink_to(target.capacity());
+                return Ok(crate::ipc::Owned::new(
+                    target,
+                    crate::lease::Owner::new(lease),
+                ));
+            }
             Err(error) => return Err(error),
         }
     }
@@ -2318,10 +2865,52 @@ fn preserve_owner(file: &File, original: &Metadata) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(unix, windows, test))]
+fn save_memory_error(pool: &BytePool) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "Server active memory budget ({} bytes) is full while preserving file metadata; the original file was not replaced.",
+            pool.limit()
+        ),
+    )
+}
+
+#[cfg(any(unix, windows, test))]
+struct SaveBuffer<T> {
+    data: Vec<T>,
+    _lease: Lease,
+}
+
+#[cfg(any(unix, windows, test))]
+impl<T: Default + Clone> SaveBuffer<T> {
+    fn new(count: usize, pool: &Arc<BytePool>) -> io::Result<Self> {
+        let memory = || save_memory_error(pool);
+        let bytes = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(memory)?;
+        let mut lease = pool.try_acquire(bytes).ok_or_else(memory)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(count).map_err(|_| memory())?;
+        let actual = data
+            .capacity()
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(memory)?;
+        if !lease.try_resize(actual) {
+            return Err(memory());
+        }
+        data.resize(count, T::default());
+        Ok(Self {
+            data,
+            _lease: lease,
+        })
+    }
+}
+
 /// Keeps ACLs and extended attributes on the Unix platforms supported by the server. Linux
 /// file capabilities are deliberately not restored: a content write normally clears them.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn preserve_xattrs(original: &File, staged: &File) -> io::Result<()> {
+fn preserve_xattrs(original: &File, staged: &File, pool: &Arc<BytePool>) -> io::Result<()> {
     use std::ffi::CStr;
     use std::os::fd::AsRawFd;
     let (from, to) = (original.as_raw_fd(), staged.as_raw_fd());
@@ -2345,13 +2934,13 @@ fn preserve_xattrs(original: &File, staged: &File) -> io::Result<()> {
         }
         return Err(error);
     }
-    let mut names = vec![0u8; count as usize];
-    if !names.is_empty() {
-        let count = list(from, names.as_mut_ptr().cast(), names.len());
+    let mut names = SaveBuffer::<u8>::new(count as usize, pool)?;
+    if !names.data.is_empty() {
+        let count = list(from, names.data.as_mut_ptr().cast(), names.data.len());
         if count < 0 {
             return Err(io::Error::last_os_error());
         }
-        names.truncate(count as usize);
+        names.data.truncate(count as usize);
     }
     // The sibling may inherit a default ACL or other directory attributes the original does
     // not have. Remove those first; chmod alone could otherwise activate extra named ACL users.
@@ -2359,16 +2948,17 @@ fn preserve_xattrs(original: &File, staged: &File) -> io::Result<()> {
     if count < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut inherited = vec![0u8; count as usize];
-    if !inherited.is_empty() {
-        let count = list(to, inherited.as_mut_ptr().cast(), inherited.len());
+    let mut inherited = SaveBuffer::<u8>::new(count as usize, pool)?;
+    if !inherited.data.is_empty() {
+        let count = list(to, inherited.data.as_mut_ptr().cast(), inherited.data.len());
         if count < 0 {
             return Err(io::Error::last_os_error());
         }
-        inherited.truncate(count as usize);
+        inherited.data.truncate(count as usize);
     }
-    for name in inherited.split_inclusive(|&byte| byte == 0) {
+    for name in inherited.data.split_inclusive(|&byte| byte == 0) {
         if names
+            .data
             .split_inclusive(|&byte| byte == 0)
             .any(|original| original == name)
         {
@@ -2385,7 +2975,7 @@ fn preserve_xattrs(original: &File, staged: &File) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    for name in names.split_inclusive(|&byte| byte == 0) {
+    for name in names.data.split_inclusive(|&byte| byte == 0) {
         let name = CStr::from_bytes_with_nul(name).map_err(io::Error::other)?;
         #[cfg(target_os = "linux")]
         if name.to_bytes() == b"security.capability" {
@@ -2407,27 +2997,34 @@ fn preserve_xattrs(original: &File, staged: &File) -> io::Result<()> {
         if size < 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut value = vec![0u8; size as usize];
-        let size = read(value.as_mut_ptr().cast(), value.len());
+        let mut value = SaveBuffer::<u8>::new(size as usize, pool)?;
+        let size = read(value.data.as_mut_ptr().cast(), value.data.len());
         if size < 0 {
             return Err(io::Error::last_os_error());
         }
-        if size as usize > value.len() {
+        if size as usize > value.data.len() {
             return Err(io::Error::other(
                 "an extended attribute changed while it was being copied",
             ));
         }
         #[cfg(target_os = "linux")]
         // SAFETY: the names and buffers remain valid for the synchronous call.
-        let saved =
-            unsafe { libc::fsetxattr(to, name.as_ptr(), value.as_ptr().cast(), size as usize, 0) };
+        let saved = unsafe {
+            libc::fsetxattr(
+                to,
+                name.as_ptr(),
+                value.data.as_ptr().cast(),
+                size as usize,
+                0,
+            )
+        };
         #[cfg(target_os = "macos")]
         // SAFETY: same contract, with position and flags both zero.
         let saved = unsafe {
             libc::fsetxattr(
                 to,
                 name.as_ptr(),
-                value.as_ptr().cast(),
+                value.data.as_ptr().cast(),
                 size as usize,
                 0,
                 0,
@@ -2444,15 +3041,19 @@ fn preserve_xattrs(original: &File, staged: &File) -> io::Result<()> {
 /// does not promise to preserve the owner or group, so copy those explicitly before publishing.
 /// A protected staging DACL keeps directory inheritance from widening access to an existing file.
 #[cfg(windows)]
-fn preserve_windows_access(original: &File, staged: &File, protect: bool) -> io::Result<()> {
+fn preserve_windows_access(
+    original: &File,
+    staged: &File,
+    protect: bool,
+    pool: &Arc<BytePool>,
+) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
-    };
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION,
-        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        GetKernelObjectSecurity, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
         UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
@@ -2478,42 +3079,91 @@ fn preserve_windows_access(original: &File, staged: &File, protect: bool) -> io:
         return Ok(());
     }
     struct Security {
-        descriptor: PSECURITY_DESCRIPTOR,
+        buffer: SaveBuffer<usize>,
         owner: PSID,
         group: PSID,
         dacl: *mut ACL,
     }
-    impl Drop for Security {
-        fn drop(&mut self) {
-            if !self.descriptor.is_null() {
-                // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
-                unsafe { LocalFree(self.descriptor) };
-            }
+    impl Security {
+        fn descriptor(&self) -> PSECURITY_DESCRIPTOR {
+            self.buffer.data.as_ptr().cast_mut().cast()
         }
     }
     let read = |file: &File, information| -> io::Result<Security> {
+        let mut required = 0u32;
+        // SAFETY: this is a size-only query on the same live handle used below.
+        let queried = unsafe {
+            GetKernelObjectSecurity(
+                file.as_raw_handle(),
+                information,
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+            )
+        };
+        if queried == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+                return Err(error);
+            }
+        }
+        if required == 0 {
+            return Err(io::Error::other("the file's security descriptor is empty"));
+        }
+        // Self-relative descriptors are DWORD-aligned. A usize buffer supplies at
+        // least that alignment on supported Windows targets; charge its rounded size.
+        let unit = std::mem::size_of::<usize>();
+        let count = (required as usize)
+            .checked_add(unit - 1)
+            .ok_or_else(|| save_memory_error(pool))?
+            / unit;
+        let mut buffer = SaveBuffer::<usize>::new(count, pool)?;
+        let mut written = 0u32;
+        // SAFETY: the aligned buffer has at least required bytes. If the descriptor
+        // grew since the query, Windows returns an error before we use its contents.
+        if unsafe {
+            GetKernelObjectSecurity(
+                file.as_raw_handle(),
+                information,
+                buffer.data.as_mut_ptr().cast(),
+                required,
+                &mut written,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         let mut security = Security {
-            descriptor: std::ptr::null_mut(),
+            buffer,
             owner: std::ptr::null_mut(),
             group: std::ptr::null_mut(),
             dacl: std::ptr::null_mut(),
         };
-        // SAFETY: the file owns the handle and every output is writable; the returned SIDs and
-        // ACL remain owned by the descriptor until Security is dropped.
-        let result = unsafe {
-            GetSecurityInfo(
-                file.as_raw_handle(),
-                SE_FILE_OBJECT,
-                information,
-                &mut security.owner,
-                &mut security.group,
-                &mut security.dacl,
-                std::ptr::null_mut(),
-                &mut security.descriptor,
-            )
-        };
-        if result != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(result as i32));
+        let descriptor = security.descriptor();
+        let mut defaulted = 0;
+        // SAFETY: both calls borrow SIDs from the still-owned descriptor buffer.
+        if unsafe { GetSecurityDescriptorOwner(descriptor, &mut security.owner, &mut defaulted) }
+            == 0
+            || unsafe {
+                GetSecurityDescriptorGroup(descriptor, &mut security.group, &mut defaulted)
+            } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if information & DACL_SECURITY_INFORMATION != 0 {
+            let mut present = 0;
+            // SAFETY: the returned ACL is borrowed from the same owned buffer.
+            if unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor,
+                    &mut present,
+                    &mut security.dacl,
+                    &mut defaulted,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
         }
         if security.owner.is_null() || security.group.is_null() {
             return Err(io::Error::other("the file's owner or group is missing"));
@@ -2524,8 +3174,9 @@ fn preserve_windows_access(original: &File, staged: &File, protect: bool) -> io:
     let source = read(original, ownership | DACL_SECURITY_INFORMATION)?;
     let current = read(staged, ownership)?;
     let (mut control, mut revision) = (0u16, 0u32);
-    // SAFETY: GetSecurityInfo returned a live security descriptor.
-    if unsafe { GetSecurityDescriptorControl(source.descriptor, &mut control, &mut revision) } == 0
+    // SAFETY: the source owns the live security descriptor buffer.
+    if unsafe { GetSecurityDescriptorControl(source.descriptor(), &mut control, &mut revision) }
+        == 0
     {
         return Err(io::Error::last_os_error());
     }
@@ -2753,27 +3404,372 @@ fn publish(staged: &Path, target: &Path, exists: bool) -> io::Result<()> {
 }
 
 /// An edit keeps the file it read separate from the path that can be changed meanwhile.
+type EditFailure = (String, Option<Value>);
+
+fn edit_sum(parts: &[usize]) -> Option<usize> {
+    parts
+        .iter()
+        .try_fold(0usize, |sum, &part| sum.checked_add(part))
+}
+
+/// Four logical lengths cover geometric capacity growth and the old allocation
+/// while its replacement is live. The floor covers small Vec/String capacities.
+fn edit_growth(items: usize, item_bytes: usize) -> Option<usize> {
+    items
+        .checked_add(8)?
+        .checked_mul(item_bytes)?
+        .checked_mul(4)
+}
+
+fn edit_memory_error(limit: usize) -> EditFailure {
+    (
+        format!(
+            "Server active memory budget ({limit} bytes) is full while editing the file; nothing was changed."
+        ),
+        None,
+    )
+}
+
+struct EditWorkspace<'a> {
+    lease: &'a mut Lease,
+    retained: usize,
+    scratch: usize,
+    limit: usize,
+}
+
+impl<'a> EditWorkspace<'a> {
+    fn new(lease: &'a mut Lease, limit: usize) -> Self {
+        let retained = lease.bytes();
+        Self {
+            lease,
+            retained,
+            scratch: 0,
+            limit,
+        }
+    }
+
+    fn retain(&mut self, bytes: Option<usize>) -> Result<(), EditFailure> {
+        let retained = bytes
+            .and_then(|bytes| self.retained.checked_add(bytes))
+            .ok_or_else(|| edit_memory_error(self.limit))?;
+        let total = retained
+            .checked_add(self.scratch)
+            .ok_or_else(|| edit_memory_error(self.limit))?;
+        if !self.lease.try_resize(total) {
+            return Err(edit_memory_error(self.limit));
+        }
+        self.retained = retained;
+        Ok(())
+    }
+
+    fn temporary(&mut self, bytes: Option<usize>) -> Result<(), EditFailure> {
+        let scratch = bytes
+            .ok_or_else(|| edit_memory_error(self.limit))?
+            .max(self.scratch);
+        let total = self
+            .retained
+            .checked_add(scratch)
+            .ok_or_else(|| edit_memory_error(self.limit))?;
+        if !self.lease.try_resize(total) {
+            return Err(edit_memory_error(self.limit));
+        }
+        self.scratch = scratch;
+        Ok(())
+    }
+
+    fn diagnostics(&mut self, edits: usize, path: &str, failed: bool) -> Result<(), EditFailure> {
+        // Each failure shows at most 20 line/entry numbers. This covers its
+        // bullet, joined message, JSON copy and temporary number/label strings.
+        let per_edit = if failed { 16 * 1024 } else { 512 };
+        self.retain(edits.checked_mul(per_edit).and_then(|bytes| {
+            edit_sum(&[
+                bytes,
+                path.len().checked_mul(16)?,
+                4096,
+                if failed { 0 } else { TEXT_BLOCK },
+            ])
+        }))
+    }
+}
+
+/// Count the dependency's fully decomposed characters without constructing text.
+/// NFKC composition cannot increase that character count; UTF-8 needs at most 4
+/// bytes per character. ASCII stays unchanged.
+#[derive(Clone, Copy)]
+struct EditNormalization {
+    chars: usize,
+    decomposed: usize,
+    bytes: usize,
+    lines: usize,
+    segment: usize,
+}
+
+impl EditNormalization {
+    fn count(text: &str) -> Option<Self> {
+        let mut chars = Some(0usize);
+        let mut decomposed = Some(0usize);
+        let mut lines = Some(1usize);
+        let mut run = Some(0usize);
+        let mut longest = 0usize;
+        let mut burst = 0usize;
+        for ch in text.chars() {
+            chars = chars.and_then(|n| n.checked_add(1));
+            let mut parts = Some(0usize);
+            unicode_normalization::char::decompose_compatible(ch, |part| {
+                decomposed = decomposed.and_then(|n| n.checked_add(1));
+                parts = parts.and_then(|n| n.checked_add(1));
+                if matches!(part, '\r' | '\n') {
+                    lines = lines.and_then(|n| n.checked_add(1));
+                }
+                run = if canonical_combining_class(part) == 0 {
+                    Some(1)
+                } else {
+                    run.and_then(|n| n.checked_add(1))
+                };
+                if let Some(run) = run {
+                    longest = longest.max(run);
+                }
+            });
+            burst = burst.max(parts?);
+        }
+        let decomposed = decomposed?;
+        Some(Self {
+            chars: chars?,
+            decomposed,
+            bytes: if text.is_ascii() {
+                text.len()
+            } else {
+                decomposed.checked_mul(4)?
+            },
+            lines: lines?,
+            segment: longest.checked_add(burst)?,
+        })
+    }
+
+    fn normalizer(self) -> Option<usize> {
+        // unicode-normalization 0.1.26: decomposition TinyVec<(u8,char)>,
+        // recomposition TinyVec<char>, and stable-sort scratch.
+        edit_sum(&[
+            edit_growth(self.segment, std::mem::size_of::<(u8, char)>())?,
+            edit_growth(self.segment, std::mem::size_of::<char>())?,
+            self.segment
+                .checked_mul(std::mem::size_of::<(u8, char)>())?,
+        ])
+    }
+
+    fn form(self) -> Option<usize> {
+        edit_sum(&[
+            self.normalizer()?,
+            edit_growth(self.bytes, 1)?.checked_mul(3)?,
+            edit_growth(self.lines, std::mem::size_of::<&str>())?,
+        ])
+    }
+
+    fn mapping(self) -> Option<usize> {
+        edit_sum(&[
+            edit_growth(self.chars, std::mem::size_of::<(usize, usize)>())?,
+            edit_growth(
+                self.chars,
+                std::mem::size_of::<(usize, usize, usize, usize)>(),
+            )?,
+            edit_growth(self.bytes, 1)?.checked_mul(2)?,
+            edit_growth(self.bytes, std::mem::size_of::<usize>())?,
+        ])
+    }
+
+    fn tagged(self) -> Option<usize> {
+        edit_sum(&[
+            self.normalizer()?,
+            edit_growth(self.decomposed, std::mem::size_of::<(char, bool)>())?.checked_mul(2)?,
+            edit_growth(self.decomposed, std::mem::size_of::<(char, usize)>())?,
+            self.decomposed.checked_mul(
+                std::mem::size_of::<(char, bool)>() + std::mem::size_of::<(char, usize)>(),
+            )?,
+            edit_growth(self.bytes, 1)?,
+        ])
+    }
+}
+
+fn prepare_edit_workspace(
+    content: &str,
+    request: &EditRequest,
+    workspace: &mut EditWorkspace<'_>,
+) -> Result<EditNormalization, EditFailure> {
+    let size =
+        EditNormalization::count(content).ok_or_else(|| edit_memory_error(workspace.limit))?;
+    let mut input_bytes = 0usize;
+    let mut new_bytes = 0usize;
+    let mut needle_bytes = 0usize;
+    let mut search_bytes = 0usize;
+    let mut scratch = size
+        .form()
+        .ok_or_else(|| edit_memory_error(workspace.limit))?;
+    for edit in &request.edits {
+        input_bytes = edit_sum(&[input_bytes, edit.old_text.len(), edit.new_text.len()])
+            .ok_or_else(|| edit_memory_error(workspace.limit))?;
+        new_bytes = new_bytes
+            .checked_add(edit.new_text.len())
+            .ok_or_else(|| edit_memory_error(workspace.limit))?;
+        let old = EditNormalization::count(&edit.old_text)
+            .ok_or_else(|| edit_memory_error(workspace.limit))?;
+        needle_bytes = needle_bytes.max(old.bytes);
+        search_bytes = search_bytes.max(
+            edit.old_text
+                .len()
+                .checked_add(old.bytes)
+                .ok_or_else(|| edit_memory_error(workspace.limit))?,
+        );
+        scratch = scratch.max(
+            old.form()
+                .ok_or_else(|| edit_memory_error(workspace.limit))?,
+        );
+    }
+    let crlf = content
+        .match_indices("\r\n")
+        .try_fold(0usize, |n, _| n.checked_add(1));
+    let raw_lines = content
+        .bytes()
+        .filter(|&ch| ch == b'\n')
+        .try_fold(0usize, |n, _| n.checked_add(1));
+    let entry_bytes = std::mem::size_of::<(String, String)>()
+        + std::mem::size_of::<String>()
+        + std::mem::size_of::<Option<EntryProblem>>()
+        + std::mem::size_of::<Matched<'_>>()
+        + std::mem::size_of::<usize>()
+        + std::mem::size_of::<bool>();
+    let retained = (|| {
+        edit_sum(&[
+            edit_growth(content.len(), 1)?.checked_mul(2)?,
+            edit_growth(crlf?, std::mem::size_of::<usize>())?,
+            edit_growth(raw_lines?, std::mem::size_of::<usize>())?,
+            edit_growth(input_bytes, 1)?.checked_mul(2)?,
+            edit_growth(new_bytes.checked_mul(2)?, 1)?,
+            edit_growth(request.edits.len(), entry_bytes)?,
+            edit_growth(
+                request.edits.len().checked_mul(MAX_REPORTED_ITEMS)?,
+                std::mem::size_of::<usize>(),
+            )?,
+            edit_growth(size.bytes, 1)?,
+            edit_growth(
+                size.lines,
+                std::mem::size_of::<usize>() + std::mem::size_of::<bool>(),
+            )?,
+            edit_growth(needle_bytes, 1)?,
+        ])
+    })();
+    workspace.retain(retained)?;
+    workspace.temporary((|| {
+        edit_sum(&[
+            scratch,
+            edit_growth(search_bytes, std::mem::size_of::<usize>())?,
+            edit_growth(MAX_REPORTED_ITEMS * 8, std::mem::size_of::<usize>())?,
+        ])
+    })())?;
+    Ok(size)
+}
+
+fn read_uninterrupted(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn verify_edit_content(current: &mut impl Read, content: &str) -> io::Result<()> {
+    let mut offset = 0;
+    let mut buffer = [0; TEXT_BLOCK];
+    loop {
+        let read = read_uninterrupted(current, &mut buffer)?;
+        if read == 0 {
+            return if offset == content.len() {
+                Ok(())
+            } else {
+                Err(EditSource::changed())
+            };
+        }
+        if content.as_bytes().get(offset..offset + read) != Some(&buffer[..read]) {
+            return Err(EditSource::changed());
+        }
+        offset += read;
+    }
+}
+
+fn read_edit_content(file: &mut impl Read, pool: &Arc<BytePool>) -> io::Result<(String, Lease)> {
+    let memory = || {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            edit_memory_error(pool.limit()).0,
+        )
+    };
+    let mut lease = pool.try_acquire(TEXT_BLOCK).ok_or_else(memory)?;
+    let mut bytes = Vec::new();
+    let mut block = [0u8; TEXT_BLOCK];
+    loop {
+        let count = read_uninterrupted(file, &mut block)?;
+        if count == 0 {
+            break;
+        }
+        let needed = bytes.len().checked_add(count).ok_or_else(memory)?;
+        if needed > bytes.capacity() {
+            let preferred = bytes
+                .capacity()
+                .checked_mul(2)
+                .ok_or_else(memory)?
+                .max(needed);
+            let mut capacity = preferred;
+            let peak = |capacity| edit_sum(&[TEXT_BLOCK, bytes.capacity(), capacity]);
+            if !peak(capacity).is_some_and(|peak| lease.try_resize(peak)) {
+                capacity = needed;
+                if !peak(capacity).is_some_and(|peak| lease.try_resize(peak)) {
+                    return Err(memory());
+                }
+            }
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(capacity)
+                .map_err(|_| memory())?;
+            if !peak(replacement.capacity()).is_some_and(|peak| lease.try_resize(peak)) {
+                return Err(memory());
+            }
+            replacement.extend_from_slice(&bytes);
+            bytes = replacement;
+            lease.shrink_to(
+                TEXT_BLOCK
+                    .checked_add(bytes.capacity())
+                    .ok_or_else(memory)?,
+            );
+        }
+        bytes.extend_from_slice(&block[..count]);
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|_| io::Error::other("the file is not valid UTF-8; edit it with exec"))?;
+    Ok((content, lease))
+}
+
 struct EditSource {
     path: PathBuf,
-    target: PathBuf,
+    target: crate::ipc::Owned<PathBuf>,
     file: File,
     content: String,
+    _content_lease: Lease,
 }
 
 impl EditSource {
-    fn read(path: PathBuf) -> io::Result<Self> {
+    fn read(path: PathBuf, pool: &Arc<BytePool>) -> io::Result<Self> {
         // A canonicalizer can discard directory requirements that the native open enforces.
         let (mut file, _) = open_regular(&path)?;
-        let target = std::fs::canonicalize(&path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let content = String::from_utf8(bytes)
-            .map_err(|_| io::Error::other("the file is not valid UTF-8; edit it with exec"))?;
+        let target = canonical_target(&path, pool)?;
+        let (content, mut lease) = read_edit_content(&mut file, pool)?;
+        // The reader's fixed block is gone; retain the actual String allocation.
+        lease.shrink_to(content.capacity());
         Ok(Self {
             path,
             target,
             file,
             content,
+            _content_lease: lease,
         })
     }
 
@@ -2781,10 +3777,10 @@ impl EditSource {
         io::Error::other("the file changed after it was read; read it again and retry the edit")
     }
 
-    fn verify_target(&self, current: Option<&File>) -> io::Result<()> {
+    fn verify_target(&self, current: Option<&File>, pool: &Arc<BytePool>) -> io::Result<()> {
         let current = current.ok_or_else(Self::changed)?;
         let (named, _) = open_regular(&self.path)?;
-        if std::fs::canonicalize(&self.path)? != self.target {
+        if canonical_target(&self.path, pool)?.value != self.target.value {
             return Err(Self::changed());
         }
         #[cfg(unix)]
@@ -2804,32 +3800,22 @@ impl EditSource {
 
     fn verify_content(&self, current: &mut File) -> io::Result<()> {
         current.rewind()?;
-        let mut offset = 0;
-        let mut buffer = [0; 8192];
-        loop {
-            let read = current.read(&mut buffer)?;
-            if read == 0 {
-                return if offset == self.content.len() {
-                    Ok(())
-                } else {
-                    Err(Self::changed())
-                };
-            }
-            if self.content.as_bytes().get(offset..offset + read) != Some(&buffer[..read]) {
-                return Err(Self::changed());
-            }
-            offset += read;
-        }
+        verify_edit_content(current, &self.content)
     }
 
-    fn save(&self, bytes: &[u8]) -> io::Result<()> {
-        save_target(self.target.clone(), bytes, Some(self))
+    fn save(&self, bytes: &[u8], pool: &Arc<BytePool>) -> io::Result<()> {
+        save_target(&self.target.value, bytes, Some(self), pool)
     }
 }
 
 /// Stage the complete replacement before publishing, and reject an edit of a changed file.
-fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io::Result<()> {
-    let mut original = match std::fs::symlink_metadata(&target) {
+fn save_target(
+    target: &Path,
+    bytes: &[u8],
+    source: Option<&EditSource>,
+    pool: &Arc<BytePool>,
+) -> io::Result<()> {
+    let mut original = match std::fs::symlink_metadata(target) {
         Ok(metadata) => {
             if !metadata.is_file() {
                 return Err(io::Error::other("the target is not a regular file"));
@@ -2848,7 +3834,7 @@ fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io
                 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
                 options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
             }
-            let file = options.open(&target)?;
+            let file = options.open(target)?;
             #[cfg(windows)]
             windows_file_identity(&file)?;
             if !file.metadata()?.is_file() {
@@ -2861,7 +3847,7 @@ fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io
         Err(error) => return Err(error),
     };
     if let Some(source) = source {
-        source.verify_target(original.as_ref())?;
+        source.verify_target(original.as_ref(), pool)?;
     }
     let metadata = original.as_ref().map(File::metadata).transpose()?;
     let parent = target
@@ -2896,7 +3882,7 @@ fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io
             .as_ref()
             .or_else(|| defaults.as_ref().and_then(|probe| probe.file.as_ref()))
             .unwrap();
-        preserve_windows_access(source, file, original.is_some())?;
+        preserve_windows_access(source, file, original.is_some(), pool)?;
     }
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
     if let Some(metadata) = &metadata {
@@ -2904,7 +3890,7 @@ fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(original) = &original {
-        preserve_xattrs(original, file)?;
+        preserve_xattrs(original, file, pool)?;
     }
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     file.set_permissions(permissions)?;
@@ -2914,7 +3900,7 @@ fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io
             .as_ref()
             .or_else(|| defaults.as_ref().and_then(|probe| probe.file.as_ref()))
             .unwrap();
-        crate::freebsd_fs::preserve(source, file, original.is_some())?;
+        crate::freebsd_fs::preserve(source, file, original.is_some(), pool)?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -2927,7 +3913,7 @@ fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io
     file.sync_all()?;
     if let Some(source) = source {
         source.verify_content(original.as_mut().ok_or_else(EditSource::changed)?)?;
-        source.verify_target(original.as_ref())?;
+        source.verify_target(original.as_ref(), pool)?;
     }
     if let Some(original) = &original {
         single_link(original)?;
@@ -2935,7 +3921,7 @@ fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io
         {
             use std::os::unix::fs::MetadataExt;
             let before = original.metadata()?;
-            let now = std::fs::symlink_metadata(&target)?;
+            let now = std::fs::symlink_metadata(target)?;
             if !now.is_file() || before.dev() != now.dev() || before.ino() != now.ino() {
                 return Err(io::Error::other(
                     "the target changed while the replacement was being saved",
@@ -2943,10 +3929,10 @@ fn save_target(target: PathBuf, bytes: &[u8], source: Option<&EditSource>) -> io
             }
         }
         #[cfg(windows)]
-        unchanged_windows_target(original, &target)?;
+        unchanged_windows_target(original, target)?;
     }
     drop(staged.file.take());
-    publish(&staged.path, &target, original.is_some())
+    publish(&staged.path, target, original.is_some())
 }
 
 /// One replacement matched against the content it is applied to.
@@ -2968,11 +3954,44 @@ enum EntryProblem {
     NotFound { lines: Vec<usize>, more: usize },
 }
 
-/// Applies every edit to one file: exact matches first, and the fuzzy form when any edit needs it.
-fn edit_outcome(
+fn edit_owned_outcome(
     request: &EditRequest,
     launch: &LaunchContext,
-) -> Result<(String, Value), (String, Option<Value>)> {
+) -> crate::ipc::Owned<BlockingOutcome> {
+    with_path_workspace(&request.path, launch, 0, |lease| {
+        let path_bytes = lease.bytes();
+        let result = edit_outcome_reserved(request, launch, lease);
+        // Every structured value here is a fresh JSON copy. Its encoded length
+        // bounds its retained string payload; the displayed String keeps capacity.
+        let retained = match &result {
+            Ok((text, value)) => crate::ipc::json_len(value)
+                .ok()
+                .and_then(|bytes| text.capacity().checked_add(bytes)),
+            Err((text, value)) => value
+                .as_ref()
+                .map_or(Some(0), |value| crate::ipc::json_len(value).ok())
+                .and_then(|bytes| text.capacity().checked_add(bytes)),
+        };
+        if let Some(retained) = retained {
+            debug_assert!(retained <= lease.bytes());
+            lease.shrink_to(path_bytes.max(retained));
+        }
+        result
+    })
+    .unwrap_or_else(|message| crate::ipc::Owned::new(Err((message, None)), Default::default()))
+}
+
+#[cfg(test)]
+fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> BlockingOutcome {
+    edit_owned_outcome(request, launch).run(|outcome| outcome)
+}
+
+/// Applies every edit to one file: exact matches first, and the fuzzy form when any edit needs it.
+fn edit_outcome_reserved(
+    request: &EditRequest,
+    launch: &LaunchContext,
+    lease: &mut Lease,
+) -> BlockingOutcome {
     if request.edits.is_empty() {
         return Err((
             "Edit tool input is invalid. edits must contain at least one replacement.".to_owned(),
@@ -2980,7 +3999,7 @@ fn edit_outcome(
         ));
     }
     for (index, edit) in request.edits.iter().enumerate() {
-        if normalize_to_lf(&edit.old_text).is_empty() {
+        if edit.old_text.is_empty() {
             return Err((format!("edits[{index}].oldText must not be empty."), None));
         }
         if edit.start_line == Some(0) {
@@ -3004,18 +4023,20 @@ fn edit_outcome(
     let resolved = resolve(&request.path, launch).map_err(|msg| (msg, None))?;
     let shown_path = display_path(&resolved);
     let _guard = lock();
-    let source = EditSource::read(resolved)
+    let source = EditSource::read(resolved, launch.memory())
         .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
-    let (mut written, starts, fuzzy_flags) = apply_edits(&source.content, request, &shown_path)?;
+    reserve_target_workspace(&source.target.value, lease, launch.memory())
+        .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
+    let mut workspace = EditWorkspace::new(lease, launch.memory().limit());
+    let (mut written, starts, fuzzy_flags) =
+        apply_edits_budgeted(&source.content, request, &shown_path, &mut workspace)?;
     if source.content.starts_with('\u{feff}') && !written.starts_with('\u{feff}') {
         written.insert(0, '\u{feff}');
     }
     if written == source.content {
         return Err(edit_no_change(&shown_path));
     }
-    source
-        .save(written.as_bytes())
-        .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
+    workspace.diagnostics(request.edits.len(), &shown_path, false)?;
     let mut text = format!(
         "Successfully replaced {} block(s) in {shown_path}.",
         request.edits.len(),
@@ -3035,6 +4056,9 @@ fn edit_outcome(
         "replacements": request.edits.len(),
         "edits": edits,
     });
+    source
+        .save(written.as_bytes(), launch.memory())
+        .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
     Ok((text, structured))
 }
 
@@ -3061,11 +4085,13 @@ fn edit_no_change(path: &str) -> (String, Option<Value>) {
 /// Matches in LF-normalized text, collects every entry failure (ambiguous, not_found, overlap),
 /// and replaces the corresponding original byte ranges when every entry succeeds.
 #[allow(clippy::type_complexity)]
-fn apply_edits(
+fn apply_edits_budgeted(
     content: &str,
     request: &EditRequest,
     path: &str,
-) -> Result<(String, Vec<usize>, Vec<bool>), (String, Option<Value>)> {
+    workspace: &mut EditWorkspace<'_>,
+) -> Result<(String, Vec<usize>, Vec<bool>), EditFailure> {
+    let size = prepare_edit_workspace(content, request, workspace)?;
     let total = request.edits.len();
     let normalized = LfText::new(content);
     let ending = detect_line_ending(content);
@@ -3179,6 +4205,15 @@ fn apply_edits(
         };
 
         if let Some(&exact_at) = exact.in_starts.first() {
+            if fuzzy.in_count > 0
+                && !same_form
+                && let Some((_, context)) =
+                    fuzzy_boundary_context(&normalized.text, exact_at, old.len())
+            {
+                workspace.temporary(
+                    EditNormalization::count(context).and_then(EditNormalization::tagged),
+                )?;
+            }
             let separate = fuzzy.in_count > 0
                 && !same_form
                 && !exact_survives_fuzzy(&normalized.text, exact_at, old.len(), &needle);
@@ -3214,6 +4249,12 @@ fn apply_edits(
                 new_text,
             });
             continue;
+        }
+
+        if map.get().is_none()
+            && (fuzzy.in_count == 1 || (fuzzy.in_count == 0 && !same_form && fuzzy.out_count != 0))
+        {
+            workspace.retain(size.mapping())?;
         }
 
         let not_found_outside = || {
@@ -3302,6 +4343,30 @@ fn apply_edits(
     }
 
     matched.sort_by_key(|edit| (edit.at, edit.index));
+    let mut overlap_entries = 0usize;
+    for (index, edit) in matched.iter().enumerate() {
+        let end = edit
+            .at
+            .checked_add(edit.len)
+            .ok_or_else(|| edit_memory_error(workspace.limit))?;
+        for later in &matched[index + 1..] {
+            if later.at >= end {
+                break;
+            }
+            overlap_entries = overlap_entries
+                .checked_add(2)
+                .ok_or_else(|| edit_memory_error(workspace.limit))?;
+        }
+    }
+    workspace.retain((|| {
+        edit_sum(&[
+            edit_growth(total, std::mem::size_of::<Vec<usize>>())?,
+            edit_growth(
+                overlap_entries.checked_add(total.checked_mul(8)?)?,
+                std::mem::size_of::<usize>(),
+            )?,
+        ])
+    })())?;
     let mut overlaps: Vec<Vec<usize>> = vec![Vec::new(); total];
     for i in 0..matched.len() {
         let end_i = matched[i].at + matched[i].len;
@@ -3319,6 +4384,7 @@ fn apply_edits(
     }
 
     if problems.iter().any(Option::is_some) || overlaps.iter().any(|p| !p.is_empty()) {
+        workspace.diagnostics(total, path, true)?;
         let mut bullets = Vec::new();
         let mut failures = Vec::new();
         for index in 0..total {
@@ -3427,6 +4493,14 @@ fn apply_edits(
         return Err((error, Some(structured)));
     }
 
+    // Reverse application can grow before a later replacement shrinks the file.
+    // Sum every positive increment, and leave room for restoring the UTF-8 BOM.
+    let largest = content.len().checked_add(3).and_then(|initial| {
+        matched.iter().try_fold(initial, |length, edit| {
+            length.checked_add(edit.new_text.len().saturating_sub(edit.len))
+        })
+    });
+    workspace.retain(largest.and_then(|bytes| edit_growth(bytes, 1)))?;
     let (replaced, starts) = replace(content, &matched);
     if replaced == content {
         return Err(edit_no_change(path));
@@ -3437,16 +4511,31 @@ fn apply_edits(
     Ok((replaced, starts, fuzzy_flags))
 }
 
-/// Normalization can absorb the sole exact match into an adjacent character (e + acute → é).
-/// Count it separately when its source units contribute none of the fuzzy copies.
-fn exact_survives_fuzzy(text: &str, at: usize, len: usize, needle: &str) -> bool {
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+fn apply_edits(
+    content: &str,
+    request: &EditRequest,
+    path: &str,
+) -> Result<(String, Vec<usize>, Vec<bool>), EditFailure> {
+    let pool = crate::lease::process_pool();
+    let mut lease = Lease::empty(pool);
+    apply_edits_budgeted(
+        content,
+        request,
+        path,
+        &mut EditWorkspace::new(&mut lease, pool.limit()),
+    )
+}
+
+fn fuzzy_boundary_context(text: &str, at: usize, len: usize) -> Option<(usize, &str)> {
     let after = at + len;
     let bytes = text.as_bytes();
     // A following ASCII character cannot combine backwards across a boundary.
     if (at == 0 || bytes[at].is_ascii() || bytes[at - 1] == b'\n')
         && (after == bytes.len() || bytes[after].is_ascii())
     {
-        return true;
+        return None;
     }
     // ASCII starts a new normalization unit. Keep a graphic character or newline on the
     // right so the enclosing line's trailing-whitespace rule is also preserved.
@@ -3455,7 +4544,16 @@ fn exact_survives_fuzzy(text: &str, at: usize, len: usize, needle: &str) -> bool
         .iter()
         .position(|&b| b.is_ascii_graphic() || b == b'\n')
         .map_or(text.len(), |pos| after + pos + 1);
-    let context = &text[start..end];
+    Some((start, &text[start..end]))
+}
+
+/// Normalization can absorb the sole exact match into an adjacent character (e + acute → é).
+/// Count it separately when its source units contribute none of the fuzzy copies.
+fn exact_survives_fuzzy(text: &str, at: usize, len: usize, needle: &str) -> bool {
+    let Some((start, context)) = fuzzy_boundary_context(text, at, len) else {
+        return true;
+    };
+    let after = at + len;
     let mut normalized: Vec<_> = context.nfkc().map(|ch| (ch, true)).collect();
     // Both strings have the same canonically ordered compatibility decomposition. Pairing
     // those characters identifies every source byte range contributing to each NFKC character,
@@ -3920,7 +5018,11 @@ mod tests {
     }
 
     fn save_text(path: &Path, bytes: &[u8]) -> io::Result<()> {
-        save_target(write_target(path)?, bytes, None)
+        let pool = crate::lease::process_pool();
+        let target = write_target(path, pool)?;
+        let mut lease = Lease::empty(pool);
+        reserve_target_workspace(&target.value, &mut lease, pool)?;
+        save_target(&target.value, bytes, None, pool)
     }
 
     fn change(
@@ -4744,10 +5846,12 @@ mod tests {
         if !file_symlink(&first, &link) {
             return;
         }
-        let source = EditSource::read(link.clone()).unwrap();
+        let source = EditSource::read(link.clone(), crate::lease::process_pool()).unwrap();
         std::fs::remove_file(&link).unwrap();
         assert!(file_symlink(&other, &link));
-        let error = source.save(b"edited content").unwrap_err();
+        let error = source
+            .save(b"edited content", crate::lease::process_pool())
+            .unwrap_err();
         assert!(
             error.to_string().contains("changed after it was read"),
             "{error}"
@@ -4760,10 +5864,12 @@ mod tests {
     fn edit_rejects_another_inode_even_when_its_content_matches() {
         let scratch = Scratch::new("edit-replaced-inode");
         let path = scratch.file("target.txt", b"old content");
-        let source = EditSource::read(path.clone()).unwrap();
+        let source = EditSource::read(path.clone(), crate::lease::process_pool()).unwrap();
         std::fs::rename(&path, scratch.0.join("retired.txt")).unwrap();
         std::fs::write(&path, b"old content").unwrap();
-        let error = source.save(b"edited content").unwrap_err();
+        let error = source
+            .save(b"edited content", crate::lease::process_pool())
+            .unwrap_err();
         assert!(
             error.to_string().contains("changed after it was read"),
             "{error}"
@@ -4778,9 +5884,11 @@ mod tests {
         let scratch = Scratch::new("edit-changed-content");
         for changed in [b"other value".as_slice(), b"old content plus bytes", b"old"] {
             let path = scratch.file("target.txt", b"old content");
-            let source = EditSource::read(path.clone()).unwrap();
+            let source = EditSource::read(path.clone(), crate::lease::process_pool()).unwrap();
             std::fs::write(&path, changed).unwrap();
-            let error = source.save(b"edited content").unwrap_err();
+            let error = source
+                .save(b"edited content", crate::lease::process_pool())
+                .unwrap_err();
             assert!(
                 error.to_string().contains("changed after it was read"),
                 "{error}"
@@ -4799,10 +5907,13 @@ mod tests {
         scratch.file("other/target.txt", b"must stay intact");
         let link = scratch.0.join("directory");
         symlink(scratch.0.join("first"), &link).unwrap();
-        let source = EditSource::read(link.join("target.txt")).unwrap();
+        let source =
+            EditSource::read(link.join("target.txt"), crate::lease::process_pool()).unwrap();
         std::fs::remove_file(&link).unwrap();
         symlink(scratch.0.join("other"), &link).unwrap();
-        let error = source.save(b"edited content").unwrap_err();
+        let error = source
+            .save(b"edited content", crate::lease::process_pool())
+            .unwrap_err();
         assert!(
             error.to_string().contains("changed after it was read"),
             "{error}"
@@ -4919,10 +6030,13 @@ mod tests {
             );
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink("target", &link).unwrap();
-            let opened = EditSource::read(link.clone()).unwrap();
+            let opened = EditSource::read(link.clone(), crate::lease::process_pool()).unwrap();
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink(&name, &link).unwrap();
-            assert!(opened.save(b"bad").is_err(), "{name}");
+            assert!(
+                opened.save(b"bad", crate::lease::process_pool()).is_err(),
+                "{name}"
+            );
             assert_eq!(std::fs::read(&original).unwrap(), b"original");
             std::fs::remove_file(link).unwrap();
         }
@@ -5713,6 +6827,104 @@ mod tests {
             acl.extend_from_slice(&id.to_le_bytes());
         }
         acl
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_xattrs_hold_both_name_lists_and_current_value() {
+        use std::os::fd::AsRawFd;
+        let scratch = Scratch::new("save-xattr-budget");
+        let source_path = scratch.file("source.txt", b"original");
+        let staged_path = scratch.file("staged.txt", b"candidate");
+        let name = c"user.fastexec-budget";
+        let inherited_name = c"user.fastexec-inherited";
+        let value = b"small retained value";
+        set_test_xattr(&source_path, name, value);
+        let source = File::open(&source_path).unwrap();
+        let staged = File::open(&staged_path).unwrap();
+        let list_size = |file: &File| {
+            // SAFETY: a null buffer and zero length query only the required size.
+            let count = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) };
+            assert!(count >= 0);
+            count as usize
+        };
+        set_test_xattr(&staged_path, inherited_name, b"remove");
+        let required = list_size(&source) + list_size(&staged) + value.len();
+        drop(staged);
+        for cap in [required - 1, required, required + 1] {
+            // Recreate the original name list for each admission boundary.
+            std::fs::remove_file(&staged_path).unwrap();
+            scratch.file("staged.txt", b"candidate");
+            set_test_xattr(&staged_path, inherited_name, b"remove");
+            let staged = File::open(&staged_path).unwrap();
+            let pool = BytePool::new(cap);
+            let result = preserve_xattrs(&source, &staged, &pool);
+            if cap < required {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+            } else {
+                result.unwrap();
+                assert_eq!(test_xattr(&staged_path, name), Some(value.to_vec()));
+                assert_eq!(test_xattr(&staged_path, inherited_name), None);
+            }
+            assert_eq!(test_xattr(&source_path, name), Some(value.to_vec()));
+            assert_eq!(scratch.read("source.txt"), b"original");
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = BytePool::new(0);
+        let error = save_target(&source_path, b"changed", None, &pool).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(scratch.read("source.txt"), b"original");
+        assert_eq!(test_xattr(&source_path, name), Some(value.to_vec()));
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_windows_descriptor_admits_both_rounded_buffers() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
+            OWNER_SECURITY_INFORMATION,
+        };
+        let scratch = Scratch::new("save-descriptor-budget");
+        let path = scratch.file("source.txt", b"original");
+        let source = File::open(&path).unwrap();
+        let staged = Staged::new(&scratch.0, true).unwrap();
+        let file = staged.file.as_ref().unwrap();
+        let ownership = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
+        let size = |file: &File, information| {
+            let mut needed = 0u32;
+            // SAFETY: the zero-length query cannot write a descriptor.
+            let result = unsafe {
+                GetKernelObjectSecurity(
+                    file.as_raw_handle(),
+                    information,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut needed,
+                )
+            };
+            assert_eq!(result, 0);
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(ERROR_INSUFFICIENT_BUFFER as i32)
+            );
+            let unit = std::mem::size_of::<usize>();
+            (needed as usize).div_ceil(unit) * unit
+        };
+        let required = size(&source, ownership | DACL_SECURITY_INFORMATION) + size(file, ownership);
+        for cap in [required - 1, required, required + 1] {
+            let pool = BytePool::new(cap);
+            let result = preserve_windows_access(&source, file, true, &pool);
+            if cap < required {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(scratch.read("source.txt"), b"original");
+            assert_eq!(pool.used(), 0);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -6546,6 +7758,10 @@ mod tests {
         let scratch = Scratch::new("animated");
         let png = png_bytes(4, 4);
         let mut animated = png[..33].to_vec();
+        // Animation metadata can legally follow a long ancillary chunk.
+        animated.extend_from_slice(&9000u32.to_be_bytes());
+        animated.extend_from_slice(b"tEXt");
+        animated.resize(animated.len() + 9000 + 4, 0);
         animated.extend_from_slice(&[0, 0, 0, 8]);
         animated.extend_from_slice(b"acTL");
         animated.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
@@ -6580,6 +7796,38 @@ mod tests {
                 img.as_image().unwrap().data,
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &animated)
             );
+        }
+    }
+
+    #[test]
+    fn media_read_keeps_capacity_charged_after_growth_and_shrink() {
+        for (initial, actual) in [(8192, 100), (65536, 65537)] {
+            for overhead in [None, Some(128)] {
+                let pool = BytePool::new(1 << 20);
+                let mut input = std::io::Cursor::new(vec![0; actual]);
+                let MediaBytes::Loaded { bytes, lease } = read_media_from_zero(
+                    &mut input,
+                    initial,
+                    MediaStart::Rewind,
+                    100_000,
+                    &pool,
+                    overhead,
+                    None,
+                )
+                .unwrap() else {
+                    panic!("small input must load");
+                };
+                assert_eq!(bytes.len(), actual);
+                assert!(
+                    lease.bytes() >= bytes.capacity(),
+                    "capacity {} was charged as {}",
+                    bytes.capacity(),
+                    lease.bytes()
+                );
+                drop(bytes);
+                drop(lease);
+                assert_eq!(pool.used(), 0);
+            }
         }
     }
 
@@ -7246,6 +8494,7 @@ mod tests {
             write_launch,
             render,
             permit,
+            Default::default(),
         ));
         let polled_once =
             std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_pending()))
@@ -7268,6 +8517,826 @@ mod tests {
                 .expect("permit released once blocking worker finishes")
                 .unwrap();
         drop(reacquired);
+    }
+
+    #[tokio::test]
+    async fn text_buffer_file_worker_results_keep_input_owner() {
+        let scratch = Scratch::new("text-result-owner");
+        let pool = BytePool::new(1024 * 1024);
+        let input_pool = BytePool::new(512);
+        let launch = Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool)));
+        let render = Render {
+            output_mode: OutputMode::Both,
+            structured_content: true,
+        };
+        for (tool, arguments, error) in [
+            (
+                "write",
+                json!({"path":"small.txt", "content":"alpha\n"}),
+                false,
+            ),
+            (
+                "edit",
+                json!({"path":"small.txt", "edits":[{"oldText":"alpha", "newText":"beta"}]}),
+                false,
+            ),
+            ("read", json!({"path":"small.txt", "limit":1}), false),
+            ("read", json!({"path":"missing.txt"}), true),
+        ] {
+            let tracked = call_tracked(
+                tool,
+                arguments,
+                Arc::clone(&launch),
+                false,
+                render,
+                None,
+                crate::lease::Owner::new(input_pool.try_acquire(512).unwrap()),
+            )
+            .await;
+            assert_eq!(tracked.result.is_error, Some(error), "{:?}", tracked.result);
+            assert_eq!(input_pool.used(), 512);
+            assert!(pool.used() > 0);
+            drop(tracked);
+            assert_eq!(input_pool.used(), 0);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn path_workspace_admits_missing_file_errors_and_keeps_their_owner() {
+        let scratch = Scratch::new("path-missing");
+        let base = context(&scratch.0, &scratch.0);
+        let path = "missing-普通.txt";
+        let required = path_workspace_bytes(path, &base, SNIFF);
+        for budget in [required - 1, required, required + 1] {
+            let pool = BytePool::new(budget);
+            let result = read_tracked(
+                ReadRequest {
+                    path: path.into(),
+                    offset: None,
+                    limit: None,
+                },
+                Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool))),
+                false,
+                Render {
+                    output_mode: OutputMode::Both,
+                    structured_content: true,
+                },
+                None,
+                Default::default(),
+            )
+            .await;
+            assert_eq!(result.result.is_error, Some(true));
+            assert_eq!(result.overload, budget < required);
+            let text = result.result.content[0].as_text().unwrap();
+            if budget < required {
+                assert!(text.text.contains("not dispatched"));
+                assert_eq!(pool.used(), 0);
+            } else {
+                assert!(text.text.contains("missing-普通.txt"));
+                assert_eq!(pool.used(), required);
+            }
+            drop(result);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn path_workspace_media_and_binary_errors_do_not_require_text_workspace() {
+        let scratch = Scratch::new("path-media");
+        scratch.file("small.png", &png_bytes(1, 1));
+        scratch.file("binary.bin", b"\0ordinary\0");
+        scratch.file("small.txt", b"hello\n");
+        for (path, error, overload) in [
+            ("small.png", false, false),
+            ("binary.bin", true, false),
+            ("missing.txt", true, false),
+            ("small.txt", true, true),
+        ] {
+            let pool = BytePool::new(256 * 1024);
+            let result = read_tracked(
+                ReadRequest {
+                    path: path.into(),
+                    offset: None,
+                    limit: None,
+                },
+                Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool))),
+                false,
+                Render {
+                    output_mode: OutputMode::Both,
+                    structured_content: true,
+                },
+                None,
+                Default::default(),
+            )
+            .await;
+            assert_eq!(
+                result.result.is_error,
+                Some(error),
+                "{path}: {:?}",
+                result.result
+            );
+            assert_eq!(result.overload, overload, "{path}");
+            assert!(
+                pool.used() >= path_workspace_bytes(path, &context(&scratch.0, &scratch.0), SNIFF)
+            );
+            drop(result);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn edit_readers_retry_interrupted_and_keep_other_errors() {
+        struct Interrupted<'a> {
+            bytes: &'a [u8],
+            interrupt: bool,
+        }
+        impl Read for Interrupted<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.interrupt = !self.interrupt;
+                if self.interrupt {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let end = buffer.len().min(3);
+                self.bytes.read(&mut buffer[..end])
+            }
+        }
+        let original = "alpha\r\nbéta\n";
+        let reader = || Interrupted {
+            bytes: original.as_bytes(),
+            interrupt: false,
+        };
+        let pool = BytePool::new(TEXT_BLOCK + 64);
+        let (content, lease) = read_edit_content(&mut reader(), &pool).unwrap();
+        assert_eq!(content, original);
+        assert!(pool.used() >= TEXT_BLOCK + content.capacity());
+        verify_edit_content(&mut reader(), original).unwrap();
+        assert!(verify_edit_content(&mut reader(), "changed").is_err());
+        drop(content);
+        drop(lease);
+        assert_eq!(pool.used(), 0);
+
+        struct Failed;
+        impl Read for Failed {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::UnexpectedEof.into())
+            }
+        }
+        assert_eq!(
+            read_edit_content(&mut Failed, &pool).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            verify_edit_content(&mut Failed, original)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn save_buffers_admit_their_rounded_capacity_and_keep_owners() {
+        let required = 3 * std::mem::size_of::<usize>();
+        for cap in [required - 1, required, required + 1] {
+            let pool = BytePool::new(cap);
+            let first = SaveBuffer::<usize>::new(2, &pool).unwrap();
+            let second = SaveBuffer::<usize>::new(1, &pool);
+            if cap < required {
+                assert_eq!(second.err().unwrap().kind(), io::ErrorKind::OutOfMemory);
+                assert_eq!(pool.used(), 2 * std::mem::size_of::<usize>());
+            } else {
+                let second = second.unwrap();
+                assert_eq!(pool.used(), required);
+                drop(second);
+                assert_eq!(pool.used(), 2 * std::mem::size_of::<usize>());
+            }
+            drop(first);
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = BytePool::new(64);
+        assert_eq!(
+            SaveBuffer::<usize>::new(usize::MAX, &pool)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::OutOfMemory
+        );
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn edit_workspace_read_growth_is_reserved_and_owned() {
+        let scratch = Scratch::new("edit-read-budget");
+        let original = "x".repeat(TEXT_BLOCK + 5);
+        let path = scratch.file("small.txt", original.as_bytes());
+        // The second read can fall back from doubling to exactly the needed
+        // capacity, while the first allocation and fixed read block remain live.
+        let required = TEXT_BLOCK + TEXT_BLOCK + original.len();
+        for cap in [required - 1, required, required + 1] {
+            let pool = BytePool::new(cap);
+            let source = read_edit_content(&mut File::open(&path).unwrap(), &pool);
+            if cap < required {
+                let error = source.expect_err("growth needs the complete peak");
+                assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+                assert_eq!(pool.used(), 0);
+            } else {
+                let (content, lease) = source.unwrap();
+                assert_eq!(content, original);
+                assert_eq!(pool.used(), TEXT_BLOCK + content.capacity());
+                drop(content);
+                drop(lease);
+                assert_eq!(pool.used(), 0);
+            }
+            assert_eq!(scratch.read("small.txt"), original.as_bytes());
+        }
+    }
+
+    fn canonical_peak(path: &Path, output: &Path) -> usize {
+        #[cfg(unix)]
+        let output_work = {
+            let _ = output;
+            libc::PATH_MAX as usize
+        };
+        #[cfg(windows)]
+        let output_work = {
+            use std::os::windows::ffi::OsStrExt;
+            let count = output.as_os_str().encode_wide().count();
+            2 * (count + 1) + edit_growth(3 * count, 1).unwrap()
+        };
+        native_path_bytes(path).unwrap() + output_work
+    }
+
+    #[test]
+    fn canonical_target_admits_native_output_and_keeps_its_owner() {
+        let scratch = Scratch::new("canonical-budget");
+        let path = scratch.file("ordinary-文字.txt", b"unchanged");
+        let expected = std::fs::canonicalize(&path).unwrap();
+        let required = canonical_peak(&path, &expected);
+        for cap in [required - 1, required, required + 1] {
+            let pool = BytePool::new(cap);
+            let result = canonical_target(&path, &pool);
+            if cap < required {
+                assert_eq!(result.err().unwrap().kind(), io::ErrorKind::OutOfMemory);
+                assert_eq!(pool.used(), 0);
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.value, expected);
+                assert_eq!(pool.used(), result.value.capacity());
+                drop(result);
+                assert_eq!(pool.used(), 0);
+            }
+            assert_eq!(scratch.read("ordinary-文字.txt"), b"unchanged");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_and_link_outputs_keep_non_utf8_native_names() {
+        use std::os::unix::ffi::OsStringExt;
+        let scratch = Scratch::new("native-target-budget");
+        let name = std::ffi::OsString::from_vec(b"ordinary-\xff.txt".to_vec());
+        let target = scratch.0.join(name);
+        std::fs::write(&target, b"unchanged").unwrap();
+        let link = scratch.0.join("short");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let pool = BytePool::new(128 * 1024);
+        let canonical = canonical_target(&link, &pool).unwrap();
+        assert_eq!(canonical.value, target);
+        let followed = write_target(&link, &pool).unwrap();
+        assert_eq!(followed.value, target);
+        assert_eq!(
+            pool.used(),
+            canonical.value.capacity() + followed.value.capacity()
+        );
+        drop(canonical);
+        assert_eq!(pool.used(), followed.value.capacity());
+        drop(followed);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_link_growth_is_admitted_before_the_next_read() {
+        let scratch = Scratch::new("native-link-growth");
+        let target = scratch
+            .0
+            .join("part".repeat(35))
+            .join("more".repeat(35))
+            .join("file.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"unchanged").unwrap();
+        let link = scratch.0.join("short");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let length = target.as_os_str().as_encoded_bytes().len();
+        assert!((256..512).contains(&length));
+        let required = native_path_bytes(&link).unwrap() + 512;
+        for cap in [required - 1, required, required + 1] {
+            let pool = BytePool::new(cap);
+            let result = read_target_link(&link, &pool);
+            if cap < required {
+                assert_eq!(result.err().unwrap().kind(), io::ErrorKind::OutOfMemory);
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.value, target);
+                assert_eq!(pool.used(), 512);
+                drop(result);
+            }
+            assert_eq!(pool.used(), 0);
+            assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        }
+    }
+
+    #[test]
+    fn edit_workspace_admits_all_stages_before_publish() {
+        let scratch = Scratch::new("edit-admission");
+        let path = "small.txt";
+        let original = "alpha\nbeta\ngamma\ndelta\n";
+        let request: EditRequest = serde_json::from_value(json!({
+            "path": path,
+            "edits": [
+                {"oldText":"alpha", "newText":"ALPHA"},
+                {"oldText":"beta", "newText":"BETA"},
+                {"oldText":"gamma", "newText":"GAMMA"},
+                {"oldText":"delta", "newText":"DELTA"}
+            ]
+        }))
+        .unwrap();
+        let probe = BytePool::new(1024 * 1024);
+        let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&probe));
+        let path_bytes = path_workspace_bytes(path, &launch, 0);
+        let resolved = scratch.file(path, original.as_bytes());
+        let source = EditSource::read(resolved.clone(), &probe).unwrap();
+        let source_held = probe.used();
+        let verification_peak = canonical_peak(&resolved, &source.target.value);
+        drop(source);
+        assert_eq!(probe.used(), 0);
+        let mut lease = probe.try_acquire(path_bytes).unwrap();
+        let result = edit_outcome_reserved(&request, &launch, &mut lease).unwrap();
+        // Matching reservations stay live during save. The prepublication name
+        // verification also holds a second canonical caller buffer, while the
+        // source's original canonical path and file content remain owned.
+        let required = lease.bytes() + source_held + verification_peak;
+        assert!(required > path_bytes + TEXT_BLOCK + original.len());
+        drop(result);
+        drop(lease);
+        assert_eq!(probe.used(), 0);
+        for cap in [required - 1, required, required + 1] {
+            scratch.file(path, original.as_bytes());
+            let pool = BytePool::new(cap);
+            let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool));
+            let outcome = edit_owned_outcome(&request, &launch);
+            if cap < required {
+                assert!(
+                    outcome
+                        .value
+                        .as_ref()
+                        .unwrap_err()
+                        .0
+                        .contains("active memory budget")
+                );
+                assert_eq!(scratch.read(path), original.as_bytes());
+            } else {
+                assert!(outcome.value.is_ok(), "{:?}", outcome.value);
+                assert_eq!(scratch.read(path), b"ALPHA\nBETA\nGAMMA\nDELTA\n");
+            }
+            assert!(pool.used() >= path_bytes, "result/error retains its owner");
+            drop(outcome);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn edit_workspace_preserves_bom_crlf_fuzzy_and_no_change() {
+        let scratch = Scratch::new("edit-normalization");
+        for (original, old, new, expected, error) in [
+            (
+                "\u{feff}alpha\r\nbeta\r\n",
+                "alpha",
+                "omega",
+                "\u{feff}omega\r\nbeta\r\n",
+                false,
+            ),
+            (
+                "prefix ｃａｆｅ\u{301}\r\n",
+                "café",
+                "tea",
+                "prefix tea\r\n",
+                false,
+            ),
+            ("ordinary\n", "ordinary", "ordinary", "ordinary\n", true),
+        ] {
+            scratch.file("small.txt", original.as_bytes());
+            let pool = BytePool::new(256 * 1024);
+            let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool));
+            let request = serde_json::from_value(json!({
+                "path":"small.txt", "edits":[{"oldText":old,"newText":new}]
+            }))
+            .unwrap();
+            let outcome = edit_owned_outcome(&request, &launch);
+            assert_eq!(outcome.value.is_err(), error, "{:?}", outcome.value);
+            assert_eq!(scratch.read("small.txt"), expected.as_bytes());
+            assert!(pool.used() > 0);
+            drop(outcome);
+            assert_eq!(pool.used(), 0);
+        }
+        for text in [
+            "ordinary ASCII",
+            "é",
+            "e\u{301}",
+            "\u{fdfa}",
+            "\u{1100}\u{1161}",
+            "q\u{301}\u{327}",
+        ] {
+            let bound = EditNormalization::count(text).unwrap();
+            assert!(nfkc(text).len() <= bound.bytes);
+            assert_eq!(text.nfkd().count(), bound.decomposed);
+        }
+        assert!(edit_growth(usize::MAX, 1).is_none());
+        assert!(edit_growth(1, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn edit_workspace_does_not_reserve_an_unused_ambiguous_map() {
+        let scratch = Scratch::new("edit-ambiguous-budget");
+        let original = "x".repeat(512) + " ａ\nａ\nａ\n";
+        scratch.file("small.txt", original.as_bytes());
+        let pool = BytePool::new(128 * 1024);
+        let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool));
+        let request = serde_json::from_value(json!({
+            "path":"small.txt",
+            "edits":[{"oldText":"a","newText":"b","startLine":1,"endLine":2}]
+        }))
+        .unwrap();
+        let outcome = edit_owned_outcome(&request, &launch);
+        let (message, structured) = outcome.value.as_ref().unwrap_err();
+        assert!(message.contains("occurs 2 times"), "{message}");
+        assert_eq!(
+            structured.as_ref().unwrap()["failures"][0]["problem"],
+            "ambiguous"
+        );
+        assert_eq!(scratch.read("small.txt"), original.as_bytes());
+        drop(outcome);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn edit_workspace_worker_keeps_its_buffers_after_waiter_drop() {
+        let scratch = Scratch::new("edit-cancel");
+        scratch.file("small.txt", "ordinary ﬁne text\n".as_bytes());
+        let pool = BytePool::new(256 * 1024);
+        let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool));
+        let worker_pool = Arc::clone(&pool);
+        let (ready, observed) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let request: EditRequest = serde_json::from_value(json!({
+                "path":"small.txt", "edits":[{"oldText":"fine","newText":"good"}]
+            }))
+            .unwrap();
+            with_path_workspace(&request.path, &launch, 0, |lease| {
+                let source = EditSource::read(launch.cwd.join("small.txt"), &worker_pool).unwrap();
+                let mut workspace = EditWorkspace::new(lease, worker_pool.limit());
+                let result =
+                    apply_edits_budgeted(&source.content, &request, "small.txt", &mut workspace)
+                        .unwrap();
+                ready.send(worker_pool.used()).unwrap();
+                blocked
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                result
+            })
+            .unwrap()
+        });
+        let retained = observed.await.unwrap();
+        assert!(retained > TEXT_BLOCK);
+        assert_eq!(pool.used(), retained);
+        drop(worker);
+        assert_eq!(
+            pool.used(),
+            retained,
+            "the blocking worker still owns its source and output"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pool.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the worker drops its undelivered output before the owner");
+        assert_eq!(scratch.read("small.txt"), "ordinary ﬁne text\n".as_bytes());
+    }
+
+    #[tokio::test]
+    async fn write_target_workspace_admits_before_publish_and_retains_errors() {
+        let scratch = Scratch::new("write-target-admission");
+        let path = "small.txt";
+        let resolved = scratch.file(path, b"original");
+        let probe = BytePool::new(256 * 1024);
+        let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&probe));
+        let base = path_workspace_bytes(path, &launch, 0);
+        let target = write_target(&resolved, &probe).unwrap();
+        let held = probe.used();
+        let native = native_path_bytes(&target.value).unwrap();
+        let mut lease = probe.try_acquire(base).unwrap();
+        reserve_target_workspace(&target.value, &mut lease, &probe).unwrap();
+        let retained = lease.bytes();
+        let required = retained + held + native;
+        drop(target);
+        drop(lease);
+        assert_eq!(probe.used(), 0);
+        for cap in [required - 1, required, required + 1] {
+            scratch.file(path, b"original");
+            let pool = BytePool::new(cap);
+            let result = call_tracked(
+                "write",
+                json!({"path":path, "content":"changed"}),
+                Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool))),
+                false,
+                Render {
+                    output_mode: OutputMode::Both,
+                    structured_content: true,
+                },
+                None,
+                Default::default(),
+            )
+            .await;
+            assert_eq!(result.result.is_error, Some(cap < required));
+            assert_eq!(
+                scratch.read(path),
+                if cap < required {
+                    b"original".as_slice()
+                } else {
+                    b"changed".as_slice()
+                }
+            );
+            assert_eq!(pool.used(), retained);
+            drop(result);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_target_owner_survives_a_dropped_worker_waiter() {
+        let scratch = Scratch::new("canonical-cancel");
+        let path = scratch.file("ordinary.txt", b"unchanged");
+        let pool = BytePool::new(64 * 1024);
+        let worker_pool = Arc::clone(&pool);
+        let (ready, observed) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let target = canonical_target(&path, &worker_pool).unwrap();
+            ready.send(()).unwrap();
+            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            target
+        });
+        observed.await.unwrap();
+        let held = pool.used();
+        assert!(held > 0);
+        drop(worker);
+        assert_eq!(pool.used(), held);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(scratch.read("ordinary.txt"), b"unchanged");
+    }
+
+    #[tokio::test]
+    async fn path_workspace_mutations_admit_before_touching_the_file() {
+        let scratch = Scratch::new("path-write");
+        let path = "small.txt";
+        let required = path_workspace_bytes(path, &context(&scratch.0, &scratch.0), 0);
+        for tool in ["write", "edit"] {
+            for budget in [required - 1, required, required + 1] {
+                scratch.file(path, b"alpha");
+                let arguments = if tool == "write" {
+                    json!({"path":path, "content":"beta"})
+                } else {
+                    json!({"path":path, "edits":[{"oldText":"alpha", "newText":"beta"}]})
+                };
+                let pool = BytePool::new(budget);
+                let result = call_tracked(
+                    tool,
+                    arguments,
+                    Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool))),
+                    false,
+                    Render {
+                        output_mode: OutputMode::Both,
+                        structured_content: true,
+                    },
+                    None,
+                    Default::default(),
+                )
+                .await;
+                // Native targets and edit contents have independent reservations;
+                // a request-path-only budget must leave both operations unchanged.
+                let refused = true;
+                assert_eq!(result.result.is_error, Some(refused), "{tool}");
+                assert_eq!(
+                    scratch.read(path),
+                    if refused {
+                        b"alpha".as_slice()
+                    } else {
+                        b"beta".as_slice()
+                    }
+                );
+                if budget >= required {
+                    assert!(
+                        result.result.content[0]
+                            .as_text()
+                            .unwrap()
+                            .text
+                            .contains("active memory budget")
+                    );
+                }
+                assert_eq!(pool.used(), if budget < required { 0 } else { required });
+                drop(result);
+                assert_eq!(pool.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn text_buffer_reads_admit_before_copy_and_keep_the_result_owned() {
+        let scratch = Scratch::new("text-buffer");
+        let path = scratch.0.join("small.txt");
+        let source = "alpha\nbeta\n";
+        std::fs::write(&path, source).unwrap();
+        for (limits, selected, retained, expected) in [
+            (ReadLimits::NESTED, None, source.len() + 1, source),
+            (ReadLimits::DIRECT, Some(1), "alpha\n".len(), "alpha\n"),
+        ] {
+            let request = ReadRequest {
+                path: "small.txt".into(),
+                offset: None,
+                limit: selected,
+            };
+            let peak = path_workspace_bytes(&request.path, &context(&scratch.0, &scratch.0), SNIFF)
+                + TEXT_FIXED_WORKSPACE
+                - SNIFF
+                + 16 * retained;
+            for (budget, fits) in [(peak - 1, false), (peak, true)] {
+                for mode in [OutputMode::Text, OutputMode::Both, OutputMode::Structured] {
+                    let pool = BytePool::new(budget);
+                    let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool));
+                    let read =
+                        read_cancellable(&request, &launch, false, limits, None).run(|read| read);
+                    if !fits {
+                        assert!(matches!(read, Err(ReadFailure::Overload(_))));
+                        assert_eq!(pool.used(), 0);
+                        continue;
+                    }
+                    let outcome = match read {
+                        Ok(outcome) => outcome,
+                        Err(_) => panic!("the exact text workspace must fit"),
+                    };
+                    assert_eq!(outcome.body.as_deref(), Some(expected));
+                    assert_eq!(pool.used(), peak);
+                    let tracked = outcome.into_tracked(Render {
+                        output_mode: mode,
+                        structured_content: true,
+                    });
+                    assert!(
+                        tracked.lease.as_ref().unwrap().bytes()
+                            >= service::result_payload_capacity(&tracked.result)
+                    );
+                    let data = tracked.result.structured_content.as_ref().unwrap();
+                    if mode == OutputMode::Text {
+                        assert!(data.get("text").is_none());
+                    } else {
+                        assert_eq!(data["text"], expected);
+                    }
+                    assert_eq!(pool.used(), peak);
+                    drop(tracked);
+                    assert_eq!(pool.used(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_buffer_growth_uses_nonblocking_admission() {
+        let scratch = Scratch::new("text-growth");
+        let path = scratch.0.join("small.txt");
+        std::fs::write(&path, "hello\n").unwrap();
+        for (kept, fits) in [(5, false), (6, true)] {
+            let pool = BytePool::new(TEXT_FIXED_WORKSPACE + 32 * "small.txt".len() + 16 * kept);
+            let mut workspace = TextWorkspace::new(&pool, "small.txt".len()).unwrap();
+            let mut file = File::open(&path).unwrap();
+            let result = read_whole_utf8(&mut file, 0, &[], "small.txt", 64, None, &mut workspace);
+            assert_eq!(result.is_ok(), fits);
+            if fits {
+                assert_eq!(result.as_ref().unwrap().body.as_deref(), Some("hello\n"));
+            } else {
+                assert!(result.err().unwrap().contains("active memory budget"));
+                drop(workspace);
+                assert_eq!(pool.used(), 0);
+                continue;
+            }
+            drop(result);
+            drop(workspace);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn text_buffer_worker_retains_output_after_its_waiter_is_dropped() {
+        let scratch = Scratch::new("text-cancel");
+        std::fs::write(scratch.0.join("small.txt"), "hello\n").unwrap();
+        let pool = BytePool::new(1024 * 1024);
+        let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool));
+        let (ready, observed) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let outcome = read_cancellable(
+                &ReadRequest {
+                    path: "small.txt".into(),
+                    offset: None,
+                    limit: None,
+                },
+                &launch,
+                false,
+                ReadLimits::NESTED,
+                None,
+            )
+            .run(|read| read)
+            .ok()
+            .expect("small text read");
+            ready.send(()).unwrap();
+            blocked
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            outcome
+        });
+        observed.await.unwrap();
+        assert!(pool.used() >= TEXT_FIXED_WORKSPACE);
+        drop(worker);
+        assert!(pool.used() >= TEXT_FIXED_WORKSPACE);
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pool.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completed worker drops its undelivered outcome");
+    }
+
+    #[tokio::test]
+    async fn ipc_ingress_file_worker_keeps_input_after_wait_is_dropped() {
+        use std::future::Future;
+        let scratch = Scratch::new("input-owner");
+        let launch = Arc::new(context(&scratch.0, &scratch.0));
+        let pool = crate::lease::BytePool::new(256);
+        let owner = crate::lease::Owner::new(pool.try_acquire(256).unwrap());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = MUTATION.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        locked_rx.recv().unwrap();
+        let request = WriteRequest {
+            path: "owned.txt".into(),
+            content: "ordinary input\n".into(),
+        };
+        let render = Render {
+            output_mode: OutputMode::Text,
+            structured_content: true,
+        };
+        let mut waiting = Box::pin(write(request, launch, render, owner));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                waiting.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        drop(waiting);
+        assert_eq!(
+            pool.used(),
+            256,
+            "queued or running worker owns the request"
+        );
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pool.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("owned.txt")).unwrap(),
+            "ordinary input\n"
+        );
     }
 
     #[test]
@@ -7415,13 +9484,16 @@ mod tests {
             let mut file = File::open(&path).unwrap();
             let initial = count_lines_streaming(&mut file, "changes.txt", None).unwrap();
             std::fs::write(&path, later).unwrap();
+            let mut workspace =
+                TextWorkspace::new(crate::lease::process_pool(), "changes.txt".len()).unwrap();
             let (observed, window) = scan_from_end(2, initial, "changes.txt", |from| {
                 file.rewind().unwrap();
                 Window::scan(
-                    Source::new(BufReader::new(&mut file), None),
+                    Source::new(BufReader::with_capacity(TEXT_BLOCK, &mut file), None),
                     from,
                     None,
                     ReadLimits::DIRECT,
+                    &mut workspace,
                 )
             })
             .unwrap();
@@ -7647,6 +9719,7 @@ mod tests {
             "grown.txt",
             NESTED_MAX_BYTES,
             None,
+            &mut TextWorkspace::new(crate::lease::process_pool(), "grown.txt".len()).unwrap(),
         )
         .err()
         .unwrap();

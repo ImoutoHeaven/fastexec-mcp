@@ -22,7 +22,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::process::Member;
+use crate::process::{Member, MemberBudget};
 
 /// `SZOMBIE` from `<sys/proc.h>`: the state of a process that has ended and not been reaped.
 const ZOMBIE: u32 = 5;
@@ -570,6 +570,10 @@ impl Client {
 
     /// Lists members, or reports no answer when the host cannot confirm membership.
     pub fn members(&self) -> Option<Vec<Member>> {
+        self.members_with_budget(&mut MemberBudget::unlimited())
+    }
+
+    pub(crate) fn members_with_budget(&self, budget: &mut MemberBudget<'_>) -> Option<Vec<Member>> {
         let mut control = lock(&self.control);
         match control.state {
             State::Ended => return Some(Vec::new()),
@@ -608,16 +612,36 @@ impl Client {
             }
             let pid = i32::from_le_bytes([fixed[0], fixed[1], fixed[2], fixed[3]]);
             let length = u16::from_le_bytes([fixed[4], fixed[5]]) as usize;
+            if !budget.temporary(length.saturating_mul(10)) {
+                // A refusal belongs to this list only. Drain this bounded native reply
+                // so the next members/kill command still starts at a frame boundary.
+                let mut remaining = length;
+                let mut discard = [0_u8; 1024];
+                while remaining > 0 {
+                    let count = remaining.min(discard.len());
+                    if !self.read_exact(&mut control, &mut discard[..count], deadline) {
+                        return ended_or_silent(&control);
+                    }
+                    remaining -= count;
+                }
+                continue;
+            }
             let mut name = vec![0_u8; length];
             if !self.read_exact(&mut control, &mut name, deadline) {
                 return ended_or_silent(&control);
             }
+            let name = String::from_utf8_lossy(&name).into_owned();
+            budget.retain(name.capacity());
             members.push(Member {
                 pid: pid as u32,
-                name: String::from_utf8_lossy(&name).into_owned(),
+                name,
             });
         }
-        Some(members)
+        if budget.refused() {
+            None
+        } else {
+            Some(members)
+        }
     }
 
     /// Kills the tree only on explicit confirmation, or reports the host's refusal or disconnect.
@@ -1159,6 +1183,29 @@ mod tests {
         tracker.apply(&scan(Vec::new(), true));
         peer.write_all(&encode_members(tracker.list_snapshot()))
             .unwrap();
+        assert!(client.members().unwrap().is_empty());
+    }
+
+    #[test]
+    fn member_budget_refusal_drains_reply_before_the_next_query() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let client = Client::new(server, 0);
+        peer.write_all(&encode_members(Some(vec![
+            Member {
+                pid: 21,
+                name: "worker".into(),
+            },
+            Member {
+                pid: 22,
+                name: "second".into(),
+            },
+        ])))
+        .unwrap();
+        let mut deny = |_| false;
+        let mut budget = MemberBudget::new(&mut deny);
+        assert!(client.members_with_budget(&mut budget).is_none());
+        assert!(budget.refused());
+        peer.write_all(&encode_members(Some(Vec::new()))).unwrap();
         assert!(client.members().unwrap().is_empty());
     }
 

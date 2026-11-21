@@ -124,6 +124,20 @@ enum Update {
 }
 
 impl History {
+    /// String storage copied by a pending snapshot, plus one newline per string.
+    pub(crate) fn snapshot_text_bytes(&self) -> usize {
+        // Clone includes retired slots too, not only the lines still in `order`.
+        self.lines
+            .iter()
+            .flat_map(|line| std::iter::once(&line.text).chain(line.was.iter()))
+            .chain(self.rows.iter().map(|row| &row.text))
+            .chain(self.out.iter())
+            .chain(self.owed.iter())
+            .fold(0usize, |bytes, text| {
+                bytes.saturating_add(text.capacity()).saturating_add(1)
+            })
+    }
+
     /// A session whose screen of `height` rows starts blank, holding up to `limit` lines.
     pub fn new(height: usize, limit: usize) -> History {
         let mut history = History {
@@ -1488,6 +1502,24 @@ mod tests {
 
     fn lines(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn snapshot_text_bytes_include_retired_slots_and_spare_capacity() {
+        let mut history = History::new(1, 10);
+        let id = history.screen[0];
+        history.lines[id].text = String::with_capacity(128);
+        history.lines[id].text.push_str("earlier");
+        let mut previous = String::with_capacity(256);
+        previous.push_str("previous");
+        history.lines[id].was = Some(previous);
+        history.lines[id].dropped = true;
+        history.order.clear();
+        history.free.push(id);
+        let held =
+            history.lines[id].text.capacity() + history.lines[id].was.as_ref().unwrap().capacity();
+        assert!(history.snapshot_text_bytes() >= held + 2);
+        assert_eq!(history.clone().lines[id].was.as_deref(), Some("previous"));
     }
 
     #[test]

@@ -560,9 +560,14 @@ pub struct Call<'a> {
     /// started it. The stdio adapter has no call IDs, so it passes `None`.
     pub call_id: Option<u64>,
     pub nested: bool,
-    /// Records a nested start before its caller's wait can be cancelled.
-    pub started: Option<&'a codemode::ScriptHandle>,
+    /// The nested script and pending bridge ID; also records starts before cancellation.
+    pub started: Option<codemode::NestedCall<'a>>,
     pub(crate) render_slot: Option<&'a RenderSlot<'a>>,
+    pub http_response: bool,
+    /// Encoded outer JSON-RPC ID length, known before committing output cursors.
+    pub rpc_id_bytes: usize,
+    /// Keeps decoded arguments alive through worker-owned copies after caller cancellation.
+    pub input_owner: crate::lease::Owner,
 }
 
 impl<'a> Call<'a> {
@@ -645,21 +650,183 @@ impl std::ops::Deref for ServiceError {
     }
 }
 
-pub(crate) fn content_b64_bytes(result: &CallToolResult) -> usize {
-    result
+fn task_read_error(message: String, task: &Task) -> ServiceError {
+    if message.starts_with("Server active memory budget (") {
+        ServiceError::Overload(
+            message,
+            Some(files::TaskMeta {
+                bare_task_id: task.id.clone(),
+                log_path: files::display_path(&task.log_path),
+            }),
+        )
+    } else {
+        ServiceError::Plain(message)
+    }
+}
+
+fn text_workspace_bytes(bytes: usize) -> usize {
+    bytes.saturating_mul(16).saturating_add(128 << 10)
+}
+
+fn value_payload_capacity(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.capacity(),
+        Value::Array(items) => items
+            .iter()
+            .map(value_payload_capacity)
+            .fold(0, usize::saturating_add),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| key.capacity().saturating_add(value_payload_capacity(value)))
+            .fold(0, usize::saturating_add),
+        _ => 0,
+    }
+}
+
+fn meta_payload_capacity(meta: &Option<rmcp::model::MetaObject>) -> usize {
+    meta.as_ref().map_or(0, |meta| {
+        meta.0
+            .iter()
+            .map(|(key, value)| key.capacity().saturating_add(value_payload_capacity(value)))
+            .fold(0, usize::saturating_add)
+    })
+}
+
+fn annotation_payload_capacity(annotations: &Option<rmcp::model::Annotations>) -> usize {
+    annotations
+        .as_ref()
+        .and_then(|annotations| annotations.last_modified.as_ref())
+        .map_or(0, String::capacity)
+}
+
+pub(crate) fn result_payload_capacity(result: &CallToolResult) -> usize {
+    let content = result
         .content
         .iter()
-        .map(|block| match block {
-            ContentBlock::Image(img) => img.data.len(),
-            ContentBlock::Audio(aud) => aud.data.len(),
-            ContentBlock::Resource(res) => match &res.resource {
-                rmcp::model::ResourceContents::BlobResourceContents { blob, .. } => blob.len(),
-                rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.len(),
-                _ => 0,
-            },
-            _ => 0,
+        .map(|block| {
+            let (payload, meta, annotations) = match block {
+                ContentBlock::Text(text) => (text.text.capacity(), &text.meta, &text.annotations),
+                ContentBlock::Image(img) => (
+                    img.data.capacity().saturating_add(img.mime_type.capacity()),
+                    &img.meta,
+                    &img.annotations,
+                ),
+                ContentBlock::Audio(aud) => (
+                    aud.data.capacity().saturating_add(aud.mime_type.capacity()),
+                    &aud.meta,
+                    &aud.annotations,
+                ),
+                ContentBlock::Resource(res) => {
+                    let payload = match &res.resource {
+                        rmcp::model::ResourceContents::BlobResourceContents {
+                            blob: body,
+                            uri,
+                            mime_type,
+                            meta,
+                        }
+                        | rmcp::model::ResourceContents::TextResourceContents {
+                            text: body,
+                            uri,
+                            mime_type,
+                            meta,
+                        } => body
+                            .capacity()
+                            .saturating_add(uri.capacity())
+                            .saturating_add(mime_type.as_ref().map_or(0, String::capacity))
+                            .saturating_add(meta_payload_capacity(meta)),
+                        _ => 0,
+                    };
+                    (payload, &res.meta, &res.annotations)
+                }
+                ContentBlock::ResourceLink(res) => {
+                    let icons = res.icons.as_ref().map_or(0, |icons| {
+                        icons
+                            .iter()
+                            .map(|icon| {
+                                icon.src
+                                    .capacity()
+                                    .saturating_add(
+                                        icon.mime_type.as_ref().map_or(0, String::capacity),
+                                    )
+                                    .saturating_add(icon.sizes.as_ref().map_or(0, |sizes| {
+                                        sizes
+                                            .iter()
+                                            .map(String::capacity)
+                                            .fold(0, usize::saturating_add)
+                                    }))
+                            })
+                            .fold(0, usize::saturating_add)
+                    });
+                    let payload = res
+                        .uri
+                        .capacity()
+                        .saturating_add(res.name.capacity())
+                        .saturating_add(res.title.as_ref().map_or(0, String::capacity))
+                        .saturating_add(res.description.as_ref().map_or(0, String::capacity))
+                        .saturating_add(res.mime_type.as_ref().map_or(0, String::capacity))
+                        .saturating_add(icons);
+                    (payload, &res.meta, &res.annotations)
+                }
+                _ => return 0,
+            };
+            payload
+                .saturating_add(meta_payload_capacity(meta))
+                .saturating_add(annotation_payload_capacity(annotations))
         })
-        .sum()
+        .fold(0, usize::saturating_add);
+    content
+        .saturating_add(
+            result
+                .structured_content
+                .as_ref()
+                .map_or(0, value_payload_capacity),
+        )
+        .saturating_add(meta_payload_capacity(&result.meta))
+}
+
+pub(crate) fn unleased_result_payload_capacity(
+    result: &CallToolResult,
+    owner: &crate::lease::Owner,
+) -> usize {
+    result_payload_capacity(result).saturating_sub(owner.get::<Lease>().map_or(0, Lease::bytes))
+}
+
+fn retain_text_result(
+    result: CallToolResult,
+    mut workspace: Lease,
+    outgoing: &mut Option<Lease>,
+    call: &Call<'_>,
+    task: &Task,
+) -> Result<(CallToolResult, crate::lease::Owner), ServiceError> {
+    let text_bytes = result
+        .content
+        .iter()
+        .map(|block| block.as_text().map_or(0, |text| text.text.capacity()))
+        .fold(0, usize::saturating_add)
+        .saturating_add(
+            result
+                .structured_content
+                .as_ref()
+                .map_or(0, value_payload_capacity),
+        );
+    let owner = if let Some(outgoing) = outgoing.as_mut().filter(|held| held.bytes() >= text_bytes)
+    {
+        outgoing.split_off(text_bytes)
+    } else if workspace.try_resize(text_bytes) {
+        workspace
+    } else {
+        drop(result);
+        drop(workspace);
+        let meta = files::TaskMeta {
+            bare_task_id: task.id.clone(),
+            log_path: files::display_path(&task.log_path),
+        };
+        return Err(ServiceError::Overload(
+            overload_task_message(call.launch().memory().limit(), &meta),
+            Some(meta),
+        ));
+    };
+    Ok((result, crate::lease::Owner::new(owner)))
 }
 
 #[derive(serde::Serialize)]
@@ -685,37 +852,122 @@ pub(crate) fn overload_task_message(limit: usize, meta: &files::TaskMeta) -> Str
     )
 }
 
+fn nested_wire_bytes(result: &CallToolResult) -> Result<usize, String> {
+    // The moved envelope adds at most 64 encoded bytes, even for the fixed
+    // missing-content fallback. 128 bytes also cover its new keys/text. Keep
+    // one conservative bound for both that workspace and the encoded String.
+    let bytes = crate::ipc::json_len(result)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or_else(|| "Cannot measure the nested result.".to_owned())?;
+    if bytes > codemode::BRIDGE_LIMIT {
+        return Err("The nested result exceeds the 256 MiB bridge limit.".to_owned());
+    }
+    Ok(bytes)
+}
+
+fn reserve_nested_bridge(call: &Call<'_>, bytes: usize) -> Result<(), String> {
+    if call.cancel.is_cancelled() {
+        return Err("Cancelled before nested output was committed.".to_owned());
+    }
+    if let Some(nested) = call.started
+        && !nested.script.reserve_result(nested.pending_id, bytes)
+    {
+        return Err(
+            "The nested result does not fit in the script's remaining bridge quota.".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn admit_nested_result(
+    call: &Call<'_>,
+    action: Action,
+    result: &CallToolResult,
+    held: &mut Option<Lease>,
+) -> Result<Lease, String> {
+    let wire = nested_wire_bytes(result)?;
+    let peak = result_payload_capacity(result)
+        .checked_add(wire)
+        .ok_or_else(|| "The nested result is too large.".to_owned())?;
+    let old_bytes = held.as_ref().map_or(0, Lease::bytes);
+    let reused = held
+        .as_mut()
+        .is_some_and(|lease| lease.try_grow(peak.saturating_sub(lease.bytes())));
+    let replacement = if reused {
+        None
+    } else {
+        Some(
+            call.launch()
+                .memory()
+                .try_acquire(peak)
+                .or_else(|| {
+                    (matches!(action, Action::List | Action::Kill)
+                        && peak <= crate::lease::CONTROL_LIMIT)
+                        .then(|| call.launch().control_memory().try_acquire(peak))
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    "Server active memory budget is full while reserving the nested result."
+                        .to_owned()
+                })?,
+        )
+    };
+    if let Err(error) = reserve_nested_bridge(call, wire) {
+        if reused {
+            held.as_mut().unwrap().shrink_to(old_bytes);
+        }
+        return Err(error);
+    }
+    if reused {
+        Ok(held.take().unwrap())
+    } else {
+        // The replacement and script quota are admitted before releasing old storage.
+        drop(held.take());
+        Ok(replacement.unwrap())
+    }
+}
+
 fn admit_outbound(
     call: &Call<'_>,
     action: Action,
     task: &Task,
     suppressed: &CallToolResult,
-    mut held_lease: Option<Lease>,
+    held_lease: &mut Option<Lease>,
 ) -> Result<Option<Lease>, ServiceError> {
-    if call.nested {
-        return Ok(None);
-    }
     let meta = || files::TaskMeta {
         bare_task_id: task.id.clone(),
         log_path: files::display_path(&task.log_path),
     };
+    if call.nested {
+        return admit_nested_result(call, action, suppressed, held_lease)
+            .map(Some)
+            .map_err(|reason| {
+                let meta = meta();
+                ServiceError::Overload(format!(
+                    "{reason} Output was not committed; the operation may have run (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId without input.",
+                    meta.bare_task_id, meta.log_path
+                ), Some(meta))
+            });
+    }
     let pool = call.launch().memory();
     let outbound_limit = call.launch().outbound_limit();
-    let b64_bytes = content_b64_bytes(suppressed);
+    let frame_len = measure_outbound_len(call, suppressed)?;
+    if frame_len > outbound_limit {
+        let m = meta();
+        return Err(ServiceError::Overload(
+            format!(
+                "The result was {frame_len} bytes, over the 512 MiB frame limit; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId with a smaller maxBytes or read logPath.",
+                m.bare_task_id, m.log_path
+            ),
+            Some(m),
+        ));
+    }
+    let b64_bytes = result_payload_capacity(suppressed);
     if call.render_slot.is_some() {
         let wire_len = wire_result_len(call.call_id, suppressed)?;
         if action == Action::Kill || action == Action::List {
-            return Ok(held_lease);
-        }
-        if wire_len > outbound_limit.saturating_add(4) {
-            let m = meta();
-            return Err(ServiceError::Overload(
-                format!(
-                    "The result was {wire_len} bytes, over the 512 MiB frame limit; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId with a smaller maxBytes or read logPath.",
-                    m.bare_task_id, m.log_path
-                ),
-                Some(m),
-            ));
+            return Ok(held_lease.take());
         }
         let Some(peak) = b64_bytes.checked_add(wire_len) else {
             let m = meta();
@@ -724,8 +976,8 @@ fn admit_outbound(
                 Some(m),
             ));
         };
-        let admitted = match held_lease.take() {
-            Some(mut lease) => lease.try_resize(peak).then_some(lease),
+        let admitted = match held_lease.as_mut() {
+            Some(lease) => lease.try_resize(peak).then(|| held_lease.take()).flatten(),
             None => pool.try_acquire(peak),
         };
         match admitted {
@@ -739,28 +991,19 @@ fn admit_outbound(
             }
         }
     } else {
-        let json_len = crate::ipc::json_len(suppressed)
-            .map_err(|err| ServiceError::Plain(format!("Cannot measure result JSON: {err}.")))?;
-        let outbound = json_len.saturating_add(256);
-        if action != Action::Kill && action != Action::List && outbound > outbound_limit {
-            let m = meta();
-            return Err(ServiceError::Overload(
-                format!(
-                    "The result was {outbound} bytes, over the 512 MiB frame limit; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId with a smaller maxBytes or read logPath.",
-                    m.bare_task_id, m.log_path
-                ),
-                Some(m),
-            ));
-        }
-        let Some(peak) = b64_bytes.checked_add(outbound) else {
+        let outbound = frame_len;
+        let Some(peak) = outbound
+            .checked_mul(if call.http_response { 0 } else { 1 })
+            .and_then(|wire| b64_bytes.checked_add(wire))
+        else {
             let m = meta();
             return Err(ServiceError::Overload(
                 overload_task_message(pool.limit(), &m),
                 Some(m),
             ));
         };
-        let admitted = match held_lease.take() {
-            Some(mut lease) => lease.try_resize(peak).then_some(lease),
+        let admitted = match held_lease.as_mut() {
+            Some(lease) => lease.try_resize(peak).then(|| held_lease.take()).flatten(),
             None => pool.try_acquire(peak).or_else(|| {
                 (action == Action::Kill && peak <= crate::lease::CONTROL_LIMIT)
                     .then(|| call.launch().control_memory().try_acquire(peak))
@@ -780,16 +1023,74 @@ fn admit_outbound(
     }
 }
 
+/// Snapshot strings can coexist with warning/row formatting, cloned JSON fields,
+/// the joined body and its growing suffix. Thirty-two times their source text,
+/// including per-row/member keys, bounds those copies and geometric capacities.
+fn list_text_workspace(bytes: usize) -> usize {
+    bytes.saturating_mul(32)
+}
+
+fn resize_list_workspace(
+    workspace: &mut Lease,
+    target: usize,
+    call: &Call<'_>,
+) -> Result<(), String> {
+    if workspace.try_resize(target) {
+        return Ok(());
+    }
+    let launch = call.launch();
+    let replacement = launch.memory().try_acquire(target)
+        .or_else(|| launch.control_memory().try_acquire(target))
+        .ok_or_else(|| format!(
+            "Server active memory budget ({} bytes) is full; retry list once in-flight transfers complete.",
+            launch.memory().limit()
+        ))?;
+    // Acquire the replacement before releasing the old pool's charge.
+    *workspace = replacement;
+    Ok(())
+}
+
+fn listed_members(
+    tree: &process::Tree,
+    workspace: &mut Lease,
+    call: &Call<'_>,
+) -> Result<Option<Vec<process::Member>>, String> {
+    let retained = workspace.bytes();
+    let (members, refused) = {
+        let mut reserve =
+            |bytes| resize_list_workspace(workspace, retained.saturating_add(bytes), call).is_ok();
+        let mut budget = process::MemberBudget::new(&mut reserve);
+        let members = tree.members_with_budget(&mut budget);
+        (members, budget.refused())
+    };
+    if refused {
+        drop(members);
+        workspace.shrink_to(retained);
+        return Err("Server active memory budget is full while listing kept processes; retry list once in-flight transfers complete.".into());
+    }
+    let text = members.as_ref().map_or(0, |members| {
+        members
+            .iter()
+            .map(|member| member.name.capacity().saturating_add(32))
+            .fold(0, usize::saturating_add)
+    });
+    // The native query's temporary scan/conversion strings have gone. Keep only
+    // the selected names and their later row/JSON rendering workspace.
+    if let Err(error) = resize_list_workspace(
+        workspace,
+        retained.saturating_add(list_text_workspace(text)),
+        call,
+    ) {
+        drop(members);
+        workspace.shrink_to(retained);
+        return Err(error);
+    }
+    Ok(members)
+}
+
 impl Service {
     pub fn new(tasks: Arc<Tasks>, daemon: bool) -> Self {
         Self { tasks, daemon }
-    }
-
-    /// Runs one call and renders its result.
-    pub async fn call(&self, request: Request, call: Call<'_>) -> CallToolResult {
-        let mut tracked = self.call_tracked(request, call).await;
-        drop(tracked.lease.take());
-        tracked.result
     }
 
     pub async fn call_tracked(&self, request: Request, mut call: Call<'_>) -> files::TrackedResult {
@@ -799,11 +1100,12 @@ impl Service {
         call.render = call.render.effective();
         let action = request.action;
         match self.handle(request, &call).await {
-            Ok((result, lease, task_meta)) => files::TrackedResult {
+            Ok((result, lease, task_meta, payload_owner)) => files::TrackedResult {
                 result: suppress(result, call.render),
                 lease,
                 overload: false,
                 task_meta,
+                payload_owner,
             },
             Err(ServiceError::Plain(message)) => {
                 files::TrackedResult::plain(suppress(error_result(action, &message), call.render))
@@ -813,6 +1115,7 @@ impl Service {
                 lease: None,
                 overload: true,
                 task_meta,
+                payload_owner: Default::default(),
             },
         }
     }
@@ -862,11 +1165,12 @@ impl Service {
         self.tasks.prune_entries(call.session);
         call.render = call.render.effective();
         match self.start_script(request, &call, transfer).await {
-            Ok((result, lease, task_meta)) => files::TrackedResult {
+            Ok((result, lease, task_meta, payload_owner)) => files::TrackedResult {
                 result: suppress(result, call.render),
                 lease,
                 overload: false,
                 task_meta,
+                payload_owner,
             },
             Err(ServiceError::Plain(message)) => {
                 files::TrackedResult::plain(suppress(codemode_error(&message), call.render))
@@ -876,6 +1180,7 @@ impl Service {
                 lease: None,
                 overload: true,
                 task_meta,
+                payload_owner: Default::default(),
             },
         }
     }
@@ -885,7 +1190,15 @@ impl Service {
         request: codemode::Request,
         call: &Call<'_>,
         transfer: bool,
-    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
+    ) -> Result<
+        (
+            CallToolResult,
+            Option<Lease>,
+            Option<files::TaskMeta>,
+            crate::lease::Owner,
+        ),
+        ServiceError,
+    > {
         let base_launch = call.launch();
         let (start, resolved_cwd) = codemode::validate(&request, base_launch)?;
         let view = validate(&start, call.nested)?;
@@ -900,6 +1213,7 @@ impl Service {
             transfer,
             call_id: call.call_id,
             service: Arc::clone(self),
+            input_owner: call.input_owner.clone(),
         };
         let tasks = Arc::clone(&self.tasks);
         let session = Arc::clone(call.session);
@@ -927,10 +1241,19 @@ impl Service {
         when: Option<&wait::ReturnWhen>,
         view: View,
         call: &Call<'_>,
-    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
+    ) -> Result<
+        (
+            CallToolResult,
+            Option<Lease>,
+            Option<files::TaskMeta>,
+            crate::lease::Owner,
+        ),
+        ServiceError,
+    > {
         let (task, entry, reader) = started;
         let state = read_gate(&reader, &call.cancel).await?;
-        let mark = wait::mark(&task, &reader, &state, when)?;
+        let mark = wait::mark(&task, &reader, &state, when, call.launch().memory())
+            .map_err(|error| task_read_error(error, &task))?;
         let encoding = view.encoding.unwrap_or(task.encoding);
         let ended = wait::wait(
             &task,
@@ -941,7 +1264,8 @@ impl Service {
             &call.cancel,
             call.progress.as_ref(),
         )
-        .await?;
+        .await
+        .map_err(|error| task_read_error(error, &task))?;
         read_result(
             &call.cancel,
             self.window_result(
@@ -964,7 +1288,15 @@ impl Service {
         &self,
         mut request: Request,
         call: &Call<'_>,
-    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
+    ) -> Result<
+        (
+            CallToolResult,
+            Option<Lease>,
+            Option<files::TaskMeta>,
+            crate::lease::Owner,
+        ),
+        ServiceError,
+    > {
         normalize_request(&mut request);
         if request.action == Action::Poll
             && let Ok((task, _)) = self.task(request.task_id.as_deref())
@@ -991,43 +1323,14 @@ impl Service {
         match request.action {
             Action::List => {
                 let _permit = call.render_permit().await?;
-                let listed = suppress(
-                    self.list(
-                        &session,
-                        &view,
-                        request.scope.unwrap_or_default(),
-                        request.state,
-                        request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
-                    ),
-                    call.render,
-                );
-                let lease = if !call.nested && call.render_slot.is_none() {
-                    let json_len = crate::ipc::json_len(&listed)
-                        .map_err(|err| format!("Cannot measure list JSON: {err}."))?;
-                    let outbound = json_len.saturating_add(256);
-                    Some(
-                        call.launch()
-                            .memory()
-                            .try_acquire(outbound)
-                            .or_else(|| {
-                                (outbound <= crate::lease::CONTROL_LIMIT)
-                                    .then(|| call.launch().control_memory().try_acquire(outbound))
-                                    .flatten()
-                            })
-                            .ok_or_else(|| {
-                                ServiceError::Overload(
-                                    format!(
-                                        "Server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
-                                        call.launch().memory().limit()
-                                    ),
-                                    None,
-                                )
-                            })?,
-                    )
-                } else {
-                    None
-                };
-                Ok((listed, lease, None))
+                let (listed, lease, owner) = self.list(
+                    call,
+                    &view,
+                    request.scope.unwrap_or_default(),
+                    request.state,
+                    request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
+                )?;
+                Ok((listed, lease, None, owner))
             }
             Action::Start => {
                 let base_launch = call.launch();
@@ -1050,6 +1353,7 @@ impl Service {
                     owner: session.label.clone(),
                     started_by: call.call_id.map(|id| (session.id.clone(), id)),
                     launch: Arc::clone(base_launch),
+                    input_owner: call.input_owner.clone(),
                 };
                 let tasks = Arc::clone(&self.tasks);
                 // The session takes the task even when this request is cancelled meanwhile, so
@@ -1064,7 +1368,7 @@ impl Service {
                     tokio::task::spawn_blocking(move || tasks.start(args, &starting, key))
                         .await
                         .map_err(|error| format!("Internal failure while starting: {error}."))??;
-                if let Some(script) = call.started {
+                if let Some(script) = call.started.map(|nested| nested.script) {
                     script.record_started(task_reader.handle(&task.id));
                     view.owned_by_script = true;
                 }
@@ -1086,7 +1390,9 @@ impl Service {
             }
             Action::Poll => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
-                view.owned_by_script = call.started.is_some_and(|script| script.owns(&task.id));
+                view.owned_by_script = call
+                    .started
+                    .is_some_and(|nested| nested.script.owns(&task.id));
                 let when = request.return_when.as_ref();
                 let watches_screen = when.and_then(|when| when.screen_condition());
                 let needs_pty = [
@@ -1174,7 +1480,8 @@ impl Service {
                     Ok(data)
                 };
                 let mut data = encode(&task)?;
-                let mark = wait::mark(&task, &task_reader, &state, when)?;
+                let mark = wait::mark(&task, &task_reader, &state, when, call.launch().memory())
+                    .map_err(|error| task_read_error(error, &task))?;
                 // The resize goes out after every validation and before the input and keys:
                 // the emulator is at the new size before the program's redraw is parsed, the
                 // native resize runs with no lock capture needs held, and its replies reach the
@@ -1198,10 +1505,31 @@ impl Service {
                         data = encode(&task)?;
                     }
                     let burst = (input.is_some() || !data.is_empty()).then_some(data.as_slice());
-                    task.send(burst, flag(request.eof), &call.cancel).await?;
+                    task.send(
+                        burst,
+                        flag(request.eof),
+                        &call.cancel,
+                        call.input_owner.clone(),
+                    )
+                    .await?;
                 } else {
-                    task.send(input, flag(request.eof), &call.cancel).await?;
-                    press(&task, input_bytes, names, parsed, delay, &call.cancel).await?;
+                    task.send(
+                        input,
+                        flag(request.eof),
+                        &call.cancel,
+                        call.input_owner.clone(),
+                    )
+                    .await?;
+                    press(
+                        &task,
+                        input_bytes,
+                        names,
+                        parsed,
+                        delay,
+                        &call.cancel,
+                        &call.input_owner,
+                    )
+                    .await?;
                 }
                 drop(gate);
                 let interacts = request.input.is_some() || request.keys.is_some() || axes.is_some();
@@ -1222,7 +1550,8 @@ impl Service {
                     &call.cancel,
                     call.progress.as_ref(),
                 )
-                .await?;
+                .await
+                .map_err(|error| task_read_error(error, &task))?;
                 read_result(
                     &call.cancel,
                     self.window_result(
@@ -1242,7 +1571,9 @@ impl Service {
             }
             Action::Kill => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
-                view.owned_by_script = call.started.is_some_and(|script| script.owns(&task.id));
+                view.owned_by_script = call
+                    .started
+                    .is_some_and(|nested| nested.script.owns(&task.id));
                 let entry = session.entry(&task);
                 let task_reader = entry.reader(key)?;
                 // Request termination before acquiring the reader gate so a long poll on the
@@ -1289,7 +1620,9 @@ impl Service {
             }
             Action::Transcript => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
-                view.owned_by_script = call.started.is_some_and(|script| script.owns(&task.id));
+                view.owned_by_script = call
+                    .started
+                    .is_some_and(|nested| nested.script.owns(&task.id));
                 if task.is_script() {
                     return Err(
                         "A codemode task has no terminal or transcript; poll returns its output."
@@ -1366,55 +1699,76 @@ impl Service {
 
     fn list(
         &self,
-        session: &Session,
+        call: &Call<'_>,
         view: &View,
         scope: ListScope,
         state: Option<ListState>,
         limit: usize,
-    ) -> CallToolResult {
+    ) -> Result<(CallToolResult, Option<Lease>, crate::lease::Owner), ServiceError> {
+        if call.cancel.is_cancelled() {
+            return Err("Cancelled while listing tasks; retry list.".into());
+        }
+        let session = call.session;
+        // Declared before every candidate: all text drops before its workspace on error.
+        let workspace = std::cell::RefCell::new(Lease::empty(call.launch().control_memory()));
+        resize_list_workspace(&mut workspace.borrow_mut(), 8192, call)
+            .map_err(|message| ServiceError::Overload(message, None))?;
         let active_filter = state.map(|state| state == ListState::Active);
-        let (total_count, selected) =
-            self.tasks
-                .listed(session, scope == ListScope::All, active_filter, limit);
-        let mut lines = Vec::with_capacity(selected.len());
-        let mut entries = Vec::with_capacity(selected.len());
-        let mut warnings = Vec::new();
-        for (task, snapshot) in &selected {
-            warnings.extend(
-                task_warnings(snapshot)
-                    .into_iter()
-                    .map(|warning| format!("{}: {warning}", task.id)),
-            );
-            let command: String = task.command.chars().take(120).collect();
-            let code = snapshot
-                .exit_code
-                .map_or(String::new(), |code| format!(" {code}"));
-            // One read, so the line and the fields name the same size.
-            let size = task.pty.then(|| task.size());
-            let log_path = files::display_path(&task.log_path);
-            lines.push(format!(
-                "{} [{}{code}] {:.1}s{}{} · {} · {}",
-                task.id,
-                snapshot.state,
-                snapshot.elapsed.as_secs_f64(),
-                match size {
-                    Some((cols, rows)) => format!(" pty {cols}x{rows}"),
-                    None => String::new(),
+        let (total_count, selected) = self
+            .tasks
+            .listed(
+                session,
+                scope == ListScope::All,
+                active_filter,
+                limit,
+                &mut |bytes| {
+                    let mut held = workspace.borrow_mut();
+                    let target = held.bytes().saturating_add(list_text_workspace(bytes));
+                    resize_list_workspace(&mut held, target, call)
                 },
-                if snapshot.kept {
-                    format!(" · keeps {}", members(&snapshot.held))
-                } else if snapshot.tree_ended {
-                    " · kept processes ended".to_string()
-                } else {
-                    String::new()
-                },
-                match &task.started_by {
-                    Some((_, call)) => format!("{} call {call}", task.owner),
-                    None => task.owner.clone(),
-                },
-                command.replace('\n', " ")
-            ));
-            entries.push(json!({
+                &mut |tree| listed_members(tree, &mut workspace.borrow_mut(), call),
+            )
+            .map_err(|message| ServiceError::Overload(message, None))?;
+        let (listed, delivered) = {
+            let mut lines = Vec::with_capacity(selected.len());
+            let mut entries = Vec::with_capacity(selected.len());
+            let mut warnings = Vec::new();
+            for (task, snapshot) in &selected {
+                warnings.extend(
+                    task_warnings(snapshot)
+                        .into_iter()
+                        .map(|warning| format!("{}: {warning}", task.id)),
+                );
+                let command: String = task.command.chars().take(120).collect();
+                let code = snapshot
+                    .exit_code
+                    .map_or(String::new(), |code| format!(" {code}"));
+                // One read, so the line and the fields name the same size.
+                let size = task.pty.then(|| task.size());
+                let log_path = files::display_path(&task.log_path);
+                lines.push(format!(
+                    "{} [{}{code}] {:.1}s{}{} · {} · {}",
+                    task.id,
+                    snapshot.state,
+                    snapshot.elapsed.as_secs_f64(),
+                    match size {
+                        Some((cols, rows)) => format!(" pty {cols}x{rows}"),
+                        None => String::new(),
+                    },
+                    if snapshot.kept {
+                        format!(" · keeps {}", members(&snapshot.held))
+                    } else if snapshot.tree_ended {
+                        " · kept processes ended".to_string()
+                    } else {
+                        String::new()
+                    },
+                    match &task.started_by {
+                        Some((_, call)) => format!("{} call {call}", task.owner),
+                        None => task.owner.clone(),
+                    },
+                    command.replace('\n', " ")
+                ));
+                entries.push(json!({
                 "kind": if task.is_script() { "codemode" } else { "bash" },
                 "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
                 "captureError": snapshot.capture_error, "logError": snapshot.log_error,
@@ -1432,32 +1786,67 @@ impl Service {
                 "session": task.started_by.as_ref().map(|(session, _)| session),
                 "callId": task.started_by.as_ref().map(|(_, call)| *call),
             }));
-        }
-        let showing_note = (total_count > selected.len()).then(|| {
-            format!(
-                "Showing {} of {total_count} tasks; raise limit to see more.",
-                selected.len()
+            }
+            let showing_note = (total_count > selected.len()).then(|| {
+                format!(
+                    "Showing {} of {total_count} tasks; raise limit to see more.",
+                    selected.len()
+                )
+            });
+            let structured = json!({
+                "ok": true, "action": "list", "tasks": entries, "totalCount": total_count, "warnings": warnings,
+            });
+            let mut suffix = warning_text(&structured["warnings"]);
+            if let Some(note) = showing_note {
+                suffix.push('\n');
+                suffix.push_str(&note);
+            }
+            let (kept, text) = if lines.is_empty() {
+                (Vec::new(), "No tasks.".to_string())
+            } else {
+                fit_lines(&lines, view.truncate, view.max_bytes)
+            };
+            // Direct calls deliver the text window; nested calls deliver every selected task.
+            let delivered = if view.nested {
+                (0..selected.len()).collect()
+            } else {
+                kept
+            };
+            (
+                suppress(success(text, structured, &suffix), call.render),
+                delivered,
             )
-        });
-        let structured = json!({
-            "ok": true, "action": "list", "tasks": entries, "totalCount": total_count, "warnings": warnings,
-        });
-        let mut suffix = warning_text(&structured["warnings"]);
-        if let Some(note) = showing_note {
-            suffix.push('\n');
-            suffix.push_str(&note);
+        };
+        let outbound = measure_outbound_len(call, &listed)?;
+        if !call.nested && outbound > call.launch().outbound_limit() {
+            return Err(ServiceError::Overload(
+                format!(
+                    "The list response was {outbound} bytes, over the frame limit; retry list with a smaller limit."
+                ),
+                None,
+            ));
         }
-        let (kept, text) = if lines.is_empty() {
-            (Vec::new(), "No tasks.".to_string())
+        let payload = result_payload_capacity(&listed);
+        let wire = if call.nested {
+            nested_wire_bytes(&listed).map_err(|message| ServiceError::Overload(message, None))?
+        } else if call.render_slot.is_some() {
+            wire_result_len(call.call_id, &listed)?
         } else {
-            fit_lines(&lines, view.truncate, view.max_bytes)
+            outbound.saturating_mul(if call.http_response { 0 } else { 1 })
         };
-        // Direct calls deliver the text window; nested calls deliver every selected task.
-        let delivered = if view.nested {
-            (0..selected.len()).collect()
-        } else {
-            kept
-        };
+        let retained = payload.saturating_add(wire);
+        if retained > workspace.borrow().bytes() {
+            resize_list_workspace(&mut workspace.borrow_mut(), retained, call)
+                .map_err(|message| ServiceError::Overload(message, None))?;
+        }
+        if call.cancel.is_cancelled() {
+            return Err("Cancelled while listing tasks; retry list.".into());
+        }
+        if call.nested {
+            reserve_nested_bridge(call, wire)
+                .map_err(|message| ServiceError::Overload(message, None))?;
+        }
+        // Only an admitted candidate commits the entries it actually displays.
         for index in delivered {
             let (task, snapshot) = &selected[index];
             if let Some(entry) = session.existing(task) {
@@ -1465,7 +1854,11 @@ impl Service {
                 entry.mark_keeps_reported(snapshot);
             }
         }
-        success(text, structured, &suffix)
+        drop(selected);
+        let mut held = workspace.into_inner();
+        held.shrink_to(retained);
+        let owner = crate::lease::Owner::new(held.split_off(payload));
+        Ok((listed, Some(held), owner))
     }
 }
 
@@ -1524,6 +1917,7 @@ async fn press(
     parsed: Vec<keys::Key>,
     delay: Duration,
     cancel: &CancellationToken,
+    input_owner: &crate::lease::Owner,
 ) -> Result<(), String> {
     let mut size = input.len();
     for (index, (name, key)) in names.iter().zip(parsed).enumerate() {
@@ -1544,7 +1938,9 @@ async fn press(
                 "Key {name:?} in the program's current keyboard mode takes input and keys past 16 KiB; send fewer keys per poll."
             )));
         }
-        task.send(Some(&bytes), false, cancel).await.map_err(sent)?;
+        task.send(Some(&bytes), false, cancel, input_owner.clone())
+            .await
+            .map_err(sent)?;
     }
     Ok(())
 }
@@ -1664,7 +2060,15 @@ impl Service {
         view: View,
         ended: Option<WaitEnd>,
         startup_warning: Option<ProbeWarning>,
-    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
+    ) -> Result<
+        (
+            CallToolResult,
+            Option<Lease>,
+            Option<files::TaskMeta>,
+            crate::lease::Owner,
+        ),
+        ServiceError,
+    > {
         let permit = call.task_render_permit(action, &task, &task_reader).await?;
         let render = call.render;
         if view.screen {
@@ -1688,6 +2092,26 @@ impl Service {
         let reader = Arc::clone(&task);
         let pool = Arc::clone(call.launch().memory());
         let outbound_limit = call.launch().outbound_limit();
+        let requested_max_bytes = view.max_bytes;
+        let mut view = view;
+        let workspace = pool
+            .try_acquire(text_workspace_bytes(view.max_bytes))
+            .or_else(|| {
+                if action != Action::Kill {
+                    return None;
+                }
+                view.max_bytes = view.max_bytes.min(64 << 10);
+                call.launch()
+                    .control_memory()
+                    .try_acquire(text_workspace_bytes(view.max_bytes))
+            })
+            .ok_or_else(|| {
+                let meta = files::TaskMeta {
+                    bare_task_id: task.id.clone(),
+                    log_path: files::display_path(&task.log_path),
+                };
+                ServiceError::Overload(overload_task_message(pool.limit(), &meta), Some(meta))
+            })?;
         let encoding = view.encoding.unwrap_or(task.encoding);
         // The state is taken before the read: a finished state means output reached EOF (or
         // stayed open, which the status line notes), so the window below holds all of it.
@@ -1696,8 +2120,9 @@ impl Service {
         let keep_nul = view.nested;
         let budget = view.max_bytes;
         let initial_seen = state.attachments_seen;
-        let (window, unseen, had_new_text, mut read, permit) =
+        let (window, unseen, had_new_text, mut read, mut permit, mut workspace) =
             tokio::task::spawn_blocking(move || {
+                let workspace = workspace;
                 let mut read = StagedRead::new(state);
                 let start = read.state.cursor;
                 let window = reader.read_window(
@@ -1716,7 +2141,7 @@ impl Service {
                 } else {
                     Vec::new()
                 };
-                (window, unseen, had_new_text, read, permit)
+                (window, unseen, had_new_text, read, permit, workspace)
             })
             .await
             .map_err(|error| format!("Internal failure while reading output: {error}."))?;
@@ -1736,13 +2161,19 @@ impl Service {
         };
         let delivered_warning = startup_warning.and_then(ProbeWarning::deliver);
         let mut extra_kill_warnings: Vec<String> = Vec::new();
+        if view.max_bytes < requested_max_bytes {
+            extra_kill_warnings.push(
+                "kill output window narrowed to fit the 8 MiB control reserve; poll taskId or read logPath for remaining output".into(),
+            );
+        }
+        let script = script_report(&self.tasks, &task, call, action)?;
         let build_candidate = |window_ref: &Window,
                                bundle_ref: &AttachmentBundle,
                                extra_warns: &[String],
                                footer: &str,
-                               max_bytes: usize|
+                               max_bytes: usize,
+                               content_blocks: Vec<ContentBlock>|
          -> CallToolResult {
-            let script = script_report(&self.tasks, &task);
             let mut status_with_log =
                 status_line(&task, &snapshot, &task_reader, true, script.as_ref());
             let mut status_no_log =
@@ -1761,7 +2192,6 @@ impl Service {
             }
             let mut delivered_json = Vec::new();
             let mut attached_summary = Vec::new();
-            let mut content_blocks = Vec::new();
             let mut step_warnings = Vec::new();
             for step in &bundle_ref.steps {
                 match step {
@@ -1770,7 +2200,6 @@ impl Service {
                         kind,
                         mime,
                         bytes,
-                        block,
                         ..
                     } => {
                         delivered_json.push(json!({
@@ -1780,15 +2209,14 @@ impl Service {
                             "bytes": bytes,
                         }));
                         attached_summary.push(format!("#{index} ({mime}, {bytes} B)"));
-                        content_blocks.push((**block).clone());
                     }
                     PackStep::Degraded { warning, .. } => {
                         step_warnings.push(warning.clone());
                     }
                 }
             }
-            if let Some(report) = script {
-                structured["codemode"] = report.value;
+            if let Some(report) = &script {
+                structured["codemode"] = report.value.clone();
                 if !bundle_ref.nested_handles.is_empty() {
                     structured["codemode"]["attachments"] =
                         Value::Array(bundle_ref.nested_handles.clone());
@@ -1849,10 +2277,15 @@ impl Service {
                 .map_or(String::new(), |(line, _)| format!("\n{line}"));
             let mut bundle = AttachmentBundle::default();
             let mut final_seen = initial_seen;
-            if let Some(script) = call.started {
+            let mut registrations = NestedAttachments {
+                script: call.started.map(|nested| nested.script),
+                ids: Vec::new(),
+            };
+            if let Some(script) = call.started.map(|nested| nested.script) {
                 for att in unseen {
                     let meta = att.meta().clone();
                     let hid = script.register_attachment(att);
+                    registrations.ids.push(hid);
                     bundle.nested_handles.push(json!({
                         "index": meta.index,
                         "kind": meta.kind.as_str(),
@@ -1869,9 +2302,15 @@ impl Service {
                 &extra_kill_warnings,
                 &footer,
                 active_max_bytes,
+                Vec::new(),
             );
+            drop(window_val);
+            let mut lease = admit_outbound(call, action, &task, &suppressed, &mut None)?;
+            let (suppressed, payload_owner) =
+                retain_text_result(suppressed, workspace, &mut lease, call, &task)?;
             read.state.attachments_seen = final_seen;
             let state = read.commit();
+            registrations.ids.clear();
             task_reader.mark_delivered();
             report(
                 session,
@@ -1888,7 +2327,7 @@ impl Service {
                 bare_task_id: task.id.clone(),
                 log_path: files::display_path(&task.log_path),
             };
-            return Ok((suppressed, None, Some(meta)));
+            return Ok((suppressed, lease, Some(meta), payload_owner));
         }
 
         let effective_cap = if action == Action::Kill {
@@ -1903,40 +2342,46 @@ impl Service {
             &extra_kill_warnings,
             "",
             active_max_bytes,
+            Vec::new(),
         );
 
-        if action == Action::Kill
-            && measure_outbound_len(call, &pre_check)?.saturating_add(516) > effective_cap
-        {
+        let pre_check_len = measure_outbound_len(call, &pre_check)?;
+        drop(pre_check);
+        if action == Action::Kill && pre_check_len.saturating_add(516) > effective_cap {
             let state_guard = read.into_guard();
             let reader_narrow = Arc::clone(&task);
             let narrow_budget = view.max_bytes.min(64 * 1024);
-            let (narrow_win, narrow_read, narrow_permit) = tokio::task::spawn_blocking(move || {
-                let mut staged = StagedRead::new(state_guard);
-                let win = reader_narrow.read_window(
-                    &mut staged.state,
-                    view.truncate,
-                    narrow_budget,
-                    view.raw,
-                    clean,
-                    keep_nul,
-                    encoding,
-                    None,
-                );
-                (win, staged, permit)
-            })
-            .await
-            .map_err(|error| format!("Internal failure while narrowing kill output: {error}."))?;
+            let (narrow_win, narrow_read, narrow_permit, returned_workspace) =
+                tokio::task::spawn_blocking(move || {
+                    let mut staged = StagedRead::new(state_guard);
+                    let win = reader_narrow.read_window(
+                        &mut staged.state,
+                        view.truncate,
+                        narrow_budget,
+                        view.raw,
+                        clean,
+                        keep_nul,
+                        encoding,
+                        None,
+                    );
+                    (win, staged, permit, workspace)
+                })
+                .await
+                .map_err(|error| {
+                    format!("Internal failure while narrowing kill output: {error}.")
+                })?;
+            workspace = returned_workspace;
             window_val =
                 narrow_win.map_err(|error| format!("Cannot read the task log: {error}."))?;
             read = narrow_read;
-            let _ = narrow_permit;
+            permit = narrow_permit;
             extra_kill_warnings.push(
                 "kill output window narrowed to fit the 8 MiB control reserve; poll taskId or read logPath for remaining output".into(),
             );
             active_max_bytes = narrow_budget;
         }
 
+        let mut packed_blocks = Vec::new();
         let total_unseen = unseen.len();
         if total_unseen > 0 {
             let base_candidate = build_candidate(
@@ -1945,9 +2390,17 @@ impl Service {
                 &extra_kill_warnings,
                 "",
                 active_max_bytes,
+                Vec::new(),
             );
+            let base_payload = result_payload_capacity(&base_candidate);
             let raw_base_wire = measure_outbound_len(call, &base_candidate)?;
-            let min_envelope_wire = if had_new_text { 512 } else { raw_base_wire };
+            let local_base_wire = local_wire_len(call, &base_candidate)?;
+            drop(base_candidate);
+            let min_envelope_wire = if had_new_text {
+                512usize.saturating_add(call.rpc_id_bytes)
+            } else {
+                raw_base_wire
+            };
             let base_wire = raw_base_wire.saturating_add(516);
             let mut running_wire = base_wire;
             let mut total_b64 = 0usize;
@@ -1995,7 +2448,16 @@ impl Service {
                 let next_wire = running_wire.saturating_add(item_wire_delta);
                 let needed_peak = next_b64.and_then(|b64| {
                     let read_peak = b64.checked_add(next_max_raw)?;
-                    let out_peak = b64.checked_add(next_wire)?.checked_add(1024)?;
+                    // The outer ID constrains packing, but a daemon reserves only
+                    // its actual IPC encoding. The endpoint owns its later RPC frame.
+                    let local_wire =
+                        local_base_wire.checked_add(next_wire.saturating_sub(raw_base_wire))?;
+                    let wire_peak =
+                        local_wire.checked_mul(if call.http_response { 0 } else { 1 })?;
+                    let out_peak = base_payload
+                        .checked_add(b64)?
+                        .checked_add(wire_peak)?
+                        .checked_add(1024)?;
                     Some(read_peak.max(out_peak))
                 });
                 if needed_peak.is_some_and(|target| pack_lease.try_resize(target)) {
@@ -2022,9 +2484,13 @@ impl Service {
 
             if !planned.is_empty() {
                 let task_for_pack = Arc::clone(&task);
-                let (encoded_steps, evicted_mid_pack) =
-                    tokio::task::spawn_blocking(move || -> Result<(Vec<PackStep>, bool), String> {
+                let (encoded_steps, blocks, evicted_mid_pack, held) =
+                    tokio::task::spawn_blocking(move || {
+                        // The blocking worker owns every guard until its buffers are gone,
+                        // even if the awaiting request is cancelled.
+                        let held = (pack_lease, read, permit, workspace);
                         let mut out = Vec::with_capacity(planned.len());
+                        let mut blocks = Vec::with_capacity(planned.len());
                         let mut saw_eviction = false;
                         for entry in planned {
                             match entry {
@@ -2034,11 +2500,13 @@ impl Service {
                                 PlannedAttachment::Select(att) => {
                                     let meta = att.meta();
                                     let shown = files::display_path(&meta.path);
-                                    let mut data = Vec::new();
-                                    let read_res = File::open(&meta.path)
-                                        .and_then(|f| f.take(meta.size + 1).read_to_end(&mut data));
+                                    let mut data = vec![0; meta.size as usize];
+                                    let read_res = File::open(&meta.path).and_then(|mut file| {
+                                        file.read_exact(&mut data)?;
+                                        file.read(&mut [0; 1])
+                                    });
                                     match read_res {
-                                        Ok(_) if data.len() as u64 == meta.size => {
+                                        Ok(0) => {
                                             let encoded = media::encode_base64(&data);
                                             drop(data);
                                             let block = media::content_block(
@@ -2051,8 +2519,8 @@ impl Service {
                                                 bytes: meta.size,
                                                 base64_len: meta.base64_len,
                                                 shown_path: shown,
-                                                block: Box::new(block),
                                             });
+                                            blocks.push(block);
                                         }
                                         Ok(_) => {
                                             return Err(format!(
@@ -2063,6 +2531,11 @@ impl Service {
                                             saw_eviction = true;
                                             break;
                                         }
+                                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                            return Err(format!(
+                                                "Cannot read stored attachment {shown}: attachment size changed; read its path directly."
+                                            ));
+                                        }
                                         Err(error) => {
                                             return Err(format!(
                                                 "Cannot read stored attachment {shown}: {error}."
@@ -2072,13 +2545,18 @@ impl Service {
                                 }
                             }
                         }
-                        Ok((out, saw_eviction))
+                        Ok::<_, String>((out, blocks, saw_eviction, held))
                     })
                     .await
                     .map_err(|error| {
                         format!("Internal failure while encoding attachments: {error}.")
                     })??;
+                let (pack_lease, packed_read, packed_permit, packed_workspace) = held;
+                read = packed_read;
+                permit = packed_permit;
+                workspace = packed_workspace;
                 bundle.steps = encoded_steps;
+                packed_blocks = blocks;
                 if evicted_mid_pack {
                     bundle.tail_warnings.push(
                         "log evicted under the 4 GiB total limit; remaining stored attachments are unavailable".into(),
@@ -2100,6 +2578,7 @@ impl Service {
             &extra_kill_warnings,
             &footer,
             active_max_bytes,
+            packed_blocks,
         );
 
         if total_unseen > 0 {
@@ -2133,12 +2612,15 @@ impl Service {
 
             let evicted_now = snapshot.evicted || task.evicted();
             update_queued_warning(&bundle.steps, &mut bundle.tail_warnings, evicted_now);
+            let blocks = suppressed.content.split_off(1);
+            drop(suppressed);
             suppressed = build_candidate(
                 &window_val,
                 &bundle,
                 &extra_kill_warnings,
                 &footer,
                 active_max_bytes,
+                blocks,
             );
             while !bundle.steps.is_empty()
                 && measure_outbound_len(call, &suppressed)? > effective_cap
@@ -2162,20 +2644,26 @@ impl Service {
                         index: *index,
                         warning: msg,
                     };
+                    suppressed.content.truncate(1);
                     bundle.lease = None;
                 } else {
-                    bundle.steps.pop();
+                    if matches!(bundle.steps.pop(), Some(PackStep::Delivered { .. })) {
+                        suppressed.content.pop();
+                    }
                     if bundle.steps.is_empty() {
                         bundle.lease = None;
                     }
                 }
                 update_queued_warning(&bundle.steps, &mut bundle.tail_warnings, evicted_now);
+                let blocks = suppressed.content.split_off(1);
+                drop(suppressed);
                 suppressed = build_candidate(
                     &window_val,
                     &bundle,
                     &extra_kill_warnings,
                     &footer,
                     active_max_bytes,
+                    blocks,
                 );
                 if matches!(bundle.steps.as_slice(), [PackStep::Degraded { .. }]) {
                     break;
@@ -2183,26 +2671,35 @@ impl Service {
             }
         }
 
-        let lease = match admit_outbound(call, action, &task, &suppressed, bundle.lease.take()) {
+        let mut lease = match admit_outbound(call, action, &task, &suppressed, &mut bundle.lease) {
             Ok(lease) => lease,
             Err(ServiceError::Overload(..))
                 if action == Action::Kill && !bundle.steps.is_empty() =>
             {
+                suppressed.content.truncate(1);
                 bundle.steps.clear();
+                bundle.lease = None;
                 bundle.tail_warnings = vec![
                     "unseen attachment(s) deferred because active media memory is full; poll taskId without input to retrieve them".into(),
                 ];
+                let blocks = suppressed.content.split_off(1);
+                drop(suppressed);
                 suppressed = build_candidate(
                     &window_val,
                     &bundle,
                     &extra_kill_warnings,
                     &footer,
                     active_max_bytes,
+                    blocks,
                 );
-                admit_outbound(call, action, &task, &suppressed, None)?
+                admit_outbound(call, action, &task, &suppressed, &mut None)?
             }
             Err(err) => return Err(err),
         };
+        drop(window_val);
+        let (suppressed, payload_owner) =
+            retain_text_result(suppressed, workspace, &mut lease, call, &task)?;
+        let _permit = permit;
         read.state.attachments_seen = bundle.steps.last().map_or(initial_seen, PackStep::index);
         let state = read.commit();
         task_reader.mark_delivered();
@@ -2221,7 +2718,7 @@ impl Service {
             bare_task_id: task.id.clone(),
             log_path: files::display_path(&task.log_path),
         };
-        Ok((suppressed, lease, Some(meta)))
+        Ok((suppressed, lease, Some(meta), payload_owner))
     }
 
     /// A PTY task's transcript from the first line no earlier read showed: its final lines,
@@ -2238,7 +2735,15 @@ impl Service {
         task_reader: Arc<Reader>,
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
-    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
+    ) -> Result<
+        (
+            CallToolResult,
+            Option<Lease>,
+            Option<files::TaskMeta>,
+            crate::lease::Owner,
+        ),
+        ServiceError,
+    > {
         let permit = call
             .task_render_permit(Action::Transcript, &task, &task_reader)
             .await?;
@@ -2246,14 +2751,25 @@ impl Service {
         let snapshot = task.snapshot_held();
         let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
         let first_permit = permit.clone();
-        let (transcript, read, _first_permit) = tokio::task::spawn_blocking(move || {
+        let memory = Arc::clone(call.launch().memory());
+        let workspace = memory
+            .try_acquire(text_workspace_bytes(view.max_bytes))
+            .ok_or_else(|| {
+                let meta = files::TaskMeta {
+                    bare_task_id: task.id.clone(),
+                    log_path: files::display_path(&task.log_path),
+                };
+                ServiceError::Overload(overload_task_message(memory.limit(), &meta), Some(meta))
+            })?;
+        let (transcript, read, _first_permit, workspace) = tokio::task::spawn_blocking(move || {
+            let owned_workspace = workspace;
             let read = StagedRead::new(state);
-            let transcript = reader.transcript(&tasks, &read.state);
-            (transcript, read, first_permit)
+            let transcript = reader.transcript(&tasks, &read.state, &memory);
+            (transcript, read, first_permit, owned_workspace)
         })
         .await
         .map_err(|error| format!("Internal failure while reading: {error}."))?;
-        let transcript = transcript?;
+        let transcript = transcript.map_err(|error| task_read_error(error, &task))?;
         let pending_lines = transcript.pending.matches('\n').count() as u64;
         let total = transcript.lines + pending_lines;
         let shown_transcript_path = files::display_path(&transcript.path);
@@ -2305,48 +2821,53 @@ impl Service {
                 )));
         }
         let logged = Arc::clone(&task);
-        let (window, read, _permit) = tokio::task::spawn_blocking(move || {
-            let mut read = read;
-            /// Reads the final lines into `builder`.
-            fn read_into(
-                path: &std::path::Path,
-                start: u64,
-                bytes: u64,
-                builder: &mut WindowBuilder<'_>,
-            ) -> std::io::Result<()> {
-                // Final lines only grow, so the range read stays as it was.
-                let mut file = File::open(path)?;
-                file.seek(SeekFrom::Start(start))?;
-                let mut remaining = bytes - start;
-                let mut buffer = vec![0_u8; 64 * 1024];
-                while remaining > 0 {
-                    let want = remaining.min(buffer.len() as u64) as usize;
-                    file.read_exact(&mut buffer[..want])?;
-                    builder.push(&buffer[..want]);
-                    remaining -= want as u64;
+        let (window, read, _permit, (snapshot_owner, workspace)) =
+            tokio::task::spawn_blocking(move || {
+                // Capture the lease explicitly: field-only closure capture must not leave it
+                // outside the blocking worker while that worker still owns pending text.
+                let held = (transcript._lease, workspace);
+                let mut read = read;
+                /// Reads the final lines into `builder`.
+                fn read_into(
+                    path: &std::path::Path,
+                    start: u64,
+                    bytes: u64,
+                    builder: &mut WindowBuilder<'_>,
+                ) -> std::io::Result<()> {
+                    // Final lines only grow, so the range read stays as it was.
+                    let mut file = File::open(path)?;
+                    file.seek(SeekFrom::Start(start))?;
+                    let mut remaining = bytes - start;
+                    let mut buffer = vec![0_u8; 64 * 1024];
+                    while remaining > 0 {
+                        let want = remaining.min(buffer.len() as u64) as usize;
+                        file.read_exact(&mut buffer[..want])?;
+                        builder.push(&buffer[..want]);
+                        remaining -= want as u64;
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            let mut cleaner = Cleaner::default();
-            let mut builder = WindowBuilder::new(spec, &mut cleaner, transcript.first_line);
-            let window = match read_into(
-                &transcript.path,
-                transcript.start,
-                transcript.bytes,
-                &mut builder,
-            ) {
-                Err(_) if logged.evicted() => Err(EVICTED_TRANSCRIPT.to_string()),
-                Err(error) => Err(format!("Cannot read the transcript file: {error}.")),
-                Ok(()) => {
-                    builder.push(transcript.pending.as_bytes());
-                    read.state.shown = (transcript.bytes, transcript.lines);
-                    Ok(builder.finish())
-                }
-            };
-            (window, read, permit)
-        })
-        .await
-        .map_err(|error| format!("Internal failure while reading: {error}."))?;
+                let mut cleaner = Cleaner::default();
+                let mut builder = WindowBuilder::new(spec, &mut cleaner, transcript.first_line);
+                let window = match read_into(
+                    &transcript.path,
+                    transcript.start,
+                    transcript.bytes,
+                    &mut builder,
+                ) {
+                    Err(_) if logged.evicted() => Err(EVICTED_TRANSCRIPT.to_string()),
+                    Err(error) => Err(format!("Cannot read the transcript file: {error}.")),
+                    Ok(()) => {
+                        builder.push(transcript.pending.as_bytes());
+                        read.state.shown = (transcript.bytes, transcript.lines);
+                        Ok(builder.finish())
+                    }
+                };
+                (window, read, permit, held)
+            })
+            .await
+            .map_err(|error| format!("Internal failure while reading: {error}."))?;
+        drop(snapshot_owner);
         let window = window?;
         add_encoding_warning(&mut structured, &window);
         let warnings = warning_text(&structured["warnings"]);
@@ -2367,7 +2888,10 @@ impl Service {
             &mut structured,
         );
         let suppressed = suppress(success(text, structured, &warnings), render);
-        let lease = admit_outbound(call, Action::Transcript, &task, &suppressed, None)?;
+        let mut lease = admit_outbound(call, Action::Transcript, &task, &suppressed, &mut None)?;
+        drop(window);
+        let (suppressed, payload_owner) =
+            retain_text_result(suppressed, workspace, &mut lease, call, &task)?;
         let state = read.commit();
         task_reader.mark_delivered();
         report(
@@ -2385,7 +2909,7 @@ impl Service {
             bare_task_id: task.id.clone(),
             log_path: files::display_path(&task.log_path),
         };
-        Ok((suppressed, lease, Some(meta)))
+        Ok((suppressed, lease, Some(meta), payload_owner))
     }
 
     /// Combines the already-budgeted `window` body with the status line and background footer,
@@ -2458,13 +2982,24 @@ impl Service {
         ended: WaitEnd,
         startup_warning: Option<ProbeWarning>,
         permit: Option<Arc<OwnedSemaphorePermit>>,
-    ) -> Result<(CallToolResult, Option<Lease>, Option<files::TaskMeta>), ServiceError> {
+    ) -> Result<
+        (
+            CallToolResult,
+            Option<Lease>,
+            Option<files::TaskMeta>,
+            crate::lease::Owner,
+        ),
+        ServiceError,
+    > {
         // A finished state, taken first, means the screen below holds all output.
         let snapshot = task.snapshot_held();
-        let screen = task.screen()?;
+        let screen = task
+            .screen(call.launch().memory())
+            .map_err(|error| task_read_error(error, &task))?;
         // The stream counts as read up to the output the screen shows.
         let (reader, until) = (Arc::clone(&task), screen.log_end);
-        let (window, read, _permit) = tokio::task::spawn_blocking(move || {
+        let (window, read, _permit, screen) = tokio::task::spawn_blocking(move || {
+            let owned_screen = screen;
             let mut read = StagedRead::new(state);
             let window = reader.read_window(
                 &mut read.state,
@@ -2476,7 +3011,7 @@ impl Service {
                 reader.encoding,
                 Some(until),
             );
-            (window, read, permit)
+            (window, read, permit, owned_screen)
         })
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
@@ -2530,7 +3065,12 @@ impl Service {
             structured["output"] = json!(body);
         }
         let suppressed = suppress(success(text, structured, &warnings), render);
-        let lease = admit_outbound(call, action, &task, &suppressed, None)?;
+        let mut lease = admit_outbound(call, action, &task, &suppressed, &mut None)?;
+        drop(window);
+        drop(body);
+        drop(screen.rows);
+        let (suppressed, payload_owner) =
+            retain_text_result(suppressed, screen._lease, &mut lease, call, &task)?;
         let state = read.commit();
         task_reader.mark_delivered();
         report(
@@ -2548,7 +3088,7 @@ impl Service {
             bare_task_id: task.id.clone(),
             log_path: files::display_path(&task.log_path),
         };
-        Ok((suppressed, lease, Some(meta)))
+        Ok((suppressed, lease, Some(meta), payload_owner))
     }
 }
 
@@ -2651,13 +3191,26 @@ fn members(members: &[process::Member]) -> String {
     text
 }
 
-fn measure_outbound_len(call: &Call<'_>, result: &CallToolResult) -> Result<usize, String> {
+fn rpc_result_len(call: &Call<'_>, result: &CallToolResult) -> Result<usize, String> {
+    crate::ipc::json_len(result)
+        .map(|n| n.saturating_add(call.rpc_id_bytes).saturating_add(256))
+        .map_err(|err| format!("Cannot measure result JSON: {err}."))
+}
+
+fn local_wire_len(call: &Call<'_>, result: &CallToolResult) -> Result<usize, String> {
     if call.render_slot.is_some() {
-        wire_result_len(call.call_id, result).map(|n| n.saturating_sub(4))
+        wire_result_len(call.call_id, result)
     } else {
-        crate::ipc::json_len(result)
-            .map(|n| n.saturating_add(256))
-            .map_err(|err| format!("Cannot measure result JSON: {err}."))
+        rpc_result_len(call, result)
+    }
+}
+
+fn measure_outbound_len(call: &Call<'_>, result: &CallToolResult) -> Result<usize, String> {
+    let rpc = rpc_result_len(call, result)?;
+    if call.render_slot.is_some() {
+        wire_result_len(call.call_id, result).map(|n| n.saturating_sub(4).max(rpc))
+    } else {
+        Ok(rpc)
     }
 }
 
@@ -2674,7 +3227,6 @@ enum PackStep {
         bytes: u64,
         base64_len: usize,
         shown_path: String,
-        block: Box<ContentBlock>,
     },
     Degraded {
         index: usize,
@@ -2686,6 +3238,23 @@ impl PackStep {
     fn index(&self) -> usize {
         match self {
             Self::Delivered { index, .. } | Self::Degraded { index, .. } => *index,
+        }
+    }
+}
+
+// A candidate can register opaque handles before its final size is known.
+// Refusal/cancellation removes only those new handles; committed handles stay.
+struct NestedAttachments<'a> {
+    script: Option<&'a codemode::ScriptHandle>,
+    ids: Vec<u64>,
+}
+
+impl Drop for NestedAttachments<'_> {
+    fn drop(&mut self) {
+        if let Some(script) = self.script {
+            for id in self.ids.drain(..) {
+                script.unregister_attachment(id);
+            }
         }
     }
 }
@@ -2702,10 +3271,37 @@ struct ScriptReport {
     value: Value,
     running: Vec<String>,
     cancelled: usize,
+    _lease: Lease,
 }
 
-fn script_report(tasks: &Tasks, task: &Task) -> Option<ScriptReport> {
-    let (cancelled, handles) = task.script()?.report();
+fn script_report(
+    tasks: &Tasks,
+    task: &Task,
+    call: &Call<'_>,
+    action: Action,
+) -> Result<Option<ScriptReport>, ServiceError> {
+    let Some(script) = task.script() else {
+        return Ok(None);
+    };
+    let codemode::ReportSnapshot {
+        cancelled,
+        started: handles,
+        _lease: lease,
+    } = script
+        .report(
+            call.launch().memory(),
+            (action == Action::Kill).then_some(call.launch().control_memory()),
+        )
+        .ok_or_else(|| {
+            let meta = files::TaskMeta {
+                bare_task_id: task.id.clone(),
+                log_path: files::display_path(&task.log_path),
+            };
+            ServiceError::Overload(
+                overload_task_message(call.launch().memory().limit(), &meta),
+                Some(meta),
+            )
+        })?;
     let mut running = Vec::new();
     let started = handles
         .into_iter()
@@ -2714,23 +3310,24 @@ fn script_report(tasks: &Tasks, task: &Task) -> Option<ScriptReport> {
                 .ok()
                 .and_then(|(id, _)| tasks.find(id));
             let state = task.as_ref().map_or("unknown", |task| {
-                let snapshot = task.snapshot();
-                if snapshot.state == "running" || snapshot.kept {
+                let (state, kept) = task.report_state();
+                if state == "running" || kept {
                     running.push(handle.clone());
                 }
-                snapshot.state
+                state
             });
             json!({"taskId": handle, "state": state})
         })
         .collect::<Vec<_>>();
-    Some(ScriptReport {
+    Ok(Some(ScriptReport {
         cancelled: cancelled.len(),
         running,
         value: json!({
             "cancelledCalls": cancelled,
             "startedTasks": started,
         }),
-    })
+        _lease: lease,
+    }))
 }
 
 fn task_handles(handles: &[String]) -> String {
@@ -3036,7 +3633,641 @@ mod tests {
             nested,
             started: None,
             render_slot: None,
+            http_response: false,
+            rpc_id_bytes: 0,
+            input_owner: Default::default(),
         }
+    }
+
+    async fn list_fixture() -> (Arc<Service>, Arc<Tasks>, Arc<Session>, Arc<TaskEntry>) {
+        let (service, tasks, session) = script_fixture();
+        let (task, entry, _) = tasks
+            .start_script(
+                tasks::ScriptArgs {
+                    code: "return undefined;".into(),
+                    launch: Arc::clone(&session.launch),
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                "abcd".into(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!entry.is_reported());
+        (service, tasks, session, entry)
+    }
+
+    #[tokio::test]
+    async fn nested_precommit_exact_memory_quota_and_cancellation_keep_old_reservations() {
+        let (_, tasks, session) = script_fixture();
+        let result = CallToolResult::success(vec![ContentBlock::text("ordinary output")]);
+        let wire = nested_wire_bytes(&result).unwrap();
+        let peak = result_payload_capacity(&result) + wire;
+        let control = crate::lease::BytePool::new(peak);
+        for (limit, fits) in [(peak - 1, false), (peak, true)] {
+            let pool = crate::lease::BytePool::new(limit);
+            let launch = Arc::new(
+                session
+                    .launch
+                    .for_session()
+                    .with_memory(Arc::clone(&pool))
+                    .with_control_memory(Arc::clone(&control)),
+            );
+            let mut call = script_call(&session, true);
+            call.launch = Some(&launch);
+            let admitted = admit_nested_result(&call, Action::Poll, &result, &mut None);
+            assert_eq!(admitted.is_ok(), fits);
+            assert_eq!(control.used(), 0, "ordinary replies do not use control");
+            if fits {
+                assert_eq!(pool.used(), peak);
+            }
+            drop(admitted);
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = crate::lease::BytePool::new(peak);
+        let launch = Arc::new(
+            session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&pool))
+                .with_control_memory(Arc::clone(&control)),
+        );
+        let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+        script.test_pending_result(7, 8, wire - 1);
+        let mut call = script_call(&session, true);
+        call.launch = Some(&launch);
+        call.started = Some(codemode::NestedCall {
+            script: &script,
+            pending_id: 7,
+        });
+        let mut held = pool.try_acquire(16);
+        assert!(admit_nested_result(&call, Action::Poll, &result, &mut held).is_err());
+        assert_eq!(held.as_ref().unwrap().bytes(), 16);
+        assert_eq!((pool.used(), script.test_bridge_bytes()), (16, 8));
+        script.test_bridge_limit(wire);
+        call.cancel.cancel();
+        assert!(admit_nested_result(&call, Action::Poll, &result, &mut held).is_err());
+        assert_eq!((pool.used(), script.test_bridge_bytes()), (16, 8));
+        call.cancel = CancellationToken::new();
+        let admitted = admit_nested_result(&call, Action::Poll, &result, &mut held).unwrap();
+        assert!(held.is_none());
+        assert_eq!((pool.used(), script.test_bridge_bytes()), (peak, wire));
+        drop(admitted);
+        assert_eq!(pool.used(), 0);
+        let full = crate::lease::BytePool::new(16);
+        let launch = Arc::new(
+            session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&full))
+                .with_control_memory(Arc::clone(&control)),
+        );
+        let mut call = script_call(&session, true);
+        call.launch = Some(&launch);
+        let mut held = full.try_acquire(16);
+        assert!(admit_nested_result(&call, Action::Poll, &result, &mut held).is_err());
+        assert_eq!((full.used(), control.used()), (16, 0));
+        let admitted = admit_nested_result(&call, Action::Kill, &result, &mut held).unwrap();
+        assert!(held.is_none());
+        assert_eq!((full.used(), control.used()), (0, peak));
+        drop(admitted);
+        assert_eq!(control.used(), 0);
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nested_precommit_list_quota_refusal_and_cancel_leave_reported_state_due() {
+        let (service, tasks, session, entry) = list_fixture().await;
+        let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+        script.test_pending_result(1, 8, 64);
+        let make_call = || {
+            let mut call = script_call(&session, true);
+            call.started = Some(codemode::NestedCall {
+                script: &script,
+                pending_id: 1,
+            });
+            call
+        };
+        let refused = service
+            .call_json_tracked(json!({"action":"list"}), make_call())
+            .await;
+        assert!(refused.overload, "{:?}", refused.result);
+        assert!(!entry.is_reported());
+        assert_eq!(script.test_bridge_bytes(), 8);
+        drop(refused);
+        script.test_bridge_limit(16 * 1024);
+        let cancelled = make_call();
+        cancelled.cancel.cancel();
+        let refused = service
+            .call_json_tracked(json!({"action":"list"}), cancelled)
+            .await;
+        assert_eq!(refused.result.is_error, Some(true));
+        assert!(!entry.is_reported());
+        assert_eq!(script.test_bridge_bytes(), 8);
+        let delivered = service
+            .call_json_tracked(json!({"action":"list"}), make_call())
+            .await;
+        assert_eq!(
+            delivered.result.is_error,
+            Some(false),
+            "{:?}",
+            delivered.result
+        );
+        assert!(entry.is_reported());
+        let wire = nested_wire_bytes(&delivered.result).unwrap();
+        assert_eq!(script.test_bridge_bytes(), wire);
+        assert!(delivered.lease.as_ref().unwrap().bytes() >= wire);
+        drop(delivered);
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nested_precommit_reader_and_attachment_watermarks_survive_refusal_and_cancel() {
+        let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let pool = crate::lease::BytePool::new(2 << 20);
+        let launch = Arc::new(
+            crate::session::LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(Arc::clone(&pool)),
+        );
+        let session = Session::new(
+            "nested-commit".into(),
+            "nested-commit".into(),
+            Arc::clone(&launch),
+        );
+        let (task, entry, _) = tasks
+            .start_script(
+                tasks::ScriptArgs {
+                    code: format!("text('hello'); attach({});", json!(pixel_url())),
+                    launch,
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                "abcd".into(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+        let reader = entry.reader(Some("9999")).unwrap();
+        let handle = format!("{}.9999", task.id);
+        let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+        script.record_started(handle.clone());
+        script.test_pending_result(1, 8, 64);
+        let make_call = || {
+            let mut call = script_call(&session, true);
+            call.render.output_mode = OutputMode::Structured;
+            call.started = Some(codemode::NestedCall {
+                script: &script,
+                pending_id: 1,
+            });
+            call
+        };
+        let request = json!({"action":"poll", "taskId":handle, "waitMs":0, "maxBytes":100});
+        let refused = service
+            .call_json_tracked(request.clone(), make_call())
+            .await;
+        assert!(refused.overload, "{:?}", refused.result);
+        let meta = refused.task_meta.as_ref().unwrap();
+        assert_eq!(meta.bare_task_id, task.id);
+        let text = refused.result.structured_content.as_ref().unwrap()["error"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains(&task.id) && text.contains(&meta.log_path));
+        assert!(text.contains("Do not retry start or resend input"));
+        assert_eq!(script.test_bridge_bytes(), 8);
+        assert_eq!(script.test_attachment_count(), 0);
+        let report = script.report(&pool, None).unwrap();
+        assert!(
+            report.started.contains(&handle),
+            "started task is recoverable from the outer report"
+        );
+        drop(report);
+        {
+            let state = reader.read_gate().lock_owned().await;
+            assert_eq!((state.cursor, state.attachments_seen), (0, 0));
+            assert!(reader.is_fresh());
+        }
+        assert!(!entry.is_reported());
+        drop(refused);
+        assert_eq!(pool.used(), 0);
+        let cancelled = make_call();
+        cancelled.cancel.cancel();
+        let refused = service.call_json_tracked(request.clone(), cancelled).await;
+        assert_eq!(refused.result.is_error, Some(true));
+        assert_eq!(script.test_bridge_bytes(), 8);
+        assert_eq!(script.test_attachment_count(), 0);
+        assert!(reader.is_fresh());
+        drop(refused);
+        script.test_bridge_limit(16 * 1024);
+        let delivered = service.call_json_tracked(request, make_call()).await;
+        assert_eq!(
+            delivered.result.is_error,
+            Some(false),
+            "{:?}",
+            delivered.result
+        );
+        let wire = nested_wire_bytes(&delivered.result).unwrap();
+        assert_eq!(script.test_bridge_bytes(), wire);
+        assert!(delivered.lease.as_ref().unwrap().bytes() >= wire);
+        assert_eq!(script.test_attachment_count(), 1);
+        let attachment =
+            &delivered.result.structured_content.as_ref().unwrap()["codemode"]["attachments"][0];
+        assert!(
+            attachment["__hid"].as_u64().unwrap() >= 2,
+            "refused registrations were removed"
+        );
+        {
+            let state = reader.read_gate().lock_owned().await;
+            assert!(state.cursor > 0);
+            assert_eq!(state.attachments_seen, 1);
+            assert!(!reader.is_fresh());
+        }
+        assert!(entry.is_reported());
+        drop(delivered);
+        assert_eq!(pool.used(), 0);
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn list_refusal_and_cancellation_leave_entries_due() {
+        let (service, tasks, session, entry) = list_fixture().await;
+        let main = crate::lease::BytePool::new(0);
+        let control = crate::lease::BytePool::new(0);
+        let blocked = Arc::new(
+            session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&main))
+                .with_control_memory(Arc::clone(&control)),
+        );
+        let mut call = script_call(&session, false);
+        call.launch = Some(&blocked);
+        let refused = service
+            .call_json_tracked(json!({"action":"list"}), call)
+            .await;
+        assert!(refused.overload);
+        assert!(!entry.is_reported());
+        assert_eq!((main.used(), control.used()), (0, 0));
+        drop(refused);
+
+        let pool = crate::lease::BytePool::new(1 << 20);
+        let small_frame = Arc::new(
+            session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&main))
+                .with_control_memory(Arc::clone(&pool))
+                .with_outbound_limit(512),
+        );
+        let mut call = script_call(&session, false);
+        call.launch = Some(&small_frame);
+        let refused = service
+            .call_json_tracked(json!({"action":"list"}), call)
+            .await;
+        assert!(refused.overload, "{:?}", refused.result);
+        assert!(
+            refused.result.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("frame limit")
+        );
+        assert!(!entry.is_reported());
+        assert_eq!(pool.used(), 0);
+        drop(refused);
+
+        let mut cancelled = script_call(&session, false);
+        cancelled.cancel.cancel();
+        cancelled.launch = Some(&small_frame);
+        let refused = service
+            .call_json_tracked(json!({"action":"list"}), cancelled)
+            .await;
+        assert_eq!(refused.result.is_error, Some(true));
+        assert!(!entry.is_reported());
+        assert_eq!(pool.used(), 0);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn list_result_owns_payload_and_only_local_wire_after_admission() {
+        for mode in 0..4 {
+            let (service, tasks, session, entry) = list_fixture().await;
+            let main = crate::lease::BytePool::new(0);
+            let control = crate::lease::BytePool::new(1 << 20);
+            let launch = Arc::new(
+                session
+                    .launch
+                    .for_session()
+                    .with_memory(Arc::clone(&main))
+                    .with_control_memory(Arc::clone(&control)),
+            );
+            let slots = Arc::new(Semaphore::new(1));
+            let slot = RenderSlot::new(&slots);
+            let mut call = script_call(&session, mode == 3);
+            call.launch = Some(&launch);
+            call.http_response = mode == 1;
+            if mode == 2 {
+                call.render_slot = Some(&slot);
+                call.call_id = Some(7);
+            }
+            let mut result = service
+                .call_json_tracked(json!({"action":"list"}), call)
+                .await;
+            assert_eq!(result.result.is_error, Some(false), "{:?}", result.result);
+            assert!(entry.is_reported());
+            let payload = result_payload_capacity(&result.result);
+            assert!(payload > 0);
+            assert_eq!(
+                unleased_result_payload_capacity(&result.result, &result.payload_owner),
+                0
+            );
+            let wire = result.lease.as_ref().map_or(0, Lease::bytes);
+            assert_eq!(wire == 0, mode == 1);
+            assert_eq!(control.used(), payload + wire);
+            assert_eq!(main.used(), 0);
+            drop(result.lease.take());
+            assert_eq!(control.used(), payload);
+            drop(result);
+            assert_eq!(control.used(), 0);
+            tasks.shutdown();
+        }
+    }
+
+    #[test]
+    fn text_buffer_result_capacity_includes_resource_metadata_without_double_counting() {
+        fn copied(text: &str, expected: &mut usize) -> String {
+            let mut value = String::with_capacity(text.len() + 32);
+            value.push_str(text);
+            *expected += value.capacity();
+            value
+        }
+        fn meta(expected: &mut usize) -> Option<rmcp::model::MetaObject> {
+            let mut fields = serde_json::Map::new();
+            fields.insert(
+                copied("note", expected),
+                Value::String(copied("sample", expected)),
+            );
+            Some(rmcp::model::MetaObject(fields))
+        }
+        fn annotations(expected: &mut usize) -> Option<rmcp::model::Annotations> {
+            let mut annotations = rmcp::model::Annotations::default();
+            annotations.last_modified = Some(copied("2026-11-20", expected));
+            Some(annotations)
+        }
+        let png_url = pixel_url();
+        let png = png_url.split_once(',').unwrap().1;
+        let wav = base64::engine::general_purpose::STANDARD.encode(
+            b"RIFF\x26\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x80\x3e\0\0\x02\0\x10\0data\x02\0\0\0\0\0",
+        );
+        let mut expected = 0;
+        let mut text = rmcp::model::TextContent::new(copied("hello", &mut expected));
+        text.meta = meta(&mut expected);
+        text.annotations = annotations(&mut expected);
+        let mut image = rmcp::model::ImageContent::new(
+            copied(png, &mut expected),
+            copied("image/png", &mut expected),
+        );
+        image.meta = meta(&mut expected);
+        let mut audio = rmcp::model::AudioContent::new(
+            copied(&wav, &mut expected),
+            copied("audio/wav", &mut expected),
+        );
+        audio.annotations = annotations(&mut expected);
+        let resource = rmcp::model::ResourceContents::BlobResourceContents {
+            uri: copied("file:///sample.png", &mut expected),
+            mime_type: Some(copied("image/png", &mut expected)),
+            blob: copied(png, &mut expected),
+            meta: meta(&mut expected),
+        };
+        let mut embedded = rmcp::model::EmbeddedResource::new(resource);
+        embedded.meta = meta(&mut expected);
+        embedded.annotations = annotations(&mut expected);
+        let mut link = rmcp::model::Resource::new(
+            copied("file:///sample.txt", &mut expected),
+            copied("sample", &mut expected),
+        );
+        link.title = Some(copied("Sample", &mut expected));
+        link.description = Some(copied("A small file", &mut expected));
+        link.mime_type = Some(copied("text/plain", &mut expected));
+        link.icons = Some(vec![
+            rmcp::model::Icon::new(copied("file:///icon.png", &mut expected))
+                .with_mime_type(copied("image/png", &mut expected))
+                .with_sizes(vec![copied("16x16", &mut expected)]),
+        ]);
+        link.meta = meta(&mut expected);
+        link.annotations = annotations(&mut expected);
+        let mut result = CallToolResult::success(vec![
+            ContentBlock::Text(text),
+            ContentBlock::Image(image),
+            ContentBlock::Audio(audio),
+            ContentBlock::Resource(embedded),
+            ContentBlock::ResourceLink(link),
+        ]);
+        result.meta = meta(&mut expected);
+        result.structured_content = Some(Value::String(copied("metadata", &mut expected)));
+        assert_eq!(result_payload_capacity(&result), expected);
+        let pool = crate::lease::BytePool::new(expected);
+        let retained = expected / 2;
+        let result = files::TrackedResult::owned(
+            result,
+            crate::lease::Owner::new(pool.try_acquire(retained).unwrap()),
+        );
+        assert_eq!(
+            unleased_result_payload_capacity(&result.result, &result.payload_owner),
+            expected - retained
+        );
+        drop(result);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn rpc_id_budget_refusal_precedes_reader_commit_on_local_and_daemon_paths() {
+        for daemon in [false, true] {
+            let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
+            let service = Arc::new(Service::new(Arc::clone(&tasks), daemon));
+            let pool = crate::lease::BytePool::new(2 << 20);
+            let launch = Arc::new(
+                crate::session::LaunchContext::new(std::env::temp_dir(), Vec::new())
+                    .with_memory(Arc::clone(&pool))
+                    .with_outbound_limit(2048),
+            );
+            let session = Session::new("rpc-id".into(), "rpc-id".into(), Arc::clone(&launch));
+            let (task, _, _) = tasks
+                .start_script(
+                    tasks::ScriptArgs {
+                        code: format!("text('hello'); attach({});", json!(pixel_url())),
+                        launch,
+                        kill_after_ms: None,
+                        transfer: false,
+                        call_id: None,
+                        service: Arc::clone(&service),
+                        input_owner: Default::default(),
+                    },
+                    &session,
+                    "abcd".into(),
+                )
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+            let entry = session.entry(&task);
+            let reader = entry.reader(Some("9999")).unwrap();
+            let render_pool = Arc::new(Semaphore::new(1));
+            let slot = RenderSlot::new(&render_pool);
+            let mut call = script_call(&session, false);
+            call.rpc_id_bytes = crate::ipc::json_len(&"r".repeat(2048)).unwrap();
+            if daemon {
+                call.call_id = Some(u64::MAX);
+                call.render_slot = Some(&slot);
+            }
+            let request = json!({
+                "action":"poll", "taskId":format!("{}.9999", task.id),
+                "waitMs":0, "maxBytes":100,
+            });
+            let refused = service.call_json_tracked(request.clone(), call).await;
+            assert!(refused.overload, "{:?}", refused.result);
+            assert!(
+                refused.result.content[0]
+                    .as_text()
+                    .unwrap()
+                    .text
+                    .contains("frame limit")
+            );
+            {
+                let state = reader.read_gate().lock_owned().await;
+                assert_eq!(state.cursor, 0);
+                assert_eq!(state.attachments_seen, 0);
+                assert!(reader.is_fresh());
+            }
+            drop(refused);
+            assert_eq!(pool.used(), 0);
+            let mut call = script_call(&session, false);
+            call.rpc_id_bytes = crate::ipc::json_len(&"small").unwrap();
+            if daemon {
+                call.call_id = Some(u64::MAX);
+                call.render_slot = Some(&slot);
+            }
+            let delivered = service.call_json_tracked(request, call).await;
+            assert_eq!(
+                delivered.result.is_error,
+                Some(false),
+                "{:?}",
+                delivered.result
+            );
+            assert_eq!(image_count(&delivered.result), 1);
+            {
+                let state = reader.read_gate().lock_owned().await;
+                assert!(state.cursor > 0);
+                assert_eq!(state.attachments_seen, 1);
+            }
+            if daemon {
+                let local = wire_result_len(Some(u64::MAX), &delivered.result).unwrap();
+                assert!(delivered.lease.as_ref().unwrap().bytes() >= local);
+            }
+            drop(delivered);
+            assert_eq!(pool.used(), 0);
+            tasks.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn script_report_uses_control_only_for_kill_and_keeps_one_snapshot() {
+        let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let memory = crate::lease::BytePool::new(0);
+        let control = crate::lease::BytePool::new(4 << 20);
+        let launch = Arc::new(
+            crate::session::LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(Arc::clone(&memory))
+                .with_control_memory(Arc::clone(&control)),
+        );
+        let session = Session::new("report".into(), "report".into(), Arc::clone(&launch));
+        let (task, _, _) = tasks
+            .start_script(
+                tasks::ScriptArgs {
+                    code: "return undefined;".into(),
+                    launch,
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                "abcd".into(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = format!("{}.abcd", task.id);
+        task.script().unwrap().record_started(handle.clone());
+        let call = script_call(&session, false);
+        for action in [Action::Start, Action::Poll] {
+            let error = script_report(&tasks, &task, &call, action).err().unwrap();
+            assert!(matches!(
+                error,
+                ServiceError::Overload(_, Some(meta)) if meta.bare_task_id == task.id
+            ));
+            assert_eq!(control.used(), 0);
+        }
+        let report = script_report(&tasks, &task, &call, Action::Kill)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.value["startedTasks"][0]["taskId"], handle);
+        assert_eq!(report.value["startedTasks"][0]["state"], "exited");
+        assert!(report.running.is_empty());
+        assert_eq!(report.cancelled, 0);
+        let held = control.used();
+        assert!(held > 0);
+        let candidate = report.value.clone();
+        task.script()
+            .unwrap()
+            .record_started("task-other.abcd".into());
+        assert_eq!(report.value["startedTasks"].as_array().unwrap().len(), 1);
+        assert_eq!(candidate["startedTasks"].as_array().unwrap().len(), 1);
+        assert_eq!(control.used(), held);
+        drop(candidate);
+        drop(report);
+        assert_eq!(control.used(), 0);
+
+        let result = service
+            .call_json_tracked(
+                json!({"action": "kill", "taskId": task.id, "maxBytes": 100}),
+                script_call(&session, false),
+            )
+            .await;
+        assert_eq!(result.result.is_error, Some(false), "{:?}", result.result);
+        assert_eq!(
+            result.result.structured_content.as_ref().unwrap()["codemode"]["startedTasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(control.used() > 0);
+        drop(result);
+        assert_eq!(control.used(), 0);
+        assert_eq!(memory.used(), 0);
+        tasks.shutdown();
     }
 
     fn pixel_url() -> String {
@@ -3061,6 +4292,148 @@ mod tests {
             .iter()
             .filter(|block| block["type"] == "image")
             .count()
+    }
+
+    #[tokio::test]
+    async fn nested_text_result_keeps_its_payload_owner_after_rendering() {
+        let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let pool = crate::lease::BytePool::new(2 << 20);
+        let launch = Arc::new(
+            crate::session::LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(Arc::clone(&pool)),
+        );
+        let session = Session::new("text-owner".into(), "text-owner".into(), launch);
+        let mut result = service
+            .codemode_tracked(
+                serde_json::from_value(
+                    json!({"code": "console.log('hello 世界');", "maxBytes": 100}),
+                )
+                .unwrap(),
+                script_call(&session, true),
+                false,
+            )
+            .await;
+        assert_eq!(result.result.is_error, Some(false), "{:?}", result.result);
+        let retained = result_payload_capacity(&result.result);
+        assert!(retained > 0);
+        let wire = result.lease.as_ref().unwrap().bytes();
+        assert!(wire >= nested_wire_bytes(&result.result).unwrap());
+        assert_eq!(pool.used(), retained + wire);
+        drop(result.lease.take());
+        assert_eq!(pool.used(), retained);
+        assert_eq!(
+            unleased_result_payload_capacity(&result.result, &result.payload_owner),
+            0
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(pool.used(), retained);
+        drop(result);
+        assert_eq!(pool.used(), 0);
+        tasks.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_keeps_attachment_worker_memory_and_reader_pinned() {
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let pool = crate::lease::BytePool::new(1 << 20);
+        let launch = Arc::new(
+            crate::session::LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(Arc::clone(&pool)),
+        );
+        let session = Session::new("pack-cancel".into(), "pack-cancel".into(), launch);
+        let result = service
+            .codemode(
+                serde_json::from_value(
+                    json!({"code": format!("attach({})", json!(pixel_url())), "maxBytes": 100}),
+                )
+                .unwrap(),
+                script_call(&session, true),
+                false,
+            )
+            .await;
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let data = result.structured_content.as_ref().unwrap();
+        let (id, _) = parse_handle(data["taskId"].as_str().unwrap()).unwrap();
+        let id = id.to_owned();
+        drop(result);
+        let task = tasks.find(&id).unwrap();
+        // A caller-owned report is released on cancellation; only the worker's
+        // buffers must remain charged while the attachment read is blocked.
+        let report_charge = {
+            let before = pool.used();
+            let report = task.script().unwrap().report(&pool, None).unwrap();
+            let charge = pool.used() - before;
+            drop(report);
+            assert_eq!(pool.used(), before);
+            charge
+        };
+        let path = task.attachment_path(1, "image/png");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let entry = session.entry(&task);
+        let reader = entry.reader(Some("9999")).unwrap();
+        let request =
+            json!({"action": "poll", "taskId": format!("{id}.9999"), "waitMs": 0, "maxBytes": 100});
+        let cancel = CancellationToken::new();
+        let cancelled = cancel.clone();
+        let running_service = Arc::clone(&service);
+        let running_session = Arc::clone(&session);
+        let response = tokio::spawn(async move {
+            let mut call = script_call(&running_session, false);
+            call.cancel = cancelled;
+            running_service.call_json(request, call).await
+        });
+        // Opening the writer succeeds only once the packing worker has opened the FIFO.
+        // Keep it empty so the real worker remains blocked in its attachment read.
+        let writer = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path)
+                {
+                    Ok(file) => break file,
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let held = pool.used();
+        assert!(held > report_charge);
+        cancel.cancel();
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.is_error, Some(true));
+        assert_eq!(
+            pool.used(),
+            held - report_charge,
+            "only the caller's report may release before the blocking worker exits"
+        );
+        assert!(reader.read_gate().try_lock_owned().is_err());
+        drop(writer);
+        let state = tokio::time::timeout(Duration::from_secs(5), reader.read_gate().lock_owned())
+            .await
+            .unwrap();
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.attachments_seen, 0);
+        assert!(reader.is_fresh());
+        assert_eq!(pool.used(), 0);
+        drop(state);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, original).unwrap();
+        tasks.shutdown();
     }
 
     #[tokio::test]
@@ -3238,6 +4611,9 @@ mod tests {
             nested: false,
             started: None,
             render_slot: None,
+            http_response: false,
+            rpc_id_bytes: 0,
+            input_owner: Default::default(),
         };
         let p1 = service
             .call_json(

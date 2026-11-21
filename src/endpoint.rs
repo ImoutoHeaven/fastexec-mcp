@@ -60,6 +60,8 @@ struct Link {
     pending: std::sync::Mutex<HashMap<u64, Pending>>,
     /// Cancelled when the link ends: every call on it is lost, and the reader stops.
     closed: CancellationToken,
+    memory: Arc<crate::lease::BytePool>,
+    control_memory: Arc<crate::lease::BytePool>,
 }
 
 /// A call waiting for its result.
@@ -84,25 +86,31 @@ impl Drop for Registration<'_> {
 impl Link {
     /// A write that ends early may leave half a frame. The drop guard poisons the stream
     /// before the writer unlocks, including when the future itself is dropped.
-    async fn send(&self, frame: &ToDaemon, attempted: &mut bool) -> bool {
+    async fn send(&self, frame: &ToDaemon, attempted: &mut bool) -> std::io::Result<bool> {
+        let frame = ipc::encode_frame_leased(
+            frame,
+            &self.memory,
+            &self.control_memory,
+            ipc::daemon_control(frame),
+        )?;
         let mut writer = tokio::select! {
             biased;
-            _ = self.closed.cancelled() => return false,
+            _ = self.closed.cancelled() => return Ok(false),
             writer = self.writer.lock() => writer,
         };
-        tokio::select! {
+        Ok(tokio::select! {
             biased;
             _ = self.closed.cancelled() => false,
             sent = async {
                 let poison = self.closed.drop_guard_ref();
                 *attempted = true;
-                if ipc::write_frame(&mut *writer, frame).await.is_err() {
+                if ipc::write_raw(&mut *writer, &frame.bytes).await.is_err() {
                     return false;
                 }
                 poison.disarm();
                 true
             } => sent,
-        }
+        })
     }
 }
 
@@ -198,11 +206,11 @@ impl Endpoint {
             .to_owned();
         // A call this large is refused here: sending it would only make the daemon refuse it,
         // and the caller would have waited for a connection to hear that.
-        match serde_json::to_vec(&arguments) {
-            Ok(body) if body.len() > ipc::CALL_LIMIT => {
+        match ipc::json_len(&arguments) {
+            Ok(length) if length > ipc::CALL_LIMIT => {
                 return plain_err(format!(
                     "The call is {} bytes; calls are limited to 3 MiB.",
-                    body.len()
+                    length
                 ));
             }
             Ok(_) => {}
@@ -254,21 +262,23 @@ impl Endpoint {
                 lease,
                 overload: false,
                 task_meta: None,
+                payload_owner: Default::default(),
             }
         };
         let mut attempted = false;
         let sent = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err("Cancelled before the call was sent."),
+            _ = cancel.cancelled() => Err("Cancelled before the call was sent.".to_owned()),
             sent = tokio::time::timeout(WRITE_WAIT, link.send(&frame, &mut attempted)) => match sent {
-                Ok(true) => Ok(()),
-                Ok(false) => Err("The daemon connection closed before the call was sent."),
-                Err(_) => Err("Timed out waiting for the daemon writer before the call was sent."),
+                Ok(Ok(true)) => Ok(()),
+                Ok(Ok(false)) => Err("The daemon connection closed before the call was sent.".to_owned()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("Timed out waiting for the daemon writer before the call was sent.".to_owned()),
             },
         };
         if let Err(reason) = sent {
             if !attempted {
-                return plain_err(reason.into());
+                return plain_err(reason);
             }
             // The write guard closed the link. A result received before EOF still wins.
             return answer.await.map(to_tracked).unwrap_or_else(|_| lost());
@@ -286,7 +296,10 @@ impl Endpoint {
                     return to_tracked(pair);
                 }
                 match sent {
-                    Ok(true) => plain_err("Cancelled; the task keeps running.".into()),
+                    Ok(Ok(true)) => plain_err("Cancelled; the task keeps running.".into()),
+                    Ok(Err(error)) if !attempted && !link.closed.is_cancelled() => {
+                        plain_err(format!("The call was sent, but Cancel could not be sent ({error}). The call's result is unknown."))
+                    }
                     Err(_) if !attempted && !link.closed.is_cancelled() => {
                         plain_err("The call was sent, but Cancel timed out before it was sent. The call's result is unknown.".into())
                     }
@@ -308,7 +321,7 @@ impl Endpoint {
             let sent = link.send(&ToDaemon::Bye, &mut false).await;
             // The reader drains what the daemon still sends until it reads the Bye and closes the
             // stream, which cancels `closed`.
-            if sent {
+            if matches!(sent, Ok(true)) {
                 link.closed.cancelled().await;
             }
         })
@@ -332,19 +345,14 @@ impl Endpoint {
         let (identity, paths) = self.identity().await?;
         let (mut client, startup) =
             runtime::connect_or_start(identity, paths, deadline, &[]).await?;
-        let (cwd, env) = self.launch.to_wire();
-        let hello = ToDaemon::Hello {
-            protocol: ipc::PROTOCOL,
-            namespace: identity.namespace.clone(),
-            build: identity.build.clone(),
-            session: self.session.clone(),
-            connection: self.generation.fetch_add(1, Ordering::Relaxed),
-            client_name: client_name.to_owned(),
-            output_mode: self.render.output_mode.name().to_owned(),
-            structured_content: self.render.structured_content,
-            cwd,
-            env,
-        };
+        let hello = hello_owned(
+            &self.launch,
+            identity,
+            &self.session,
+            self.generation.fetch_add(1, Ordering::Relaxed),
+            client_name,
+            self.render,
+        )?;
         let epoch = match tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             handshake(&mut client, hello, identity),
@@ -364,6 +372,8 @@ impl Endpoint {
             writer: Mutex::new(writer),
             pending: std::sync::Mutex::new(HashMap::new()),
             closed: CancellationToken::new(),
+            memory: Arc::clone(self.launch.memory()),
+            control_memory: Arc::clone(self.launch.control_memory()),
         });
         tokio::spawn(read_loop(
             Arc::clone(&link),
@@ -467,6 +477,10 @@ async fn read_loop(
                 let entry = lock(&link.pending).remove(&id);
                 if let Some(entry) = entry {
                     let _ = entry.result.send((result, Some(lease)));
+                } else {
+                    // The unclaimed payload must die before its allocation owner.
+                    drop(result);
+                    drop(lease);
                 }
             }
             Some(ipc::LeasedEndpointFrame::OverloadProgress) => {}
@@ -502,22 +516,81 @@ async fn read_loop(
     }
 }
 
+/// Reserves the temporary environment and identity copies before building Hello.
+pub(crate) fn hello_owned(
+    launch: &LaunchContext,
+    identity: &runtime::Identity,
+    session: &str,
+    connection: u64,
+    client_name: &str,
+    render: Render,
+) -> Result<ipc::Owned<ToDaemon>, String> {
+    let copied = launch
+        .wire_capacity()
+        .saturating_add(identity.namespace.len())
+        .saturating_add(identity.build.len())
+        .saturating_add(session.len())
+        .saturating_add(client_name.len())
+        .saturating_add(render.output_mode.name().len());
+    let lease = launch
+        .memory()
+        .try_acquire(copied)
+        .or_else(|| {
+            (copied <= 64 * 1024)
+                .then(|| launch.control_memory().try_acquire(copied))
+                .flatten()
+        })
+        .ok_or_else(|| ipc::input_budget_error().to_string())?;
+    let (cwd, env) = launch.to_wire();
+    Ok(ipc::Owned::new(
+        ToDaemon::Hello {
+            protocol: ipc::PROTOCOL,
+            namespace: identity.namespace.clone(),
+            build: identity.build.clone(),
+            session: session.to_owned(),
+            connection,
+            client_name: client_name.to_owned(),
+            output_mode: render.output_mode.name().to_owned(),
+            structured_content: render.structured_content,
+            cwd,
+            env,
+        },
+        crate::lease::Owner::new(lease),
+    ))
+}
+
 /// Sends the Hello and returns the Welcome's epoch, or the reason the daemon refused it.
 pub async fn handshake(
     client: &mut transport::Client,
-    hello: ToDaemon,
+    hello: ipc::Owned<ToDaemon>,
     identity: &runtime::Identity,
 ) -> Result<String, String> {
-    ipc::write_frame(client, &hello)
-        .await
-        .map_err(|error| format!("cannot send the Hello: {error}"))?;
-    match ipc::read_frame::<_, ToEndpoint>(client, ipc::RESPONSE_LIMIT).await {
-        Ok(Some(ToEndpoint::Welcome {
-            protocol,
-            namespace,
-            build,
-            epoch,
-        })) => {
+    ipc::write_request_frame(
+        client,
+        &hello.value,
+        crate::lease::process_pool(),
+        crate::lease::control_pool(),
+    )
+    .await
+    .map_err(|error| format!("cannot send the Hello: {error}"))?;
+    match ipc::read_endpoint_frame_leased(
+        client,
+        ipc::RESPONSE_LIMIT,
+        crate::lease::process_pool(),
+        crate::lease::control_pool(),
+        |_| false,
+    )
+    .await
+    {
+        Ok(ipc::LeasedEndpointFrame::Frame(
+            ToEndpoint::Welcome {
+                protocol,
+                namespace,
+                build,
+                epoch,
+            },
+            _lease,
+        )) => {
             // A Welcome is only a Welcome from the daemon this endpoint meant to reach.
             if protocol != ipc::PROTOCOL {
                 return Err(format!(
@@ -539,7 +612,7 @@ pub async fn handshake(
             }
             Ok(epoch)
         }
-        Ok(Some(ToEndpoint::Reject { message })) => Err(message),
+        Ok(ipc::LeasedEndpointFrame::Frame(ToEndpoint::Reject { message }, _lease)) => Err(message),
         Ok(other) => Err(format!("the daemon answered the Hello with {other:?}")),
         Err(error) => Err(format!("cannot read the Welcome: {error}")),
     }
@@ -665,6 +738,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ipc_ingress_hello_reserves_copies_before_construction() {
+        let identity = identity();
+        let render = Render {
+            output_mode: crate::service::OutputMode::Text,
+            structured_content: true,
+        };
+        let launch = LaunchContext::new(
+            std::env::temp_dir(),
+            vec![("SAMPLE".into(), "hello λ".into())],
+        );
+        let copied =
+            launch.wire_capacity() + identity.namespace.len() + identity.build.len() + 1 + 4 + 4;
+        for (limit, fits) in [(copied - 1, false), (copied, true)] {
+            let pool = crate::lease::BytePool::new(limit);
+            let launch = launch
+                .for_session()
+                .with_memory(Arc::clone(&pool))
+                .with_control_memory(crate::lease::BytePool::new(0));
+            let hello = hello_owned(&launch, &identity, "s", 1, "test", render);
+            assert_eq!(hello.is_ok(), fits);
+            assert_eq!(pool.used(), if fits { copied } else { 0 });
+            drop(hello);
+            assert_eq!(pool.used(), 0);
+        }
+        let control = crate::lease::BytePool::new(copied);
+        let launch = launch
+            .with_memory(crate::lease::BytePool::new(0))
+            .with_control_memory(Arc::clone(&control));
+        let hello = hello_owned(&launch, &identity, "s", 1, "test", render).unwrap();
+        assert_eq!(control.used(), copied);
+        drop(hello);
+        assert_eq!(control.used(), 0);
+    }
+
     const TEST_EPOCH: &str = "eeeeeeee";
 
     fn welcome(identity: &runtime::Identity) -> ToEndpoint {
@@ -712,7 +820,11 @@ mod tests {
             // hanging the harness.
             let answer = timeout(
                 Duration::from_secs(30),
-                handshake(&mut client, hello(&identity), &identity),
+                handshake(
+                    &mut client,
+                    ipc::Owned::new(hello(&identity), Default::default()),
+                    &identity,
+                ),
             )
             .await
             .expect("the exchange finished");
@@ -1125,6 +1237,105 @@ mod tests {
         drop(busy);
         release.send(()).unwrap();
         let result = timeout(Duration::from_secs(5), other).await.unwrap();
+        assert_eq!(result.content[0].as_text().unwrap().text, "still connected");
+        endpoint.bye().await;
+        finish(peer).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_budget_rejection_keeps_the_connection_available() {
+        let (identity, paths, mut listener, _target) = test_daemon("cancel-budget");
+        let welcome = welcome(&identity);
+        let (announced, seen) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let _ = ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                .await
+                .unwrap();
+            ipc::write_frame(&mut conn, &welcome).await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Call { id: 1, .. })
+            ));
+            announced.send(()).unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Call { id: 2, .. })
+            ));
+            ipc::write_frame(
+                &mut conn,
+                &ToEndpoint::Result {
+                    id: 2,
+                    result: CallToolResult::success(vec![ContentBlock::text("still connected")]),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Bye)
+            ));
+        });
+        let pool = crate::lease::BytePool::new(16 * 1024);
+        let control = crate::lease::BytePool::new(4 * 1024);
+        let mut endpoint = Endpoint::for_test(identity, paths);
+        endpoint.launch = Arc::new(
+            LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(Arc::clone(&pool))
+                .with_control_memory(Arc::clone(&control)),
+        );
+        let cancel = CancellationToken::new();
+        let mut first = std::pin::pin!(endpoint.call(
+            "exec",
+            serde_json::json!({"action": "list"}),
+            "1".into(),
+            "test",
+            cancel.clone(),
+            None,
+        ));
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                result = &mut first => panic!("call ended before cancellation: {result:?}"),
+                seen = seen => seen.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        let link = endpoint.link.lock().await.clone().unwrap();
+        let full = pool.try_acquire(pool.limit() - pool.used()).unwrap();
+        let full_control = control
+            .try_acquire(control.limit() - control.used())
+            .unwrap();
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(5), &mut first).await.unwrap();
+        let message = &result.content[0].as_text().unwrap().text;
+        assert!(message.contains("Cancel could not be sent"), "{message}");
+        assert!(message.contains("active memory budget"), "{message}");
+        assert!(message.contains("result is unknown"), "{message}");
+        assert!(!link.closed.is_cancelled());
+        assert!(lock(&link.pending).is_empty());
+        drop(full);
+        drop(full_control);
+        let result = timeout(
+            Duration::from_secs(5),
+            endpoint.call(
+                "exec",
+                serde_json::json!({"action": "list"}),
+                "2".into(),
+                "test",
+                CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.content[0].as_text().unwrap().text, "still connected");
         endpoint.bye().await;
         finish(peer).await;

@@ -3080,16 +3080,16 @@ fn non_http_foreground_daemon_ignores_invalid_instructions_tool() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn endpoint_list_kill_and_overload_receipt_succeed_via_control_reserve_when_main_pool_is_full() {
+fn endpoint_control_reserve_survives_output_admission_failure() {
     let fixture = Fixture::new("endpoint-control-reserve");
     let work = fixture.runtime.join("work");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::write(work.join("note.txt"), "ordinary output\n").unwrap();
 
-    // Start daemon with 1-byte main pool (`FASTEXEC_TEST_MEMORY_LIMIT=1`).
+    // Admit request metadata, but leave too little main budget for text output.
     let started_daemon = fixture
         .command(&["daemon", "start"])
-        .env("FASTEXEC_TEST_MEMORY_LIMIT", "1")
+        .env("FASTEXEC_TEST_MEMORY_LIMIT", "131072")
         .output()
         .unwrap();
     let d_out = String::from_utf8_lossy(&started_daemon.stdout);
@@ -3097,10 +3097,10 @@ fn endpoint_list_kill_and_overload_receipt_succeed_via_control_reserve_when_main
     assert_eq!(started_daemon.status.code(), Some(0), "{d_out}{d_err}");
     fixture.pid.set(pid_of(&d_out));
 
-    // Start stdio `Endpoint` (`FASTEXEC_DAEMON=on`) ALSO with `FASTEXEC_TEST_MEMORY_LIMIT=1`.
+    // Use the same small main pool in the stdio endpoint.
     let mut ep = Endpoint::start_with(&fixture, |cmd| {
         cmd.current_dir(&work)
-            .env("FASTEXEC_TEST_MEMORY_LIMIT", "1");
+            .env("FASTEXEC_TEST_MEMORY_LIMIT", "131072");
     });
 
     // 1. `start` runs the task; its overload receipt (`taskId: <bare_id>`) passes through Daemon
@@ -3143,12 +3143,12 @@ fn endpoint_list_kill_and_overload_receipt_succeed_via_control_reserve_when_main
     assert_eq!(killed["state"], json!("killed"));
     drop(ep);
 
-    // 5. Standalone stdio (`FASTEXEC_DAEMON=off`) with `FASTEXEC_TEST_MEMORY_LIMIT=1` also
+    // 5. Standalone stdio with the same small main pool also
     // delivers `start` overload receipts plus `list` and `kill` through its 8 MiB control pool.
     let mut local_stdio = Endpoint::start_with(&fixture, |cmd| {
         cmd.current_dir(&work)
             .env("FASTEXEC_DAEMON", "off")
-            .env("FASTEXEC_TEST_MEMORY_LIMIT", "1");
+            .env("FASTEXEC_TEST_MEMORY_LIMIT", "131072");
     });
     let (_, local_start_text, local_start_err) = local_stdio.call(json!({
         "action": "start",

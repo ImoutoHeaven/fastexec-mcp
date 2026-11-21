@@ -419,7 +419,6 @@ fn is_png(buf: &[u8]) -> bool {
 }
 
 pub(crate) fn is_animated_png(buf: &[u8]) -> bool {
-    let buf = &buf[..buf.len().min(SNIFF)];
     if !buf.starts_with(&PNG_SIGNATURE) {
         return false;
     }
@@ -463,7 +462,6 @@ fn is_jpeg(buf: &[u8]) -> bool {
 }
 
 pub(crate) fn is_jpeg_ls(buf: &[u8]) -> bool {
-    let buf = &buf[..buf.len().min(SNIFF)];
     if buf.len() < 4 || buf[0..2] != [0xFF, 0xD8] {
         return false;
     }
@@ -1068,21 +1066,28 @@ pub fn file_uri(path: &Path) -> String {
 #[cfg(windows)]
 fn windows_os_bytes(text: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt;
-    if let Some(utf8) = text.to_str() {
-        return utf8.as_bytes().to_vec();
-    }
+    windows_utf16_bytes(text.encode_wide())
+}
+
+#[cfg(any(windows, test))]
+fn windows_utf16_bytes(units: impl IntoIterator<Item = u16>) -> Vec<u8> {
     let mut out = Vec::new();
-    for unit in text.encode_wide() {
-        if let Some(ch) = char::from_u32(u32::from(unit)) {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-        } else {
-            out.extend_from_slice(&[
-                0xED,
-                0xA0 | ((unit >> 12) as u8 & 0x0F),
-                0x80 | ((unit >> 6) as u8 & 0x3F),
-                0x80 | (unit as u8 & 0x3F),
-            ]);
+    for decoded in char::decode_utf16(units) {
+        match decoded {
+            Ok(ch) => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            Err(error) => {
+                // WTF-8 preserves an unpaired native Windows code unit.
+                // decode_utf16 already combined every valid surrogate pair.
+                let unit = error.unpaired_surrogate();
+                out.extend_from_slice(&[
+                    0xE0 | (unit >> 12) as u8,
+                    0x80 | ((unit >> 6) as u8 & 0x3F),
+                    0x80 | (unit as u8 & 0x3F),
+                ]);
+            }
         }
     }
     out
@@ -1226,8 +1231,64 @@ pub fn compress_image(
     lease: &mut Lease,
 ) -> Result<CompressedImage, CompressFailure> {
     let original_bytes = bytes.len() as u64;
-    let (decoded_info, normalized, converted_from) = normalize_for_compress(bytes, mime, lease)?;
-    let resized = resize_normalized(normalized, decoded_info, lease)?;
+    let base = normalize_mime(mime);
+    let passthrough_mime = match base.as_str() {
+        "image/png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    };
+    let filtered = if bytes.starts_with(&PNG_SIGNATURE) {
+        png_without_unused_metadata(&bytes, bytes.capacity(), lease)?
+    } else {
+        None
+    };
+    let working = filtered.as_ref().unwrap_or(&bytes);
+    let live_input = bytes
+        .capacity()
+        .checked_add(filtered.as_ref().map_or(0, Vec::capacity))
+        .ok_or(CompressFailure::Overload)?;
+    let info = inspect_and_check_bounds(working, live_input, lease)?;
+    let (original_width, original_height) =
+        oriented_size(info.width, info.height, info.orientation);
+    let converted_from = passthrough_mime.is_none().then_some(base);
+    let resized = if let Some(supported) = passthrough_mime
+        && original_width <= MAX_DISPLAY_DIMENSION
+        && original_height <= MAX_DISPLAY_DIMENSION
+        && bytes.len() <= COMPRESSED_BYTES_LIMIT
+    {
+        drop(filtered);
+        ResizedImage {
+            bytes,
+            mime: supported.to_owned(),
+            original_width,
+            original_height,
+            width: original_width,
+            height: original_height,
+            was_resized: false,
+        }
+    } else {
+        let bytes = match filtered {
+            Some(filtered) => {
+                drop(bytes);
+                filtered
+            }
+            None => bytes,
+        };
+        lease.shrink_to(bytes.capacity());
+        let mut image = decode_checked(&bytes, bytes.capacity(), &info, lease)?;
+        drop(bytes);
+        lease.shrink_to(image.as_bytes().len());
+        reserve_compression(
+            lease,
+            orientation_peak(image.as_bytes().len(), info.orientation),
+        )?;
+        image.apply_orientation(info.orientation);
+        resize_decoded(image, converted_from.is_some(), lease)?
+    };
+    // Decoder, filtered input, orientation, and resize buffers have gone before handoff.
+    lease.shrink_to(resized.bytes.capacity());
     let mut hints = Vec::new();
     if let Some(from) = &converted_from
         && *from != resized.mime
@@ -1263,27 +1324,25 @@ pub fn compress_image(
     })
 }
 
-struct HeaderInfo {
-    mime: String,
-    original_width: u32,
-    original_height: u32,
+const CODEC_WORKSPACE: usize = 1 << 20;
+const ENCODER_WORKSPACE: usize = 16 << 20;
+const COMPRESSED_BYTES_LIMIT: usize = (MAX_COMPRESSED_BASE64 / 4 - 1) * 3;
+
+fn checked_sum(parts: &[usize]) -> Option<usize> {
+    parts
+        .iter()
+        .try_fold(0usize, |sum, &part| sum.checked_add(part))
 }
 
-fn inspect_and_check_bounds(bytes: &[u8]) -> Result<(Orientation, u32, u32, u64), CompressFailure> {
-    let reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|_| {
-            CompressFailure::Rejected(
-                "image could not be recognized for FASTEXEC_IMAGE_COMPRESS=true.".into(),
-            )
-        })?;
-    let mut decoder = reader.into_decoder().map_err(|_| {
-        CompressFailure::Rejected(
-            "image header could not be decoded under FASTEXEC_IMAGE_COMPRESS=true.".into(),
-        )
-    })?;
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let (width, height) = decoder.dimensions();
+fn reserve_compression(lease: &mut Lease, target: Option<usize>) -> Result<(), CompressFailure> {
+    let target = target.ok_or(CompressFailure::Overload)?;
+    if target > lease.bytes() && !lease.try_resize(target) {
+        return Err(CompressFailure::Overload);
+    }
+    Ok(())
+}
+
+fn check_image_dimensions(width: u32, height: u32) -> Result<(), CompressFailure> {
     if width == 0 || height == 0 || width > MAX_DECODE_DIMENSION || height > MAX_DECODE_DIMENSION {
         return Err(CompressFailure::Rejected(format!(
             "image dimensions {width}x{height} exceed the {MAX_DECODE_DIMENSION} px single-side decode limit."
@@ -1295,6 +1354,237 @@ fn inspect_and_check_bounds(bytes: &[u8]) -> Result<(Orientation, u32, u32, u64)
             "image pixel count {pixels} ({width}x{height}) exceeds the {MAX_DECODE_PIXELS} pixel decode limit."
         )));
     }
+    Ok(())
+}
+
+fn png_chunks(bytes: &[u8], mut visit: impl FnMut(&[u8], bool)) -> Result<(), CompressFailure> {
+    let invalid =
+        || CompressFailure::Rejected("PNG chunk extends beyond the available image bytes.".into());
+    if !is_png(bytes) {
+        return Err(invalid());
+    }
+    let mut at = PNG_SIGNATURE.len();
+    while at < bytes.len() {
+        if bytes.len() - at < 12 {
+            return Err(invalid());
+        }
+        let len = read_u32_be(bytes, at) as usize;
+        let end = at
+            .checked_add(12)
+            .and_then(|at| at.checked_add(len))
+            .ok_or_else(invalid)?;
+        if end > bytes.len() {
+            return Err(invalid());
+        }
+        let kind = &bytes[at + 4..at + 8];
+        let ignored = matches!(kind, b"iCCP" | b"tEXt" | b"zTXt" | b"iTXt");
+        visit(&bytes[at..end], ignored);
+        at = end;
+        if kind == b"IEND" {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn png_without_unused_metadata(
+    bytes: &[u8],
+    raw_capacity: usize,
+    lease: &mut Lease,
+) -> Result<Option<Vec<u8>>, CompressFailure> {
+    if bytes.len() < 33 || !is_png(bytes) {
+        return Err(CompressFailure::Rejected(
+            "PNG header is truncated or invalid.".into(),
+        ));
+    }
+    check_image_dimensions(read_u32_be(bytes, 16), read_u32_be(bytes, 20))?;
+    let mut kept = PNG_SIGNATURE.len();
+    let mut omitted = false;
+    png_chunks(bytes, |chunk, ignored| {
+        if ignored {
+            omitted = true;
+        } else {
+            kept += chunk.len();
+        }
+    })?;
+    if !omitted {
+        return Ok(None);
+    }
+    reserve_compression(lease, raw_capacity.checked_add(kept))?;
+    let mut filtered = Vec::with_capacity(kept);
+    filtered.extend_from_slice(&PNG_SIGNATURE);
+    png_chunks(bytes, |chunk, ignored| {
+        if !ignored {
+            filtered.extend_from_slice(chunk);
+        }
+    })?;
+    Ok(Some(filtered))
+}
+
+#[derive(Default)]
+struct WebpWorkspace {
+    padded_pixels: usize,
+    lossless_bytes: usize,
+}
+
+impl WebpWorkspace {
+    fn dimensions(&mut self, width: u32, height: u32) -> Result<(), CompressFailure> {
+        check_image_dimensions(width, height)?;
+        let pixels = (width as usize).div_ceil(16) * 16 * (height as usize).div_ceil(16) * 16;
+        self.padded_pixels = self.padded_pixels.max(pixels);
+        Ok(())
+    }
+}
+
+fn inspect_webp_chunks(
+    mut bytes: &[u8],
+    in_frame: bool,
+    workspace: &mut WebpWorkspace,
+) -> Result<(), CompressFailure> {
+    let invalid =
+        || CompressFailure::Rejected("WebP chunk extends beyond the available image bytes.".into());
+    let mut saw_frame = false;
+    while !bytes.is_empty() {
+        if bytes.len() < 8 {
+            return Err(invalid());
+        }
+        let len = read_u32_le(bytes, 4) as usize;
+        let end = 8usize.checked_add(len).ok_or_else(invalid)?;
+        let padded_end = end.checked_add(len & 1).ok_or_else(invalid)?;
+        if padded_end > bytes.len() {
+            return Err(invalid());
+        }
+        let payload = &bytes[8..end];
+        match &bytes[..4] {
+            b"VP8 " => {
+                if payload.len() < 10 {
+                    return Err(invalid());
+                }
+                workspace.dimensions(
+                    u32::from(read_u16_le(payload, 6) & 0x3fff),
+                    u32::from(read_u16_le(payload, 8) & 0x3fff),
+                )?;
+            }
+            b"VP8L" => {
+                if payload.len() < 5 {
+                    return Err(invalid());
+                }
+                let header = read_u32_le(payload, 1);
+                workspace.dimensions((header & 0x3fff) + 1, ((header >> 14) & 0x3fff) + 1)?;
+                workspace.lossless_bytes = workspace.lossless_bytes.saturating_add(payload.len());
+            }
+            b"ALPH" => {
+                if in_frame && bytes.get(padded_end..padded_end.saturating_add(4)) != Some(b"VP8 ")
+                {
+                    return Err(invalid());
+                }
+                if payload.first().is_some_and(|flags| flags & 3 == 1) {
+                    workspace.lossless_bytes =
+                        workspace.lossless_bytes.saturating_add(payload.len());
+                }
+            }
+            b"ANMF" if !in_frame && !saw_frame => {
+                if payload.len() < 16 {
+                    return Err(invalid());
+                }
+                let axis = |offset: usize| {
+                    1 + u32::from_le_bytes([
+                        payload[offset],
+                        payload[offset + 1],
+                        payload[offset + 2],
+                        0,
+                    ])
+                };
+                workspace.dimensions(axis(6), axis(9))?;
+                inspect_webp_chunks(&payload[16..], true, workspace)?;
+                saw_frame = true;
+            }
+            _ => {}
+        }
+        bytes = &bytes[padded_end..];
+    }
+    Ok(())
+}
+
+struct HeaderInfo {
+    format: ImageFormat,
+    orientation: Orientation,
+    width: u32,
+    height: u32,
+    total_bytes: usize,
+    decoder_len: usize,
+    webp: WebpWorkspace,
+}
+
+fn header_peak(format: ImageFormat, live_input: usize, raw_len: usize) -> Option<usize> {
+    let workspace = match format {
+        // Raw chunk capacity can approach 2R; Info and orientation each clone eXIf.
+        ImageFormat::Png => raw_len.checked_mul(4)?,
+        // image copies JPEG input; zune retains APP data and orientation clones EXIF.
+        ImageFormat::Jpeg => raw_len.checked_mul(5)?,
+        ImageFormat::Gif => raw_len.checked_mul(2)?,
+        ImageFormat::WebP => raw_len,
+        _ => 0,
+    };
+    checked_sum(&[live_input, workspace, CODEC_WORKSPACE])
+}
+
+fn image_limits(total_bytes: usize) -> Result<image::Limits, CompressFailure> {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits.reserve(total_bytes as u64).map_err(|_| {
+        CompressFailure::Rejected("image exceeds image::Limits allocation bounds.".into())
+    })?;
+    Ok(limits)
+}
+
+fn inspect_and_check_bounds(
+    bytes: &[u8],
+    live_input: usize,
+    lease: &mut Lease,
+) -> Result<HeaderInfo, CompressFailure> {
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| {
+            CompressFailure::Rejected(
+                "image could not be recognized for FASTEXEC_IMAGE_COMPRESS=true.".into(),
+            )
+        })?;
+    let format = reader.format().ok_or_else(|| {
+        CompressFailure::Rejected(
+            "image could not be recognized for FASTEXEC_IMAGE_COMPRESS=true.".into(),
+        )
+    })?;
+    let mut webp = WebpWorkspace::default();
+    let mut decoder_len = bytes.len();
+    if format == ImageFormat::WebP {
+        // The decoder allocates EXIF by declared size, so check RIFF ranges first.
+        if bytes.len() < 12 {
+            return Err(CompressFailure::Rejected(
+                "WebP header is truncated.".into(),
+            ));
+        }
+        let end = (read_u32_le(bytes, 4) as usize)
+            .checked_add(8)
+            .filter(|&end| end >= 12 && end <= bytes.len())
+            .ok_or_else(|| {
+                CompressFailure::Rejected("WebP RIFF length exceeds available bytes.".into())
+            })?;
+        inspect_webp_chunks(&bytes[12..end], false, &mut webp)?;
+        decoder_len = end;
+        reader = ImageReader::with_format(Cursor::new(&bytes[..end]), format);
+    }
+    reserve_compression(lease, header_peak(format, live_input, bytes.len()))?;
+    // PNG only reads max_alloc at construction.
+    reader.limits(image_limits(0)?);
+    let mut decoder = reader.into_decoder().map_err(|_| {
+        CompressFailure::Rejected(
+            "image header could not be decoded under FASTEXEC_IMAGE_COMPRESS=true.".into(),
+        )
+    })?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let (width, height) = decoder.dimensions();
+    check_image_dimensions(width, height)?;
     let total_bytes = decoder.total_bytes();
     if total_bytes > MAX_DECODE_ALLOC {
         return Err(CompressFailure::Rejected(format!(
@@ -1302,95 +1592,133 @@ fn inspect_and_check_bounds(bytes: &[u8]) -> Result<(Orientation, u32, u32, u64)
             MAX_DECODE_ALLOC >> 20
         )));
     }
-    Ok((orientation, width, height, total_bytes))
+    if format == ImageFormat::WebP {
+        webp.dimensions(width, height)?;
+    }
+    Ok(HeaderInfo {
+        format,
+        orientation,
+        width,
+        height,
+        total_bytes: total_bytes as usize,
+        decoder_len,
+        webp,
+    })
+}
+
+fn decode_peak(info: &HeaderInfo, raw_capacity: usize, raw_len: usize) -> Option<usize> {
+    match info.format {
+        ImageFormat::Jpeg => {
+            let padded_width = (info.width as usize).checked_add(31)? / 32 * 32;
+            let padded_height = (info.height as usize).checked_add(31)? / 32 * 32;
+            // zune progressive coefficients and padded component rows do not honor max_alloc.
+            let coefficients = padded_width.checked_mul(padded_height)?.checked_mul(8)?;
+            let rows = padded_width.checked_mul(3072)?;
+            checked_sum(&[
+                header_peak(info.format, raw_capacity, raw_len)?,
+                info.total_bytes,
+                coefficients,
+                rows,
+            ])
+        }
+        ImageFormat::Png => {
+            // png limits logical bytes; its Vec capacity can double. The unfiltering window
+            // is separate and holds several padded rows, plus scratch and inflate tables.
+            let rows = (info.width as usize)
+                .checked_mul(8)?
+                .checked_add(1)?
+                .checked_mul(16)?;
+            checked_sum(&[
+                raw_capacity,
+                raw_len.checked_mul(3)?,
+                info.total_bytes,
+                (MAX_DECODE_ALLOC as usize)
+                    .checked_sub(info.total_bytes)?
+                    .checked_mul(2)?,
+                rows,
+                CODEC_WORKSPACE,
+            ])
+        }
+        ImageFormat::Gif => checked_sum(&[
+            raw_capacity,
+            raw_len.checked_mul(2)?,
+            MAX_DECODE_ALLOC as usize,
+            CODEC_WORKSPACE,
+        ]),
+        ImageFormat::WebP => {
+            // image-webp 0.2.4 leaves lossless Huffman allocations unlimited. Each group
+            // consumes >=20 encoded bits and has five trees with <=3136 symbols total.
+            // 256 KiB/group includes nodes, tables, metadata, and allocation growth.
+            // The conservative bound may reject ordinary lossless/alpha images. It is
+            // used only when decoding, never for byte passthrough.
+            let groups = info
+                .webp
+                .lossless_bytes
+                .checked_mul(8)?
+                .checked_div(20)?
+                .min(65536);
+            checked_sum(&[
+                raw_capacity,
+                raw_len.checked_mul(4)?,
+                info.webp.padded_pixels.checked_mul(16)?,
+                groups.checked_mul(256 << 10)?,
+                // The VP8 reader reserves a 24-bit partition before its read can fail.
+                16 << 20,
+                CODEC_WORKSPACE,
+            ])
+        }
+        _ => checked_sum(&[raw_capacity, info.total_bytes, CODEC_WORKSPACE]),
+    }
 }
 
 fn decode_checked(
     bytes: &[u8],
+    raw_capacity: usize,
+    info: &HeaderInfo,
     lease: &mut Lease,
-) -> Result<(DynamicImage, u32, u32), CompressFailure> {
-    let (orientation, width, height, total_bytes) = inspect_and_check_bounds(bytes)?;
-    let (original_width, original_height) = oriented_size(width, height, orientation);
-    let decode_peak = bytes
-        .len()
-        .saturating_add(usize::try_from(total_bytes).unwrap_or(usize::MAX))
-        .saturating_add(16 << 20);
-    let previous = lease.bytes();
-    if decode_peak > previous && !lease.try_resize(decode_peak) {
-        return Err(CompressFailure::Overload);
-    }
-    let reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|_| {
-            CompressFailure::Rejected(
-                "image could not be decoded under FASTEXEC_IMAGE_COMPRESS=true.".into(),
-            )
-        })?;
-    let mut decoder = reader.into_decoder().map_err(|_| {
+) -> Result<DynamicImage, CompressFailure> {
+    reserve_compression(lease, decode_peak(info, raw_capacity, bytes.len()))?;
+    let mut limits = image_limits(info.total_bytes)?;
+    limits.max_image_width = Some(MAX_DECODE_DIMENSION);
+    limits.max_image_height = Some(MAX_DECODE_DIMENSION);
+    // Rebuild after inspecting the header so PNG's internal allowance excludes output D.
+    let mut reader = ImageReader::with_format(Cursor::new(&bytes[..info.decoder_len]), info.format);
+    reader.limits(limits);
+    let decoder = reader.into_decoder().map_err(|_| {
         CompressFailure::Rejected(
             "image could not be decoded under FASTEXEC_IMAGE_COMPRESS=true.".into(),
         )
     })?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DECODE_DIMENSION);
-    limits.max_image_height = Some(MAX_DECODE_DIMENSION);
-    limits.max_alloc = Some(MAX_DECODE_ALLOC);
-    limits.reserve(total_bytes).map_err(|_| {
-        CompressFailure::Rejected("image exceeds image::Limits allocation bounds.".into())
-    })?;
-    decoder.set_limits(limits).map_err(|_| {
-        CompressFailure::Rejected("image decoder rejected allocation bounds.".into())
-    })?;
-    let mut img = DynamicImage::from_decoder(decoder).map_err(|_| {
+    DynamicImage::from_decoder(decoder).map_err(|_| {
         CompressFailure::Rejected(
             "image pixels could not be decoded under FASTEXEC_IMAGE_COMPRESS=true.".into(),
         )
-    })?;
-    img.apply_orientation(orientation);
-    Ok((img, original_width, original_height))
+    })
 }
 
-fn normalize_for_compress(
-    bytes: Vec<u8>,
-    mime: &str,
-    lease: &mut Lease,
-) -> Result<(HeaderInfo, Vec<u8>, Option<String>), CompressFailure> {
-    let base = normalize_mime(mime);
-    let passthrough_mime = match base.as_str() {
-        "image/png" => Some("image/png"),
-        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
-        "image/gif" => Some("image/gif"),
-        "image/webp" => Some("image/webp"),
-        _ => None,
-    };
-    if let Some(supported) = passthrough_mime {
-        let (orientation, width, height, _) = inspect_and_check_bounds(&bytes)?;
-        let (original_width, original_height) = oriented_size(width, height, orientation);
-        return Ok((
-            HeaderInfo {
-                mime: supported.to_owned(),
-                original_width,
-                original_height,
-            },
-            bytes,
-            None,
-        ));
+fn orientation_peak(decoded: usize, orientation: Orientation) -> Option<usize> {
+    match orientation {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => decoded.checked_mul(2),
+        _ => Some(decoded),
     }
-    let (image, original_width, original_height) = decode_checked(&bytes, lease)?;
-    drop(bytes);
-    let mut png = Vec::new();
-    image
-        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
-        .map_err(|_| CompressFailure::Rejected("image could not be converted to PNG.".into()))?;
-    Ok((
-        HeaderInfo {
-            mime: "image/png".to_owned(),
-            original_width,
-            original_height,
-        },
-        png,
-        Some(base),
-    ))
+}
+
+fn resize_peak(image: &DynamicImage, width: u32, height: u32) -> Option<usize> {
+    let decoded = image.as_bytes().len();
+    if (image.width(), image.height()) == (width, height) {
+        return Some(decoded);
+    }
+    let floating = (image.width() as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(16)?;
+    let candidate = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(image.color().bytes_per_pixel() as usize)?;
+    let weights = (image.width().max(image.height()) as usize).checked_mul(8)?;
+    checked_sum(&[decoded, floating, candidate, weights, CODEC_WORKSPACE])
 }
 
 struct ResizedImage {
@@ -1403,28 +1731,12 @@ struct ResizedImage {
     was_resized: bool,
 }
 
-fn resize_normalized(
-    bytes: Vec<u8>,
-    info: HeaderInfo,
+fn resize_decoded(
+    image: DynamicImage,
+    converted: bool,
     lease: &mut Lease,
 ) -> Result<ResizedImage, CompressFailure> {
-    let input_base64 = bytes.len().div_ceil(3) * 4;
-    if info.original_width <= MAX_DISPLAY_DIMENSION
-        && info.original_height <= MAX_DISPLAY_DIMENSION
-        && input_base64 < MAX_COMPRESSED_BASE64
-    {
-        return Ok(ResizedImage {
-            bytes,
-            mime: info.mime,
-            original_width: info.original_width,
-            original_height: info.original_height,
-            width: info.original_width,
-            height: info.original_height,
-            was_resized: false,
-        });
-    }
-    let (image, original_width, original_height) = decode_checked(&bytes, lease)?;
-    drop(bytes);
+    let (original_width, original_height) = (image.width(), image.height());
     let mut width = original_width;
     let mut height = original_height;
     if width > MAX_DISPLAY_DIMENSION {
@@ -1436,19 +1748,29 @@ fn resize_normalized(
         height = MAX_DISPLAY_DIMENSION;
     }
     loop {
-        let candidate = image.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
-        for (encoded, out_mime) in candidate_encodings(&candidate) {
-            if encoded.len().div_ceil(3) * 4 < MAX_COMPRESSED_BASE64 {
-                return Ok(ResizedImage {
-                    bytes: encoded,
-                    mime: out_mime,
-                    original_width,
-                    original_height,
-                    width,
-                    height,
-                    was_resized: true,
-                });
-            }
+        lease.shrink_to(image.as_bytes().len());
+        reserve_compression(lease, resize_peak(&image, width, height))?;
+        let resized = ((width, height) != (original_width, original_height))
+            .then(|| image.resize_exact(width, height, image::imageops::FilterType::Lanczos3));
+        let candidate = resized.as_ref().unwrap_or(&image);
+        let live = image
+            .as_bytes()
+            .len()
+            .checked_add(resized.as_ref().map_or(0, |image| image.as_bytes().len()))
+            .ok_or(CompressFailure::Overload)?;
+        lease.shrink_to(live);
+        if let Some((encoded, out_mime)) = first_fitting_encoding(candidate, live, lease)? {
+            return Ok(ResizedImage {
+                bytes: encoded,
+                mime: out_mime.to_owned(),
+                original_width,
+                original_height,
+                width,
+                height,
+                was_resized: !converted
+                    || (width, height) != (original_width, original_height)
+                    || out_mime != "image/png",
+            });
         }
         if width == 1 && height == 1 {
             break;
@@ -1479,26 +1801,64 @@ fn scale_axis(side: u32, limit: u32, other: u32) -> u32 {
     scaled.max(1.0).min(f64::from(u32::MAX)) as u32
 }
 
-fn candidate_encodings(image: &DynamicImage) -> Vec<(Vec<u8>, String)> {
-    let mut candidates = Vec::with_capacity(QUALITIES.len() + 1);
-    let mut png = Vec::new();
-    if image
-        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
-        .is_ok()
-    {
-        candidates.push((png, "image/png".to_owned()));
+fn png_encoding_peak(live: usize, candidate: usize) -> Option<usize> {
+    // Internal compressed Vecs (including fallback), PNG16 endian copy, and row buffers.
+    // Two bounded outputs cover shrinking the returned Vec to exact capacity.
+    checked_sum(&[
+        live,
+        candidate.checked_mul(8)?,
+        COMPRESSED_BYTES_LIMIT.checked_mul(2)?,
+        ENCODER_WORKSPACE,
+    ])
+}
+
+fn jpeg_encoding_peak(live: usize, width: u32, height: u32) -> Option<usize> {
+    checked_sum(&[
+        live,
+        (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(3)?,
+        COMPRESSED_BYTES_LIMIT.checked_mul(2)?,
+        CODEC_WORKSPACE,
+    ])
+}
+
+fn encode_bounded(
+    encode: impl FnOnce(&mut Cursor<&mut [u8]>) -> image::ImageResult<()>,
+) -> Option<Vec<u8>> {
+    let mut bytes = vec![0; COMPRESSED_BYTES_LIMIT];
+    let mut writer = Cursor::new(bytes.as_mut_slice());
+    encode(&mut writer).ok()?;
+    let len = writer.position() as usize;
+    bytes.truncate(len);
+    Some(bytes.into_boxed_slice().into_vec())
+}
+
+fn first_fitting_encoding(
+    image: &DynamicImage,
+    live: usize,
+    lease: &mut Lease,
+) -> Result<Option<(Vec<u8>, &'static str)>, CompressFailure> {
+    reserve_compression(lease, png_encoding_peak(live, image.as_bytes().len()))?;
+    if let Some(bytes) = encode_bounded(|writer| image.write_to(writer, ImageFormat::Png)) {
+        return Ok(Some((bytes, "image/png")));
     }
-    let rgb = image.to_rgb8();
+    // Failed candidate and PNG encoder internals are gone before making an RGB copy.
+    lease.shrink_to(live);
+    reserve_compression(
+        lease,
+        jpeg_encoding_peak(live, image.width(), image.height()),
+    )?;
+    let converted = image.as_rgb8().is_none().then(|| image.to_rgb8());
+    let rgb = converted.as_ref().or_else(|| image.as_rgb8()).unwrap();
     for quality in QUALITIES {
-        let mut jpeg = Vec::new();
-        if JpegEncoder::new_with_quality(&mut Cursor::new(&mut jpeg), quality)
-            .encode_image(&rgb)
-            .is_ok()
-        {
-            candidates.push((jpeg, "image/jpeg".to_owned()));
+        if let Some(bytes) = encode_bounded(|writer| {
+            JpegEncoder::new_with_quality(writer, quality).encode_image(rgb)
+        }) {
+            return Ok(Some((bytes, "image/jpeg")));
         }
     }
-    candidates
+    Ok(None)
 }
 
 fn oriented_size(width: u32, height: u32, orientation: Orientation) -> (u32, u32) {
@@ -1912,6 +2272,36 @@ mod tests {
     }
 
     #[test]
+    fn windows_uri_preserves_unicode_pairs_and_native_unpaired_units() {
+        assert_eq!(
+            windows_utf16_bytes("A😀é".encode_utf16()),
+            "A😀é".as_bytes()
+        );
+        let units = [0x0061, 0xD83D, 0xDE00, 0xD800, 0x0062, 0xDC00];
+        let bytes = windows_utf16_bytes(units);
+        assert_eq!(
+            bytes,
+            [
+                b'a', 0xF0, 0x9F, 0x98, 0x80, 0xED, 0xA0, 0x80, b'b', 0xED, 0xB0, 0x80,
+            ]
+        );
+        assert_eq!(
+            format_windows_uri([
+                WinUriPart::Disk(b'C'),
+                WinUriPart::RootDir,
+                WinUriPart::Normal(&bytes),
+            ]),
+            "file:///C:/a%F0%9F%98%80%ED%A0%80b%ED%B0%80"
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let native = std::ffi::OsString::from_wide(&units);
+            assert_eq!(windows_os_bytes(&native), bytes);
+        }
+    }
+
+    #[test]
     fn rfc8089_file_uri_encodes_unix_bytes_and_windows_drive_and_unc_forms() {
         fn parse_win_parts(raw: &str) -> Vec<WinUriPart<'_>> {
             let mut parts = Vec::new();
@@ -2073,8 +2463,238 @@ mod tests {
     }
 
     #[test]
+    fn compression_exemptions_scan_past_the_classification_prefix() {
+        let mut png = PNG_SIGNATURE.to_vec();
+        png.extend_from_slice(&9000u32.to_be_bytes());
+        png.extend_from_slice(b"tEXt");
+        png.resize(png.len() + 9000 + 4, 0);
+        png.extend_from_slice(&8u32.to_be_bytes());
+        png.extend_from_slice(b"acTL");
+        png.extend_from_slice(&[0; 12]);
+        assert!(!is_compressible_image("image/png", &png));
+
+        let mut jpeg_ls = vec![0xff, 0xd8, 0xff, 0xe1];
+        jpeg_ls.extend_from_slice(&9002u16.to_be_bytes());
+        jpeg_ls.resize(jpeg_ls.len() + 9000, 0);
+        jpeg_ls.extend_from_slice(&[0xff, 0xf7, 0, 2]);
+        assert!(!is_compressible_image("image/jpeg", &jpeg_ls));
+    }
+
+    #[test]
+    fn compression_png_truncated_ihdr_is_rejected_at_every_prefix() {
+        let raw = encoded_img(8, 6, ImageFormat::Png);
+        for len in 0..33 {
+            let bytes = raw[..len].to_vec();
+            let pool = BytePool::new(8 << 20);
+            let mut lease = pool.try_acquire(bytes.capacity()).unwrap();
+            assert!(
+                matches!(
+                    compress_image(bytes, "image/png", &mut lease),
+                    Err(CompressFailure::Rejected(_))
+                ),
+                "truncated IHDR length {len} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn compression_png_header_covers_retained_chunk_and_two_exif_copies() {
+        // The retained chunk can approach 2R; Info and orientation each retain another R.
+        let raw_len = (2 << 20) + 1;
+        let required = raw_len + 4 * raw_len + CODEC_WORKSPACE;
+        let peak = header_peak(ImageFormat::Png, raw_len, raw_len).unwrap();
+        assert_eq!(peak, required);
+        for limit in [required - 1, required, required + 1] {
+            let pool = BytePool::new(limit);
+            let mut lease = pool.try_acquire(raw_len).unwrap();
+            assert_eq!(
+                reserve_compression(&mut lease, Some(peak)).is_ok(),
+                limit >= required
+            );
+        }
+    }
+
+    #[test]
+    fn compression_webp_ignores_exif_after_the_declared_riff_end() {
+        let simple = base64::engine::general_purpose::STANDARD.decode(
+            "UklGRqQAAABXRUJQVlA4IJgAAADQDQCdASq4CwMAPm02mUmkIyKhICgAgA2JaW7hdrEe3AfgAAAT2Ae+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvSAAD+/2yx///1aHy0Plofuff//zBK/IN2EzwoAAAAAAAAAA=="
+        ).unwrap();
+        let mut raw = b"RIFF".to_vec();
+        raw.extend_from_slice(&((simple.len() + 18 - 8) as u32).to_le_bytes());
+        raw.extend_from_slice(b"WEBPVP8X");
+        raw.extend_from_slice(&10u32.to_le_bytes());
+        raw.extend_from_slice(&[0, 0, 0, 0, 0xb7, 0x0b, 0, 2, 0, 0]);
+        raw.extend_from_slice(&simple[12..]);
+        // A complete, ordinary EXIF orientation record appended after the image container.
+        let exif = b"MM\x00*\x00\x00\x00\x08\x00\x01\x01\x12\x00\x03\x00\x00\x00\x01\x00\x06\x00\x00\x00\x00\x00\x00";
+        raw.extend_from_slice(b"EXIF");
+        raw.extend_from_slice(&(exif.len() as u32).to_le_bytes());
+        raw.extend_from_slice(exif);
+        let pool = BytePool::new(8 << 20);
+        let mut lease = pool.try_acquire(raw.capacity()).unwrap();
+        let info = inspect_and_check_bounds(&raw, raw.capacity(), &mut lease).unwrap();
+        assert_eq!(info.orientation, Orientation::NoTransforms);
+    }
+
+    #[test]
+    fn compression_stage_bounds_cover_rotation_resize_and_png16() {
+        let mut image = DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+            8,
+            6,
+            Rgba([1200, 4000, 65000, 32768]),
+        ));
+        let decoded = image.as_bytes().len();
+        let rotation = orientation_peak(decoded, Orientation::Rotate90).unwrap();
+        assert_eq!(rotation, 2 * decoded);
+        let resize = resize_peak(&image, 4, 3).unwrap();
+        assert!(resize >= decoded + 16 * 8 * 3 + 8 * 4 * 3);
+        assert_eq!(resize_peak(&image, 8, 6), Some(decoded));
+        for peak in [rotation, resize] {
+            for limit in [peak - 1, peak, peak + 1] {
+                let pool = BytePool::new(limit);
+                let mut lease = pool.try_acquire(decoded).unwrap();
+                assert_eq!(
+                    reserve_compression(&mut lease, Some(peak)).is_ok(),
+                    limit >= peak
+                );
+                drop(lease);
+                assert_eq!(pool.used(), 0);
+            }
+        }
+        image.apply_orientation(Orientation::Rotate90);
+        assert_eq!((image.width(), image.height()), (6, 8));
+        let peak = png_encoding_peak(decoded, decoded).unwrap();
+        for limit in [peak - 1, peak, peak + 1] {
+            let pool = BytePool::new(limit);
+            let mut lease = pool.try_acquire(decoded).unwrap();
+            let encoded = first_fitting_encoding(&image, decoded, &mut lease);
+            if limit < peak {
+                assert!(matches!(encoded, Err(CompressFailure::Overload)));
+            } else {
+                let (bytes, mime) = encoded.unwrap().unwrap();
+                assert_eq!(mime, "image/png");
+                assert_eq!(bytes.capacity(), bytes.len());
+                let roundtrip = image::load_from_memory(&bytes).unwrap();
+                assert_eq!(roundtrip.as_rgba16().unwrap(), image.as_rgba16().unwrap());
+            }
+            drop(lease);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn compression_filters_unused_png_metadata_but_keeps_passthrough_and_orientation() {
+        // An ordinary 8x6 PNG with text/ICC metadata and EXIF orientation 6.
+        let raw = base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAGCAIAAABxZ0isAAAAJGlDQ1BJQ0MgUHJvZmlsZQAAeJzLTM/LL0pNUSgoyk/LzEkFAC/1Bfq/lh2jAAAAG3RFWHRwbGFpbgBrZXB0IG9ubHkgaW4gb3JpZ2luYWzYpyg3AAAAJnpUWHRjb21wcmVzc2VkAAB4nMsvKMnMz0vMUShJrSjJH+WQxQEAUneEVDBeJOEAAAAiaVRYdHV0ZjgAAQAAAHicyy8oyczPS8xRyE0tSUxJLEkEAD4MBsgfjJsjAAAAGmVYSWZNTQAqAAAACAABARIAAwAAAAEABgAAAAAAANZnS2kAAAAUSURBVHicY+SJusSADTBhFaWTBAC3tAFE08AREQAAAABJRU5ErkJggg=="
+        ).unwrap();
+        let pool = BytePool::new(8 << 20);
+        let mut lease = pool.try_acquire(raw.capacity()).unwrap();
+        let filtered = png_without_unused_metadata(&raw, raw.capacity(), &mut lease)
+            .unwrap()
+            .unwrap();
+        png_chunks(&filtered, |_, ignored| assert!(!ignored)).unwrap();
+        assert!(filtered.windows(4).any(|window| window == b"eXIf"));
+        let info =
+            inspect_and_check_bounds(&filtered, raw.capacity() + filtered.capacity(), &mut lease)
+                .unwrap();
+        assert_eq!(
+            oriented_size(info.width, info.height, info.orientation),
+            (6, 8)
+        );
+        assert_eq!(
+            image::load_from_memory(&filtered)
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(0, 0),
+            &Rgb([12, 90, 210])
+        );
+        drop(filtered);
+        let mut exif = Vec::new();
+        png_chunks(&raw, |chunk, _| {
+            if &chunk[4..8] == b"eXIf" {
+                exif.extend_from_slice(chunk);
+            }
+        })
+        .unwrap();
+        let wide = encoded_img(3000, 3, ImageFormat::Png);
+        let mut rotated = wide[..33].to_vec();
+        rotated.extend_from_slice(&exif);
+        rotated.extend_from_slice(&wide[33..]);
+        let rotation_pool = BytePool::new(1 << 30);
+        let mut rotation_lease = rotation_pool.try_acquire(rotated.capacity()).unwrap();
+        let out = compress_image(rotated, "image/png", &mut rotation_lease).unwrap();
+        assert_eq!((out.original_width, out.original_height), (3, 3000));
+        assert_eq!((out.width, out.height), (2, 2000));
+        assert_eq!(
+            image::load_from_memory(&out.bytes).unwrap().dimensions(),
+            (2, 2000)
+        );
+        drop(out);
+        drop(rotation_lease);
+        assert_eq!(rotation_pool.used(), 0);
+        let out = compress_image(raw.clone(), "image/png", &mut lease).unwrap();
+        assert_eq!(out.bytes, raw);
+        assert!(!out.transformed);
+        assert_eq!((out.width, out.height), (6, 8));
+        drop(out);
+        drop(lease);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn compression_webp_real_images_and_decode_admission_boundaries() {
+        // Generated from the same solid-color 3000x3 image as the lossless fixture.
+        let lossy = base64::engine::general_purpose::STANDARD.decode(
+            "UklGRqQAAABXRUJQVlA4IJgAAADQDQCdASq4CwMAPm02mUmkIyKhICgAgA2JaW7hdrEe3AfgAAAT2Ae+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvSAAD+/2yx///1aHy0Plofuff//zBK/IN2EzwoAAAAAAAAAA=="
+        ).unwrap();
+        let lossless = encoded_img(3000, 3, ImageFormat::WebP);
+        for raw in [lossy, lossless] {
+            let pool = BytePool::new(1 << 30);
+            let mut lease = pool.try_acquire(raw.capacity()).unwrap();
+            let info = inspect_and_check_bounds(&raw, raw.capacity(), &mut lease).unwrap();
+            let peak = decode_peak(&info, raw.capacity(), raw.len()).unwrap();
+            drop(lease);
+            for limit in [peak - 1, peak, peak + 1] {
+                let pool = BytePool::new(limit);
+                let mut lease = pool.try_acquire(raw.capacity()).unwrap();
+                let decoded = decode_checked(&raw, raw.capacity(), &info, &mut lease);
+                if limit < peak {
+                    assert!(matches!(decoded, Err(CompressFailure::Overload)));
+                } else {
+                    let decoded = decoded.unwrap();
+                    assert_eq!((decoded.width(), decoded.height()), (3000, 3));
+                }
+                drop(lease);
+                assert_eq!(pool.used(), 0);
+            }
+            let mut lease = pool.try_acquire(raw.capacity()).unwrap();
+            let compressed = compress_image(raw, "image/webp", &mut lease).unwrap();
+            assert_eq!((compressed.width, compressed.height), (2000, 2));
+            assert!(compressed.transformed);
+            assert_eq!(lease.bytes(), compressed.bytes.capacity());
+            drop(compressed);
+            drop(lease);
+            assert_eq!(pool.used(), 0);
+        }
+    }
+
+    #[test]
+    fn compression_rejects_unleased_resize_workspace() {
+        let raw = encoded_img(3000, 1000, ImageFormat::Png);
+        let pool = BytePool::new(32 << 20);
+        let mut lease = pool.try_acquire(raw.capacity()).unwrap();
+        assert!(matches!(
+            compress_image(raw, "image/png", &mut lease),
+            Err(CompressFailure::Overload)
+        ));
+        drop(lease);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
     fn compress_enforces_pre_decode_bounds_and_scales_large_images() {
-        let pool = BytePool::new(256 << 20);
+        let pool = BytePool::new(1 << 30);
         let mut lease = pool.try_acquire(1024).unwrap();
 
         // Crafted PNG IHDR with single side > MAX_DECODE_DIMENSION (40000 x 1) fails before decoding.
