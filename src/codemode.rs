@@ -1235,14 +1235,23 @@ fn run_vm(
                     }
                     // The callback borrows VM strings. Path and MIME diagnostics
                     // can create Rust copies independently of the media bytes.
-                    let copied = declared_mime.len()
-                        .saturating_add(expected_kind.len())
-                        .saturating_add(if mode == 1 { payload.len() } else { 0 });
-                    let _argument_workspace = launch_ctx.memory()
-                        .try_acquire(copied.saturating_mul(16).saturating_add(4096))
-                        .ok_or_else(|| Exception::throw_range(
-                            &ctx, "Server active memory budget is full."
-                        ))?;
+                    let copied = declared_mime.len().saturating_add(expected_kind.len());
+                    let _argument_workspace = if mode == 1 {
+                        files::with_path_workspace(
+                            payload.as_str(),
+                            &launch_ctx,
+                            copied.saturating_mul(16),
+                            |_| (),
+                        )
+                        .map_err(|error| Exception::throw_range(&ctx, &error))?
+                        .owner
+                    } else {
+                        crate::lease::Owner::new(launch_ctx.memory()
+                            .try_acquire(copied.saturating_mul(16).saturating_add(4096))
+                            .ok_or_else(|| Exception::throw_range(
+                                &ctx, "Server active memory budget is full."
+                            ))?)
+                    };
                     let max_bytes = launch_ctx
                         .max_media_bytes()
                         .map_err(|err| Exception::throw_type(&ctx, &err))?;
@@ -3380,6 +3389,43 @@ mod tests {
             );
             assert!(output.contains("Script error:"));
             assert!(output.len() <= TASK_LOG_LIMIT as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_path_admits_cwd_and_home_before_resolving() {
+        for path in ["missing.png", "~/missing.png"] {
+            for extra in [-1isize, 0, 1] {
+                let mut fixture = Fixture::new();
+                let home = fixture.dir.join("session-home");
+                let launch = LaunchContext::new(
+                    fixture.dir.clone(),
+                    vec![
+                        ("HOME".into(), home.clone().into_os_string()),
+                        ("USERPROFILE".into(), home.into_os_string()),
+                    ],
+                );
+                let needed = launch.path_source_bytes(path) * 32 + 4096;
+                let pool = crate::lease::BytePool::new(needed.checked_add_signed(extra).unwrap());
+                fixture.session = Session::new(
+                    "attach-path-budget".into(),
+                    "attach-path-budget".into(),
+                    Arc::new(launch.with_memory(Arc::clone(&pool))),
+                );
+                let (state, output) = fixture.result(&format!("attach({path:?});")).await;
+                assert_eq!(state.exit_code, Some(1), "{output}");
+                if extra < 0 {
+                    assert!(
+                        output.contains("budget") && output.contains("preparing the file path"),
+                        "{output}"
+                    );
+                    assert!(!output.contains("Cannot read"), "{output}");
+                } else {
+                    assert!(output.contains("Cannot read"), "{output}");
+                    assert!(!output.contains("memory budget"), "{output}");
+                }
+                assert_eq!(pool.used(), 0);
+            }
         }
     }
 

@@ -839,6 +839,12 @@ response frame and every cloned slice. Dropping the body does not release a
 retained frame's charge. A failed admission ends the body with an I/O error;
 the existing range, idle-entry and file-handle behavior remains unchanged.
 
+The file-path branch of `attach` uses the same path workspace as file tools.
+Admission includes the borrowed path, cwd and applicable home-directory sources
+before resolution, display conversion or file I/O. Its owner stays in the actual
+VM callback through media reading and error construction; the media byte lease
+remains separate.
+
 Nested callbacks borrow QuickJS-owned UTF-8 strings. Before parsing tool arguments,
 the Rust bridge reserves four times their UTF-8 length, including the tool name,
 for decoded values, escape scratch, typed requests, diagnostics and worker copies.
