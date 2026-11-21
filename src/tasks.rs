@@ -1712,10 +1712,9 @@ impl Tasks {
         session: &'a Session,
         exclude: &str,
         cap: usize,
-    ) -> (
-        Option<(String, Vec<Shown>)>,
-        crate::session::OutsideClaim<'a>,
-    ) {
+        reserve: &mut impl FnMut(usize) -> Result<(), String>,
+        members: &mut impl FnMut(&Tree) -> Result<Option<Vec<Member>>, String>,
+    ) -> Result<BackgroundNotice<'a>, String> {
         let mut claim = session.claim_outside();
         // Registry and session locks are taken together, in that order, so a task that starts
         // meanwhile cannot be pruned as retired; both are released before any snapshot.
@@ -1738,8 +1737,8 @@ impl Tasks {
         let others = others
             .iter()
             .filter(|task| {
-                let snapshot = task.snapshot();
-                snapshot.state == "running" || snapshot.kept
+                let (state, kept) = task.report_state();
+                state == "running" || kept
             })
             .count();
         // Rank 0: failed or expired; 1: other finished, or held processes ended; 2: running or
@@ -1751,39 +1750,45 @@ impl Tasks {
             Keeps,
             Running,
         }
-        let mut entries: Vec<(u8, Notice, Arc<Task>, Snapshot)> = touched
-            .into_iter()
-            .filter(|(task, _)| task.id != exclude)
-            .filter_map(|(task, entry)| {
-                let mut snapshot = task.snapshot();
-                let (rank, notice) = match snapshot.state {
-                    "running" => (2, Notice::Running),
-                    _ if !entry.is_reported() => {
-                        let failed = snapshot.state == "exited" && snapshot.exit_code != Some(0)
-                            || snapshot.expired;
-                        (if failed { 0 } else { 1 }, Notice::Root)
+        let mut entries = Vec::new();
+        for (task, entry) in touched.into_iter().filter(|(task, _)| task.id != exclude) {
+            let mut snapshot = task.notice_snapshot();
+            let (rank, notice) = match snapshot.state {
+                "running" => (2, Notice::Running),
+                _ if !entry.is_reported() => {
+                    let failed = snapshot.state == "exited" && snapshot.exit_code != Some(0)
+                        || snapshot.expired;
+                    (if failed { 0 } else { 1 }, Notice::Root)
+                }
+                _ if snapshot.tree_ended && !entry.tree_end_reported() => (1, Notice::TreeEnded),
+                _ if snapshot.kept => {
+                    snapshot.held = match &task.root {
+                        Root::Process(tree) => members(tree)?.unwrap_or_default(),
+                        Root::Script(_) => Vec::new(),
+                    };
+                    // The current PID vector fits the admitted member workspace; the
+                    // previous reported vector may be longer and is only borrowed.
+                    if snapshot.kill_error.is_none()
+                        && entry.keeps_reported_eq(&pids(&snapshot.held))
+                    {
+                        continue;
                     }
-                    _ if snapshot.tree_ended && !entry.tree_end_reported() => {
-                        (1, Notice::TreeEnded)
-                    }
-                    _ if snapshot.kept => {
-                        snapshot.held = task.root.members().unwrap_or_default();
-                        if snapshot.kill_error.is_none()
-                            && entry.keeps_reported().as_ref() == Some(&pids(&snapshot.held))
-                        {
-                            return None;
-                        }
-                        (2, Notice::Keeps)
-                    }
-                    _ => return None,
-                };
-                Some((rank, notice, task, snapshot))
-            })
-            .collect();
+                    (2, Notice::Keeps)
+                }
+                _ => continue,
+            };
+            entries.push((rank, notice, task, snapshot));
+        }
         if entries.is_empty() && others == 0 {
-            return (None, claim);
+            return Ok((None, claim));
         }
         entries.sort_by_key(|(rank, ..)| *rank);
+        // Counts/labels are fixed-size metadata. Only three handles enter formatting;
+        // process names were admitted while querying the relevant held trees.
+        reserve(256)?;
+        for (_, _, task, _) in entries.iter().take(3) {
+            reserve(task.id.capacity().saturating_add(128))?;
+        }
         let count = |rank: u8| entries.iter().filter(|entry| entry.0 == rank).count();
         let failed = count(0);
         let running = entries
@@ -1804,10 +1809,10 @@ impl Tasks {
             }
         }
         let counts = counts.join(", ");
-        let shown_tasks = |shown: usize| -> Vec<Shown> {
-            entries[..shown]
-                .iter()
-                .map(|(_, _, task, snapshot)| (Arc::clone(task), snapshot.clone()))
+        let shown_tasks = |entries: &mut Vec<(u8, Notice, Arc<Task>, Snapshot)>, shown: usize| {
+            entries
+                .drain(..shown)
+                .map(|(_, _, task, snapshot)| (task, snapshot))
                 .collect()
         };
         let format_named = |shown: usize| -> Vec<String> {
@@ -1861,7 +1866,7 @@ impl Tasks {
                     )
                 };
                 if line.len() <= cap {
-                    return (Some((line, shown_tasks(shown))), claim);
+                    return Ok((Some((line, shown_tasks(&mut entries, shown))), claim));
                 }
             }
             let line = if entries.is_empty() {
@@ -1870,13 +1875,13 @@ impl Tasks {
                 format!("(Background: {counts}; {outside_text}; use list with scope \"all\".)")
             };
             if line.len() <= cap {
-                return (Some((line, Vec::new())), claim);
+                return Ok((Some((line, Vec::new())), claim));
             }
             // The budget could not fit the outside-task count: leave the slot for a later call.
             claim.release();
         }
         if entries.is_empty() {
-            return (None, claim);
+            return Ok((None, claim));
         }
         for shown in (1..=entries.len().min(3)).rev() {
             let named = format_named(shown);
@@ -1890,17 +1895,17 @@ impl Tasks {
                 )
             };
             if line.len() <= cap {
-                return (Some((line, shown_tasks(shown))), claim);
+                return Ok((Some((line, shown_tasks(&mut entries, shown))), claim));
             }
         }
         let line = format!("(Background: {counts}; use list.)");
         if line.len() <= cap {
-            return (Some((line, Vec::new())), claim);
+            return Ok((Some((line, Vec::new())), claim));
         }
         let total = entries.len();
         let plural = if total == 1 { "" } else { "s" };
         let line = format!("({total} task{plural}; use list.)");
-        ((line.len() <= cap).then(|| (line, Vec::new())), claim)
+        Ok(((line.len() <= cap).then(|| (line, Vec::new())), claim))
     }
 }
 
@@ -2159,6 +2164,10 @@ fn drain_until(task: &Task, eof: &mpsc::Receiver<()>, kept: bool, deadline: Inst
 
 /// A task and the snapshot a result showed of it.
 pub type Shown = (Arc<Task>, Snapshot);
+pub type BackgroundNotice<'a> = (
+    Option<(String, Vec<Shown>)>,
+    crate::session::OutsideClaim<'a>,
+);
 
 /// The sorted PIDs of `held`.
 pub(crate) fn pids(held: &[Member]) -> Vec<u32> {
@@ -2631,15 +2640,53 @@ impl Task {
         (state, held_past_exit && !*self.tree_done.borrow())
     }
 
+    /// Footer classification needs scalar state and a kill-error flag, not diagnostic text.
+    fn notice_snapshot(&self) -> Snapshot {
+        let (state, exit_code, expired, elapsed, held_past_exit) = {
+            let end = lock(&self.end);
+            (
+                match end.as_ref() {
+                    None => "running",
+                    Some(end) if end.killed => "killed",
+                    Some(_) => "exited",
+                },
+                end.as_ref().and_then(|end| end.exit_code),
+                end.as_ref().is_some_and(|end| end.expired),
+                end.as_ref()
+                    .map_or_else(|| self.started.elapsed(), |end| end.elapsed),
+                end.as_ref().is_some_and(|end| end.kept),
+            )
+        };
+        let tree_done = *self.tree_done.borrow();
+        Snapshot {
+            state,
+            exit_code,
+            elapsed,
+            expired,
+            kept: held_past_exit && !tree_done,
+            tree_ended: held_past_exit && tree_done,
+            // Shown uses the ordinary commit interface, which only checks presence.
+            kill_error: (!tree_done && lock(&self.kill_error).is_some()).then(String::new),
+            held: Vec::new(),
+            forced_end: false,
+            lines: 0,
+            dropped: 0,
+            evicted: false,
+            output_open: false,
+            log_error: None,
+            capture_error: None,
+            input_warning: None,
+            input_error: None,
+            leftovers: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn snapshot(&self) -> Snapshot {
         let end = lock(&self.end).clone();
         let tree_done = *self.tree_done.borrow();
-        self.snapshot_at(end, tree_done)
-    }
-
-    fn snapshot_at(&self, end: Option<Final>, tree_done: bool) -> Snapshot {
         self.snapshot_at_reserved(end, tree_done, &mut |_| Ok(()))
-            .expect("unrestricted snapshot")
+            .expect("unrestricted test snapshot")
     }
 
     fn snapshot_at_reserved(
@@ -4477,6 +4524,81 @@ mod script_tests {
                 .unwrap();
         });
         assert_eq!(task.snapshot().exit_code, Some(0));
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn background_metadata_admits_only_notice_fields_and_leaves_claims_due_on_refusal() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let (task, entry, _) = tasks
+            .start_script(script_args(&tasks), &session, "meta".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        let mut note = String::with_capacity(256);
+        note.push_str("ordinary diagnostic");
+        lock(&task.out).log_error = Some(note.clone());
+        lock(&task.out).capture_error = Some(note.clone());
+        *lock(&task.input_warning) = Some(note.clone());
+        *lock(&task.input_error) = Some(note.clone());
+        *lock(&task.kill_error) = Some(note);
+        lock(&task.end).as_mut().unwrap().leftovers.push(Member {
+            pid: 7,
+            name: "worker".into(),
+        });
+        let snapshot = task.notice_snapshot();
+        assert_eq!((snapshot.state, snapshot.exit_code), ("exited", Some(0)));
+        assert!(snapshot.leftovers.is_empty());
+        assert!(snapshot.log_error.is_none() && snapshot.capture_error.is_none());
+        assert!(snapshot.input_warning.is_none() && snapshot.input_error.is_none());
+        let charges = [256, task.id.capacity() + 128];
+        let required = 32 * charges.iter().sum::<usize>();
+        for limit in [required - 1, required, required + 1] {
+            let memory = BytePool::new(limit);
+            let mut lease = crate::lease::Lease::empty(&memory);
+            let mut requested = Vec::new();
+            let notice = tasks.background(
+                &session,
+                "another-task",
+                512,
+                &mut |bytes| {
+                    requested.push(bytes);
+                    lease
+                        .try_grow(32 * bytes)
+                        .then_some(())
+                        .ok_or_else(|| "metadata full".into())
+                },
+                &mut |_| panic!("a script has no native members"),
+            );
+            assert_eq!(requested, charges);
+            assert!(!entry.is_reported());
+            if limit < required {
+                assert!(notice.is_err());
+                drop(notice);
+                drop(lease);
+            } else {
+                let (value, claim) = notice.unwrap();
+                let (line, shown) = value.as_ref().unwrap();
+                assert_eq!(line, &format!("(Background: {} exited 0.)", task.id));
+                assert_eq!(shown.len(), 1);
+                assert!(shown[0].1.leftovers.is_empty());
+                let owned = crate::ipc::Owned::new((value, claim), crate::lease::Owner::new(lease));
+                assert_eq!(memory.used(), required);
+                drop(owned);
+            }
+            assert_eq!(memory.used(), 0);
+            assert!(!entry.is_reported());
+            let claim = session.claim_outside();
+            assert!(
+                claim.is_claimed(),
+                "an uncommitted notice leaves the outside count due"
+            );
+            drop(claim);
+        }
         tasks.shutdown();
     }
 

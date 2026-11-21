@@ -1101,6 +1101,13 @@ fn metadata_members(
     Ok(members)
 }
 
+// Footer text and shown snapshots stay owned until their report marks are committed.
+struct Background<'a> {
+    value: Option<(String, Vec<tasks::Shown>)>,
+    claim: crate::session::OutsideClaim<'a>,
+    _workspace: Lease,
+}
+
 // Snapshot text drops before the workspace, including on cancellation across an await.
 struct RenderSnapshot {
     value: Snapshot,
@@ -1761,18 +1768,34 @@ impl Service {
 
     fn background<'a>(
         &self,
-        session: &'a Session,
-        id: &str,
+        call: &Call<'a>,
+        task: &Task,
         nested: bool,
-    ) -> (
-        Option<(String, Vec<tasks::Shown>)>,
-        crate::session::OutsideClaim<'a>,
-    ) {
-        if nested {
+        action: Action,
+    ) -> Result<Background<'a>, ServiceError> {
+        let workspace = std::cell::RefCell::new(Lease::empty(call.launch().memory()));
+        let (value, claim) = if nested {
             (None, crate::session::OutsideClaim::none())
         } else {
-            self.tasks.background(session, id, FOOTER_LIMIT)
-        }
+            self.tasks
+                .background(
+                    call.session,
+                    &task.id,
+                    FOOTER_LIMIT,
+                    &mut |bytes| {
+                        let mut held = workspace.borrow_mut();
+                        let target = held.bytes().saturating_add(metadata_workspace_bytes(bytes));
+                        resize_metadata_workspace(&mut held, target, call, action)
+                    },
+                    &mut |tree| metadata_members(tree, &mut workspace.borrow_mut(), call, action),
+                )
+                .map_err(|_| RenderSnapshot::overload(call, task))?
+        };
+        Ok(Background {
+            value,
+            claim,
+            _workspace: workspace.into_inner(),
+        })
     }
 
     fn list(
@@ -2079,8 +2102,7 @@ fn report(
     entry: &TaskEntry,
     reader: &Reader,
     shown: &Snapshot,
-    background: Option<(String, Vec<tasks::Shown>)>,
-    claim: crate::session::OutsideClaim<'_>,
+    mut background: Background<'_>,
     nested: bool,
     owned_by_script: bool,
 ) {
@@ -2092,13 +2114,18 @@ fn report(
         return;
     }
     entry.mark_reported(shown);
-    for (task, shown) in background.map(|(_, shown)| shown).unwrap_or_default() {
+    for (task, shown) in background
+        .value
+        .take()
+        .map(|(_, shown)| shown)
+        .unwrap_or_default()
+    {
         if let Some(entry) = session.existing(&task) {
             entry.mark_reported(&shown);
             entry.mark_keeps_reported(&shown);
         }
     }
-    claim.consume();
+    background.claim.consume();
 }
 
 fn kill_pending_note(task: &Task, snapshot: &Snapshot) -> Option<&'static str> {
@@ -2340,8 +2367,9 @@ impl Service {
         let mut active_max_bytes = view.max_bytes;
 
         if call.nested {
-            let (background, claim) = self.background(session, &task.id, view.nested);
+            let background = self.background(call, &task, view.nested, action)?;
             let footer = background
+                .value
                 .as_ref()
                 .map_or(String::new(), |(line, _)| format!("\n{line}"));
             let mut bundle = AttachmentBundle::default();
@@ -2387,7 +2415,6 @@ impl Service {
                 &task_reader,
                 snapshot,
                 background,
-                claim,
                 view.nested,
                 view.owned_by_script,
             );
@@ -2637,8 +2664,9 @@ impl Service {
             }
         }
 
-        let (background, claim) = self.background(session, &task.id, view.nested);
+        let background = self.background(call, &task, view.nested, action)?;
         let footer = background
+            .value
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
         let mut suppressed = build_candidate(
@@ -2778,7 +2806,6 @@ impl Service {
             &task_reader,
             snapshot,
             background,
-            claim,
             view.nested,
             view.owned_by_script,
         );
@@ -2941,8 +2968,9 @@ impl Service {
         let window = window?;
         add_encoding_warning(&mut structured, &window);
         let warnings = warning_text(&structured["warnings"]);
-        let (background, claim) = self.background(session, &task.id, view.nested);
+        let background = self.background(call, &task, view.nested, Action::Transcript)?;
         let footer = background
+            .value
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
         let text = self.layout(
@@ -2970,7 +2998,6 @@ impl Service {
             &task_reader,
             snapshot,
             background,
-            claim,
             view.nested,
             view.owned_by_script,
         );
@@ -3096,8 +3123,9 @@ impl Service {
         }
         add_encoding_warning(&mut structured, &window);
         let warnings = warning_text(&structured["warnings"]);
-        let (background, claim) = self.background(session, &task.id, view.nested);
+        let background = self.background(call, &task, view.nested, action)?;
         let footer = background
+            .value
             .as_ref()
             .map_or(String::new(), |(line, _)| format!("\n{line}"));
         let (row, col) = (screen.cursor.0 + 1, screen.cursor.1 + 1);
@@ -3150,7 +3178,6 @@ impl Service {
             &task_reader,
             snapshot,
             background,
-            claim,
             view.nested,
             view.owned_by_script,
         );
@@ -3733,6 +3760,110 @@ mod tests {
             .unwrap();
         assert!(!entry.is_reported());
         (service, tasks, session, entry)
+    }
+
+    #[tokio::test]
+    async fn background_metadata_keeps_owner_and_claim_until_commit_and_only_kill_uses_control() {
+        let (service, tasks, session, noticed_entry) = list_fixture().await;
+        let noticed = tasks.all().pop().unwrap();
+        let (task, entry, reader) = tasks
+            .start_script(
+                tasks::ScriptArgs {
+                    code: "return undefined;".into(),
+                    launch: Arc::clone(&session.launch),
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                "meta".into(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+        let call = script_call(&session, false);
+        let probe = service
+            .background(&call, &task, false, Action::Poll)
+            .unwrap();
+        assert!(probe.value.as_ref().unwrap().0.contains(&noticed.id));
+        let required = probe._workspace.bytes();
+        drop(probe);
+        for limit in [required - 1, required, required + 1] {
+            let memory = crate::lease::BytePool::new(limit);
+            let control = crate::lease::BytePool::new(required);
+            let launch = Arc::new(
+                session
+                    .launch
+                    .for_session()
+                    .with_memory(Arc::clone(&memory))
+                    .with_control_memory(Arc::clone(&control)),
+            );
+            let mut call = script_call(&session, false);
+            call.launch = Some(&launch);
+            let notice = service.background(&call, &task, false, Action::Poll);
+            assert_eq!(notice.is_ok(), limit >= required);
+            assert_eq!(control.used(), 0);
+            if limit >= required {
+                assert_eq!(memory.used(), required);
+            } else {
+                assert!(
+                    matches!(&notice, Err(ServiceError::Overload(_, Some(meta))) if meta.bare_task_id == task.id)
+                );
+            }
+            drop(notice);
+            assert_eq!(memory.used(), 0);
+            assert!(!noticed_entry.is_reported());
+            let claim = session.claim_outside();
+            assert!(claim.is_claimed());
+            drop(claim);
+        }
+        let memory = crate::lease::BytePool::new(0);
+        let control = crate::lease::BytePool::new(required);
+        let launch = Arc::new(
+            session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&memory))
+                .with_control_memory(Arc::clone(&control)),
+        );
+        let mut call = script_call(&session, false);
+        call.launch = Some(&launch);
+        for action in [Action::Start, Action::Poll, Action::Transcript] {
+            let error = service
+                .background(&call, &task, false, action)
+                .err()
+                .unwrap();
+            assert!(error.contains("Do not retry start or resend input"));
+            assert_eq!((memory.used(), control.used()), (0, 0));
+        }
+        let notice = service
+            .background(&call, &task, false, Action::Kill)
+            .unwrap();
+        assert_eq!(control.used(), required);
+        assert!(!noticed_entry.is_reported());
+        drop(notice);
+        assert_eq!(control.used(), 0);
+        assert!(!noticed_entry.is_reported());
+        let notice = service
+            .background(&call, &task, false, Action::Kill)
+            .unwrap();
+        report(
+            &session,
+            &entry,
+            &reader,
+            &task.snapshot(),
+            notice,
+            false,
+            false,
+        );
+        assert!(noticed_entry.is_reported());
+        assert!(!session.claim_outside().is_claimed());
+        assert_eq!((memory.used(), control.used()), (0, 0));
+        tasks.shutdown();
     }
 
     #[tokio::test]
@@ -4874,7 +5005,19 @@ mod tests {
             )
             .await;
         assert!(!entry.is_reported());
-        assert!(tasks.background(&session, "another-task", 512).0.is_some());
+        assert!(
+            tasks
+                .background(
+                    &session,
+                    "another-task",
+                    512,
+                    &mut |_| Ok(()),
+                    &mut |_| panic!("script has no native members")
+                )
+                .unwrap()
+                .0
+                .is_some()
+        );
         service
             .codemode(
                 serde_json::from_value(json!({"code":"return 8"})).unwrap(),

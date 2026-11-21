@@ -645,6 +645,14 @@ the snapshot before its metadata lease; a queued body worker keeps its separate
 workspace until that worker finishes. Refusal leaves reader and attachment marks
 unchanged and retains the task handle and recovery instructions in the error.
 
+Background footers classify and order tasks from scalar state without copying their
+unused diagnostics or leftover lists. Held-process queries admit their names before
+allocation; the notice also reserves its handle and formatting workspace. Comparisons
+borrow the previous reported PID list under its lock. Only snapshots actually named
+in the footer move into the pending report, with their workspace held through the
+report commit. Refusal or a dropped candidate leaves those notices and the outside-task
+claim due; the same kill-only control fallback and task recovery errors apply.
+
 A list candidate checks the final frame limit and reserves its payload and
 application-owned wire before marking entries reported. HTTP reserves its payload
 until handler return; the SDK creates its own encoding afterward. Cancellation or refusal leaves those marks

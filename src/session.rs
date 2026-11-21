@@ -532,8 +532,9 @@ impl TaskEntry {
         self.tree_end_reported.load(Ordering::SeqCst)
     }
 
-    pub fn keeps_reported(&self) -> Option<Vec<u32>> {
-        lock(&self.keeps_reported).clone()
+    /// Compare borrowed prior PIDs without copying a possibly longer previous list.
+    pub fn keeps_reported_eq(&self, current: &[u32]) -> bool {
+        lock(&self.keeps_reported).as_deref() == Some(current)
     }
 
     pub fn mark_reported(&self, shown: &Snapshot) {
@@ -614,6 +615,24 @@ pub struct ReadState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_metadata_pid_comparison_borrows_prior_list_and_preserves_none() {
+        let entry = TaskEntry::default();
+        assert!(!entry.keeps_reported_eq(&[]));
+        *lock(&entry.keeps_reported) = Some(vec![3, 7, 9]);
+        let previous = lock(&entry.keeps_reported).as_ref().unwrap().as_ptr();
+        assert!(entry.keeps_reported_eq(&[3, 7, 9]));
+        assert!(!entry.keeps_reported_eq(&[3]));
+        assert!(!entry.keeps_reported_eq(&[]));
+        assert!(!entry.keeps_reported_eq(&[9, 7, 3]));
+        assert_eq!(
+            lock(&entry.keeps_reported).as_ref().unwrap().as_ptr(),
+            previous
+        );
+        *lock(&entry.keeps_reported) = Some(Vec::new());
+        assert!(entry.keeps_reported_eq(&[]));
+    }
 
     #[test]
     fn handles_are_bare_ids_or_exact_reader_suffixes() {
