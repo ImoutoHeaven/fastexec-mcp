@@ -864,6 +864,7 @@ impl Server {
                     return Ok(stream_complete_result(&sub_id));
                 }
 
+                let mut terminated_sent = false;
                 loop {
                     tokio::select! {
                         biased;
@@ -873,7 +874,7 @@ impl Server {
                         }
                         frame = stream.next() => {
                             match frame {
-                                Some(ipc::EventWireFrame::Active(active)) => {
+                                Some((ipc::EventWireFrame::Active(active), _lease)) => {
                                     let payload = serde_json::to_value(active)
                                         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
                                     if context.peer.send_notification(build_event_notification(
@@ -885,7 +886,7 @@ impl Server {
                                         return Ok(stream_complete_result(&sub_id));
                                     }
                                 }
-                                Some(ipc::EventWireFrame::Event(ev)) => {
+                                Some((ipc::EventWireFrame::Event(ev), _lease)) => {
                                     let payload = serde_json::to_value(ev)
                                         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
                                     if context.peer.send_notification(build_event_notification(
@@ -897,7 +898,7 @@ impl Server {
                                         return Ok(stream_complete_result(&sub_id));
                                     }
                                 }
-                                Some(ipc::EventWireFrame::Heartbeat { cursor }) => {
+                                Some((ipc::EventWireFrame::Heartbeat { cursor }, _lease)) => {
                                     if context.peer.send_notification(build_event_notification(
                                         "notifications/events/heartbeat",
                                         serde_json::json!({ "cursor": cursor }),
@@ -907,7 +908,7 @@ impl Server {
                                         return Ok(stream_complete_result(&sub_id));
                                     }
                                 }
-                                Some(ipc::EventWireFrame::Error(err)) => {
+                                Some((ipc::EventWireFrame::Error(err), _lease)) => {
                                     let mut obj = serde_json::json!({
                                         "code": err.code,
                                         "message": err.message,
@@ -924,7 +925,8 @@ impl Server {
                                         return Ok(stream_complete_result(&sub_id));
                                     }
                                 }
-                                Some(ipc::EventWireFrame::Terminated(err)) => {
+                                Some((ipc::EventWireFrame::Terminated(err), _lease)) => {
+                                    terminated_sent = true;
                                     let mut obj = serde_json::json!({
                                         "code": err.code,
                                         "message": err.message,
@@ -938,24 +940,26 @@ impl Server {
                                         &sub_id,
                                     )).await;
                                 }
-                                Some(ipc::EventWireFrame::Complete) => {
+                                Some((ipc::EventWireFrame::Complete, _lease)) => {
                                     return Ok(stream_complete_result(&sub_id));
                                 }
                                 None => {
-                                    let _ = context.peer.send_notification(build_event_notification(
-                                        "notifications/events/terminated",
-                                        serde_json::json!({
-                                            "error": {
-                                                "code": -32000,
-                                                "message": "daemon connection closed"
-                                            }
-                                        }),
-                                        &sub_id,
-                                    )).await;
+                                    if !terminated_sent {
+                                        let _ = context.peer.send_notification(build_event_notification(
+                                            "notifications/events/terminated",
+                                            serde_json::json!({
+                                                "error": {
+                                                    "code": -32000,
+                                                    "message": "daemon connection closed"
+                                                }
+                                            }),
+                                            &sub_id,
+                                        )).await;
+                                    }
                                     return Ok(stream_complete_result(&sub_id));
                                 }
-                                Some(ipc::EventWireFrame::ListResult(_))
-                                | Some(ipc::EventWireFrame::PollResult(_)) => {}
+                                Some((ipc::EventWireFrame::ListResult(_), _))
+                                | Some((ipc::EventWireFrame::PollResult(_), _)) => {}
                             }
                         }
                     }
@@ -2899,13 +2903,65 @@ async fn send_emit_event(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedLine {
+    Eof,
+    Line(Vec<u8>),
+    TooLong,
+}
+
+/// Reads one line up to `max_bytes` (including `\r\n`). If a line exceeds `max_bytes`, drains and
+/// discards bytes until the next `\n` or EOF so an unbounded single line cannot OOM the process.
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<BoundedLine> {
+    use tokio::io::AsyncBufReadExt as _;
+    buf.clear();
+    let mut overflowed = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if overflowed {
+                BoundedLine::TooLong
+            } else if buf.is_empty() {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line(std::mem::take(buf))
+            });
+        }
+        let newline_pos = available.iter().position(|&b| b == b'\n');
+        let consume = match newline_pos {
+            Some(pos) => pos + 1,
+            None => available.len(),
+        };
+        if !overflowed {
+            if buf.len().saturating_add(consume) > max_bytes {
+                overflowed = true;
+                buf.clear();
+            } else {
+                buf.extend_from_slice(&available[..consume]);
+            }
+        }
+        reader.consume(consume);
+        if newline_pos.is_some() {
+            return Ok(if overflowed {
+                BoundedLine::TooLong
+            } else {
+                BoundedLine::Line(std::mem::take(buf))
+            });
+        }
+    }
+}
+
 async fn cli_emit(
     identity: &runtime::Identity,
     paths: &runtime::Paths,
     deadline: std::time::Instant,
     flags: DaemonFlags,
 ) -> i32 {
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     if !flags.stream {
         let mut buf = Vec::new();
@@ -2959,16 +3015,46 @@ async fn cli_emit(
     };
     let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    let mut line = String::new();
+    let max_line_bytes = events::MAX_EXTERNAL_EVENT_BYTES + 2;
+    let mut line_buf = Vec::new();
     loop {
-        line.clear();
-        let read = match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(n) => n,
+        let line_bytes = match read_bounded_line(&mut reader, &mut line_buf, max_line_bytes).await {
+            Ok(BoundedLine::Eof) => break,
+            Ok(BoundedLine::TooLong) => {
+                let out = format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "ok": false,
+                        "error": format!(
+                            "event payload exceeds {} byte limit",
+                            events::MAX_EXTERNAL_EVENT_BYTES
+                        )
+                    })
+                );
+                if stdout.write_all(out.as_bytes()).await.is_err() || stdout.flush().await.is_err()
+                {
+                    return 1;
+                }
+                continue;
+            }
+            Ok(BoundedLine::Line(bytes)) => bytes,
             Err(error) => return fail(&format!("cannot read stdin: {error}")),
         };
-        let _ = read;
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let line_str = match std::str::from_utf8(&line_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                let out = format!(
+                    "{}\n",
+                    serde_json::json!({ "ok": false, "error": "line is not valid UTF-8" })
+                );
+                if stdout.write_all(out.as_bytes()).await.is_err() || stdout.flush().await.is_err()
+                {
+                    return 1;
+                }
+                continue;
+            }
+        };
+        let trimmed = line_str.trim_end_matches(['\r', '\n']);
         if trimmed.trim().is_empty() {
             continue;
         }
@@ -5187,5 +5273,38 @@ mod stdio_transport_tests {
             Some("external.event")
         );
         assert!(decode_mcp_header_value("=?base64?!!!invalid!!!?=").is_none());
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_skips_oversized_line_and_recovers_next() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"ok1\r\n");
+        input.extend_from_slice(&[b'x'; 128]);
+        input.push(b'\n');
+        input.extend_from_slice(b"ok2\n");
+        input.extend_from_slice(&[b'y'; 64]);
+        let mut reader = tokio::io::BufReader::with_capacity(16, &input[..]);
+        let mut buf = Vec::new();
+
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buf, 16).await.unwrap(),
+            BoundedLine::Line(b"ok1\r\n".to_vec())
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buf, 16).await.unwrap(),
+            BoundedLine::TooLong
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buf, 16).await.unwrap(),
+            BoundedLine::Line(b"ok2\n".to_vec())
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buf, 16).await.unwrap(),
+            BoundedLine::TooLong
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buf, 16).await.unwrap(),
+            BoundedLine::Eof
+        );
     }
 }

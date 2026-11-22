@@ -3249,6 +3249,14 @@ fn daemon_emit_single_and_stream_ndjson() {
                   not-json\n",
             )
             .unwrap();
+        let oversized = format!(
+            "{{\"eventId\":\"big\",\"name\":\"x\",\"data\":\"{}\"}}\n",
+            "a".repeat(70_000)
+        );
+        stdin.write_all(oversized.as_bytes()).unwrap();
+        stdin
+            .write_all(b"{\"eventId\":\"e4\",\"name\":\"after_big\",\"data\":{\"n\":4}}\n")
+            .unwrap();
     }
     let stream_out = stream.wait_with_output().unwrap();
     assert!(
@@ -3261,7 +3269,7 @@ fn daemon_emit_single_and_stream_ndjson() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 5);
     assert_eq!(lines[0]["ok"], true);
     assert_eq!(lines[0]["deduplicated"], true);
     assert_eq!(lines[1]["ok"], true);
@@ -3270,4 +3278,8 @@ fn daemon_emit_single_and_stream_ndjson() {
     assert!(lines[1]["cursor"].is_string());
     assert_eq!(lines[2]["ok"], false);
     assert!(lines[2]["error"].is_string());
+    assert_eq!(lines[3]["ok"], false);
+    assert_eq!(lines[3]["error"], "event payload exceeds 65536 byte limit");
+    assert_eq!(lines[4]["ok"], true);
+    assert_eq!(lines[4]["deduplicated"], false);
 }
