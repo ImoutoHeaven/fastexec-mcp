@@ -1002,11 +1002,9 @@ impl EventBus {
                         }
                         backlog.push_back(Arc::clone(rec));
                     }
-                    let start_seq = if backlog.is_empty() {
-                        latest_seq
-                    } else {
-                        cursor_seq.max(state.oldest_seq().unwrap_or(1).saturating_sub(1))
-                    };
+                    let start_seq = backlog
+                        .front()
+                        .map_or(latest_seq, |record| record.seq.saturating_sub(1));
                     (start_seq, truncated, backlog)
                 }
             }
@@ -1711,6 +1709,65 @@ mod tests {
             .unwrap_err();
         assert_eq!(not_found.code(), -32023);
         assert_eq!(not_found.data(), Some(json!({ "kind": "event" })));
+    }
+
+    #[tokio::test]
+    async fn initial_active_cursor_keeps_expired_prefix_out_of_reconnect_backlog() {
+        let (bus, _) = test_bus(32, 1 << 20, 8, 1 << 20);
+        for (id, at) in [("old", 1_000), ("fresh", 5_000), ("later", 5_500)] {
+            bus.publish_external_at(ext_input("src", id, "ready", json!({})), at)
+                .unwrap();
+        }
+        let sub = bus
+            .subscribe_at(
+                SubscribeRequest {
+                    name: EVENT_EXTERNAL.to_owned(),
+                    cursor: Some("ep000001:0".to_owned()),
+                    max_age_ms: Some(1_000),
+                    ..Default::default()
+                },
+                None,
+                5_600,
+            )
+            .unwrap();
+        let active = sub.initial_active();
+        assert!(active.truncated);
+        assert_eq!(active.cursor, "ep000001:1");
+        drop(sub);
+
+        let mut resumed = bus
+            .subscribe_at(
+                SubscribeRequest {
+                    name: EVENT_EXTERNAL.to_owned(),
+                    cursor: Some(active.cursor),
+                    ..Default::default()
+                },
+                None,
+                5_600,
+            )
+            .unwrap();
+        for id in ["fresh", "later"] {
+            let StreamItem::Event(event) = resumed.next().await.unwrap() else {
+                panic!("expected replay event");
+            };
+            assert_eq!(event.data["upstreamEventId"], id);
+        }
+        assert_eq!(resumed.current_cursor(), "ep000001:3");
+
+        let expired = bus
+            .subscribe_at(
+                SubscribeRequest {
+                    name: EVENT_EXTERNAL.to_owned(),
+                    cursor: Some("ep000001:0".to_owned()),
+                    max_age_ms: Some(100),
+                    ..Default::default()
+                },
+                None,
+                10_000,
+            )
+            .unwrap();
+        assert!(expired.initial_active().truncated);
+        assert_eq!(expired.initial_active().cursor, "ep000001:3");
     }
 
     #[tokio::test]
