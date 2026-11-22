@@ -431,6 +431,7 @@ struct EventRecord {
     emitted_ms: u64,
     data: Value,
     meta: EventMeta,
+    lease: Lease,
 }
 
 impl EventRecord {
@@ -454,13 +455,8 @@ impl EventRecord {
     }
 }
 
-struct StoredEntry {
-    record: Arc<EventRecord>,
-    lease: Lease,
-}
-
 struct BusState {
-    ring: VecDeque<StoredEntry>,
+    ring: VecDeque<Arc<EventRecord>>,
     next_seq: u64,
     ring_bytes: usize,
     dedup: HashMap<(String, String), u64>,
@@ -485,7 +481,7 @@ impl BusState {
     }
 
     fn oldest_seq(&self) -> Option<u64> {
-        self.ring.front().map(|entry| entry.record.seq)
+        self.ring.front().map(|entry| entry.seq)
     }
 
     fn evict_oldest(&mut self) -> bool {
@@ -497,10 +493,10 @@ impl BusState {
             source,
             upstream_event_id,
             ..
-        } = &evicted.record.meta
+        } = &evicted.meta
         {
             let key = (source.clone(), upstream_event_id.clone());
-            if self.dedup.get(&key).copied() == Some(evicted.record.seq) {
+            if self.dedup.get(&key).copied() == Some(evicted.seq) {
                 self.dedup.remove(&key);
             }
         }
@@ -816,7 +812,7 @@ impl EventBus {
             });
         }
 
-        // Evict oldest entries and drop their leases before charging the new event.
+        // Subscribers keep evicted records charged until their final reference is dropped.
         while state.ring.len() >= self.max_events
             || state.ring_bytes.saturating_add(entry_bytes) > self.max_bytes
         {
@@ -850,19 +846,17 @@ impl EventBus {
             emitted_ms: now_ms,
             data,
             meta,
-        });
-
-        state.ring_bytes = state.ring_bytes.saturating_add(lease.bytes());
-        state.ring.push_back(StoredEntry {
-            record: Arc::clone(&record),
             lease,
         });
+
+        state.ring_bytes = state.ring_bytes.saturating_add(record.lease.bytes());
+        state.ring.push_back(Arc::clone(&record));
         if let Some(key) = dedup_key {
             state.dedup.insert(key, seq);
         }
-        drop(state);
-
+        // Publish under the sequence lock so concurrent writers cannot reorder delivery.
         let _ = self.tx.send(record);
+        drop(state);
         Ok(PublishResult {
             event_id,
             cursor,
@@ -936,8 +930,7 @@ impl EventBus {
         let mut last_returned_seq = cursor_seq;
         let mut has_more = false;
 
-        for entry in &state.ring {
-            let rec = &entry.record;
+        for rec in &state.ring {
             if rec.seq <= cursor_seq {
                 continue;
             }
@@ -1022,8 +1015,7 @@ impl EventBus {
                     };
                     let cutoff_ms = request.max_age_ms.map(|age| now_ms.saturating_sub(age));
                     let mut backlog = VecDeque::new();
-                    for entry in &state.ring {
-                        let rec = &entry.record;
+                    for rec in &state.ring {
                         if rec.seq <= cursor_seq || !filter.matches(rec) {
                             continue;
                         }
@@ -1076,8 +1068,7 @@ impl EventBus {
         let mut group_order: Vec<String> = Vec::new();
         let mut group_counts: HashMap<String, usize> = HashMap::new();
 
-        for entry in &state.ring {
-            let rec = &entry.record;
+        for rec in &state.ring {
             if rec.seq <= last_seen {
                 continue;
             }
@@ -1449,6 +1440,76 @@ mod tests {
 
         drop(bus);
         assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn concurrent_publications_reach_subscribers_in_sequence_order() {
+        const WRITERS: usize = 16;
+        const PER_WRITER: usize = 64;
+        let count = WRITERS * PER_WRITER;
+        let (bus, _) = test_bus(count, 8 << 20, count, 16 << 20);
+        let mut rx = bus.tx.subscribe();
+        let start = std::sync::Barrier::new(WRITERS);
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let bus = &bus;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for index in 0..PER_WRITER {
+                        bus.publish_external(ext_input(
+                            "parallel",
+                            &format!("{writer}-{index}"),
+                            "ready",
+                            json!({}),
+                        ))
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        for seq in 1..=count as u64 {
+            assert_eq!(rx.try_recv().unwrap().seq, seq);
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn evicted_events_remain_charged_until_subscribers_release_them() {
+        for replay in [false, true] {
+            let (bus, pool) = test_bus(1, 1 << 20, 8, 2 << 20);
+            let cursor = bus.current_cursor();
+            if replay {
+                bus.publish_external(ext_input("src", "e1", "ready", json!({})))
+                    .unwrap();
+            }
+            let sub = bus
+                .subscribe(
+                    SubscribeRequest {
+                        name: EVENT_EXTERNAL.to_owned(),
+                        cursor: Some(cursor),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            if !replay {
+                bus.publish_external(ext_input("src", "e1", "ready", json!({})))
+                    .unwrap();
+            }
+            let charge = pool.used();
+            bus.publish_external(ext_input("src", "e2", "ready", json!({})))
+                .unwrap();
+            assert_eq!(bus.ring_len(), 1);
+            assert_eq!(pool.used(), charge * 2, "replay={replay}");
+            drop(sub);
+            assert_eq!(pool.used(), charge, "replay={replay}");
+            drop(bus);
+            assert_eq!(pool.used(), 0);
+        }
     }
 
     #[test]
