@@ -2761,12 +2761,14 @@ async fn cli(action: &str, flags: DaemonFlags) -> i32 {
         Ok(paths) => paths,
         Err(error) => return fail(&format!("cannot use the runtime directory: {error}")),
     };
-    // One deadline for the whole command, so a daemon that stops answering cannot hold the CLI.
+    if action == "emit" {
+        return cli_emit(&identity, &paths, flags).await;
+    }
+    // One deadline bounds each daemon control exchange.
     let deadline = std::time::Instant::now() + runtime::START_WAIT;
     match action {
         "start" => cli_start(&identity, &paths, &launch, deadline, flags).await,
         "status" => cli_status(&identity, &paths, &launch, deadline).await,
-        "emit" => cli_emit(&identity, &paths, deadline, flags).await,
         _ => cli_stop(&identity, &paths, &launch, deadline).await,
     }
 }
@@ -2955,12 +2957,7 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
-async fn cli_emit(
-    identity: &runtime::Identity,
-    paths: &runtime::Paths,
-    deadline: std::time::Instant,
-    flags: DaemonFlags,
-) -> i32 {
+async fn cli_emit(identity: &runtime::Identity, paths: &runtime::Paths, flags: DaemonFlags) -> i32 {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     if !flags.stream {
@@ -2984,6 +2981,7 @@ async fn cli_emit(
                 Ok(ev) => ev,
                 Err(message) => return fail(&message),
             };
+        let deadline = std::time::Instant::now() + runtime::START_WAIT;
         let mut client = match connect_emit_daemon(identity, paths, deadline).await {
             Ok(client) => client,
             Err(message) => return fail(&message),
@@ -3009,6 +3007,7 @@ async fn cli_emit(
         };
     }
 
+    let deadline = std::time::Instant::now() + runtime::START_WAIT;
     let mut client = match connect_emit_daemon(identity, paths, deadline).await {
         Ok(client) => client,
         Err(message) => return fail(&message),
