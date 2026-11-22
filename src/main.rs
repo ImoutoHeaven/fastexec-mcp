@@ -843,123 +843,138 @@ impl Server {
                 }
             }
             Backend::Daemon(endpoint) => {
-                let (initial, mut stream) = endpoint
-                    .events_stream(&client_name(&context), sub_req, context.ct.clone())
-                    .await
-                    .map_err(ipc_event_error_to_rmcp)?;
-
-                let initial_val = serde_json::to_value(initial)
-                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-                if context
-                    .peer
-                    .send_notification(build_event_notification(
-                        "notifications/events/active",
-                        initial_val,
-                        &sub_id,
-                    ))
-                    .await
-                    .is_err()
-                {
-                    stream.cancel().await;
-                    return Ok(stream_complete_result(&sub_id));
-                }
-
-                let mut terminated_sent = false;
+                let client = client_name(&context);
+                let mut request = sub_req;
                 loop {
-                    tokio::select! {
-                        biased;
-                        _ = context.ct.cancelled() => {
-                            stream.cancel().await;
-                            return Ok(stream_complete_result(&sub_id));
-                        }
-                        frame = stream.next() => {
-                            match frame {
-                                Some((ipc::EventWireFrame::Active(active), _lease)) => {
-                                    let payload = serde_json::to_value(active)
-                                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-                                    if context.peer.send_notification(build_event_notification(
-                                        "notifications/events/active",
-                                        payload,
-                                        &sub_id,
-                                    )).await.is_err() {
-                                        stream.cancel().await;
-                                        return Ok(stream_complete_result(&sub_id));
+                    let (initial, mut stream) = endpoint
+                        .events_stream(&client, request.clone(), context.ct.clone())
+                        .await
+                        .map_err(ipc_event_error_to_rmcp)?;
+
+                    request.cursor = Some(initial.cursor.clone());
+                    request.max_age_ms = None;
+                    let initial_val = serde_json::to_value(initial)
+                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                    if context
+                        .peer
+                        .send_notification(build_event_notification(
+                            "notifications/events/active",
+                            initial_val,
+                            &sub_id,
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        stream.cancel().await;
+                        return Ok(stream_complete_result(&sub_id));
+                    }
+
+                    let mut terminated_sent = false;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = context.ct.cancelled() => {
+                                stream.cancel().await;
+                                return Ok(stream_complete_result(&sub_id));
+                            }
+                            frame = stream.next() => {
+                                match frame {
+                                    Some((ipc::EventWireFrame::Active(active), _lease)) => {
+                                        let cursor = active.cursor.clone();
+                                        let payload = serde_json::to_value(active)
+                                            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                        if context.peer.send_notification(build_event_notification(
+                                            "notifications/events/active",
+                                            payload,
+                                            &sub_id,
+                                        )).await.is_err() {
+                                            stream.cancel().await;
+                                            return Ok(stream_complete_result(&sub_id));
+                                        }
+                                        request.cursor = Some(cursor);
                                     }
-                                }
-                                Some((ipc::EventWireFrame::Event(ev), _lease)) => {
-                                    let payload = serde_json::to_value(ev)
-                                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-                                    if context.peer.send_notification(build_event_notification(
-                                        "notifications/events/event",
-                                        payload,
-                                        &sub_id,
-                                    )).await.is_err() {
-                                        stream.cancel().await;
-                                        return Ok(stream_complete_result(&sub_id));
+                                    Some((ipc::EventWireFrame::Event(ev), _lease)) => {
+                                        let cursor = ev.cursor.clone();
+                                        let payload = serde_json::to_value(ev)
+                                            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                        if context.peer.send_notification(build_event_notification(
+                                            "notifications/events/event",
+                                            payload,
+                                            &sub_id,
+                                        )).await.is_err() {
+                                            stream.cancel().await;
+                                            return Ok(stream_complete_result(&sub_id));
+                                        }
+                                        request.cursor = Some(cursor);
                                     }
-                                }
-                                Some((ipc::EventWireFrame::Heartbeat { cursor }, _lease)) => {
-                                    if context.peer.send_notification(build_event_notification(
-                                        "notifications/events/heartbeat",
-                                        serde_json::json!({ "cursor": cursor }),
-                                        &sub_id,
-                                    )).await.is_err() {
-                                        stream.cancel().await;
-                                        return Ok(stream_complete_result(&sub_id));
+                                    Some((ipc::EventWireFrame::Heartbeat { cursor }, _lease)) => {
+                                        if context.peer.send_notification(build_event_notification(
+                                            "notifications/events/heartbeat",
+                                            serde_json::json!({ "cursor": cursor }),
+                                            &sub_id,
+                                        )).await.is_err() {
+                                            stream.cancel().await;
+                                            return Ok(stream_complete_result(&sub_id));
+                                        }
+                                        request.cursor = Some(cursor);
                                     }
-                                }
-                                Some((ipc::EventWireFrame::Error(err), _lease)) => {
-                                    let mut obj = serde_json::json!({
-                                        "code": err.code,
-                                        "message": err.message,
-                                    });
-                                    if let Some(data) = err.data {
-                                        obj["data"] = data;
+                                    Some((ipc::EventWireFrame::Error(err), _lease)) => {
+                                        let mut obj = serde_json::json!({
+                                            "code": err.code,
+                                            "message": err.message,
+                                        });
+                                        if let Some(data) = err.data {
+                                            obj["data"] = data;
+                                        }
+                                        if context.peer.send_notification(build_event_notification(
+                                            "notifications/events/error",
+                                            serde_json::json!({ "error": obj }),
+                                            &sub_id,
+                                        )).await.is_err() {
+                                            stream.cancel().await;
+                                            return Ok(stream_complete_result(&sub_id));
+                                        }
                                     }
-                                    if context.peer.send_notification(build_event_notification(
-                                        "notifications/events/error",
-                                        serde_json::json!({ "error": obj }),
-                                        &sub_id,
-                                    )).await.is_err() {
-                                        stream.cancel().await;
-                                        return Ok(stream_complete_result(&sub_id));
-                                    }
-                                }
-                                Some((ipc::EventWireFrame::Terminated(err), _lease)) => {
-                                    terminated_sent = true;
-                                    let mut obj = serde_json::json!({
-                                        "code": err.code,
-                                        "message": err.message,
-                                    });
-                                    if let Some(data) = err.data {
-                                        obj["data"] = data;
-                                    }
-                                    let _ = context.peer.send_notification(build_event_notification(
-                                        "notifications/events/terminated",
-                                        serde_json::json!({ "error": obj }),
-                                        &sub_id,
-                                    )).await;
-                                }
-                                Some((ipc::EventWireFrame::Complete, _lease)) => {
-                                    return Ok(stream_complete_result(&sub_id));
-                                }
-                                None => {
-                                    if !terminated_sent {
+                                    Some((ipc::EventWireFrame::Terminated(err), _lease)) => {
+                                        terminated_sent = true;
+                                        let mut obj = serde_json::json!({
+                                            "code": err.code,
+                                            "message": err.message,
+                                        });
+                                        if let Some(data) = err.data {
+                                            obj["data"] = data;
+                                        }
                                         let _ = context.peer.send_notification(build_event_notification(
                                             "notifications/events/terminated",
-                                            serde_json::json!({
-                                                "error": {
-                                                    "code": -32000,
-                                                    "message": "daemon connection closed"
-                                                }
-                                            }),
+                                            serde_json::json!({ "error": obj }),
                                             &sub_id,
                                         )).await;
                                     }
-                                    return Ok(stream_complete_result(&sub_id));
+                                    Some((ipc::EventWireFrame::Complete, _lease)) => {
+                                        return Ok(stream_complete_result(&sub_id));
+                                    }
+                                    None => {
+                                        if !terminated_sent && stream.is_lagged() {
+                                            stream.cancel().await;
+                                            break;
+                                        }
+                                        if !terminated_sent {
+                                            let _ = context.peer.send_notification(build_event_notification(
+                                                "notifications/events/terminated",
+                                                serde_json::json!({
+                                                    "error": {
+                                                        "code": -32000,
+                                                        "message": "daemon connection closed"
+                                                    }
+                                                }),
+                                                &sub_id,
+                                            )).await;
+                                        }
+                                        return Ok(stream_complete_result(&sub_id));
+                                    }
+                                    Some((ipc::EventWireFrame::ListResult(_), _))
+                                    | Some((ipc::EventWireFrame::PollResult(_), _)) => {}
                                 }
-                                Some((ipc::EventWireFrame::ListResult(_), _))
-                                | Some((ipc::EventWireFrame::PollResult(_), _)) => {}
                             }
                         }
                     }

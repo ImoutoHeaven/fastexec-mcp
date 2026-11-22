@@ -275,6 +275,14 @@ impl Endpoint {
 
     /// Starts an endpoint after `configure` adjusts its launch, such as its environment.
     fn start_with(fixture: &Fixture, configure: impl FnOnce(&mut Command)) -> Endpoint {
+        Self::start_with_event_pause(fixture, configure, None)
+    }
+
+    fn start_with_event_pause(
+        fixture: &Fixture,
+        configure: impl FnOnce(&mut Command),
+        mut pause: Option<Receiver<()>>,
+    ) -> Endpoint {
         let mut command = fixture.command(&[]);
         configure(&mut command);
         command
@@ -287,9 +295,13 @@ impl Endpoint {
         let (sender, lines) = channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                match serde_json::from_str(&line) {
+                match serde_json::from_str::<Value>(&line) {
                     Ok(value) => {
+                        let active = value["method"] == "notifications/events/active";
                         let _ = sender.send(value);
+                        if active && let Some(resume) = pause.take() {
+                            let _ = resume.recv();
+                        }
                     }
                     Err(error) => {
                         let _ = sender.send(
@@ -3282,4 +3294,98 @@ fn daemon_emit_single_and_stream_ndjson() {
     assert_eq!(lines[3]["error"], "event payload exceeds 65536 byte limit");
     assert_eq!(lines[4]["ok"], true);
     assert_eq!(lines[4]["deduplicated"], false);
+}
+
+#[test]
+fn event_stream_resumes_after_endpoint_backpressure_and_ends_on_daemon_stop() {
+    const COUNT: usize = 350;
+    let fixture = Fixture::new("events-backpressure");
+    let (resume, pause) = channel();
+    let mut endpoint = Endpoint::start_with_event_pause(&fixture, |_| {}, Some(pause));
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "events-test", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let subscription = endpoint.request_later(
+        "events/stream",
+        json!({"name": "external.event", "_meta": meta}),
+    );
+    let active = endpoint.next_matching("stream did not activate", |message| {
+        message["method"] == "notifications/events/active" || message["id"] == subscription
+    });
+    assert_eq!(active["method"], "notifications/events/active", "{active}");
+    let mut emitter = fixture
+        .command(&["daemon", "emit", "--stream", "--source", "burst"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = emitter.stdin.take().unwrap();
+    let writing = std::thread::spawn(move || {
+        let pad = "x".repeat(2048);
+        for index in 0..COUNT {
+            writeln!(
+                input,
+                "{}",
+                json!({"eventId": format!("e{index}"), "name": "ready", "data": {"index": index, "pad": pad}})
+            )
+            .unwrap();
+        }
+    });
+    let emitted = emitter.wait_with_output().unwrap();
+    writing.join().unwrap();
+    assert!(
+        emitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let acks: Vec<Value> = String::from_utf8(emitted.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(acks.len(), COUNT);
+    assert!(acks.iter().all(|ack| ack["ok"] == true), "{acks:?}");
+    resume.send(()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut received = 0;
+    let mut resumptions = 0;
+    while received < COUNT {
+        let message = endpoint
+            .lines
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("stream did not resume");
+        assert_eq!(
+            message["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], subscription,
+            "{message}"
+        );
+        match message["method"].as_str() {
+            Some("notifications/events/active") => {
+                assert_eq!(message["params"]["truncated"], false, "{message}");
+                resumptions += 1;
+            }
+            Some("notifications/events/event") => {
+                assert_eq!(
+                    message["params"]["data"]["data"]["index"], received,
+                    "{message}"
+                );
+                received += 1;
+            }
+            Some("notifications/events/heartbeat") => {}
+            _ => panic!("unexpected stream message: {message}"),
+        }
+    }
+    assert!(resumptions > 0, "the test did not fill the endpoint queue");
+    let listed = endpoint.request("events/list", json!({"_meta": meta}));
+    assert!(listed.get("error").is_none(), "{listed}");
+
+    let (code, out, err) = fixture.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let ended = endpoint.next_matching("daemon stop did not terminate the stream", |message| {
+        message["method"] == "notifications/events/terminated"
+    });
+    assert_eq!(ended["params"]["error"]["code"], -32000, "{ended}");
 }

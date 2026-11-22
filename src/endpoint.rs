@@ -131,6 +131,10 @@ impl EndpointEventStream {
         self.rx.recv().await
     }
 
+    pub fn is_lagged(&self) -> bool {
+        self.rx.is_closed() && !self.cancelled && !self.link.closed.is_cancelled()
+    }
+
     pub async fn cancel(&mut self) {
         if self.cancelled {
             return;
@@ -783,7 +787,7 @@ async fn read_loop(
                 let sender = lock(&link.event_pending).get(&id).cloned();
                 if let Some(tx) = sender {
                     if let Err(err) = tx.try_send((frame, lease)) {
-                        // Evict full/closed channels so the consumer sees EOF and reconnects by cursor.
+                        // A live link's closed receiver lets the consumer resume after draining its cursor.
                         lock(&link.event_pending).remove(&id);
                         let (frame, lease) = match err {
                             mpsc::error::TrySendError::Full(item)
