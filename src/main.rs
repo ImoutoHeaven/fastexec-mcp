@@ -7,6 +7,7 @@ mod conpty;
 mod conpty_spawn;
 mod daemon;
 mod endpoint;
+mod events;
 mod files;
 mod frames;
 #[cfg(target_os = "freebsd")]
