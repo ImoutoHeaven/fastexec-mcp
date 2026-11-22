@@ -1053,34 +1053,55 @@ impl Daemon {
                         token.cancel();
                     }
                 }
-                ToDaemon::EventsList { id } => {
-                    let result = self.service.event_bus().list_event_types();
-                    queue_event_frame(
-                        outgoing,
-                        &self.memory,
-                        &self.reserved,
-                        &attached.token,
-                        id,
-                        ipc::EventWireFrame::ListResult(result),
-                    );
-                }
+                ToDaemon::EventsList { id } => match self.service.event_bus().list_event_types() {
+                    Ok(result) => {
+                        queue_event_frame(
+                            outgoing,
+                            &self.memory,
+                            &self.reserved,
+                            &attached.token,
+                            id,
+                            result.map(ipc::EventWireFrame::ListResult),
+                        );
+                    }
+                    Err(error) => {
+                        queue_event_control(
+                            outgoing,
+                            &self.memory,
+                            &self.reserved,
+                            &attached.token,
+                            id,
+                            ipc::EventWireFrame::Error(error.into()),
+                        );
+                    }
+                },
                 ToDaemon::EventsPoll { id, request } => {
-                    let frame = match self
+                    match self
                         .service
                         .event_bus()
                         .poll(request, Some(&attached.session_id))
                     {
-                        Ok(resp) => ipc::EventWireFrame::PollResult(resp),
-                        Err(err) => ipc::EventWireFrame::Error(err.into()),
-                    };
-                    queue_event_frame(
-                        outgoing,
-                        &self.memory,
-                        &self.reserved,
-                        &attached.token,
-                        id,
-                        frame,
-                    );
+                        Ok(result) => {
+                            queue_event_frame(
+                                outgoing,
+                                &self.memory,
+                                &self.reserved,
+                                &attached.token,
+                                id,
+                                result.map(ipc::EventWireFrame::PollResult),
+                            );
+                        }
+                        Err(error) => {
+                            queue_event_control(
+                                outgoing,
+                                &self.memory,
+                                &self.reserved,
+                                &attached.token,
+                                id,
+                                ipc::EventWireFrame::Error(error.into()),
+                            );
+                        }
+                    }
                 }
                 ToDaemon::EventsStream { id, request } => {
                     let stream_token = {
@@ -1142,7 +1163,7 @@ impl Daemon {
                             ));
                         }
                         Err(err) => {
-                            queue_event_frame(
+                            queue_event_control(
                                 outgoing,
                                 &self.memory,
                                 &self.reserved,
@@ -1654,8 +1675,12 @@ fn queue_event_frame(
     reserved: &Arc<Semaphore>,
     closing: &CancellationToken,
     id: u64,
-    frame: ipc::EventWireFrame,
+    frame: ipc::Owned<ipc::EventWireFrame>,
 ) -> bool {
+    let ipc::Owned {
+        value: frame,
+        owner,
+    } = frame;
     let message = ToEndpoint::EventFrame { id, frame };
     let Ok(length) = ipc::frame_len(&message) else {
         return false;
@@ -1673,6 +1698,8 @@ fn queue_event_frame(
     let Ok(bytes) = ipc::encode_frame(&message) else {
         return false;
     };
+    drop(message);
+    drop(owner);
     outgoing
         .send(Outgoing {
             bytes,
@@ -1680,6 +1707,37 @@ fn queue_event_frame(
             written: None,
         })
         .is_ok()
+}
+
+fn queue_event_control(
+    outgoing: &mpsc::UnboundedSender<Outgoing>,
+    memory: &Arc<BytePool>,
+    reserved: &Arc<Semaphore>,
+    closing: &CancellationToken,
+    id: u64,
+    frame: ipc::EventWireFrame,
+) -> bool {
+    let Ok(length) = ipc::frame_len(&frame) else {
+        return false;
+    };
+    let owner = if let Some(lease) = memory.try_acquire(length) {
+        crate::lease::Owner::new(lease)
+    } else if let Ok(want) = u32::try_from(length)
+        && let Ok(permit) = Arc::clone(reserved).try_acquire_many_owned(want)
+    {
+        crate::lease::Owner::new(permit)
+    } else {
+        closing.cancel();
+        return false;
+    };
+    queue_event_frame(
+        outgoing,
+        memory,
+        reserved,
+        closing,
+        id,
+        ipc::Owned::new(frame, owner),
+    )
 }
 
 async fn run_event_stream(
@@ -1694,15 +1752,39 @@ async fn run_event_stream(
     if token.is_cancelled() {
         return;
     }
+    let queue = |frame| {
+        queue_event_frame(
+            &outgoing,
+            &daemon.memory,
+            &daemon.reserved,
+            &closing,
+            id,
+            frame,
+        )
+    };
+    let control = |frame| {
+        queue_event_control(
+            &outgoing,
+            &daemon.memory,
+            &daemon.reserved,
+            &closing,
+            id,
+            frame,
+        )
+    };
+    let terminate = |error| {
+        control(ipc::EventWireFrame::Terminated(error));
+        control(ipc::EventWireFrame::Complete);
+    };
     let heartbeat = Duration::from_millis(sub.heartbeat_ms());
-    if !queue_event_frame(
-        &outgoing,
-        &daemon.memory,
-        &daemon.reserved,
-        &closing,
-        id,
-        ipc::EventWireFrame::Active(sub.initial_active()),
-    ) {
+    let initial = match sub.initial_active() {
+        Ok(active) => active,
+        Err(error) => {
+            control(ipc::EventWireFrame::Error(error.into()));
+            return;
+        }
+    };
+    if !queue(initial.map(ipc::EventWireFrame::Active)) {
         return;
     }
 
@@ -1716,93 +1798,49 @@ async fn run_event_stream(
                 break;
             }
             _ = daemon.stopped.cancelled() => {
-                let _ = queue_event_frame(
-                    &outgoing,
-                    &daemon.memory,
-                    &daemon.reserved,
-                    &closing,
-                    id,
-                    ipc::EventWireFrame::Terminated(ipc::IpcEventError {
-                        code: -32000,
-                        message: "fastexec daemon shutting down".to_owned(),
-                        data: None,
-                    }),
-                );
-                let _ = queue_event_frame(
-                    &outgoing,
-                    &daemon.memory,
-                    &daemon.reserved,
-                    &closing,
-                    id,
-                    ipc::EventWireFrame::Complete,
-                );
+                terminate(ipc::IpcEventError {
+                    code: -32000,
+                    message: "fastexec daemon shutting down".to_owned(),
+                    data: None,
+                });
                 break;
             }
             item = sub.next() => {
                 match item {
-                    Some(crate::events::StreamItem::Active(active)) => {
-                        if !queue_event_frame(
-                            &outgoing,
-                            &daemon.memory,
-                            &daemon.reserved,
-                            &closing,
-                            id,
-                            ipc::EventWireFrame::Active(active),
-                        ) {
+                    Ok(Some(item)) => {
+                        if !queue(item.map(|item| match item {
+                            crate::events::StreamItem::Active(active) => ipc::EventWireFrame::Active(active),
+                            crate::events::StreamItem::Event(event) => ipc::EventWireFrame::Event(event),
+                        })) {
                             break;
                         }
                         sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
                     }
-                    Some(crate::events::StreamItem::Event(ev)) => {
-                        if !queue_event_frame(
-                            &outgoing,
-                            &daemon.memory,
-                            &daemon.reserved,
-                            &closing,
-                            id,
-                            ipc::EventWireFrame::Event(ev),
-                        ) {
-                            break;
-                        }
-                        sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
+                    Ok(None) => {
+                        terminate(ipc::IpcEventError {
+                            code: -32000,
+                            message: "event bus closed".to_owned(),
+                            data: None,
+                        });
+                        break;
                     }
-                    None => {
-                        let _ = queue_event_frame(
-                            &outgoing,
-                            &daemon.memory,
-                            &daemon.reserved,
-                            &closing,
-                            id,
-                            ipc::EventWireFrame::Terminated(ipc::IpcEventError {
-                                code: -32000,
-                                message: "event bus closed".to_owned(),
-                                data: None,
-                            }),
-                        );
-                        let _ = queue_event_frame(
-                            &outgoing,
-                            &daemon.memory,
-                            &daemon.reserved,
-                            &closing,
-                            id,
-                            ipc::EventWireFrame::Complete,
-                        );
+                    Err(error) => {
+                        terminate(error.into());
                         break;
                     }
                 }
             }
             _ = &mut sleep => {
-                if !queue_event_frame(
-                    &outgoing,
-                    &daemon.memory,
-                    &daemon.reserved,
-                    &closing,
-                    id,
-                    ipc::EventWireFrame::Heartbeat {
-                        cursor: sub.current_cursor(),
-                    },
-                ) {
-                    break;
+                match sub.current_cursor() {
+                    Ok(cursor) => {
+                        if !queue(cursor.map(|cursor| ipc::EventWireFrame::Heartbeat { cursor })) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        terminate(error.into());
+                        break;
+                    }
                 }
                 sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
             }
@@ -2225,6 +2263,46 @@ mod tests {
     #![cfg_attr(not(windows), allow(dead_code))]
 
     use super::*;
+
+    #[test]
+    fn event_ipc_encoding_reserves_overlap_and_keeps_queued_bytes_charged() {
+        let frame = || {
+            ipc::EventWireFrame::Event(crate::events::StreamEvent {
+                event_id: "eeeeeeee-1".to_owned(),
+                name: "external.event".to_owned(),
+                timestamp: "2026-11-22T00:00:00.000Z".to_owned(),
+                data: serde_json::Value::String("x".repeat(4096)),
+                cursor: "eeeeeeee:1".to_owned(),
+            })
+        };
+        let source_bytes = 4096;
+        let encoded_bytes = ipc::frame_len(&ToEndpoint::EventFrame {
+            id: 1,
+            frame: frame(),
+        })
+        .unwrap();
+        for fits in [false, true] {
+            let pool = BytePool::new(source_bytes + encoded_bytes - usize::from(!fits));
+            let owner = crate::lease::Owner::new(pool.try_acquire(source_bytes).unwrap());
+            let input = ipc::Owned::new(frame(), owner);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let closing = CancellationToken::new();
+            let queued =
+                queue_event_frame(&tx, &pool, &Arc::new(Semaphore::new(0)), &closing, 1, input);
+            assert_eq!(queued, fits);
+            assert_eq!(closing.is_cancelled(), !fits);
+            assert_eq!(pool.used(), if fits { encoded_bytes } else { 0 });
+            if fits {
+                let queued = rx.try_recv().unwrap();
+                assert_eq!(queued.bytes.len(), encoded_bytes);
+                drop(queued);
+                assert_eq!(pool.used(), 0);
+            } else {
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+
     use crate::ipc::OsText;
     use crate::tasks::Limits;
     use crate::transport::Endpoint;

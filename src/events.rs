@@ -1,6 +1,7 @@
 //! Bounded in-memory event bus for MCP Events (`task.exited` and `external.event`).
 
-use crate::lease::{self, BytePool, Lease};
+use crate::ipc::{self, Owned};
+use crate::lease::{self, BytePool, Lease, Owner};
 use crate::tasks;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,6 +28,8 @@ pub const MIN_HEARTBEAT_MS: u64 = 5_000;
 pub const MAX_HEARTBEAT_MS: u64 = 30_000;
 const DEFAULT_BROADCAST_CAPACITY: usize = 1024;
 const ENTRY_FIXED_OVERHEAD: usize = 128;
+const OUTPUT_FIXED_BYTES: usize = 256;
+const CATALOG_WORKSPACE_BYTES: usize = 8 << 10;
 const DEDUP_FIXED_OVERHEAD: usize = 64;
 const MAX_SUMMARY_LABEL_CHARS: usize = 48;
 const MAX_SUMMARY_GROUPS: usize = 3;
@@ -410,6 +413,16 @@ struct EventRecord {
 }
 
 impl EventRecord {
+    fn projection_bytes(&self, cursor_bytes: usize) -> usize {
+        ipc::json_len(&self.data)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.event_id.len())
+            .saturating_add(self.name.len())
+            .saturating_add(self.timestamp.len())
+            .saturating_add(cursor_bytes)
+            .saturating_add(OUTPUT_FIXED_BYTES)
+    }
+
     fn to_polled(&self) -> PolledEvent {
         PolledEvent {
             event_id: self.event_id.clone(),
@@ -419,14 +432,109 @@ impl EventRecord {
         }
     }
 
-    fn to_stream(&self, boot_epoch: &str) -> StreamEvent {
-        StreamEvent {
-            event_id: self.event_id.clone(),
-            name: self.name.to_owned(),
-            timestamp: self.timestamp.clone(),
-            data: self.data.clone(),
-            cursor: format_cursor(boot_epoch, self.seq),
-        }
+    fn to_stream(&self, bus: &EventBus) -> Result<Owned<StreamEvent>, EventError> {
+        let lease = bus.output_lease(self.projection_bytes(bus.boot_epoch.len() + 21))?;
+        Ok(Owned::new(
+            StreamEvent {
+                event_id: self.event_id.clone(),
+                name: self.name.to_owned(),
+                timestamp: self.timestamp.clone(),
+                data: self.data.clone(),
+                cursor: format_cursor(bus.boot_epoch(), self.seq),
+            },
+            Owner::new(lease),
+        ))
+    }
+}
+
+pub(crate) fn value_object<const N: usize>(fields: [(&'static str, Value); N]) -> Value {
+    Value::Object(
+        fields
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+    )
+}
+
+impl From<EventTypeDescriptor> for Value {
+    fn from(event: EventTypeDescriptor) -> Self {
+        value_object([
+            ("name", Value::String(event.name.into_owned())),
+            ("description", Value::String(event.description.into_owned())),
+            (
+                "delivery",
+                Value::Array(
+                    event
+                        .delivery
+                        .into_iter()
+                        .map(|mode| Value::String(mode.into_owned()))
+                        .collect(),
+                ),
+            ),
+            ("inputSchema", event.input_schema),
+            ("payloadSchema", event.payload_schema),
+        ])
+    }
+}
+
+impl From<EventsListResult> for Value {
+    fn from(result: EventsListResult) -> Self {
+        value_object([
+            ("resultType", Value::String(result.result_type.into_owned())),
+            (
+                "events",
+                Value::Array(result.events.into_iter().map(Value::from).collect()),
+            ),
+        ])
+    }
+}
+
+impl From<PolledEvent> for Value {
+    fn from(event: PolledEvent) -> Self {
+        value_object([
+            ("eventId", Value::String(event.event_id)),
+            ("name", Value::String(event.name)),
+            ("timestamp", Value::String(event.timestamp)),
+            ("data", event.data),
+        ])
+    }
+}
+
+impl From<PollResponse> for Value {
+    fn from(result: PollResponse) -> Self {
+        value_object([
+            ("resultType", Value::String(result.result_type.into_owned())),
+            (
+                "events",
+                Value::Array(result.events.into_iter().map(Value::from).collect()),
+            ),
+            ("cursor", Value::String(result.cursor)),
+            ("truncated", Value::Bool(result.truncated)),
+            ("hasMore", Value::Bool(result.has_more)),
+            ("nextPollMs", Value::Number(result.next_poll_ms.into())),
+        ])
+    }
+}
+
+impl From<ActiveNotice> for Value {
+    fn from(active: ActiveNotice) -> Self {
+        value_object([
+            ("cursor", Value::String(active.cursor)),
+            ("truncated", Value::Bool(active.truncated)),
+            ("heartbeatMs", Value::Number(active.heartbeat_ms.into())),
+        ])
+    }
+}
+
+impl From<StreamEvent> for Value {
+    fn from(event: StreamEvent) -> Self {
+        value_object([
+            ("eventId", Value::String(event.event_id)),
+            ("name", Value::String(event.name)),
+            ("timestamp", Value::String(event.timestamp)),
+            ("data", event.data),
+            ("cursor", Value::String(event.cursor)),
+        ])
     }
 }
 
@@ -577,68 +685,84 @@ impl EventBus {
         format_cursor(&self.boot_epoch, state.latest_seq())
     }
 
-    pub fn list_event_types(&self) -> EventsListResult {
-        EventsListResult {
-            result_type: Cow::Borrowed("complete"),
-            events: vec![
-                EventTypeDescriptor {
-                    name: Cow::Borrowed(EVENT_TASK_EXITED),
-                    description: Cow::Borrowed(
-                        "Emitted when a fastexec task exits, is killed, or expires.",
-                    ),
-                    delivery: vec![Cow::Borrowed("push"), Cow::Borrowed("poll")],
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "taskId": { "type": "string" },
-                            "scope": { "type": "string", "enum": ["session", "all"] }
-                        },
-                        "additionalProperties": false
-                    }),
-                    payload_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "taskId": { "type": "string" },
-                            "state": { "type": "string" },
-                            "exitCode": { "type": "integer" },
-                            "expired": { "type": "boolean" },
-                            "keptProcesses": { "type": "integer", "minimum": 0 },
-                            "treeEnded": { "type": "boolean" },
-                            "logPath": { "type": "string" }
-                        },
-                        "required": ["taskId", "state", "expired", "keptProcesses", "treeEnded"],
-                        "additionalProperties": false
-                    }),
-                },
-                EventTypeDescriptor {
-                    name: Cow::Borrowed(EVENT_EXTERNAL),
-                    description: Cow::Borrowed("External event injected via fastexec daemon emit."),
-                    delivery: vec![Cow::Borrowed("push"), Cow::Borrowed("poll")],
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "source": { "type": "string" },
-                            "topic": { "type": "string" },
-                            "name": { "type": "string" }
-                        },
-                        "additionalProperties": false
-                    }),
-                    payload_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "source": { "type": "string" },
-                            "topic": { "type": "string" },
-                            "name": { "type": "string" },
-                            "upstreamEventId": { "type": "string" },
-                            "data": {},
-                            "upstreamTruncated": { "type": "boolean" }
-                        },
-                        "required": ["source", "name", "upstreamEventId", "data"],
-                        "additionalProperties": false
-                    }),
-                },
-            ],
-        }
+    fn output_lease(&self, bytes: usize) -> Result<Lease, EventError> {
+        self.pool
+            .try_acquire(bytes)
+            .ok_or_else(|| EventError::ResourceExhausted {
+                limit: "process_memory",
+                max: self.pool.limit(),
+                message: "process byte budget is full while preparing event output".to_owned(),
+            })
+    }
+
+    pub fn list_event_types(&self) -> Result<Owned<EventsListResult>, EventError> {
+        let lease = self.output_lease(CATALOG_WORKSPACE_BYTES)?;
+        Ok(Owned::new(
+            EventsListResult {
+                result_type: Cow::Borrowed("complete"),
+                events: vec![
+                    EventTypeDescriptor {
+                        name: Cow::Borrowed(EVENT_TASK_EXITED),
+                        description: Cow::Borrowed(
+                            "Emitted when a fastexec task exits, is killed, or expires.",
+                        ),
+                        delivery: vec![Cow::Borrowed("push"), Cow::Borrowed("poll")],
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "taskId": { "type": "string" },
+                                "scope": { "type": "string", "enum": ["session", "all"] }
+                            },
+                            "additionalProperties": false
+                        }),
+                        payload_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "taskId": { "type": "string" },
+                                "state": { "type": "string" },
+                                "exitCode": { "type": "integer" },
+                                "expired": { "type": "boolean" },
+                                "keptProcesses": { "type": "integer", "minimum": 0 },
+                                "treeEnded": { "type": "boolean" },
+                                "logPath": { "type": "string" }
+                            },
+                            "required": ["taskId", "state", "expired", "keptProcesses", "treeEnded"],
+                            "additionalProperties": false
+                        }),
+                    },
+                    EventTypeDescriptor {
+                        name: Cow::Borrowed(EVENT_EXTERNAL),
+                        description: Cow::Borrowed(
+                            "External event injected via fastexec daemon emit.",
+                        ),
+                        delivery: vec![Cow::Borrowed("push"), Cow::Borrowed("poll")],
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "source": { "type": "string" },
+                                "topic": { "type": "string" },
+                                "name": { "type": "string" }
+                            },
+                            "additionalProperties": false
+                        }),
+                        payload_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "source": { "type": "string" },
+                                "topic": { "type": "string" },
+                                "name": { "type": "string" },
+                                "upstreamEventId": { "type": "string" },
+                                "data": {},
+                                "upstreamTruncated": { "type": "boolean" }
+                            },
+                            "required": ["source", "name", "upstreamEventId", "data"],
+                            "additionalProperties": false
+                        }),
+                    },
+                ],
+            },
+            Owner::new(lease),
+        ))
     }
 
     pub fn publish_task_exited(&self, input: TaskExitedInput) -> Result<PublishResult, EventError> {
@@ -843,7 +967,7 @@ impl EventBus {
         &self,
         request: PollRequest,
         caller_session: Option<&str>,
-    ) -> Result<PollResponse, EventError> {
+    ) -> Result<Owned<PollResponse>, EventError> {
         self.poll_at(request, caller_session, now_unix_ms())
     }
 
@@ -852,7 +976,7 @@ impl EventBus {
         request: PollRequest,
         caller_session: Option<&str>,
         now_ms: u64,
-    ) -> Result<PollResponse, EventError> {
+    ) -> Result<Owned<PollResponse>, EventError> {
         let filter = EventFilter::parse(&request.name, request.arguments, caller_session)?;
         let limit = match request.max_events {
             Some(0) => {
@@ -866,15 +990,19 @@ impl EventBus {
 
         let state = lock(&self.state);
         let latest_seq = state.latest_seq();
+        let mut held = self.output_lease(OUTPUT_FIXED_BYTES + self.boot_epoch.len() + 21)?;
         let Some(raw_cursor) = request.cursor.as_deref() else {
-            return Ok(PollResponse {
-                result_type: Cow::Borrowed("complete"),
-                events: Vec::new(),
-                cursor: format_cursor(&self.boot_epoch, latest_seq),
-                truncated: false,
-                has_more: false,
-                next_poll_ms: POLL_NEXT_IDLE_MS,
-            });
+            return Ok(Owned::new(
+                PollResponse {
+                    result_type: Cow::Borrowed("complete"),
+                    events: Vec::new(),
+                    cursor: format_cursor(&self.boot_epoch, latest_seq),
+                    truncated: false,
+                    has_more: false,
+                    next_poll_ms: POLL_NEXT_IDLE_MS,
+                },
+                Owner::new(held),
+            ));
         };
 
         let Some((cursor_epoch, cursor_seq)) = parse_cursor(raw_cursor) else {
@@ -884,14 +1012,17 @@ impl EventBus {
         };
 
         if cursor_epoch != self.boot_epoch || cursor_seq > latest_seq {
-            return Ok(PollResponse {
-                result_type: Cow::Borrowed("complete"),
-                events: Vec::new(),
-                cursor: format_cursor(&self.boot_epoch, latest_seq),
-                truncated: true,
-                has_more: false,
-                next_poll_ms: POLL_NEXT_IDLE_MS,
-            });
+            return Ok(Owned::new(
+                PollResponse {
+                    result_type: Cow::Borrowed("complete"),
+                    events: Vec::new(),
+                    cursor: format_cursor(&self.boot_epoch, latest_seq),
+                    truncated: true,
+                    has_more: false,
+                    next_poll_ms: POLL_NEXT_IDLE_MS,
+                },
+                Owner::new(held),
+            ));
         }
 
         let mut truncated = match state.oldest_seq() {
@@ -919,6 +1050,14 @@ impl EventBus {
                 continue;
             }
             if events.len() < limit {
+                if !held.try_grow(rec.projection_bytes(0)) {
+                    return Err(EventError::ResourceExhausted {
+                        limit: "process_memory",
+                        max: self.pool.limit(),
+                        message: "process byte budget is full while preparing event output"
+                            .to_owned(),
+                    });
+                }
                 last_returned_seq = rec.seq;
                 events.push(rec.to_polled());
             } else {
@@ -938,14 +1077,17 @@ impl EventBus {
             POLL_NEXT_IDLE_MS
         };
 
-        Ok(PollResponse {
-            result_type: Cow::Borrowed("complete"),
-            events,
-            cursor: format_cursor(&self.boot_epoch, next_cursor_seq),
-            truncated,
-            has_more,
-            next_poll_ms,
-        })
+        Ok(Owned::new(
+            PollResponse {
+                result_type: Cow::Borrowed("complete"),
+                events,
+                cursor: format_cursor(&self.boot_epoch, next_cursor_seq),
+                truncated,
+                has_more,
+                next_poll_ms,
+            },
+            Owner::new(held),
+        ))
     }
 
     pub fn subscribe(
@@ -1010,20 +1152,16 @@ impl EventBus {
             }
         };
 
-        let initial_active = ActiveNotice {
-            cursor: format_cursor(&self.boot_epoch, initial_cursor_seq),
-            truncated,
-            heartbeat_ms,
-        };
-
         Ok(EventSubscription {
             bus: Arc::clone(self),
             filter,
             heartbeat_ms,
-            initial_active,
+            initial_seq: initial_cursor_seq,
+            initial_truncated: truncated,
             backlog,
             rx,
             last_sent_seq: initial_cursor_seq,
+            pending_active: None,
         })
     }
 
@@ -1148,40 +1286,71 @@ pub struct EventSubscription {
     bus: Arc<EventBus>,
     filter: EventFilter,
     heartbeat_ms: u64,
-    initial_active: ActiveNotice,
+    initial_seq: u64,
+    initial_truncated: bool,
     backlog: VecDeque<Arc<EventRecord>>,
     rx: broadcast::Receiver<Arc<EventRecord>>,
     last_sent_seq: u64,
+    pending_active: Option<u64>,
 }
 
 impl EventSubscription {
-    pub fn initial_active(&self) -> ActiveNotice {
-        self.initial_active.clone()
+    fn active_notice(&self, seq: u64, truncated: bool) -> Result<Owned<ActiveNotice>, EventError> {
+        let lease = self
+            .bus
+            .output_lease(OUTPUT_FIXED_BYTES + self.bus.boot_epoch.len() + 21)?;
+        Ok(Owned::new(
+            ActiveNotice {
+                cursor: format_cursor(self.bus.boot_epoch(), seq),
+                truncated,
+                heartbeat_ms: self.heartbeat_ms,
+            },
+            Owner::new(lease),
+        ))
+    }
+
+    pub fn initial_active(&self) -> Result<Owned<ActiveNotice>, EventError> {
+        self.active_notice(self.initial_seq, self.initial_truncated)
     }
 
     pub fn heartbeat_ms(&self) -> u64 {
         self.heartbeat_ms
     }
 
-    pub fn current_cursor(&self) -> String {
-        format_cursor(self.bus.boot_epoch(), self.last_sent_seq)
+    pub fn current_cursor(&self) -> Result<Owned<String>, EventError> {
+        let lease = self
+            .bus
+            .output_lease(OUTPUT_FIXED_BYTES + self.bus.boot_epoch.len() + 21)?;
+        Ok(Owned::new(
+            format_cursor(self.bus.boot_epoch(), self.last_sent_seq),
+            Owner::new(lease),
+        ))
     }
 
-    pub async fn next(&mut self) -> Option<StreamItem> {
-        if let Some(rec) = self.backlog.pop_front() {
-            self.last_sent_seq = self.last_sent_seq.max(rec.seq);
-            return Some(StreamItem::Event(rec.to_stream(self.bus.boot_epoch())));
-        }
-
+    pub async fn next(&mut self) -> Result<Option<Owned<StreamItem>>, EventError> {
         loop {
+            if let Some(seq) = self.pending_active {
+                let active = self.active_notice(seq, true)?;
+                self.pending_active = None;
+                self.last_sent_seq = seq;
+                return Ok(Some(active.map(StreamItem::Active)));
+            }
+            if let Some(rec) = self.backlog.front() {
+                let event = rec.to_stream(&self.bus)?;
+                self.last_sent_seq = self.last_sent_seq.max(rec.seq);
+                self.backlog.pop_front();
+                return Ok(Some(event.map(StreamItem::Event)));
+            }
+
             match self.rx.recv().await {
                 Ok(rec) => {
                     if rec.seq <= self.last_sent_seq {
                         continue;
                     }
-                    self.last_sent_seq = rec.seq;
                     if self.filter.matches(&rec) {
-                        return Some(StreamItem::Event(rec.to_stream(self.bus.boot_epoch())));
+                        self.backlog.push_back(rec);
+                    } else {
+                        self.last_sent_seq = rec.seq;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1191,14 +1360,9 @@ impl EventSubscription {
                         (state.latest_seq(), self.bus.tx.subscribe())
                     };
                     self.rx = fresh_rx;
-                    self.last_sent_seq = latest_seq;
-                    return Some(StreamItem::Active(ActiveNotice {
-                        cursor: format_cursor(self.bus.boot_epoch(), latest_seq),
-                        truncated: true,
-                        heartbeat_ms: self.heartbeat_ms,
-                    }));
+                    self.pending_active = Some(latest_seq);
                 }
-                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(broadcast::error::RecvError::Closed) => return Ok(None),
             }
         }
     }
@@ -1328,16 +1492,156 @@ mod tests {
     #[test]
     fn list_event_types_exposes_only_v1_events_with_schemas() {
         let (bus, _) = test_bus(64, 1 << 20, 16, 2 << 20);
-        let list = bus.list_event_types();
-        assert_eq!(list.result_type, "complete");
-        let names: Vec<&str> = list.events.iter().map(|e| e.name.as_ref()).collect();
+        let list = bus.list_event_types().unwrap();
+        assert_eq!(list.value.result_type, "complete");
+        let names: Vec<&str> = list.value.events.iter().map(|e| e.name.as_ref()).collect();
         assert_eq!(names, vec![EVENT_TASK_EXITED, EVENT_EXTERNAL]);
-        for desc in &list.events {
+        for desc in &list.value.events {
             let delivery: Vec<&str> = desc.delivery.iter().map(AsRef::as_ref).collect();
             assert_eq!(delivery, vec!["push", "poll"]);
             assert_eq!(desc.input_schema["type"], "object");
             assert_eq!(desc.payload_schema["type"], "object");
         }
+    }
+
+    #[tokio::test]
+    async fn event_projections_reserve_before_copy_and_keep_outputs_charged() {
+        let (bus, pool) = test_bus(16, 64 << 10, 8, 128 << 10);
+        let cursor = bus.current_cursor();
+        bus.publish_external(ext_input(
+            "src",
+            "owned",
+            "ready",
+            Value::String("x".repeat(4096)),
+        ))
+        .unwrap();
+        let request = PollRequest {
+            name: EVENT_EXTERNAL.to_owned(),
+            cursor: Some(cursor.clone()),
+            ..Default::default()
+        };
+        let mut sub = bus
+            .subscribe(
+                SubscribeRequest {
+                    name: EVENT_EXTERNAL.to_owned(),
+                    cursor: Some(cursor),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let source_bytes = pool.used();
+        let full = pool.try_acquire(pool.limit() - source_bytes).unwrap();
+        assert_eq!(bus.poll(request.clone(), None).unwrap_err().code(), -32025);
+        assert_eq!(sub.next().await.unwrap_err().code(), -32025);
+        assert_eq!(sub.last_sent_seq, 0);
+        assert_eq!(bus.list_event_types().unwrap_err().code(), -32025);
+        assert_eq!(sub.initial_active().unwrap_err().code(), -32025);
+        assert_eq!(sub.current_cursor().unwrap_err().code(), -32025);
+        assert_eq!(pool.used(), pool.limit());
+        drop(full);
+
+        let poll = bus.poll(request, None).unwrap();
+        let stream = sub.next().await.unwrap().unwrap();
+        let poll_bytes = poll.owner.get::<Lease>().unwrap().bytes();
+        let stream_bytes = stream.owner.get::<Lease>().unwrap().bytes();
+        assert!(poll_bytes >= 4096);
+        assert!(stream_bytes >= 4096);
+        assert_eq!(pool.used(), source_bytes + poll_bytes + stream_bytes);
+        drop(sub);
+        drop(bus);
+        assert_eq!(pool.used(), poll_bytes + stream_bytes);
+
+        let expected_poll = serde_json::to_value(&poll.value).unwrap();
+        let poll_ptr = poll.value.events[0].data["data"].as_str().unwrap().as_ptr();
+        let poll = poll.map(Value::from);
+        assert_eq!(poll.value, expected_poll);
+        assert_eq!(
+            poll.value["events"][0]["data"]["data"]
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            poll_ptr
+        );
+        let StreamItem::Event(event) = &stream.value else {
+            panic!("expected event")
+        };
+        let expected_stream = serde_json::to_value(event).unwrap();
+        let stream_ptr = event.data["data"].as_str().unwrap().as_ptr();
+        let stream = stream.map(|item| match item {
+            StreamItem::Event(event) => Value::from(event),
+            StreamItem::Active(_) => panic!("expected event"),
+        });
+        assert_eq!(stream.value, expected_stream);
+        assert_eq!(
+            stream.value["data"]["data"].as_str().unwrap().as_ptr(),
+            stream_ptr
+        );
+        assert_eq!(pool.used(), poll_bytes + stream_bytes);
+        drop(poll);
+        assert_eq!(pool.used(), stream_bytes);
+        drop(stream);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn metadata_outputs_keep_owners_and_match_wire_serialization() {
+        let (bus, pool) = test_bus(16, 64 << 10, 8, 128 << 10);
+        let sub = bus
+            .subscribe(
+                SubscribeRequest {
+                    name: EVENT_EXTERNAL.to_owned(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let catalog = bus.list_event_types().unwrap();
+        let active = sub.initial_active().unwrap();
+        let cursor = sub.current_cursor().unwrap();
+        let expected_catalog = serde_json::to_value(&catalog.value).unwrap();
+        let expected_active = serde_json::to_value(&active.value).unwrap();
+        assert!(
+            ipc::json_len(&catalog.value).unwrap() <= catalog.owner.get::<Lease>().unwrap().bytes()
+        );
+        let charged = pool.used();
+        let catalog = catalog.map(Value::from);
+        let active = active.map(Value::from);
+        assert_eq!(catalog.value, expected_catalog);
+        assert_eq!(active.value, expected_active);
+        drop(sub);
+        drop(bus);
+        assert_eq!(pool.used(), charged);
+        drop((catalog, active, cursor));
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn truncated_active_is_retained_when_projection_budget_is_full() {
+        let (bus, pool) = test_bus(16, 64 << 10, 2, 128 << 10);
+        let mut sub = bus
+            .subscribe(
+                SubscribeRequest {
+                    name: EVENT_EXTERNAL.to_owned(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        for i in 0..5 {
+            bus.publish_external(ext_input("src", &i.to_string(), "ready", json!({})))
+                .unwrap();
+        }
+        let full = pool.try_acquire(pool.limit() - pool.used()).unwrap();
+        assert_eq!(sub.next().await.unwrap_err().code(), -32025);
+        assert_eq!(sub.last_sent_seq, 0);
+        drop(full);
+        let active = sub.next().await.unwrap().unwrap();
+        let StreamItem::Active(active) = &active.value else {
+            panic!("expected truncated active")
+        };
+        assert!(active.truncated);
+        assert_eq!(active.cursor, "ep000001:5");
     }
 
     #[test]
@@ -1541,8 +1845,8 @@ mod tests {
                 5010,
             )
             .unwrap();
-        assert_eq!(resp.events.len(), 1);
-        let data = &resp.events[0].data;
+        assert_eq!(resp.value.events.len(), 1);
+        let data = &resp.value.events[0].data;
         assert_eq!(data["taskId"], "abcd1234-1");
         assert_eq!(data["state"], "exited");
         assert!(data["exitCode"].is_i64());
@@ -1567,7 +1871,7 @@ mod tests {
                 5010,
             )
             .unwrap();
-        assert!(other.events.is_empty());
+        assert!(other.value.events.is_empty());
     }
 
     #[test]
@@ -1595,11 +1899,11 @@ mod tests {
                 999_999,
             )
             .unwrap();
-        assert!(tail.events.is_empty());
-        assert!(!tail.truncated);
-        assert!(!tail.has_more);
-        assert_eq!(tail.next_poll_ms, POLL_NEXT_IDLE_MS);
-        assert_eq!(tail.cursor, "ep000001:70");
+        assert!(tail.value.events.is_empty());
+        assert!(!tail.value.truncated);
+        assert!(!tail.value.has_more);
+        assert_eq!(tail.value.next_poll_ms, POLL_NEXT_IDLE_MS);
+        assert_eq!(tail.value.cursor, "ep000001:70");
 
         // Mismatched boot_epoch sets truncated=true and returns current valid cursor.
         let wrong_epoch = bus
@@ -1613,9 +1917,9 @@ mod tests {
                 10_000,
             )
             .unwrap();
-        assert!(wrong_epoch.truncated);
-        assert!(wrong_epoch.events.is_empty());
-        assert_eq!(wrong_epoch.cursor, "ep000001:70");
+        assert!(wrong_epoch.value.truncated);
+        assert!(wrong_epoch.value.events.is_empty());
+        assert_eq!(wrong_epoch.value.cursor, "ep000001:70");
 
         // Pagination caps at min(maxEvents, 64), sets hasMore and nextPollMs=2000, and omits cursor on items.
         let page1 = bus
@@ -1630,19 +1934,19 @@ mod tests {
                 10_000,
             )
             .unwrap();
-        assert_eq!(page1.events.len(), 64);
-        assert!(page1.has_more);
-        assert!(!page1.truncated);
-        assert_eq!(page1.next_poll_ms, POLL_NEXT_ACTIVE_MS);
-        assert_eq!(page1.cursor, "ep000001:64");
-        let serialized_item = serde_json::to_value(&page1.events[0]).unwrap();
+        assert_eq!(page1.value.events.len(), 64);
+        assert!(page1.value.has_more);
+        assert!(!page1.value.truncated);
+        assert_eq!(page1.value.next_poll_ms, POLL_NEXT_ACTIVE_MS);
+        assert_eq!(page1.value.cursor, "ep000001:64");
+        let serialized_item = serde_json::to_value(&page1.value.events[0]).unwrap();
         assert!(serialized_item.get("cursor").is_none());
 
         let page2 = bus
             .poll_at(
                 PollRequest {
                     name: EVENT_EXTERNAL.to_owned(),
-                    cursor: Some(page1.cursor),
+                    cursor: Some(page1.value.cursor),
                     max_events: Some(64),
                     ..Default::default()
                 },
@@ -1650,10 +1954,10 @@ mod tests {
                 10_000,
             )
             .unwrap();
-        assert_eq!(page2.events.len(), 6);
-        assert!(!page2.has_more);
-        assert_eq!(page2.next_poll_ms, POLL_NEXT_ACTIVE_MS);
-        assert_eq!(page2.cursor, "ep000001:70");
+        assert_eq!(page2.value.events.len(), 6);
+        assert!(!page2.value.has_more);
+        assert_eq!(page2.value.next_poll_ms, POLL_NEXT_ACTIVE_MS);
+        assert_eq!(page2.value.cursor, "ep000001:70");
 
         // Non-empty cursor + maxAgeMs skips expired events and sets truncated=true.
         // Event 70 is at 8000ms, event 69 at 7900ms; at now=8050 with maxAgeMs=100, cutoff=7950.
@@ -1669,9 +1973,9 @@ mod tests {
                 8050,
             )
             .unwrap();
-        assert!(aged.truncated);
-        assert_eq!(aged.events.len(), 1);
-        assert_eq!(aged.events[0].data["data"]["i"], 70);
+        assert!(aged.value.truncated);
+        assert_eq!(aged.value.events.len(), 1);
+        assert_eq!(aged.value.events[0].data["data"]["i"], 70);
 
         // Evicted seq sets truncated=true and still delivers surviving ring records.
         let (small_bus, _) = test_bus(2, 1 << 20, 8, 1 << 20);
@@ -1691,11 +1995,11 @@ mod tests {
                 100,
             )
             .unwrap();
-        assert!(evicted.truncated);
-        assert_eq!(evicted.events.len(), 2);
-        assert_eq!(evicted.events[0].data["data"]["i"], 3);
-        assert_eq!(evicted.events[1].data["data"]["i"], 4);
-        assert_eq!(evicted.cursor, "ep000001:4");
+        assert!(evicted.value.truncated);
+        assert_eq!(evicted.value.events.len(), 2);
+        assert_eq!(evicted.value.events[0].data["data"]["i"], 3);
+        assert_eq!(evicted.value.events[1].data["data"]["i"], 4);
+        assert_eq!(evicted.value.cursor, "ep000001:4");
 
         // Unknown event type returns -32023 NotFound with kind=event.
         let not_found = small_bus
@@ -1730,16 +2034,16 @@ mod tests {
                 5_600,
             )
             .unwrap();
-        let active = sub.initial_active();
-        assert!(active.truncated);
-        assert_eq!(active.cursor, "ep000001:1");
+        let active = sub.initial_active().unwrap();
+        assert!(active.value.truncated);
+        assert_eq!(active.value.cursor, "ep000001:1");
         drop(sub);
 
         let mut resumed = bus
             .subscribe_at(
                 SubscribeRequest {
                     name: EVENT_EXTERNAL.to_owned(),
-                    cursor: Some(active.cursor),
+                    cursor: Some(active.value.cursor),
                     ..Default::default()
                 },
                 None,
@@ -1747,12 +2051,13 @@ mod tests {
             )
             .unwrap();
         for id in ["fresh", "later"] {
-            let StreamItem::Event(event) = resumed.next().await.unwrap() else {
+            let item = resumed.next().await.unwrap().unwrap();
+            let StreamItem::Event(event) = &item.value else {
                 panic!("expected replay event");
             };
             assert_eq!(event.data["upstreamEventId"], id);
         }
-        assert_eq!(resumed.current_cursor(), "ep000001:3");
+        assert_eq!(resumed.current_cursor().unwrap().value, "ep000001:3");
 
         let expired = bus
             .subscribe_at(
@@ -1766,8 +2071,8 @@ mod tests {
                 10_000,
             )
             .unwrap();
-        assert!(expired.initial_active().truncated);
-        assert_eq!(expired.initial_active().cursor, "ep000001:3");
+        assert!(expired.initial_active().unwrap().value.truncated);
+        assert_eq!(expired.initial_active().unwrap().value.cursor, "ep000001:3");
     }
 
     #[tokio::test]
@@ -1783,15 +2088,16 @@ mod tests {
                 None,
             )
             .unwrap();
-        let active = sub.initial_active();
-        assert_eq!(active.heartbeat_ms, MAX_HEARTBEAT_MS);
-        assert!(!active.truncated);
-        assert_eq!(active.cursor, "ep000001:0");
+        let active = sub.initial_active().unwrap();
+        assert_eq!(active.value.heartbeat_ms, MAX_HEARTBEAT_MS);
+        assert!(!active.value.truncated);
+        assert_eq!(active.value.cursor, "ep000001:0");
 
         // Normal live event.
         bus.publish_external(ext_input("gh", "live-1", "pr", json!({"ok": true})))
             .unwrap();
-        match sub.next().await.unwrap() {
+        let item = sub.next().await.unwrap().unwrap();
+        match &item.value {
             StreamItem::Event(ev) => {
                 assert_eq!(ev.cursor, "ep000001:1");
                 assert_eq!(ev.name, EVENT_EXTERNAL);
@@ -1804,7 +2110,8 @@ mod tests {
             bus.publish_external(ext_input("gh", &format!("lag-{i}"), "pr", json!({"i": i})))
                 .unwrap();
         }
-        match sub.next().await.unwrap() {
+        let item = sub.next().await.unwrap().unwrap();
+        match &item.value {
             StreamItem::Active(notice) => {
                 assert!(notice.truncated);
                 assert_eq!(notice.cursor, "ep000001:5");
@@ -1816,7 +2123,8 @@ mod tests {
         // Stream stays alive and delivers subsequent events.
         bus.publish_external(ext_input("gh", "after-lag", "pr", json!({"ok": 6})))
             .unwrap();
-        match sub.next().await.unwrap() {
+        let item = sub.next().await.unwrap().unwrap();
+        match &item.value {
             StreamItem::Event(ev) => {
                 assert_eq!(ev.cursor, "ep000001:6");
                 assert_eq!(ev.data["data"]["ok"], 6);

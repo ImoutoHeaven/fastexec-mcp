@@ -39,6 +39,11 @@ impl<T> Owned<T> {
         Self { value, owner }
     }
 
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Owned<U> {
+        let Self { value, owner } = self;
+        Owned::new(f(value), owner)
+    }
+
     /// A derived value may reserve additional buffers while keeping its input owner.
     pub fn flat_map<U>(self, f: impl FnOnce(T) -> Owned<U>) -> Owned<U> {
         let Self { value, owner } = self;
@@ -768,9 +773,29 @@ impl From<crate::events::EventError> for IpcEventError {
     fn from(err: crate::events::EventError) -> Self {
         Self {
             code: err.code(),
-            message: err.to_string(),
             data: err.data(),
+            message: match err {
+                crate::events::EventError::InvalidParams(message)
+                | crate::events::EventError::NotFound { message, .. }
+                | crate::events::EventError::Forbidden(message)
+                | crate::events::EventError::ResourceExhausted { message, .. } => message,
+            },
         }
+    }
+}
+
+impl From<IpcEventError> for serde_json::Value {
+    fn from(error: IpcEventError) -> Self {
+        let mut value = serde_json::Map::new();
+        value.insert("code".to_owned(), error.code.into());
+        value.insert(
+            "message".to_owned(),
+            serde_json::Value::String(error.message),
+        );
+        if let Some(data) = error.data {
+            value.insert("data".to_owned(), data);
+        }
+        serde_json::Value::Object(value)
     }
 }
 

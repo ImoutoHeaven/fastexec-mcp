@@ -492,21 +492,48 @@ impl Endpoint {
         Ok(link)
     }
 
+    fn event_link_error(
+        &self,
+        message: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> ipc::Owned<ipc::IpcEventError> {
+        let message = message.into();
+        let bytes = message.len().saturating_add(256);
+        if let Some(lease) = self
+            .memory()
+            .try_acquire(bytes)
+            .or_else(|| self.control_memory().try_acquire(bytes))
+        {
+            ipc::Owned::new(
+                ipc::IpcEventError {
+                    code: -32603,
+                    message: message.into_owned(),
+                    data: None,
+                },
+                crate::lease::Owner::new(lease),
+            )
+        } else {
+            ipc::Owned::new(
+                ipc::IpcEventError {
+                    code: -32025,
+                    message: String::new(),
+                    data: None,
+                },
+                crate::lease::Owner::default(),
+            )
+        }
+    }
+
     /// Lists event types from the daemon.
     pub async fn events_list(
         &self,
         client_name: &str,
         cancel: CancellationToken,
-    ) -> Result<crate::events::EventsListResult, ipc::IpcEventError> {
+    ) -> Result<ipc::Owned<crate::events::EventsListResult>, ipc::Owned<ipc::IpcEventError>> {
         let deadline = std::time::Instant::now() + runtime::START_WAIT;
-        let link =
-            self.link(client_name, deadline)
-                .await
-                .map_err(|message| ipc::IpcEventError {
-                    code: -32603,
-                    message,
-                    data: None,
-                })?;
+        let link = self
+            .link(client_name, deadline)
+            .await
+            .map_err(|message| self.event_link_error(message))?;
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel(EVENT_RPC_CHANNEL_CAPACITY);
         lock(&link.event_pending).insert(id, tx);
@@ -520,32 +547,24 @@ impl Endpoint {
         {
             Ok(Ok(true)) => {}
             _ => {
-                return Err(ipc::IpcEventError {
-                    code: -32603,
-                    message: "failed to send events/list to fastexec daemon".to_owned(),
-                    data: None,
-                });
+                return Err(self.event_link_error("failed to send events/list to fastexec daemon"));
             }
         }
         let frame = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                return Err(ipc::IpcEventError {
-                    code: -32603,
-                    message: "events/list cancelled".to_owned(),
-                    data: None,
-                });
+                return Err(self.event_link_error("events/list cancelled"));
             }
             frame = rx.recv() => frame,
         };
         match frame {
-            Some((ipc::EventWireFrame::ListResult(res), _lease)) => Ok(res),
-            Some((ipc::EventWireFrame::Error(err), _lease)) => Err(err),
-            _ => Err(ipc::IpcEventError {
-                code: -32603,
-                message: "daemon connection closed during events/list".to_owned(),
-                data: None,
-            }),
+            Some((ipc::EventWireFrame::ListResult(res), lease)) => {
+                Ok(ipc::Owned::new(res, crate::lease::Owner::new(lease)))
+            }
+            Some((ipc::EventWireFrame::Error(err), lease)) => {
+                Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
+            }
+            _ => Err(self.event_link_error("daemon connection closed during events/list")),
         }
     }
 
@@ -555,16 +574,12 @@ impl Endpoint {
         client_name: &str,
         request: crate::events::PollRequest,
         cancel: CancellationToken,
-    ) -> Result<crate::events::PollResponse, ipc::IpcEventError> {
+    ) -> Result<ipc::Owned<crate::events::PollResponse>, ipc::Owned<ipc::IpcEventError>> {
         let deadline = std::time::Instant::now() + runtime::START_WAIT;
-        let link =
-            self.link(client_name, deadline)
-                .await
-                .map_err(|message| ipc::IpcEventError {
-                    code: -32603,
-                    message,
-                    data: None,
-                })?;
+        let link = self
+            .link(client_name, deadline)
+            .await
+            .map_err(|message| self.event_link_error(message))?;
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel(EVENT_RPC_CHANNEL_CAPACITY);
         lock(&link.event_pending).insert(id, tx);
@@ -578,32 +593,24 @@ impl Endpoint {
         {
             Ok(Ok(true)) => {}
             _ => {
-                return Err(ipc::IpcEventError {
-                    code: -32603,
-                    message: "failed to send events/poll to fastexec daemon".to_owned(),
-                    data: None,
-                });
+                return Err(self.event_link_error("failed to send events/poll to fastexec daemon"));
             }
         }
         let frame = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                return Err(ipc::IpcEventError {
-                    code: -32603,
-                    message: "events/poll cancelled".to_owned(),
-                    data: None,
-                });
+                return Err(self.event_link_error("events/poll cancelled"));
             }
             frame = rx.recv() => frame,
         };
         match frame {
-            Some((ipc::EventWireFrame::PollResult(res), _lease)) => Ok(res),
-            Some((ipc::EventWireFrame::Error(err), _lease)) => Err(err),
-            _ => Err(ipc::IpcEventError {
-                code: -32603,
-                message: "daemon connection closed during events/poll".to_owned(),
-                data: None,
-            }),
+            Some((ipc::EventWireFrame::PollResult(res), lease)) => {
+                Ok(ipc::Owned::new(res, crate::lease::Owner::new(lease)))
+            }
+            Some((ipc::EventWireFrame::Error(err), lease)) => {
+                Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
+            }
+            _ => Err(self.event_link_error("daemon connection closed during events/poll")),
         }
     }
 
@@ -614,16 +621,15 @@ impl Endpoint {
         client_name: &str,
         request: crate::events::SubscribeRequest,
         cancel: CancellationToken,
-    ) -> Result<(crate::events::ActiveNotice, EndpointEventStream), ipc::IpcEventError> {
+    ) -> Result<
+        (ipc::Owned<crate::events::ActiveNotice>, EndpointEventStream),
+        ipc::Owned<ipc::IpcEventError>,
+    > {
         let deadline = std::time::Instant::now() + runtime::START_WAIT;
-        let link =
-            self.link(client_name, deadline)
-                .await
-                .map_err(|message| ipc::IpcEventError {
-                    code: -32603,
-                    message,
-                    data: None,
-                })?;
+        let link = self
+            .link(client_name, deadline)
+            .await
+            .map_err(|message| self.event_link_error(message))?;
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel(EVENT_STREAM_CHANNEL_CAPACITY);
         lock(&link.event_pending).insert(id, tx);
@@ -639,29 +645,23 @@ impl Endpoint {
                 reg.arm_cancel();
             }
             _ => {
-                return Err(ipc::IpcEventError {
-                    code: -32603,
-                    message: "failed to send events/stream to fastexec daemon".to_owned(),
-                    data: None,
-                });
+                return Err(
+                    self.event_link_error("failed to send events/stream to fastexec daemon")
+                );
             }
         }
         let first = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                return Err(ipc::IpcEventError {
-                    code: -32603,
-                    message: "events/stream cancelled".to_owned(),
-                    data: None,
-                });
+                return Err(self.event_link_error("events/stream cancelled"));
             }
             frame = rx.recv() => frame,
         };
         match first {
-            Some((ipc::EventWireFrame::Active(active), _lease)) => {
+            Some((ipc::EventWireFrame::Active(active), lease)) => {
                 reg.disarm();
                 Ok((
-                    active,
+                    ipc::Owned::new(active, crate::lease::Owner::new(lease)),
                     EndpointEventStream {
                         link,
                         id,
@@ -670,18 +670,15 @@ impl Endpoint {
                     },
                 ))
             }
-            Some((ipc::EventWireFrame::Error(err), _lease)) => {
+            Some((ipc::EventWireFrame::Error(err), lease)) => {
                 // Daemon rejected setup; no server-side stream exists to cancel.
                 reg.cancel_on_drop = false;
-                Err(err)
+                Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
             }
             _ => {
                 reg.cancel_on_drop = false;
-                Err(ipc::IpcEventError {
-                    code: -32603,
-                    message: "daemon connection closed before events/stream activated".to_owned(),
-                    data: None,
-                })
+                Err(self
+                    .event_link_error("daemon connection closed before events/stream activated"))
             }
         }
     }
@@ -1181,6 +1178,149 @@ mod tests {
             .await
             .expect("the peer finished")
             .expect("the peer did not panic");
+    }
+
+    #[tokio::test]
+    async fn event_rpc_outputs_keep_decoded_leases_after_return() {
+        let (identity, paths, mut listener, _target) = test_daemon("events-output-owners");
+        let welcome = welcome(&identity);
+        let peer = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Hello { .. })
+            ));
+            ipc::write_frame(&mut conn, &welcome).await.unwrap();
+            let mut replies = 0;
+            loop {
+                let request = ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (id, frame) = match request {
+                    ToDaemon::EventsList { id } => (
+                        id,
+                        ipc::EventWireFrame::ListResult(crate::events::EventsListResult {
+                            result_type: "complete".into(),
+                            events: vec![crate::events::EventTypeDescriptor {
+                                name: "external.event".into(),
+                                description: "event documentation ".repeat(256).into(),
+                                delivery: vec!["push".into(), "poll".into()],
+                                input_schema: serde_json::json!({"type": "object"}),
+                                payload_schema: serde_json::json!({"type": "object"}),
+                            }],
+                        }),
+                    ),
+                    ToDaemon::EventsPoll { id, .. } if replies == 1 => (
+                        id,
+                        ipc::EventWireFrame::PollResult(crate::events::PollResponse {
+                            result_type: "complete".into(),
+                            events: vec![crate::events::PolledEvent {
+                                event_id: "eeeeeeee-1".to_owned(),
+                                name: "external.event".to_owned(),
+                                timestamp: "2026-11-22T00:00:00.000Z".to_owned(),
+                                data: serde_json::Value::String("x".repeat(4096)),
+                            }],
+                            cursor: "eeeeeeee:1".to_owned(),
+                            truncated: false,
+                            has_more: false,
+                            next_poll_ms: 2000,
+                        }),
+                    ),
+                    ToDaemon::EventsStream { id, .. } => (
+                        id,
+                        ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                            cursor: "eeeeeeee:1".to_owned(),
+                            truncated: false,
+                            heartbeat_ms: 30_000,
+                        }),
+                    ),
+                    ToDaemon::EventsPoll { id, .. } => (
+                        id,
+                        ipc::EventWireFrame::Error(ipc::IpcEventError {
+                            code: -32025,
+                            message: "event output is temporarily unavailable".to_owned(),
+                            data: Some(serde_json::Value::String("details ".repeat(512))),
+                        }),
+                    ),
+                    ToDaemon::EventsCancel { .. } => continue,
+                    ToDaemon::Bye => {
+                        assert_eq!(replies, 4);
+                        break;
+                    }
+                    other => panic!("unexpected event request: {other:?}"),
+                };
+                ipc::write_frame(&mut conn, &ToEndpoint::EventFrame { id, frame })
+                    .await
+                    .unwrap();
+                replies += 1;
+            }
+        });
+        let pool = crate::lease::BytePool::new(256 << 10);
+        let mut endpoint = Endpoint::for_test(identity, paths);
+        endpoint.launch = Arc::new(
+            LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(Arc::clone(&pool))
+                .with_control_memory(crate::lease::BytePool::new(0)),
+        );
+        let list = endpoint
+            .events_list("test", CancellationToken::new())
+            .await
+            .unwrap();
+        let request = crate::events::PollRequest {
+            name: "external.event".to_owned(),
+            ..Default::default()
+        };
+        let poll = endpoint
+            .events_poll("test", request.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let (active, mut stream) = endpoint
+            .events_stream(
+                "test",
+                crate::events::SubscribeRequest {
+                    name: "external.event".to_owned(),
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        stream.cancel().await;
+        let error = endpoint
+            .events_poll("test", request, CancellationToken::new())
+            .await
+            .unwrap_err();
+        let data_ptr = error
+            .value
+            .data
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        let outputs = [
+            list.map(serde_json::Value::from),
+            poll.map(serde_json::Value::from),
+            active.map(serde_json::Value::from),
+            error.map(crate::event_error_payload),
+        ];
+        assert_eq!(
+            outputs[3].value["error"]["data"].as_str().unwrap().as_ptr(),
+            data_ptr
+        );
+        let bytes: usize = outputs
+            .iter()
+            .map(|output| output.owner.get::<crate::lease::Lease>().unwrap().bytes())
+            .sum();
+        assert!(bytes > 8192);
+        endpoint.bye().await;
+        finish(peer).await;
+        assert_eq!(pool.used(), bytes);
+        drop(outputs);
+        assert_eq!(pool.used(), 0);
     }
 
     #[tokio::test]
