@@ -1695,7 +1695,7 @@ fn queue_event_frame(
         closing.cancel();
         return false;
     };
-    let Ok(bytes) = ipc::encode_frame(&message) else {
+    let Ok(bytes) = ipc::encode_measured(&message, length) else {
         return false;
     };
     drop(message);
