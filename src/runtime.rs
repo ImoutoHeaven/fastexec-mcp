@@ -82,12 +82,27 @@ fn digest(parts: &[&[u8]]) -> String {
 /// context has one, else the canonical path of the image, so two copies of one image share a
 /// daemon only when asked to.
 pub fn identity(launch: &LaunchContext) -> io::Result<Identity> {
+    identity_with_namespace(launch, None)
+}
+
+/// Same as [`identity`], allowing an explicit namespace override (e.g. `--namespace`).
+pub fn identity_with_namespace(
+    launch: &LaunchContext,
+    namespace_override: Option<&std::ffi::OsStr>,
+) -> io::Result<Identity> {
     let build = build_id()?;
     // The scope is hashed as the OS bytes it is, so two names that only differ outside UTF-8
     // still get a namespace each.
-    let scope: Vec<u8> = match launch.var("FASTEXEC_NAMESPACE") {
-        Some(value) if !value.is_empty() => value.as_encoded_bytes().to_vec(),
-        _ => std::fs::canonicalize(image_path()?)?
+    let raw_ns = namespace_override
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            launch
+                .var("FASTEXEC_NAMESPACE")
+                .filter(|value| !value.is_empty())
+        });
+    let scope: Vec<u8> = match raw_ns {
+        Some(value) => value.as_encoded_bytes().to_vec(),
+        None => std::fs::canonicalize(image_path()?)?
             .as_os_str()
             .as_encoded_bytes()
             .to_vec(),

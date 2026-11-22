@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{ReadHalf, WriteHalf};
-use tokio::sync::{Mutex, OnceCell, oneshot, watch};
+use tokio::sync::{Mutex, OnceCell, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Total deadline for queueing on the request writer and sending a call frame (not response read).
@@ -58,10 +58,70 @@ struct Link {
     epoch: String,
     writer: Mutex<Writer>,
     pending: std::sync::Mutex<HashMap<u64, Pending>>,
+    event_pending: std::sync::Mutex<HashMap<u64, mpsc::UnboundedSender<ipc::EventWireFrame>>>,
     /// Cancelled when the link ends: every call on it is lost, and the reader stops.
     closed: CancellationToken,
     memory: Arc<crate::lease::BytePool>,
     control_memory: Arc<crate::lease::BytePool>,
+}
+
+/// Removes the event routing entry even if the caller's future is dropped.
+struct EventRegistration<'a> {
+    link: &'a Link,
+    id: u64,
+}
+
+impl Drop for EventRegistration<'_> {
+    fn drop(&mut self) {
+        lock(&self.link.event_pending).remove(&self.id);
+    }
+}
+
+/// Handle to a live daemon-backed `events/stream` subscription.
+pub struct EndpointEventStream {
+    link: Arc<Link>,
+    id: u64,
+    rx: mpsc::UnboundedReceiver<ipc::EventWireFrame>,
+    cancelled: bool,
+}
+
+impl EndpointEventStream {
+    pub async fn next(&mut self) -> Option<ipc::EventWireFrame> {
+        self.rx.recv().await
+    }
+
+    pub async fn cancel(&mut self) {
+        if self.cancelled {
+            return;
+        }
+        self.cancelled = true;
+        lock(&self.link.event_pending).remove(&self.id);
+        let mut attempted = false;
+        let _ = tokio::time::timeout(
+            CANCEL_WAIT,
+            self.link
+                .send(&ToDaemon::EventsCancel { id: self.id }, &mut attempted),
+        )
+        .await;
+    }
+}
+
+impl Drop for EndpointEventStream {
+    fn drop(&mut self) {
+        lock(&self.link.event_pending).remove(&self.id);
+        if !self.cancelled && !self.link.closed.is_cancelled() {
+            let link = Arc::clone(&self.link);
+            let id = self.id;
+            tokio::spawn(async move {
+                let mut attempted = false;
+                let _ = tokio::time::timeout(
+                    CANCEL_WAIT,
+                    link.send(&ToDaemon::EventsCancel { id }, &mut attempted),
+                )
+                .await;
+            });
+        }
+    }
 }
 
 /// A call waiting for its result.
@@ -371,6 +431,7 @@ impl Endpoint {
             epoch,
             writer: Mutex::new(writer),
             pending: std::sync::Mutex::new(HashMap::new()),
+            event_pending: std::sync::Mutex::new(HashMap::new()),
             closed: CancellationToken::new(),
             memory: Arc::clone(self.launch.memory()),
             control_memory: Arc::clone(self.launch.control_memory()),
@@ -384,6 +445,201 @@ impl Endpoint {
         ));
         *slot = Some(Arc::clone(&link));
         Ok(link)
+    }
+
+    /// Lists event types from the daemon.
+    pub async fn events_list(
+        &self,
+        client_name: &str,
+        cancel: CancellationToken,
+    ) -> Result<crate::events::EventsListResult, ipc::IpcEventError> {
+        let deadline = std::time::Instant::now() + runtime::START_WAIT;
+        let link =
+            self.link(client_name, deadline)
+                .await
+                .map_err(|message| ipc::IpcEventError {
+                    code: -32603,
+                    message,
+                    data: None,
+                })?;
+        let id = self.next_call.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        lock(&link.event_pending).insert(id, tx);
+        let _reg = EventRegistration { link: &link, id };
+        let mut attempted = false;
+        match tokio::time::timeout(
+            WRITE_WAIT,
+            link.send(&ToDaemon::EventsList { id }, &mut attempted),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            _ => {
+                return Err(ipc::IpcEventError {
+                    code: -32603,
+                    message: "failed to send events/list to fastexec daemon".to_owned(),
+                    data: None,
+                });
+            }
+        }
+        let frame = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(ipc::IpcEventError {
+                    code: -32603,
+                    message: "events/list cancelled".to_owned(),
+                    data: None,
+                });
+            }
+            frame = rx.recv() => frame,
+        };
+        match frame {
+            Some(ipc::EventWireFrame::ListResult(res)) => Ok(res),
+            Some(ipc::EventWireFrame::Error(err)) => Err(err),
+            _ => Err(ipc::IpcEventError {
+                code: -32603,
+                message: "daemon connection closed during events/list".to_owned(),
+                data: None,
+            }),
+        }
+    }
+
+    /// Polls events from the daemon.
+    pub async fn events_poll(
+        &self,
+        client_name: &str,
+        request: crate::events::PollRequest,
+        cancel: CancellationToken,
+    ) -> Result<crate::events::PollResponse, ipc::IpcEventError> {
+        let deadline = std::time::Instant::now() + runtime::START_WAIT;
+        let link =
+            self.link(client_name, deadline)
+                .await
+                .map_err(|message| ipc::IpcEventError {
+                    code: -32603,
+                    message,
+                    data: None,
+                })?;
+        let id = self.next_call.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        lock(&link.event_pending).insert(id, tx);
+        let _reg = EventRegistration { link: &link, id };
+        let mut attempted = false;
+        match tokio::time::timeout(
+            WRITE_WAIT,
+            link.send(&ToDaemon::EventsPoll { id, request }, &mut attempted),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            _ => {
+                return Err(ipc::IpcEventError {
+                    code: -32603,
+                    message: "failed to send events/poll to fastexec daemon".to_owned(),
+                    data: None,
+                });
+            }
+        }
+        let frame = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(ipc::IpcEventError {
+                    code: -32603,
+                    message: "events/poll cancelled".to_owned(),
+                    data: None,
+                });
+            }
+            frame = rx.recv() => frame,
+        };
+        match frame {
+            Some(ipc::EventWireFrame::PollResult(res)) => Ok(res),
+            Some(ipc::EventWireFrame::Error(err)) => Err(err),
+            _ => Err(ipc::IpcEventError {
+                code: -32603,
+                message: "daemon connection closed during events/poll".to_owned(),
+                data: None,
+            }),
+        }
+    }
+
+    /// Opens an `events/stream` subscription on the daemon. Returns the initial `ActiveNotice`
+    /// and the live stream handle, or an `IpcEventError` if subscription setup failed.
+    pub async fn events_stream(
+        &self,
+        client_name: &str,
+        request: crate::events::SubscribeRequest,
+        cancel: CancellationToken,
+    ) -> Result<(crate::events::ActiveNotice, EndpointEventStream), ipc::IpcEventError> {
+        let deadline = std::time::Instant::now() + runtime::START_WAIT;
+        let link =
+            self.link(client_name, deadline)
+                .await
+                .map_err(|message| ipc::IpcEventError {
+                    code: -32603,
+                    message,
+                    data: None,
+                })?;
+        let id = self.next_call.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        lock(&link.event_pending).insert(id, tx);
+        let mut attempted = false;
+        match tokio::time::timeout(
+            WRITE_WAIT,
+            link.send(&ToDaemon::EventsStream { id, request }, &mut attempted),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            _ => {
+                lock(&link.event_pending).remove(&id);
+                return Err(ipc::IpcEventError {
+                    code: -32603,
+                    message: "failed to send events/stream to fastexec daemon".to_owned(),
+                    data: None,
+                });
+            }
+        }
+        let first = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                lock(&link.event_pending).remove(&id);
+                let mut cancel_attempted = false;
+                let _ = tokio::time::timeout(
+                    CANCEL_WAIT,
+                    link.send(&ToDaemon::EventsCancel { id }, &mut cancel_attempted),
+                )
+                .await;
+                return Err(ipc::IpcEventError {
+                    code: -32603,
+                    message: "events/stream cancelled".to_owned(),
+                    data: None,
+                });
+            }
+            frame = rx.recv() => frame,
+        };
+        match first {
+            Some(ipc::EventWireFrame::Active(active)) => Ok((
+                active,
+                EndpointEventStream {
+                    link,
+                    id,
+                    rx,
+                    cancelled: false,
+                },
+            )),
+            Some(ipc::EventWireFrame::Error(err)) => {
+                lock(&link.event_pending).remove(&id);
+                Err(err)
+            }
+            _ => {
+                lock(&link.event_pending).remove(&id);
+                Err(ipc::IpcEventError {
+                    code: -32603,
+                    message: "daemon connection closed before events/stream activated".to_owned(),
+                    data: None,
+                })
+            }
+        }
     }
 
     /// The call may have run, so it is reported, never replayed.
@@ -483,6 +739,12 @@ async fn read_loop(
                     drop(lease);
                 }
             }
+            Some(ipc::LeasedEndpointFrame::Frame(ToEndpoint::EventFrame { id, frame }, _lease)) => {
+                let sender = lock(&link.event_pending).get(&id).cloned();
+                if let Some(tx) = sender {
+                    let _ = tx.send(frame);
+                }
+            }
             Some(ipc::LeasedEndpointFrame::OverloadProgress) => {}
             Some(ipc::LeasedEndpointFrame::OverloadResult { id: Some(id) }) => {
                 let entry = lock(&link.pending).remove(&id);
@@ -503,6 +765,7 @@ async fn read_loop(
     link.closed.cancel();
     // Dropping the senders is what makes a waiting call see the link end.
     lock(&link.pending).clear();
+    lock(&link.event_pending).clear();
     drop(reader);
     // A reconnect holds the slot while handshaking; do not keep the old writer alive behind it.
     let ended = Arc::downgrade(&link);

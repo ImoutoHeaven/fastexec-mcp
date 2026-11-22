@@ -1,12 +1,12 @@
 //! Bounded in-memory event bus for MCP Events (`task.exited` and `external.event`).
 
-#![allow(dead_code)]
-
 use crate::lease::{self, BytePool, Lease};
 use crate::tasks::{self, Snapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -18,6 +18,8 @@ pub const DEFAULT_MAX_EVENTS: usize = 4096;
 pub const DEFAULT_MAX_BYTES: usize = 8 << 20;
 pub const MAX_EXTERNAL_EVENT_BYTES: usize = 64 * 1024;
 pub const MAX_POLL_EVENTS: usize = 64;
+pub const MAX_SESSION_CURSORS: usize = 4096;
+pub const MAX_EVENT_STREAMS: usize = 64;
 pub const POLL_NEXT_ACTIVE_MS: u64 = 2000;
 pub const POLL_NEXT_IDLE_MS: u64 = 5000;
 pub const DEFAULT_HEARTBEAT_MS: u64 = 30_000;
@@ -118,9 +120,9 @@ impl std::error::Error for EventError {}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EventTypeDescriptor {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub delivery: Vec<&'static str>,
+    pub name: Cow<'static, str>,
+    pub description: Cow<'static, str>,
+    pub delivery: Vec<Cow<'static, str>>,
     pub input_schema: Value,
     pub payload_schema: Value,
 }
@@ -128,7 +130,7 @@ pub struct EventTypeDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EventsListResult {
-    pub result_type: &'static str,
+    pub result_type: Cow<'static, str>,
     pub events: Vec<EventTypeDescriptor>,
 }
 
@@ -170,7 +172,7 @@ impl TaskExitedInput {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalEventInput {
     /// Optional explicit event type; external callers may only emit `external.event`.
@@ -194,7 +196,7 @@ pub struct PublishResult {
     pub deduplicated: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PollRequest {
     pub name: String,
@@ -221,7 +223,7 @@ pub struct PolledEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PollResponse {
-    pub result_type: &'static str,
+    pub result_type: Cow<'static, str>,
     pub events: Vec<PolledEvent>,
     pub cursor: String,
     pub truncated: bool,
@@ -229,7 +231,7 @@ pub struct PollResponse {
     pub next_poll_ms: u64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscribeRequest {
     pub name: String,
@@ -462,7 +464,8 @@ struct BusState {
     next_seq: u64,
     ring_bytes: usize,
     dedup: HashMap<(String, String), u64>,
-    session_cursors: HashMap<String, u64>,
+    session_cursors: HashMap<String, (u64, u64)>,
+    session_cursor_clock: u64,
 }
 
 impl BusState {
@@ -473,6 +476,7 @@ impl BusState {
             ring_bytes: 0,
             dedup: HashMap::new(),
             session_cursors: HashMap::new(),
+            session_cursor_clock: 0,
         }
     }
 
@@ -510,9 +514,23 @@ pub struct EventBus {
     boot_epoch: String,
     max_events: usize,
     max_bytes: usize,
+    max_session_cursors: usize,
+    max_streams: usize,
+    active_streams: AtomicUsize,
     pool: Arc<BytePool>,
     state: Mutex<BusState>,
     tx: broadcast::Sender<Arc<EventRecord>>,
+}
+
+/// RAII guard tracking an active `events/stream` across HTTP, stdio, and daemon IPC.
+pub struct StreamGuard {
+    bus: Arc<EventBus>,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.bus.active_streams.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl EventBus {
@@ -539,6 +557,9 @@ impl EventBus {
             boot_epoch,
             max_events: max_events.max(1),
             max_bytes: max_bytes.max(1),
+            max_session_cursors: MAX_SESSION_CURSORS,
+            max_streams: MAX_EVENT_STREAMS,
+            active_streams: AtomicUsize::new(0),
             pool,
             state: Mutex::new(BusState::new()),
             tx,
@@ -549,6 +570,37 @@ impl EventBus {
         &self.boot_epoch
     }
 
+    pub fn active_streams(&self) -> usize {
+        self.active_streams.load(Ordering::Acquire)
+    }
+
+    pub fn try_acquire_stream(self: &Arc<Self>) -> Result<StreamGuard, EventError> {
+        let mut current = self.active_streams.load(Ordering::Acquire);
+        loop {
+            if current >= self.max_streams {
+                return Err(EventError::ResourceExhausted {
+                    limit: "active_event_streams",
+                    max: self.max_streams,
+                    message: format!("active event streams reached limit ({})", self.max_streams),
+                });
+            }
+            match self.active_streams.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(StreamGuard {
+                        bus: Arc::clone(self),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub fn current_cursor(&self) -> String {
         let state = lock(&self.state);
         format_cursor(&self.boot_epoch, state.latest_seq())
@@ -556,12 +608,14 @@ impl EventBus {
 
     pub fn list_event_types(&self) -> EventsListResult {
         EventsListResult {
-            result_type: "complete",
+            result_type: Cow::Borrowed("complete"),
             events: vec![
                 EventTypeDescriptor {
-                    name: EVENT_TASK_EXITED,
-                    description: "Emitted when a fastexec task exits, is killed, or expires.",
-                    delivery: vec!["push", "poll"],
+                    name: Cow::Borrowed(EVENT_TASK_EXITED),
+                    description: Cow::Borrowed(
+                        "Emitted when a fastexec task exits, is killed, or expires.",
+                    ),
+                    delivery: vec![Cow::Borrowed("push"), Cow::Borrowed("poll")],
                     input_schema: json!({
                         "type": "object",
                         "properties": {
@@ -586,9 +640,9 @@ impl EventBus {
                     }),
                 },
                 EventTypeDescriptor {
-                    name: EVENT_EXTERNAL,
-                    description: "External event injected via fastexec daemon emit.",
-                    delivery: vec!["push", "poll"],
+                    name: Cow::Borrowed(EVENT_EXTERNAL),
+                    description: Cow::Borrowed("External event injected via fastexec daemon emit."),
+                    delivery: vec![Cow::Borrowed("push"), Cow::Borrowed("poll")],
                     input_schema: json!({
                         "type": "object",
                         "properties": {
@@ -845,7 +899,7 @@ impl EventBus {
         let latest_seq = state.latest_seq();
         let Some(raw_cursor) = request.cursor.as_deref() else {
             return Ok(PollResponse {
-                result_type: "complete",
+                result_type: Cow::Borrowed("complete"),
                 events: Vec::new(),
                 cursor: format_cursor(&self.boot_epoch, latest_seq),
                 truncated: false,
@@ -862,7 +916,7 @@ impl EventBus {
 
         if cursor_epoch != self.boot_epoch || cursor_seq > latest_seq {
             return Ok(PollResponse {
-                result_type: "complete",
+                result_type: Cow::Borrowed("complete"),
                 events: Vec::new(),
                 cursor: format_cursor(&self.boot_epoch, latest_seq),
                 truncated: true,
@@ -876,9 +930,7 @@ impl EventBus {
             None => cursor_seq < latest_seq,
         };
 
-        let cutoff_ms = request
-            .max_age_ms
-            .map(|age| now_ms.saturating_sub(age));
+        let cutoff_ms = request.max_age_ms.map(|age| now_ms.saturating_sub(age));
 
         let mut events = Vec::new();
         let mut last_returned_seq = cursor_seq;
@@ -919,7 +971,7 @@ impl EventBus {
         };
 
         Ok(PollResponse {
-            result_type: "complete",
+            result_type: Cow::Borrowed("complete"),
             events,
             cursor: format_cursor(&self.boot_epoch, next_cursor_seq),
             truncated,
@@ -1015,7 +1067,10 @@ impl EventBus {
     /// exists. Never includes untrusted `data`.
     pub fn peek_external_background_summary(&self, session_id: &str) -> Option<(String, u64)> {
         let state = lock(&self.state);
-        let last_seen = state.session_cursors.get(session_id).copied().unwrap_or(0);
+        let last_seen = state
+            .session_cursors
+            .get(session_id)
+            .map_or(0, |&(seq, _)| seq);
         let mut total = 0usize;
         let mut newest_seq = last_seen;
         let mut group_order: Vec<String> = Vec::new();
@@ -1073,16 +1128,36 @@ impl EventBus {
     /// Advances the session's `background()` external-event cursor after a notice is committed.
     pub fn commit_external_background_cursor(&self, session_id: &str, seq: u64) {
         let mut state = lock(&self.state);
-        let entry = state
-            .session_cursors
-            .entry(session_id.to_owned())
-            .or_insert(0);
-        if seq > *entry {
-            *entry = seq;
+        state.session_cursor_clock = state.session_cursor_clock.saturating_add(1);
+        let tick = state.session_cursor_clock;
+        if let Some((cur, last_tick)) = state.session_cursors.get_mut(session_id) {
+            if seq > *cur {
+                *cur = seq;
+            }
+            *last_tick = tick;
+            return;
         }
+        if state.session_cursors.len() >= self.max_session_cursors
+            && let Some(oldest_key) = state
+                .session_cursors
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+        {
+            state.session_cursors.remove(&oldest_key);
+        }
+        state
+            .session_cursors
+            .insert(session_id.to_owned(), (seq, tick));
+    }
+
+    /// Removes a session's stored `background()` external-event cursor on session teardown.
+    pub fn remove_session(&self, session_id: &str) {
+        lock(&self.state).session_cursors.remove(session_id);
     }
 
     /// Convenience wrapper that reads and immediately commits the session's external-event summary.
+    #[cfg(test)]
     pub fn external_background_summary(&self, session_id: &str) -> Option<String> {
         let (summary, seq) = self.peek_external_background_summary(session_id)?;
         self.commit_external_background_cursor(session_id, seq);
@@ -1336,10 +1411,11 @@ mod tests {
         let (bus, _) = test_bus(64, 1 << 20, 16, 2 << 20);
         let list = bus.list_event_types();
         assert_eq!(list.result_type, "complete");
-        let names: Vec<&str> = list.events.iter().map(|e| e.name).collect();
+        let names: Vec<&str> = list.events.iter().map(|e| e.name.as_ref()).collect();
         assert_eq!(names, vec![EVENT_TASK_EXITED, EVENT_EXTERNAL]);
         for desc in &list.events {
-            assert_eq!(desc.delivery, vec!["push", "poll"]);
+            let delivery: Vec<&str> = desc.delivery.iter().map(AsRef::as_ref).collect();
+            assert_eq!(delivery, vec!["push", "poll"]);
             assert_eq!(desc.input_schema["type"], "object");
             assert_eq!(desc.payload_schema["type"], "object");
         }
@@ -1743,5 +1819,54 @@ mod tests {
             format_rfc3339_ms(1_700_000_000_123),
             "2023-11-14T22:13:20.123Z"
         );
+    }
+
+    #[test]
+    fn remove_session_clears_cursor_and_evicts_oldest_when_capped() {
+        let pool = BytePool::new(1 << 20);
+        let mut bus = EventBus::with_config("ep000002".to_owned(), 32, 1 << 20, 16, pool);
+        bus.max_session_cursors = 3;
+        bus.publish_external(ext_input("gh", "e1", "push", json!({})))
+            .unwrap();
+
+        assert!(bus.external_background_summary("s1").is_some());
+        assert!(bus.external_background_summary("s1").is_none());
+        bus.remove_session("s1");
+        assert!(bus.external_background_summary("s1").is_some());
+
+        // Touch s2, s3, then s4: cap is 3 so oldest (s1) is evicted.
+        assert!(bus.external_background_summary("s2").is_some());
+        assert!(bus.external_background_summary("s3").is_some());
+        assert!(bus.external_background_summary("s4").is_some());
+        assert_eq!(lock(&bus.state).session_cursors.len(), 3);
+        assert!(!lock(&bus.state).session_cursors.contains_key("s1"));
+        assert!(lock(&bus.state).session_cursors.contains_key("s4"));
+    }
+
+    #[test]
+    fn stream_guard_enforces_active_stream_limit_and_releases_on_drop() {
+        let pool = BytePool::new(1 << 20);
+        let mut raw_bus = EventBus::with_config("ep000003".to_owned(), 16, 1 << 20, 8, pool);
+        raw_bus.max_streams = 2;
+        let bus = Arc::new(raw_bus);
+
+        let g1 = bus.try_acquire_stream().unwrap();
+        let g2 = bus.try_acquire_stream().unwrap();
+        assert_eq!(bus.active_streams(), 2);
+
+        let err = bus.try_acquire_stream().err().unwrap();
+        assert_eq!(err.code(), -32025);
+        assert_eq!(
+            err.data(),
+            Some(json!({ "limit": "active_event_streams", "max": 2 }))
+        );
+
+        drop(g1);
+        assert_eq!(bus.active_streams(), 1);
+        let _g3 = bus.try_acquire_stream().unwrap();
+        assert_eq!(bus.active_streams(), 2);
+        drop(g2);
+        drop(_g3);
+        assert_eq!(bus.active_streams(), 0);
     }
 }

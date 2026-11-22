@@ -1328,7 +1328,8 @@ mod tests {
             if partial {
                 headers.insert(header::RANGE, "bytes=3-".parse().unwrap());
             }
-            let response = transfer_get(Version::HTTP_11, &headers, table.admit(&id).unwrap()).await;
+            let response =
+                transfer_get(Version::HTTP_11, &headers, table.admit(&id).unwrap()).await;
             std::fs::rename(&replacement, &path).unwrap();
             let (status, length, body) = if partial {
                 assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 3-7/8");
@@ -1928,5 +1929,428 @@ mod tests {
         stopped.cancel();
         let _ = server_task.await;
         let _ = conn_task.await;
+    }
+
+    fn real_http_service(
+        bound: SocketAddr,
+    ) -> (
+        StreamableHttpService<Server, Sessions>,
+        Arc<crate::service::Service>,
+    ) {
+        let tasks = crate::tasks::Tasks::new(crate::tasks::Limits::OFF).unwrap();
+        let service = Arc::new(crate::service::Service::new(tasks, true));
+        let launch = Arc::new(LaunchContext::current().unwrap());
+        let tools = Tools {
+            codemode: true,
+            transfer: false,
+            yolo: false,
+        };
+        let render = Render {
+            output_mode: crate::service::OutputMode::Text,
+            structured_content: true,
+        };
+        let (instructions, tool_instructions) =
+            crate::compose_instructions(true, false, None, InstructionsToolMode::Off);
+        let router = Arc::new(Server::build_router(&launch, tools, None));
+        let principals: Arc<[Arc<Session>]> = vec![Session::new(
+            "t1".to_owned(),
+            "http-t1".to_owned(),
+            Arc::clone(&launch),
+        )]
+        .into();
+
+        let svc_clone = Arc::clone(&service);
+        let factory = move || {
+            let backend = Backend::Local {
+                service: Arc::clone(&svc_clone),
+                render,
+                session: Arc::new(OnceLock::new()),
+                launch: Arc::clone(&launch),
+                daemon: true,
+            };
+            let mut server = Server::with_shared(
+                backend,
+                Arc::clone(&router),
+                Arc::clone(&instructions),
+                tool_instructions.clone(),
+                None,
+                tools,
+            );
+            server.principals = Some(Arc::clone(&principals));
+            Ok(server)
+        };
+
+        let mut config = StreamableHttpServerConfig::default();
+        config.legacy_session_mode = true;
+        config.stateless_protocol_metadata_required = false;
+        config.json_response = true;
+        config.sse_keep_alive = Some(Duration::from_secs(15));
+        config.sse_retry = None;
+        config.allowed_hosts = allowed_hosts(bound, false);
+        let sessions = Arc::new(Sessions::new(SessionConfig::default(), MAX_HTTP_SESSIONS));
+        (
+            StreamableHttpService::new(factory, sessions, config),
+            service,
+        )
+    }
+
+    #[tokio::test]
+    async fn three_client_suites_modern_events_modern_plain_and_legacy_2025() {
+        use base64::Engine as _;
+        use tower_service::Service as _;
+
+        let (mut http_svc, core_service) = real_http_service(SocketAddr::from(([127, 0, 0, 1], 0)));
+
+        // --- Suite 1: 2026-07-28 + Events ---
+        // 1a. server/discover advertises io.modelcontextprotocol/events with listChanged: false.
+        let mut disc_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "server/discover")
+            .body(Full::new(modern_post_body(
+                1,
+                "server/discover",
+                serde_json::json!({}),
+            )))
+            .unwrap();
+        disc_req.extensions_mut().insert(Principal(0));
+        let disc_res = http_svc.call(disc_req).await.unwrap();
+        assert_eq!(disc_res.status(), StatusCode::OK);
+        let disc_body: serde_json::Value =
+            serde_json::from_slice(&disc_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            disc_body["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/events"],
+            serde_json::json!({ "listChanged": false })
+        );
+
+        // 1b. events/list returns application/json with resultType: "complete" and v1 events.
+        let mut list_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/list")
+            .body(Full::new(modern_post_body(
+                2,
+                "events/list",
+                serde_json::json!({}),
+            )))
+            .unwrap();
+        list_req.extensions_mut().insert(Principal(0));
+        let list_res = http_svc.call(list_req).await.unwrap();
+        assert_eq!(list_res.status(), StatusCode::OK);
+        assert!(
+            list_res.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        let list_body: serde_json::Value =
+            serde_json::from_slice(&list_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(list_body["result"]["resultType"], "complete");
+        assert_eq!(list_body["result"]["events"].as_array().unwrap().len(), 2);
+
+        // 1c. events/poll with base64 Mcp-Name succeeds (without client declaring events cap).
+        let start_cursor = core_service.event_bus().current_cursor();
+        core_service
+            .event_bus()
+            .publish_external(crate::events::ExternalEventInput {
+                event_type: None,
+                source: "github".to_owned(),
+                topic: Some("pr".to_owned()),
+                name: "merged".to_owned(),
+                upstream_event_id: "u-1".to_owned(),
+                data: serde_json::json!({ "secret": "TOP_SECRET_DATA" }),
+                upstream_truncated: None,
+            })
+            .unwrap();
+        let b64_name = format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode("external.event")
+        );
+        let mut poll_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/poll")
+            .header("mcp-name", b64_name)
+            .body(Full::new(modern_post_body(
+                3,
+                "events/poll",
+                serde_json::json!({
+                    "name": "external.event",
+                    "cursor": start_cursor
+                }),
+            )))
+            .unwrap();
+        poll_req.extensions_mut().insert(Principal(0));
+        let poll_res = http_svc.call(poll_req).await.unwrap();
+        assert_eq!(poll_res.status(), StatusCode::OK);
+        let poll_body: serde_json::Value =
+            serde_json::from_slice(&poll_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(poll_body["result"]["resultType"], "complete");
+        assert_eq!(poll_body["result"]["events"].as_array().unwrap().len(), 1);
+        assert!(poll_body["result"]["events"][0].get("cursor").is_none());
+
+        // 1d. Mcp-Name mismatch -> HTTP 400 + -32020.
+        let mut bad_hdr = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/poll")
+            .header("mcp-name", "task.exited")
+            .body(Full::new(modern_post_body(
+                4,
+                "events/poll",
+                serde_json::json!({ "name": "external.event" }),
+            )))
+            .unwrap();
+        bad_hdr.extensions_mut().insert(Principal(0));
+        let bad_res = http_svc.call(bad_hdr).await.unwrap();
+        assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+        let bad_body: serde_json::Value =
+            serde_json::from_slice(&bad_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(bad_body["error"]["code"], -32020);
+
+        // 1e. Unknown event -> HTTP 200 + -32023; events/subscribe -> HTTP 404 + -32601.
+        let mut unknown_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/poll")
+            .body(Full::new(modern_post_body(
+                5,
+                "events/poll",
+                serde_json::json!({ "name": "no.such.event" }),
+            )))
+            .unwrap();
+        unknown_req.extensions_mut().insert(Principal(0));
+        let unknown_res = http_svc.call(unknown_req).await.unwrap();
+        assert_eq!(unknown_res.status(), StatusCode::OK);
+        let unknown_body: serde_json::Value =
+            serde_json::from_slice(&unknown_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(unknown_body["error"]["code"], -32023);
+        assert_eq!(unknown_body["error"]["data"]["kind"], "event");
+
+        let mut sub_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/subscribe")
+            .body(Full::new(modern_post_body(
+                6,
+                "events/subscribe",
+                serde_json::json!({}),
+            )))
+            .unwrap();
+        sub_req.extensions_mut().insert(Principal(0));
+        let sub_res = http_svc.call(sub_req).await.unwrap();
+        assert_eq!(sub_res.status(), StatusCode::NOT_FOUND);
+
+        // 1f. events/stream delivers active + event with numeric subscriptionId preserved.
+        let stream_cursor = core_service.event_bus().current_cursor();
+        let mut stream_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/stream")
+            .header("mcp-name", "external.event")
+            .body(Full::new(modern_post_body(
+                77,
+                "events/stream",
+                serde_json::json!({
+                    "name": "external.event",
+                    "cursor": stream_cursor
+                }),
+            )))
+            .unwrap();
+        stream_req.extensions_mut().insert(Principal(0));
+        let stream_res = http_svc.call(stream_req).await.unwrap();
+        assert_eq!(stream_res.status(), StatusCode::OK);
+        assert!(
+            stream_res.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream")
+        );
+        let mut stream_body = stream_res.into_body();
+        let first_chunk = tokio::time::timeout(Duration::from_secs(5), stream_body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let first_text = String::from_utf8(first_chunk.to_vec()).unwrap();
+        let active_msg: serde_json::Value = first_text
+            .lines()
+            .find_map(|l| l.strip_prefix("data:"))
+            .map(|d| serde_json::from_str(d.trim()).unwrap())
+            .unwrap();
+        assert_eq!(active_msg["method"], "notifications/events/active");
+        assert_eq!(active_msg["params"]["heartbeatMs"], 30000);
+        // Numeric request id 77 must remain a JSON integer, not "77".
+        assert_eq!(
+            active_msg["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"].as_i64(),
+            Some(77)
+        );
+        drop(stream_body);
+
+        // --- Suite 2: 2026-07-28 without Events ---
+        // Calls tools/call directly; receives JSON response with sanitized external event summary
+        // and never receives any notifications/events/*.
+        let mut call_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "codemode")
+            .body(Full::new(modern_post_body(
+                10,
+                "tools/call",
+                serde_json::json!({
+                    "name": "codemode",
+                    "arguments": { "code": "return 42" }
+                }),
+            )))
+            .unwrap();
+        call_req.extensions_mut().insert(Principal(0));
+        let call_res = http_svc.call(call_req).await.unwrap();
+        assert_eq!(call_res.status(), StatusCode::OK);
+        let call_text = String::from_utf8(
+            call_res
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!call_text.contains("notifications/events/"));
+        assert!(
+            call_text.contains("External events: 1 new"),
+            "unexpected call_text: {call_text}"
+        );
+        assert!(!call_text.contains("TOP_SECRET_DATA"));
+
+        // --- Suite 3: 2025-11-25 legacy client ---
+        let mut init_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": { "name": "legacy", "version": "1.0" }
+                    }
+                })
+                .to_string(),
+            )))
+            .unwrap();
+        init_req.extensions_mut().insert(Principal(0));
+        let init_res = http_svc.call(init_req).await.unwrap();
+        assert_eq!(init_res.status(), StatusCode::OK);
+        let session_id = init_res.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let init_text = String::from_utf8(
+            init_res
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let init_msg: serde_json::Value = init_text
+            .lines()
+            .find_map(|l| l.strip_prefix("data:"))
+            .map(|d| serde_json::from_str(d.trim()).unwrap())
+            .unwrap();
+        assert!(
+            init_msg["result"]["capabilities"]
+                .get("extensions")
+                .is_none(),
+            "legacy initialize must not advertise io.modelcontextprotocol/events"
+        );
+
+        // Complete legacy handshake with notifications/initialized.
+        let mut inited_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-session-id", &session_id)
+            .header("mcp-protocol-version", "2025-11-25")
+            .body(Full::new(Bytes::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                })
+                .to_string(),
+            )))
+            .unwrap();
+        inited_req.extensions_mut().insert(Principal(0));
+        let inited_res = http_svc.call(inited_req).await.unwrap();
+        assert_eq!(inited_res.status(), StatusCode::ACCEPTED);
+
+        // Calling events/list on a 2025-11-25 session must return -32601.
+        let mut legacy_ev = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-session-id", &session_id)
+            .header("mcp-protocol-version", "2025-11-25")
+            .body(Full::new(Bytes::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "events/list",
+                    "params": {}
+                })
+                .to_string(),
+            )))
+            .unwrap();
+        legacy_ev.extensions_mut().insert(Principal(0));
+        let legacy_res = http_svc.call(legacy_ev).await.unwrap();
+        let legacy_text = String::from_utf8(
+            legacy_res
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let legacy_msg: serde_json::Value = legacy_text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .or(Some(legacy_text.trim()))
+            .map(|d| serde_json::from_str(d).unwrap())
+            .unwrap();
+        assert_eq!(legacy_msg["error"]["code"], -32601);
     }
 }

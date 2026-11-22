@@ -165,6 +165,19 @@ impl Backend {
     }
 }
 
+impl Drop for Backend {
+    fn drop(&mut self) {
+        if let Self::Local {
+            service, session, ..
+        } = self
+            && Arc::strong_count(session) == 1
+            && let Some(Ok(sess)) = session.get()
+        {
+            service.event_bus().remove_session(&sess.id);
+        }
+    }
+}
+
 impl Server {
     /// A server over `backend`, whose `exec` tool says where its tasks run.
     fn new(
@@ -515,11 +528,51 @@ impl ServerHandler for Server {
             lease::process_pool(),
             self.instructions.len().saturating_add(512),
         )?;
+        let mut info = self.get_info();
+        let mut extensions = info.capabilities.extensions.take().unwrap_or_default();
+        let mut events_cap = serde_json::Map::new();
+        events_cap.insert("listChanged".to_owned(), serde_json::Value::Bool(false));
+        extensions.insert("io.modelcontextprotocol/events".to_owned(), events_cap);
+        info.capabilities.extensions = Some(extensions);
         Ok(rmcp::model::DiscoverResult::from_server_info(
             self.supported_protocol_versions().into_owned(),
-            self.get_info()
-                .with_instructions(self.instructions.as_ref()),
+            info.with_instructions(self.instructions.as_ref()),
         ))
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: rmcp::model::CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CustomResult, rmcp::ErrorData> {
+        // Version isolation: events/* is only available on MCP 2026-07-28+.
+        let supports_events = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        if !supports_events {
+            return Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                request.method,
+                None,
+            ));
+        }
+
+        match request.method.as_str() {
+            "events/list" => self.handle_events_list(request.params, context).await,
+            "events/poll" => self.handle_events_poll(request.params, context).await,
+            "events/stream" => self.handle_events_stream(request.params, context).await,
+            // Webhook delivery (`events/subscribe`, `events/unsubscribe`) is intentionally out of scope.
+            "events/subscribe" | "events/unsubscribe" => Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                request.method,
+                None,
+            )),
+            _ => Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                request.method,
+                None,
+            )),
+        }
     }
 
     async fn list_tools(
@@ -547,6 +600,368 @@ impl ServerHandler for Server {
         // Internal capability checks need no per-request instructions copy.
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fastexec", env!("CARGO_PKG_VERSION")))
+    }
+}
+
+fn event_error_to_rmcp(err: events::EventError) -> rmcp::ErrorData {
+    rmcp::ErrorData::new(
+        rmcp::model::ErrorCode(err.code()),
+        err.to_string(),
+        err.data(),
+    )
+}
+
+fn ipc_event_error_to_rmcp(err: ipc::IpcEventError) -> rmcp::ErrorData {
+    rmcp::ErrorData::new(rmcp::model::ErrorCode(err.code), err.message, err.data)
+}
+
+fn decode_mcp_header_value(raw: &str) -> Option<String> {
+    use base64::Engine as _;
+    if let Some(rest) = raw.strip_prefix("=?base64?") {
+        let encoded = rest.strip_suffix("?=")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        return String::from_utf8(bytes).ok();
+    }
+    Some(raw.to_owned())
+}
+
+/// Validates the HTTP `Mcp-Name` header against `params.name` (supporting `=?base64?...?=`
+/// decoding). During Beta interop, a missing header is tolerated while any present header that
+/// fails decoding or mismatches `params.name` returns `ErrorData::header_mismatch` (HTTP 400 / -32020).
+fn validate_mcp_name_header(
+    context: &RequestContext<RoleServer>,
+    expected_name: &str,
+) -> Result<(), rmcp::ErrorData> {
+    let Some(parts) = context.extensions.get::<::http::request::Parts>() else {
+        return Ok(());
+    };
+    let Some(raw_header) = parts.headers.get("mcp-name") else {
+        return Ok(());
+    };
+    let raw_str = raw_header.to_str().map_err(|_| {
+        rmcp::ErrorData::header_mismatch("Mcp-Name header is not valid ASCII", None)
+    })?;
+    let decoded = decode_mcp_header_value(raw_str).ok_or_else(|| {
+        rmcp::ErrorData::header_mismatch("Mcp-Name header has invalid base64 encoding", None)
+    })?;
+    if decoded != expected_name {
+        return Err(rmcp::ErrorData::header_mismatch(
+            format!("Mcp-Name header ({decoded:?}) does not match params.name ({expected_name:?})"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn build_event_notification(
+    method: &str,
+    params: serde_json::Value,
+    subscription_id: &rmcp::model::RequestId,
+) -> rmcp::model::ServerNotification {
+    let mut notif = rmcp::model::CustomNotification::new(method, Some(params));
+    rmcp::model::GetMeta::get_meta_mut(&mut notif).set_subscription_id(subscription_id.clone());
+    rmcp::model::ServerNotification::CustomNotification(notif)
+}
+
+fn stream_complete_result(subscription_id: &rmcp::model::RequestId) -> rmcp::model::CustomResult {
+    let id_value = serde_json::to_value(subscription_id).unwrap_or(serde_json::Value::Null);
+    rmcp::model::CustomResult::new(serde_json::json!({
+        "resultType": "complete",
+        "_meta": {
+            "io.modelcontextprotocol/subscriptionId": id_value
+        }
+    }))
+}
+
+impl Server {
+    async fn handle_events_list(
+        &self,
+        params: Option<serde_json::Value>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CustomResult, rmcp::ErrorData> {
+        if let Some(value) = params
+            && !value.is_object()
+            && !value.is_null()
+        {
+            return Err(rmcp::ErrorData::invalid_params(
+                "events/list params must be an object",
+                None,
+            ));
+        }
+        let result = match &self.backend {
+            Backend::Local { service, .. } => service.event_bus().list_event_types(),
+            Backend::Daemon(endpoint) => endpoint
+                .events_list(&client_name(&context), context.ct.clone())
+                .await
+                .map_err(ipc_event_error_to_rmcp)?,
+        };
+        let value = serde_json::to_value(result)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(rmcp::model::CustomResult::new(value))
+    }
+
+    async fn handle_events_poll(
+        &self,
+        params: Option<serde_json::Value>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CustomResult, rmcp::ErrorData> {
+        let Some(raw) = params else {
+            return Err(rmcp::ErrorData::invalid_params(
+                "events/poll requires params with `name`",
+                None,
+            ));
+        };
+        let poll_req: events::PollRequest = serde_json::from_value(raw)
+            .map_err(|e| rmcp::ErrorData::invalid_params(format!("invalid params: {e}"), None))?;
+        validate_mcp_name_header(&context, &poll_req.name)?;
+
+        let response = match &self.backend {
+            Backend::Local { service, .. } => {
+                let caller_session = self.session(&context).ok().map(|s| s.id.clone());
+                service
+                    .event_bus()
+                    .poll(poll_req, caller_session.as_deref())
+                    .map_err(event_error_to_rmcp)?
+            }
+            Backend::Daemon(endpoint) => endpoint
+                .events_poll(&client_name(&context), poll_req, context.ct.clone())
+                .await
+                .map_err(ipc_event_error_to_rmcp)?,
+        };
+        let value = serde_json::to_value(response)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(rmcp::model::CustomResult::new(value))
+    }
+
+    async fn handle_events_stream(
+        &self,
+        params: Option<serde_json::Value>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CustomResult, rmcp::ErrorData> {
+        let Some(raw) = params else {
+            return Err(rmcp::ErrorData::invalid_params(
+                "events/stream requires params with `name`",
+                None,
+            ));
+        };
+        let sub_req: events::SubscribeRequest = serde_json::from_value(raw)
+            .map_err(|e| rmcp::ErrorData::invalid_params(format!("invalid params: {e}"), None))?;
+        validate_mcp_name_header(&context, &sub_req.name)?;
+
+        let sub_id = context.id.clone();
+        match &self.backend {
+            Backend::Local { service, .. } => {
+                let _guard = service
+                    .event_bus()
+                    .try_acquire_stream()
+                    .map_err(event_error_to_rmcp)?;
+                let caller_session = self.session(&context).ok().map(|s| s.id.clone());
+                let mut sub = service
+                    .event_bus()
+                    .subscribe(sub_req, caller_session.as_deref())
+                    .map_err(event_error_to_rmcp)?;
+
+                let initial = serde_json::to_value(sub.initial_active())
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                if context
+                    .peer
+                    .send_notification(build_event_notification(
+                        "notifications/events/active",
+                        initial,
+                        &sub_id,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return Ok(stream_complete_result(&sub_id));
+                }
+
+                let heartbeat = std::time::Duration::from_millis(sub.heartbeat_ms());
+                let sleep = tokio::time::sleep(heartbeat);
+                tokio::pin!(sleep);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = context.ct.cancelled() => {
+                            // Client cancelled: rmcp drops the response when local_ct_pool entry is gone.
+                            return Ok(stream_complete_result(&sub_id));
+                        }
+                        item = sub.next() => {
+                            match item {
+                                Some(events::StreamItem::Active(active)) => {
+                                    let payload = serde_json::to_value(active)
+                                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                    if context.peer.send_notification(build_event_notification(
+                                        "notifications/events/active",
+                                        payload,
+                                        &sub_id,
+                                    )).await.is_err() {
+                                        return Ok(stream_complete_result(&sub_id));
+                                    }
+                                    sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
+                                }
+                                Some(events::StreamItem::Event(ev)) => {
+                                    let payload = serde_json::to_value(ev)
+                                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                    if context.peer.send_notification(build_event_notification(
+                                        "notifications/events/event",
+                                        payload,
+                                        &sub_id,
+                                    )).await.is_err() {
+                                        return Ok(stream_complete_result(&sub_id));
+                                    }
+                                    sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
+                                }
+                                None => {
+                                    let _ = context.peer.send_notification(build_event_notification(
+                                        "notifications/events/terminated",
+                                        serde_json::json!({
+                                            "error": {
+                                                "code": -32000,
+                                                "message": "event bus closed"
+                                            }
+                                        }),
+                                        &sub_id,
+                                    )).await;
+                                    return Ok(stream_complete_result(&sub_id));
+                                }
+                            }
+                        }
+                        _ = &mut sleep => {
+                            if context.peer.send_notification(build_event_notification(
+                                "notifications/events/heartbeat",
+                                serde_json::json!({ "cursor": sub.current_cursor() }),
+                                &sub_id,
+                            )).await.is_err() {
+                                return Ok(stream_complete_result(&sub_id));
+                            }
+                            sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
+                        }
+                    }
+                }
+            }
+            Backend::Daemon(endpoint) => {
+                let (initial, mut stream) = endpoint
+                    .events_stream(&client_name(&context), sub_req, context.ct.clone())
+                    .await
+                    .map_err(ipc_event_error_to_rmcp)?;
+
+                let initial_val = serde_json::to_value(initial)
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                if context
+                    .peer
+                    .send_notification(build_event_notification(
+                        "notifications/events/active",
+                        initial_val,
+                        &sub_id,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    stream.cancel().await;
+                    return Ok(stream_complete_result(&sub_id));
+                }
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = context.ct.cancelled() => {
+                            stream.cancel().await;
+                            return Ok(stream_complete_result(&sub_id));
+                        }
+                        frame = stream.next() => {
+                            match frame {
+                                Some(ipc::EventWireFrame::Active(active)) => {
+                                    let payload = serde_json::to_value(active)
+                                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                    if context.peer.send_notification(build_event_notification(
+                                        "notifications/events/active",
+                                        payload,
+                                        &sub_id,
+                                    )).await.is_err() {
+                                        stream.cancel().await;
+                                        return Ok(stream_complete_result(&sub_id));
+                                    }
+                                }
+                                Some(ipc::EventWireFrame::Event(ev)) => {
+                                    let payload = serde_json::to_value(ev)
+                                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                    if context.peer.send_notification(build_event_notification(
+                                        "notifications/events/event",
+                                        payload,
+                                        &sub_id,
+                                    )).await.is_err() {
+                                        stream.cancel().await;
+                                        return Ok(stream_complete_result(&sub_id));
+                                    }
+                                }
+                                Some(ipc::EventWireFrame::Heartbeat { cursor }) => {
+                                    if context.peer.send_notification(build_event_notification(
+                                        "notifications/events/heartbeat",
+                                        serde_json::json!({ "cursor": cursor }),
+                                        &sub_id,
+                                    )).await.is_err() {
+                                        stream.cancel().await;
+                                        return Ok(stream_complete_result(&sub_id));
+                                    }
+                                }
+                                Some(ipc::EventWireFrame::Error(err)) => {
+                                    let mut obj = serde_json::json!({
+                                        "code": err.code,
+                                        "message": err.message,
+                                    });
+                                    if let Some(data) = err.data {
+                                        obj["data"] = data;
+                                    }
+                                    if context.peer.send_notification(build_event_notification(
+                                        "notifications/events/error",
+                                        serde_json::json!({ "error": obj }),
+                                        &sub_id,
+                                    )).await.is_err() {
+                                        stream.cancel().await;
+                                        return Ok(stream_complete_result(&sub_id));
+                                    }
+                                }
+                                Some(ipc::EventWireFrame::Terminated(err)) => {
+                                    let mut obj = serde_json::json!({
+                                        "code": err.code,
+                                        "message": err.message,
+                                    });
+                                    if let Some(data) = err.data {
+                                        obj["data"] = data;
+                                    }
+                                    let _ = context.peer.send_notification(build_event_notification(
+                                        "notifications/events/terminated",
+                                        serde_json::json!({ "error": obj }),
+                                        &sub_id,
+                                    )).await;
+                                }
+                                Some(ipc::EventWireFrame::Complete) => {
+                                    return Ok(stream_complete_result(&sub_id));
+                                }
+                                None => {
+                                    let _ = context.peer.send_notification(build_event_notification(
+                                        "notifications/events/terminated",
+                                        serde_json::json!({
+                                            "error": {
+                                                "code": -32000,
+                                                "message": "daemon connection closed"
+                                            }
+                                        }),
+                                        &sub_id,
+                                    )).await;
+                                    return Ok(stream_complete_result(&sub_id));
+                                }
+                                Some(ipc::EventWireFrame::ListResult(_))
+                                | Some(ipc::EventWireFrame::PollResult(_)) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2174,6 +2589,7 @@ usage: fastexec [--help | --version]
        fastexec daemon run [--http <addr>]
        fastexec daemon status
        fastexec daemon stop
+       fastexec daemon emit [--namespace <ns>] [--source <src>] [--topic <topic>] [--stream]
 
 With no arguments, fastexec serves MCP over stdio.";
 
@@ -2194,7 +2610,7 @@ fn daemon_main(args: &[std::ffi::OsString]) -> i32 {
             };
             options
         }
-        "start" | "run" | "status" | "stop" => arguments,
+        "start" | "run" | "status" | "stop" | "emit" => arguments,
         _ => return daemon_usage_error(&format!("unknown argument {action}")),
     };
     let flags = match daemon_flags(&action, options) {
@@ -2221,12 +2637,16 @@ fn daemon_main(args: &[std::ffi::OsString]) -> i32 {
     }
 }
 
-const DAEMON_USAGE: &str = "usage: fastexec daemon start [--http <addr>] [--idle-exit on|off] | run [--http <addr>] | status | stop";
+const DAEMON_USAGE: &str = "usage: fastexec daemon start [--http <addr>] [--idle-exit on|off] | run [--http <addr>] | status | stop | emit [--namespace <ns>] [--source <src>] [--topic <topic>] [--stream]";
 
 #[derive(Default)]
 struct DaemonFlags {
     http: Option<String>,
     idle_exit: Option<bool>,
+    namespace: Option<std::ffi::OsString>,
+    source: Option<String>,
+    topic: Option<String>,
+    stream: bool,
 }
 
 fn daemon_flags(action: &str, args: &[std::ffi::OsString]) -> Result<DaemonFlags, String> {
@@ -2258,6 +2678,36 @@ fn daemon_flags(action: &str, args: &[std::ffi::OsString]) -> Result<DaemonFlags
                         ));
                     }
                 });
+            }
+            Some("--namespace") if action == "emit" && flags.namespace.is_none() => {
+                let value = args.next().ok_or("--namespace needs a value")?;
+                if value.is_empty() {
+                    return Err("--namespace must not be empty".to_owned());
+                }
+                flags.namespace = Some(value.clone());
+            }
+            Some("--source") if action == "emit" && flags.source.is_none() => {
+                let value = args
+                    .next()
+                    .ok_or("--source needs a value")?
+                    .to_string_lossy();
+                if value.trim().is_empty() {
+                    return Err("--source must not be empty".to_owned());
+                }
+                flags.source = Some(value.into_owned());
+            }
+            Some("--topic") if action == "emit" && flags.topic.is_none() => {
+                let value = args
+                    .next()
+                    .ok_or("--topic needs a value")?
+                    .to_string_lossy();
+                if value.trim().is_empty() {
+                    return Err("--topic must not be empty".to_owned());
+                }
+                flags.topic = Some(value.into_owned());
+            }
+            Some("--stream") if action == "emit" && !flags.stream => {
+                flags.stream = true;
             }
             _ => return Err(format!("unknown argument {}", flag.to_string_lossy())),
         }
@@ -2299,7 +2749,7 @@ async fn cli(action: &str, flags: DaemonFlags) -> i32 {
         Ok(launch) => launch,
         Err(error) => return fail(&format!("cannot read the launch context: {error}")),
     };
-    let identity = match runtime::identity(&launch) {
+    let identity = match runtime::identity_with_namespace(&launch, flags.namespace.as_deref()) {
         Ok(identity) => identity,
         Err(error) => return fail(&format!("cannot identify this image: {error}")),
     };
@@ -2312,8 +2762,262 @@ async fn cli(action: &str, flags: DaemonFlags) -> i32 {
     match action {
         "start" => cli_start(&identity, &paths, &launch, deadline, flags).await,
         "status" => cli_status(&identity, &paths, &launch, deadline).await,
+        "emit" => cli_emit(&identity, &paths, deadline, flags).await,
         _ => cli_stop(&identity, &paths, &launch, deadline).await,
     }
+}
+
+/// Parses a single JSON object from stdin into an [`events::ExternalEventInput`], applying CLI
+/// `--source` / `--topic` defaults and accepting `eventId` / `truncated` aliases from `mcpcli`.
+fn parse_emit_payload(
+    raw: &str,
+    default_source: Option<&str>,
+    default_topic: Option<&str>,
+) -> Result<events::ExternalEventInput, String> {
+    if raw.len() > events::MAX_EXTERNAL_EVENT_BYTES {
+        return Err(format!(
+            "event payload ({} bytes) exceeds {} byte limit",
+            raw.len(),
+            events::MAX_EXTERNAL_EVENT_BYTES
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "event payload must be a JSON object".to_owned())?;
+
+    let str_field = |key: &str| -> Result<Option<String>, String> {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(format!("field `{key}` must be a string")),
+        }
+    };
+    let bool_field = |key: &str| -> Result<Option<bool>, String> {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Bool(b)) => Ok(Some(*b)),
+            Some(_) => Err(format!("field `{key}` must be a boolean")),
+        }
+    };
+
+    let event_type = str_field("eventType")?;
+    let source = str_field("source")?
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| default_source.map(str::to_owned))
+        .ok_or_else(|| "missing required `source` (provide in JSON or via --source)".to_owned())?;
+    let topic = str_field("topic")?
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| default_topic.map(str::to_owned));
+    let name = str_field("name")?
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "missing required `name`".to_owned())?;
+    let upstream_event_id = str_field("upstreamEventId")?
+        .filter(|s| !s.trim().is_empty())
+        .or(str_field("eventId")?.filter(|s| !s.trim().is_empty()))
+        .ok_or_else(|| "missing required `upstreamEventId` (or `eventId`)".to_owned())?;
+    let data = obj.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let upstream_truncated = match bool_field("upstreamTruncated")? {
+        Some(v) => Some(v),
+        None => bool_field("truncated")?,
+    };
+
+    Ok(events::ExternalEventInput {
+        event_type,
+        source,
+        topic,
+        name,
+        upstream_event_id,
+        data,
+        upstream_truncated,
+    })
+}
+
+async fn connect_emit_daemon(
+    identity: &runtime::Identity,
+    paths: &runtime::Paths,
+    deadline: std::time::Instant,
+) -> Result<transport::Client, String> {
+    let Some(mut client) = within(deadline, connect_existing(paths)).await? else {
+        return Err(format!(
+            "no fastexec daemon is running for namespace {}",
+            identity.namespace
+        ));
+    };
+    let hello = ToDaemon::HelloEmit {
+        protocol: ipc::PROTOCOL,
+        build: identity.build.clone(),
+    };
+    within(deadline, async {
+        ipc::write_frame_idle(&mut client, &hello, daemon::WRITE_STALL)
+            .await
+            .map_err(|e| format!("cannot send HelloEmit: {e}"))?;
+        let frame = ipc::read_endpoint_frame_leased(
+            &mut client,
+            ipc::RESPONSE_LIMIT,
+            lease::process_pool(),
+            lease::control_pool(),
+            |_| true,
+        )
+        .await
+        .map_err(|e| format!("cannot read Welcome: {e}"))?;
+        match frame {
+            ipc::LeasedEndpointFrame::Frame(ToEndpoint::Welcome { protocol, .. }, _)
+                if protocol == ipc::PROTOCOL =>
+            {
+                Ok(())
+            }
+            ipc::LeasedEndpointFrame::Frame(ToEndpoint::Reject { message }, _) => Err(message),
+            _ => Err("unexpected response to HelloEmit".to_owned()),
+        }
+    })
+    .await?;
+    Ok(client)
+}
+
+async fn send_emit_event(
+    client: &mut transport::Client,
+    event: events::ExternalEventInput,
+) -> Result<ToEndpoint, String> {
+    ipc::write_frame_idle(client, &ToDaemon::EmitEvent { event }, daemon::WRITE_STALL)
+        .await
+        .map_err(|e| format!("cannot send EmitEvent: {e}"))?;
+    match ipc::read_endpoint_frame_leased(
+        client,
+        ipc::RESPONSE_LIMIT,
+        lease::process_pool(),
+        lease::control_pool(),
+        |_| true,
+    )
+    .await
+    .map_err(|e| format!("cannot read EmitAck: {e}"))?
+    {
+        ipc::LeasedEndpointFrame::Frame(ack @ ToEndpoint::EmitAck { .. }, _) => Ok(ack),
+        ipc::LeasedEndpointFrame::Eof => Err("daemon closed the connection".to_owned()),
+        _ => Err("unexpected frame from daemon".to_owned()),
+    }
+}
+
+async fn cli_emit(
+    identity: &runtime::Identity,
+    paths: &runtime::Paths,
+    deadline: std::time::Instant,
+    flags: DaemonFlags,
+) -> i32 {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    if !flags.stream {
+        let mut buf = Vec::new();
+        let mut stdin = tokio::io::stdin().take((events::MAX_EXTERNAL_EVENT_BYTES + 1) as u64);
+        if let Err(error) = stdin.read_to_end(&mut buf).await {
+            return fail(&format!("cannot read stdin: {error}"));
+        }
+        if buf.len() > events::MAX_EXTERNAL_EVENT_BYTES {
+            return fail(&format!(
+                "event payload exceeds {} byte limit",
+                events::MAX_EXTERNAL_EVENT_BYTES
+            ));
+        }
+        let raw = match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(error) => return fail(&format!("stdin is not valid UTF-8: {error}")),
+        };
+        let event =
+            match parse_emit_payload(raw.trim(), flags.source.as_deref(), flags.topic.as_deref()) {
+                Ok(ev) => ev,
+                Err(message) => return fail(&message),
+            };
+        let mut client = match connect_emit_daemon(identity, paths, deadline).await {
+            Ok(client) => client,
+            Err(message) => return fail(&message),
+        };
+        let ack = match within(deadline, send_emit_event(&mut client, event)).await {
+            Ok(ack) => ack,
+            Err(message) => return fail(&message),
+        };
+        let _ = ipc::write_frame_idle(
+            &mut client,
+            &ToDaemon::Bye,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        return match ack {
+            ToEndpoint::EmitAck { ok: true, .. } => 0,
+            ToEndpoint::EmitAck { error, .. } => fail(
+                &error
+                    .map(|e| e.message)
+                    .unwrap_or_else(|| "daemon rejected event".to_owned()),
+            ),
+            _ => fail("unexpected response from daemon"),
+        };
+    }
+
+    let mut client = match connect_emit_daemon(identity, paths, deadline).await {
+        Ok(client) => client,
+        Err(message) => return fail(&message),
+    };
+    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut stdout = tokio::io::stdout();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) => return fail(&format!("cannot read stdin: {error}")),
+        };
+        let _ = read;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+        let reply = match parse_emit_payload(
+            trimmed,
+            flags.source.as_deref(),
+            flags.topic.as_deref(),
+        ) {
+            Err(message) => serde_json::json!({ "ok": false, "error": message }),
+            Ok(event) => match send_emit_event(&mut client, event).await {
+                Ok(ToEndpoint::EmitAck {
+                    ok: true,
+                    event_id,
+                    cursor,
+                    deduplicated,
+                    ..
+                }) => serde_json::json!({
+                    "ok": true,
+                    "eventId": event_id,
+                    "cursor": cursor,
+                    "deduplicated": deduplicated,
+                }),
+                Ok(ToEndpoint::EmitAck { error, .. }) => serde_json::json!({
+                    "ok": false,
+                    "error": error.map(|e| e.message).unwrap_or_else(|| "daemon rejected event".to_owned()),
+                }),
+                Ok(_) => {
+                    serde_json::json!({ "ok": false, "error": "unexpected frame from daemon" })
+                }
+                Err(message) => {
+                    let out = format!("{}\n", serde_json::json!({ "ok": false, "error": message }));
+                    let _ = stdout.write_all(out.as_bytes()).await;
+                    let _ = stdout.flush().await;
+                    return 1;
+                }
+            },
+        };
+        let out = format!("{reply}\n");
+        if stdout.write_all(out.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
+            return 1;
+        }
+    }
+    let _ = ipc::write_frame_idle(
+        &mut client,
+        &ToDaemon::Bye,
+        std::time::Duration::from_secs(1),
+    )
+    .await;
+    0
 }
 
 const NO_ANSWER: &str = "the daemon did not answer in time";
@@ -4420,5 +5124,68 @@ mod stdio_transport_tests {
         drop(bytes);
         drop(lease);
         assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn daemon_emit_flags_and_payload_parsing() {
+        let flags = daemon_flags(
+            "emit",
+            &[
+                "--namespace".into(),
+                "custom-ns".into(),
+                "--source".into(),
+                "github".into(),
+                "--topic".into(),
+                "pr".into(),
+                "--stream".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            flags.namespace.as_deref(),
+            Some(std::ffi::OsStr::new("custom-ns"))
+        );
+        assert_eq!(flags.source.as_deref(), Some("github"));
+        assert_eq!(flags.topic.as_deref(), Some("pr"));
+        assert!(flags.stream);
+        assert!(daemon_flags("emit", &["--http".into(), "127.0.0.1:0".into()]).is_err());
+
+        // Accepts mcpcli eventId/truncated aliases and fills source/topic from CLI flags.
+        let parsed = parse_emit_payload(
+            r#"{"eventId":"evt-42","name":"pr.merged","data":{"n":1},"truncated":true}"#,
+            Some("github"),
+            Some("pr"),
+        )
+        .unwrap();
+        assert_eq!(parsed.source, "github");
+        assert_eq!(parsed.topic.as_deref(), Some("pr"));
+        assert_eq!(parsed.name, "pr.merged");
+        assert_eq!(parsed.upstream_event_id, "evt-42");
+        assert_eq!(parsed.upstream_truncated, Some(true));
+
+        // Rejects oversized payloads (> 64 KiB).
+        let huge = format!(
+            r#"{{"source":"s","name":"n","upstreamEventId":"1","data":"{}"}}"#,
+            "x".repeat(events::MAX_EXTERNAL_EVENT_BYTES)
+        );
+        assert!(parse_emit_payload(&huge, None, None).is_err());
+    }
+
+    #[test]
+    fn mcp_name_header_decoding_handles_plain_and_base64() {
+        use base64::Engine as _;
+        assert_eq!(
+            decode_mcp_header_value("external.event").as_deref(),
+            Some("external.event")
+        );
+        let encoded = format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode("external.event")
+        );
+        assert_eq!(
+            decode_mcp_header_value(&encoded).as_deref(),
+            Some("external.event")
+        );
+        assert!(decode_mcp_header_value("=?base64?!!!invalid!!!?=").is_none());
     }
 }

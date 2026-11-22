@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// What a Hello and a Welcome must agree on.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// The largest frame the daemon accepts. A Hello carries the endpoint's whole environment, which
 /// is the reason this is larger than a call.
@@ -113,10 +113,16 @@ pub(crate) fn encode_frame_leased<T: Serialize + ?Sized>(
 pub(crate) fn daemon_control(message: &ToDaemon) -> bool {
     match message {
         ToDaemon::Cancel { .. }
+        | ToDaemon::EventsCancel { .. }
         | ToDaemon::Bye
         | ToDaemon::Status
         | ToDaemon::Stop
-        | ToDaemon::Hello { .. } => true,
+        | ToDaemon::Hello { .. }
+        | ToDaemon::HelloEmit { .. } => true,
+        ToDaemon::EmitEvent { .. }
+        | ToDaemon::EventsList { .. }
+        | ToDaemon::EventsPoll { .. }
+        | ToDaemon::EventsStream { .. } => false,
         ToDaemon::Call {
             tool, arguments, ..
         } => {
@@ -233,6 +239,50 @@ pub(crate) async fn read_daemon_frame_owned<R: AsyncRead + Unpin>(
         message,
         Owner::new(raw.lease),
     )))
+}
+
+/// Reads a daemon frame using only the main byte pool (never touches `control_pool`).
+/// Used on `HelloEmit` connections so external event floods cannot contend with control traffic.
+pub(crate) async fn read_daemon_frame_main_only<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+    main: &Arc<BytePool>,
+) -> std::io::Result<DaemonFrame> {
+    let mut header = [0u8; 4];
+    let mut filled = 0;
+    while filled < header.len() {
+        match reader.read(&mut header[filled..]).await {
+            Ok(0) if filled == 0 => return Ok(DaemonFrame::Eof),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("the input ended after {filled} of 4 length bytes"),
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let length = u32::from_le_bytes(header) as usize;
+    if length > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a frame of {length} bytes is over the {max} byte limit"),
+        ));
+    }
+    let peak = length.checked_mul(6).ok_or_else(input_budget_error)?;
+    let Some(mut lease) = main.try_acquire(peak) else {
+        drain_exact_bytes(reader, length, length).await?;
+        return Ok(DaemonFrame::Overload { id: None });
+    };
+    let mut bytes = vec![0; length];
+    read_exact_slice(reader, &mut bytes).await?;
+    let message: ToDaemon = serde_json::from_slice(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    drop(bytes);
+    lease.shrink_to(length * 4);
+    Ok(DaemonFrame::Message(Owned::new(message, Owner::new(lease))))
 }
 
 /// A message as the bytes a frame holds: the u32 little-endian length and its JSON. Encoding
@@ -704,6 +754,40 @@ impl OsText {
     }
 }
 
+/// Structured event error carried over IPC.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpcEventError {
+    pub code: i32,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+impl From<crate::events::EventError> for IpcEventError {
+    fn from(err: crate::events::EventError) -> Self {
+        Self {
+            code: err.code(),
+            message: err.to_string(),
+            data: err.data(),
+        }
+    }
+}
+
+/// Event RPC responses and streaming frames sent from daemon to endpoint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventWireFrame {
+    ListResult(crate::events::EventsListResult),
+    PollResult(crate::events::PollResponse),
+    Active(crate::events::ActiveNotice),
+    Event(crate::events::StreamEvent),
+    Heartbeat { cursor: String },
+    Error(IpcEventError),
+    Terminated(IpcEventError),
+    Complete,
+}
+
 /// What an endpoint sends the daemon.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -722,6 +806,27 @@ pub enum ToDaemon {
         cwd: OsText,
         env: Vec<(OsText, OsText)>,
     },
+    /// Lightweight handshake for `fastexec daemon emit`: no cwd/env and no daemon session entry.
+    HelloEmit { protocol: u32, build: String },
+    /// External event injection from `fastexec daemon emit`. Only `external.event` is accepted,
+    /// capped at 64 KiB, and never routed through `control_pool`.
+    EmitEvent {
+        event: crate::events::ExternalEventInput,
+    },
+    /// List available MCP event types.
+    EventsList { id: u64 },
+    /// Poll MCP events from a cursor.
+    EventsPoll {
+        id: u64,
+        request: crate::events::PollRequest,
+    },
+    /// Open a streaming MCP event subscription.
+    EventsStream {
+        id: u64,
+        request: crate::events::SubscribeRequest,
+    },
+    /// Cancel an active MCP event stream.
+    EventsCancel { id: u64 },
     /// One call, of one tool. `id` comes from an endpoint-wide counter, so it keeps naming this
     /// call across a reconnect; `request_id` is the MCP JSON-RPC ID, kept as a label because
     /// clients reuse it.
@@ -754,6 +859,20 @@ pub enum ToEndpoint {
     },
     /// The handshake was refused, and `message` says why.
     Reject { message: String },
+    /// Acknowledgement for `ToDaemon::EmitEvent`.
+    EmitAck {
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default)]
+        deduplicated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<IpcEventError>,
+    },
+    /// Response or streaming notification for an `EventsList`, `EventsPoll`, or `EventsStream`.
+    EventFrame { id: u64, frame: EventWireFrame },
     /// A call is still running: `seconds` since it started, and what it is waiting on.
     Progress {
         id: u64,
@@ -1397,7 +1516,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_writes_reset_on_forward_progress_and_fail_on_stall() {
-        assert_eq!(PROTOCOL, 3);
+        assert_eq!(PROTOCOL, 4);
         assert_eq!(RESPONSE_LIMIT, 512 << 20);
 
         let payload = vec![b'x'; 256];

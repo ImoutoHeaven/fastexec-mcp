@@ -617,6 +617,7 @@ impl<'a> Call<'a> {
 /// The tool's operations and renderers, independent of any transport.
 pub struct Service {
     tasks: Arc<Tasks>,
+    event_bus: Arc<crate::events::EventBus>,
     /// Whether the tasks live in a daemon: its unknown-task texts name the daemon and the tasks
     /// that outlive a session.
     daemon: bool,
@@ -1105,6 +1106,8 @@ fn metadata_members(
 struct Background<'a> {
     value: Option<(String, Vec<tasks::Shown>)>,
     claim: crate::session::OutsideClaim<'a>,
+    external_cursor: Option<u64>,
+    event_bus: Option<Arc<crate::events::EventBus>>,
     _workspace: Lease,
 }
 
@@ -1175,7 +1178,25 @@ impl RenderSnapshot {
 
 impl Service {
     pub fn new(tasks: Arc<Tasks>, daemon: bool) -> Self {
-        Self { tasks, daemon }
+        let event_bus = Arc::new(crate::events::EventBus::new().unwrap_or_else(|_| {
+            crate::events::EventBus::with_config(
+                tasks.epoch().to_owned(),
+                crate::events::DEFAULT_MAX_EVENTS,
+                crate::events::DEFAULT_MAX_BYTES,
+                1024,
+                Arc::clone(crate::lease::process_pool()),
+            )
+        }));
+        tasks.attach_event_bus(Arc::clone(&event_bus));
+        Self {
+            tasks,
+            event_bus,
+            daemon,
+        }
+    }
+
+    pub fn event_bus(&self) -> &Arc<crate::events::EventBus> {
+        &self.event_bus
     }
 
     pub async fn call_tracked(&self, request: Request, mut call: Call<'_>) -> files::TrackedResult {
@@ -1774,7 +1795,7 @@ impl Service {
         action: Action,
     ) -> Result<Background<'a>, ServiceError> {
         let workspace = std::cell::RefCell::new(Lease::empty(call.launch().memory()));
-        let (value, claim) = if nested {
+        let (mut value, claim) = if nested {
             (None, crate::session::OutsideClaim::none())
         } else {
             self.tasks
@@ -1791,9 +1812,28 @@ impl Service {
                 )
                 .map_err(|_| RenderSnapshot::overload(call, task))?
         };
+        let external_cursor = if nested {
+            None
+        } else if let Some((ext_line, seq)) = self
+            .event_bus
+            .peek_external_background_summary(&call.session.id)
+        {
+            match &mut value {
+                Some((line, _)) => {
+                    line.push('\n');
+                    line.push_str(&ext_line);
+                }
+                None => value = Some((ext_line, Vec::new())),
+            }
+            Some(seq)
+        } else {
+            None
+        };
         Ok(Background {
             value,
             claim,
+            external_cursor,
+            event_bus: (!nested).then(|| Arc::clone(&self.event_bus)),
             _workspace: workspace.into_inner(),
         })
     }
@@ -2126,6 +2166,9 @@ fn report(
         }
     }
     background.claim.consume();
+    if let (Some(bus), Some(seq)) = (background.event_bus, background.external_cursor) {
+        bus.commit_external_background_cursor(&session.id, seq);
+    }
 }
 
 fn kill_pending_note(task: &Task, snapshot: &Snapshot) -> Option<&'static str> {

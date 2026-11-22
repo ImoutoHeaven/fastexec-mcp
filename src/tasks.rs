@@ -110,6 +110,7 @@ pub struct Tasks {
     /// Files whose unlink failed keep their byte charge here until a later unlink succeeds.
     pending_deletes: Mutex<Vec<PendingDelete>>,
     delete_retry_gate: Mutex<()>,
+    event_bus: OnceLock<Arc<crate::events::EventBus>>,
     #[cfg(test)]
     remove_hook: Mutex<Option<RemoveHook>>,
     #[cfg(test)]
@@ -570,6 +571,8 @@ pub struct Task {
     pub keep: bool,
     /// The session that started the task: its client name and short session ID.
     pub owner: String,
+    /// The session ID that started the task, used for `task.exited` scope filtering.
+    pub session_id: Option<String>,
     /// The session ID and daemon call that started the task, when a daemon call started it.
     pub started_by: Option<(String, u64)>,
     started: Instant,
@@ -866,6 +869,7 @@ impl Tasks {
                 .unwrap_or(TOTAL_LOG_LIMIT),
             pending_deletes: Mutex::default(),
             delete_retry_gate: Mutex::new(()),
+            event_bus: OnceLock::new(),
             #[cfg(test)]
             remove_hook: Mutex::new(None),
             #[cfg(test)]
@@ -899,6 +903,25 @@ impl Tasks {
             return hook(file, bytes);
         }
         file.set_len(bytes)
+    }
+
+    /// Attaches the shared event bus once so task exits emit `task.exited`.
+    pub fn attach_event_bus(&self, bus: Arc<crate::events::EventBus>) {
+        let _ = self.event_bus.set(bus);
+    }
+
+    fn emit_task_exited(&self, task: &Task) {
+        let Some(bus) = self.event_bus.get() else {
+            return;
+        };
+        let snapshot = task.notice_snapshot();
+        let input = crate::events::TaskExitedInput::from_snapshot(
+            task.id.clone(),
+            task.session_id.clone(),
+            Some(crate::files::display_path(&task.log_path)),
+            &snapshot,
+        );
+        let _ = bus.publish_task_exited(input);
     }
 
     pub fn find(&self, id: &str) -> Option<Arc<Task>> {
@@ -1197,6 +1220,7 @@ impl Tasks {
             encoding: args.encoding,
             keep: args.keep,
             owner: args.owner,
+            session_id: Some(session.id.clone()),
             started_by: args.started_by,
             started: Instant::now(),
             root: Root::Process(spawned.tree),
@@ -1309,6 +1333,7 @@ impl Tasks {
             encoding: encoding_rs::UTF_8,
             keep: false,
             owner: session.label.clone(),
+            session_id: Some(session.id.clone()),
             started_by: args.call_id.map(|id| (session.id.clone(), id)),
             started: Instant::now(),
             root: Root::Script(script),
@@ -1405,6 +1430,7 @@ impl Tasks {
         self.retire_finished(&mut registry);
         drop(registry);
         task.done.send_replace(true);
+        self.emit_task_exited(task);
     }
 
     /// Saves an attachment with a monotonic 1-based task-local index under the 4 GiB and 1024-entry caps.
@@ -1996,6 +2022,7 @@ fn wait_task(job: WaitWork) {
     shared.retire_finished(&mut registry);
     drop(registry);
     task.done.send_replace(true);
+    shared.emit_task_exited(&task);
 }
 
 fn finish_tree(
@@ -2022,12 +2049,18 @@ fn finish_tree(
             let _ = std::fs::remove_file(status);
         }
     }
-    let mut registry = lock(&shared.registry);
-    if tree_ended {
-        let _ = task.tree_ended_at.set(Instant::now());
-        task.tree_done.send_replace(true);
+    let emit_kept_ended = {
+        let mut registry = lock(&shared.registry);
+        if tree_ended {
+            let _ = task.tree_ended_at.set(Instant::now());
+            task.tree_done.send_replace(true);
+        }
+        shared.retire_finished(&mut registry);
+        tree_ended && task.keep && lock(&task.end).is_some()
+    };
+    if emit_kept_ended {
+        shared.emit_task_exited(task);
     }
-    shared.retire_finished(&mut registry);
 }
 
 impl Spool {
@@ -5055,6 +5088,7 @@ mod script_tests {
             encoding: encoding_rs::UTF_8,
             keep: false,
             owner: "pty-test".into(),
+            session_id: None,
             started_by: None,
             started: Instant::now(),
             root: Root::Script(script),

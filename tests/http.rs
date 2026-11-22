@@ -312,6 +312,16 @@ impl Response {
 
     /// The JSON-RPC messages the answer carried, in the order they arrived.
     fn messages(&self) -> Vec<Value> {
+        if self
+            .header("content-type")
+            .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
+        {
+            return match serde_json::from_str::<Value>(self.body.trim()) {
+                Ok(Value::Array(items)) => items,
+                Ok(item) => vec![item],
+                Err(_) => Vec::new(),
+            };
+        }
         self.body
             .lines()
             .filter_map(|line| line.strip_prefix("data:"))

@@ -36,6 +36,12 @@ pub const TICK: Duration = Duration::from_secs(60);
 pub const IDLE_AFTER: Duration = Duration::from_secs(600);
 /// How many connections the daemon serves at once, handshaking or live.
 pub const MAX_CONNECTIONS: usize = 128;
+/// Independent limit for lightweight `HelloEmit` connections so emitters do not starve normal
+/// session connections.
+pub const MAX_EMIT_CONNECTIONS: usize = 128;
+/// Independent per-connection cap for active `events/stream` subscriptions (separate from
+/// `MAX_IN_FLIGHT`).
+pub const MAX_EVENT_STREAMS_PER_CONN: usize = 16;
 /// How long a stopping daemon waits for admitted starts to end their tasks.
 pub const STOP_WAIT: Duration = Duration::from_secs(5);
 /// Independent control-plane reserve for `list`, short `kill` receipts, and overload receipts.
@@ -116,40 +122,67 @@ pub struct Daemon {
 struct Gate {
     handshaking: usize,
     live: usize,
+    emit_live: usize,
     stopping: bool,
     idle_since: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TicketKind {
+    Handshaking,
+    Live,
+    Emit,
 }
 
 /// A connection's place in the gate. It gives the place back on drop, so no way out of serving a
 /// connection leaves it counted.
 pub struct Ticket {
     daemon: Arc<Daemon>,
-    /// Whether the place counts as live rather than as handshaking.
-    live: bool,
+    kind: TicketKind,
 }
 
 impl Ticket {
     /// Counts the connection as live, once its Welcome is written.
     pub fn promote(&mut self) {
-        if self.live {
+        if self.kind != TicketKind::Handshaking {
             return;
         }
         let mut gate = lock(&self.daemon.gate);
         gate.handshaking -= 1;
         gate.live += 1;
-        self.live = true;
+        self.kind = TicketKind::Live;
+    }
+
+    /// Moves a handshaking ticket into the independent `HelloEmit` pool.
+    fn promote_emit(&mut self) -> bool {
+        if self.kind != TicketKind::Handshaking {
+            return false;
+        }
+        let mut gate = lock(&self.daemon.gate);
+        if gate.stopping || gate.emit_live >= MAX_EMIT_CONNECTIONS {
+            return false;
+        }
+        gate.handshaking -= 1;
+        gate.emit_live += 1;
+        self.kind = TicketKind::Emit;
+        true
     }
 }
 
 impl Drop for Ticket {
     fn drop(&mut self) {
         let mut gate = lock(&self.daemon.gate);
-        if self.live {
-            gate.live -= 1;
-        } else {
-            gate.handshaking -= 1;
+        match self.kind {
+            TicketKind::Handshaking => gate.handshaking -= 1,
+            TicketKind::Live => gate.live -= 1,
+            TicketKind::Emit => gate.emit_live -= 1,
         }
     }
+}
+
+enum Handshake {
+    Session(Attachment),
+    Emit,
 }
 
 /// One session in the table.
@@ -397,7 +430,7 @@ impl Daemon {
         gate.idle_since = None;
         Some(Ticket {
             daemon: Arc::clone(self),
-            live: false,
+            kind: TicketKind::Handshaking,
         })
     }
 
@@ -413,31 +446,39 @@ impl Daemon {
         let (mut reader, mut writer) = tokio::io::split(stream);
         // A stopping daemon ends every connection, handshaking ones included, and the guard then
         // drops the ticket, the stream, and any attachment.
-        let guard = {
-            let handshake = self.handshake(&mut reader, &mut writer);
+        let handshake = {
+            let handshake = self.handshake(&mut reader, &mut writer, &mut ticket);
             tokio::pin!(handshake);
             tokio::select! {
                 biased;
                 _ = self.stopped.cancelled() => return,
-                guard = &mut handshake => guard,
+                result = &mut handshake => result,
             }
         };
-        let Some(guard) = guard else {
+        let Some(handshake) = handshake else {
             return;
         };
-        // The Welcome is written, so the connection is live rather than handshaking.
-        ticket.promote();
-        let attached = &guard.attached;
-        let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
-        let stall = self.config.write_stall;
-        // The writer owns the write half, so a stalled write never holds up a read.
-        let closing = attached.token.clone();
-        tokio::spawn(async move {
-            write_loop(writer, outgoing_rx, closing, stall).await;
-        });
-        let in_flight: Arc<Mutex<HashMap<u64, CancellationToken>>> = Arc::default();
-        self.read_loop(&mut reader, attached, &outgoing, &in_flight)
-            .await;
+        match handshake {
+            Handshake::Emit => {
+                self.emit_loop(&mut reader, &mut writer).await;
+            }
+            Handshake::Session(guard) => {
+                // The Welcome is written, so the connection is live rather than handshaking.
+                ticket.promote();
+                let attached = &guard.attached;
+                let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
+                let stall = self.config.write_stall;
+                // The writer owns the write half, so a stalled write never holds up a read.
+                let closing = attached.token.clone();
+                tokio::spawn(async move {
+                    write_loop(writer, outgoing_rx, closing, stall).await;
+                });
+                let in_flight: Arc<Mutex<HashMap<u64, CancellationToken>>> = Arc::default();
+                let event_streams: Arc<Mutex<HashMap<u64, CancellationToken>>> = Arc::default();
+                self.read_loop(&mut reader, attached, &outgoing, &in_flight, &event_streams)
+                    .await;
+            }
+        }
     }
 
     /// Runs until the daemon stops or exits on its own: accepts connections, and on every tick
@@ -492,12 +533,14 @@ impl Daemon {
     /// Stops the daemon when it has been idle for `idle_after` and exiting on idleness is what it
     /// was asked to do. Called under the gate, which is where idleness is read.
     fn idle_expired(&self, now: Instant) -> bool {
-        // Only `Tasks::idle` and `Transfers::is_idle` are called under the gate; neither takes
-        // `gate` or `sessions`.
+        // Only `Tasks::idle`, `Transfers::is_idle`, and lock-free `active_streams()` are called
+        // under the gate; none takes `gate` or `sessions`.
         let mut gate = lock(&self.gate);
         let idle = self.config.idle_exit
             && gate.handshaking == 0
             && gate.live == 0
+            && gate.emit_live == 0
+            && self.service.event_bus().active_streams() == 0
             && self.tasks.idle()
             && self.transfers.is_idle(now);
         if !idle {
@@ -538,20 +581,30 @@ impl Daemon {
 
     /// Drops every session that has been detached for `SESSION_TTL`, counted from `now`.
     pub fn sweep_sessions(&self, now: Instant) {
-        let mut sessions = lock(&self.sessions);
-        sessions.retain(|_, entry| match entry.detached_at {
-            Some(at) => now.saturating_duration_since(at) < SESSION_TTL,
-            None => true,
-        });
+        let mut expired = Vec::new();
+        {
+            let mut sessions = lock(&self.sessions);
+            sessions.retain(|id, entry| match entry.detached_at {
+                Some(at) if now.saturating_duration_since(at) >= SESSION_TTL => {
+                    expired.push(id.clone());
+                    false
+                }
+                _ => true,
+            });
+        }
+        for id in expired {
+            self.service.event_bus().remove_session(&id);
+        }
     }
 
-    /// Reads the Hello and answers it. `None` means the connection is done: it ended, or a
-    /// `Reject` was written and nothing more is said.
+    /// Reads the Hello or HelloEmit and answers it. `None` means the connection is done: it ended,
+    /// or a `Reject` was written and nothing more is said.
     async fn handshake(
         self: &Arc<Self>,
         reader: &mut Reader,
         writer: &mut Writer,
-    ) -> Option<Attachment> {
+        ticket: &mut Ticket,
+    ) -> Option<Handshake> {
         let first = timeout(
             HANDSHAKE_TIMEOUT,
             ipc::read_daemon_frame_owned(
@@ -568,7 +621,7 @@ impl Daemon {
         };
         message
             .owner
-            .hold_future(self.handshake_message(writer, message.value))
+            .hold_future(self.handshake_message(writer, message.value, ticket))
             .await
     }
 
@@ -576,7 +629,57 @@ impl Daemon {
         self: &Arc<Self>,
         writer: &mut Writer,
         message: ToDaemon,
-    ) -> Option<Attachment> {
+        ticket: &mut Ticket,
+    ) -> Option<Handshake> {
+        if let ToDaemon::HelloEmit { protocol, build } = message {
+            if protocol != ipc::PROTOCOL {
+                reject(
+                    writer,
+                    self.config.write_stall,
+                    &self.stopped,
+                    format!("protocol {protocol} is not {}", ipc::PROTOCOL),
+                )
+                .await;
+                return None;
+            }
+            if build != self.build {
+                reject(
+                    writer,
+                    self.config.write_stall,
+                    &self.stopped,
+                    format!("build {build:?} is not {:?}", self.build),
+                )
+                .await;
+                return None;
+            }
+            if !ticket.promote_emit() {
+                reject(
+                    writer,
+                    self.config.write_stall,
+                    &self.stopped,
+                    "emit connection limit reached or daemon stopping".to_owned(),
+                )
+                .await;
+                return None;
+            }
+            let welcome = ToEndpoint::Welcome {
+                protocol: ipc::PROTOCOL,
+                namespace: self.namespace.clone(),
+                build: self.build.clone(),
+                epoch: self.tasks.epoch().to_owned(),
+            };
+            let stall = self.config.write_stall;
+            let written = {
+                let writing = async { ipc::write_frame_idle(writer, &welcome, stall).await };
+                tokio::pin!(writing);
+                tokio::select! {
+                    biased;
+                    _ = self.stopped.cancelled() => false,
+                    result = &mut writing => result.is_ok(),
+                }
+            };
+            return written.then_some(Handshake::Emit);
+        }
         let ToDaemon::Hello {
             protocol,
             namespace,
@@ -590,13 +693,14 @@ impl Daemon {
             env,
         } = message
         else {
-            return reject(
+            reject(
                 writer,
                 self.config.write_stall,
                 &self.stopped,
                 "expected Hello".to_owned(),
             )
             .await;
+            return None;
         };
         if protocol != ipc::PROTOCOL {
             return reject(
@@ -700,7 +804,72 @@ impl Daemon {
             }
         };
         // A Welcome that could not be written drops the guard, which hands the session back.
-        written.then_some(guard)
+        written.then_some(Handshake::Session(guard))
+    }
+
+    /// Lightweight request/ack loop for `HelloEmit` connections. Only `EmitEvent` and `Bye` are
+    /// accepted; frames are charged exclusively against `memory` (never `control_memory`).
+    async fn emit_loop(&self, reader: &mut Reader, writer: &mut Writer) {
+        let max_frame = crate::events::MAX_EXTERNAL_EVENT_BYTES * 2;
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = self.stopped.cancelled() => return,
+                frame = ipc::read_daemon_frame_main_only(reader, max_frame, &self.memory) => frame,
+            };
+            let ack = match frame {
+                Ok(ipc::DaemonFrame::Eof) => return,
+                Ok(ipc::DaemonFrame::Overload { .. }) => ToEndpoint::EmitAck {
+                    ok: false,
+                    event_id: None,
+                    cursor: None,
+                    deduplicated: false,
+                    error: Some(ipc::IpcEventError {
+                        code: -32025,
+                        message: ipc::input_budget_error().to_string(),
+                        data: None,
+                    }),
+                },
+                Ok(ipc::DaemonFrame::Message(owned)) => match owned.value {
+                    ToDaemon::EmitEvent { event } => {
+                        let result = self.service.event_bus().publish_external(event);
+                        drop(owned.owner);
+                        match result {
+                            Ok(published) => ToEndpoint::EmitAck {
+                                ok: true,
+                                event_id: Some(published.event_id),
+                                cursor: Some(published.cursor),
+                                deduplicated: published.deduplicated,
+                                error: None,
+                            },
+                            Err(err) => ToEndpoint::EmitAck {
+                                ok: false,
+                                event_id: None,
+                                cursor: None,
+                                deduplicated: false,
+                                error: Some(err.into()),
+                            },
+                        }
+                    }
+                    ToDaemon::Bye => return,
+                    _ => return,
+                },
+                Err(_) => return,
+            };
+            let stall = self.config.write_stall;
+            let written = {
+                let writing = async { ipc::write_frame_idle(writer, &ack, stall).await };
+                tokio::pin!(writing);
+                tokio::select! {
+                    biased;
+                    _ = self.stopped.cancelled() => false,
+                    result = &mut writing => result.is_ok(),
+                }
+            };
+            if !written {
+                return;
+            }
+        }
     }
 
     /// Puts this connection in the table, or says why it cannot be. The gate is held across the
@@ -747,6 +916,7 @@ impl Daemon {
             match oldest {
                 Some(id) => {
                     sessions.remove(&id);
+                    self.service.event_bus().remove_session(&id);
                 }
                 None => return Err(format!("{MAX_SESSIONS} sessions are attached")),
             }
@@ -776,6 +946,7 @@ impl Daemon {
         attached: &Attached,
         outgoing: &mpsc::UnboundedSender<Outgoing>,
         in_flight: &Arc<Mutex<HashMap<u64, CancellationToken>>>,
+        event_streams: &Arc<Mutex<HashMap<u64, CancellationToken>>>,
     ) {
         loop {
             let message = tokio::select! {
@@ -857,6 +1028,103 @@ impl Daemon {
                         token.cancel();
                     }
                 }
+                ToDaemon::EventsList { id } => {
+                    let result = self.service.event_bus().list_event_types();
+                    queue_event_frame(
+                        outgoing,
+                        &self.memory,
+                        &self.reserved,
+                        &attached.token,
+                        id,
+                        ipc::EventWireFrame::ListResult(result),
+                    );
+                }
+                ToDaemon::EventsPoll { id, request } => {
+                    let frame = match self
+                        .service
+                        .event_bus()
+                        .poll(request, Some(&attached.session_id))
+                    {
+                        Ok(resp) => ipc::EventWireFrame::PollResult(resp),
+                        Err(err) => ipc::EventWireFrame::Error(err.into()),
+                    };
+                    queue_event_frame(
+                        outgoing,
+                        &self.memory,
+                        &self.reserved,
+                        &attached.token,
+                        id,
+                        frame,
+                    );
+                }
+                ToDaemon::EventsStream { id, request } => {
+                    let stream_token = {
+                        let mut streams = lock(event_streams);
+                        if streams.contains_key(&id) {
+                            Err(ipc::IpcEventError {
+                                code: -32602,
+                                message: format!("event stream {id} is already active"),
+                                data: None,
+                            })
+                        } else if streams.len() >= MAX_EVENT_STREAMS_PER_CONN {
+                            Err(ipc::IpcEventError {
+                                code: -32025,
+                                message: format!(
+                                    "active event streams on connection reached limit ({MAX_EVENT_STREAMS_PER_CONN})"
+                                ),
+                                data: Some(serde_json::json!({
+                                    "limit": "connection_event_streams",
+                                    "max": MAX_EVENT_STREAMS_PER_CONN
+                                })),
+                            })
+                        } else {
+                            match self.service.event_bus().try_acquire_stream() {
+                                Err(err) => Err(err.into()),
+                                Ok(guard) => match self
+                                    .service
+                                    .event_bus()
+                                    .subscribe(request, Some(&attached.session_id))
+                                {
+                                    Ok(sub) => {
+                                        let token = attached.token.child_token();
+                                        streams.insert(id, token.clone());
+                                        Ok((token, guard, sub))
+                                    }
+                                    Err(err) => Err(err.into()),
+                                },
+                            }
+                        }
+                    };
+                    match stream_token {
+                        Ok((token, guard, sub)) => {
+                            tokio::spawn(run_event_stream(
+                                Arc::clone(self),
+                                id,
+                                token,
+                                guard,
+                                sub,
+                                Arc::clone(event_streams),
+                                outgoing.clone(),
+                                attached.token.clone(),
+                            ));
+                        }
+                        Err(err) => {
+                            queue_event_frame(
+                                outgoing,
+                                &self.memory,
+                                &self.reserved,
+                                &attached.token,
+                                id,
+                                ipc::EventWireFrame::Error(err),
+                            );
+                        }
+                    }
+                }
+                ToDaemon::EventsCancel { id } => {
+                    if let Some(token) = lock(event_streams).remove(&id) {
+                        token.cancel();
+                    }
+                }
                 ToDaemon::Status => {
                     // The asking connection's own session is not counted, so a client that has
                     // just handshaken sees the sessions that were there before it.
@@ -885,8 +1153,10 @@ impl Daemon {
                     attached.token.cancel();
                     return;
                 }
-                // A second Hello is not a message a served connection can answer.
-                ToDaemon::Hello { .. } => return,
+                // A second Hello, HelloEmit, or EmitEvent is not valid on a served session.
+                ToDaemon::Hello { .. }
+                | ToDaemon::HelloEmit { .. }
+                | ToDaemon::EmitEvent { .. } => return,
             }
         }
     }
@@ -894,12 +1164,21 @@ impl Daemon {
     /// Ends the session at once: its cursors go with it, so a later connection of the same ID
     /// starts a new session. Only the connection whose generation holds the entry may do this.
     fn bye(&self, attached: &Attached) {
-        let mut sessions = lock(&self.sessions);
-        if sessions
-            .get(&attached.session_id)
-            .is_some_and(|entry| entry.connection == attached.connection)
-        {
-            sessions.remove(&attached.session_id);
+        let removed = {
+            let mut sessions = lock(&self.sessions);
+            if sessions
+                .get(&attached.session_id)
+                .is_some_and(|entry| entry.connection == attached.connection)
+            {
+                sessions.remove(&attached.session_id).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.service
+                .event_bus()
+                .remove_session(&attached.session_id);
         }
     }
 
@@ -1334,6 +1613,169 @@ fn queue_frame(
     }
 }
 
+fn queue_event_frame(
+    outgoing: &mpsc::UnboundedSender<Outgoing>,
+    memory: &Arc<BytePool>,
+    reserved: &Arc<Semaphore>,
+    closing: &CancellationToken,
+    id: u64,
+    frame: ipc::EventWireFrame,
+) -> bool {
+    let message = ToEndpoint::EventFrame { id, frame };
+    let Ok(length) = ipc::frame_len(&message) else {
+        return false;
+    };
+    let permit = if let Some(lease) = memory.try_acquire(length) {
+        OutgoingPermit::Main(lease)
+    } else if let Ok(want) = u32::try_from(length)
+        && let Ok(permit) = Arc::clone(reserved).try_acquire_many_owned(want)
+    {
+        OutgoingPermit::Reserved(permit)
+    } else {
+        closing.cancel();
+        return false;
+    };
+    let Ok(bytes) = ipc::encode_frame(&message) else {
+        return false;
+    };
+    outgoing
+        .send(Outgoing {
+            bytes,
+            _permit: Some(permit),
+            written: None,
+        })
+        .is_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_event_stream(
+    daemon: Arc<Daemon>,
+    id: u64,
+    token: CancellationToken,
+    _guard: crate::events::StreamGuard,
+    mut sub: crate::events::EventSubscription,
+    event_streams: Arc<Mutex<HashMap<u64, CancellationToken>>>,
+    outgoing: mpsc::UnboundedSender<Outgoing>,
+    closing: CancellationToken,
+) {
+    let heartbeat = Duration::from_millis(sub.heartbeat_ms());
+    if !queue_event_frame(
+        &outgoing,
+        &daemon.memory,
+        &daemon.reserved,
+        &closing,
+        id,
+        ipc::EventWireFrame::Active(sub.initial_active()),
+    ) {
+        lock(&event_streams).remove(&id);
+        return;
+    }
+
+    let sleep = tokio::time::sleep(heartbeat);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                // Client cancelled or connection closed: exit without terminal response.
+                break;
+            }
+            _ = daemon.stopped.cancelled() => {
+                let _ = queue_event_frame(
+                    &outgoing,
+                    &daemon.memory,
+                    &daemon.reserved,
+                    &closing,
+                    id,
+                    ipc::EventWireFrame::Terminated(ipc::IpcEventError {
+                        code: -32000,
+                        message: "fastexec daemon shutting down".to_owned(),
+                        data: None,
+                    }),
+                );
+                let _ = queue_event_frame(
+                    &outgoing,
+                    &daemon.memory,
+                    &daemon.reserved,
+                    &closing,
+                    id,
+                    ipc::EventWireFrame::Complete,
+                );
+                break;
+            }
+            item = sub.next() => {
+                match item {
+                    Some(crate::events::StreamItem::Active(active)) => {
+                        if !queue_event_frame(
+                            &outgoing,
+                            &daemon.memory,
+                            &daemon.reserved,
+                            &closing,
+                            id,
+                            ipc::EventWireFrame::Active(active),
+                        ) {
+                            break;
+                        }
+                        sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
+                    }
+                    Some(crate::events::StreamItem::Event(ev)) => {
+                        if !queue_event_frame(
+                            &outgoing,
+                            &daemon.memory,
+                            &daemon.reserved,
+                            &closing,
+                            id,
+                            ipc::EventWireFrame::Event(ev),
+                        ) {
+                            break;
+                        }
+                        sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
+                    }
+                    None => {
+                        let _ = queue_event_frame(
+                            &outgoing,
+                            &daemon.memory,
+                            &daemon.reserved,
+                            &closing,
+                            id,
+                            ipc::EventWireFrame::Terminated(ipc::IpcEventError {
+                                code: -32000,
+                                message: "event bus closed".to_owned(),
+                                data: None,
+                            }),
+                        );
+                        let _ = queue_event_frame(
+                            &outgoing,
+                            &daemon.memory,
+                            &daemon.reserved,
+                            &closing,
+                            id,
+                            ipc::EventWireFrame::Complete,
+                        );
+                        break;
+                    }
+                }
+            }
+            _ = &mut sleep => {
+                if !queue_event_frame(
+                    &outgoing,
+                    &daemon.memory,
+                    &daemon.reserved,
+                    &closing,
+                    id,
+                    ipc::EventWireFrame::Heartbeat {
+                        cursor: sub.current_cursor(),
+                    },
+                ) {
+                    break;
+                }
+                sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
+            }
+        }
+    }
+    lock(&event_streams).remove(&id);
+}
+
 fn error(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
@@ -1345,7 +1787,7 @@ async fn reject(
     stall: Duration,
     stopped: &CancellationToken,
     message: String,
-) -> Option<Attachment> {
+) -> Option<Handshake> {
     let message = ToEndpoint::Reject { message };
     let writing = ipc::write_frame_idle(writer, &message, stall);
     tokio::select! {
@@ -2949,7 +3391,8 @@ mod tests {
         old_client.send(&bad_hello).await;
         match old_client.next().await {
             Some(ToEndpoint::Reject { message }) => {
-                assert!(message.contains("protocol 2 is not 3"), "{message}");
+                let expected = format!("protocol 2 is not {}", ipc::PROTOCOL);
+                assert!(message.contains(&expected), "{message}");
             }
             other => panic!("expected Reject for protocol 2, got {other:?}"),
         }
@@ -3521,5 +3964,175 @@ mod tests {
         );
         // A full `idle_after` after that admission, the daemon is idle long enough.
         assert!(daemon.idle_expired(later + Duration::from_millis(200)));
+    }
+
+    #[tokio::test]
+    async fn hello_emit_bypasses_sessions_deduplicates_and_blocks_task_forgery() {
+        let fixture = fixture_with_config(Config::default());
+        let daemon = &fixture.daemon;
+
+        let mut emitter = connect(daemon).await;
+        emitter
+            .send(&ToDaemon::HelloEmit {
+                protocol: ipc::PROTOCOL,
+                build: env!("CARGO_PKG_VERSION").to_owned(),
+            })
+            .await;
+        assert!(matches!(
+            emitter.next().await,
+            Some(ToEndpoint::Welcome { .. })
+        ));
+        assert!(
+            lock(&daemon.sessions).is_empty(),
+            "HelloEmit must not insert an entry into Daemon::sessions"
+        );
+
+        let ev = crate::events::ExternalEventInput {
+            event_type: None,
+            source: "github".to_owned(),
+            topic: Some("pr".to_owned()),
+            name: "merged".to_owned(),
+            upstream_event_id: "id-1".to_owned(),
+            data: serde_json::json!({ "pr": 42 }),
+            upstream_truncated: None,
+        };
+        emitter
+            .send(&ToDaemon::EmitEvent { event: ev.clone() })
+            .await;
+        let first_cursor = match emitter.next().await {
+            Some(ToEndpoint::EmitAck {
+                ok: true,
+                cursor: Some(c),
+                deduplicated: false,
+                ..
+            }) => c,
+            other => panic!("expected first EmitAck ok, got {other:?}"),
+        };
+
+        // Re-emitting the same (source, upstreamEventId) deduplicates.
+        emitter.send(&ToDaemon::EmitEvent { event: ev }).await;
+        match emitter.next().await {
+            Some(ToEndpoint::EmitAck {
+                ok: true,
+                cursor: Some(c),
+                deduplicated: true,
+                ..
+            }) => assert_eq!(c, first_cursor),
+            other => panic!("expected deduplicated EmitAck, got {other:?}"),
+        }
+
+        // Forging task.exited via EmitEvent is rejected with -32024 Forbidden.
+        emitter
+            .send(&ToDaemon::EmitEvent {
+                event: crate::events::ExternalEventInput {
+                    event_type: Some(crate::events::EVENT_TASK_EXITED.to_owned()),
+                    source: "github".to_owned(),
+                    topic: None,
+                    name: "forged".to_owned(),
+                    upstream_event_id: "id-2".to_owned(),
+                    data: serde_json::json!({}),
+                    upstream_truncated: None,
+                },
+            })
+            .await;
+        match emitter.next().await {
+            Some(ToEndpoint::EmitAck {
+                ok: false,
+                error: Some(err),
+                ..
+            }) => assert_eq!(err.code, -32024),
+            other => panic!("expected -32024 Forbidden EmitAck, got {other:?}"),
+        }
+
+        emitter.send(&ToDaemon::Bye).await;
+        assert_eq!(emitter.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn daemon_events_rpc_and_active_http_stream_prevent_idle_exit() {
+        let fixture = fixture_with_config(Config {
+            idle_after: Duration::from_millis(200),
+            idle_exit: true,
+            ..Config::default()
+        });
+        let daemon = &fixture.daemon;
+
+        // IPC EventsList / EventsStream / EventsCancel roundtrip.
+        let mut client = connect(daemon).await;
+        client.welcome("events1", 1).await;
+
+        client.send(&ToDaemon::EventsList { id: 10 }).await;
+        match client.next().await {
+            Some(ToEndpoint::EventFrame {
+                id: 10,
+                frame: ipc::EventWireFrame::ListResult(res),
+            }) => {
+                assert_eq!(res.result_type, "complete");
+                assert_eq!(res.events.len(), 2);
+            }
+            other => panic!("expected ListResult, got {other:?}"),
+        }
+
+        client
+            .send(&ToDaemon::EventsStream {
+                id: 11,
+                request: crate::events::SubscribeRequest {
+                    name: crate::events::EVENT_EXTERNAL.to_owned(),
+                    ..Default::default()
+                },
+            })
+            .await;
+        match client.next().await {
+            Some(ToEndpoint::EventFrame {
+                id: 11,
+                frame: ipc::EventWireFrame::Active(active),
+            }) => assert_eq!(active.heartbeat_ms, crate::events::DEFAULT_HEARTBEAT_MS),
+            other => panic!("expected Active frame, got {other:?}"),
+        }
+
+        daemon
+            .service()
+            .event_bus()
+            .publish_external(crate::events::ExternalEventInput {
+                event_type: None,
+                source: "ci".to_owned(),
+                topic: None,
+                name: "done".to_owned(),
+                upstream_event_id: "u-99".to_owned(),
+                data: serde_json::json!({ "ok": true }),
+                upstream_truncated: None,
+            })
+            .unwrap();
+        match client.next().await {
+            Some(ToEndpoint::EventFrame {
+                id: 11,
+                frame: ipc::EventWireFrame::Event(ev),
+            }) => assert_eq!(ev.data["upstreamEventId"], "u-99"),
+            other => panic!("expected Event frame, got {other:?}"),
+        }
+
+        client.send(&ToDaemon::EventsCancel { id: 11 }).await;
+        client.send(&ToDaemon::Bye).await;
+        assert_eq!(client.next().await, None);
+        // Wait for the connection's ticket to drop before checking idle_expired.
+        timeout(Duration::from_secs(5), async {
+            while {
+                let gate = lock(&daemon.gate);
+                gate.live + gate.handshaking > 0
+            } {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // An active HTTP/local EventBus stream keeps idle_expired() false even with zero IPC conns.
+        let guard = daemon.service().event_bus().try_acquire_stream().unwrap();
+        let t0 = Instant::now();
+        assert!(!daemon.idle_expired(t0));
+        assert!(!daemon.idle_expired(t0 + Duration::from_secs(10)));
+        drop(guard);
+        assert!(!daemon.idle_expired(t0 + Duration::from_secs(10)));
+        assert!(daemon.idle_expired(t0 + Duration::from_secs(10) + Duration::from_millis(250)));
     }
 }

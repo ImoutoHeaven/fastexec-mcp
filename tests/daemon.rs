@@ -3173,3 +3173,101 @@ fn endpoint_control_reserve_survives_output_admission_failure() {
     assert!(!local_kill_err, "{local_kill_text}");
     assert_eq!(local_killed["state"], json!("killed"));
 }
+
+#[test]
+fn daemon_emit_single_and_stream_ndjson() {
+    let fixture = Fixture::new("emit");
+    let started = fixture.command(&["daemon", "start"]).output().unwrap();
+    assert!(
+        started.status.success(),
+        "daemon start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    // 1. Single-shot emit via stdin succeeds (exit 0) and rejects forged eventType (non-zero).
+    let mut single = fixture
+        .command(&["daemon", "emit", "--source", "github", "--topic", "pr"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    single
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"eventId":"e1","name":"merged","data":{"n":1}}"#)
+        .unwrap();
+    let single_out = single.wait_with_output().unwrap();
+    assert!(
+        single_out.status.success(),
+        "single emit failed: {}",
+        String::from_utf8_lossy(&single_out.stderr)
+    );
+
+    let mut forged = fixture
+        .command(&["daemon", "emit", "--source", "github"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    forged
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"eventType":"task.exited","eventId":"e2","name":"fake","data":{}}"#)
+        .unwrap();
+    let forged_out = forged.wait_with_output().unwrap();
+    assert!(!forged_out.status.success());
+    assert!(!forged_out.stderr.is_empty());
+
+    // 2. --stream mode handles \n and \r\n, deduplicates, and reports per-line errors.
+    let mut stream = fixture
+        .command(&[
+            "daemon",
+            "emit",
+            "--namespace",
+            &fixture.namespace,
+            "--source",
+            "github",
+            "--topic",
+            "pr",
+            "--stream",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = stream.stdin.take().unwrap();
+        stdin
+            .write_all(
+                b"{\"eventId\":\"e1\",\"name\":\"merged\",\"data\":{\"n\":1}}\n\
+                  {\"eventId\":\"e3\",\"name\":\"opened\",\"data\":{\"n\":3}}\r\n\
+                  not-json\n",
+            )
+            .unwrap();
+    }
+    let stream_out = stream.wait_with_output().unwrap();
+    assert!(
+        stream_out.status.success(),
+        "stream emit failed: {}",
+        String::from_utf8_lossy(&stream_out.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(stream_out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["ok"], true);
+    assert_eq!(lines[0]["deduplicated"], true);
+    assert_eq!(lines[1]["ok"], true);
+    assert_eq!(lines[1]["deduplicated"], false);
+    assert!(lines[1]["eventId"].is_string());
+    assert!(lines[1]["cursor"].is_string());
+    assert_eq!(lines[2]["ok"], false);
+    assert!(lines[2]["error"].is_string());
+}
