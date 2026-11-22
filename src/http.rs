@@ -8,12 +8,12 @@ use crate::transfer::{self, Admitted, Transfers};
 use crate::{Backend, InstructionsToolMode, Server, Tools, TransferEndpoint};
 use bytes::Bytes;
 use http::header::HeaderName;
-use http::{HeaderMap, Method, Request, Response, StatusCode, header};
+use http::{HeaderMap, Method, Request, Response, StatusCode, Version, header};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use rmcp::transport::streamable_http_server::session::local::SessionConfig;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -42,6 +42,10 @@ const MAX_CONNECTIONS: usize = 128;
 const MAX_HTTP_SESSIONS: usize = 256;
 /// The deadline for a complete HTTP request header.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-connection HTTP/2 stream cap.
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 64;
+/// HTTP/2 PING interval for keeping idle multiplexed connections alive through proxies.
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// An upload may continue indefinitely while it delivers data, but not hold a file idle.
 const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -293,8 +297,9 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     let mut config = StreamableHttpServerConfig::default();
     // Legacy clients keep independent sessions; rmcp routes modern requests without one.
     config.legacy_session_mode = true;
-    // A tool result is one answer, and every client here speaks event streams.
-    config.json_response = false;
+    config.stateless_protocol_metadata_required = false;
+    // Stateless responses return JSON unless the handler emits notifications first.
+    config.json_response = true;
     config.sse_keep_alive = Some(Duration::from_secs(15));
     // Gemini rejects empty SSE priming events before reading the JSON-RPC answer.
     config.sse_retry = None;
@@ -362,8 +367,16 @@ where
                 let stopped = stopped.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let mut builder = http1::Builder::new();
-                    builder.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT);
+                    let mut builder = auto::Builder::new(TokioExecutor::new());
+                    builder
+                        .http1()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(HEADER_TIMEOUT);
+                    builder
+                        .http2()
+                        .timer(TokioTimer::new())
+                        .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
+                        .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL);
                     let served = tokio::select! {
                         _ = stopped.cancelled() => return,
                         served = builder.serve_connection(
@@ -373,7 +386,7 @@ where
                     // Malformed or abandoned unauthenticated requests are ordinary client
                     // faults. Logging each one would let a peer fill the daemon's error log.
                     if let Err(error) = served
-                        && !client_fault(&error)
+                        && !client_fault(error.as_ref())
                     {
                         eprintln!("fastexec: an HTTP connection failed: {error}");
                     }
@@ -405,7 +418,7 @@ impl tower_service::Service<Request<Incoming>> for TransferOnly {
             if request.uri().path().starts_with("/t/") {
                 return Ok(serve_transfer(request, table, stopped).await);
             }
-            Ok(refusal(StatusCode::NOT_FOUND, ""))
+            Ok(refusal(request.version(), StatusCode::NOT_FOUND, ""))
         })
     }
 }
@@ -465,13 +478,16 @@ pub fn remote_allowed() -> bool {
 
 /// An invalid request, an idle peer or a disconnected client is not a server failure. Actual
 /// transport/storage faults still reach the daemon log instead of disappearing with them.
-fn client_fault(error: &hyper::Error) -> bool {
-    if error.is_parse() || error.is_incomplete_message() || error.is_timeout() {
-        return true;
-    }
-    use std::error::Error;
-    let mut source: Option<&(dyn Error + 'static)> = Some(error);
+fn client_fault(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = source {
+        if let Some(hyper_error) = current.downcast_ref::<hyper::Error>()
+            && (hyper_error.is_parse()
+                || hyper_error.is_incomplete_message()
+                || hyper_error.is_timeout())
+        {
+            return true;
+        }
         if let Some(io) = current.downcast_ref::<std::io::Error>() {
             return matches!(
                 io.kind(),
@@ -493,16 +509,19 @@ pub struct Principal(pub usize);
 /// The token check and the body cap, in front of rmcp: a request without a token never reaches
 /// a session, and one over the cap is refused before it is read.
 #[derive(Clone)]
-struct Bearer {
+struct Bearer<H = Server> {
     /// Fixed-size digests shared by every request on this listener.
     digests: Arc<[[u8; 32]]>,
     /// The files this listener publishes under `/t/`.
     table: Arc<Transfers>,
     stopped: CancellationToken,
-    inner: StreamableHttpService<Server, Sessions>,
+    inner: StreamableHttpService<H, Sessions>,
 }
 
-impl tower_service::Service<Request<Incoming>> for Bearer {
+impl<H> tower_service::Service<Request<Incoming>> for Bearer<H>
+where
+    H: rmcp::ServerHandler + Send + 'static,
+{
     type Response = Reply;
     type Error = Infallible;
     type Future = Pin<Box<dyn Future<Output = Result<Reply, Infallible>> + Send>>;
@@ -521,18 +540,19 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
             if request.uri().path().starts_with("/t/") {
                 return Ok(serve_transfer(request, table, stopped).await);
             }
+            let version = request.version();
             let Some(principal) = authorized(request.headers(), &digests) else {
-                return Ok(refusal(StatusCode::UNAUTHORIZED, "Bearer"));
+                return Ok(refusal(version, StatusCode::UNAUTHORIZED, "Bearer"));
             };
             // Two routes, and no other: a proxy that forwards its prefix without stripping it
             // fails here, at `initialize`, rather than at a download an hour later.
             if request.uri().path() != "/mcp" {
-                return Ok(refusal(StatusCode::NOT_FOUND, ""));
+                return Ok(refusal(version, StatusCode::NOT_FOUND, ""));
             }
             // A declared length over the cap is refused before a byte of it is read; a chunked
             // body over the cap fails at `Limited`, and rmcp answers that as an error response.
             if declared_length(request.headers()).is_some_and(|length| length > LIMIT as u64) {
-                return Ok(refusal(StatusCode::PAYLOAD_TOO_LARGE, ""));
+                return Ok(refusal(version, StatusCode::PAYLOAD_TOO_LARGE, ""));
             }
             let (mut parts, body) = request.into_parts();
             parts.extensions.insert(Principal(principal));
@@ -556,12 +576,13 @@ impl tower_service::Service<Request<Incoming>> for Bearer {
 }
 
 /// A refusal with no body, so nothing about why is said to a caller that was not admitted.
-fn refusal(status: StatusCode, challenge: &str) -> Reply {
+fn refusal(version: Version, status: StatusCode, challenge: &str) -> Reply {
     // The rejected request's body is deliberately unread. Closing prevents a peer from
     // keeping a connection occupied forever by declaring a body and never sending it.
-    let mut builder = Response::builder()
-        .status(status)
-        .header(header::CONNECTION, "close");
+    let mut builder = Response::builder().status(status);
+    if version < Version::HTTP_2 {
+        builder = builder.header(header::CONNECTION, "close");
+    }
     if !challenge.is_empty() {
         builder = builder.header(header::WWW_AUTHENTICATE, challenge);
     }
@@ -617,6 +638,7 @@ async fn serve_transfer(
     table: Arc<Transfers>,
     stopped: CancellationToken,
 ) -> Reply {
+    let version = request.version();
     let id = request
         .uri()
         .path()
@@ -624,19 +646,20 @@ async fn serve_transfer(
         .unwrap_or_default()
         .to_owned();
     if !transfer::valid_id(&id) {
-        return transfer_empty(StatusCode::NOT_FOUND, &[]);
+        return transfer_empty(version, StatusCode::NOT_FOUND, &[]);
     }
     // An unknown or expired id is absent whatever the method is, and a request refreshes a live
     // one, so admission comes before the method is looked at. The guard then travels with the
     // request: a download holds it inside its body, an upload inside its writer task.
     let Some(admitted) = table.admit(&id) else {
-        return transfer_empty(StatusCode::NOT_FOUND, &[]);
+        return transfer_empty(version, StatusCode::NOT_FOUND, &[]);
     };
     match *request.method() {
-        Method::GET => transfer_get(request.headers(), admitted).await,
-        Method::HEAD => transfer_head(admitted).await,
+        Method::GET => transfer_get(version, request.headers(), admitted).await,
+        Method::HEAD => transfer_head(version, admitted).await,
         Method::PUT => transfer_put(request, admitted, stopped).await,
         _ => transfer_empty(
+            version,
             StatusCode::METHOD_NOT_ALLOWED,
             &[(header::ALLOW.as_str(), "GET, HEAD, PUT")],
         ),
@@ -686,7 +709,7 @@ async fn presence(path: Arc<PathBuf>) -> Presence {
 }
 
 /// Downloads a file, or the one range of it that was asked for.
-async fn transfer_get(headers: &HeaderMap, admitted: Admitted) -> Reply {
+async fn transfer_get(version: Version, headers: &HeaderMap, admitted: Admitted) -> Reply {
     let path = admitted.path();
     let (file, metadata) = match transfer_file(
         path,
@@ -704,9 +727,9 @@ async fn transfer_get(headers: &HeaderMap, admitted: Admitted) -> Reply {
                     | std::io::ErrorKind::Unsupported
             ) =>
         {
-            return transfer_empty(StatusCode::NOT_FOUND, &[]);
+            return transfer_empty(version, StatusCode::NOT_FOUND, &[]);
         }
-        _ => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+        _ => return transfer_empty(version, StatusCode::INTERNAL_SERVER_ERROR, &[]),
     };
     let mut file = tokio::fs::File::from_std(file);
     // Atomic saves may replace the path; the reported size and bytes share this handle.
@@ -719,6 +742,7 @@ async fn transfer_get(headers: &HeaderMap, admitted: Admitted) -> Reply {
         transfer::Range::Unsatisfiable => {
             let header = format!("bytes */{size}");
             return transfer_empty(
+                version,
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 &[(header::CONTENT_RANGE.as_str(), &header)],
             );
@@ -732,7 +756,7 @@ async fn transfer_get(headers: &HeaderMap, admitted: Admitted) -> Reply {
         transfer::Range::Whole => (0, size, StatusCode::OK, None),
     };
     if start > 0 && file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-        return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]);
+        return transfer_empty(version, StatusCode::INTERNAL_SERVER_ERROR, &[]);
     }
     let mut builder =
         transfer_response(status, Some(length)).header(header::ACCEPT_RANGES, "bytes");
@@ -753,12 +777,12 @@ async fn transfer_get(headers: &HeaderMap, admitted: Admitted) -> Reply {
 }
 
 /// Reports the current size of a file, which an upload can resume from.
-async fn transfer_head(admitted: Admitted) -> Reply {
+async fn transfer_head(version: Version, admitted: Admitted) -> Reply {
     let length = match presence(admitted.path()).await {
         Presence::File(size) => size,
         Presence::Missing => 0,
-        Presence::NotAFile => return transfer_empty(StatusCode::NOT_FOUND, &[]),
-        Presence::Failed => return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+        Presence::NotAFile => return transfer_empty(version, StatusCode::NOT_FOUND, &[]),
+        Presence::Failed => return transfer_empty(version, StatusCode::INTERNAL_SERVER_ERROR, &[]),
     };
     transfer_response(StatusCode::OK, Some(length))
         .header(header::ACCEPT_RANGES, "bytes")
@@ -776,24 +800,26 @@ async fn transfer_put(
     admitted: Admitted,
     stopped: CancellationToken,
 ) -> Reply {
+    let version = request.version();
     let offset = match offset_of(request.uri().query()) {
         Ok(offset) => offset,
-        Err(()) => return transfer_empty(StatusCode::BAD_REQUEST, &[]),
+        Err(()) => return transfer_empty(version, StatusCode::BAD_REQUEST, &[]),
     };
     // A disconnected request waiting for another upload must release its file descriptor and
     // its place in the lock queue. Keep preparation in this handler, whose drop cancels it.
     let target = match prepare_upload(&admitted, offset).await {
         Ok(target) => target,
-        Err(status) => return transfer_empty(status, &[]),
+        Err(status) => return transfer_empty(version, status, &[]),
     };
     let body = request.into_body();
     // Only an actual writer is detached: a disconnect must not drop a write before its accepted
     // bytes are flushed, or release the lock while that flush is still in flight.
-    let task =
-        tokio::spawn(async move { write_upload(admitted, target, offset, body, stopped).await });
+    let task = tokio::spawn(async move {
+        write_upload(version, admitted, target, offset, body, stopped).await
+    });
     match task.await {
         Ok(reply) => reply,
-        Err(_) => transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+        Err(_) => transfer_empty(version, StatusCode::INTERNAL_SERVER_ERROR, &[]),
     }
 }
 
@@ -854,6 +880,7 @@ async fn prepare_upload(admitted: &Admitted, offset: u64) -> Result<UploadFile, 
 
 /// Writes one part into the entry's file, from `offset` on, and answers its new size.
 async fn write_upload(
+    version: Version,
     _admitted: Admitted,
     target: UploadFile,
     offset: u64,
@@ -865,13 +892,13 @@ async fn write_upload(
         turn: _turn,
     } = target;
     if stopped.is_cancelled() {
-        return transfer_empty(StatusCode::SERVICE_UNAVAILABLE, &[]);
+        return transfer_empty(version, StatusCode::SERVICE_UNAVAILABLE, &[]);
     }
     // The part replaces whatever followed `offset`, and nothing of the body is read before that.
     if file.set_len(offset).await.is_err()
         || file.seek(std::io::SeekFrom::Start(offset)).await.is_err()
     {
-        return transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]);
+        return transfer_empty(version, StatusCode::INTERNAL_SERVER_ERROR, &[]);
     }
     // A write that fails is remembered to the end: a later flush can succeed on its own and must
     // not turn a rejected part into a success.
@@ -917,11 +944,11 @@ async fn write_upload(
     drop(file);
     match size {
         Ok(size) if !refused && flushed.is_ok() => match body_failure {
-            Some(status) => transfer_empty(status, &[]),
+            Some(status) => transfer_empty(version, status, &[]),
             None => transfer_text(StatusCode::OK, size.to_string()),
         },
         // The disk refused part of the upload, or its size cannot be read: nothing to report.
-        _ => transfer_empty(StatusCode::INTERNAL_SERVER_ERROR, &[]),
+        _ => transfer_empty(version, StatusCode::INTERNAL_SERVER_ERROR, &[]),
     }
 }
 
@@ -972,9 +999,9 @@ fn transfer_response(status: StatusCode, length: Option<u64>) -> http::response:
     }
 }
 
-fn transfer_empty(status: StatusCode, extra: &[(&str, &str)]) -> Reply {
+fn transfer_empty(version: Version, status: StatusCode, extra: &[(&str, &str)]) -> Reply {
     let mut builder = transfer_response(status, None);
-    if status.is_client_error() || status.is_server_error() {
+    if version < Version::HTTP_2 && (status.is_client_error() || status.is_server_error()) {
         // A refused capability or upload may also have a body the route did not consume.
         builder = builder.header(header::CONNECTION, "close");
     }
@@ -1301,7 +1328,7 @@ mod tests {
             if partial {
                 headers.insert(header::RANGE, "bytes=3-".parse().unwrap());
             }
-            let response = transfer_get(&headers, table.admit(&id).unwrap()).await;
+            let response = transfer_get(Version::HTTP_11, &headers, table.admit(&id).unwrap()).await;
             std::fs::rename(&replacement, &path).unwrap();
             let (status, length, body) = if partial {
                 assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 3-7/8");
@@ -1347,12 +1374,21 @@ mod tests {
         let admitted = table.admit(&id).unwrap();
         let target = prepare_upload(&admitted, 0).await.unwrap();
         let input = Stalled(Some(Bytes::from_static(b"accepted")));
-        let response = write_upload(admitted, target, 0, input, CancellationToken::new()).await;
+        let response = write_upload(
+            Version::HTTP_11,
+            admitted,
+            target,
+            0,
+            input,
+            CancellationToken::new(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
         assert_eq!(std::fs::read(&path).unwrap(), b"accepted");
         let admitted = table.admit(&id).unwrap();
         let resume = prepare_upload(&admitted, 8).await.unwrap();
         let response = write_upload(
+            Version::HTTP_11,
             admitted,
             resume,
             8,
@@ -1539,5 +1575,358 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[derive(Clone)]
+    struct PocEventsHandler {
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl rmcp::ServerHandler for PocEventsHandler {
+        async fn on_custom_request(
+            &self,
+            request: rmcp::model::CustomRequest,
+            context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CustomResult, rmcp::ErrorData> {
+            use rmcp::model::{CustomNotification, CustomResult, ErrorCode, ServerNotification};
+            use serde_json::json;
+
+            match request.method.as_str() {
+                "events/list" => Ok(CustomResult::new(json!({
+                    "resultType": "complete",
+                    "events": []
+                }))),
+                "events/poll" => Err(rmcp::ErrorData::new(
+                    ErrorCode(-32023),
+                    "event not found",
+                    Some(json!({"kind": "event"})),
+                )),
+                "events/stream" => {
+                    context
+                        .peer
+                        .send_notification(ServerNotification::CustomNotification(
+                            CustomNotification::new(
+                                "notifications/events/active",
+                                Some(json!({
+                                    "cursor": "1:0",
+                                    "truncated": false,
+                                    "heartbeatMs": 30000
+                                })),
+                            ),
+                        ))
+                        .await
+                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                    self.gate.notified().await;
+                    context
+                        .peer
+                        .send_notification(ServerNotification::CustomNotification(
+                            CustomNotification::new(
+                                "notifications/events/event",
+                                Some(json!({
+                                    "eventId": "evt-1",
+                                    "name": "task.exited",
+                                    "cursor": "1:1",
+                                    "data": {"taskId": "t1"}
+                                })),
+                            ),
+                        ))
+                        .await
+                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                    Ok(CustomResult::new(json!({
+                        "resultType": "complete"
+                    })))
+                }
+                _ => Err(rmcp::ErrorData::new(
+                    ErrorCode::METHOD_NOT_FOUND,
+                    request.method,
+                    None,
+                )),
+            }
+        }
+    }
+
+    fn poc_service(
+        gate: Arc<tokio::sync::Notify>,
+        bound: SocketAddr,
+    ) -> StreamableHttpService<PocEventsHandler, Sessions> {
+        let mut config = StreamableHttpServerConfig::default();
+        config.legacy_session_mode = true;
+        config.stateless_protocol_metadata_required = false;
+        config.json_response = true;
+        config.sse_keep_alive = Some(Duration::from_secs(15));
+        config.sse_retry = None;
+        config.allowed_hosts = allowed_hosts(bound, false);
+        let sessions = Arc::new(Sessions::new(SessionConfig::default(), MAX_HTTP_SESSIONS));
+        StreamableHttpService::new(
+            move || {
+                Ok(PocEventsHandler {
+                    gate: Arc::clone(&gate),
+                })
+            },
+            sessions,
+            config,
+        )
+    }
+
+    fn modern_post_body(id: u64, method: &str, params: serde_json::Value) -> Bytes {
+        let mut map = params.as_object().cloned().unwrap_or_default();
+        map.insert(
+            "_meta".to_owned(),
+            serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }),
+        );
+        Bytes::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": map
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn rmcp_json_response_returns_json_for_single_reply_and_business_error() {
+        use tower_service::Service as _;
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut service = poc_service(gate, SocketAddr::from(([127, 0, 0, 1], 0)));
+
+        let list_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/list")
+            .body(Full::new(modern_post_body(
+                1,
+                "events/list",
+                serde_json::json!({}),
+            )))
+            .unwrap();
+        let list_res = service.call(list_req).await.unwrap();
+        assert_eq!(list_res.status(), StatusCode::OK);
+        let content_type = list_res.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(
+            content_type.starts_with("application/json"),
+            "unexpected content-type: {content_type}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&list_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["result"]["resultType"], "complete");
+
+        let err_req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/poll")
+            .body(Full::new(modern_post_body(
+                2,
+                "events/poll",
+                serde_json::json!({"name": "missing"}),
+            )))
+            .unwrap();
+        let err_res = service.call(err_req).await.unwrap();
+        assert_eq!(err_res.status(), StatusCode::OK);
+        let content_type = err_res.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(
+            content_type.starts_with("application/json"),
+            "unexpected content-type: {content_type}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&err_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["error"]["code"], -32023);
+        assert_eq!(body["error"]["data"]["kind"], "event");
+    }
+
+    #[tokio::test]
+    async fn rmcp_custom_request_flushes_sse_event_notifications_before_complete() {
+        use tower_service::Service as _;
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut service = poc_service(Arc::clone(&gate), SocketAddr::from(([127, 0, 0, 1], 0)));
+
+        let req = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/stream")
+            .body(Full::new(modern_post_body(
+                7,
+                "events/stream",
+                serde_json::json!({"name": "task.exited"}),
+            )))
+            .unwrap();
+        let res = service.call(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let content_type = res.headers()[header::CONTENT_TYPE].to_str().unwrap();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "unexpected content-type: {content_type}"
+        );
+
+        let mut body = res.into_body();
+        let mut sse_buf = String::new();
+        let mut data_frames = Vec::new();
+        let read_next_data = |buf: &mut String, out: &mut Vec<serde_json::Value>| {
+            while let Some(pos) = buf.find("\n\n") {
+                let block = buf[..pos].to_owned();
+                buf.drain(..pos + 2);
+                for line in block.lines() {
+                    if let Some(payload) = line.strip_prefix("data:") {
+                        let trimmed = payload.trim();
+                        if !trimmed.is_empty() {
+                            out.push(serde_json::from_str(trimmed).unwrap());
+                        }
+                    }
+                }
+            }
+        };
+
+        // Must observe the first SSE frame before releasing the handler gate.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while data_frames.is_empty() {
+                let frame = body.frame().await.expect("stream ended early").unwrap();
+                if let Some(data) = frame.data_ref() {
+                    sse_buf.push_str(std::str::from_utf8(data).unwrap());
+                    read_next_data(&mut sse_buf, &mut data_frames);
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for immediate active SSE frame");
+        assert_eq!(data_frames[0]["method"], "notifications/events/active");
+
+        gate.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = body.frame().await {
+                if let Some(data) = frame.unwrap().data_ref() {
+                    sse_buf.push_str(std::str::from_utf8(data).unwrap());
+                    read_next_data(&mut sse_buf, &mut data_frames);
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for remaining SSE frames");
+
+        assert_eq!(data_frames.len(), 3, "frames: {data_frames:?}");
+        assert_eq!(data_frames[1]["method"], "notifications/events/event");
+        assert_eq!(data_frames[2]["id"], 7);
+        assert_eq!(data_frames[2]["result"]["resultType"], "complete");
+    }
+
+    #[tokio::test]
+    async fn http2_h2c_concurrent_requests_and_refusal_omit_connection_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let stopped = CancellationToken::new();
+        let token = "phase1-h2c-token";
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let layer = Bearer {
+            digests: Arc::from([digest(token)]),
+            table: Arc::new(Transfers::new()),
+            stopped: stopped.clone(),
+            inner: poc_service(gate, bound),
+        };
+        let server_task = tokio::spawn(serve_connections(listener, layer, stopped.clone()));
+
+        let stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let make_mcp_req = |id: u64| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{bound}/mcp"))
+                .version(Version::HTTP_2)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "events/list")
+                .body(Full::new(modern_post_body(
+                    id,
+                    "events/list",
+                    serde_json::json!({}),
+                )))
+                .unwrap()
+        };
+
+        let f1 = sender.send_request(make_mcp_req(10));
+        let f2 = sender.send_request(make_mcp_req(11));
+        let (r1, r2) = tokio::join!(f1, f2);
+        for (res, expected_id) in [(r1.unwrap(), 10), (r2.unwrap(), 11)] {
+            assert_eq!(res.version(), Version::HTTP_2);
+            assert_eq!(res.status(), StatusCode::OK);
+            assert!(
+                res.headers()[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json")
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["id"], expected_id);
+            assert_eq!(body["result"]["resultType"], "complete");
+        }
+
+        // HTTP/2 refusal and transfer error must omit `Connection: close` (RFC 9113 §8.2.2).
+        let unauth = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{bound}/mcp"))
+            .version(Version::HTTP_2)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let unauth_res = sender.send_request(unauth).await.unwrap();
+        assert_eq!(unauth_res.version(), Version::HTTP_2);
+        assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
+        assert!(!unauth_res.headers().contains_key(header::CONNECTION));
+
+        let missing_transfer = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://{bound}/t/invalid"))
+            .version(Version::HTTP_2)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let transfer_res = sender.send_request(missing_transfer).await.unwrap();
+        assert_eq!(transfer_res.version(), Version::HTTP_2);
+        assert_eq!(transfer_res.status(), StatusCode::NOT_FOUND);
+        assert!(!transfer_res.headers().contains_key(header::CONNECTION));
+
+        // HTTP/1.1 still sets `Connection: close`.
+        assert_eq!(
+            refusal(Version::HTTP_11, StatusCode::UNAUTHORIZED, "Bearer")
+                .headers()
+                .get(header::CONNECTION)
+                .and_then(|v| v.to_str().ok()),
+            Some("close")
+        );
+        assert_eq!(
+            transfer_empty(Version::HTTP_11, StatusCode::NOT_FOUND, &[])
+                .headers()
+                .get(header::CONNECTION)
+                .and_then(|v| v.to_str().ok()),
+            Some("close")
+        );
+
+        drop(sender);
+        stopped.cancel();
+        let _ = server_task.await;
+        let _ = conn_task.await;
     }
 }
