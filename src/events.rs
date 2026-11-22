@@ -1,7 +1,7 @@
 //! Bounded in-memory event bus for MCP Events (`task.exited` and `external.event`).
 
 use crate::lease::{self, BytePool, Lease};
-use crate::tasks::{self, Snapshot};
+use crate::tasks;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -145,31 +145,6 @@ pub struct TaskExitedInput {
     pub kept_processes: u64,
     pub tree_ended: bool,
     pub log_path: Option<String>,
-}
-
-impl TaskExitedInput {
-    pub fn from_snapshot(
-        task_id: String,
-        session_id: Option<String>,
-        log_path: Option<String>,
-        snapshot: &Snapshot,
-    ) -> Self {
-        let kept_processes = if snapshot.kept {
-            snapshot.held.len().max(snapshot.leftovers.len()) as u64
-        } else {
-            0
-        };
-        Self {
-            task_id,
-            session_id,
-            state: snapshot.state.to_owned(),
-            exit_code: snapshot.exit_code,
-            expired: snapshot.expired,
-            kept_processes,
-            tree_ended: snapshot.tree_ended,
-            log_path,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1322,8 +1297,6 @@ fn format_sanitized_label(source: &str, topic: Option<&str>, name: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::Member;
-    use std::time::Duration;
 
     fn test_bus(
         max_events: usize,
@@ -1351,49 +1324,6 @@ mod tests {
             upstream_event_id: id.to_owned(),
             data,
             upstream_truncated: None,
-        }
-    }
-
-    fn sample_snapshot(state: &'static str, exit_code: Option<i32>, kept: bool) -> Snapshot {
-        Snapshot {
-            state,
-            exit_code,
-            forced_end: false,
-            elapsed: Duration::from_secs(1),
-            lines: 10,
-            dropped: 0,
-            evicted: false,
-            output_open: false,
-            expired: false,
-            log_error: None,
-            capture_error: None,
-            input_warning: None,
-            input_error: None,
-            leftovers: if kept {
-                vec![Member {
-                    pid: 1001,
-                    name: "sleep".to_owned(),
-                }]
-            } else {
-                Vec::new()
-            },
-            kept,
-            tree_ended: !kept,
-            held: if kept {
-                vec![
-                    Member {
-                        pid: 1001,
-                        name: "sleep".to_owned(),
-                    },
-                    Member {
-                        pid: 1002,
-                        name: "nc".to_owned(),
-                    },
-                ]
-            } else {
-                Vec::new()
-            },
-            kill_error: None,
         }
     }
 
@@ -1585,15 +1515,18 @@ mod tests {
     }
 
     #[test]
-    fn publish_task_exited_aligns_with_snapshot_and_strict_json_integers() {
+    fn publish_task_exited_preserves_fields_and_strict_json_integers() {
         let (bus, _) = test_bus(16, 1 << 20, 8, 1 << 20);
-        let snap = sample_snapshot("exited", Some(0), true);
-        let input = TaskExitedInput::from_snapshot(
-            "abcd1234-1".to_owned(),
-            Some("sess-a".to_owned()),
-            Some("/tmp/task.log".to_owned()),
-            &snap,
-        );
+        let input = TaskExitedInput {
+            task_id: "abcd1234-1".to_owned(),
+            session_id: Some("sess-a".to_owned()),
+            state: "exited".to_owned(),
+            exit_code: Some(0),
+            expired: false,
+            kept_processes: 2,
+            tree_ended: false,
+            log_path: Some("/tmp/task.log".to_owned()),
+        };
         let start_cursor = bus.current_cursor();
         bus.publish_task_exited_at(input, 5000).unwrap();
 

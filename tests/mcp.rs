@@ -9222,3 +9222,49 @@ fn instructions_tool_rejects_invalid_env_values() {
         );
     }
 }
+
+#[test]
+fn task_exit_events_count_kept_children_until_the_tree_ends() {
+    let mut server = Server::start_with(|command| {
+        command.env("FASTEXEC_DAEMON", "off");
+    });
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "events-test", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let initial = server.request("events/poll", json!({"name": "task.exited", "_meta": meta}));
+    let mut cursor = initial["result"]["cursor"].clone();
+    assert!(cursor.is_string(), "{initial}");
+    let (started, text) = server.ok(json!({
+        "action": "start", "command": "sleep 300 &", "keepTree": true,
+        "loginShell": false, "waitMs": 10000
+    }));
+    let handle = started["taskId"].as_str().expect(&text).to_owned();
+    let task_id = bare_id(&handle);
+    let next_event = |server: &mut Server, cursor: &mut Value| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = server.request(
+                "events/poll",
+                json!({"name": "task.exited", "cursor": cursor, "_meta": meta}),
+            );
+            assert!(response.get("error").is_none(), "{response}");
+            *cursor = response["result"]["cursor"].clone();
+            if let Some(event) = response["result"]["events"].as_array().unwrap().first() {
+                return event["data"].clone();
+            }
+            assert!(Instant::now() < deadline, "missing task exit event");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let root = next_event(&mut server, &mut cursor);
+    server.ok(json!({"action": "kill", "taskId": handle}));
+    let ended = next_event(&mut server, &mut cursor);
+    assert_eq!(root["taskId"], task_id);
+    assert!(root["keptProcesses"].as_u64().unwrap() > 0, "{root}");
+    assert_eq!(root["treeEnded"], false);
+    assert_eq!(ended["taskId"], task_id);
+    assert_eq!(ended["keptProcesses"], 0);
+    assert_eq!(ended["treeEnded"], true);
+}

@@ -914,13 +914,25 @@ impl Tasks {
         let Some(bus) = self.event_bus.get() else {
             return;
         };
-        let snapshot = task.notice_snapshot();
-        let input = crate::events::TaskExitedInput::from_snapshot(
-            task.id.clone(),
-            task.session_id.clone(),
-            Some(crate::files::display_path(&task.log_path)),
-            &snapshot,
-        );
+        let input = {
+            let end = lock(&task.end);
+            let Some(end) = end.as_ref() else { return };
+            let tree_done = *task.tree_done.borrow();
+            crate::events::TaskExitedInput {
+                task_id: task.id.clone(),
+                session_id: task.session_id.clone(),
+                state: if end.killed { "killed" } else { "exited" }.to_owned(),
+                exit_code: end.exit_code,
+                expired: end.expired,
+                kept_processes: if end.kept && !tree_done {
+                    end.leftovers.len() as u64
+                } else {
+                    0
+                },
+                tree_ended: end.kept && tree_done,
+                log_path: Some(crate::files::display_path(&task.log_path)),
+            }
+        };
         let _ = bus.publish_task_exited(input);
     }
 
