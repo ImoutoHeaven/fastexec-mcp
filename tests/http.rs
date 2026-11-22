@@ -352,10 +352,13 @@ fn exchange_body(addr: SocketAddr, request: &[u8], body: bool) -> Response {
         .unwrap();
     stream.write_all(request).unwrap();
     let mut bytes = Vec::new();
-    // A read that fails or times out is a truncated answer, not a shorter one.
-    stream
-        .read_to_end(&mut bytes)
-        .unwrap_or_else(|error| panic!("the answer ended early: {error}"));
+    // A read that fails or times out is a truncated answer, not a shorter one; on macOS/BSD,
+    // closing after an early 400 with unread request bytes can trigger TCP RST after the reply.
+    match stream.read_to_end(&mut bytes) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset && !bytes.is_empty() => {}
+        Err(error) => panic!("the answer ended early: {error}"),
+    }
     parse_body(&bytes, body)
 }
 

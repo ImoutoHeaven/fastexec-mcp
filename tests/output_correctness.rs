@@ -115,10 +115,16 @@ fn assert_log_recovers(command: &str, expected: &[u8], retained: usize, scan: bo
     let result = server.exec(start);
     assert_ne!(result["isError"], true, "{}", text(&result));
     let metadata = &result["structuredContent"];
+    let task = metadata["taskId"].as_str().unwrap();
+    if scan {
+        // `start` returned as soon as `"A"` matched; wait for the task to finish so the full log
+        // is flushed before reading and truncating it.
+        let settled = server.exec(json!({"action": "poll", "taskId": task, "waitMs": 10000}));
+        assert_ne!(settled["isError"], true, "{}", text(&settled));
+    }
     let path = PathBuf::from(metadata["logPath"].as_str().unwrap());
     let original = std::fs::read(&path).unwrap();
     assert_eq!(original, expected);
-    let task = metadata["taskId"].as_str().unwrap();
     let bare = task.split_once('.').unwrap().0;
     // A chosen new reader starts at byte zero, and can be retried after the error.
     let handle = format!("{bare}.abcd");

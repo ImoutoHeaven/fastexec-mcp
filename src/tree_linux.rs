@@ -208,12 +208,21 @@ pub fn members(host: i32, budget: &mut MemberBudget<'_>) -> io::Result<Vec<Membe
 }
 
 pub fn kill(host: i32) -> io::Result<()> {
-    let reaper = Pinned::open(host)?;
+    let reaper = match Pinned::open(host) {
+        Ok(reaper) => Some(reaper),
+        // The host exits only after waitpid confirms ECHILD; ESRCH means it already exited.
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => None,
+        Err(error) => return Err(error),
+    };
     for _ in 0..40 {
         let entries = snapshot(host)?;
         // An empty scan can overlap an orphan's adoption. The host itself exits only after
         // waitpid confirms ECHILD; wait for its pidfd rather than killing a still-owning reaper.
-        if entries.is_empty() && reaper.exited()? {
+        let reaper_exited = match &reaper {
+            Some(reaper) => reaper.exited()?,
+            None => true,
+        };
+        if entries.is_empty() && reaper_exited {
             return Ok(());
         }
         // The first scan only selects candidates. Pin every candidate before reading any
