@@ -210,6 +210,31 @@ struct Outgoing {
     written: Option<oneshot::Sender<()>>,
 }
 
+struct ActiveEventStream {
+    token: Arc<CancellationToken>,
+    _guard: crate::events::StreamGuard,
+}
+
+type EventStreams = Arc<Mutex<HashMap<u64, ActiveEventStream>>>;
+
+struct EventStreamRegistration {
+    streams: EventStreams,
+    id: u64,
+    token: Arc<CancellationToken>,
+}
+
+impl Drop for EventStreamRegistration {
+    fn drop(&mut self) {
+        let mut streams = lock(&self.streams);
+        if streams
+            .get(&self.id)
+            .is_some_and(|stream| Arc::ptr_eq(&stream.token, &self.token))
+        {
+            streams.remove(&self.id);
+        }
+    }
+}
+
 /// A connection's hold on its session. Dropping it closes the connection, so no way out of
 /// serving one — including a panic or the task being aborted — leaves a session attached to
 /// nothing.
@@ -474,7 +499,7 @@ impl Daemon {
                     write_loop(writer, outgoing_rx, closing, stall).await;
                 });
                 let in_flight: Arc<Mutex<HashMap<u64, CancellationToken>>> = Arc::default();
-                let event_streams: Arc<Mutex<HashMap<u64, CancellationToken>>> = Arc::default();
+                let event_streams: EventStreams = Arc::default();
                 self.read_loop(&mut reader, attached, &outgoing, &in_flight, &event_streams)
                     .await;
             }
@@ -946,7 +971,7 @@ impl Daemon {
         attached: &Attached,
         outgoing: &mpsc::UnboundedSender<Outgoing>,
         in_flight: &Arc<Mutex<HashMap<u64, CancellationToken>>>,
-        event_streams: &Arc<Mutex<HashMap<u64, CancellationToken>>>,
+        event_streams: &EventStreams,
     ) {
         loop {
             let message = tokio::select! {
@@ -1086,9 +1111,20 @@ impl Daemon {
                                     .subscribe(request, Some(&attached.session_id))
                                 {
                                     Ok(sub) => {
-                                        let token = attached.token.child_token();
-                                        streams.insert(id, token.clone());
-                                        Ok((token, guard, sub))
+                                        let token = Arc::new(attached.token.child_token());
+                                        streams.insert(
+                                            id,
+                                            ActiveEventStream {
+                                                token: Arc::clone(&token),
+                                                _guard: guard,
+                                            },
+                                        );
+                                        let registration = EventStreamRegistration {
+                                            streams: Arc::clone(event_streams),
+                                            id,
+                                            token,
+                                        };
+                                        Ok((registration, sub))
                                     }
                                     Err(err) => Err(err.into()),
                                 },
@@ -1096,14 +1132,11 @@ impl Daemon {
                         }
                     };
                     match stream_token {
-                        Ok((token, guard, sub)) => {
+                        Ok((registration, sub)) => {
                             tokio::spawn(run_event_stream(
                                 Arc::clone(self),
-                                id,
-                                token,
-                                guard,
+                                registration,
                                 sub,
-                                Arc::clone(event_streams),
                                 outgoing.clone(),
                                 attached.token.clone(),
                             ));
@@ -1121,8 +1154,10 @@ impl Daemon {
                     }
                 }
                 ToDaemon::EventsCancel { id } => {
-                    if let Some(token) = lock(event_streams).remove(&id) {
-                        token.cancel();
+                    if let Some(stream) = lock(event_streams).remove(&id) {
+                        stream.token.cancel();
+                        // Release the quota before the next request can register a replacement.
+                        drop(stream);
                     }
                 }
                 ToDaemon::Status => {
@@ -1647,17 +1682,18 @@ fn queue_event_frame(
         .is_ok()
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_event_stream(
     daemon: Arc<Daemon>,
-    id: u64,
-    token: CancellationToken,
-    _guard: crate::events::StreamGuard,
+    registration: EventStreamRegistration,
     mut sub: crate::events::EventSubscription,
-    event_streams: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     outgoing: mpsc::UnboundedSender<Outgoing>,
     closing: CancellationToken,
 ) {
+    let id = registration.id;
+    let token = &registration.token;
+    if token.is_cancelled() {
+        return;
+    }
     let heartbeat = Duration::from_millis(sub.heartbeat_ms());
     if !queue_event_frame(
         &outgoing,
@@ -1667,7 +1703,6 @@ async fn run_event_stream(
         id,
         ipc::EventWireFrame::Active(sub.initial_active()),
     ) {
-        lock(&event_streams).remove(&id);
         return;
     }
 
@@ -1773,7 +1808,6 @@ async fn run_event_stream(
             }
         }
     }
-    lock(&event_streams).remove(&id);
 }
 
 fn error(message: String) -> CallToolResult {
@@ -4046,6 +4080,83 @@ mod tests {
 
         emitter.send(&ToDaemon::Bye).await;
         assert_eq!(emitter.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn event_cancel_releases_full_quota_before_reusing_request_id() {
+        let fixture = fixture();
+        let daemon = &fixture.daemon;
+        let bus = Arc::clone(daemon.service().event_bus());
+        let occupied: Vec<_> = (1..crate::events::MAX_EVENT_STREAMS)
+            .map(|_| bus.try_acquire_stream().unwrap())
+            .collect();
+        let mut client = connect(daemon).await;
+        client.welcome("eventsreuse", 1).await;
+        let request = ToDaemon::EventsStream {
+            id: 11,
+            request: crate::events::SubscribeRequest {
+                name: crate::events::EVENT_EXTERNAL.to_owned(),
+                ..Default::default()
+            },
+        };
+        client.send(&request).await;
+        assert!(matches!(
+            client.next().await,
+            Some(ToEndpoint::EventFrame {
+                id: 11,
+                frame: ipc::EventWireFrame::Active(_),
+            })
+        ));
+        assert_eq!(bus.active_streams(), crate::events::MAX_EVENT_STREAMS);
+
+        for round in 0..4 {
+            client.send(&ToDaemon::EventsCancel { id: 11 }).await;
+            client.send(&request).await;
+            let active = client.next().await;
+            assert!(
+                matches!(
+                    &active,
+                    Some(ToEndpoint::EventFrame {
+                        id: 11,
+                        frame: ipc::EventWireFrame::Active(_),
+                    })
+                ),
+                "{active:?}"
+            );
+            assert_eq!(bus.active_streams(), crate::events::MAX_EVENT_STREAMS);
+            bus.publish_external(crate::events::ExternalEventInput {
+                event_type: None,
+                source: "quota".to_owned(),
+                topic: None,
+                name: "ready".to_owned(),
+                upstream_event_id: round.to_string(),
+                data: serde_json::json!({}),
+                upstream_truncated: None,
+            })
+            .unwrap();
+            assert!(matches!(
+                client.next().await,
+                Some(ToEndpoint::EventFrame {
+                    id: 11,
+                    frame: ipc::EventWireFrame::Event(_),
+                })
+            ));
+        }
+
+        client.send(&ToDaemon::EventsCancel { id: 11 }).await;
+        client.send(&ToDaemon::EventsList { id: 12 }).await;
+        assert!(matches!(
+            client.next().await,
+            Some(ToEndpoint::EventFrame {
+                id: 12,
+                frame: ipc::EventWireFrame::ListResult(_),
+            })
+        ));
+        assert_eq!(bus.active_streams(), occupied.len());
+        drop(occupied);
+        assert_eq!(bus.active_streams(), 0);
+        client.send(&ToDaemon::Bye).await;
+        assert_eq!(client.next().await, None);
     }
 
     #[tokio::test]

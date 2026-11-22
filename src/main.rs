@@ -845,11 +845,28 @@ impl Server {
             Backend::Daemon(endpoint) => {
                 let client = client_name(&context);
                 let mut request = sub_req;
+                let mut activated = false;
                 loop {
-                    let (initial, mut stream) = endpoint
+                    let (initial, mut stream) = match endpoint
                         .events_stream(&client, request.clone(), context.ct.clone())
                         .await
-                        .map_err(ipc_event_error_to_rmcp)?;
+                    {
+                        Ok(stream) => stream,
+                        Err(error) if !activated => return Err(ipc_event_error_to_rmcp(error)),
+                        Err(error) => {
+                            if !context.ct.is_cancelled() {
+                                let _ = context
+                                    .peer
+                                    .send_notification(build_event_notification(
+                                        "notifications/events/terminated",
+                                        serde_json::json!({ "error": error }),
+                                        &sub_id,
+                                    ))
+                                    .await;
+                            }
+                            return Ok(stream_complete_result(&sub_id));
+                        }
+                    };
 
                     request.cursor = Some(initial.cursor.clone());
                     request.max_age_ms = None;
@@ -869,6 +886,7 @@ impl Server {
                         return Ok(stream_complete_result(&sub_id));
                     }
 
+                    activated = true;
                     let mut terminated_sent = false;
                     loop {
                         tokio::select! {

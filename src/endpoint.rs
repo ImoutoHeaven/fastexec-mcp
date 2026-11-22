@@ -1184,6 +1184,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_stream_recovery_sends_terminated_before_complete() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let (identity, paths, mut listener, _target) = test_daemon("events-recovery-error");
+        let response = welcome(&identity);
+        let (flooded, flood) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Hello { .. })
+            ));
+            ipc::write_frame(&mut conn, &response).await.unwrap();
+            let Some(ToDaemon::EventsStream { id, .. }) =
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected initial subscription");
+            };
+            ipc::write_frame(
+                &mut conn,
+                &ToEndpoint::EventFrame {
+                    id,
+                    frame: ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                        cursor: "ep000001:0".into(),
+                        truncated: false,
+                        heartbeat_ms: 30_000,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            for index in 1..=350 {
+                ipc::write_frame(
+                    &mut conn,
+                    &ToEndpoint::EventFrame {
+                        id,
+                        frame: ipc::EventWireFrame::Event(crate::events::StreamEvent {
+                            event_id: format!("ev{index}"),
+                            name: crate::events::EVENT_EXTERNAL.into(),
+                            timestamp: "2026-11-22T00:00:00.000Z".into(),
+                            data: serde_json::json!({"index": index, "pad": "x".repeat(2048)}),
+                            cursor: format!("ep000001:{index}"),
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            flooded.send(id).unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await.unwrap(),
+                Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == id
+            ));
+            let Some(ToDaemon::EventsStream { id: retry, request }) =
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected recovery subscription");
+            };
+            assert_ne!(retry, id);
+            assert!(request.cursor.is_some());
+            ipc::write_frame(
+                &mut conn,
+                &ToEndpoint::EventFrame {
+                    id: retry,
+                    frame: ipc::EventWireFrame::Error(ipc::IpcEventError {
+                        code: -32025,
+                        message: "event stream quota is full".into(),
+                        data: Some(serde_json::json!({"limit": "active_event_streams", "max": 64})),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let endpoint = Arc::new(Endpoint::for_test(identity, paths));
+        let leases = Arc::new(crate::RequestLeases::default());
+        let server = crate::Server::new(
+            crate::Backend::Daemon(Arc::clone(&endpoint)),
+            &endpoint.launch,
+            None,
+            crate::Tools::default(),
+            None,
+            crate::InstructionsToolMode::Off,
+        )
+        .with_stdio_leases(Arc::clone(&leases));
+        let (client, serving) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(serving);
+        let transport = crate::StdioTransport::new(read, write, leases);
+        let serving = tokio::spawn(async move {
+            let service = server.serve(transport).await.unwrap();
+            let _ = service.waiting().await;
+        });
+        let (read, mut input) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"}
+            }
+        });
+        input
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .unwrap();
+        let init = timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&init)
+                .unwrap()
+                .get("error")
+                .is_none()
+        );
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "resume-request",
+            "method": "events/stream",
+            "params": {
+                "name": "external.event",
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }
+            }
+        });
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        });
+        input
+            .write_all(format!("{initialized}\n{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let active = timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&active).unwrap()["method"],
+            "notifications/events/active"
+        );
+        let id = timeout(Duration::from_secs(10), flood)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let link = endpoint.link.lock().await.clone().unwrap();
+                if !lock(&link.event_pending).contains_key(&id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut terminated = false;
+        loop {
+            let line = timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert!(message.get("error").is_none(), "{message}");
+            if message["method"] == "notifications/events/terminated" {
+                assert!(!terminated, "{message}");
+                assert_eq!(message["params"]["error"]["code"], -32025);
+                assert_eq!(
+                    message["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                    "resume-request"
+                );
+                terminated = true;
+            } else if message["id"] == "resume-request" {
+                assert!(terminated, "{message}");
+                assert_eq!(message["result"]["resultType"], "complete");
+                break;
+            }
+        }
+        drop(input);
+        drop(lines);
+        finish(peer).await;
+        finish(serving).await;
+    }
+
+    #[tokio::test]
     async fn cancellation_during_a_handshake_never_dispatches_the_call() {
         let (identity, paths, mut listener, _target) = test_daemon("cancel-hello");
         let (announced, hello_seen) = oneshot::channel();
