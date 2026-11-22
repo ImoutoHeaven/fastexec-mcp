@@ -39,12 +39,17 @@ impl Pinned {
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: the initialized array has one valid descriptor, and the poll never waits.
-        let result = unsafe { libc::poll(&mut fd, 1, 0) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            // SAFETY: the initialized array has one valid descriptor, and the poll never waits.
+            let result = unsafe { libc::poll(&mut fd, 1, 0) };
+            if result >= 0 {
+                return Ok(result > 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
-        Ok(result > 0)
     }
 }
 
@@ -123,6 +128,10 @@ fn entry_reserved(pid: i32, budget: &mut MemberBudget<'_>) -> io::Result<Option<
     loop {
         let count = match file.read(&mut chunk) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // A process that exits between open() and read() makes proc_pid_stat return ESRCH.
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+                return Ok(None);
+            }
             other => other?,
         };
         if count == 0 {
@@ -153,11 +162,11 @@ fn entry_reserved(pid: i32, budget: &mut MemberBudget<'_>) -> io::Result<Option<
     Ok(Some(parsed))
 }
 
-fn snapshot(host: i32) -> io::Result<Vec<Entry>> {
-    snapshot_reserved(host, &mut MemberBudget::unlimited())
-}
-
-fn snapshot_reserved(host: i32, budget: &mut MemberBudget<'_>) -> io::Result<Vec<Entry>> {
+fn snapshot_reserved(
+    host: i32,
+    require_host: bool,
+    budget: &mut MemberBudget<'_>,
+) -> io::Result<(bool, Vec<Entry>)> {
     let mut entries = Vec::new();
     for item in std::fs::read_dir("/proc")? {
         let item = item?;
@@ -168,14 +177,16 @@ fn snapshot_reserved(host: i32, budget: &mut MemberBudget<'_>) -> io::Result<Vec
             entries.push(entry);
         }
     }
-    if !entries.iter().any(|entry| entry.pid == host) {
+    let host_present = entries.iter().any(|entry| entry.pid == host);
+    if require_host && !host_present {
         return Err(io::Error::other("the task host is absent from /proc"));
     }
     let inside = owned(host, entries.iter());
-    Ok(entries
+    let descendants = entries
         .into_iter()
         .filter(|entry| entry.pid != host && !entry.zombie && inside.contains(&entry.pid))
-        .collect())
+        .collect();
+    Ok((host_present, descendants))
 }
 
 fn owned<'a>(
@@ -198,7 +209,8 @@ fn owned<'a>(
 }
 
 pub fn members(host: i32, budget: &mut MemberBudget<'_>) -> io::Result<Vec<Member>> {
-    Ok(snapshot_reserved(host, budget)?
+    Ok(snapshot_reserved(host, true, budget)?
+        .1
         .into_iter()
         .map(|entry| Member {
             pid: entry.pid as u32,
@@ -214,14 +226,18 @@ pub fn kill(host: i32) -> io::Result<()> {
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => None,
         Err(error) => return Err(error),
     };
-    for _ in 0..40 {
-        let entries = snapshot(host)?;
+    for _ in 0..200 {
+        let (host_present, entries) =
+            snapshot_reserved(host, false, &mut MemberBudget::unlimited())?;
         // An empty scan can overlap an orphan's adoption. The host itself exits only after
         // waitpid confirms ECHILD; wait for its pidfd rather than killing a still-owning reaper.
         let reaper_exited = match &reaper {
             Some(reaper) => reaper.exited()?,
             None => true,
         };
+        if !host_present && !reaper_exited {
+            return Err(io::Error::other("the task host is absent from /proc"));
+        }
         if entries.is_empty() && reaper_exited {
             return Ok(());
         }
