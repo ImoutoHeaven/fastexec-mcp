@@ -321,23 +321,26 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_callers_make_progress_and_reclaim_all_bytes() {
+    fn concurrent_leases_respect_capacity_and_reclaim_all_bytes() {
         let pool = BytePool::new(100);
         let barrier = std::sync::Barrier::new(2);
-        let successes = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..2 {
                 scope.spawn(|| {
+                    let mut lease = pool.try_acquire(40);
                     barrier.wait();
-                    if let Some(mut lease) = pool.try_acquire(40)
-                        && lease.try_grow(30)
-                    {
-                        successes.fetch_add(1, Ordering::SeqCst);
-                    }
+                    let grew = lease.as_mut().map(|lease| lease.try_grow(30));
+                    barrier.wait();
+                    assert_eq!(grew, Some(false));
                 });
             }
         });
-        assert!(successes.load(Ordering::SeqCst) >= 1);
+        assert_eq!(pool.used(), 0);
+
+        let mut lease = pool.try_acquire(40).unwrap();
+        assert!(lease.try_grow(30));
+        assert_eq!(pool.used(), 70);
+        drop(lease);
         assert_eq!(pool.used(), 0);
     }
 }
