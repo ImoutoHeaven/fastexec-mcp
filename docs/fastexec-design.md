@@ -265,13 +265,22 @@ server admits four scripts and a daemon eight, within the existing total task
 limit. The VM, output reader and capture workers are prepared before admission
 is published; a failed preparation returns its capacity and files.
 
-The script globals are `tools.exec/read/write/edit`, `sleep`, `sh.quote`, `text`,
+The script globals are `tools.exec/read/write/edit`, `sleep`, `sh`, `text`,
 `console`, `attach`, `exit`, and UTF-8 `TextEncoder`/`TextDecoder` (alongside
 QuickJS's built-in `atob`/`btoa`). `sleep(ms)` returns a `Promise<void>` without
 spawning a process (yielding once when `ms <= 0` and throwing `TypeError` for
-non-finite numbers). `sh` is frozen; `sh.quote(value)` formats a
-string or finite number as one POSIX single-quoted word and throws `TypeError`
-for `NaN`, infinities, NUL bytes, or other types. There are no modules, Node
+non-finite numbers). `sh`, `sh.quote`, and `sh.join` are frozen, non-constructible
+functions with no own `prototype` property. `sh.quote(value)` formats a string or
+finite number as one POSIX single-quoted word and throws `TypeError` for `NaN`,
+infinities, NUL bytes (`U+0000`), or other types. `sh.join(values)` takes a dense
+array of own elements (validating a single `length` read as a uint32 and checking
+each index as an own property), formats each element with `sh.quote`, and joins
+them with spaces (returning `""` for `[]`). Tagged `` sh`...` `` validates
+`strings` as a non-null object with an own `raw` array read once whose uint32
+length matches the call arguments, checks each raw segment is an own NUL-free
+string, preserves raw static text verbatim, expands array interpolations with
+`sh.join`, and quotes scalar interpolations with `sh.quote`, throwing `TypeError`
+on any invalid input. There are no modules, Node
 APIs, callback timers (`setTimeout`/`setInterval`), store/load, network, or direct
 filesystem APIs. `text` appends strings as-is and other values as JSON
 (preserved verbatim without ANSI or trailing-space stripping). Console methods

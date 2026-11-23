@@ -6845,6 +6845,31 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
                     command: "printf '%s' " + sh.quote(tricky)
                 });
                 if (rt.output !== tricky) throw new Error("sh.quote mismatch: " + JSON.stringify(rt.output));
+
+                const args = ["it's", "$HOME", "`uname`", "\\", "a\nb", ""];
+                const expectedLines = args.join("\n");
+                const tagCmd = sh`printf '%s\n' ${args}`;
+                if (!tagCmd.startsWith("printf '%s\\n' ")) {
+                    throw new Error("sh tagged template did not preserve raw \\n: " + JSON.stringify(tagCmd));
+                }
+                const rtTag = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    raw: true,
+                    command: tagCmd
+                });
+                if (rtTag.output !== expectedLines) {
+                    throw new Error("sh tagged template mismatch: " + JSON.stringify(rtTag.output));
+                }
+                const rtJoin = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    raw: true,
+                    command: "printf '%s\\n' " + sh.join(args)
+                });
+                if (rtJoin.output !== expectedLines) {
+                    throw new Error("sh.join mismatch: " + JSON.stringify(rtJoin.output));
+                }
                 return "all-nested-checks-ok";
             "#
         }),

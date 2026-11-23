@@ -1682,6 +1682,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
     const weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get);
     const defineProperty = Object.defineProperty;
     const objectFreeze = Object.freeze;
+    const hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
     const numberIsFinite = Number.isFinite;
     const arrayJoin = Function.prototype.call.bind(Array.prototype.join);
     const toStringTag = Symbol.toStringTag;
@@ -1882,35 +1883,104 @@ const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
             throw new TypeErrorCtor("tools." + name + " does not exist. Available: exec, read, write, edit.");
         }
     });
-    function quote(value) {
-        let str;
-        if (typeof value === "string") {
-            str = value;
-        } else if (typeof value === "number") {
-            if (!numberIsFinite(value)) {
+    const shHelpers = {
+        quote(value) {
+            let str;
+            if (typeof value === "string") {
+                str = value;
+            } else if (typeof value === "number") {
+                if (!numberIsFinite(value)) {
+                    throw new TypeErrorCtor("sh.quote requires a string or finite number.");
+                }
+                str = StringCtor(value);
+            } else {
                 throw new TypeErrorCtor("sh.quote requires a string or finite number.");
             }
-            str = StringCtor(value);
-        } else {
-            throw new TypeErrorCtor("sh.quote requires a string or finite number.");
-        }
-        if (stringIndexOf(str, "\0") !== -1) {
-            throw new TypeErrorCtor("sh.quote string must not contain NUL (U+0000).");
-        }
-        let out = "'";
-        let start = 0;
-        while (true) {
-            const at = stringIndexOf(str, "'", start);
-            if (at === -1) {
-                out += start === 0 ? str : stringSlice(str, start);
-                break;
+            if (stringIndexOf(str, "\0") !== -1) {
+                throw new TypeErrorCtor("sh.quote string must not contain NUL (U+0000).");
             }
-            out += stringSlice(str, start, at) + "'\\''";
-            start = at + 1;
-        }
-        return out + "'";
-    }
-    const sh = objectFreeze({ quote });
+            let out = "'";
+            let start = 0;
+            while (true) {
+                const at = stringIndexOf(str, "'", start);
+                if (at === -1) {
+                    out += start === 0 ? str : stringSlice(str, start);
+                    break;
+                }
+                out += stringSlice(str, start, at) + "'\\''";
+                start = at + 1;
+            }
+            return out + "'";
+        },
+        join(values) {
+            if (!isArray(values)) {
+                throw new TypeErrorCtor("sh.join requires an array.");
+            }
+            const len = values.length;
+            if (typeof len !== "number" || (len >>> 0) !== len) {
+                throw new TypeErrorCtor("sh.join array has an invalid length.");
+            }
+            let out = "";
+            for (let i = 0; i < len; i++) {
+                if (!hasOwn(values, i)) {
+                    throw new TypeErrorCtor("sh.join array must not contain holes.");
+                }
+                const word = quote(values[i]);
+                out += i === 0 ? word : " " + word;
+            }
+            return out;
+        },
+        sh(strings) {
+            if (strings === null || typeof strings !== "object" || !hasOwn(strings, "raw")) {
+                throw new TypeErrorCtor("sh must be called as a tagged template.");
+            }
+            const raw = strings.raw;
+            if (!isArray(raw)) {
+                throw new TypeErrorCtor("sh template strings.raw must be an array.");
+            }
+            const len = raw.length;
+            if (typeof len !== "number" || (len >>> 0) !== len || len !== arguments.length) {
+                throw new TypeErrorCtor("sh template strings.raw length does not match values.");
+            }
+            let out = "";
+            for (let i = 0; i < len; i++) {
+                if (!hasOwn(raw, i)) {
+                    throw new TypeErrorCtor("sh template strings.raw must not contain holes.");
+                }
+                const seg = raw[i];
+                if (typeof seg !== "string") {
+                    throw new TypeErrorCtor("sh template segments must be strings.");
+                }
+                if (stringIndexOf(seg, "\0") !== -1) {
+                    throw new TypeErrorCtor("sh template must not contain NUL (U+0000).");
+                }
+                out += seg;
+                if (i + 1 < len) {
+                    const val = arguments[i + 1];
+                    out += isArray(val) ? join(val) : quote(val);
+                }
+            }
+            return out;
+        },
+    };
+    const quote = objectFreeze(shHelpers.quote);
+    const join = objectFreeze(shHelpers.join);
+    const sh = shHelpers.sh;
+    defineProperty(sh, "quote", {
+        __proto__: null,
+        value: quote,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+    });
+    defineProperty(sh, "join", {
+        __proto__: null,
+        value: join,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+    });
+    objectFreeze(sh);
     const attachmentHandles = new WeakMap();
     function parseDataUrl(value) {
         if (value.length < 12) return undefined;
@@ -4456,5 +4526,178 @@ mod tests {
             "expected both inner toJSON frame and tools.write call frame: {out}"
         );
         assert!(!out.contains("codemode-prelude.js"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn sh_template_join_quote_contract_and_prototype_pollution_immunity() {
+        let fixture = Fixture::new();
+        let (st, out) = fixture
+            .result(
+                r#"
+                function assertEq(got, exp, label) {
+                    if (got !== exp) {
+                        throw new Error(label + ": " + JSON.stringify(got) + " !== " + JSON.stringify(exp));
+                    }
+                }
+                function assertTypeError(fn, label) {
+                    let ok = false;
+                    try { fn(); } catch (e) { if (e instanceof TypeError) ok = true; }
+                    if (!ok) throw new Error("expected TypeError for " + label);
+                }
+
+                // 1. Frozen and non-constructible function objects without own .prototype.
+                assertEq(typeof sh, "function", "typeof sh");
+                assertEq(typeof sh.quote, "function", "typeof sh.quote");
+                assertEq(typeof sh.join, "function", "typeof sh.join");
+                assertEq(Object.isFrozen(sh), true, "sh frozen");
+                assertEq(Object.isFrozen(sh.quote), true, "sh.quote frozen");
+                assertEq(Object.isFrozen(sh.join), true, "sh.join frozen");
+                for (const [name, fn] of [["sh", sh], ["sh.quote", sh.quote], ["sh.join", sh.join]]) {
+                    assertEq(
+                        Object.prototype.hasOwnProperty.call(fn, "prototype"),
+                        false,
+                        name + " has no own prototype"
+                    );
+                    assertTypeError(() => new fn(), "new " + name);
+                }
+                for (const prop of ["quote", "join"]) {
+                    const desc = Object.getOwnPropertyDescriptor(sh, prop);
+                    assertEq(desc.writable, false, "sh." + prop + " writable");
+                    assertEq(desc.configurable, false, "sh." + prop + " configurable");
+                }
+
+                // 2. sh.quote valid and invalid inputs.
+                assertEq(sh.quote(""), "''", "quote empty");
+                assertEq(sh.quote("hello world"), "'hello world'", "quote spaces");
+                assertEq(sh.quote("it's $HOME `id` \\ \n"), "'it'\\''s $HOME `id` \\ \n'", "quote special");
+                assertEq(sh.quote(0), "'0'", "quote 0");
+                assertEq(sh.quote(-3.5), "'-3.5'", "quote float");
+                for (const bad of [null, undefined, true, false, {}, [], NaN, Infinity, -Infinity, "a\0b", Symbol("x"), 1n]) {
+                    assertTypeError(() => sh.quote(bad), "sh.quote(" + typeof bad + ")");
+                }
+
+                // 3. sh.join valid and invalid inputs, sparse arrays, and Proxy length tampering.
+                assertEq(sh.join([]), "", "join empty");
+                assertEq(sh.join(["solo"]), "'solo'", "join single");
+                assertEq(
+                    sh.join(["a b", "it's", "line1\nline2", 42, -1.5, ""]),
+                    "'a b' 'it'\\''s' 'line1\nline2' '42' '-1.5' ''",
+                    "join multi"
+                );
+                for (const bad of [null, undefined, "abc", 123, { 0: "a", length: 1 }, true]) {
+                    assertTypeError(() => sh.join(bad), "sh.join non-array");
+                }
+                const sparse1 = new Array(1);
+                const sparse2 = ["a", , "b"];
+                for (const badArr of [
+                    [undefined],
+                    [null],
+                    [NaN],
+                    [Infinity],
+                    [-Infinity],
+                    [true],
+                    [{}],
+                    [["nested"]],
+                    ["a\0b"],
+                    [Symbol("x")],
+                    [1n],
+                    sparse1,
+                    sparse2,
+                ]) {
+                    assertTypeError(() => sh.join(badArr), "sh.join invalid element");
+                }
+                for (const badLen of [NaN, -1, 1.5, Infinity, -Infinity, "0", "1", null, undefined]) {
+                    const proxied = new Proxy(["a"], {
+                        get(target, prop, receiver) {
+                            if (prop === "length") return badLen;
+                            return Reflect.get(target, prop, receiver);
+                        },
+                    });
+                    assertTypeError(() => sh.join(proxied), "sh.join Proxy length=" + String(badLen));
+                }
+
+                // 4. sh`...` tagged template: raw escapes, scalar+array, empty array, errors.
+                assertEq(sh`printf '%s\n\t\s\\'`, "printf '%s\\n\\t\\s\\\\'", "raw escapes");
+                assertEq(
+                    sh`rg ${"-n"} ${["foo bar", "a'b"]} ${123}`,
+                    "rg '-n' 'foo bar' 'a'\\''b' '123'",
+                    "mixed scalar and array"
+                );
+                assertEq(sh`cmd ${[]}`, "cmd ", "empty array trailing");
+                assertEq(sh`ls ${[]} /tmp`, "ls  /tmp", "empty array middle");
+                assertTypeError(() => sh(), "sh()");
+                assertTypeError(() => sh("ls"), "sh('ls')");
+                assertTypeError(() => sh(null), "sh(null)");
+                assertTypeError(() => sh({}), "sh({})");
+                assertTypeError(() => sh({ raw: "not-array" }), "sh raw non-array");
+                assertTypeError(() => sh({ raw: [] }), "sh raw empty");
+                assertTypeError(() => sh({ raw: ["a"] }, "x"), "sh raw too short");
+                assertTypeError(() => sh({ raw: ["a", "b"] }), "sh raw too long");
+                assertTypeError(() => sh({ raw: ["a\0b"] }), "sh raw NUL");
+                assertTypeError(() => sh({ raw: [123] }), "sh raw non-string");
+                assertTypeError(() => sh({ raw: [null] }), "sh raw null seg");
+
+                const sparseRaw = new Array(2);
+                sparseRaw[0] = "echo ";
+                assertTypeError(() => sh({ raw: sparseRaw }, "x"), "sh sparse raw");
+
+                let rawReads = 0;
+                const oneShotOk = {
+                    get raw() {
+                        rawReads++;
+                        if (rawReads > 1) throw new Error("raw getter read more than once");
+                        return ["echo ", " end"];
+                    },
+                };
+                assertEq(sh(oneShotOk, "hi"), "echo 'hi' end", "sh raw getter single read ok");
+                assertEq(rawReads, 1, "raw getter read count ok");
+
+                let badRawReads = 0;
+                const oneShotMismatch = {
+                    get raw() {
+                        badRawReads++;
+                        return ["only-one"];
+                    },
+                };
+                assertTypeError(() => sh(oneShotMismatch, "extra"), "sh raw getter mismatch");
+                assertEq(badRawReads, 1, "raw getter read count mismatch");
+
+                for (const badLen of [NaN, -1, 1.5, Infinity, "1"]) {
+                    const proxiedRaw = new Proxy(["a"], {
+                        get(target, prop, receiver) {
+                            if (prop === "length") return badLen;
+                            return Reflect.get(target, prop, receiver);
+                        },
+                    });
+                    assertTypeError(() => sh({ raw: proxiedRaw }), "sh raw Proxy length=" + String(badLen));
+                }
+
+                for (const badVal of [undefined, null, true, {}, NaN, Infinity, -Infinity, [["nested"]], sparse1, "a\0b", Symbol("x"), 1n]) {
+                    assertTypeError(() => sh`echo ${badVal}`, "sh bad interpolation");
+                }
+
+                // 5. Prototype pollution immunity.
+                Array.prototype.join = () => "POLLUTED_JOIN";
+                Array.prototype.map = () => ["POLLUTED_MAP"];
+                Array.prototype[Symbol.iterator] = function* () { yield "POLLUTED_ITER"; };
+                Array.prototype[0] = "POLLUTED_ARR0";
+                Object.prototype[0] = "POLLUTED_OBJ0";
+                Object.prototype.raw = ["POLLUTED_RAW"];
+
+                assertEq(sh.quote("it's"), "'it'\\''s'", "polluted quote");
+                assertEq(sh.join(["a b", 7]), "'a b' '7'", "polluted join");
+                assertEq(sh.join([]), "", "polluted join empty");
+                assertEq(sh`printf '%s\n' ${["a b", "c'd"]}`, "printf '%s\\n' 'a b' 'c'\\''d'", "polluted template");
+                assertTypeError(() => sh({}), "polluted Object.prototype.raw rejected");
+                assertTypeError(() => sh.join(new Array(1)), "polluted sparse join rejected");
+                const pollutedSparseRaw = new Array(1);
+                assertTypeError(() => sh({ raw: pollutedSparseRaw }), "polluted sparse raw rejected");
+
+                return "sh-contract-ok";
+                "#,
+            )
+            .await;
+        assert_eq!(st.exit_code, Some(0), "{out}");
+        assert_eq!(out, "sh-contract-ok\n");
     }
 }

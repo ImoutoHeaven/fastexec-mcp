@@ -24,7 +24,11 @@ branching on tool results, or filtering bulky output before returning it to cont
   PDF, and video without loading base64 into JS. For UTF-8 text without offset or limit it returns
   the whole file up to 4 MiB, or rejects with ToolError if larger or non-UTF-8; passing offset or
   limit reads a 4 MiB slice.
-- sh.quote(value) quotes value as one bash word.
+- sh`...` builds bash commands using raw template text (keeping backslashes), quotes scalar
+  interpolations with sh.quote(value), and expands arrays with sh.join(values); do not wrap
+  ${...} in quotes. Call sh.quote or sh.join directly when needed. For multiline interpreter
+  scripts (python3, awk, jq), pass command: "python3 -" with input: String.raw`...` instead of
+  nested quotes or heredocs.
 - text(value) appends strings verbatim and other values as JSON. console.log/info/warn/error/debug
   join arguments with spaces. A non-undefined return value must be a string or JSON-serializable
   and is appended last; exit() ends with 0. Output fits maxBytes (default 16384); logPath keeps
