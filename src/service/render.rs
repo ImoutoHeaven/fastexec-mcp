@@ -718,7 +718,10 @@ impl Service {
         ),
         ServiceError,
     > {
-        let permit = call.task_render_permit(action, &task, &task_reader).await?;
+        // Locals drop in reverse declaration order; abandoned worker tuples drop left to right.
+        // Keep the reader before its resources here and last in worker results.
+        let mut read;
+        let mut permit = call.task_render_permit(action, &task, &task_reader).await?;
         let render = call.render;
         if view.screen {
             return self
@@ -743,7 +746,7 @@ impl Service {
         let outbound_limit = call.launch().outbound_limit();
         let requested_max_bytes = view.max_bytes;
         let mut view = view;
-        let workspace = pool
+        let mut workspace = pool
             .try_acquire(text_workspace_bytes(view.max_bytes))
             .or_else(|| {
                 if action != Action::Kill {
@@ -769,7 +772,8 @@ impl Service {
         let keep_nul = view.nested;
         let budget = view.max_bytes;
         let initial_seen = state.attachments_seen;
-        let (window, unseen, had_new_text, mut read, mut permit, mut workspace) =
+        let (window, unseen, had_new_text);
+        (window, unseen, had_new_text, workspace, permit, read) =
             tokio::task::spawn_blocking(move || {
                 let workspace = workspace;
                 let mut read = StagedRead::new(state);
@@ -790,7 +794,7 @@ impl Service {
                 } else {
                     Vec::new()
                 };
-                (window, unseen, had_new_text, read, permit, workspace)
+                (window, unseen, had_new_text, workspace, permit, read)
             })
             .await
             .map_err(|error| format!("Internal failure while reading output: {error}."))?;
@@ -991,30 +995,25 @@ impl Service {
             let state_guard = read.into_guard();
             let reader_narrow = Arc::clone(&task);
             let narrow_budget = view.max_bytes.min(64 * 1024);
-            let (narrow_win, narrow_read, narrow_permit, returned_workspace) =
-                tokio::task::spawn_blocking(move || {
-                    let mut staged = StagedRead::new(state_guard);
-                    let win = reader_narrow.read_window(
-                        &mut staged.state,
-                        view.truncate,
-                        narrow_budget,
-                        view.raw,
-                        clean,
-                        keep_nul,
-                        encoding,
-                        None,
-                    );
-                    (win, staged, permit, workspace)
-                })
-                .await
-                .map_err(|error| {
-                    format!("Internal failure while narrowing kill output: {error}.")
-                })?;
-            workspace = returned_workspace;
+            let narrow_win;
+            (narrow_win, workspace, permit, read) = tokio::task::spawn_blocking(move || {
+                let mut staged = StagedRead::new(state_guard);
+                let win = reader_narrow.read_window(
+                    &mut staged.state,
+                    view.truncate,
+                    narrow_budget,
+                    view.raw,
+                    clean,
+                    keep_nul,
+                    encoding,
+                    None,
+                );
+                (win, workspace, permit, staged)
+            })
+            .await
+            .map_err(|error| format!("Internal failure while narrowing kill output: {error}."))?;
             window_val =
                 narrow_win.map_err(|error| format!("Cannot read the task log: {error}."))?;
-            read = narrow_read;
-            permit = narrow_permit;
             extra_kill_warnings.push(
                 "kill output window narrowed to fit the 8 MiB control reserve; poll taskId or read logPath for remaining output".into(),
             );
@@ -1385,6 +1384,8 @@ impl Service {
         ),
         ServiceError,
     > {
+        // Error paths release the reader after the workspaces and render permits.
+        let (mut read, _first_permit, _permit);
         let permit = call
             .task_render_permit(Action::Transcript, &task, &task_reader)
             .await?;
@@ -1394,7 +1395,7 @@ impl Service {
         let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
         let first_permit = permit.clone();
         let memory = Arc::clone(call.launch().memory());
-        let workspace = memory
+        let mut workspace = memory
             .try_acquire(text_workspace_bytes(view.max_bytes))
             .ok_or_else(|| {
                 let meta = files::TaskMeta {
@@ -1403,11 +1404,12 @@ impl Service {
                 };
                 ServiceError::Overload(overload_task_message(memory.limit(), &meta), Some(meta))
             })?;
-        let (transcript, read, _first_permit, workspace) = tokio::task::spawn_blocking(move || {
+        let transcript;
+        (transcript, workspace, _first_permit, read) = tokio::task::spawn_blocking(move || {
             let owned_workspace = workspace;
             let read = StagedRead::new(state);
             let transcript = reader.transcript(&tasks, &read.state, &memory);
-            (transcript, read, first_permit, owned_workspace)
+            (transcript, owned_workspace, first_permit, read)
         })
         .await
         .map_err(|error| format!("Internal failure while reading: {error}."))?;
@@ -1463,7 +1465,8 @@ impl Service {
                 )));
         }
         let logged = Arc::clone(&task);
-        let (window, read, _permit, (snapshot_owner, workspace)) =
+        let (window, snapshot_owner);
+        (window, (snapshot_owner, workspace), _permit, read) =
             tokio::task::spawn_blocking(move || {
                 // Capture the lease explicitly: field-only closure capture must not leave it
                 // outside the blocking worker while that worker still owns pending text.
@@ -1505,7 +1508,7 @@ impl Service {
                         Ok(builder.finish())
                     }
                 };
-                (window, read, permit, held)
+                (window, held, permit, read)
             })
             .await
             .map_err(|error| format!("Internal failure while reading: {error}."))?;
@@ -1633,15 +1636,17 @@ impl Service {
         ),
         ServiceError,
     > {
+        // Error paths release the reader after the screen workspace and render permit.
+        let (window, read, _permit);
         // A finished state, taken first, means the screen below holds all output.
         let metadata = RenderSnapshot::new(&task, call, action)?;
         let snapshot = &metadata.value;
-        let screen = task
+        let mut screen = task
             .screen(call.launch().memory())
             .map_err(|error| task_read_error(error, &task))?;
         // The stream counts as read up to the output the screen shows.
         let (reader, until) = (Arc::clone(&task), screen.log_end);
-        let (window, read, _permit, screen) = tokio::task::spawn_blocking(move || {
+        (window, screen, _permit, read) = tokio::task::spawn_blocking(move || {
             let owned_screen = screen;
             let mut read = StagedRead::new(state);
             let window = reader.read_window(
@@ -1654,7 +1659,7 @@ impl Service {
                 reader.encoding,
                 Some(until),
             );
-            (window, read, permit, owned_screen)
+            (window, owned_screen, permit, read)
         })
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;

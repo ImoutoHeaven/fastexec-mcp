@@ -226,6 +226,25 @@ async fn response_snapshot_owns_its_workspace_and_uses_control_only_for_kill() {
 #[test]
 fn response_snapshot_cancellation_releases_metadata_but_keeps_queued_window_owned() {
     use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    struct ReadWake {
+        memory: Arc<crate::lease::BytePool>,
+        slots: Arc<Semaphore>,
+        used: AtomicUsize,
+        permits: AtomicUsize,
+        woken: AtomicBool,
+    }
+
+    impl Wake for ReadWake {
+        fn wake(self: Arc<Self>) {
+            self.used.store(self.memory.used(), Ordering::Relaxed);
+            self.permits
+                .store(self.slots.available_permits(), Ordering::Relaxed);
+            self.woken.store(true, Ordering::Release);
+        }
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
@@ -268,8 +287,11 @@ fn response_snapshot_cancellation_releases_metadata_but_keeps_queued_window_owne
             let _ = blocked.recv();
         });
         ready_rx.await.unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let slot = RenderSlot::new(&slots);
         let mut call = script_call(&session, false);
         call.launch = Some(&launch);
+        call.render_slot = Some(&slot);
         let mut operation = Box::pin(service.call_json_tracked(
             json!({"action":"poll", "taskId":reader.handle(&task.id), "waitMs":0, "maxBytes":100}),
             call,
@@ -281,17 +303,37 @@ fn response_snapshot_cancellation_releases_metadata_but_keeps_queued_window_owne
         }
         assert!(memory.used() > text_workspace_bytes(100));
         drop(operation);
+        drop(slot);
         assert_eq!(memory.used(), text_workspace_bytes(100));
+        assert_eq!(slots.available_permits(), 0);
+        let observed = Arc::new(ReadWake {
+            memory: Arc::clone(&memory),
+            slots: Arc::clone(&slots),
+            used: AtomicUsize::new(usize::MAX),
+            permits: AtomicUsize::new(usize::MAX),
+            woken: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&observed));
+        let mut next_read = Box::pin(reader.read_gate().lock_owned());
+        assert!(
+            next_read
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
         release.send(()).unwrap();
         blocker.await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while memory.used() != 0 {
+            while !observed.woken.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        let state = reader.read_gate().lock_owned().await;
+        // The worker's unlock wakes the next reader before any later tuple fields drop.
+        assert_eq!(observed.used.load(Ordering::Relaxed), 0);
+        assert_eq!(observed.permits.load(Ordering::Relaxed), 1);
+        let state = next_read.await;
         assert_eq!((state.cursor, state.attachments_seen), (0, 0));
         assert!(reader.is_fresh());
         assert!(!entry.is_reported());
