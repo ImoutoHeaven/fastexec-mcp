@@ -153,20 +153,30 @@ pub(crate) async fn write_request_frame<W: AsyncWrite + Unpin>(
 pub(crate) enum DaemonFrame {
     Message(Owned<ToDaemon>),
     Overload { id: Option<u64> },
+    OverloadEvent { id: Option<u64> },
     Eof,
 }
 
-fn daemon_call_id(head: &[u8]) -> Option<u64> {
+fn sniff_daemon_overload(head: &[u8]) -> DaemonFrame {
     let text = std::str::from_utf8(head)
         .unwrap_or_else(|error| std::str::from_utf8(&head[..error.valid_up_to()]).unwrap_or(""));
-    if !text.contains("\"type\":\"call\"") {
-        return None;
+    let parse_id = || {
+        let digits = text.split_once("\"id\":")?.1.trim_start();
+        let end = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        digits[..end].parse().ok()
+    };
+    if text.contains("\"type\":\"call\"") {
+        return DaemonFrame::Overload { id: parse_id() };
     }
-    let digits = text.split_once("\"id\":")?.1.trim_start();
-    let end = digits
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(digits.len());
-    digits[..end].parse().ok()
+    if text.contains("\"type\":\"events_list\"")
+        || text.contains("\"type\":\"events_poll\"")
+        || text.contains("\"type\":\"events_stream\"")
+    {
+        return DaemonFrame::OverloadEvent { id: parse_id() };
+    }
+    DaemonFrame::Overload { id: None }
 }
 
 /// Charges raw bytes, parsing, and the owned arguments through actual dispatch.
@@ -208,9 +218,7 @@ pub(crate) async fn read_daemon_frame_owned<R: AsyncRead + Unpin>(
         let mut head = [0u8; 256];
         read_exact_slice(reader, &mut head[..prefix_len]).await?;
         drain_exact_bytes(reader, length - prefix_len, length).await?;
-        return Ok(DaemonFrame::Overload {
-            id: daemon_call_id(&head[..prefix_len]),
-        });
+        return Ok(sniff_daemon_overload(&head[..prefix_len]));
     };
     struct Raw {
         bytes: Vec<u8>,
@@ -231,12 +239,15 @@ pub(crate) async fn read_daemon_frame_owned<R: AsyncRead + Unpin>(
     raw.lease.shrink_to(retained);
     if in_control && !daemon_control(&message) {
         let Some(lease) = main.try_acquire(retained) else {
-            let id = match &message {
-                ToDaemon::Call { id, .. } => Some(*id),
-                _ => None,
+            let frame = match &message {
+                ToDaemon::Call { id, .. } => DaemonFrame::Overload { id: Some(*id) },
+                ToDaemon::EventsList { id }
+                | ToDaemon::EventsPoll { id, .. }
+                | ToDaemon::EventsStream { id, .. } => DaemonFrame::OverloadEvent { id: Some(*id) },
+                _ => DaemonFrame::Overload { id: None },
             };
             drop(message);
-            return Ok(DaemonFrame::Overload { id });
+            return Ok(frame);
         };
         raw.lease = lease;
     }
@@ -515,6 +526,7 @@ where
 pub enum LeasedEndpointFrame {
     Frame(ToEndpoint, crate::lease::Lease),
     OverloadResult { id: Option<u64> },
+    OverloadEvent { id: Option<u64> },
     OverloadProgress,
     Eof,
 }
@@ -625,10 +637,11 @@ where
         read_exact_slice(reader, &mut head[..prefix_len]).await?;
         let sniffed = sniff_endpoint_overload(&head[..prefix_len]);
         let skip_control_pool = length > 64 * 1024
-            && matches!(
-                sniffed,
-                LeasedEndpointFrame::OverloadResult { id } if !id.is_some_and(&is_control_call)
-            );
+            && match sniffed {
+                LeasedEndpointFrame::OverloadResult { id } => !id.is_some_and(&is_control_call),
+                LeasedEndpointFrame::OverloadEvent { .. } => true,
+                _ => false,
+            };
         if !skip_control_pool && let Some(mut clease) = control_pool.try_acquire(parse_peak) {
             let mut body = vec![0u8; length];
             body[..prefix_len].copy_from_slice(&head[..prefix_len]);
@@ -652,6 +665,23 @@ where
                     drop(decoded);
                     drop(clease);
                     return Ok(LeasedEndpointFrame::OverloadResult { id: Some(id) });
+                }
+                ToEndpoint::EventFrame {
+                    frame:
+                        EventWireFrame::Error(_)
+                        | EventWireFrame::Terminated(_)
+                        | EventWireFrame::Complete
+                        | EventWireFrame::Heartbeat { .. },
+                    ..
+                } => {
+                    clease.shrink_to(length);
+                    return Ok(LeasedEndpointFrame::Frame(decoded, clease));
+                }
+                ToEndpoint::EventFrame { id, .. } => {
+                    let id = *id;
+                    drop(decoded);
+                    drop(clease);
+                    return Ok(LeasedEndpointFrame::OverloadEvent { id: Some(id) });
                 }
                 _ => {
                     clease.shrink_to(length);
@@ -679,18 +709,23 @@ fn sniff_endpoint_overload(head: &[u8]) -> LeasedEndpointFrame {
     if text.contains("\"type\":\"progress\"") {
         return LeasedEndpointFrame::OverloadProgress;
     }
+    let parse_id = || {
+        text.split_once("\"id\":").and_then(|(_, rest)| {
+            let digits: String = rest
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+    };
+    if text.contains("\"type\":\"event_frame\"") {
+        return LeasedEndpointFrame::OverloadEvent { id: parse_id() };
+    }
     if !text.contains("\"type\":\"result\"") {
         return LeasedEndpointFrame::OverloadResult { id: None };
     }
-    let id = text.split_once("\"id\":").and_then(|(_, rest)| {
-        let digits: String = rest
-            .trim_start()
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        digits.parse().ok()
-    });
-    LeasedEndpointFrame::OverloadResult { id }
+    LeasedEndpointFrame::OverloadResult { id: parse_id() }
 }
 
 /// An OS string as the wire carries it: a JSON string when it is valid Unicode, and its native
@@ -1022,6 +1057,7 @@ mod tests {
                     assert!(!fits);
                     assert_eq!(id, Some(7));
                 }
+                DaemonFrame::OverloadEvent { .. } => panic!("expected call frame"),
                 DaemonFrame::Eof => panic!("one complete frame"),
             }
             assert_eq!(pool.used(), 0);
@@ -1883,5 +1919,201 @@ mod tests {
         }
         assert_eq!(roomy_control.used(), 0);
         drop(full_main);
+    }
+
+    #[tokio::test]
+    async fn daemon_event_requests_return_overload_event_when_main_pool_is_full() {
+        let requests = [
+            (11, ToDaemon::EventsList { id: 11 }),
+            (
+                12,
+                ToDaemon::EventsPoll {
+                    id: 12,
+                    request: crate::events::PollRequest::default(),
+                },
+            ),
+            (
+                13,
+                ToDaemon::EventsStream {
+                    id: 13,
+                    request: crate::events::SubscribeRequest::default(),
+                },
+            ),
+        ];
+
+        // 1. Short frames decoded in `control` when `main` is full yield `OverloadEvent { id }`.
+        let empty_main = BytePool::new(0);
+        let roomy_control = BytePool::new(16 * 1024);
+        for (expected_id, message) in &requests {
+            let wire = encode_frame(message).unwrap();
+            let mut cursor = std::io::Cursor::new(wire);
+            match read_daemon_frame_owned(&mut cursor, REQUEST_LIMIT, &empty_main, &roomy_control)
+                .await
+                .unwrap()
+            {
+                DaemonFrame::OverloadEvent { id } => assert_eq!(id, Some(*expected_id)),
+                _ => panic!("expected OverloadEvent({expected_id})"),
+            }
+            assert_eq!(roomy_control.used(), 0);
+        }
+
+        // 2. When both `main` and `control` are full, header sniffing still yields `OverloadEvent`
+        //    and drains the frame cleanly so a trailing frame parses normally.
+        let empty_control = BytePool::new(0);
+        for (expected_id, message) in &requests {
+            let mut wire = encode_frame(message).unwrap();
+            wire.extend_from_slice(&encode_frame(&ToDaemon::Status).unwrap());
+            let mut cursor = std::io::Cursor::new(wire);
+            match read_daemon_frame_owned(&mut cursor, REQUEST_LIMIT, &empty_main, &empty_control)
+                .await
+                .unwrap()
+            {
+                DaemonFrame::OverloadEvent { id } => assert_eq!(id, Some(*expected_id)),
+                _ => panic!("expected sniffed OverloadEvent({expected_id})"),
+            }
+            let status_pool = BytePool::new(4096);
+            match read_daemon_frame_owned(&mut cursor, REQUEST_LIMIT, &status_pool, &empty_control)
+                .await
+                .unwrap()
+            {
+                DaemonFrame::Message(owned) => assert_eq!(owned.value, ToDaemon::Status),
+                _ => panic!("expected trailing Status after drained OverloadEvent"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_event_frames_isolate_control_pool_and_return_overload_event() {
+        let main_pool = crate::lease::BytePool::new(1024);
+        let control_pool = crate::lease::BytePool::new(crate::lease::CONTROL_LIMIT);
+        let _full_main = main_pool.try_acquire(1024).unwrap();
+
+        // 1. Oversized (> 64 KiB) EventFrame skips `control_pool` and returns `OverloadEvent`.
+        let mut big_body =
+            br#"{"type":"event_frame","id":201,"frame":{"kind":"event","data":"#.to_vec();
+        big_body.resize(70 * 1024, b'x');
+        let mut big_wire = (big_body.len() as u32).to_le_bytes().to_vec();
+        big_wire.extend_from_slice(&big_body);
+        let mut big_cursor = std::io::Cursor::new(big_wire);
+        match read_endpoint_frame_leased(
+            &mut big_cursor,
+            RESPONSE_LIMIT,
+            &main_pool,
+            &control_pool,
+            |_| false,
+        )
+        .await
+        .unwrap()
+        {
+            LeasedEndpointFrame::OverloadEvent { id } => assert_eq!(id, Some(201)),
+            other => panic!("expected OverloadEvent(201), got {other:?}"),
+        }
+        assert_eq!(control_pool.used(), 0);
+
+        // 2. Data EventFrames (<= 64 KiB) do not remain on `control_pool` and return `OverloadEvent`.
+        let data_frames = [
+            (
+                202,
+                EventWireFrame::ListResult(crate::events::EventsListResult {
+                    result_type: std::borrow::Cow::Borrowed("events.list"),
+                    events: vec![],
+                }),
+            ),
+            (
+                203,
+                EventWireFrame::PollResult(crate::events::PollResponse {
+                    result_type: std::borrow::Cow::Borrowed("events.poll"),
+                    events: vec![],
+                    cursor: "0:0".to_owned(),
+                    has_more: false,
+                    truncated: false,
+                    next_poll_ms: 1000,
+                }),
+            ),
+            (
+                204,
+                EventWireFrame::Active(crate::events::ActiveNotice {
+                    cursor: "0:0".to_owned(),
+                    truncated: false,
+                    heartbeat_ms: 30_000,
+                }),
+            ),
+        ];
+        for (expected_id, frame) in data_frames {
+            let wire = encode_frame(&ToEndpoint::EventFrame {
+                id: expected_id,
+                frame,
+            })
+            .unwrap();
+            let mut cursor = std::io::Cursor::new(wire);
+            match read_endpoint_frame_leased(
+                &mut cursor,
+                RESPONSE_LIMIT,
+                &main_pool,
+                &control_pool,
+                |_| false,
+            )
+            .await
+            .unwrap()
+            {
+                LeasedEndpointFrame::OverloadEvent { id } => assert_eq!(id, Some(expected_id)),
+                other => panic!("expected OverloadEvent({expected_id}), got {other:?}"),
+            }
+            assert_eq!(control_pool.used(), 0);
+        }
+
+        // 3. Control EventFrames still decode on `control_pool`.
+        let control_frames = [
+            (
+                210,
+                EventWireFrame::Error(IpcEventError {
+                    code: -32025,
+                    message: "busy".to_owned(),
+                    data: None,
+                }),
+            ),
+            (
+                211,
+                EventWireFrame::Terminated(IpcEventError {
+                    code: -32025,
+                    message: "terminated".to_owned(),
+                    data: None,
+                }),
+            ),
+            (212, EventWireFrame::Complete),
+            (
+                213,
+                EventWireFrame::Heartbeat {
+                    cursor: "0:1".to_owned(),
+                },
+            ),
+        ];
+        for (expected_id, frame) in control_frames {
+            let wire = encode_frame(&ToEndpoint::EventFrame {
+                id: expected_id,
+                frame: frame.clone(),
+            })
+            .unwrap();
+            let mut cursor = std::io::Cursor::new(wire);
+            match read_endpoint_frame_leased(
+                &mut cursor,
+                RESPONSE_LIMIT,
+                &main_pool,
+                &control_pool,
+                |_| false,
+            )
+            .await
+            .unwrap()
+            {
+                LeasedEndpointFrame::Frame(ToEndpoint::EventFrame { id, frame: got }, lease) => {
+                    assert_eq!(id, expected_id);
+                    assert_eq!(got, frame);
+                    assert!(control_pool.used() > 0);
+                    drop(lease);
+                }
+                other => panic!("expected control EventFrame({expected_id}), got {other:?}"),
+            }
+            assert_eq!(control_pool.used(), 0);
+        }
     }
 }

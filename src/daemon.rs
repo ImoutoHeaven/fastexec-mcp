@@ -844,17 +844,19 @@ impl Daemon {
             };
             let ack = match frame {
                 Ok(ipc::DaemonFrame::Eof) => return,
-                Ok(ipc::DaemonFrame::Overload { .. }) => ToEndpoint::EmitAck {
-                    ok: false,
-                    event_id: None,
-                    cursor: None,
-                    deduplicated: false,
-                    error: Some(ipc::IpcEventError {
-                        code: -32025,
-                        message: ipc::input_budget_error().to_string(),
-                        data: None,
-                    }),
-                },
+                Ok(ipc::DaemonFrame::Overload { .. } | ipc::DaemonFrame::OverloadEvent { .. }) => {
+                    ToEndpoint::EmitAck {
+                        ok: false,
+                        event_id: None,
+                        cursor: None,
+                        deduplicated: false,
+                        error: Some(ipc::IpcEventError {
+                            code: -32025,
+                            message: ipc::input_budget_error().to_string(),
+                            data: None,
+                        }),
+                    }
+                }
                 Ok(ipc::DaemonFrame::Message(owned)) => match owned.value {
                     ToDaemon::EmitEvent { event } => {
                         let result = self.service.event_bus().publish_external(event);
@@ -984,6 +986,21 @@ impl Daemon {
                     Ok(ipc::DaemonFrame::Overload { id: Some(id) }) => {
                         queue_result(outgoing, &self.reserved, &attached.token, id,
                             error(ipc::input_budget_error().to_string()));
+                        continue;
+                    }
+                    Ok(ipc::DaemonFrame::OverloadEvent { id: Some(id) }) => {
+                        queue_event_control(
+                            outgoing,
+                            &self.memory,
+                            &self.reserved,
+                            &attached.token,
+                            id,
+                            ipc::EventWireFrame::Error(ipc::IpcEventError {
+                                code: -32025,
+                                message: ipc::input_budget_error().to_string(),
+                                data: None,
+                            }),
+                        );
                         continue;
                     }
                     _ => return,
