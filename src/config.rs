@@ -2,7 +2,7 @@
 
 use crate::files;
 use crate::http;
-use crate::service::{self, Render};
+use crate::service::render::{OutputMode, Render};
 use crate::session::{self, LaunchContext};
 use std::sync::Arc;
 
@@ -111,14 +111,14 @@ pub(crate) fn instructions_file(launch: &LaunchContext) -> Result<Option<String>
     if raw.is_empty() {
         return Err(format!("{INSTRUCTIONS_FILE} must not be empty"));
     }
-    let resolved = files::resolve(raw, launch).map_err(|error| {
+    let resolved = files::path::resolve(raw, launch).map_err(|error| {
         format!(
             "invalid {INSTRUCTIONS_FILE}: {}",
             error.trim_end_matches('.')
         )
     })?;
-    let shown_path = files::display_path(&resolved);
-    let (file, _) = files::open_regular(&resolved)
+    let shown_path = files::path::display_path(&resolved);
+    let (file, _) = files::path::open_regular(&resolved)
         .map_err(|error| format!("cannot read {INSTRUCTIONS_FILE} {shown_path}: {error}"))?;
     let mut bytes = Vec::new();
     file.take(MAX_INSTRUCTIONS_BYTES as u64 + 1)
@@ -136,7 +136,7 @@ pub(crate) fn instructions_file(launch: &LaunchContext) -> Result<Option<String>
     }
     let text = String::from_utf8(bytes)
         .map_err(|_| format!("{INSTRUCTIONS_FILE} {shown_path} is not valid UTF-8"))?;
-    let normalized = files::normalize_to_lf(&text);
+    let normalized = files::edit::normalize_to_lf(&text);
     let content = normalized.trim_start_matches('\u{feff}');
     if content.trim().is_empty() {
         return Ok(None);
@@ -145,18 +145,18 @@ pub(crate) fn instructions_file(launch: &LaunchContext) -> Result<Option<String>
 }
 
 /// The output mode `FASTEXEC_OUTPUT_MODE` names, or the message saying what it held instead.
-pub fn output_mode() -> Result<service::OutputMode, String> {
+pub fn output_mode() -> Result<OutputMode, String> {
     output_mode_of(std::env::var_os("FASTEXEC_OUTPUT_MODE").as_deref())
 }
 
-fn output_mode_of(value: Option<&std::ffi::OsStr>) -> Result<service::OutputMode, String> {
+fn output_mode_of(value: Option<&std::ffi::OsStr>) -> Result<OutputMode, String> {
     let Some(value) = value else {
-        return Ok(service::OutputMode::Text);
+        return Ok(OutputMode::Text);
     };
     match value.to_str() {
-        Some("text") => Ok(service::OutputMode::Text),
-        Some("both") => Ok(service::OutputMode::Both),
-        Some("structured") => Ok(service::OutputMode::Structured),
+        Some("text") => Ok(OutputMode::Text),
+        Some("both") => Ok(OutputMode::Both),
+        Some("structured") => Ok(OutputMode::Structured),
         _ => Err(format!(
             "invalid FASTEXEC_OUTPUT_MODE {value:?}; expected text, both, or structured"
         )),
@@ -391,7 +391,7 @@ mod yolo_tests {
         TRANSFER_ADDR, check_listen_addr, check_routable_addr, output_mode_of, parse_bool_env,
         transfer_addr_of,
     };
-    use crate::service::OutputMode;
+    use crate::service::render::OutputMode;
     use std::ffi::OsStr;
 
     #[test]

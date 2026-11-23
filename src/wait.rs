@@ -4,7 +4,7 @@
 
 use crate::lease::{BytePool, Lease};
 use crate::session::{ReadState, Reader};
-use crate::tasks::Task;
+use crate::tasks::state::Task;
 use crate::term::output::{Cleaner, Matcher};
 use encoding_rs::Encoding;
 use schemars::JsonSchema;
@@ -181,7 +181,7 @@ pub fn mark(
             format!(
                 "{message} The task may have run (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId without input once in-flight transfers complete.",
                 reader.handle(&task.id),
-                crate::files::display_path(&task.log_path)
+                crate::files::path::display_path(&task.log_path)
             )
         })?;
     let (cursor, cleaner) = (state.cursor, state.cleaner.clone());
@@ -490,7 +490,7 @@ mod tests {
             if let Err(message) = &result {
                 assert!(message.starts_with("Server active memory budget ("));
                 assert!(message.contains(&reader.handle(&task.id)));
-                assert!(message.contains(&crate::files::display_path(&task.log_path)));
+                assert!(message.contains(&crate::files::path::display_path(&task.log_path)));
                 assert!(message.contains("Do not retry start or resend input"));
             } else {
                 assert_eq!(memory.used(), needed);

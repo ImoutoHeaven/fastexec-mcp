@@ -1051,7 +1051,7 @@ impl crate::session::LaunchContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::OutputMode;
+    use crate::service::render::OutputMode;
     use serde_json::json;
     use std::path::PathBuf;
 

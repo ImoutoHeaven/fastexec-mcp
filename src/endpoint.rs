@@ -8,7 +8,7 @@
 
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::platform::runtime;
-use crate::service::Render;
+use crate::service::render::Render;
 use crate::session::LaunchContext;
 use crate::transport;
 use crate::wait;
@@ -820,7 +820,7 @@ impl Endpoint {
             ready,
             launch: Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new())),
             render: Render {
-                output_mode: crate::service::OutputMode::Text,
+                output_mode: crate::service::render::OutputMode::Text,
                 structured_content: true,
             },
             session: "s".repeat(26),
@@ -1182,7 +1182,7 @@ mod tests {
     fn ipc_ingress_hello_reserves_copies_before_construction() {
         let identity = identity();
         let render = Render {
-            output_mode: crate::service::OutputMode::Text,
+            output_mode: crate::service::render::OutputMode::Text,
             structured_content: true,
         };
         let launch = LaunchContext::new(

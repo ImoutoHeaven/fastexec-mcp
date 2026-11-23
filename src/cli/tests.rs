@@ -11,7 +11,8 @@ use crate::files;
 use crate::ipc;
 use crate::lease;
 use crate::mcp::{Backend, RequestLeases, Server, decode_mcp_header_value};
-use crate::service::{self, Render, Service};
+use crate::service::Service;
+use crate::service::render::{self as service_render, OutputMode, Render};
 use crate::session::LaunchContext;
 use crate::tasks::{Limits, Tasks};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -37,7 +38,7 @@ mod event_budget_tests {
                 Backend::Local {
                     service: Arc::new(Service::new(Tasks::new(Limits::OFF).unwrap(), false)),
                     render: Render {
-                        output_mode: service::OutputMode::Both,
+                        output_mode: OutputMode::Both,
                         structured_content: true,
                     },
                     session: Arc::new(OnceLock::new()),
@@ -361,7 +362,7 @@ mod stdio_transport_tests {
         for send in [false, true] {
             let result = CallToolResult::success(vec![ContentBlock::text("already admitted")]);
             let id = rmcp::model::RequestId::Number(7);
-            let payload_bytes = service::result_payload_capacity(&result);
+            let payload_bytes = service_render::result_payload_capacity(&result);
             let wire_bytes = ipc::json_len(&result).unwrap() + ipc::json_len(&id).unwrap() + 256;
             let pool = lease::BytePool::new(payload_bytes + wire_bytes);
             let launch = Arc::new(
@@ -371,7 +372,7 @@ mod stdio_transport_tests {
             );
             let tasks = Tasks::new(Limits::OFF).unwrap();
             let render = Render {
-                output_mode: service::OutputMode::Both,
+                output_mode: OutputMode::Both,
                 structured_content: true,
             };
             let leases = Arc::new(RequestLeases::default());

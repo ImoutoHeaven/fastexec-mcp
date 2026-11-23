@@ -11,7 +11,7 @@ use crate::http;
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::lease;
 use crate::platform::runtime;
-use crate::service;
+use crate::service::render::{OutputMode, Render};
 use crate::session::LaunchContext;
 use crate::tasks;
 use crate::transport;
@@ -795,8 +795,8 @@ fn hello(
         &session,
         1,
         "cli",
-        service::Render {
-            output_mode: service::OutputMode::Text,
+        Render {
+            output_mode: OutputMode::Text,
             structured_content: true,
         },
     )

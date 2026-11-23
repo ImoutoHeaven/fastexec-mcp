@@ -9,7 +9,9 @@ use crate::http;
 use crate::ingress;
 use crate::ipc;
 use crate::lease;
-use crate::service::{self, Call, Render, Service};
+use crate::service::render::{self as service_render, Render};
+use crate::service::schema::{Action, Request};
+use crate::service::{Call, Service};
 use crate::session::{LaunchContext, Session};
 use crate::tasks;
 use crate::transfer::{self, TransferEndpoint, publish_transfer, transfer_error};
@@ -33,11 +35,11 @@ struct CodemodeArguments(serde_json::Value);
 
 impl schemars::JsonSchema for CodemodeArguments {
     fn schema_name() -> std::borrow::Cow<'static, str> {
-        codemode::Request::schema_name()
+        codemode::control::Request::schema_name()
     }
 
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        codemode::Request::json_schema(generator)
+        codemode::control::Request::json_schema(generator)
     }
 }
 
@@ -277,14 +279,15 @@ pub(crate) fn host_line(launch: &LaunchContext) -> String {
     let user = value("USER")
         .or_else(|| value("USERNAME"))
         .unwrap_or_else(|| "unknown".to_owned());
-    let home = launch
-        .home()
-        .map_or_else(|| "unknown".to_owned(), |home| files::display_path(&home));
+    let home = launch.home().map_or_else(
+        || "unknown".to_owned(),
+        |home| files::path::display_path(&home),
+    );
     format!(
         "{} {} · {hostname} · user {user} · home {home} · default cwd {}",
         std::env::consts::OS,
         std::env::consts::ARCH,
-        files::display_path(&launch.cwd)
+        files::path::display_path(&launch.cwd)
     )
 }
 
@@ -881,13 +884,10 @@ impl Server {
     )]
     async fn exec(
         &self,
-        Parameters(request): Parameters<service::Request>,
+        Parameters(request): Parameters<Request>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let is_control = matches!(
-            request.action,
-            service::Action::List | service::Action::Kill
-        );
+        let is_control = matches!(request.action, Action::List | Action::Kill);
         let mut context = context;
         if let Err(error) = self.admit_tool_input(&mut context, &request, is_control) {
             return error;
@@ -943,8 +943,10 @@ impl Server {
                     self.deliver_local(&context, tracked, launch, *render, is_control)
                 }
                 Err(message) => {
-                    let err =
-                        service::suppress(service::error_result(request.action, &message), *render);
+                    let err = service_render::suppress(
+                        service_render::error_result(request.action, &message),
+                        *render,
+                    );
                     self.deliver_local(
                         &context,
                         files::TrackedResult::plain(err),
@@ -976,7 +978,7 @@ impl Server {
         if let Err(error) = self.admit_tool_input(&mut context, &arguments.0, false) {
             return error;
         }
-        let request: codemode::Request = match serde_json::from_value(arguments.0) {
+        let request: codemode::control::Request = match serde_json::from_value(arguments.0) {
             Ok(request) => request,
             Err(error) => {
                 return CallToolResult::error(vec![ContentBlock::text(error.to_string())]);
@@ -996,7 +998,10 @@ impl Server {
                 let session = match self.session(&context) {
                     Ok(session) => session,
                     Err(message) => {
-                        return service::suppress(service::codemode_error(&message), *render);
+                        return service_render::suppress(
+                            service_render::codemode_error(&message),
+                            *render,
+                        );
                     }
                 };
                 let (progress, _forwarder) = progress(&context);
@@ -1243,8 +1248,10 @@ impl Server {
             return tracked.result;
         }
         let use_control = is_control || tracked.result.is_error == Some(true);
-        let b64_bytes =
-            service::unleased_result_payload_capacity(&tracked.result, &tracked.payload_owner);
+        let b64_bytes = service_render::unleased_result_payload_capacity(
+            &tracked.result,
+            &tracked.payload_owner,
+        );
         let exact_json = ipc::json_len(&tracked.result).unwrap_or(usize::MAX);
         let id_bytes = ipc::json_len(&context.id).unwrap_or(usize::MAX);
         let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
@@ -1262,7 +1269,7 @@ impl Server {
             let meta = tracked.task_meta.take();
             drop(tracked);
             let msg = match &meta {
-                Some(m) => service::overload_task_message(launch.memory().limit(), m),
+                Some(m) => service_render::overload_task_message(launch.memory().limit(), m),
                 None => format!(
                     "Server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
                     launch.memory().limit()
@@ -1271,13 +1278,13 @@ impl Server {
             let effective = render.effective();
             let mut err = CallToolResult::error(vec![ContentBlock::text(msg.clone())]);
             err.structured_content = Some(serde_json::json!({ "ok": false, "error": msg }));
-            let suppressed = service::suppress(err, effective);
+            let suppressed = service_render::suppress(err, effective);
             let err_outbound = ipc::json_len(&suppressed)
                 .unwrap_or(usize::MAX)
                 .saturating_add(id_bytes)
                 .saturating_add(256);
             let err_peak =
-                service::result_payload_capacity(&suppressed).saturating_add(err_outbound);
+                service_render::result_payload_capacity(&suppressed).saturating_add(err_outbound);
             if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
                 .then(|| launch.control_memory().try_acquire(err_peak))
                 .flatten()
@@ -1323,8 +1330,10 @@ impl Server {
         let pool = endpoint.memory();
         let control_pool = endpoint.control_memory();
         let use_control = is_control || tracked.result.is_error == Some(true);
-        let b64_bytes =
-            service::unleased_result_payload_capacity(&tracked.result, &tracked.payload_owner);
+        let b64_bytes = service_render::unleased_result_payload_capacity(
+            &tracked.result,
+            &tracked.payload_owner,
+        );
         let exact_json = ipc::json_len(&tracked.result).unwrap_or(usize::MAX);
         let id_bytes = ipc::json_len(&context.id).unwrap_or(usize::MAX);
         let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
@@ -1341,7 +1350,8 @@ impl Server {
                 .unwrap_or(usize::MAX)
                 .saturating_add(id_bytes)
                 .saturating_add(256);
-            let err_peak = service::result_payload_capacity(&err).saturating_add(err_outbound);
+            let err_peak =
+                service_render::result_payload_capacity(&err).saturating_add(err_outbound);
             if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
                 .then(|| control_pool.try_acquire(err_peak))
                 .flatten()
@@ -1987,7 +1997,7 @@ mod portable_schema_tests {
         let backend = Backend::Local {
             service: Arc::new(Service::new(tasks, true)),
             render: Render {
-                output_mode: service::OutputMode::Text,
+                output_mode: service_render::OutputMode::Text,
                 structured_content: true,
             },
             session: Arc::new(OnceLock::new()),
@@ -2394,7 +2404,7 @@ mod event_notification_tests {
             Backend::Local {
                 service,
                 render: Render {
-                    output_mode: service::OutputMode::Text,
+                    output_mode: service_render::OutputMode::Text,
                     structured_content: true,
                 },
                 session: Arc::new(OnceLock::new()),

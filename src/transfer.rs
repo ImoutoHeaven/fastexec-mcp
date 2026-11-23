@@ -473,13 +473,13 @@ pub(crate) enum TransferEndpoint {
 
 pub(crate) fn transfer_error(
     message: String,
-    render: crate::service::Render,
+    render: crate::service::render::Render,
 ) -> rmcp::model::CallToolResult {
     let effective = render.effective();
     let mut result =
         rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message.clone())]);
     result.structured_content = Some(serde_json::json!({ "ok": false, "error": message }));
-    crate::service::suppress(result, effective)
+    crate::service::render::suppress(result, effective)
 }
 
 pub(crate) type TransferInspection = Result<(std::path::PathBuf, String, Option<u64>), String>;
@@ -494,9 +494,9 @@ pub(crate) fn inspect_transfer_request(
     async move {
         match tokio::task::spawn_blocking(move || {
             input.flat_map(|request| {
-                crate::files::with_path_workspace(&request.path, &launch, 0, |lease| {
-                    let path = crate::files::resolve(&request.path, &launch)?;
-                    let shown = crate::files::display_path(&path);
+                crate::files::path::with_path_workspace(&request.path, &launch, 0, |lease| {
+                    let path = crate::files::path::resolve(&request.path, &launch)?;
+                    let shown = crate::files::path::display_path(&path);
                     let bytes = inspect_transfer_target(&path, &shown, launch.memory(), lease)?;
                     Ok::<_, String>((path, shown, bytes))
                 })
@@ -520,7 +520,7 @@ pub(crate) fn mint_transfer(
     bytes: Option<u64>,
     table: &Arc<Transfers>,
     base: &str,
-    render: crate::service::Render,
+    render: crate::service::render::Render,
 ) -> rmcp::model::CallToolResult {
     let effective = render.effective();
     let id = match table.create(path) {
@@ -540,7 +540,7 @@ pub(crate) fn mint_transfer(
         "path": shown_path,
         "bytes": bytes,
     }));
-    crate::service::suppress(result, effective)
+    crate::service::render::suppress(result, effective)
 }
 
 pub(crate) fn publish_transfer<'a>(
@@ -548,7 +548,7 @@ pub(crate) fn publish_transfer<'a>(
     launch: Arc<crate::session::LaunchContext>,
     table: &'a Arc<Transfers>,
     base: &'a str,
-    render: crate::service::Render,
+    render: crate::service::render::Render,
     input_owner: crate::lease::Owner,
 ) -> impl std::future::Future<Output = crate::files::TrackedResult> + 'a {
     let inspection = inspect_transfer_request(request, launch, input_owner);
@@ -588,8 +588,9 @@ fn inspect_transfer_target(
             "Cannot transfer {shown_path}: it is not a regular file; pack directories or special files with tar through exec first."
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let target = crate::files::write_target(path, pool).map_err(failed)?;
-            crate::files::reserve_target_workspace(&target.value, lease, pool).map_err(failed)?;
+            let target = crate::files::write::write_target(path, pool).map_err(failed)?;
+            crate::files::path::reserve_target_workspace(&target.value, lease, pool)
+                .map_err(failed)?;
             for ancestor in target.value.ancestors().skip(1) {
                 if ancestor.as_os_str().is_empty() {
                     break;
@@ -603,7 +604,7 @@ fn inspect_transfer_target(
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                             return Err(format!(
                                 "Cannot transfer {shown_path}: {} is a dangling directory link. Create its target before uploading.",
-                                crate::files::display_path(ancestor)
+                                crate::files::path::display_path(ancestor)
                             ));
                         }
                         Err(error) => return Err(failed(error)),
@@ -613,7 +614,7 @@ fn inspect_transfer_target(
                 }
                 return Err(format!(
                     "Cannot transfer {shown_path}: {} is not a directory.",
-                    crate::files::display_path(ancestor)
+                    crate::files::path::display_path(ancestor)
                 ));
             }
             Ok(None)
@@ -625,7 +626,7 @@ fn inspect_transfer_target(
 #[cfg(test)]
 mod transfer_owner_tests {
     use super::*;
-    use crate::service::{self, Render};
+    use crate::service::render::{OutputMode, Render};
     use std::future::Future;
     use std::time::Duration;
 
@@ -671,7 +672,7 @@ mod transfer_owner_tests {
             &table,
             "http://localhost/",
             Render {
-                output_mode: service::OutputMode::Both,
+                output_mode: OutputMode::Both,
                 structured_content: true,
             },
             crate::lease::Owner::new(pool.try_acquire(64).unwrap()),

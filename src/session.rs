@@ -1,7 +1,8 @@
 //! Session-scoped task notices and independent, bounded reader cursors.
 
 use crate::lease::{self, BytePool};
-use crate::tasks::{ALPHABET, Snapshot, Task, pids, random_chars};
+use crate::tasks::state::{Snapshot, Task};
+use crate::tasks::{ALPHABET, pids, random_chars};
 use crate::term::output::Cleaner;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -260,7 +261,7 @@ impl LaunchContext {
     /// The absolute home directory for file tools and the Host description.
     pub fn home(&self) -> Option<PathBuf> {
         self.env_home()
-            .and_then(|path| crate::files::resolve_from(&path, &self.session_cwd).ok())
+            .and_then(|path| crate::files::path::resolve_from(&path, &self.session_cwd).ok())
     }
 
     /// The home directory this context's environment names: `USERPROFILE`, else `HOMEDRIVE` with
