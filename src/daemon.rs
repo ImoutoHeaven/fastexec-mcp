@@ -1123,7 +1123,7 @@ impl Daemon {
                         &attached.token,
                         outgoing,
                         id,
-                        request,
+                        ipc::Owned::new(request, owner),
                     );
                 }
                 ToDaemon::EventsCancel { id } => {

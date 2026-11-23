@@ -1955,6 +1955,106 @@ async fn event_ingress_budget_receipts_include_limits_and_keep_connection() {
 }
 
 #[tokio::test]
+async fn event_stream_keeps_input_charged_until_cancel_or_disconnect() {
+    let pool = BytePool::new(128 << 10);
+    let fixture = fixture_with_config(Config {
+        memory: Some(Arc::clone(&pool)),
+        ..Config::default()
+    });
+    let daemon = &fixture.daemon;
+    for disconnect in [false, true] {
+        let mut client = connect(daemon).await;
+        client.welcome("eventsinput", 1).await;
+        until(|| pool.used() == 0).await;
+        let source = "ci";
+        let topic = "build";
+        let name = "done";
+        let request = ToDaemon::EventsStream {
+            id: 11,
+            request: crate::events::SubscribeRequest {
+                name: crate::events::EVENT_EXTERNAL.to_owned(),
+                arguments: Some(json!({"source": source, "topic": topic, "name": name})),
+                ..Default::default()
+            },
+        };
+        client.send(&request).await;
+        assert!(matches!(
+            client.next().await,
+            Some(ToEndpoint::EventFrame {
+                id: 11,
+                frame: ipc::EventWireFrame::Active(_),
+            })
+        ));
+        // Status proves read_loop has finished dispatching the subscription.
+        client.send(&ToDaemon::Status).await;
+        assert!(matches!(
+            client.next().await,
+            Some(ToEndpoint::Status { .. })
+        ));
+        let retained = pool.used();
+        assert!(
+            retained >= source.len() + topic.len() + name.len(),
+            "the active subscription still owns its filter strings, but only {retained} bytes remain charged"
+        );
+
+        client.send(&request).await;
+        assert!(matches!(
+            client.next().await,
+            Some(ToEndpoint::EventFrame {
+                id: 11,
+                frame: ipc::EventWireFrame::Error(ipc::IpcEventError { code: -32602, .. }),
+            })
+        ));
+        assert_eq!(
+            pool.used(),
+            retained,
+            "a duplicate stream releases its input"
+        );
+        client
+            .send(&ToDaemon::EventsStream {
+                id: 12,
+                request: crate::events::SubscribeRequest {
+                    name: crate::events::EVENT_EXTERNAL.to_owned(),
+                    arguments: Some(json!({"topic": 7})),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert!(matches!(
+            client.next().await,
+            Some(ToEndpoint::EventFrame {
+                id: 12,
+                frame: ipc::EventWireFrame::Error(ipc::IpcEventError { code: -32602, .. }),
+            })
+        ));
+        assert_eq!(
+            pool.used(),
+            retained,
+            "an invalid filter releases its input"
+        );
+        assert_eq!(daemon.service.event_bus().active_streams(), 1);
+
+        if disconnect {
+            client.writer.shutdown().await.unwrap();
+        } else {
+            client.send(&ToDaemon::EventsCancel { id: 11 }).await;
+            client.send(&ToDaemon::Status).await;
+            assert!(matches!(
+                client.next().await,
+                Some(ToEndpoint::Status { .. })
+            ));
+        }
+        until(|| pool.used() == 0).await;
+        assert_eq!(daemon.service.event_bus().active_streams(), 0);
+        if !disconnect {
+            client.send(&ToDaemon::Bye).await;
+        }
+        assert_eq!(client.next().await, None);
+        client.serving.take().unwrap().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn event_cancel_releases_full_quota_before_reusing_request_id() {
     let fixture = fixture();
     let daemon = &fixture.daemon;

@@ -39,7 +39,7 @@ pub(super) fn start_stream(
     closing: &CancellationToken,
     outgoing: &mpsc::UnboundedSender<Outgoing>,
     id: u64,
-    request: crate::events::SubscribeRequest,
+    request: ipc::Owned<crate::events::SubscribeRequest>,
 ) {
     let stream_token = {
         let mut streams = lock(event_streams);
@@ -66,7 +66,7 @@ pub(super) fn start_stream(
                 Ok(guard) => match daemon
                     .service
                     .event_bus()
-                    .subscribe(request, Some(session_id))
+                    .subscribe(request.value, Some(session_id))
                 {
                     Ok(sub) => {
                         let token = Arc::new(closing.child_token());
@@ -91,13 +91,13 @@ pub(super) fn start_stream(
     };
     match stream_token {
         Ok((registration, sub)) => {
-            tokio::spawn(run_event_stream(
+            tokio::spawn(request.owner.hold_future(run_event_stream(
                 Arc::clone(daemon),
                 registration,
                 sub,
                 outgoing.clone(),
                 closing.clone(),
-            ));
+            )));
         }
         Err(err) => {
             queue_event_control(
