@@ -685,16 +685,21 @@ async fn send_event_notification(
     method: &str,
     params: ipc::Owned<serde_json::Value>,
     subscription_id: &rmcp::model::RequestId,
+    metadata: &lease::Owner,
 ) -> bool {
+    use rmcp::model::GetExtensions;
+
     let ipc::Owned { value, owner } = params;
-    owner
-        .hold_future(context.peer.send_notification(build_event_notification(
-            method,
-            value,
-            subscription_id,
-        )))
-        .await
-        .is_ok()
+    let mut notification = build_event_notification(method, value, subscription_id);
+    // The peer may keep this notification queued after the request is cancelled.
+    notification
+        .extensions_mut()
+        .insert(lease::Owner::new((owner, metadata.clone())));
+    tokio::select! {
+        biased;
+        _ = context.ct.cancelled() => false,
+        sent = context.peer.send_notification(notification) => sent.is_ok(),
+    }
 }
 
 fn stream_complete_result(subscription_id: &rmcp::model::RequestId) -> rmcp::model::CustomResult {
@@ -832,6 +837,7 @@ impl Server {
                     "notifications/events/active",
                     initial,
                     &sub_id,
+                    &metadata,
                 )
                 .await
                 {
@@ -855,7 +861,7 @@ impl Server {
                                         events::StreamItem::Active(active) => ("notifications/events/active", active.into()),
                                         events::StreamItem::Event(event) => ("notifications/events/event", event.into()),
                                     };
-                                    if !send_event_notification(&context, method, ipc::Owned::new(payload, owner), &sub_id).await {
+                                    if !send_event_notification(&context, method, ipc::Owned::new(payload, owner), &sub_id, &metadata).await {
                                         return Ok(stream_complete_result(&sub_id));
                                     }
                                     sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
@@ -870,7 +876,7 @@ impl Server {
                                         },
                                         Ok(Some(_)) => unreachable!(),
                                     };
-                                    send_event_notification(&context, "notifications/events/terminated", terminated(error), &sub_id).await;
+                                    send_event_notification(&context, "notifications/events/terminated", terminated(error), &sub_id, &metadata).await;
                                     return Ok(stream_complete_result(&sub_id));
                                 }
                             }
@@ -879,12 +885,12 @@ impl Server {
                             let cursor = match sub.current_cursor() {
                                 Ok(cursor) => cursor,
                                 Err(error) => {
-                                    send_event_notification(&context, "notifications/events/terminated", terminated(error.into()), &sub_id).await;
+                                    send_event_notification(&context, "notifications/events/terminated", terminated(error.into()), &sub_id, &metadata).await;
                                     return Ok(stream_complete_result(&sub_id));
                                 }
                             };
                             let payload = cursor.map(|cursor| events::value_object([("cursor", serde_json::Value::String(cursor))]));
-                            if !send_event_notification(&context, "notifications/events/heartbeat", payload, &sub_id).await {
+                            if !send_event_notification(&context, "notifications/events/heartbeat", payload, &sub_id, &metadata).await {
                                 return Ok(stream_complete_result(&sub_id));
                             }
                             sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
@@ -910,6 +916,7 @@ impl Server {
                                     "notifications/events/terminated",
                                     error.map(event_error_payload),
                                     &sub_id,
+                                    &metadata,
                                 )
                                 .await;
                             }
@@ -924,6 +931,7 @@ impl Server {
                         "notifications/events/active",
                         initial.map(serde_json::Value::from),
                         &sub_id,
+                        &metadata,
                     )
                     .await
                     {
@@ -956,6 +964,7 @@ impl Server {
                                                 data: None,
                                             }),
                                             &sub_id,
+                                            &metadata,
                                         ).await;
                                     }
                                     return Ok(stream_complete_result(&sub_id));
@@ -982,7 +991,7 @@ impl Server {
                                     ipc::EventWireFrame::Complete => return Ok(stream_complete_result(&sub_id)),
                                     ipc::EventWireFrame::ListResult(_) | ipc::EventWireFrame::PollResult(_) => continue,
                                 };
-                                if !send_event_notification(&context, method, ipc::Owned::new(payload, owned.owner), &sub_id).await {
+                                if !send_event_notification(&context, method, ipc::Owned::new(payload, owned.owner), &sub_id, &metadata).await {
                                     stream.cancel().await;
                                     return Ok(stream_complete_result(&sub_id));
                                 }
@@ -5390,5 +5399,209 @@ mod stdio_transport_tests {
             read_bounded_line(&mut reader, &mut buf, 16).await.unwrap(),
             BoundedLine::Eof
         );
+    }
+}
+
+#[cfg(test)]
+mod event_notification_tests {
+    use super::*;
+    use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
+    use rmcp::transport::Transport;
+    use tokio::sync::{mpsc, oneshot};
+
+    struct HeldNotification {
+        message: ServerJsonRpcMessage,
+        complete: oneshot::Sender<()>,
+    }
+
+    struct TestServer;
+
+    impl ServerHandler for TestServer {}
+
+    struct PausedTransport(mpsc::Sender<HeldNotification>);
+
+    impl Transport<RoleServer> for PausedTransport {
+        type Error = std::io::Error;
+
+        fn send(
+            &mut self,
+            message: ServerJsonRpcMessage,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+            let outgoing = self.0.clone();
+            async move {
+                let (complete, waiting) = oneshot::channel();
+                outgoing
+                    .send(HeldNotification { message, complete })
+                    .await
+                    .map_err(|_| std::io::Error::other("test receiver closed"))?;
+                waiting
+                    .await
+                    .map_err(|_| std::io::Error::other("test send dropped"))
+            }
+        }
+
+        async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn event_notification_backpressure_does_not_delay_stream_cancel() {
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(tasks, false));
+        let bus = Arc::clone(service.event_bus());
+        let launch = Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new()));
+        let server = Server::new(
+            Backend::Local {
+                service,
+                render: Render {
+                    output_mode: service::OutputMode::Text,
+                    structured_content: true,
+                },
+                session: Arc::new(OnceLock::new()),
+                launch: Arc::clone(&launch),
+                daemon: false,
+            },
+            &launch,
+            None,
+            Tools::default(),
+            None,
+            InstructionsToolMode::Off,
+        );
+        let (outgoing, mut queued) = mpsc::channel(1);
+        let mut peer =
+            rmcp::service::serve_directly(server.clone(), PausedTransport(outgoing), None);
+        let context = RequestContext::new(
+            rmcp::model::RequestId::String("stream-cancel".into()),
+            peer.peer().clone(),
+        );
+        let cancel = context.ct.clone();
+        let mut streaming = tokio::spawn(async move {
+            server
+                .handle_events_stream(
+                    Some(serde_json::json!({"name": events::EVENT_EXTERNAL})),
+                    context,
+                )
+                .await
+        });
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), queued.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let value = serde_json::to_value(&pending.message).unwrap();
+        assert_eq!(value["method"], "notifications/events/active");
+        assert_eq!(bus.active_streams(), 1);
+
+        cancel.cancel();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), &mut streaming)
+            .await
+            .expect("cancel must release the subscription before the notification can be written")
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.0["resultType"], "complete");
+        assert_eq!(bus.active_streams(), 0);
+        drop(pending.message);
+        pending.complete.send(()).unwrap();
+        peer.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn event_notification_cancel_keeps_owners_until_transport_drops_it() {
+        let (outgoing, mut queued) = mpsc::channel(1);
+        let mut peer = rmcp::service::serve_directly(TestServer, PausedTransport(outgoing), None);
+        let context = RequestContext::new(
+            rmcp::model::RequestId::String("stream-owner".into()),
+            peer.peer().clone(),
+        );
+        let cancel = context.ct.clone();
+        let payload_pool = lease::BytePool::new(64);
+        let metadata_pool = lease::BytePool::new(64);
+        let payload = serde_json::json!({"cursor": "current"});
+        let payload_bytes = ipc::json_len(&payload).unwrap();
+        let metadata_bytes = ipc::json_len(&context.id).unwrap();
+        let params = ipc::Owned::new(
+            payload,
+            lease::Owner::new(payload_pool.try_acquire(payload_bytes).unwrap()),
+        );
+        let metadata = lease::Owner::new(metadata_pool.try_acquire(metadata_bytes).unwrap());
+        let mut sending = tokio::spawn(async move {
+            send_event_notification(
+                &context,
+                "notifications/events/heartbeat",
+                params,
+                &context.id,
+                &metadata,
+            )
+            .await
+        });
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), queued.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        cancel.cancel();
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(5), &mut sending)
+                .await
+                .expect("notification send must observe cancellation while transport is paused")
+                .unwrap()
+        );
+        assert_eq!(payload_pool.used(), payload_bytes);
+        assert_eq!(metadata_pool.used(), metadata_bytes);
+        drop(pending.message);
+        assert_eq!(payload_pool.used(), 0);
+        assert_eq!(metadata_pool.used(), 0);
+        pending.complete.send(()).unwrap();
+        peer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_notification_pre_cancel_sends_no_notification() {
+        let (outgoing, mut queued) = mpsc::channel(1);
+        let mut peer = rmcp::service::serve_directly(TestServer, PausedTransport(outgoing), None);
+        let context = RequestContext::new(
+            rmcp::model::RequestId::String("stream-pre-cancel".into()),
+            peer.peer().clone(),
+        );
+        context.ct.cancel();
+        assert!(
+            !tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                send_event_notification(
+                    &context,
+                    "notifications/events/active",
+                    ipc::Owned::new(serde_json::json!({}), lease::Owner::default()),
+                    &context.id,
+                    &lease::Owner::default(),
+                ),
+            )
+            .await
+            .expect("a pre-cancelled request must not wait for the transport")
+        );
+
+        let after_cancel = tokio::spawn(async move {
+            context
+                .peer
+                .send_notification(build_event_notification(
+                    "notifications/events/heartbeat",
+                    serde_json::json!({"cursor": "after-cancel"}),
+                    &context.id,
+                ))
+                .await
+        });
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), queued.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let value = serde_json::to_value(&pending.message).unwrap();
+        assert_eq!(value["method"], "notifications/events/heartbeat");
+        assert_eq!(value["params"]["cursor"], "after-cancel");
+        drop(pending.message);
+        pending.complete.send(()).unwrap();
+        after_cancel.await.unwrap().unwrap();
+        peer.close().await.unwrap();
     }
 }
