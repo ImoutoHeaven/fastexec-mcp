@@ -1339,7 +1339,7 @@ mod tests {
     async fn first_event_connection_budget_refusal_preserves_category_and_recovers() {
         for method in ["list", "poll", "stream"] {
             let (identity, paths, mut listener, _target) =
-                test_daemon(&format!("events-connect-budget-{method}"));
+                test_daemon(&format!("evt-init-{method}"));
             let response = welcome(&identity);
             let peer = tokio::spawn(async move {
                 let mut refused = listener.accept().await.unwrap();
@@ -1489,15 +1489,17 @@ mod tests {
 
     #[tokio::test]
     async fn event_cancel_failures_close_the_transport_with_link_owners_retained() {
-        for mode in [
+        for (case, mode) in [
             "budget",
             "writer_timeout",
             "drop_future",
             "drop_stream",
             "drop_registration",
-        ] {
-            let (identity, paths, mut listener, _target) =
-                test_daemon(&format!("event-cancel-{mode}"));
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (identity, paths, mut listener, _target) = test_daemon(&format!("evt-stop-{case}"));
             let response = welcome(&identity);
             let (ended, closed) = oneshot::channel();
             let peer = tokio::spawn(async move {
