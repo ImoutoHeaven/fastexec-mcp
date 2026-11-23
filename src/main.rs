@@ -23,6 +23,16 @@ mod transport;
 mod wait;
 
 fn main() {
+    const CLI_USAGE: &str = "\
+usage: fastexec [--help | --version]
+       fastexec daemon start [--http <addr>] [--idle-exit on|off]
+       fastexec daemon run [--http <addr>]
+       fastexec daemon status
+       fastexec daemon stop
+       fastexec daemon emit [--namespace <ns>] [--source <src>] [--topic <topic>] [--stream]
+
+With no arguments, fastexec serves MCP over stdio.";
+
     #[cfg(unix)]
     // Keep every child waitable before starting any thread or helper. Inheriting SIG_IGN or
     // SA_NOCLDWAIT would let the kernel reuse a task host's PID before its Tree is finished.
@@ -82,13 +92,3 @@ fn main() {
         }
     }
 }
-
-const CLI_USAGE: &str = "\
-usage: fastexec [--help | --version]
-       fastexec daemon start [--http <addr>] [--idle-exit on|off]
-       fastexec daemon run [--http <addr>]
-       fastexec daemon status
-       fastexec daemon stop
-       fastexec daemon emit [--namespace <ns>] [--source <src>] [--topic <topic>] [--stream]
-
-With no arguments, fastexec serves MCP over stdio.";
