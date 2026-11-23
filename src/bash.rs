@@ -29,22 +29,10 @@ pub fn find(ctx: &LaunchContext) -> Result<PathBuf, String> {
             )),
         };
     }
-    let mut seen = HashSet::new();
-    for candidate in candidates(ctx) {
-        // Windows paths compare case-insensitively; Unix paths that differ in case are distinct.
-        let key = candidate.to_string_lossy();
-        let key = if cfg!(windows) {
-            key.to_lowercase()
-        } else {
-            key.into_owned()
-        };
-        if candidate.is_absolute()
-            && !excluded(&candidate, ctx)
-            && seen.insert(key)
-            && validate(&candidate, ctx).is_ok()
-        {
-            return Ok(candidate);
-        }
+    if let Some(candidate) =
+        find_candidate(ctx, candidates(ctx), |path| validate(path, ctx).is_ok())
+    {
+        return Ok(candidate);
     }
     Err(if cfg!(windows) {
         format!(
@@ -53,6 +41,29 @@ pub fn find(ctx: &LaunchContext) -> Result<PathBuf, String> {
     } else {
         format!("Cannot find GNU bash. Install bash or set {OVERRIDE} to its absolute path.")
     })
+}
+
+fn find_candidate(
+    ctx: &LaunchContext,
+    candidates: Vec<PathBuf>,
+    mut is_bash: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        // Windows paths compare case-insensitively; Unix paths retain their native bytes.
+        #[cfg(windows)]
+        let key = candidate.to_string_lossy().to_lowercase();
+        #[cfg(not(windows))]
+        let key = candidate.as_os_str().to_owned();
+        if candidate.is_absolute()
+            && !excluded(&candidate, ctx)
+            && seen.insert(key)
+            && is_bash(&candidate)
+        {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Longest `--version` output a candidate may print.
@@ -151,4 +162,54 @@ fn excluded(path: &Path, ctx: &LaunchContext) -> bool {
 #[cfg(not(windows))]
 fn excluded(_path: &Path, _ctx: &LaunchContext) -> bool {
     false
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn path_discovery_tries_distinct_native_names_with_the_same_lossy_text() {
+        let real_bash = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+            .expect("system GNU Bash");
+        let root = std::env::temp_dir().join(format!(
+            "fastexec-bash-native-{}-{}",
+            std::process::id(),
+            crate::tasks::random_chars(10).unwrap(),
+        ));
+        let missing = root.join(OsString::from_vec(b"bin-\xff".to_vec()));
+        let working = root.join("bin-\u{fffd}");
+        assert_ne!(missing, working);
+        assert_eq!(missing.to_string_lossy(), working.to_string_lossy());
+        std::fs::create_dir_all(&working).unwrap();
+        let expected = working.join("bash");
+        std::os::unix::fs::symlink(&real_bash, &expected).unwrap();
+        let ctx = LaunchContext::new(
+            root.clone(),
+            vec![(
+                "PATH".into(),
+                std::env::join_paths([&missing, &working]).unwrap(),
+            )],
+        );
+        // The unit-test executable cannot act as the production Unix task host.
+        // The same candidate loop uses an ordinary GNU Bash banner check here.
+        let selected = find_candidate(&ctx, path_candidates("bash", &ctx), |candidate| {
+            candidate.is_file()
+                && std::process::Command::new(candidate)
+                    .arg("--version")
+                    .env_clear()
+                    .output()
+                    .is_ok_and(|output| {
+                        output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).contains("GNU bash")
+                    })
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(selected, Some(expected));
+    }
 }
