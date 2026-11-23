@@ -804,6 +804,39 @@ pub struct IpcEventError {
     pub data: Option<serde_json::Value>,
 }
 
+impl IpcEventError {
+    /// Reserves the short receipt before allocating its message and limit metadata.
+    pub(crate) fn memory_full(
+        main: &Arc<BytePool>,
+        control: &Arc<BytePool>,
+        message: &'static str,
+    ) -> Owned<Self> {
+        let bytes = message.len().saturating_add(256);
+        if let Some(lease) = main
+            .try_acquire(bytes)
+            .or_else(|| control.try_acquire(bytes))
+        {
+            Owned::new(
+                Self {
+                    code: -32025,
+                    message: message.to_owned(),
+                    data: Some(serde_json::json!({"limit": "process_memory", "max": main.limit()})),
+                },
+                Owner::new(lease),
+            )
+        } else {
+            Owned::new(
+                Self {
+                    code: -32025,
+                    message: String::new(),
+                    data: None,
+                },
+                Owner::default(),
+            )
+        }
+    }
+}
+
 impl From<crate::events::EventError> for IpcEventError {
     fn from(err: crate::events::EventError) -> Self {
         Self {

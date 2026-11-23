@@ -523,6 +523,10 @@ impl Endpoint {
         }
     }
 
+    fn event_budget_error(&self, message: &'static str) -> ipc::Owned<ipc::IpcEventError> {
+        ipc::IpcEventError::memory_full(self.memory(), self.control_memory(), message)
+    }
+
     /// Lists event types from the daemon.
     pub async fn events_list(
         &self,
@@ -555,6 +559,10 @@ impl Endpoint {
         };
         match sent {
             Ok(Ok(true)) => {}
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                return Err(self
+                    .event_budget_error("endpoint memory budget full while sending events/list"));
+            }
             _ => {
                 return Err(self.event_link_error("failed to send events/list to fastexec daemon"));
             }
@@ -573,11 +581,11 @@ impl Endpoint {
             Some((ipc::EventWireFrame::Error(err), lease)) => {
                 Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
             }
-            _ => Err(self.event_link_error(if link.closed.is_cancelled() {
-                "daemon connection closed during events/list"
-            } else {
-                "endpoint memory budget full during events/list"
-            })),
+            None if link.closed.is_cancelled() => {
+                Err(self.event_link_error("daemon connection closed during events/list"))
+            }
+            None => Err(self.event_budget_error("endpoint memory budget full during events/list")),
+            Some(_) => Err(self.event_link_error("unexpected daemon response during events/list")),
         }
     }
 
@@ -614,6 +622,10 @@ impl Endpoint {
         };
         match sent {
             Ok(Ok(true)) => {}
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                return Err(self
+                    .event_budget_error("endpoint memory budget full while sending events/poll"));
+            }
             _ => {
                 return Err(self.event_link_error("failed to send events/poll to fastexec daemon"));
             }
@@ -632,11 +644,11 @@ impl Endpoint {
             Some((ipc::EventWireFrame::Error(err), lease)) => {
                 Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
             }
-            _ => Err(self.event_link_error(if link.closed.is_cancelled() {
-                "daemon connection closed during events/poll"
-            } else {
-                "endpoint memory budget full during events/poll"
-            })),
+            None if link.closed.is_cancelled() => {
+                Err(self.event_link_error("daemon connection closed during events/poll"))
+            }
+            None => Err(self.event_budget_error("endpoint memory budget full during events/poll")),
+            Some(_) => Err(self.event_link_error("unexpected daemon response during events/poll")),
         }
     }
 
@@ -679,6 +691,11 @@ impl Endpoint {
             Ok(Ok(true)) => {
                 reg.arm_cancel();
             }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                return Err(self.event_budget_error(
+                    "endpoint memory budget full while sending events/stream",
+                ));
+            }
             _ => {
                 return Err(
                     self.event_link_error("failed to send events/stream to fastexec daemon")
@@ -710,15 +727,21 @@ impl Endpoint {
                 reg.cancel_on_drop = false;
                 Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
             }
-            _ => {
+            None => {
                 if link.closed.is_cancelled() {
                     reg.cancel_on_drop = false;
-                }
-                Err(self.event_link_error(if link.closed.is_cancelled() {
-                    "daemon connection closed before events/stream activated"
+                    Err(self.event_link_error(
+                        "daemon connection closed before events/stream activated",
+                    ))
                 } else {
-                    "endpoint memory budget full before events/stream activated"
-                }))
+                    Err(self.event_budget_error(
+                        "endpoint memory budget full before events/stream activated",
+                    ))
+                }
+            }
+            Some(_) => {
+                Err(self
+                    .event_link_error("unexpected daemon response before events/stream activated"))
             }
         }
     }
@@ -1223,6 +1246,204 @@ mod tests {
             .await
             .expect("the peer finished")
             .expect("the peer did not panic");
+    }
+
+    async fn failed_event_rpc(endpoint: &Endpoint, method: &str) -> ipc::Owned<ipc::IpcEventError> {
+        let cancel = CancellationToken::new();
+        match method {
+            "list" => endpoint.events_list("test", cancel).await.err(),
+            "poll" => endpoint
+                .events_poll(
+                    "test",
+                    crate::events::PollRequest {
+                        name: "external.event".into(),
+                        ..Default::default()
+                    },
+                    cancel,
+                )
+                .await
+                .err(),
+            "stream" => endpoint
+                .events_stream(
+                    "test",
+                    crate::events::SubscribeRequest {
+                        name: "external.event".into(),
+                        ..Default::default()
+                    },
+                    cancel,
+                )
+                .await
+                .err(),
+            _ => unreachable!(),
+        }
+        .expect("the event RPC must report the memory refusal")
+    }
+
+    #[tokio::test]
+    async fn event_rpc_budget_errors_preserve_classification_owners_and_link() {
+        for receive in [false, true] {
+            let (identity, paths, mut listener, _target) =
+                test_daemon(&format!("events-budget-{receive}"));
+            let response = welcome(&identity);
+            let (paused, mut pauses) = mpsc::channel(1);
+            let peer = tokio::spawn(async move {
+                let mut conn = listener.accept().await.unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Hello { .. })
+                ));
+                ipc::write_frame(&mut conn, &response).await.unwrap();
+                let mut replies = 0;
+                loop {
+                    let request = ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let (id, frame) = match request {
+                        ToDaemon::EventsList { id } => (
+                            id,
+                            ipc::EventWireFrame::ListResult(crate::events::EventsListResult {
+                                result_type: "complete".into(),
+                                events: Vec::new(),
+                            }),
+                        ),
+                        ToDaemon::EventsPoll { id, .. } => (
+                            id,
+                            ipc::EventWireFrame::PollResult(crate::events::PollResponse {
+                                result_type: "complete".into(),
+                                events: Vec::new(),
+                                cursor: "eeeeeeee:0".into(),
+                                truncated: false,
+                                has_more: false,
+                                next_poll_ms: 2000,
+                            }),
+                        ),
+                        ToDaemon::EventsStream { id, .. } => (
+                            id,
+                            ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                                cursor: "eeeeeeee:0".into(),
+                                truncated: false,
+                                heartbeat_ms: 30_000,
+                            }),
+                        ),
+                        ToDaemon::EventsCancel { .. } => continue,
+                        ToDaemon::Bye => {
+                            assert_eq!(replies, if receive { 4 } else { 1 });
+                            break;
+                        }
+                        other => panic!("unexpected event request: {other:?}"),
+                    };
+                    if receive && replies < 3 {
+                        let (resume, ready) = oneshot::channel();
+                        paused.send(resume).await.unwrap();
+                        ready.await.unwrap();
+                    } else {
+                        assert_eq!(id, 4, "only the recovery request is admitted");
+                    }
+                    ipc::write_frame(&mut conn, &ToEndpoint::EventFrame { id, frame })
+                        .await
+                        .unwrap();
+                    replies += 1;
+                }
+            });
+            let pool = crate::lease::BytePool::new(16 << 10);
+            let control = crate::lease::BytePool::new(512);
+            let mut endpoint = Endpoint::for_test(identity, paths);
+            endpoint.launch = Arc::new(
+                LaunchContext::new(std::env::temp_dir(), Vec::new())
+                    .with_memory(Arc::clone(&pool))
+                    .with_control_memory(Arc::clone(&control)),
+            );
+            let link = endpoint
+                .link("test", std::time::Instant::now() + runtime::START_WAIT)
+                .await
+                .unwrap();
+            for method in ["list", "poll", "stream"] {
+                let calling = failed_event_rpc(&endpoint, method);
+                tokio::pin!(calling);
+                let resume = if receive {
+                    Some(timeout(Duration::from_secs(5), async {
+                        tokio::select! {
+                            result = &mut calling => panic!("RPC ended before its response: {result:?}"),
+                            resume = pauses.recv() => resume.unwrap(),
+                        }
+                    }).await.unwrap())
+                } else {
+                    None
+                };
+                let full = pool.try_acquire(pool.limit() - pool.used()).unwrap();
+                if let Some(resume) = resume {
+                    resume.send(()).unwrap();
+                }
+                let error = timeout(Duration::from_secs(5), &mut calling).await.unwrap();
+                assert_eq!(
+                    error.value.code, -32025,
+                    "{method} receive={receive}: {error:?}"
+                );
+                assert_eq!(
+                    error.value.data,
+                    Some(serde_json::json!({"limit": "process_memory", "max": pool.limit()}))
+                );
+                assert!(error.owner.get::<crate::lease::Lease>().unwrap().bytes() > 0);
+                assert!(control.used() > 0);
+                assert!(!link.closed.is_cancelled());
+                assert!(lock(&link.event_pending).is_empty());
+                drop(error);
+                drop(full);
+            }
+            let result = timeout(
+                Duration::from_secs(5),
+                endpoint.events_list("test", CancellationToken::new()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(result.value.events.is_empty());
+            drop(result);
+            endpoint.bye().await;
+            finish(peer).await;
+            assert_eq!(pool.used(), 0);
+            assert_eq!(control.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn event_rpc_disconnects_keep_internal_error() {
+        for method in ["list", "poll", "stream"] {
+            let (identity, paths, mut listener, _target) =
+                test_daemon(&format!("events-disconnect-{method}"));
+            let response = welcome(&identity);
+            let peer = tokio::spawn(async move {
+                let mut conn = listener.accept().await.unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Hello { .. })
+                ));
+                ipc::write_frame(&mut conn, &response).await.unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(
+                        ToDaemon::EventsList { .. }
+                            | ToDaemon::EventsPoll { .. }
+                            | ToDaemon::EventsStream { .. }
+                    )
+                ));
+            });
+            let endpoint = Endpoint::for_test(identity, paths);
+            let error = timeout(Duration::from_secs(5), failed_event_rpc(&endpoint, method))
+                .await
+                .unwrap();
+            assert_eq!(error.value.code, -32603, "{method}: {error:?}");
+            assert_eq!(error.value.data, None);
+            assert!(error.value.message.contains("connection closed"));
+            finish(peer).await;
+        }
     }
 
     #[tokio::test]

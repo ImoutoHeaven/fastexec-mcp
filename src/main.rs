@@ -611,7 +611,8 @@ fn event_error_to_rmcp(err: events::EventError) -> rmcp::ErrorData {
         | events::EventError::ResourceExhausted { message, .. } => message.len(),
     };
     let Some(held) = lease::control_pool().try_acquire(message_bytes.saturating_add(256)) else {
-        return rmcp::ErrorData::internal_error(
+        return rmcp::ErrorData::new(
+            rmcp::model::ErrorCode(-32025),
             "Server active memory budget is full while preparing the event error",
             None,
         );
@@ -801,10 +802,12 @@ impl Server {
             pool.try_acquire(metadata_bytes)
                 .or_else(|| control.try_acquire(metadata_bytes))
                 .ok_or_else(|| {
-                    rmcp::ErrorData::internal_error(
+                    ipc::IpcEventError::memory_full(
+                        pool,
+                        control,
                         "Server active memory budget is full while preparing event subscription",
-                        None,
                     )
+                    .run(ipc_event_error_to_rmcp)
                 })?,
         );
         let sub_id = context.id.clone();
@@ -3913,6 +3916,62 @@ async fn shutdown_signal() {
     }
     #[cfg(windows)]
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod event_budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn subscription_metadata_refusal_reports_resource_exhausted() {
+        for control_limit in [0, 512] {
+            let pool = lease::BytePool::new(0);
+            let control = lease::BytePool::new(control_limit);
+            let launch = Arc::new(
+                LaunchContext::new(std::env::temp_dir(), Vec::new())
+                    .with_memory(Arc::clone(&pool))
+                    .with_control_memory(Arc::clone(&control)),
+            );
+            let server = Server::new(
+                Backend::Local {
+                    service: Arc::new(Service::new(Tasks::new(Limits::OFF).unwrap(), false)),
+                    render: Render {
+                        output_mode: service::OutputMode::Both,
+                        structured_content: true,
+                    },
+                    session: Arc::new(OnceLock::new()),
+                    launch: Arc::clone(&launch),
+                    daemon: false,
+                },
+                &launch,
+                None,
+                Tools::default(),
+                None,
+                InstructionsToolMode::Off,
+            );
+            let (_input, read) = tokio::io::duplex(64);
+            let mut peer = rmcp::service::serve_directly(
+                server.clone(),
+                StdioTransport::new(read, tokio::io::sink(), Arc::new(RequestLeases::default())),
+                None,
+            );
+            let context =
+                RequestContext::new(rmcp::model::RequestId::Number(1), peer.peer().clone());
+            let error = server
+                .handle_events_stream(Some(serde_json::json!({"name": "external.event"})), context)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code.0, -32025);
+            assert_eq!(
+                error.data,
+                (control_limit != 0)
+                    .then(|| serde_json::json!({"limit": "process_memory", "max": pool.limit()}))
+            );
+            assert_eq!(pool.used(), 0);
+            assert_eq!(control.used(), 0);
+            peer.close().await.unwrap();
+        }
+    }
 }
 
 #[cfg(test)]

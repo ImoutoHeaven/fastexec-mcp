@@ -989,17 +989,18 @@ impl Daemon {
                         continue;
                     }
                     Ok(ipc::DaemonFrame::OverloadEvent { id: Some(id) }) => {
-                        queue_event_control(
+                        queue_event_frame(
                             outgoing,
                             &self.memory,
                             &self.reserved,
                             &attached.token,
                             id,
-                            ipc::EventWireFrame::Error(ipc::IpcEventError {
-                                code: -32025,
-                                message: ipc::input_budget_error().to_string(),
-                                data: None,
-                            }),
+                            ipc::IpcEventError::memory_full(
+                                &self.memory,
+                                &self.control_memory,
+                                "Server active memory budget is full while reading the event request; the operation was not dispatched",
+                            )
+                            .map(ipc::EventWireFrame::Error),
                         );
                         continue;
                     }
@@ -4175,6 +4176,61 @@ mod tests {
 
         emitter.send(&ToDaemon::Bye).await;
         assert_eq!(emitter.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn event_ingress_budget_receipts_include_limits_and_keep_connection() {
+        let pool = BytePool::new(128 << 10);
+        let fixture = fixture_with_config(Config {
+            memory: Some(Arc::clone(&pool)),
+            ..Config::default()
+        });
+        let daemon = &fixture.daemon;
+        let mut client = connect(daemon).await;
+        client.welcome("eventsbudget", 1).await;
+        let full = pool.try_acquire(pool.limit() - pool.used()).unwrap();
+        for request in [
+            ToDaemon::EventsList { id: 1 },
+            ToDaemon::EventsPoll {
+                id: 2,
+                request: crate::events::PollRequest {
+                    name: crate::events::EVENT_EXTERNAL.into(),
+                    ..Default::default()
+                },
+            },
+            ToDaemon::EventsStream {
+                id: 3,
+                request: crate::events::SubscribeRequest {
+                    name: crate::events::EVENT_EXTERNAL.into(),
+                    ..Default::default()
+                },
+            },
+        ] {
+            client.send(&request).await;
+            let Some(ToEndpoint::EventFrame {
+                frame: ipc::EventWireFrame::Error(error),
+                ..
+            }) = client.next().await
+            else {
+                panic!("the event request must receive a budget error");
+            };
+            assert_eq!(error.code, -32025);
+            assert_eq!(
+                error.data,
+                Some(json!({"limit": "process_memory", "max": pool.limit()}))
+            );
+        }
+        drop(full);
+        client.send(&ToDaemon::EventsList { id: 4 }).await;
+        assert!(matches!(
+            client.next().await,
+            Some(ToEndpoint::EventFrame {
+                id: 4,
+                frame: ipc::EventWireFrame::ListResult(_),
+            })
+        ));
+        client.send(&ToDaemon::Bye).await;
+        assert_eq!(client.next().await, None);
     }
 
     #[tokio::test]
