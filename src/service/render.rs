@@ -1127,8 +1127,9 @@ impl Service {
                 let (encoded_steps, blocks, evicted_mid_pack, held) =
                     tokio::task::spawn_blocking(move || {
                         // The blocking worker owns every guard until its buffers are gone,
-                        // even if the awaiting request is cancelled.
-                        let held = (pack_lease, read, permit, workspace);
+                        // even if the awaiting request is cancelled. Keep `read` last so
+                        // memory leases and permits release before `read_gate` unlocks.
+                        let held = (pack_lease, workspace, permit, read);
                         let mut out = Vec::with_capacity(planned.len());
                         let mut blocks = Vec::with_capacity(planned.len());
                         let mut saw_eviction = false;
@@ -1191,7 +1192,7 @@ impl Service {
                     .map_err(|error| {
                         format!("Internal failure while encoding attachments: {error}.")
                     })??;
-                let (pack_lease, packed_read, packed_permit, packed_workspace) = held;
+                let (pack_lease, packed_workspace, packed_permit, packed_read) = held;
                 read = packed_read;
                 permit = packed_permit;
                 workspace = packed_workspace;
