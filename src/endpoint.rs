@@ -83,7 +83,7 @@ type Writer = tests::ControlledWriter;
 /// A live connection to the daemon, shared by every call in flight.
 struct Link {
     epoch: String,
-    writer: Mutex<Writer>,
+    writer: Mutex<Option<Writer>>,
     pending: std::sync::Mutex<HashMap<u64, Pending>>,
     event_pending:
         std::sync::Mutex<HashMap<u64, mpsc::Sender<(ipc::EventWireFrame, crate::lease::Lease)>>>,
@@ -127,16 +127,7 @@ impl Drop for EventRegistration {
         }
         lock(&self.link.event_pending).remove(&self.id);
         if self.cancel_on_drop && !self.link.closed.is_cancelled() {
-            let link = Arc::clone(&self.link);
-            let id = self.id;
-            tokio::spawn(async move {
-                let mut attempted = false;
-                let _ = tokio::time::timeout(
-                    CANCEL_WAIT,
-                    link.send(&ToDaemon::EventsCancel { id }, &mut attempted),
-                )
-                .await;
-            });
+            tokio::spawn(Arc::clone(&self.link).cancel_event(self.id));
         }
     }
 }
@@ -164,13 +155,7 @@ impl EndpointEventStream {
         }
         self.cancelled = true;
         lock(&self.link.event_pending).remove(&self.id);
-        let mut attempted = false;
-        let _ = tokio::time::timeout(
-            CANCEL_WAIT,
-            self.link
-                .send(&ToDaemon::EventsCancel { id: self.id }, &mut attempted),
-        )
-        .await;
+        Arc::clone(&self.link).cancel_event(self.id).await;
     }
 }
 
@@ -178,16 +163,7 @@ impl Drop for EndpointEventStream {
     fn drop(&mut self) {
         lock(&self.link.event_pending).remove(&self.id);
         if !self.cancelled && !self.link.closed.is_cancelled() {
-            let link = Arc::clone(&self.link);
-            let id = self.id;
-            tokio::spawn(async move {
-                let mut attempted = false;
-                let _ = tokio::time::timeout(
-                    CANCEL_WAIT,
-                    link.send(&ToDaemon::EventsCancel { id }, &mut attempted),
-                )
-                .await;
-            });
+            tokio::spawn(Arc::clone(&self.link).cancel_event(self.id));
         }
     }
 }
@@ -212,6 +188,27 @@ impl Drop for Registration<'_> {
 }
 
 impl Link {
+    /// Sends a complete cancellation or closes the link, even if the future is dropped.
+    fn cancel_event(
+        self: Arc<Self>,
+        id: u64,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let close_on_failure = self.closed.clone().drop_guard();
+        async move {
+            let mut attempted = false;
+            if matches!(
+                tokio::time::timeout(
+                    CANCEL_WAIT,
+                    self.send(&ToDaemon::EventsCancel { id }, &mut attempted),
+                )
+                .await,
+                Ok(Ok(true))
+            ) {
+                close_on_failure.disarm();
+            }
+        }
+    }
+
     /// A write that ends early may leave half a frame. The drop guard poisons the stream
     /// before the writer unlocks, including when the future itself is dropped.
     async fn send(&self, frame: &ToDaemon, attempted: &mut bool) -> std::io::Result<bool> {
@@ -225,6 +222,9 @@ impl Link {
             biased;
             _ = self.closed.cancelled() => return Ok(false),
             writer = self.writer.lock() => writer,
+        };
+        let Some(writer) = writer.as_mut() else {
+            return Ok(false);
         };
         Ok(tokio::select! {
             biased;
@@ -501,7 +501,7 @@ impl Endpoint {
         let writer = tests::ControlledWriter::new(writer);
         let link = Arc::new(Link {
             epoch,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Some(writer)),
             pending: std::sync::Mutex::new(HashMap::new()),
             event_pending: std::sync::Mutex::new(HashMap::new()),
             closed: CancellationToken::new(),
@@ -924,6 +924,8 @@ async fn read_loop(
     lock(&link.pending).clear();
     lock(&link.event_pending).clear();
     drop(reader);
+    // Other stream handles may keep the Link alive after cancellation.
+    drop(link.writer.lock().await.take());
     // A reconnect holds the slot while handshaking; do not keep the old writer alive behind it.
     let ended = Arc::downgrade(&link);
     drop(link);
@@ -1482,6 +1484,185 @@ mod tests {
             finish(peer).await;
             assert_eq!(pool.used(), 0);
             assert_eq!(control.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn event_cancel_failures_close_the_transport_with_link_owners_retained() {
+        for mode in [
+            "budget",
+            "writer_timeout",
+            "drop_future",
+            "drop_stream",
+            "drop_registration",
+        ] {
+            let (identity, paths, mut listener, _target) =
+                test_daemon(&format!("event-cancel-{mode}"));
+            let response = welcome(&identity);
+            let (ended, closed) = oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let mut conn = listener.accept().await.unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Hello { .. })
+                ));
+                ipc::write_frame(&mut conn, &response).await.unwrap();
+                let Some(ToDaemon::EventsStream { id, .. }) =
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap()
+                else {
+                    panic!("expected subscription");
+                };
+                ipc::write_frame(
+                    &mut conn,
+                    &ToEndpoint::EventFrame {
+                        id,
+                        frame: ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                            cursor: "eeeeeeee:0".into(),
+                            truncated: false,
+                            heartbeat_ms: 30_000,
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "failed cancellation must close the actual transport"
+                );
+                ended.send(()).unwrap();
+                drop(conn);
+                let mut conn = listener.accept().await.unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Hello { .. })
+                ));
+                ipc::write_frame(&mut conn, &response).await.unwrap();
+                let Some(ToDaemon::EventsList { id }) =
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap()
+                else {
+                    panic!("expected reconnect list");
+                };
+                ipc::write_frame(
+                    &mut conn,
+                    &ToEndpoint::EventFrame {
+                        id,
+                        frame: ipc::EventWireFrame::ListResult(crate::events::EventsListResult {
+                            result_type: "complete".into(),
+                            events: Vec::new(),
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Bye)
+                ));
+            });
+            let pool = crate::lease::BytePool::new(16 << 10);
+            let control = crate::lease::BytePool::new(4 << 10);
+            let mut endpoint = Endpoint::for_test(identity, paths);
+            endpoint.launch = Arc::new(
+                LaunchContext::new(std::env::temp_dir(), Vec::new())
+                    .with_memory(Arc::clone(&pool))
+                    .with_control_memory(Arc::clone(&control)),
+            );
+            let (active, stream) = endpoint
+                .events_stream(
+                    "test",
+                    crate::events::SubscribeRequest {
+                        name: "external.event".into(),
+                        ..Default::default()
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            drop(active);
+            let link = Arc::clone(&stream.link);
+            let mut stream = Some(stream);
+            let held = if matches!(mode, "budget" | "drop_stream" | "drop_registration") {
+                Some((
+                    pool.try_acquire(pool.limit() - pool.used()).unwrap(),
+                    control
+                        .try_acquire(control.limit() - control.used())
+                        .unwrap(),
+                ))
+            } else {
+                None
+            };
+            match mode {
+                "budget" => stream.as_mut().unwrap().cancel().await,
+                "drop_stream" => drop(stream.take()),
+                "drop_registration" => {
+                    let mut stream = stream.take().unwrap();
+                    stream.cancelled = true;
+                    let mut registration = EventRegistration::new(Arc::clone(&link), stream.id);
+                    registration.arm_cancel();
+                    drop(registration);
+                    drop(stream);
+                }
+                "writer_timeout" | "drop_future" => {
+                    let busy = link.writer.lock().await;
+                    tokio::time::pause();
+                    let mut cancelling = Box::pin(stream.as_mut().unwrap().cancel());
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancelling => panic!("cancel must wait for the writer"),
+                        () = std::future::ready(()) => {}
+                    }
+                    if mode == "drop_future" {
+                        drop(cancelling);
+                    } else {
+                        tokio::time::advance(CANCEL_WAIT + Duration::from_millis(1)).await;
+                        cancelling.await;
+                    }
+                    tokio::time::resume();
+                    assert!(link.closed.is_cancelled(), "{mode} must close the link");
+                    drop(busy);
+                }
+                _ => unreachable!(),
+            }
+            if mode == "budget" {
+                assert!(
+                    link.closed.is_cancelled(),
+                    "budget refusal must close the link"
+                );
+            }
+            timeout(Duration::from_secs(5), closed)
+                .await
+                .expect("the peer must see EOF while Arc<Link> is still retained")
+                .unwrap();
+            assert!(link.closed.is_cancelled());
+            drop(held);
+            let list = timeout(
+                Duration::from_secs(5),
+                endpoint.events_list("test", CancellationToken::new()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(list.value.events.is_empty());
+            drop(list);
+            endpoint.bye().await;
+            finish(peer).await;
+            drop(stream);
+            assert_eq!(pool.used(), 0);
+            assert_eq!(control.used(), 0);
+            drop(link);
         }
     }
 
@@ -2215,7 +2396,7 @@ mod tests {
             .link("test", std::time::Instant::now() + runtime::START_WAIT)
             .await
             .unwrap();
-        link.writer.lock().await.pause = Some(WritePause {
+        link.writer.lock().await.as_mut().unwrap().pause = Some(WritePause {
             remaining: PARTIAL_BYTES,
             blocked: Some(paused),
         });
