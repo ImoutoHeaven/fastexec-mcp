@@ -59,7 +59,7 @@ pub fn main(args: &[OsString]) -> ! {
     // become the subreaper would silently leave daemonizing processes outside the tree, so it
     // fails the start instead of running bash.
     #[cfg(target_os = "linux")]
-    let startup = match crate::tree_linux::acquire() {
+    let startup = match crate::platform::tree_linux::acquire() {
         Ok(()) => 0,
         Err(error) => {
             let errno = error.raw_os_error().unwrap_or(libc::EIO) as u32;
@@ -93,7 +93,9 @@ pub fn main(args: &[OsString]) -> ! {
     // The control socket is closed across exec again before bash starts: the server cleared that
     // flag only for the exec into this host.
     #[cfg(target_os = "macos")]
-    let control = std::sync::Arc::new(std::sync::Mutex::new(crate::tree_macos::from_fd(control)));
+    let control = std::sync::Arc::new(std::sync::Mutex::new(crate::platform::tree_macos::from_fd(
+        control,
+    )));
     // The host shares bash's process group, the PTY's foreground group, so Ctrl-C, Ctrl-Z, the
     // hangup of a closing terminal, and a command's `kill 0` reach it too: it outlives every
     // signal but SIGKILL that would end or stop it. A handler, unlike SIG_IGN, resets to the
@@ -144,12 +146,14 @@ pub fn main(args: &[OsString]) -> ! {
     // failed startup must not orphan a command that already detached from the host's group.
     #[cfg(target_os = "macos")]
     let tracker = {
-        let tracker = std::sync::Arc::new(std::sync::Mutex::new(crate::tree_macos::Tracker::new()));
+        let tracker = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::platform::tree_macos::Tracker::new(),
+        ));
         let served = std::sync::Arc::clone(&tracker);
         let serving = std::sync::Arc::clone(&control);
         std::thread::Builder::new()
             .name("fastexec-control".into())
-            .spawn(move || crate::tree_macos::serve(serving, served))
+            .spawn(move || crate::platform::tree_macos::serve(serving, served))
             .unwrap_or_else(|error| fail_start(&mut status, error));
         let ticking = std::sync::Arc::clone(&tracker);
         std::thread::Builder::new()
@@ -210,7 +214,7 @@ pub fn main(args: &[OsString]) -> ! {
     // The root's identity is taken now, while it is known to be this process: forgetting it at its
     // exit must not reach a successor that took the number.
     #[cfg(target_os = "macos")]
-    let bash_start = crate::tree_macos::start_time(bash).unwrap_or(0);
+    let bash_start = crate::platform::tree_macos::start_time(bash).unwrap_or(0);
     drop(spawn_guard);
     // A caller may kill immediately after readiness, so it must never observe a host that has
     // yet to create its command. A closed status pipe does not relinquish an existing tree:
@@ -276,7 +280,7 @@ fn wait_macos(
     bash: libc::pid_t,
     bash_start: u64,
     status: &mut File,
-    tracker: &std::sync::Arc<std::sync::Mutex<crate::tree_macos::Tracker>>,
+    tracker: &std::sync::Arc<std::sync::Mutex<crate::platform::tree_macos::Tracker>>,
     control: &std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>,
 ) -> ! {
     let mut reported = false;
@@ -439,7 +443,7 @@ fn watch(mut lifeline: File) {
     // A privileged descendant may reject SIGKILL. Retain reaper ownership until it ends or
     // becomes signalable, including when the server has died and cannot retry the request.
     loop {
-        if crate::process::kill_tree(std::process::id() as i32).is_ok() {
+        if crate::platform::process::kill_tree(std::process::id() as i32).is_ok() {
             // FreeBSD's main thread must finish the PTY drain before the session ends.
             #[cfg(target_os = "freebsd")]
             return;
@@ -455,7 +459,7 @@ fn watch(mut lifeline: File) {
 #[cfg(target_os = "macos")]
 fn watch_macos(
     mut lifeline: File,
-    tracker: std::sync::Arc<std::sync::Mutex<crate::tree_macos::Tracker>>,
+    tracker: std::sync::Arc<std::sync::Mutex<crate::platform::tree_macos::Tracker>>,
 ) {
     read_lifeline(&mut lifeline);
     // The tree is held until it can be ended: a member this user may not signal keeps the host

@@ -10,7 +10,7 @@
 //! implementation (https://github.com/wez/wezterm, `src/cmdbuilder.rs`), Copyright 2018 Wez
 //! Furlong, licensed under the MIT license in `vendor/conpty/LICENSE`; see NOTICE.
 
-use crate::process::{Child, Launch, Spawned, Tree, bash_args, environment};
+use crate::platform::process::{Child, Launch, Spawned, Tree, bash_args, environment};
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -62,7 +62,7 @@ impl ConPty {
         }
         // Only the module loaded from the verified bundled image may override the system
         // API. A failed extraction must never search CWD or PATH for another conpty.dll.
-        let bundled = crate::conpty::module().and_then(resolve);
+        let bundled = crate::platform::conpty::module().and_then(resolve);
         let (create, resize, close) = match bundled.or_else(|| resolve(kernel)) {
             Some(triple) => triple,
             None => {
@@ -212,7 +212,7 @@ pub fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
         output: suspended.output,
         input: Some(suspended.input),
         tree: suspended.tree,
-        pty: Some(crate::process::PtyControl::new(terminal)),
+        pty: Some(crate::platform::process::PtyControl::new(terminal)),
     })
 }
 
@@ -938,8 +938,8 @@ mod tests {
             login: false,
             pty: true,
             pipe_stdin: false,
-            cols: crate::process::PTY_COLS,
-            rows: crate::process::PTY_ROWS,
+            cols: crate::platform::process::PTY_COLS,
+            rows: crate::platform::process::PTY_ROWS,
             exit_status: None,
         };
         let suspended = create_in_job(&launch).expect("a suspended PTY root");

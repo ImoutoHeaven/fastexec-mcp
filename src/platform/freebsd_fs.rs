@@ -190,7 +190,7 @@ pub fn create_private_directory(dir: &Path) -> io::Result<()> {
         if held.dev() != named.dev() || held.ino() != named.ino() || !named.is_dir() {
             return Err(io::Error::other("the new private directory was replaced"));
         }
-        crate::runtime::create_private_unix_check(dir)?;
+        crate::platform::runtime::create_private_unix_check(dir)?;
         if fs::read_dir(dir)?.next().transpose()?.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -209,7 +209,7 @@ pub fn create_private_directory(dir: &Path) -> io::Result<()> {
 /// ordinary path components, while the requested leaf must always pass the private-directory check.
 pub fn create_private_all(dir: &Path) -> io::Result<()> {
     match fs::symlink_metadata(dir) {
-        Ok(_) => return crate::runtime::create_private_unix_check(dir),
+        Ok(_) => return crate::platform::runtime::create_private_unix_check(dir),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -254,13 +254,13 @@ fn publish_private_directory(dir: &Path) -> io::Result<()> {
         };
         if renamed == 0 {
             // The temporary name no longer exists. Never clean up the published directory.
-            return crate::runtime::create_private_unix_check(dir);
+            return crate::platform::runtime::create_private_unix_check(dir);
         }
         let error = io::Error::last_os_error();
         // Only our random, empty sibling is removed, never the winner or its contents.
         fs::remove_dir(&temporary)?;
         return if error.kind() == io::ErrorKind::AlreadyExists {
-            crate::runtime::create_private_unix_check(dir)
+            crate::platform::runtime::create_private_unix_check(dir)
         } else {
             Err(error)
         };
@@ -618,7 +618,7 @@ mod tests {
                 break;
             }
             assert_eq!(fs::read_dir(&directory).unwrap().count(), 8);
-            crate::runtime::create_private_unix_check(&directory).unwrap();
+            crate::platform::runtime::create_private_unix_check(&directory).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
         assert!(

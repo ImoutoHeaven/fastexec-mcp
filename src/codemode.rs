@@ -3,10 +3,10 @@
 use crate::files;
 use crate::lease::{BytePool, Lease};
 use crate::media::{self, CompressFailure, MediaKind};
-use crate::output::Truncate;
 use crate::service::{self, Call, OutputMode, Render, Service};
 use crate::session::{LaunchContext, Session, parse_handle};
 use crate::tasks::{TASK_LOG_LIMIT, Task, Tasks};
+use crate::term::output::Truncate;
 use base64::Engine;
 use rquickjs::context::EvalOptions;
 use rquickjs::{Context, Ctx, Exception, Function, Object, Persistent, Runtime, Value};

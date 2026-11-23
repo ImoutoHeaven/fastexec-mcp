@@ -176,7 +176,7 @@ pub(crate) fn create_private(dir: &Path) -> io::Result<()> {
     }
     #[cfg(target_os = "freebsd")]
     {
-        crate::freebsd_fs::create_private_all(dir)
+        crate::platform::freebsd_fs::create_private_all(dir)
     }
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
     {
@@ -203,7 +203,7 @@ pub(crate) fn create_private_new(dir: &Path) -> io::Result<()> {
     }
     #[cfg(target_os = "freebsd")]
     {
-        crate::freebsd_fs::create_private_directory(dir)
+        crate::platform::freebsd_fs::create_private_directory(dir)
     }
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
     {
@@ -596,7 +596,7 @@ pub(crate) fn create_private_unix_check(dir: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     private_macos::check_acl(&file, dir)?;
     #[cfg(target_os = "freebsd")]
-    crate::freebsd_fs::check_private_acl(&file)?;
+    crate::platform::freebsd_fs::check_private_acl(&file)?;
     Ok(())
 }
 
@@ -1050,8 +1050,9 @@ fn spawn_daemon(
         build.into(),
     ];
     args.extend(extra.iter().cloned());
-    let mut command_line = crate::conpty_spawn::command_line_of(exe.as_os_str(), &args)
-        .map_err(|error| format!("cannot build the daemon command line: {error}"))?;
+    let mut command_line =
+        crate::platform::conpty_spawn::command_line_of(exe.as_os_str(), &args)
+            .map_err(|error| format!("cannot build the daemon command line: {error}"))?;
     let application: Vec<u16> = exe
         .as_os_str()
         .encode_wide()

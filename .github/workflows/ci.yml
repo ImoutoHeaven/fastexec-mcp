@@ -60,7 +60,7 @@ jobs:
           FASTEXEC_REQUIRE_ROOT_TEST: ${{ runner.os == 'macOS' && '1' || '0' }}
         run: |
           python3 scripts/ci/run-tests.py --timeout 1200 \
-            --note "src/tasks.rs unit tests (cfg(all(test, windows)): a Unix unit-test binary is not the task host)" \
+            --note "src/tasks/tests.rs unit tests (cfg(all(test, windows)): a Unix unit-test binary is not the task host)" \
             --note "non-UTF-8 filesystem-name round trip is Linux/FreeBSD-only; native argument byte preservation runs on every Unix host"
 
       - name: test (windows)
@@ -145,11 +145,11 @@ jobs:
           sudo chmod -R o+rX "$GITHUB_WORKSPACE"
           sudo install -d -m 1777 /var/tmp/fx-root
           python3 scripts/ci/run-tests.py --timeout 600 --only mcp --sudo \
-            --note "src/tasks.rs unit tests (cfg(all(test, windows)): a Unix unit-test binary is not the task host)" \
+            --note "src/tasks/tests.rs unit tests (cfg(all(test, windows)): a Unix unit-test binary is not the task host)" \
             --env FASTEXEC_REQUIRE_ROOT_TEST=1 \
             --env TMPDIR=/var/tmp/fx-root \
             --env HOME=/var/tmp/fx-root \
-            -- processes_the_server_may_not_kill_stay_held_and_reported --exact --nocapture
+            -- exec::processes_the_server_may_not_kill_stay_held_and_reported --exact --nocapture
 
       - name: test log
         if: always()
@@ -186,7 +186,7 @@ jobs:
               cargo fmt --check
               cargo clippy --locked --all-targets -- -D warnings
               python3 scripts/ci/run-tests.py --timeout 1200 \
-                --note "src/tasks.rs unit tests are Windows-only"
+                --note "src/tasks/tests.rs unit tests are Windows-only"
             '
 
       - name: test log
@@ -237,7 +237,7 @@ jobs:
             cargo fmt --check
             cargo clippy --locked --all-targets -- -D warnings
             python3 scripts/ci/run-tests.py --timeout 1200 \
-              --note "src/tasks.rs unit tests are Windows-only"
+              --note "src/tasks/tests.rs unit tests are Windows-only"
             sh scripts/ci/freebsd-acl-tests.sh
             FREEBSD
             # Let the VM synchronize failure logs before the host enforces the test result.

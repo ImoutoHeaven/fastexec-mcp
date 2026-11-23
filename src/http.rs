@@ -1,11 +1,12 @@
 //! Streamable HTTP: the daemon's second front door, for clients that speak MCP over HTTP instead
 //! of the stdio endpoint or the namespace's pipe.
 
+use crate::config::{InstructionsToolMode, Tools};
 use crate::daemon::Daemon;
+use crate::mcp::{Backend, Server};
 use crate::service::Render;
 use crate::session::{LaunchContext, Session};
-use crate::transfer::{self, Admitted, Transfers};
-use crate::{Backend, InstructionsToolMode, Server, Tools, TransferEndpoint};
+use crate::transfer::{self, Admitted, TransferEndpoint, Transfers};
 use bytes::Bytes;
 use http::header::HeaderName;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Version, header};
@@ -252,7 +253,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
             )
         })
         .collect();
-    let (instructions, tool_instructions) = crate::compose_instructions(
+    let (instructions, tool_instructions) = crate::config::compose_instructions(
         true,
         tools.codemode,
         extra_instructions.as_deref(),
@@ -1950,7 +1951,7 @@ mod tests {
             structured_content: true,
         };
         let (instructions, tool_instructions) =
-            crate::compose_instructions(true, false, None, InstructionsToolMode::Off);
+            crate::config::compose_instructions(true, false, None, InstructionsToolMode::Off);
         let router = Arc::new(Server::build_router(&launch, tools, None));
         let principals: Arc<[Arc<Session>]> = vec![Session::new(
             "t1".to_owned(),

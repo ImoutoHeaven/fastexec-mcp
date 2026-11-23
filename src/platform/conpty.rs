@@ -32,11 +32,21 @@ mod bundled {
     const FILES: [(&str, &[u8]); 2] = [
         (
             "conpty.dll",
-            include_bytes!(concat!("../vendor/conpty/", arch!(), "/conpty.dll")),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/vendor/conpty/",
+                arch!(),
+                "/conpty.dll"
+            )),
         ),
         (
             "OpenConsole.exe",
-            include_bytes!(concat!("../vendor/conpty/", arch!(), "/OpenConsole.exe")),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/vendor/conpty/",
+                arch!(),
+                "/OpenConsole.exe"
+            )),
         ),
     ];
 
@@ -127,9 +137,9 @@ mod bundled {
                                 .all(|byte| crate::tasks::ALPHABET.contains(&byte))
                     })
                     .and_then(|(pid, _)| pid.parse::<u32>().ok());
-                if old_pid
-                    .is_some_and(|pid| pid != std::process::id() && !crate::process::is_alive(pid))
-                    && crate::runtime::create_private(&entry.path()).is_ok()
+                if old_pid.is_some_and(|pid| {
+                    pid != std::process::id() && !crate::platform::process::is_alive(pid)
+                }) && crate::platform::runtime::create_private(&entry.path()).is_ok()
                 {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
@@ -138,7 +148,7 @@ mod bundled {
         for _ in 0..8 {
             let nonce = crate::tasks::random_chars(12).map_err(|error| error.to_string())?;
             let dir = temp.join(format!("{prefix}{}-{nonce}", std::process::id()));
-            match crate::runtime::create_private_new(&dir) {
+            match crate::platform::runtime::create_private_new(&dir) {
                 Ok(()) => return Ok(dir),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(format!("cannot create {}: {error}", dir.display())),

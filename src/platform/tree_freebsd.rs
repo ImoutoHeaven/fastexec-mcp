@@ -1,6 +1,6 @@
 //! FreeBSD's kernel reaper owns detached descendants and selects signal targets itself.
 
-use crate::process::{Member, MemberBudget};
+use crate::platform::process::{Member, MemberBudget};
 use std::io;
 
 // The public, padded ABI in <sys/procctl.h>; libc exposes the commands but not these records.

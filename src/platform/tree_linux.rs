@@ -1,6 +1,6 @@
 //! Linux subreaper ownership; pidfds keep a scanned PID from becoming an unrelated kill target.
 
-use crate::process::{Member, MemberBudget};
+use crate::platform::process::{Member, MemberBudget};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 

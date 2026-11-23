@@ -4,11 +4,11 @@
 //! Object are derived from FastCtx `src/shell/process.rs` and `src/process_policy.rs`
 //! (Apache-2.0, Copyright 2026 yc-duan), modified for fastexec.
 
+#[cfg(unix)]
+use crate::platform::unix_pty::open as open_pty;
 use crate::session::LaunchContext;
 #[cfg(windows)]
 use crate::session::var_in;
-#[cfg(unix)]
-use crate::unix_pty::open as open_pty;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -61,14 +61,16 @@ pub struct Spawned {
 /// the tree ended finds it taken.
 pub struct PtyControl {
     #[cfg(windows)]
-    terminal: std::sync::Arc<crate::conpty_spawn::Terminal>,
+    terminal: std::sync::Arc<crate::platform::conpty_spawn::Terminal>,
     #[cfg(unix)]
     master: std::os::fd::OwnedFd,
 }
 
 impl PtyControl {
     #[cfg(windows)]
-    pub(crate) fn new(terminal: std::sync::Arc<crate::conpty_spawn::Terminal>) -> PtyControl {
+    pub(crate) fn new(
+        terminal: std::sync::Arc<crate::platform::conpty_spawn::Terminal>,
+    ) -> PtyControl {
         PtyControl { terminal }
     }
 
@@ -197,7 +199,7 @@ pub enum Child {
         /// Held until the tree ends; dropping it closes the terminal so output reaches EOF. The
         /// task's size control holds another reference while the tree runs.
         #[allow(dead_code)] // held for the console's lifetime, never read here
-        terminal: std::sync::Arc<crate::conpty_spawn::Terminal>,
+        terminal: std::sync::Arc<crate::platform::conpty_spawn::Terminal>,
         /// Where the script records its exit status, so a root that never terminates can still
         /// end its task.
         exit_status: Option<std::path::PathBuf>,
@@ -219,7 +221,7 @@ impl Child {
                 process,
                 exit_status,
                 ..
-            } => crate::conpty_spawn::wait(process, exit_status.as_deref()),
+            } => crate::platform::conpty_spawn::wait(process, exit_status.as_deref()),
         };
         (msys_signal_exit(code), forced)
     }
@@ -948,7 +950,7 @@ pub const PTY_ROWS_MAX: u16 = 200;
 
 #[cfg(windows)]
 fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
-    crate::conpty_spawn::spawn_pty(launch)
+    crate::platform::conpty_spawn::spawn_pty(launch)
 }
 
 /// Starts the task host (`src/host.rs`) as the leader of a new session, with bash's command
@@ -974,7 +976,7 @@ fn spawn_host_args(
     // must not signal a group by a number the kernel may have reused. Other platforms answer from
     // /proc or their job, and pass no such descriptor.
     #[cfg(target_os = "macos")]
-    let (control, control_host) = crate::tree_macos::socket_pair()?;
+    let (control, control_host) = crate::platform::tree_macos::socket_pair()?;
     #[cfg(target_os = "macos")]
     let passed = vec![
         status_writer.as_raw_fd(),
@@ -996,7 +998,7 @@ fn spawn_host_args(
     };
     let mut command = Command::new(host);
     command
-        .arg(crate::host::FLAG)
+        .arg(crate::platform::host::FLAG)
         .args(passed.iter().map(|fd| fd.to_string()))
         .arg(launch.bash)
         .args(args)
@@ -1072,7 +1074,7 @@ fn spawn_host_args(
         _lifeline: lifeline,
         state: std::sync::Mutex::new(TreeState::Active),
         #[cfg(target_os = "macos")]
-        control: crate::tree_macos::Client::new(control, host.id() as i32),
+        control: crate::platform::tree_macos::Client::new(control, host.id() as i32),
     };
     Ok(Spawned {
         child: Child {
@@ -1100,7 +1102,7 @@ fn finish_host_startup(
         )),
         Ok(()) => {
             let startup = u32::from_le_bytes(startup);
-            if startup == crate::host::STARTUP_READY {
+            if startup == crate::platform::host::STARTUP_READY {
                 return Ok(());
             }
             let problem = std::io::Error::from_raw_os_error(startup as i32);
@@ -1306,7 +1308,7 @@ pub struct Tree {
     /// The host's control socket: macOS asks the host which processes the tree holds, so no
     /// membership list or signal target lives here.
     #[cfg(target_os = "macos")]
-    control: crate::tree_macos::Client,
+    control: crate::platform::tree_macos::Client,
 }
 
 impl Tree {
@@ -1385,11 +1387,11 @@ impl Tree {
             }
             #[cfg(target_os = "freebsd")]
             {
-                crate::tree_freebsd::members(self.host, budget).ok()
+                crate::platform::tree_freebsd::members(self.host, budget).ok()
             }
             #[cfg(target_os = "linux")]
             {
-                crate::tree_linux::members(self.host, budget).ok()
+                crate::platform::tree_linux::members(self.host, budget).ok()
             }
             #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
             {
@@ -1418,13 +1420,13 @@ impl Tree {
 pub fn kill_tree(host: i32) -> std::io::Result<()> {
     #[cfg(target_os = "freebsd")]
     if matches!(
-        crate::tree_freebsd::kill(host)?,
-        crate::tree_freebsd::KillResult::EmptyHost
+        crate::platform::tree_freebsd::kill(host)?,
+        crate::platform::tree_freebsd::KillResult::EmptyHost
     ) {
         return Ok(());
     }
     #[cfg(target_os = "linux")]
-    crate::tree_linux::kill(host)?;
+    crate::platform::tree_linux::kill(host)?;
     // SAFETY: plain syscall; the group ID stays reserved while the unreaped host holds it.
     if unsafe { libc::kill(-host, libc::SIGKILL) } == -1 {
         let error = std::io::Error::last_os_error();
@@ -1897,7 +1899,7 @@ mod windows {
                 ));
                 assert!(job_members(job, root).unwrap().is_empty());
                 assert!(job_members(job, None).unwrap().is_empty());
-                assert!(!crate::process::is_alive(child.id()));
+                assert!(!crate::platform::process::is_alive(child.id()));
             }
         }
 

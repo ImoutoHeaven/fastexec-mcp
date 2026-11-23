@@ -22,7 +22,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::process::{Member, MemberBudget};
+use crate::platform::process::{Member, MemberBudget};
 
 /// `SZOMBIE` from `<sys/proc.h>`: the state of a process that has ended and not been reaped.
 const ZOMBIE: u32 = 5;

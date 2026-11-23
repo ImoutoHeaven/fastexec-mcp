@@ -3,9 +3,9 @@
 //! task ends when they do, once a result has shown the root's exit.
 
 use crate::lease::{BytePool, Lease};
-use crate::output::{Cleaner, Matcher};
 use crate::session::{ReadState, Reader};
 use crate::tasks::Task;
+use crate::term::output::{Cleaner, Matcher};
 use encoding_rs::Encoding;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

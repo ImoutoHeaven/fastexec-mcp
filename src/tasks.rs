@@ -3,13 +3,13 @@
 use crate::codemode;
 use crate::lease::{BytePool, Lease};
 use crate::media::MediaKind;
-use crate::output::{
+use crate::platform::process::{self, Launch, Member, Tree};
+use crate::session::{LaunchContext, ProbeWarning, ReadState, Reader, Session, TaskEntry};
+use crate::term::output::{
     MATCH_SCAN_BYTES, Matcher, Truncate, Window, WindowBuilder, WindowSpec,
     incomplete_legacy_suffix_reader, incomplete_utf8_suffix,
 };
-use crate::process::{self, Launch, Member, Tree};
-use crate::session::{LaunchContext, ProbeWarning, ReadState, Reader, Session, TaskEntry};
-use crate::terminal::Live;
+use crate::term::terminal::Live;
 use encoding_rs::Encoding;
 use std::collections::HashSet;
 use std::fs::File;
@@ -833,7 +833,7 @@ impl Tasks {
                 std::process::id(),
                 random_chars(12)?
             ));
-            match crate::runtime::create_private_new(&dir) {
+            match crate::platform::runtime::create_private_new(&dir) {
                 Ok(()) => return Self::new_in(limits, dir),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
@@ -853,7 +853,7 @@ impl Tasks {
                 "Tasks needs a tokio runtime for the killAfterMs timer: {error}."
             ))
         })?;
-        crate::runtime::create_private(&dir)?;
+        crate::platform::runtime::create_private(&dir)?;
         Ok(Arc::new(Self {
             dir,
             handle,
@@ -2786,7 +2786,7 @@ impl Task {
     }
 
     /// The keyboard modes of a PTY task's program.
-    pub fn modes(&self) -> Result<crate::keys::Modes, String> {
+    pub fn modes(&self) -> Result<crate::term::keys::Modes, String> {
         self.check_size()?;
         let terminal = self
             .terminal
@@ -3356,7 +3356,7 @@ fn remove_stale_dirs(temp: &Path) {
                 pid.parse().ok()
             });
         if pid.is_some_and(|pid| pid != std::process::id() && !process::is_alive(pid))
-            && crate::runtime::create_private_unix_check(&entry.path()).is_ok()
+            && crate::platform::runtime::create_private_unix_check(&entry.path()).is_ok()
         {
             let _ = std::fs::remove_dir_all(entry.path());
         }
@@ -3670,8 +3670,8 @@ mod ids {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use crate::output::Cleaner;
     use crate::service::{Call, OutputMode, Render, Request, Service};
+    use crate::term::output::Cleaner;
 
     /// A `Tasks` for a test: it needs a runtime for its `killAfterMs` timer, which these tests
     /// do not arm.

@@ -1,8 +1,8 @@
 //! Session-scoped task notices and independent, bounded reader cursors.
 
 use crate::lease::{self, BytePool};
-use crate::output::Cleaner;
 use crate::tasks::{ALPHABET, Snapshot, Task, pids, random_chars};
+use crate::term::output::Cleaner;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -286,7 +286,7 @@ impl LaunchContext {
     pub fn bash(&self) -> Result<PathBuf, String> {
         self.cache
             .bash_lookup()
-            .get_or_init(|| crate::bash::find(self))
+            .get_or_init(|| crate::platform::bash::find(self))
             .clone()
     }
 
@@ -301,7 +301,7 @@ impl LaunchContext {
         }
         let mut reserved = None;
         let entry = self.cache.login_env.get_or_init(|| {
-            match crate::process::probe_login_env(bash, self) {
+            match crate::platform::process::probe_login_env(bash, self) {
                 Ok(mut vars) => {
                     vars.retain(|(key, _)| {
                         !SHELL_MANAGED_VARS

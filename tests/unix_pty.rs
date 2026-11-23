@@ -1,7 +1,7 @@
 //! Native PTY pairs must stay matched and private while other threads spawn commands.
 #![cfg(unix)]
 
-#[path = "../src/unix_pty.rs"]
+#[path = "../src/platform/unix_pty.rs"]
 mod unix_pty;
 
 use std::ffi::CStr;

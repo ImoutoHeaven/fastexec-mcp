@@ -105,7 +105,7 @@ impl Buffer {
         }
         let raw = if stdio {
             self.bytes
-                .strip_prefix(crate::UTF8_BOM)
+                .strip_prefix(crate::ingress::UTF8_BOM)
                 .unwrap_or(&self.bytes)
         } else {
             &self.bytes
@@ -137,9 +137,9 @@ impl Buffer {
         if parsed.is_err()
             && stdio
             && let Some(method) = value.get("method").and_then(serde_json::Value::as_str)
-            && ((value.get("id").is_none() && !crate::is_standard_mcp_method(method))
+            && ((value.get("id").is_none() && !crate::ingress::is_standard_mcp_method(method))
                 || (method.starts_with("notifications/")
-                    && !crate::is_standard_mcp_notification(method)))
+                    && !crate::ingress::is_standard_mcp_notification(method)))
         {
             return Ok(None);
         }
@@ -239,6 +239,48 @@ pub(crate) fn retain_id(owner: &Owner, id: &rmcp::model::RequestId) -> Owner {
         return owner.clone();
     }
     Owner::new(held.split_off(bytes))
+}
+
+pub(crate) const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";
+
+pub(crate) fn is_standard_mcp_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "notifications/cancelled"
+            | "notifications/initialized"
+            | "notifications/message"
+            | "notifications/progress"
+            | "notifications/prompts/list_changed"
+            | "notifications/resources/list_changed"
+            | "notifications/resources/updated"
+            | "notifications/roots/list_changed"
+            | "notifications/subscriptions/acknowledged"
+            | "notifications/tools/list_changed"
+    )
+}
+
+pub(crate) fn is_standard_mcp_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "ping"
+            | "server/discover"
+            | "prompts/get"
+            | "prompts/list"
+            | "resources/list"
+            | "resources/read"
+            | "resources/subscribe"
+            | "resources/unsubscribe"
+            | "resources/templates/list"
+            | "subscriptions/listen"
+            | "tools/call"
+            | "tools/list"
+            | "completion/complete"
+            | "elicitation/create"
+            | "logging/setLevel"
+            | "roots/list"
+            | "sampling/createMessage"
+    ) || is_standard_mcp_notification(method)
 }
 
 #[cfg(test)]
@@ -380,7 +422,7 @@ mod tests {
             .get::<Owner>()
             .unwrap()
             .clone();
-        let requests = crate::RequestLeases::default();
+        let requests = crate::mcp::RequestLeases::default();
         assert!(requests.on_cancel_owned(&id, owner));
         assert_eq!(pool.used(), request_charge(raw));
         drop(message);

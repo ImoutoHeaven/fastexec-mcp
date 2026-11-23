@@ -73,8 +73,12 @@ fn validate(path: &Path, ctx: &LaunchContext) -> Result<(), String> {
     if !path.is_file() {
         return Err("the file does not exist".to_string());
     }
-    let bytes =
-        crate::process::bash_version(path, ctx, BANNER_LIMIT, std::time::Duration::from_secs(5))?;
+    let bytes = crate::platform::process::bash_version(
+        path,
+        ctx,
+        BANNER_LIMIT,
+        std::time::Duration::from_secs(5),
+    )?;
     if String::from_utf8_lossy(&bytes).contains("GNU bash") {
         Ok(())
     } else {

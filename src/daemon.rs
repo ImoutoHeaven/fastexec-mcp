@@ -4,7 +4,7 @@
 use crate::http::{self, Http};
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::lease::{self, BytePool, Lease};
-use crate::runtime;
+use crate::platform::runtime;
 use crate::service::{Call, OutputMode, Render, RenderSlot, Service};
 use crate::session::{LaunchContext, Session};
 use crate::tasks::{Limits, Tasks};
@@ -337,9 +337,16 @@ impl Daemon {
     ) -> Result<std::net::SocketAddr, String> {
         let allow_remote = http::remote_allowed()
             || launch.var("FASTEXEC_HTTP_ALLOW_REMOTE") == Some(std::ffi::OsStr::new("1"));
-        let requested = crate::transfer_addr_of(launch.var(crate::TRANSFER_ADDR), allow_remote)?;
+        let requested = crate::config::transfer_addr_of(
+            launch.var(crate::config::TRANSFER_ADDR),
+            allow_remote,
+        )?;
         if let Some(addr) = requested {
-            crate::check_routable_addr(crate::TRANSFER_ADDR, addr, has_public_root)?;
+            crate::config::check_routable_addr(
+                crate::config::TRANSFER_ADDR,
+                addr,
+                has_public_root,
+            )?;
         }
         let bound = *self
             .transfer_listener
@@ -367,7 +374,7 @@ impl Daemon {
                 "the daemon already serves /t/ on {bound}, not {addr}; stop it first"
             ));
         }
-        crate::check_routable_addr(crate::TRANSFER_ADDR, bound, has_public_root)?;
+        crate::config::check_routable_addr(crate::config::TRANSFER_ADDR, bound, has_public_root)?;
         Ok(bound)
     }
 
@@ -381,43 +388,52 @@ impl Daemon {
         let session_root = match http::root_of(launch.var(http::PUBLIC_URL)) {
             Ok(root) => root,
             Err(message) => {
-                return crate::files::TrackedResult::plain(crate::transfer_error(message, render));
+                return crate::files::TrackedResult::plain(crate::transfer::transfer_error(
+                    message, render,
+                ));
             }
         };
         let public_root = session_root.or_else(|| self.public_root.as_deref().map(str::to_owned));
         if let Some(http_addr) = &self.http {
-            if launch.var(crate::TRANSFER_ADDR).is_some() {
-                return crate::files::TrackedResult::plain(crate::transfer_error(
+            if launch.var(crate::config::TRANSFER_ADDR).is_some() {
+                return crate::files::TrackedResult::plain(crate::transfer::transfer_error(
                     format!(
                         "cannot set {} with --http; --http already serves /t/",
-                        crate::TRANSFER_ADDR
+                        crate::config::TRANSFER_ADDR
                     ),
                     render,
                 ));
             }
             if public_root.is_none()
                 && let Ok(addr) = http_addr.parse::<std::net::SocketAddr>()
-                && let Err(message) = crate::check_routable_addr("--http", addr, false)
+                && let Err(message) = crate::config::check_routable_addr("--http", addr, false)
             {
-                return crate::files::TrackedResult::plain(crate::transfer_error(message, render));
+                return crate::files::TrackedResult::plain(crate::transfer::transfer_error(
+                    message, render,
+                ));
             }
         }
-        let inspected =
-            match crate::inspect_transfer_request(request, Arc::clone(launch), input_owner).await {
-                ipc::Owned {
-                    value: Ok(target),
+        let inspected = match crate::transfer::inspect_transfer_request(
+            request,
+            Arc::clone(launch),
+            input_owner,
+        )
+        .await
+        {
+            ipc::Owned {
+                value: Ok(target),
+                owner,
+            } => ipc::Owned::new(target, owner),
+            ipc::Owned {
+                value: Err(message),
+                owner,
+            } => {
+                return crate::files::TrackedResult::owned(
+                    crate::transfer::transfer_error(message, render),
                     owner,
-                } => ipc::Owned::new(target, owner),
-                ipc::Owned {
-                    value: Err(message),
-                    owner,
-                } => {
-                    return crate::files::TrackedResult::owned(
-                        crate::transfer_error(message, render),
-                        owner,
-                    );
-                }
-            };
+                );
+            }
+        };
         let base = match (public_root, &self.http) {
             (Some(root), Some(_)) => root,
             (None, Some(http_addr)) => format!("http://{http_addr}/"),
@@ -428,9 +444,9 @@ impl Daemon {
                 {
                     Ok(addr) => addr,
                     Err(message) => {
-                        return crate::files::TrackedResult::plain(crate::transfer_error(
-                            message, render,
-                        ));
+                        return crate::files::TrackedResult::plain(
+                            crate::transfer::transfer_error(message, render),
+                        );
                     }
                 };
                 public_root.unwrap_or_else(|| format!("http://{bound}/"))
@@ -438,7 +454,7 @@ impl Daemon {
         };
         let owner = inspected.owner.clone();
         let result = inspected.run(|(path, shown_path, bytes)| {
-            crate::mint_transfer(path, shown_path, bytes, &self.transfers, &base, render)
+            crate::transfer::mint_transfer(path, shown_path, bytes, &self.transfers, &base, render)
         });
         crate::files::TrackedResult::owned(result, owner)
     }
@@ -1347,7 +1363,7 @@ async fn run_call(
         }
     } else if tool == "transfer" {
         if !transfer {
-            crate::files::TrackedResult::plain(crate::transfer_error(
+            crate::files::TrackedResult::plain(crate::transfer::transfer_error(
                 "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
                 render,
             ))
@@ -1358,10 +1374,12 @@ async fn run_call(
                         .transfer(request, &session.launch, render, input_owner.clone())
                         .await
                 }
-                Err(problem) => crate::files::TrackedResult::plain(crate::transfer_error(
-                    format!("failed to deserialize parameters: {problem}"),
-                    render,
-                )),
+                Err(problem) => {
+                    crate::files::TrackedResult::plain(crate::transfer::transfer_error(
+                        format!("failed to deserialize parameters: {problem}"),
+                        render,
+                    ))
+                }
             }
         }
     } else {
@@ -1976,14 +1994,14 @@ async fn serve_daemon(
     // The HTTP front door is opened before the pipe or socket, so a daemon that cannot serve it
     // never becomes reachable the other way, and it never exits on idleness: a client that speaks
     // HTTP expects it to be there.
-    let render = match crate::render() {
+    let render = match crate::config::render() {
         Ok(render) => render,
         Err(message) => {
             eprintln!("fastexec: {message}");
             return 1;
         }
     };
-    let tools = match crate::Tools::from_env() {
+    let tools = match crate::config::Tools::from_env() {
         Ok(tools) => tools,
         Err(message) => {
             eprintln!("fastexec: {message}");
@@ -2007,21 +2025,21 @@ async fn serve_daemon(
     // sessions keep that directory as the one a task starts in.
     let (http_addr, http, startup_transfer, config) = match http {
         Some(value) => {
-            if std::env::var_os(crate::TRANSFER_ADDR).is_some() {
+            if std::env::var_os(crate::config::TRANSFER_ADDR).is_some() {
                 eprintln!(
                     "fastexec: cannot set {} with --http; --http already serves /t/",
-                    crate::TRANSFER_ADDR
+                    crate::config::TRANSFER_ADDR
                 );
                 return 1;
             }
-            let addr = match crate::http_addr(&value) {
+            let addr = match crate::config::http_addr(&value) {
                 Ok(addr) => addr,
                 Err(message) => {
                     eprintln!("fastexec: {message}");
                     return 1;
                 }
             };
-            let digests = match crate::http_token() {
+            let digests = match crate::config::http_token() {
                 Ok(tokens) => tokens
                     .iter()
                     .map(|token| Sha256::digest(token.as_bytes()).into())
@@ -2038,14 +2056,14 @@ async fn serve_daemon(
                     return 1;
                 }
             };
-            let instructions_tool = match crate::instructions_tool_mode() {
+            let instructions_tool = match crate::config::instructions_tool_mode() {
                 Ok(mode) => mode,
                 Err(message) => {
                     eprintln!("fastexec: {message}");
                     return 1;
                 }
             };
-            let extra_instructions = match crate::instructions_file(&launch) {
+            let extra_instructions = match crate::config::instructions_file(&launch) {
                 Ok(extra) => extra,
                 Err(message) => {
                     eprintln!("fastexec: {message}");
@@ -2083,10 +2101,10 @@ async fn serve_daemon(
         }
         None => {
             let startup_transfer = if tools.transfer {
-                match crate::transfer_addr() {
+                match crate::config::transfer_addr() {
                     Ok(Some(addr)) => {
-                        if let Err(message) = crate::check_routable_addr(
-                            crate::TRANSFER_ADDR,
+                        if let Err(message) = crate::config::check_routable_addr(
+                            crate::config::TRANSFER_ADDR,
                             addr,
                             public_root.is_some(),
                         ) {

@@ -2,14 +2,15 @@
 //! tasks, and render the result. The MCP adapter in main.rs calls it in-process; the daemon
 //! calls it for IPC and HTTP callers.
 
-use crate::keys;
 use crate::lease::Lease;
-use crate::output::{self, Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
-use crate::process;
+use crate::platform::conpty;
+use crate::platform::process;
 use crate::session::{ProbeWarning, ReadState, Reader, Session, TaskEntry, parse_handle};
 use crate::tasks::{self, EVICTED_TRANSCRIPT, ScriptArgs, Snapshot, StartArgs, Task, Tasks};
+use crate::term::keys;
+use crate::term::output::{self, Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
 use crate::wait::{self, WaitEnd};
-use crate::{codemode, conpty, files, media};
+use crate::{codemode, files, media};
 use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

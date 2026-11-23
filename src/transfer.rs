@@ -455,3 +455,328 @@ mod tests {
         assert_eq!(decimal(" 1"), Err(()));
     }
 }
+
+/// How a local or HTTP server publishes `/t/` capabilities when `transfer` is enabled.
+#[derive(Clone)]
+pub(crate) enum TransferEndpoint {
+    /// Local stdio: a dedicated `/t/` listener with a fixed base URL.
+    Fixed {
+        table: Arc<Transfers>,
+        base: Arc<str>,
+    },
+    /// Streamable HTTP: `public_root` when configured, else inferred from each request.
+    Http {
+        table: Arc<Transfers>,
+        public_root: Option<Arc<str>>,
+    },
+}
+
+pub(crate) fn transfer_error(
+    message: String,
+    render: crate::service::Render,
+) -> rmcp::model::CallToolResult {
+    let effective = render.effective();
+    let mut result =
+        rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message.clone())]);
+    result.structured_content = Some(serde_json::json!({ "ok": false, "error": message }));
+    crate::service::suppress(result, effective)
+}
+
+pub(crate) type TransferInspection = Result<(std::path::PathBuf, String, Option<u64>), String>;
+
+pub(crate) fn inspect_transfer_request(
+    request: Request,
+    launch: Arc<crate::session::LaunchContext>,
+    input_owner: crate::lease::Owner,
+) -> impl std::future::Future<Output = crate::ipc::Owned<TransferInspection>> {
+    // Build the owner before creating the future, including its never-polled case.
+    let input = crate::ipc::Owned::new(request, input_owner);
+    async move {
+        match tokio::task::spawn_blocking(move || {
+            input.flat_map(|request| {
+                crate::files::with_path_workspace(&request.path, &launch, 0, |lease| {
+                    let path = crate::files::resolve(&request.path, &launch)?;
+                    let shown = crate::files::display_path(&path);
+                    let bytes = inspect_transfer_target(&path, &shown, launch.memory(), lease)?;
+                    Ok::<_, String>((path, shown, bytes))
+                })
+                .unwrap_or_else(|message| crate::ipc::Owned::new(Err(message), Default::default()))
+            })
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => crate::ipc::Owned::new(
+                Err(format!("the file operation did not finish: {error}")),
+                Default::default(),
+            ),
+        }
+    }
+}
+
+pub(crate) fn mint_transfer(
+    path: std::path::PathBuf,
+    shown_path: String,
+    bytes: Option<u64>,
+    table: &Arc<Transfers>,
+    base: &str,
+    render: crate::service::Render,
+) -> rmcp::model::CallToolResult {
+    let effective = render.effective();
+    let id = match table.create(path) {
+        Ok(id) => id,
+        Err(message) => return transfer_error(message, render),
+    };
+    let url = format!("{base}t/{id}");
+    let text = match bytes {
+        Some(size) => format!("{url}\n{shown_path} · {size} bytes"),
+        None => format!("{url}\n{shown_path} · does not exist yet; a PUT creates it"),
+    };
+    let mut result =
+        rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]);
+    result.structured_content = Some(serde_json::json!({
+        "ok": true,
+        "url": url,
+        "path": shown_path,
+        "bytes": bytes,
+    }));
+    crate::service::suppress(result, effective)
+}
+
+pub(crate) fn publish_transfer<'a>(
+    request: Request,
+    launch: Arc<crate::session::LaunchContext>,
+    table: &'a Arc<Transfers>,
+    base: &'a str,
+    render: crate::service::Render,
+    input_owner: crate::lease::Owner,
+) -> impl std::future::Future<Output = crate::files::TrackedResult> + 'a {
+    let inspection = inspect_transfer_request(request, launch, input_owner);
+    async move {
+        let inspected = inspection.await;
+        let owner = inspected.owner.clone();
+        let result = inspected.run(|inspected| match inspected {
+            Ok((path, shown_path, bytes)) => {
+                mint_transfer(path, shown_path, bytes, table, base, render)
+            }
+            Err(message) => transfer_error(message, render),
+        });
+        crate::files::TrackedResult::owned(result, owner)
+    }
+}
+
+/// Verifies that `path` is either an existing regular file (returning its byte size) or a
+/// not-yet-existing path under accessible directory ancestors (`None`). Directories, special
+/// files, and permission or I/O errors fail with a tar hint.
+fn inspect_transfer_target(
+    path: &std::path::Path,
+    shown_path: &str,
+    pool: &Arc<crate::lease::BytePool>,
+    lease: &mut crate::lease::Lease,
+) -> Result<Option<u64>, String> {
+    let failed = |error: std::io::Error| {
+        format!(
+            "Cannot transfer {shown_path}: {error}. Pack directories with tar through exec first."
+        )
+    };
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "Cannot transfer {shown_path}: it is a directory; pack it with tar through exec first."
+        )),
+        Ok(_) => Err(format!(
+            "Cannot transfer {shown_path}: it is not a regular file; pack directories or special files with tar through exec first."
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let target = crate::files::write_target(path, pool).map_err(failed)?;
+            crate::files::reserve_target_workspace(&target.value, lease, pool).map_err(failed)?;
+            for ancestor in target.value.ancestors().skip(1) {
+                if ancestor.as_os_str().is_empty() {
+                    break;
+                }
+                match std::fs::symlink_metadata(ancestor) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(failed(error)),
+                    Ok(metadata) if metadata.is_dir() => break,
+                    Ok(metadata) if metadata.is_symlink() => match std::fs::metadata(ancestor) {
+                        Ok(target) if target.is_dir() => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(format!(
+                                "Cannot transfer {shown_path}: {} is a dangling directory link. Create its target before uploading.",
+                                crate::files::display_path(ancestor)
+                            ));
+                        }
+                        Err(error) => return Err(failed(error)),
+                        Ok(_) => {}
+                    },
+                    Ok(_) => {}
+                }
+                return Err(format!(
+                    "Cannot transfer {shown_path}: {} is not a directory.",
+                    crate::files::display_path(ancestor)
+                ));
+            }
+            Ok(None)
+        }
+        Err(error) => Err(failed(error)),
+    }
+}
+
+#[cfg(test)]
+mod transfer_owner_tests {
+    use super::*;
+    use crate::service::{self, Render};
+    use std::future::Future;
+    use std::time::Duration;
+
+    fn launch() -> Arc<crate::session::LaunchContext> {
+        Arc::new(crate::session::LaunchContext::new(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            Vec::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn transfer_owner_survives_unpolled_future_and_completed_inspection() {
+        let pool = crate::lease::BytePool::new(64);
+        let request = || Request {
+            path: "Cargo.toml".into(),
+        };
+        let pending = inspect_transfer_request(
+            request(),
+            launch(),
+            crate::lease::Owner::new(pool.try_acquire(64).unwrap()),
+        );
+        assert_eq!(pool.used(), 64);
+        drop(pending);
+        assert_eq!(pool.used(), 0);
+
+        for path in ["Cargo.toml", "."] {
+            let inspected = inspect_transfer_request(
+                Request { path: path.into() },
+                launch(),
+                crate::lease::Owner::new(pool.try_acquire(64).unwrap()),
+            )
+            .await;
+            assert_eq!(inspected.value.is_ok(), path == "Cargo.toml");
+            assert_eq!(pool.used(), 64);
+            drop(inspected);
+            assert_eq!(pool.used(), 0);
+        }
+
+        let table = Arc::new(Transfers::new());
+        let result = publish_transfer(
+            request(),
+            launch(),
+            &table,
+            "http://localhost/",
+            Render {
+                output_mode: service::OutputMode::Both,
+                structured_content: true,
+            },
+            crate::lease::Owner::new(pool.try_acquire(64).unwrap()),
+        )
+        .await;
+        assert_eq!(result.result.is_error, Some(false));
+        assert_eq!(pool.used(), 64);
+        drop(result);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn transfer_path_workspace_retains_success_and_error_until_consumed() {
+        for path in ["Cargo.toml", "missing-transfer-file", "."] {
+            let pool = crate::lease::BytePool::new(64 * 1024);
+            let context = Arc::new(
+                crate::session::LaunchContext::new(
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                    Vec::new(),
+                )
+                .with_memory(Arc::clone(&pool)),
+            );
+            let result = inspect_transfer_request(
+                Request { path: path.into() },
+                context,
+                Default::default(),
+            )
+            .await;
+            assert_eq!(result.value.is_ok(), path != ".");
+            if path == "missing-transfer-file" {
+                assert_eq!(result.value.as_ref().unwrap().2, None);
+            }
+            assert!(pool.used() > 0);
+            drop(result);
+            assert_eq!(pool.used(), 0);
+        }
+        let pool = crate::lease::BytePool::new(0);
+        let context = Arc::new(
+            crate::session::LaunchContext::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                Vec::new(),
+            )
+            .with_memory(Arc::clone(&pool)),
+        );
+        let result = inspect_transfer_request(
+            Request {
+                path: "Cargo.toml".into(),
+            },
+            context,
+            Default::default(),
+        )
+        .await;
+        assert!(
+            result
+                .value
+                .as_ref()
+                .unwrap_err()
+                .contains("not dispatched")
+        );
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn transfer_owner_stays_with_a_queued_worker_after_waiter_cancellation() {
+        struct Released(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started, running) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            running.await.unwrap();
+            let pool = crate::lease::BytePool::new(64);
+            let (released, retired) = tokio::sync::oneshot::channel();
+            let owner =
+                crate::lease::Owner::new((pool.try_acquire(64).unwrap(), Released(Some(released))));
+            let mut inspection = Box::pin(inspect_transfer_request(
+                Request {
+                    path: "Cargo.toml".into(),
+                },
+                launch(),
+                owner,
+            ));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(inspection.as_mut().poll(&mut context).is_pending());
+            drop(inspection);
+            assert_eq!(pool.used(), 64);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), retired)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pool.used(), 0);
+        });
+    }
+}

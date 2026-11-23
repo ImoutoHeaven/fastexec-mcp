@@ -7,7 +7,7 @@
 //! `Cancel` still names the right call after the link was replaced.
 
 use crate::ipc::{self, ToDaemon, ToEndpoint};
-use crate::runtime;
+use crate::platform::runtime;
 use crate::service::Render;
 use crate::session::LaunchContext;
 use crate::transport;
@@ -1960,7 +1960,7 @@ mod tests {
             list.map(serde_json::Value::from),
             poll.map(serde_json::Value::from),
             active.map(serde_json::Value::from),
-            error.map(crate::event_error_payload),
+            error.map(crate::mcp::event_error_payload),
         ];
         assert_eq!(
             outputs[3].value["error"]["data"].as_str().unwrap().as_ptr(),
@@ -2062,19 +2062,19 @@ mod tests {
         });
 
         let endpoint = Arc::new(Endpoint::for_test(identity, paths));
-        let leases = Arc::new(crate::RequestLeases::default());
-        let server = crate::Server::new(
-            crate::Backend::Daemon(Arc::clone(&endpoint)),
+        let leases = Arc::new(crate::mcp::RequestLeases::default());
+        let server = crate::mcp::Server::new(
+            crate::mcp::Backend::Daemon(Arc::clone(&endpoint)),
             &endpoint.launch,
             None,
-            crate::Tools::default(),
+            crate::config::Tools::default(),
             None,
-            crate::InstructionsToolMode::Off,
+            crate::config::InstructionsToolMode::Off,
         )
         .with_stdio_leases(Arc::clone(&leases));
         let (client, serving) = tokio::io::duplex(4096);
         let (read, write) = tokio::io::split(serving);
-        let transport = crate::StdioTransport::new(read, write, leases);
+        let transport = crate::cli::stdio::StdioTransport::new(read, write, leases);
         let serving = tokio::spawn(async move {
             let service = server.serve(transport).await.unwrap();
             let _ = service.waiting().await;

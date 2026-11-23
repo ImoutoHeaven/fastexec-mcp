@@ -9,8 +9,8 @@
 //! alternate-screen session is merged from its frames. Lines are written out once they
 //! settle; the rest, such as the screen, is pending until it settles or the output ends.
 
-use crate::frames::{History, Row as FrameRow};
-use crate::keys::Modes;
+use crate::term::frames::{History, Row as FrameRow};
+use crate::term::keys::Modes;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid, Row};
 use alacritty_terminal::index::{Column, Line};
@@ -1608,7 +1608,7 @@ fn row_text(row: &Row<Cell>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::{PTY_COLS, PTY_ROWS};
+    use crate::platform::process::{PTY_COLS, PTY_ROWS};
 
     /// What happened to the output at a point of a test log.
     #[derive(Clone, Copy, Debug)]

@@ -2489,7 +2489,7 @@ impl Staged {
             let path = append_path(parent, Path::new(&name));
             #[cfg(target_os = "freebsd")]
             let directory = if private {
-                match crate::runtime::create_private_new(&path) {
+                match crate::platform::runtime::create_private_new(&path) {
                     Ok(()) => Some(path.clone()),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(error) => return Err(error),
@@ -3900,7 +3900,7 @@ fn save_target(
             .as_ref()
             .or_else(|| defaults.as_ref().and_then(|probe| probe.file.as_ref()))
             .unwrap();
-        crate::freebsd_fs::preserve(source, file, original.is_some(), pool)?;
+        crate::platform::freebsd_fs::preserve(source, file, original.is_some(), pool)?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -5084,7 +5084,9 @@ mod tests {
         let file = scratch.file("local-home/notes", b"session home");
         let home = scratch.0.join("local-home");
         assert_eq!(nested.home().as_deref(), Some(home.as_path()));
-        assert!(crate::host_line(&nested).contains(&format!(" · home {} · ", display_path(&home))));
+        assert!(
+            crate::mcp::host_line(&nested).contains(&format!(" · home {} · ", display_path(&home)))
+        );
         assert_eq!(resolve("~/notes", &nested).unwrap(), file);
         assert_eq!(whole("~/notes", &nested, false).unwrap(), "session home");
     }
@@ -6106,7 +6108,8 @@ mod tests {
 
     #[cfg(target_os = "freebsd")]
     fn freebsd_acl_fixture(scratch: &Scratch) -> Option<bool> {
-        let kind = crate::freebsd_fs::test_acl_is_nfs4(&File::open(&scratch.0).unwrap()).unwrap();
+        let kind = crate::platform::freebsd_fs::test_acl_is_nfs4(&File::open(&scratch.0).unwrap())
+            .unwrap();
         if kind.is_none() {
             assert_ne!(
                 std::env::var("FASTEXEC_REQUIRE_ACL_TEST").as_deref(),
@@ -6223,7 +6226,10 @@ mod tests {
         save_text(&path, b"replacement").unwrap();
         let launch = context(&scratch.0, &scratch.0);
         change("original.txt", &[("replacement", "edited")], &launch).unwrap();
-        assert!(crate::freebsd_fs::test_equal_acl(&original, &File::open(&path).unwrap()).unwrap());
+        assert!(
+            crate::platform::freebsd_fs::test_equal_acl(&original, &File::open(&path).unwrap())
+                .unwrap()
+        );
         assert_eq!(scratch.read("original.txt"), b"edited");
     }
 
@@ -6239,7 +6245,7 @@ mod tests {
         let probe = Staged::new(&scratch.0, false).unwrap();
         let private = Staged::new(&scratch.0, true).unwrap();
         let directory = private.directory.as_ref().unwrap();
-        crate::runtime::create_private_unix_check(directory).unwrap();
+        crate::platform::runtime::create_private_unix_check(directory).unwrap();
         assert_eq!(
             private
                 .file
@@ -6255,7 +6261,7 @@ mod tests {
         let complete = scratch.0.join("complete.txt");
         save_text(&complete, b"complete content").unwrap();
         assert!(
-            crate::freebsd_fs::test_equal_acl(
+            crate::platform::freebsd_fs::test_equal_acl(
                 probe.file.as_ref().unwrap(),
                 &File::open(&complete).unwrap(),
             )
@@ -6279,7 +6285,7 @@ mod tests {
             return;
         };
         let runtime = scratch.0.join("runtime");
-        crate::runtime::create_private_new(&runtime).unwrap();
+        crate::platform::runtime::create_private_new(&runtime).unwrap();
         if nfs4 {
             freebsd_set_acl(&runtime, &["-a", "0", "user:1:r-x---a-R-c--s::allow"]);
         } else {
@@ -6295,7 +6301,7 @@ mod tests {
             output.stdout
         };
         let before = listing(&runtime);
-        assert!(crate::runtime::create_private(&runtime).is_err());
+        assert!(crate::platform::runtime::create_private(&runtime).is_err());
         assert_eq!(listing(&runtime), before);
     }
 
@@ -6309,12 +6315,12 @@ mod tests {
         freebsd_inherit_acl(&scratch.0, nfs4);
         let middle = scratch.0.join("middle");
         let leaf = middle.join("runtime");
-        crate::runtime::create_private(&leaf).unwrap();
-        crate::runtime::create_private_unix_check(&middle).unwrap();
-        crate::runtime::create_private_unix_check(&leaf).unwrap();
+        crate::platform::runtime::create_private(&leaf).unwrap();
+        crate::platform::runtime::create_private_unix_check(&middle).unwrap();
+        crate::platform::runtime::create_private_unix_check(&leaf).unwrap();
         let child = leaf.join("child");
-        crate::runtime::create_private_new(&child).unwrap();
-        crate::runtime::create_private_unix_check(&child).unwrap();
+        crate::platform::runtime::create_private_new(&child).unwrap();
+        crate::platform::runtime::create_private_unix_check(&child).unwrap();
     }
 
     #[cfg(target_os = "freebsd")]
@@ -6351,10 +6357,10 @@ mod tests {
             );
         }
         let denied = scratch.0.join("denied");
-        let result = crate::runtime::create_private_new(&denied);
+        let result = crate::platform::runtime::create_private_new(&denied);
         if readable {
             result.unwrap();
-            crate::runtime::create_private_unix_check(&denied).unwrap();
+            crate::platform::runtime::create_private_unix_check(&denied).unwrap();
             save_text(&target, b"replacement").unwrap();
             assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
         } else {
@@ -6366,8 +6372,11 @@ mod tests {
             assert!(save_text(&target, b"replacement").is_err());
             assert_eq!(std::fs::read(&target).unwrap(), b"original");
             assert!(
-                crate::freebsd_fs::test_equal_acl(&original, &File::open(&target).unwrap())
-                    .unwrap()
+                crate::platform::freebsd_fs::test_equal_acl(
+                    &original,
+                    &File::open(&target).unwrap()
+                )
+                .unwrap()
             );
             assert_eq!(
                 std::fs::read_dir(&scratch.0).unwrap().count(),

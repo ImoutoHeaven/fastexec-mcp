@@ -1239,7 +1239,7 @@ omitted on final serialization unless noted as always-present below.
   `logs/` directory at daemon start while holding its `daemon.lock`.
 - **Live PTY emulator and continuous transcript spool**: Each UTF-8 PTY task
   feeds output bytes into an `alacritty_terminal` (`0.26.0`) instance at the
-  task's size (`src/terminal.rs`, `src/frames.rs`) that answers terminal queries
+  task's size (`src/term/terminal.rs`, `src/term/frames.rs`) that answers terminal queries
   (`ESC[6n`, `ESC[c`), tracks keyboard modes, serves `screen: true`, and
   continuously spools `<taskId>.transcript.txt` (up to `64` MiB, counted under
   the `4` GiB total limit). A resize settles the transcript at the old size,
@@ -1264,7 +1264,7 @@ omitted on final serialization unless noted as always-present below.
 
 ## 4. PTY Keys and Bundled ConPTY
 
-- **Key names and modes (`src/keys.rs`)**: `keys` uses case-insensitive tmux
+- **Key names and modes (`src/term/keys.rs`)**: `keys` uses case-insensitive tmux
   `send-keys` names (`Enter`, `Tab`, `BTab`, `Escape`, `Space`, `BSpace`,
   arrows, `Home`, `End`, `PageUp`/`PageDown`, `Insert`, `Delete`, `F1` to `F12`,
   keypad keys, `[NUL]` to `[US]`, `0xHH`, or single characters) with `C-`, `M-`,
@@ -1286,7 +1286,7 @@ omitted on final serialization unless noted as always-present below.
   always warns that its mode could not be verified: MSYS console readers may
   discard a leading byte after a resize, even for short keys ([#5](https://github.com/ImoutoHeaven/fastexec-mcp/issues/5)).
   Writer acknowledgement does not confirm delivery to the application.
-- **Bundled ConPTY (`src/conpty.rs`)**: Windows x64 and arm64 builds embed Microsoft
+- **Bundled ConPTY (`src/platform/conpty.rs`)**: Windows x64 and arm64 builds embed Microsoft
   ConPTY `1.24.260710001` (`conpty.dll` and `OpenConsole.exe`, MIT). Each process
   extracts into a newly reserved owner-only directory named
   `%TEMP%\fastexec-conpty-<version>-<arch>-<pid>-<random>` and pins the verified files
@@ -1299,7 +1299,7 @@ omitted on final serialization unless noted as always-present below.
 
 ## 5. Bash Launch and Process-Tree Ownership
 
-- **Launch (`src/bash.rs`, `src/process.rs`, `src/session.rs`)**: Runs
+- **Launch (`src/platform/bash.rs`, `src/platform/process.rs`, `src/session.rs`)**: Runs
   `bash --noprofile --norc -c` (`loginShell: false`, default) on top of a
   once-per-session login-environment snapshot probed via `bash -l -c 'exec "$0" --fastexec-dump-env' <fastexec>`
   (`5` s deadline, `1` MiB cap, stripping `PWD`, `OLDPWD`, `SHLVL`, `_`,
@@ -1318,7 +1318,7 @@ omitted on final serialization unless noted as always-present below.
   limit, a `5` second deadline, and cleanup of descendants on every outcome.
   Task workers and startup reapers are reserved before launching processes;
   allocation failures return errors without admitting an untracked running task.
-- **Tree ownership (`src/process.rs`, `src/host.rs`)**:
+- **Tree ownership (`src/platform/process.rs`, `src/platform/host.rs`)**:
   Unix entry points restore `SIGCHLD` to its default disposition with automatic
   reaping disabled before spawning children. Each task host's PID stays reserved
   until its owning server explicitly waits for it. Readiness follows the bash
