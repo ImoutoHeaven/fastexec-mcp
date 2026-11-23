@@ -41,7 +41,7 @@ branching on tool results, or filtering bulky output before returning it to cont
 - Waits like exec start (waitMs, returnWhen with outputContains or quietMs, killAfterMs, truncate,
   maxBytes) and returns a task handle for exec poll and kill. Uncaught errors exit 1 with
   "Script error:".
-- Ending cancels unawaited calls. Killing cancels only awaited calls: completed calls stand, and
+- Ending cancels unawaited calls. Killing cancels pending calls: completed calls stand, and
   started tasks keep running (listed for exec kill).
 - Limits: 256 KiB code, 256 MiB VM memory, 8 exec starts and 8 file/transcript I/O calls in
   flight (poll, kill, list, and sleep take no slot), 1024 pending calls, 256 MiB pending bridge
