@@ -34,6 +34,29 @@ const EVENT_STREAM_CHANNEL_CAPACITY: usize = 128;
 /// This build's identity and runtime directory, or why they could not be read.
 type Identity = Result<(runtime::Identity, runtime::Paths), String>;
 
+#[derive(Debug)]
+pub(crate) enum SetupError {
+    MemoryBudget,
+    Other(String),
+}
+
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MemoryBudget => formatter.write_str(
+                "Server active memory budget is full while preparing the daemon connection",
+            ),
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for SetupError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
 /// One endpoint's daemon link, and everything it knows before it has one.
 pub struct Endpoint {
     /// Set once, by the task started in [`Endpoint::new`]: the hash reads the whole image.
@@ -439,7 +462,7 @@ impl Endpoint {
         &self,
         client_name: &str,
         deadline: std::time::Instant,
-    ) -> Result<Arc<Link>, String> {
+    ) -> Result<Arc<Link>, SetupError> {
         let mut slot = self.link.lock().await;
         if let Some(link) = slot.as_ref()
             && !link.closed.is_cancelled()
@@ -465,7 +488,11 @@ impl Endpoint {
         .await
         {
             Ok(answer) => answer?,
-            Err(_) => return Err("the daemon did not answer the Hello in time".to_owned()),
+            Err(_) => {
+                return Err("the daemon did not answer the Hello in time"
+                    .to_owned()
+                    .into());
+            }
         };
         // The start is exclusive until the daemon has answered, and no longer.
         drop(startup);
@@ -490,6 +517,15 @@ impl Endpoint {
         ));
         *slot = Some(Arc::clone(&link));
         Ok(link)
+    }
+
+    fn event_setup_error(&self, error: SetupError) -> ipc::Owned<ipc::IpcEventError> {
+        match error {
+            SetupError::MemoryBudget => self.event_budget_error(
+                "endpoint memory budget full while connecting to fastexec daemon",
+            ),
+            SetupError::Other(message) => self.event_link_error(message),
+        }
     }
 
     fn event_link_error(
@@ -538,7 +574,7 @@ impl Endpoint {
             biased;
             _ = cancel.cancelled() => return Err(self.event_link_error("events/list cancelled")),
             linked = self.link(client_name, deadline) => {
-                linked.map_err(|message| self.event_link_error(message))?
+                linked.map_err(|error| self.event_setup_error(error))?
             }
         };
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
@@ -601,7 +637,7 @@ impl Endpoint {
             biased;
             _ = cancel.cancelled() => return Err(self.event_link_error("events/poll cancelled")),
             linked = self.link(client_name, deadline) => {
-                linked.map_err(|message| self.event_link_error(message))?
+                linked.map_err(|error| self.event_setup_error(error))?
             }
         };
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
@@ -668,7 +704,7 @@ impl Endpoint {
             biased;
             _ = cancel.cancelled() => return Err(self.event_link_error("events/stream cancelled")),
             linked = self.link(client_name, deadline) => {
-                linked.map_err(|message| self.event_link_error(message))?
+                linked.map_err(|error| self.event_setup_error(error))?
             }
         };
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
@@ -908,7 +944,7 @@ pub(crate) fn hello_owned(
     connection: u64,
     client_name: &str,
     render: Render,
-) -> Result<ipc::Owned<ToDaemon>, String> {
+) -> Result<ipc::Owned<ToDaemon>, SetupError> {
     let copied = launch
         .wire_capacity()
         .saturating_add(identity.namespace.len())
@@ -924,7 +960,7 @@ pub(crate) fn hello_owned(
                 .then(|| launch.control_memory().try_acquire(copied))
                 .flatten()
         })
-        .ok_or_else(|| ipc::input_budget_error().to_string())?;
+        .ok_or(SetupError::MemoryBudget)?;
     let (cwd, env) = launch.to_wire();
     Ok(ipc::Owned::new(
         ToDaemon::Hello {
@@ -944,19 +980,29 @@ pub(crate) fn hello_owned(
 }
 
 /// Sends the Hello and returns the Welcome's epoch, or the reason the daemon refused it.
-pub async fn handshake(
+pub(crate) async fn handshake(
     client: &mut transport::Client,
     hello: ipc::Owned<ToDaemon>,
     identity: &runtime::Identity,
-) -> Result<String, String> {
-    ipc::write_request_frame(
-        client,
-        &hello.value,
-        crate::lease::process_pool(),
-        crate::lease::control_pool(),
-    )
-    .await
-    .map_err(|error| format!("cannot send the Hello: {error}"))?;
+) -> Result<String, SetupError> {
+    {
+        let frame = ipc::encode_frame_leased(
+            &hello.value,
+            crate::lease::process_pool(),
+            crate::lease::control_pool(),
+            ipc::daemon_control(&hello.value),
+        )
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::OutOfMemory {
+                SetupError::MemoryBudget
+            } else {
+                SetupError::Other(format!("cannot send the Hello: {error}"))
+            }
+        })?;
+        ipc::write_raw(client, &frame.bytes)
+            .await
+            .map_err(|error| SetupError::Other(format!("cannot send the Hello: {error}")))?;
+    }
     match ipc::read_endpoint_frame_leased(
         client,
         ipc::RESPONSE_LIMIT,
@@ -980,25 +1026,33 @@ pub async fn handshake(
                 return Err(format!(
                     "the daemon speaks protocol {protocol}, not {}",
                     ipc::PROTOCOL
-                ));
+                )
+                .into());
             }
             if namespace != identity.namespace {
                 return Err(format!(
                     "the daemon serves namespace {namespace}, not {}",
                     identity.namespace
-                ));
+                )
+                .into());
             }
             if build != identity.build {
-                return Err(format!(
-                    "the daemon runs build {build}, not {}",
-                    identity.build
-                ));
+                return Err(
+                    format!("the daemon runs build {build}, not {}", identity.build).into(),
+                );
             }
             Ok(epoch)
         }
-        Ok(ipc::LeasedEndpointFrame::Frame(ToEndpoint::Reject { message }, _lease)) => Err(message),
-        Ok(other) => Err(format!("the daemon answered the Hello with {other:?}")),
-        Err(error) => Err(format!("cannot read the Welcome: {error}")),
+        Ok(ipc::LeasedEndpointFrame::Frame(ToEndpoint::Reject { message }, _lease)) => {
+            Err(SetupError::Other(message))
+        }
+        Ok(
+            ipc::LeasedEndpointFrame::OverloadResult { .. }
+            | ipc::LeasedEndpointFrame::OverloadEvent { .. }
+            | ipc::LeasedEndpointFrame::OverloadProgress,
+        ) => Err(SetupError::MemoryBudget),
+        Ok(other) => Err(format!("the daemon answered the Hello with {other:?}").into()),
+        Err(error) => Err(format!("cannot read the Welcome: {error}").into()),
     }
 }
 
@@ -1217,7 +1271,7 @@ mod tests {
             match expected {
                 None => assert_eq!(answer.unwrap(), TEST_EPOCH),
                 Some(text) => {
-                    let message = answer.unwrap_err();
+                    let message = answer.unwrap_err().to_string();
                     assert!(message.contains(text), "{message}");
                 }
             }
@@ -1277,6 +1331,158 @@ mod tests {
             _ => unreachable!(),
         }
         .expect("the event RPC must report the memory refusal")
+    }
+
+    #[tokio::test]
+    async fn first_event_connection_budget_refusal_preserves_category_and_recovers() {
+        for method in ["list", "poll", "stream"] {
+            let (identity, paths, mut listener, _target) =
+                test_daemon(&format!("events-connect-budget-{method}"));
+            let response = welcome(&identity);
+            let peer = tokio::spawn(async move {
+                let mut refused = listener.accept().await.unwrap();
+                assert!(
+                    ipc::read_frame::<_, ToDaemon>(&mut refused, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "budget refusal must not send a partial Hello"
+                );
+                drop(refused);
+                let mut conn = listener.accept().await.unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Hello { .. })
+                ));
+                ipc::write_frame(&mut conn, &response).await.unwrap();
+                let request = ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (id, frame) = match request {
+                    ToDaemon::EventsList { id } => (
+                        id,
+                        ipc::EventWireFrame::ListResult(crate::events::EventsListResult {
+                            result_type: "complete".into(),
+                            events: Vec::new(),
+                        }),
+                    ),
+                    ToDaemon::EventsPoll { id, .. } => (
+                        id,
+                        ipc::EventWireFrame::PollResult(crate::events::PollResponse {
+                            result_type: "complete".into(),
+                            events: Vec::new(),
+                            cursor: "eeeeeeee:0".into(),
+                            truncated: false,
+                            has_more: false,
+                            next_poll_ms: 2000,
+                        }),
+                    ),
+                    ToDaemon::EventsStream { id, .. } => (
+                        id,
+                        ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                            cursor: "eeeeeeee:0".into(),
+                            truncated: false,
+                            heartbeat_ms: 30_000,
+                        }),
+                    ),
+                    other => panic!("unexpected event request after recovery: {other:?}"),
+                };
+                ipc::write_frame(&mut conn, &ToEndpoint::EventFrame { id, frame })
+                    .await
+                    .unwrap();
+                loop {
+                    match ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                    {
+                        ToDaemon::EventsCancel { .. } => {}
+                        ToDaemon::Bye => break,
+                        other => panic!("unexpected frame after event response: {other:?}"),
+                    }
+                }
+            });
+            let pool = crate::lease::BytePool::new(16 << 10);
+            let control = crate::lease::BytePool::new(512);
+            let mut endpoint = Endpoint::for_test(identity, paths);
+            endpoint.launch = Arc::new(
+                LaunchContext::new(
+                    std::env::temp_dir(),
+                    vec![(
+                        "SAMPLE".into(),
+                        "ordinary environment value ".repeat(40).into(),
+                    )],
+                )
+                .with_memory(Arc::clone(&pool))
+                .with_control_memory(Arc::clone(&control)),
+            );
+            let full = pool.try_acquire(pool.limit()).unwrap();
+            let error = timeout(Duration::from_secs(10), failed_event_rpc(&endpoint, method))
+                .await
+                .unwrap();
+            assert_eq!(error.value.code, -32025, "{method}: {error:?}");
+            assert_eq!(
+                error.value.data,
+                Some(serde_json::json!({"limit": "process_memory", "max": pool.limit()}))
+            );
+            assert!(error.owner.get::<crate::lease::Lease>().unwrap().bytes() > 0);
+            assert!(control.used() > 0);
+            assert!(endpoint.link.lock().await.is_none());
+            drop(error);
+            assert_eq!(control.used(), 0);
+            drop(full);
+            assert_eq!(pool.used(), 0);
+            timeout(Duration::from_secs(10), async {
+                match method {
+                    "list" => {
+                        let result = endpoint
+                            .events_list("test", CancellationToken::new())
+                            .await
+                            .unwrap();
+                        assert!(result.value.events.is_empty());
+                    }
+                    "poll" => {
+                        let result = endpoint
+                            .events_poll(
+                                "test",
+                                crate::events::PollRequest {
+                                    name: "external.event".into(),
+                                    ..Default::default()
+                                },
+                                CancellationToken::new(),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(result.value.events.is_empty());
+                    }
+                    "stream" => {
+                        let (active, mut stream) = endpoint
+                            .events_stream(
+                                "test",
+                                crate::events::SubscribeRequest {
+                                    name: "external.event".into(),
+                                    ..Default::default()
+                                },
+                                CancellationToken::new(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(active.value.cursor, "eeeeeeee:0");
+                        stream.cancel().await;
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .unwrap();
+            endpoint.bye().await;
+            finish(peer).await;
+            assert_eq!(pool.used(), 0);
+            assert_eq!(control.used(), 0);
+        }
     }
 
     #[tokio::test]

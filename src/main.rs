@@ -3259,7 +3259,13 @@ async fn cli_start(
         Ok(hello) => hello,
         Err(message) => return fail(&message),
     };
-    let epoch = match within(deadline, endpoint::handshake(&mut client, hello, identity)).await {
+    let epoch = match within(deadline, async {
+        endpoint::handshake(&mut client, hello, identity)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await
+    {
         Ok(epoch) => epoch,
         Err(message) => return fail(&message),
     };
@@ -3308,7 +3314,9 @@ async fn cli_status(
     };
     let status = match within(deadline, async {
         let hello = hello(identity, launch)?;
-        endpoint::handshake(&mut client, hello, identity).await?;
+        endpoint::handshake(&mut client, hello, identity)
+            .await
+            .map_err(|error| error.to_string())?;
         request_status(&mut client).await
     })
     .await
@@ -3347,7 +3355,9 @@ async fn cli_stop(
     };
     let epoch = match within(deadline, async {
         let hello = hello(identity, launch)?;
-        let epoch = endpoint::handshake(&mut client, hello, identity).await?;
+        let epoch = endpoint::handshake(&mut client, hello, identity)
+            .await
+            .map_err(|error| error.to_string())?;
         ipc::write_request_frame(
             &mut client,
             &ToDaemon::Stop,
@@ -3406,6 +3416,7 @@ fn hello(
             structured_content: true,
         },
     )
+    .map_err(|error| error.to_string())
 }
 
 /// Says Bye and reads until the daemon ends the connection, so the session is gone before the CLI
