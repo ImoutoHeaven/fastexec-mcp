@@ -190,7 +190,7 @@ impl<'a> MemberBudget<'a> {
     }
 }
 
-/// The root of a task: bash itself on Windows, the task host (src/host.rs) on Unix.
+/// The root of a task: bash itself on Windows, the task host (src/platform/host.rs) on Unix.
 #[cfg(windows)]
 pub enum Child {
     Pipe(std::process::Child),
@@ -249,7 +249,7 @@ impl Child {
     }
 }
 
-/// The root of a task: bash itself on Windows, the task host (`src/host.rs`) on Unix.
+/// The root of a task: bash itself on Windows, the task host (`src/platform/host.rs`) on Unix.
 #[cfg(unix)]
 pub struct Child {
     host: std::process::Child,
@@ -953,7 +953,7 @@ fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
     crate::platform::conpty_spawn::spawn_pty(launch)
 }
 
-/// Starts the task host (`src/host.rs`) as the leader of a new session, with bash's command
+/// Starts the task host (`src/platform/host.rs`) as the leader of a new session, with bash's command
 /// line after the descriptors of its status pipe and lifeline. A PTY task's terminal becomes the
 /// host's controlling terminal, so bash ending leaves the terminal and its session up.
 #[cfg(unix)]
