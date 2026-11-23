@@ -310,6 +310,7 @@ mod ids {
 
 // Unix tasks run under the fastexec binary as their host, which a test binary is not.
 #[cfg(windows)]
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
     use crate::service::render::{OutputMode, Render};
