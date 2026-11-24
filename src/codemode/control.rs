@@ -4,11 +4,12 @@ use super::bridge::{BRIDGE_ERROR, BRIDGE_LIMIT};
 use crate::lease::{BytePool, Lease};
 use crate::service::schema as service_schema;
 use crate::session::{LaunchContext, parse_handle};
+use crate::tasks::state::AttachmentLease;
 use crate::term::output::Truncate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -213,6 +214,85 @@ pub(super) enum Wake {
     Stop,
 }
 
+struct HeldAttachment {
+    attachment: AttachmentLease,
+    _pin: Lease,
+}
+
+#[derive(Default)]
+pub(super) struct AttachmentRegistry {
+    entries: Vec<HeldAttachment>,
+    capacity: Option<Lease>,
+}
+
+/// Keeps registrations private until bridge admission commits the batch.
+pub(crate) struct NestedAttachments<'a> {
+    registry: MutexGuard<'a, AttachmentRegistry>,
+    original_len: usize,
+    memory: &'a Arc<BytePool>,
+    control: Option<&'a Arc<BytePool>>,
+}
+
+impl NestedAttachments<'_> {
+    fn acquire(&self, bytes: usize) -> Option<Lease> {
+        self.memory
+            .try_acquire(bytes)
+            .or_else(|| self.control.and_then(|pool| pool.try_acquire(bytes)))
+    }
+
+    pub(crate) fn register(&mut self, attachment: AttachmentLease) -> Option<u64> {
+        if let Some(index) = self
+            .registry
+            .entries
+            .iter()
+            .position(|held| held.attachment.same_attachment(&attachment))
+        {
+            return Some(index as u64 + 1);
+        }
+        let pin = self.acquire(attachment.metadata_bytes())?;
+        let held = HeldAttachment {
+            attachment,
+            _pin: pin,
+        };
+        if self.registry.entries.len() == self.registry.entries.capacity() {
+            let capacity = self.registry.entries.capacity().checked_mul(2)?.max(1);
+            let bytes = capacity.checked_mul(std::mem::size_of::<HeldAttachment>())?;
+            // Keep the old buffer charged until its replacement is ready.
+            let mut owner = self.acquire(bytes)?;
+            let mut entries = Vec::new();
+            entries.try_reserve_exact(capacity).ok()?;
+            if !owner.try_resize(
+                entries
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<HeldAttachment>())?,
+            ) {
+                return None;
+            }
+            entries.append(&mut self.registry.entries);
+            let old = std::mem::replace(&mut self.registry.entries, entries);
+            drop(old);
+            self.registry.capacity = Some(owner);
+        }
+        self.registry.entries.push(held);
+        Some(self.registry.entries.len() as u64)
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.original_len = self.registry.entries.len();
+    }
+}
+
+impl Drop for NestedAttachments<'_> {
+    fn drop(&mut self) {
+        if self.original_len == 0 {
+            let dropped = std::mem::take(&mut *self.registry);
+            drop(dropped);
+        } else {
+            self.registry.entries.truncate(self.original_len);
+        }
+    }
+}
+
 pub(super) struct Control {
     pub(super) stopped: AtomicBool,
     pub(super) exited: AtomicBool,
@@ -220,8 +300,7 @@ pub(super) struct Control {
     pub(super) wake: mpsc::Sender<Wake>,
     pub(super) report: Mutex<Report>,
     pub(super) in_flight: (Mutex<usize>, Condvar),
-    pub(super) held_attachments: Mutex<HashMap<u64, crate::tasks::state::AttachmentLease>>,
-    pub(super) next_attachment_handle: std::sync::atomic::AtomicU64,
+    pub(super) held_attachments: Mutex<AttachmentRegistry>,
     pub(super) queued_starts: AtomicUsize,
     pub(super) cancelled_starts: AtomicUsize,
 }
@@ -368,28 +447,43 @@ impl ScriptHandle {
         lock(&self.0.report).started_ids.contains(task_id)
     }
 
-    pub(crate) fn register_attachment(&self, lease: crate::tasks::state::AttachmentLease) -> u64 {
-        let id = self
-            .0
-            .next_attachment_handle
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        lock(&self.0.held_attachments).insert(id, lease);
-        id
-    }
-
-    pub(crate) fn unregister_attachment(&self, id: u64) {
-        let removed = lock(&self.0.held_attachments).remove(&id);
-        drop(removed);
+    pub(crate) fn nested_attachments<'a>(
+        &'a self,
+        memory: &'a Arc<BytePool>,
+        control: Option<&'a Arc<BytePool>>,
+    ) -> NestedAttachments<'a> {
+        let registry = lock(&self.0.held_attachments);
+        let original_len = registry.entries.len();
+        NestedAttachments {
+            registry,
+            original_len,
+            memory,
+            control,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn test_attachment_count(&self) -> usize {
-        lock(&self.0.held_attachments).len()
+        lock(&self.0.held_attachments).entries.len()
     }
 
-    pub(super) fn get_attachment(&self, id: u64) -> Option<crate::tasks::state::AttachmentLease> {
-        lock(&self.0.held_attachments).get(&id).cloned()
+    #[cfg(test)]
+    pub(crate) fn test_attachment_bytes(&self) -> usize {
+        let registry = lock(&self.0.held_attachments);
+        registry
+            .entries
+            .iter()
+            .map(|held| held._pin.bytes())
+            .sum::<usize>()
+            + registry.capacity.as_ref().map_or(0, Lease::bytes)
+    }
+
+    pub(super) fn get_attachment(&self, id: u64) -> Option<AttachmentLease> {
+        let index = usize::try_from(id.checked_sub(1)?).ok()?;
+        lock(&self.0.held_attachments)
+            .entries
+            .get(index)
+            .map(|held| held.attachment.clone())
     }
 
     pub(super) fn cancel_and_drain(&self) {

@@ -2,7 +2,7 @@
 //! handle registration with rollback, and single-peak bridge memory admission.
 
 use super::bridge::BRIDGE_LIMIT;
-use super::control::{CallInfo, Outcome, ScriptHandle};
+use super::control::{CallInfo, Outcome};
 use crate::files::{
     self, EditError, EditFailure, EditMatch, FileEditData, FileError, FileReadData, FileWriteData,
     MediaPayload,
@@ -64,33 +64,6 @@ impl ProgramOutcome {
         Self {
             outcome: Outcome::Cancelled(message),
             pre_reserved: false,
-        }
-    }
-}
-
-/// Registers opaque attachment handles before final admission; drops unregister them unless disarmed.
-struct NestedAttachments<'a> {
-    script: &'a ScriptHandle,
-    ids: Vec<u64>,
-}
-
-impl<'a> NestedAttachments<'a> {
-    fn new(script: &'a ScriptHandle) -> Self {
-        Self {
-            script,
-            ids: Vec::new(),
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.ids.clear();
-    }
-}
-
-impl Drop for NestedAttachments<'_> {
-    fn drop(&mut self) {
-        for id in self.ids.drain(..) {
-            self.script.unregister_attachment(id);
         }
     }
 }
@@ -635,13 +608,20 @@ fn encode_window(
     ctx: &ExecContext<'_>,
     delivery: &ProgramDelivery<'_>,
 ) -> ProgramOutcome {
-    let mut registrations = NestedAttachments::new(delivery.script);
+    let mut registrations = delivery.script.nested_attachments(
+        ctx.launch().memory(),
+        delivery.is_control.then(|| ctx.launch().control_memory()),
+    );
     let mut final_seen = prepared.initial_seen;
     let mut nested_handles = Vec::with_capacity(prepared.unseen.len());
     for att in prepared.unseen.drain(..) {
         let meta = att.meta().clone();
-        let hid = delivery.script.register_attachment(att);
-        registrations.ids.push(hid);
+        let Some(hid) = registrations.register(att) else {
+            return ProgramOutcome::memory(Some((
+                prepared.task.id.clone(),
+                files::path::display_path(&prepared.task.log_path),
+            )));
+        };
         nested_handles.push(NestedAttachmentDto {
             index: meta.index,
             kind: meta.kind.as_str(),

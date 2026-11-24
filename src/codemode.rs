@@ -12,7 +12,6 @@ use crate::session::{LaunchContext, Session};
 use crate::tasks::Tasks;
 use crate::tasks::state::Task;
 use control::{Control, Report, ScriptHandle};
-use std::collections::HashMap;
 use std::io::PipeWriter;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -53,8 +52,7 @@ pub fn prepare(runtime: Handle) -> Result<(ScriptHandle, ScriptWorker), String> 
         wake,
         report: Mutex::new(Report::default()),
         in_flight: (Mutex::new(0), Condvar::new()),
-        held_attachments: Mutex::new(HashMap::new()),
-        next_attachment_handle: std::sync::atomic::AtomicU64::new(0),
+        held_attachments: Mutex::default(),
         queued_starts: AtomicUsize::new(0),
         cancelled_starts: AtomicUsize::new(0),
     }));

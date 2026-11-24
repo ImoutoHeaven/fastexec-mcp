@@ -675,9 +675,10 @@ async fn nested_precommit_reader_and_attachment_watermarks_survive_refusal_and_c
     assert_eq!(script.test_attachment_count(), 1);
     let parsed: Value = serde_json::from_str(&payload.value).unwrap();
     let attachment = &parsed["value"]["codemode"]["attachments"][0];
-    assert!(
-        attachment["__hid"].as_u64().unwrap() >= 2,
-        "refused registrations were removed"
+    assert_eq!(
+        attachment["__hid"].as_u64(),
+        Some(1),
+        "a refused batch leaves its undelivered slot available"
     );
     {
         let state = reader.read_gate().lock_owned().await;
@@ -687,7 +688,8 @@ async fn nested_precommit_reader_and_attachment_watermarks_survive_refusal_and_c
     }
     assert!(entry.is_reported());
     drop(payload);
-    assert_eq!(pool.used(), 0);
+    assert_eq!(pool.used(), script.test_attachment_bytes());
+    assert!(pool.used() > 0, "the script retains its attachment handle");
     drop(worker);
     tasks.shutdown();
 }
@@ -2636,7 +2638,11 @@ async fn program_bridge_admission_rollback_and_control_memory_fallback() {
     assert_eq!(kill_json["value"]["action"], "kill");
     assert_eq!(kill_json["value"]["output"], "rollback-body");
     drop(kill_payload);
-    assert_eq!(control_pool.used(), 0);
+    assert_eq!(control_pool.used(), script.test_attachment_bytes());
+    assert!(
+        control_pool.used() > 0,
+        "the script retains its attachment handle"
+    );
 
     drop(_held_main);
     assert_eq!(main_pool.used(), 0);

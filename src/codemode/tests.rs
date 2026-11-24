@@ -1017,6 +1017,169 @@ async fn inline_whitespace_copy_is_admitted_before_allocation() {
 }
 
 #[tokio::test]
+async fn nested_attachment_registry_reuses_handles_and_rolls_back_owners() {
+    let fixture = Fixture::new();
+    let producer = fixture.start("return 'source';", Some(5000));
+    let other = fixture.start("return 'other source';", Some(5000));
+    complete(&producer).await;
+    complete(&other).await;
+    let mut png = Vec::new();
+    image::DynamicImage::new_rgb8(1, 1)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    for task in [&producer, &producer, &producer, &other] {
+        fixture
+            .tasks
+            .store_attachment(task, crate::media::MediaKind::Image, "image/png", &png)
+            .unwrap();
+    }
+    let mut attachments = producer.unseen_attachments(0);
+    attachments.extend(other.unseen_attachments(0));
+    assert_eq!(attachments[0].meta().index, attachments[3].meta().index);
+
+    let pool = BytePool::new(64 * 1024);
+    let (script, worker) = prepare(Handle::current()).unwrap();
+    drop(worker);
+    {
+        let mut batch = script.nested_attachments(&pool, None);
+        assert_eq!(batch.register(attachments[0].clone()), Some(1));
+        assert_eq!(batch.register(attachments[1].clone()), Some(2));
+    }
+    assert_eq!(script.test_attachment_count(), 0);
+    assert_eq!(pool.used(), 0, "a wholly refused batch releases its table");
+
+    {
+        let mut batch = script.nested_attachments(&pool, None);
+        assert_eq!(batch.register(attachments[0].clone()), Some(1));
+        assert_eq!(batch.register(attachments[0].clone()), Some(1));
+        batch.disarm();
+    }
+    let first_bytes = pool.used();
+    assert_eq!(first_bytes, script.test_attachment_bytes());
+    assert!(first_bytes > attachments[0].metadata_bytes());
+    {
+        let mut batch = script.nested_attachments(&pool, None);
+        assert_eq!(batch.register(attachments[1].clone()), Some(2));
+        assert_eq!(batch.register(attachments[0].clone()), Some(1));
+    }
+    let retained = pool.used();
+    assert_eq!(retained, script.test_attachment_bytes());
+    assert!(retained > first_bytes, "the grown table stays charged");
+    assert_eq!(script.test_attachment_count(), 1);
+    assert!(
+        script
+            .get_attachment(1)
+            .unwrap()
+            .same_attachment(&attachments[0])
+    );
+    assert!(script.get_attachment(2).is_none());
+
+    let pressure = pool.try_acquire(pool.limit() - retained).unwrap();
+    {
+        let mut batch = script.nested_attachments(&pool, None);
+        assert_eq!(batch.register(attachments[0].clone()), Some(1));
+        assert_eq!(batch.register(attachments[1].clone()), None);
+    }
+    drop(pressure);
+    assert_eq!(pool.used(), retained);
+    {
+        let mut batch = script.nested_attachments(&pool, None);
+        assert_eq!(batch.register(attachments[1].clone()), Some(2));
+        batch.disarm();
+    }
+
+    let table_bytes =
+        pool.used() - attachments[0].metadata_bytes() - attachments[1].metadata_bytes();
+    let growth_peak = attachments[2].metadata_bytes() + 2 * table_bytes;
+    for (available, fits) in [(growth_peak - 1, false), (growth_peak, true)] {
+        let resident = pool.used();
+        let pressure = pool
+            .try_acquire(pool.limit() - resident - available)
+            .unwrap();
+        {
+            let mut batch = script.nested_attachments(&pool, None);
+            let id = batch.register(attachments[2].clone());
+            assert_eq!(id, fits.then_some(3));
+            if fits {
+                batch.disarm();
+            }
+        }
+        drop(pressure);
+        assert_eq!(script.test_attachment_count(), if fits { 3 } else { 2 });
+        assert_eq!(pool.used(), script.test_attachment_bytes());
+        if !fits {
+            assert_eq!(pool.used(), resident);
+        }
+    }
+
+    let mut uncommitted = script.nested_attachments(&pool, None);
+    assert_eq!(uncommitted.register(attachments[3].clone()), Some(4));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter = {
+        let script = script.clone();
+        let pool = Arc::clone(&pool);
+        let first = attachments[0].clone();
+        let fourth = attachments[3].clone();
+        std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let mut batch = script.nested_attachments(&pool, None);
+            let first = batch.register(first);
+            let fourth = batch.register(fourth);
+            batch.disarm();
+            drop(batch);
+            done_tx.send((first, fourth)).unwrap();
+        })
+    };
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(done_rx.try_recv().is_err());
+    drop(uncommitted);
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (Some(1), Some(4))
+    );
+    waiter.join().unwrap();
+    assert_eq!(script.test_attachment_count(), 4);
+    for (index, attachment) in attachments.iter().enumerate() {
+        assert!(
+            script
+                .get_attachment(index as u64 + 1)
+                .unwrap()
+                .same_attachment(attachment)
+        );
+    }
+    assert_eq!(pool.used(), script.test_attachment_bytes());
+    drop(script.finish());
+    assert_eq!(script.test_attachment_count(), 0);
+    assert!(script.get_attachment(1).is_none());
+    assert_eq!(pool.used(), 0);
+
+    let primary = BytePool::new(attachments[0].metadata_bytes());
+    let control = BytePool::new(64 * 1024);
+    let (fallback, worker) = prepare(Handle::current()).unwrap();
+    drop(worker);
+    for commit in [false, true] {
+        {
+            let mut batch = fallback.nested_attachments(&primary, Some(&control));
+            assert_eq!(batch.register(attachments[0].clone()), Some(1));
+            assert_eq!(batch.register(attachments[1].clone()), Some(2));
+            if commit {
+                batch.disarm();
+            }
+        }
+        assert_eq!(fallback.test_attachment_count(), if commit { 2 } else { 0 });
+        assert_eq!(
+            primary.used() + control.used(),
+            fallback.test_attachment_bytes()
+        );
+        assert_eq!(primary.used() > 0, commit);
+        assert_eq!(control.used() > 0, commit);
+    }
+    drop(fallback.finish());
+    assert_eq!((primary.used(), control.used()), (0, 0));
+}
+
+#[tokio::test]
 async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() {
     let fixture = Fixture::new();
     let mut png_bytes = Vec::new();
@@ -1144,6 +1307,13 @@ async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() 
                 const next = await tools.exec({{action: "poll", taskId: r.taskId, waitMs: 0}});
                 if (next.codemode?.attachments) throw new Error("handles delivered twice");
 
+                for (let i = 0; i < 2; i++) {{
+                    const replay = await tools.exec({{action: "poll", taskId: {pid:?}, waitMs: 0}});
+                    if (replay.codemode?.attachments?.length !== 2) throw new Error("fresh reader missed attachments");
+                    if (attach(replay.codemode.attachments[0]).bytes !== {png_len}) throw new Error("replayed handle failed");
+                }}
+                if (attach(h).bytes !== {png_len}) throw new Error("original handle expired");
+
                 text("PINNED");
                 await sleep(30000);
                 "#,
@@ -1168,6 +1338,12 @@ async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() 
             std::fs::read_to_string(&consumer.log_path)
                 .unwrap()
                 .contains("PINNED")
+        );
+
+        assert_eq!(
+            consumer.script().unwrap().test_attachment_count(),
+            2,
+            "fresh readers reuse the same two source attachment slots"
         );
 
         // Evict `producer` while `consumer` is still running: `src_att1` stays pinned on disk!

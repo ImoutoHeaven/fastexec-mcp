@@ -470,8 +470,12 @@ its own advances the watermark only alongside a visible warning naming its
 `Attached: #<index> (<mime>, <bytes> B)` to the text summary alongside the
 media `content[]` blocks (with no `structuredContent`). Nested `exec poll` and `kill` return unforgeable
 script-scoped handles in `result.codemode.attachments`, holding short-term read
-leases across source-task eviction until the calling script exits or cancels. If
-a transport write is interrupted, attaching a fresh reader via the bare `taskId`
+leases across source-task eviction until the calling script exits or cancels.
+Repeated reads of the same source attachment reuse its handle within that script.
+The active byte pool charges each retained attachment's metadata and the handle
+table's allocated capacity until script cleanup; failed delivery rolls back new
+registrations and keeps earlier handles valid. If a transport write is interrupted,
+attaching a fresh reader via the bare `taskId`
 re-reads retained output and attachments from index `1` for deduplication by
 `index`.
 

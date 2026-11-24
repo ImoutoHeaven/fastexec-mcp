@@ -112,6 +112,17 @@ impl AttachmentLease {
     pub fn meta(&self) -> &AttachmentMeta {
         &self.0.meta
     }
+
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn metadata_bytes(&self) -> usize {
+        std::mem::size_of::<AttachmentSlot>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(self.0.meta.mime.capacity())
+            .saturating_add(self.0.meta.path.capacity())
+    }
 }
 
 impl Clone for AttachmentLease {
