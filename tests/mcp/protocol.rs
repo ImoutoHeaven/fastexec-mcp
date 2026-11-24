@@ -12,6 +12,54 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
+fn stdio_requests_require_current_protocol_metadata() {
+    use std::io::Write;
+
+    let mut server = Server::start();
+    let discovered = server.request("server/discover", json!({}));
+    assert_eq!(
+        discovered["result"]["supportedVersions"],
+        json!(["2026-07-28"]),
+        "{discovered}"
+    );
+    let listed = server.request("tools/list", json!({}));
+    assert!(listed.get("error").is_none(), "{listed}");
+
+    for (metadata, code) in [
+        (
+            json!({"io.modelcontextprotocol/clientCapabilities": {}}),
+            -32602,
+        ),
+        (
+            json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"}),
+            -32602,
+        ),
+        (
+            json!({
+                "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }),
+            -32022,
+        ),
+    ] {
+        server.next_id += 1;
+        let id = server.next_id;
+        let request = json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/list",
+            "params": {"_meta": metadata},
+        });
+        let stdin = server.stdin.as_mut().unwrap();
+        writeln!(stdin, "{request}").unwrap();
+        stdin.flush().unwrap();
+        let refused = server.response(id);
+        assert_eq!(refused["error"]["code"], code, "{refused}");
+    }
+
+    let listed = server.request("tools/list", json!({}));
+    assert!(listed.get("error").is_none(), "{listed}");
+}
+
+#[test]
 fn the_listed_tool_says_which_host_it_runs_on() {
     let dir = Scratch::new("exec-description");
     std::fs::create_dir_all(&*dir).unwrap();
@@ -1066,19 +1114,13 @@ fn schema_description_words(node: &Value) -> usize {
 #[test]
 fn server_instructions_and_tool_descriptions_stay_within_their_word_budget() {
     let mut disabled = Server::start();
-    let init_off = disabled.request(
-        "initialize",
-        json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}),
-    );
-    let instructions_off = init_off["result"]["instructions"].as_str().unwrap();
+    let discover_off = disabled.request("server/discover", json!({}));
+    let instructions_off = discover_off["result"]["instructions"].as_str().unwrap();
     assert!(!instructions_off.contains("codemode"), "{instructions_off}");
 
     let mut enabled = codemode_server();
-    let init_on = enabled.request(
-        "initialize",
-        json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}),
-    );
-    let instructions_on = init_on["result"]["instructions"].as_str().unwrap();
+    let discover_on = enabled.request("server/discover", json!({}));
+    let instructions_on = discover_on["result"]["instructions"].as_str().unwrap();
     assert!(
         instructions_on.contains("codemode") && instructions_on.contains("Prefer codemode"),
         "{instructions_on}"
@@ -1406,20 +1448,14 @@ fn transfer_over_local_stdio_serves_put_head_get_and_validates_settings() {
 }
 
 #[test]
-fn instructions_file_appends_to_stdio_initialize_and_rejects_invalid_files() {
+fn instructions_file_appends_to_stdio_discovery_and_rejects_invalid_files() {
     let dir = Scratch::new("instructions-file");
     std::fs::create_dir_all(&*dir).unwrap();
     let file = dir.join("notes.txt");
     std::fs::write(&file, "\u{feff}    indented line\r\nsecond line\r\n").unwrap();
 
-    let init_params = json!({
-        "protocolVersion": "2025-06-18",
-        "capabilities": {},
-        "clientInfo": {"name": "probe", "version": "0"},
-    });
-
     let mut plain = Server::start();
-    let base = plain.request("initialize", init_params.clone())["result"]["instructions"]
+    let base = plain.request("server/discover", json!({}))["result"]["instructions"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1430,7 +1466,7 @@ fn instructions_file_appends_to_stdio_initialize_and_rejects_invalid_files() {
             .current_dir(&*dir)
             .env("FASTEXEC_INSTRUCTIONS_FILE", "notes.txt");
     });
-    let actual = with_file.request("initialize", init_params)["result"]["instructions"]
+    let actual = with_file.request("server/discover", json!({}))["result"]["instructions"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1466,14 +1502,6 @@ fn instructions_file_appends_to_stdio_initialize_and_rejects_invalid_files() {
 
 const MOVE_GUIDANCE_POINTER: &str = "See the instructions tool for host-specific guidance.";
 
-fn stdio_init_params() -> Value {
-    json!({
-        "protocolVersion": "2025-06-18",
-        "capabilities": {},
-        "clientInfo": {"name": "probe", "version": "0"},
-    })
-}
-
 fn find_tool<'a>(listed: &'a Value, name: &str) -> Option<&'a Value> {
     listed["result"]["tools"]
         .as_array()
@@ -1499,14 +1527,14 @@ fn assert_instructions_call_ok(message: &Value, expected: &str, context: &str) {
 }
 
 #[test]
-fn instructions_tool_off_and_unset_preserve_v070_behavior() {
+fn instructions_tool_off_and_unset_omit_the_tool() {
     let dir = Scratch::new("instructions-tool-off");
     std::fs::create_dir_all(&*dir).unwrap();
     let file = dir.join("extra.txt");
     std::fs::write(&file, "    host note\r\nsecond line  \r\n").unwrap();
 
     let mut plain = Server::start();
-    let base = plain.request("initialize", stdio_init_params())["result"]["instructions"]
+    let base = plain.request("server/discover", json!({}))["result"]["instructions"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1528,7 +1556,7 @@ fn instructions_tool_off_and_unset_preserve_v070_behavior() {
                     command.env("FASTEXEC_INSTRUCTIONS_FILE", "extra.txt");
                 }
             });
-            let init = server.request("initialize", stdio_init_params())["result"]["instructions"]
+            let discovery = server.request("server/discover", json!({}))["result"]["instructions"]
                 .as_str()
                 .unwrap()
                 .to_owned();
@@ -1537,7 +1565,7 @@ fn instructions_tool_off_and_unset_preserve_v070_behavior() {
             } else {
                 base.clone()
             };
-            assert_eq!(init, expected, "mode={mode:?} with_file={with_file}");
+            assert_eq!(discovery, expected, "mode={mode:?} with_file={with_file}");
 
             let listed = server.request("tools/list", json!({}));
             assert!(
@@ -1563,7 +1591,7 @@ fn instructions_tool_move_mode_contract_and_annotations() {
     std::fs::write(dir.join("host.txt"), raw).unwrap();
 
     let mut plain = Server::start();
-    let base = plain.request("initialize", stdio_init_params())["result"]["instructions"]
+    let base = plain.request("server/discover", json!({}))["result"]["instructions"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1599,12 +1627,18 @@ fn instructions_tool_move_mode_contract_and_annotations() {
             }
         });
 
-        let init = server.request("initialize", stdio_init_params())["result"]["instructions"]
+        let discovery = server.request("server/discover", json!({}))["result"]["instructions"]
             .as_str()
             .unwrap()
             .to_owned();
-        assert_eq!(init, expected_proto, "yolo={yolo} output={output_mode:?}");
-        assert!(!init.contains(marker), "file text leaked into initialize");
+        assert_eq!(
+            discovery, expected_proto,
+            "yolo={yolo} output={output_mode:?}"
+        );
+        assert!(
+            !discovery.contains(marker),
+            "file text leaked into discovery"
+        );
 
         let listed = server.request("tools/list", json!({}));
         let tool = find_tool(&listed, "instructions")
@@ -1661,11 +1695,11 @@ fn instructions_tool_move_mode_contract_and_annotations() {
     let mut no_file = Server::start_with(|command| {
         command.env("FASTEXEC_INSTRUCTIONS_TOOL", "move");
     });
-    let init = no_file.request("initialize", stdio_init_params())["result"]["instructions"]
+    let discovery = no_file.request("server/discover", json!({}))["result"]["instructions"]
         .as_str()
         .unwrap()
         .to_owned();
-    assert_eq!(init, base);
+    assert_eq!(discovery, base);
     let listed = no_file.request("tools/list", json!({}));
     let tool = find_tool(&listed, "instructions").expect("instructions tool");
     assert_eq!(tool["description"].as_str(), Some(base.as_str()));
@@ -1683,7 +1717,7 @@ fn instructions_tool_copy_mode_with_and_without_file() {
     std::fs::write(dir.join("copy.txt"), "    copied guidance — naïve  \r\n").unwrap();
 
     let mut plain = Server::start();
-    let base = plain.request("initialize", stdio_init_params())["result"]["instructions"]
+    let base = plain.request("server/discover", json!({}))["result"]["instructions"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1702,11 +1736,11 @@ fn instructions_tool_copy_mode_with_and_without_file() {
             }
         });
 
-        let init = server.request("initialize", stdio_init_params())["result"]["instructions"]
+        let discovery = server.request("server/discover", json!({}))["result"]["instructions"]
             .as_str()
             .unwrap()
             .to_owned();
-        assert_eq!(init, expected, "with_file={with_file}");
+        assert_eq!(discovery, expected, "with_file={with_file}");
 
         let listed = server.request("tools/list", json!({}));
         let tool = find_tool(&listed, "instructions").expect("instructions tool");
@@ -1730,7 +1764,7 @@ fn instructions_tool_16kib_boundary_and_snapshot_immutability() {
     std::fs::create_dir_all(&*dir).unwrap();
 
     let mut plain = Server::start();
-    let base = plain.request("initialize", stdio_init_params())["result"]["instructions"]
+    let base = plain.request("server/discover", json!({}))["result"]["instructions"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1767,11 +1801,11 @@ fn instructions_tool_16kib_boundary_and_snapshot_immutability() {
         };
 
         let check = |server: &mut Server, stage: &str| {
-            let init = server.request("initialize", stdio_init_params())["result"]["instructions"]
+            let discovery = server.request("server/discover", json!({}))["result"]["instructions"]
                 .as_str()
                 .unwrap()
                 .to_owned();
-            assert_eq!(init, expected_proto, "{mode} {stage} initialize");
+            assert_eq!(discovery, expected_proto, "{mode} {stage} discovery");
             let listed = server.request("tools/list", json!({}));
             let tool = find_tool(&listed, "instructions").expect("instructions tool");
             assert_eq!(

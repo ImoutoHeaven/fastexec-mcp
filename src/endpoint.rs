@@ -2081,24 +2081,25 @@ mod tests {
         });
         let (read, mut input) = tokio::io::split(client);
         let mut lines = tokio::io::BufReader::new(read).lines();
-        let initialize = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18", "capabilities": {},
-                "clientInfo": {"name": "test", "version": "1"}
-            }
+        let discovery = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }}
         });
         input
-            .write_all(format!("{initialize}\n").as_bytes())
+            .write_all(format!("{discovery}\n").as_bytes())
             .await
             .unwrap();
-        let init = timeout(Duration::from_secs(10), lines.next_line())
+        let discovered = timeout(Duration::from_secs(10), lines.next_line())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         assert!(
-            serde_json::from_str::<serde_json::Value>(&init)
+            serde_json::from_str::<serde_json::Value>(&discovered)
                 .unwrap()
                 .get("error")
                 .is_none()
@@ -2116,11 +2117,8 @@ mod tests {
                 }
             }
         });
-        let initialized = serde_json::json!({
-            "jsonrpc": "2.0", "method": "notifications/initialized"
-        });
         input
-            .write_all(format!("{initialized}\n{request}\n").as_bytes())
+            .write_all(format!("{request}\n").as_bytes())
             .await
             .unwrap();
         let active = timeout(Duration::from_secs(10), lines.next_line())

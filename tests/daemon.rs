@@ -319,15 +319,23 @@ impl Endpoint {
             lines,
             next_id: 0,
         };
-        endpoint.request(
-            "initialize",
-            json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
-        );
-        endpoint.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        let discovery = endpoint.request("server/discover", json!({}));
+        assert!(discovery.get("error").is_none(), "{discovery}");
         endpoint
     }
 
-    fn send(&mut self, message: Value) {
+    fn send(&mut self, mut message: Value) {
+        if message.get("id").is_some() {
+            let mut metadata = json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            });
+            if let Some(existing) = message["params"]["_meta"].as_object() {
+                metadata.as_object_mut().unwrap().extend(existing.clone());
+            }
+            message["params"]["_meta"] = metadata;
+        }
         let stdin = self.stdin.as_mut().expect("stdin is open");
         writeln!(stdin, "{message}").unwrap();
         stdin.flush().unwrap();
@@ -1117,7 +1125,7 @@ fn a_lost_call_after_a_daemon_stop_is_reported_and_the_next_call_starts_a_daemon
     assert!(text.contains("session "), "{text}");
     assert!(text.contains("the operation may have run"), "{text}");
 
-    // The next call on the same endpoint starts a daemon and succeeds, with no new initialize.
+    // The next call on the same endpoint starts a daemon and succeeds, without repeating discovery.
     let (listed, text, error) = endpoint.call(json!({"action": "list"}));
     assert!(!error, "{text}");
     assert_eq!(listed["tasks"], json!([]), "{listed}");
@@ -1169,7 +1177,7 @@ fn an_invalid_daemon_mode_is_refused_at_startup() {
 }
 
 #[test]
-fn initialize_and_tools_list_answer_with_no_daemon() {
+fn discovery_and_tools_list_answer_with_no_daemon() {
     let fixture = Fixture::new("e2e-lazy");
     let mut endpoint = Endpoint::start(&fixture);
     let listed = endpoint.request("tools/list", json!({}));
@@ -2249,7 +2257,11 @@ fn daemon_ipc_accepts_1mib_escaped_input_refuses_over_3mib_and_matches_stdio_sch
         writeln!(
             stdin,
             "{}",
-            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}})
+            json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientInfo":{"name":"test","version":"0"},
+                "io.modelcontextprotocol/clientCapabilities":{}
+            }}})
         )
         .unwrap();
         stdin.flush().unwrap();
@@ -2260,13 +2272,11 @@ fn daemon_ipc_accepts_1mib_escaped_input_refuses_over_3mib_and_matches_stdio_sch
         writeln!(
             stdin,
             "{}",
-            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-        )
-        .unwrap();
-        writeln!(
-            stdin,
-            "{}",
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientInfo":{"name":"test","version":"0"},
+                "io.modelcontextprotocol/clientCapabilities":{}
+            }}})
         )
         .unwrap();
         stdin.flush().unwrap();

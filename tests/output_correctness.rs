@@ -51,18 +51,22 @@ impl Server {
             lines,
             next: 0,
         };
-        server.request(
-            "initialize",
-            json!({
-                "protocolVersion": "2025-06-18", "capabilities": {},
-                "clientInfo": {"name": "output-correctness", "version": "1"}
-            }),
-        );
-        server.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        server.request("server/discover", json!({}));
         server
     }
 
-    fn send(&mut self, value: Value) {
+    fn send(&mut self, mut value: Value) {
+        if value.get("id").is_some() {
+            let mut metadata = json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            });
+            if let Some(existing) = value["params"]["_meta"].as_object() {
+                metadata.as_object_mut().unwrap().extend(existing.clone());
+            }
+            value["params"]["_meta"] = metadata;
+        }
         let stdin = self.child.stdin.as_mut().unwrap();
         writeln!(stdin, "{value}").unwrap();
         stdin.flush().unwrap();
@@ -381,14 +385,7 @@ fn p0_1_and_p1_6_windows_and_nul_preservation_hold_direct_and_nested() {
         lines,
         next: 0,
     };
-    server.request(
-        "initialize",
-        json!({
-            "protocolVersion": "2025-06-18", "capabilities": {},
-            "clientInfo": {"name": "output-correctness-cm", "version": "1"}
-        }),
-    );
-    server.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    server.request("server/discover", json!({}));
 
     // Direct 10,000 B JSON line under default parameters: whole, valid JSON, no cutLines.
     let payload_10k = "j".repeat(9980);
