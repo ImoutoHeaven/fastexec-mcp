@@ -2413,3 +2413,46 @@ fn codemode_list_overflows_over_8_active_children_and_status_line_hints() {
         server.ok(json!({"action": "kill", "taskId": child["taskId"]}));
     }
 }
+
+#[test]
+fn list_does_not_report_warnings_from_trimmed_active_children() {
+    let mut server = codemode_server();
+    let started = code_result(
+        &mut server,
+        json!({
+            "code": "await tools.exec({action:'start',command:'sleep 30 &',keepTree:true,waitMs:5000}); await sleep(30000);",
+            "waitMs": 0
+        }),
+    );
+    let parent = started["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let parent_id = bare_id(&parent).to_owned();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let child_id = loop {
+        let (listed, _) =
+            server.ok(json!({"action":"list", "parentTaskId":parent_id, "state":"active"}));
+        if let Some(child) = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["outputOpen"] == true)
+        {
+            break child["taskId"].as_str().unwrap().to_owned();
+        }
+        assert!(Instant::now() < deadline, "{listed}");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let (listed, text) = server.ok(json!({"action":"list","limit":1,"maxBytes":100}));
+    assert!(text.contains(&parent_id), "{text}");
+    assert!(!text.contains(&child_id), "{text}");
+    assert!(listed.get("warnings").is_none(), "{listed}");
+    assert!(!text.contains("Warning:"), "{text}");
+    assert!(
+        listed["tasks"][0]["children"]["activeTasks"][0]["warnings"].is_array(),
+        "{listed}"
+    );
+    server.ok(json!({"action":"kill","taskId":parent}));
+    server.ok(json!({"action":"kill","taskId":child_id}));
+}

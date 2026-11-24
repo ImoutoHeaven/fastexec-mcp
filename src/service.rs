@@ -883,14 +883,8 @@ impl Service {
         let mut blocks = Vec::with_capacity(items.len());
         let (listed, delivered) = {
             let mut entries = Vec::with_capacity(items.len());
-            let mut warnings = Vec::new();
             for item in items {
                 let running = item.snapshot.state == "running";
-                warnings.extend(
-                    task_warnings(&item.snapshot)
-                        .into_iter()
-                        .map(|warning| format!("{}: {warning}", item.task.id)),
-                );
                 // One read, so the line and the fields name the same size.
                 let size = item.task.pty.then(|| item.task.size());
                 let summary_text = item
@@ -921,11 +915,6 @@ impl Service {
                     let parent_task_id_str = item.task.id.clone();
                     let mut child_rows = Vec::with_capacity(children.active_tasks.len());
                     for (child, child_snapshot) in children.active_tasks {
-                        warnings.extend(
-                            task_warnings(&child_snapshot)
-                                .into_iter()
-                                .map(|warning| format!("{}: {warning}", child.id)),
-                        );
                         let child_size = child.pty.then(|| child.size());
                         block_lines.push(format_child_row(&child, &child_snapshot, child_size));
                         active_entries.push(task_entry_json(
@@ -1002,14 +991,6 @@ impl Service {
                 )),
                 (false, false) => None,
             };
-            let structured = json!({
-                "ok": true, "action": "list", "tasks": entries, "totalCount": total_count, "warnings": warnings,
-            });
-            let mut suffix = warning_text(&structured["warnings"]);
-            if let Some(note) = showing_note {
-                suffix.push('\n');
-                suffix.push_str(&note);
-            }
             // Direct calls deliver the text window; nested calls deliver every selected task.
             let delivered = if view.nested {
                 blocks
@@ -1020,6 +1001,23 @@ impl Service {
             } else {
                 kept
             };
+            let warnings: Vec<String> = delivered
+                .iter()
+                .flat_map(|&(index, count)| &blocks[index].delivered_tasks[..count])
+                .flat_map(|(task, snapshot)| {
+                    task_warnings(snapshot)
+                        .into_iter()
+                        .map(|warning| format!("{}: {warning}", task.id))
+                })
+                .collect();
+            let structured = json!({
+                "ok": true, "action": "list", "tasks": entries, "totalCount": total_count, "warnings": warnings,
+            });
+            let mut suffix = warning_text(&structured["warnings"]);
+            if let Some(note) = showing_note {
+                suffix.push('\n');
+                suffix.push_str(&note);
+            }
             (
                 suppress(success(text, structured, &suffix), call.render),
                 delivered,

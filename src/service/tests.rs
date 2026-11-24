@@ -2157,3 +2157,66 @@ async fn status_line_appends_parent_task_id_hint_only_when_more_than_three_child
 
     tasks.shutdown();
 }
+
+#[tokio::test]
+async fn list_warnings_follow_the_delivered_rows_for_direct_and_nested_calls() {
+    let (service, tasks, session, warned_entry) = list_fixture().await;
+    let warned = tasks.all().pop().unwrap();
+    warned.inject_io_errors(Some("omitted-row-warning"), None);
+    let (newest, _, _) = tasks
+        .start_script(
+            tasks::ScriptArgs {
+                code: "return undefined;".into(),
+                launch: Arc::clone(&session.launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "next".into(),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), newest.done().wait_for(|done| *done))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let request = json!({"action":"list", "truncate":"head", "maxBytes":100});
+    let direct = service
+        .call_json(request.clone(), script_call(&session, false))
+        .await;
+    let text = direct.content[0].as_text().unwrap().text.as_str();
+    assert!(!text.contains(&warned.id), "{text}");
+    assert!(!text.contains("Warning:"), "{text}");
+    let data = direct.structured_content.unwrap();
+    assert!(data.get("warnings").is_none(), "{data}");
+    assert!(
+        data["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["taskId"] == warned.id
+                && task["warnings"]
+                    .as_array()
+                    .is_some_and(|warnings| !warnings.is_empty())),
+        "{data}"
+    );
+    assert!(!warned_entry.is_reported());
+
+    let nested = service
+        .call_json(request, script_call(&session, true))
+        .await;
+    let data = nested.structured_content.unwrap();
+    assert!(
+        data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("omitted-row-warning")),
+        "{data}"
+    );
+    assert!(warned_entry.is_reported());
+    tasks.shutdown();
+}
