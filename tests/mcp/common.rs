@@ -98,13 +98,16 @@ impl Server {
             pending_messages: Vec::new(),
             started: Vec::new(),
         };
-        let discovery = server.request("server/discover", json!({}));
-        assert!(discovery.get("error").is_none(), "{discovery}");
+        server.request(
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        server.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         server
     }
 
     /// Like [`Server::start_with`], returning `Err(stderr)` if the process exits before answering
-    /// `server/discover` (for example, when a probed `FASTEXEC_TRANSFER_ADDR` raced with another test).
+    /// `initialize` (for example, when a probed `FASTEXEC_TRANSFER_ADDR` raced with another test).
     pub(super) fn try_start_with(configure: impl FnOnce(&mut Command)) -> Result<Server, String> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
         crate::support::scrub_fastexec_env(&mut command);
@@ -119,13 +122,7 @@ impl Server {
         let _ = writeln!(
             stdin,
             "{}",
-            json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"},
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                }
-            }})
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}})
         );
         let _ = stdin.flush();
         let mut reader = BufReader::new(child.stdout.take().unwrap());
@@ -137,10 +134,10 @@ impl Server {
                 return Err(String::from_utf8_lossy(&output.stderr).into_owned());
             }
             Ok(_) => {
-                let discovery: Value = serde_json::from_str(&first_line).unwrap_or_else(|error| {
-                    panic!("invalid discovery JSON {error}: {first_line:?}")
+                let init: Value = serde_json::from_str(&first_line).unwrap_or_else(|error| {
+                    panic!("invalid initialize JSON {error}: {first_line:?}")
                 });
-                assert!(discovery.get("error").is_none(), "{discovery}");
+                assert!(init.get("error").is_none(), "{init}");
             }
             Err(error) => {
                 drop(stdin);
@@ -179,28 +176,19 @@ impl Server {
                 }
             }
         });
-        Ok(Server {
+        let mut server = Server {
             child,
             stdin: Some(stdin),
             lines,
             next_id: 1,
             pending_messages: Vec::new(),
             started: Vec::new(),
-        })
+        };
+        server.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        Ok(server)
     }
 
-    pub(super) fn send(&mut self, mut message: Value) {
-        if message.get("id").is_some() {
-            let mut metadata = json!({
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"},
-                "io.modelcontextprotocol/clientCapabilities": {},
-            });
-            if let Some(existing) = message["params"]["_meta"].as_object() {
-                metadata.as_object_mut().unwrap().extend(existing.clone());
-            }
-            message["params"]["_meta"] = metadata;
-        }
+    pub(super) fn send(&mut self, message: Value) {
         let stdin = self.stdin.as_mut().unwrap();
         writeln!(stdin, "{message}").unwrap();
         stdin.flush().unwrap();

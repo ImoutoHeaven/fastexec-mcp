@@ -24,11 +24,13 @@ class Client:
         self.next_id = 0
         threading.Thread(target=self.read, daemon=True).start()
         try:
-            discovered = self.request("server/discover", {})
-            assert discovered["supportedVersions"] == ["2026-07-28"], discovered
-            server_info = discovered["_meta"]["io.modelcontextprotocol/serverInfo"]
-            assert server_info["name"] == "fastexec", discovered
-            assert server_info["version"] == version, discovered
+            initialized = self.request("initialize", {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "release-smoke", "version": "1"},
+            })
+            assert initialized["serverInfo"]["name"] == "fastexec", initialized
+            assert initialized["serverInfo"]["version"] == version, initialized
+            self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         except BaseException:
             self.close()
             raise
@@ -48,11 +50,6 @@ class Client:
         self.process.stdin.flush()
 
     def request(self, method, params):
-        params = {**params, "_meta": {
-            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-            "io.modelcontextprotocol/clientInfo": {"name": "release-smoke", "version": "1"},
-            "io.modelcontextprotocol/clientCapabilities": {},
-        }}
         self.next_id += 1
         self.send({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params})
         deadline = time.monotonic() + 30
@@ -128,7 +125,7 @@ def smoke(binary, version):
             })
             finished(result, text, "PTY:ready")
             assert "40 100" in text, text
-        print("PASS: server/discover, tools/list, files, pipe exec, PTY input and resize", flush=True)
+        print("PASS: initialize, tools/list, files, pipe exec, PTY input and resize", flush=True)
 
         def daemon(action):
             result = subprocess.run(

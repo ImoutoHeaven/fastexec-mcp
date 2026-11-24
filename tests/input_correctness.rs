@@ -41,22 +41,18 @@ impl Server {
             lines,
             next: 0,
         };
-        server.request("server/discover", json!({}));
+        server.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "input-correctness", "version": "1"}
+            }),
+        );
+        server.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         server
     }
 
-    fn send(&mut self, mut value: Value) {
-        if value.get("id").is_some() {
-            let mut metadata = json!({
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"},
-                "io.modelcontextprotocol/clientCapabilities": {},
-            });
-            if let Some(existing) = value["params"]["_meta"].as_object() {
-                metadata.as_object_mut().unwrap().extend(existing.clone());
-            }
-            value["params"]["_meta"] = metadata;
-        }
+    fn send(&mut self, value: Value) {
         let stdin = self.child.stdin.as_mut().unwrap();
         writeln!(stdin, "{value}").unwrap();
         stdin.flush().unwrap();
