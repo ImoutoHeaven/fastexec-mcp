@@ -372,11 +372,42 @@ fn head_and_tail_use_the_body_budget_and_report_omissions_in_status() {
             let (nested_body, nested_status) = split_output(&nested_text);
             assert!(nested_status.starts_with("[exited 0] "), "{nested_status}");
             let data: Value = serde_json::from_str(nested_body).unwrap();
-            assert_eq!(data["output"], endpoint);
+            let expected = if raw {
+                format!("{endpoint}\n")
+            } else {
+                endpoint.clone()
+            };
+            assert_eq!(data["output"], expected);
             assert_eq!(data["omittedRange"], json!(omitted));
             assert_eq!(data["cutLines"].as_u64().unwrap_or(0), 0);
         }
     }
+}
+
+#[test]
+fn nested_raw_exec_preserves_line_terminators() {
+    let mut server = Server::start();
+    let result = server.codemode(json!({
+        "code": r#"
+            for (const sample of ["", "\n", "\r\n", "a\n", "a\r\n", "a\nb\n", "a\nb"]) {
+                const result = await tools.exec({
+                    action: "start",
+                    loginShell: false,
+                    raw: true,
+                    command: "printf '%s' " + sh.quote(sample)
+                });
+                if (result.output !== sample || result.truncated) {
+                    throw new Error(JSON.stringify({ sample, result }));
+                }
+            }
+            return "raw line endings preserved";
+        "#
+    }));
+    assert_ne!(result["isError"], true, "{}", text(&result));
+    let rendered = text(&result);
+    let (body, status) = split_output(&rendered);
+    assert_eq!(body, "raw line endings preserved");
+    assert!(status.starts_with("[exited 0] "), "{status}");
 }
 
 #[test]

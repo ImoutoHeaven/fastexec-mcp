@@ -491,6 +491,9 @@ impl<'a> WindowBuilder<'a> {
     }
 
     fn end_line(&mut self, terminated: bool) {
+        if terminated && self.spec.raw && !self.spec.include_markers {
+            self.append(b'\n');
+        }
         let last = self.first_line + self.newlines;
         self.newlines += u64::from(terminated);
         let first = std::mem::replace(&mut self.line_start, self.first_line + self.newlines);
@@ -540,10 +543,11 @@ impl<'a> WindowBuilder<'a> {
 
     fn place(&mut self, cand: Candidate) {
         self.total_lines += 1;
-        let total = self.spec.budget.saturating_add(1);
+        let separator = usize::from(!self.spec.raw || self.spec.include_markers);
+        let total = self.spec.budget.saturating_add(separator);
         if self.head_open {
             if cand.dropped == 0 {
-                let cost = cand.prefix.len().saturating_add(1);
+                let cost = cand.prefix.len().saturating_add(separator);
                 if self.head_bytes.saturating_add(cost) <= total {
                     self.head_bytes += cost;
                     self.head.push(cand);
@@ -552,7 +556,7 @@ impl<'a> WindowBuilder<'a> {
             }
             self.head_open = false;
             if self.head.is_empty() {
-                self.head_bytes = cand.prefix.len().saturating_add(1);
+                self.head_bytes = cand.prefix.len().saturating_add(separator);
                 self.head.push(cand);
                 return;
             }
@@ -562,7 +566,7 @@ impl<'a> WindowBuilder<'a> {
         }
         if cand.dropped > 0 {
             self.tail.clear();
-            self.tail_bytes = cand.prefix.len().saturating_add(1);
+            self.tail_bytes = cand.prefix.len().saturating_add(separator);
             self.tail.push_back(cand);
             return;
         }
@@ -570,12 +574,12 @@ impl<'a> WindowBuilder<'a> {
             self.tail.clear();
             self.tail_bytes = 0;
         }
-        let cost = cand.prefix.len().saturating_add(1);
+        let cost = cand.prefix.len().saturating_add(separator);
         self.tail_bytes = self.tail_bytes.saturating_add(cost);
         self.tail.push_back(cand);
         while self.tail.len() > 1 && self.tail_bytes > total {
             let dropped = self.tail.pop_front().expect("tail has multiple items");
-            self.tail_bytes -= dropped.prefix.len().saturating_add(1);
+            self.tail_bytes -= dropped.prefix.len().saturating_add(separator);
         }
     }
 
@@ -607,6 +611,11 @@ impl<'a> WindowBuilder<'a> {
 
     fn assemble(&mut self) -> (String, u64, Option<(u64, u64)>) {
         let budget = self.spec.budget;
+        let separator = if self.spec.raw && !self.spec.include_markers {
+            ""
+        } else {
+            "\n"
+        };
         if self.total_lines == 0 {
             return (String::new(), 0, None);
         }
@@ -616,7 +625,7 @@ impl<'a> WindowBuilder<'a> {
                 .iter()
                 .map(|cand| cand.prefix.as_str())
                 .collect::<Vec<_>>()
-                .join("\n");
+                .join(separator);
             return (text, 0, None);
         }
         let first_num = self.head[0].first;
@@ -659,7 +668,7 @@ impl<'a> WindowBuilder<'a> {
                 .iter()
                 .map(|cand| cand.prefix.as_str())
                 .collect::<Vec<_>>()
-                .join("\n");
+                .join(separator);
             return (
                 text,
                 0,
@@ -681,8 +690,8 @@ impl<'a> WindowBuilder<'a> {
             let mut tail_used = 0usize;
             let mut t = 0usize;
             for cand in suffix_rev.iter().copied() {
-                let next_used = tail_used + cand.prefix.len() + 1;
-                if cand.dropped > 0 || next_used > budget.saturating_add(1) {
+                let next_used = tail_used + cand.prefix.len() + separator.len();
+                if cand.dropped > 0 || next_used > budget.saturating_add(separator.len()) {
                     break;
                 }
                 tail_used = next_used;
@@ -694,7 +703,7 @@ impl<'a> WindowBuilder<'a> {
                     .rev()
                     .map(|cand| cand.prefix.as_str())
                     .collect::<Vec<_>>()
-                    .join("\n");
+                    .join(separator);
                 return (text, 0, Some((first_num, suffix_rev[t - 1].first - 1)));
             }
             let last = suffix_rev[0];
@@ -1938,6 +1947,135 @@ mod tests {
         assert_eq!(out.cut_lines, 0);
         assert!(out.truncated());
         assert_no_markers(&out.text);
+    }
+
+    fn raw_program_spec(truncate: Truncate, budget: usize) -> WindowSpec {
+        WindowSpec {
+            truncate,
+            budget,
+            raw: true,
+            clean: true,
+            keep_nul: true,
+            include_markers: false,
+            encoding: encoding_rs::UTF_8,
+            source: "log",
+        }
+    }
+
+    #[test]
+    fn program_raw_windows_preserve_line_terminators() {
+        let mut samples = vec![
+            Vec::new(),
+            b"\n".to_vec(),
+            b"\n\n".to_vec(),
+            b"a\n".to_vec(),
+            b"a\r\n".to_vec(),
+            b"a\nb\n".to_vec(),
+            b"a\nb".to_vec(),
+            b"\x1b[31ma\0b\x1b[0m\r\n".to_vec(),
+            "中\n😀\n".as_bytes().to_vec(),
+        ];
+        samples.push(format!("{}\r\n", "x".repeat(8192)).into_bytes());
+        for mode in [Truncate::Head, Truncate::Tail] {
+            for input in &samples {
+                let mut cleaner = Cleaner::default();
+                let mut builder =
+                    WindowBuilder::new(raw_program_spec(mode, input.len()), &mut cleaner, 1);
+                for chunk in input.chunks(7) {
+                    builder.push(chunk);
+                }
+                let out = builder.finish();
+                assert_eq!(out.text.as_bytes(), input, "{mode:?}");
+                assert_eq!(out.is_empty(), input.is_empty());
+                assert_eq!(
+                    out.newlines,
+                    input.iter().filter(|&&byte| byte == b'\n').count() as u64
+                );
+                assert!(!out.truncated());
+                assert_eq!(out.bad_lines, 0);
+                assert_no_markers(&out.text);
+            }
+        }
+    }
+
+    #[test]
+    fn program_raw_windows_count_terminators_in_the_byte_budget() {
+        for mode in [Truncate::Head, Truncate::Tail] {
+            let head = mode == Truncate::Head;
+            for (input, budget, expected, omitted, cut_lines) in [
+                ("abc\n", 3, "abc", None, 1),
+                ("😀\n", 4, "😀", None, 1),
+                ("😀\n", 2, "", Some((1, 1)), 0),
+                ("\n", 0, "", Some((1, 1)), 0),
+                (
+                    "a\nb\n",
+                    3,
+                    if head { "a\n" } else { "b\n" },
+                    Some(if head { (2, 2) } else { (1, 1) }),
+                    0,
+                ),
+                ("\n\n", 1, "\n", Some(if head { (2, 2) } else { (1, 1) }), 0),
+                (
+                    "aaa\nb",
+                    4,
+                    if head { "aaa\n" } else { "b" },
+                    Some(if head { (2, 2) } else { (1, 1) }),
+                    0,
+                ),
+                (
+                    "first\nabcdef\n",
+                    4,
+                    if head { "firs" } else { "abcd" },
+                    Some(if head { (2, 2) } else { (1, 1) }),
+                    1,
+                ),
+            ] {
+                let mut cleaner = Cleaner::default();
+                let mut builder =
+                    WindowBuilder::new(raw_program_spec(mode, budget), &mut cleaner, 1);
+                builder.push(input.as_bytes());
+                let out = builder.finish();
+                assert_eq!(out.text, expected, "{mode:?}, {input:?}, {budget}");
+                assert_eq!(out.omitted, omitted);
+                assert_eq!(out.cut_lines, cut_lines);
+                assert!(out.truncated());
+                assert!(out.text.len() <= budget);
+                assert_no_markers(&out.text);
+            }
+        }
+    }
+
+    #[test]
+    fn program_raw_windows_preserve_bytes_and_cleaner_state_across_polls() {
+        let sequences: &[&[(bool, &[u8], &str)]] = &[
+            &[(true, b"a", "a"), (true, b"\n", "\n")],
+            &[
+                (false, b"first\r", "first"),
+                (true, b"\n", "\n"),
+                (false, b"\nnext\n", "\nnext"),
+            ],
+            &[(true, b"x\x1b[", "x\x1b["), (false, b"31mRED\n", "RED")],
+            &[
+                (false, b"old\x1b[", "old"),
+                (true, b"31mRAW\n", "31mRAW\n"),
+                (false, b"\nnext\n", "\nnext"),
+            ],
+            &[(true, b"raw\r", "raw\r"), (false, b"\nnext\n", "next")],
+        ];
+        for sequence in sequences {
+            let mut cleaner = Cleaner::default();
+            let mut first_line = 1;
+            for &(raw, input, expected) in *sequence {
+                let mut spec = raw_program_spec(Truncate::Head, 100);
+                spec.raw = raw;
+                let mut builder = WindowBuilder::new(spec, &mut cleaner, first_line);
+                builder.push(input);
+                let out = builder.finish();
+                assert_eq!(out.text, expected, "raw={raw}, input={input:?}");
+                assert!(!out.truncated());
+                first_line += out.newlines;
+            }
+        }
     }
 
     #[test]

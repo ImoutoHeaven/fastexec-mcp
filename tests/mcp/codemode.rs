@@ -1075,7 +1075,7 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
                 if (rt.output !== tricky) throw new Error("sh.quote mismatch: " + JSON.stringify(rt.output));
 
                 const args = ["it's", "$HOME", "`uname`", "\\", "a\nb", ""];
-                const expectedLines = args.join("\n");
+                const expectedLines = args.join("\n") + "\n";
                 const tagCmd = sh`printf '%s\n' ${args}`;
                 if (!tagCmd.startsWith("printf '%s\\n' ")) {
                     throw new Error("sh tagged template did not preserve raw \\n: " + JSON.stringify(tagCmd));
