@@ -1,5 +1,6 @@
 use super::common::{
-    Scratch, Server, bare_id, body_of, code_result, code_text, codemode_server, scratch,
+    Scratch, Server, bare_id, body_of, code_result, code_text, codemode_server, log_path_of,
+    scratch, task_id_of,
 };
 use serde_json::{Value, json};
 use std::process::{Command, Stdio};
@@ -128,21 +129,13 @@ fn codemode_requires_explicit_enable_and_respects_yolo() {
 #[test]
 fn codemode_invalid_arguments_do_not_create_tasks() {
     let mut server = codemode_server();
-    // Schema-decoding failures have no structuredContent.
+    // Schema-decoding, parameter, and business validation failures return pure-text errors
+    // with no structuredContent and create no tasks.
     for args in [
         json!({}),
         json!({"code":42}),
         json!({"code":"return 1", "pty":true}),
         json!({"code":"return 1", "returnWhen":{"screenContains":["x"]}}),
-    ] {
-        let result = code_result(&mut server, args);
-        assert_eq!(result["isError"], true, "{result}");
-        assert!(result.get("structuredContent").is_none(), "{result}");
-        let (listed, _) = server.ok(json!({"action":"list"}));
-        assert!(listed["tasks"].as_array().unwrap().is_empty(), "{listed}");
-    }
-    // Parameter and business validation failures carry structuredContent with action: "codemode".
-    for args in [
         json!({"code":"  "}),
         json!({"code":"x\0y"}),
         json!({"code":"return 1", "cwd":"definitely-missing-relative-path"}),
@@ -155,19 +148,9 @@ fn codemode_invalid_arguments_do_not_create_tasks() {
     ] {
         let result = code_result(&mut server, args);
         assert_eq!(result["isError"], true, "{result}");
-        assert_eq!(result["structuredContent"]["ok"], false, "{result}");
-        assert_eq!(
-            result["structuredContent"]["action"], "codemode",
-            "{result}"
-        );
-        assert!(
-            result["structuredContent"]["error"]
-                .as_str()
-                .is_some_and(|error| !error.is_empty()),
-            "{result}"
-        );
-        let (listed, _) = server.ok(json!({"action":"list"}));
-        assert!(listed["tasks"].as_array().unwrap().is_empty(), "{listed}");
+        assert!(!code_text(&result).is_empty(), "{result}");
+        let listed = server.ok(json!({"action":"list"}));
+        assert!(listed.contains("No tasks."), "{listed}");
     }
 }
 
@@ -179,12 +162,11 @@ fn codemode_streams_script_results_and_preserves_error_lines() {
         json!({"code":"text('first'); await Promise.resolve(); console.log('second', {ok:true}); return {last:3};"}),
     );
     assert_eq!(result["isError"], false, "{result}");
-    let task = &result["structuredContent"];
-    assert_eq!(task["action"], "codemode", "{result}");
-    assert_eq!(task["kind"], "codemode", "{result}");
-    assert_eq!(task["exitCode"], 0, "{result}");
+    let text = code_text(&result);
+    assert!(text.contains("[exited 0]"), "{result}");
     assert_eq!(
-        task["output"], "first\nsecond {\"ok\":true}\n{\"last\":3}",
+        body_of(text),
+        "first\nsecond {\"ok\":true}\n{\"last\":3}",
         "{result}"
     );
     for code in [
@@ -192,8 +174,9 @@ fn codemode_streams_script_results_and_preserves_error_lines() {
         "return undefined;",
     ] {
         let result = code_result(&mut server, json!({"code":code}));
-        assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
-        assert_eq!(result["structuredContent"]["output"], "", "{result}");
+        let text = code_text(&result);
+        assert!(text.contains("[exited 0]"), "{result}");
+        assert_eq!(body_of(text), "(no new output)", "{result}");
     }
     for (code, expected) in [
         ("text('before');\nthrow new Error('boom');", "codemode.js:2"),
@@ -206,7 +189,7 @@ fn codemode_streams_script_results_and_preserves_error_lines() {
     ] {
         let result = code_result(&mut server, json!({"code":code}));
         assert_eq!(result["isError"], false, "{result}");
-        assert_eq!(result["structuredContent"]["exitCode"], 1, "{result}");
+        assert!(code_text(&result).contains("[exited 1]"), "{result}");
         assert!(
             code_text(&result).contains("Script error:") && code_text(&result).contains(expected),
             "{result}"
@@ -215,18 +198,15 @@ fn codemode_streams_script_results_and_preserves_error_lines() {
 }
 
 #[test]
-fn codemode_nested_results_keep_their_shape_under_outer_render_settings() {
+fn codemode_nested_results_keep_their_program_shape_while_outer_is_pure_text() {
     let dir = Scratch::new("codemode-files");
     std::fs::create_dir_all(&*dir).unwrap();
-    for structured in ["true", "false"] {
-        let mut server = Server::start_with(|command| {
-            command
-                .current_dir(&*dir)
-                .env("FASTEXEC_CODEMODE", "true")
-                .env("FASTEXEC_OUTPUT_MODE", "structured")
-                .env("FASTEXEC_STRUCTURED_CONTENT", structured);
-        });
-        let code = r#"
+    let mut server = Server::start_with(|command| {
+        command
+            .current_dir(&*dir)
+            .env("FASTEXEC_CODEMODE", "true");
+    });
+    let code = r#"
 const written = await tools.write({path:'note.txt', content:'alpha\nbeta\n'});
 const edited = await tools.edit({path:'note.txt', edits:[{oldText:'beta', newText:'BETA'}]});
 const [command, file, absentOutcome] = await Promise.all([
@@ -237,34 +217,18 @@ const [command, file, absentOutcome] = await Promise.all([
 if ('ok' in written || 'structuredContent' in written || written.bytes !== 11) throw new Error('write shape');
 if ('ok' in edited || edited.replacements !== 1 || edited.edits[0].line !== 2) throw new Error('edit shape');
 if ('ok' in command || 'content' in command || command.output !== 'nested-output') throw new Error('exec shape');
-if ('ok' in file || file.text !== 'alpha\nBETA\n' || file.truncated !== false || file.nextOffset !== null || file.totalLines !== 2) throw new Error('file shape');
-if (!absentOutcome || absentOutcome.name !== 'ToolError' || absentOutcome.tool !== 'read' || typeof absentOutcome.result?.error !== 'string') throw new Error('absent shape');
+if ('ok' in file || file.text !== 'alpha\nBETA\n' || file.truncated !== false || file.nextOffset !== undefined || file.totalLines !== 2) throw new Error('file shape');
+if (!absentOutcome || absentOutcome.name !== 'ToolError' || absentOutcome.tool !== 'read' || absentOutcome.code !== 'NOT_FOUND' || typeof absentOutcome.message !== 'string') throw new Error('absent shape');
 const reads = await Promise.all(Array.from({length:20}, () => tools.read({path:'note.txt'})));
 if (reads.length !== 20 || reads.some(r => 'ok' in r || r.text !== 'alpha\nBETA\n')) throw new Error('queued reads');
 text('nested-ok');
 "#;
-        let result = code_result(&mut server, json!({"code":code}));
-        assert_eq!(result["isError"], false, "{result}");
-        let bad = code_result(&mut server, json!({"code":"   "}));
-        assert_eq!(bad["isError"], true, "{bad}");
-        if structured == "true" {
-            assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
-            assert_eq!(
-                result["structuredContent"]["output"], "nested-ok",
-                "{result}"
-            );
-            assert!(!code_text(&result).contains("nested-ok"), "{result}");
-            assert_eq!(bad["structuredContent"]["action"], "codemode", "{bad}");
-        } else {
-            assert!(result.get("structuredContent").is_none(), "{result}");
-            assert!(bad.get("structuredContent").is_none(), "{bad}");
-            assert!(
-                code_text(&result).contains("nested-ok")
-                    && !code_text(&result).contains("Script error:"),
-                "{result}"
-            );
-        }
-    }
+    let result = code_result(&mut server, json!({"code":code}));
+    assert_eq!(result["isError"], false, "{result}");
+    assert!(code_text(&result).contains("[exited 0]"), "{result}");
+    assert_eq!(body_of(code_text(&result)), "nested-ok", "{result}");
+    let bad = code_result(&mut server, json!({"code":"   "}));
+    assert_eq!(bad["isError"], true, "{bad}");
 }
 
 #[test]
@@ -286,7 +250,7 @@ for (const call of [
 ]) {
   let err = null;
   try { await call(); } catch (e) { err = e; }
-  if (!err || err.name !== 'ToolError' || typeof err.result?.error !== 'string') throw new Error('validation failure did not reject with ToolError');
+  if (!err || err.name !== 'ToolError' || err.code !== 'VALIDATION' || typeof err.message !== 'string' || !err.message.length) throw new Error('validation failure did not reject with ToolError');
 }
 const longWait = await tools.exec({action:'start', command:'true', waitMs:600000, loginShell:false});
 if (longWait.exitCode !== 0) throw new Error('nested waitMs > 240000 must succeed');
@@ -300,8 +264,8 @@ if (!missingErr || missingErr.name !== 'ToolError') throw new Error('missing fil
 text('settled');
 "#;
     let result = code_result(&mut server, json!({"code":code}));
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
-    assert_eq!(result["structuredContent"]["output"], "settled", "{result}");
+    assert!(code_text(&result).contains("[exited 0]"), "{result}");
+    assert_eq!(body_of(code_text(&result)), "settled", "{result}");
 }
 
 #[test]
@@ -315,16 +279,13 @@ fn codemode_kill_reports_pending_calls_and_leaves_started_tasks_running() {
         }),
     );
     assert_eq!(result["isError"], false, "{result}");
-    let script = result["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let script = task_id_of(code_text(&result)).to_owned();
     let child = code_text(&result)
         .lines()
         .find_map(|line| line.strip_prefix("child="))
         .unwrap()
         .to_owned();
-    let (_, ok_text, ok_err) = server.call(json!({"action":"poll", "taskId":script, "waitMs":0, "eof":false, "screen":false, "raw":false}));
+    let (ok_text, ok_err) = server.call(json!({"action":"poll", "taskId":script, "waitMs":0, "eof":false, "screen":false, "raw":false}));
     assert!(!ok_err, "{ok_text}");
     for extra in [
         json!({"input":"x"}),
@@ -344,62 +305,32 @@ fn codemode_kill_reports_pending_calls_and_leaves_started_tasks_running() {
         args.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        let (_, text, error) = server.call(args);
+        let (text, error) = server.call(args);
         assert!(
             error && text.contains("A codemode task takes no input"),
             "{text}"
         );
     }
-    let (_, text, error) = server.call(json!({"action":"transcript", "taskId":script}));
+    let (text, error) = server.call(json!({"action":"transcript", "taskId":script}));
     assert!(error && text.to_lowercase().contains("terminal"), "{text}");
-    let (stopped, text) = server.ok(json!({"action":"kill", "taskId":script}));
-    assert_eq!(stopped["state"], "killed", "{stopped}: {text}");
-    assert!(stopped["exitCode"].is_null(), "{stopped}");
+    let text = server.ok(json!({"action":"kill", "taskId":script}));
+    assert!(text.contains("[killed]"), "{text}");
     assert!(
         text.contains("tasks it started") && text.contains("keep running"),
         "{text}"
     );
+    assert!(text.contains("cancelled 1 pending call(s): exec poll"), "{text}");
+    assert!(text.contains(&child), "{text}");
+    let listed = server.ok(json!({"action":"list"}));
     assert!(
-        stopped["codemode"]["cancelledCalls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|call| call["tool"] == "exec" && call["action"] == "poll"),
-        "{stopped}"
-    );
-    assert!(
-        stopped["codemode"]["startedTasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|task| task["taskId"] == child && task["state"] == "running"),
-        "{stopped}"
-    );
-    let (listed, _) = server.ok(json!({"action":"list"}));
-    assert!(
-        listed["tasks"].as_array().unwrap().iter().any(|task| {
-            task["taskId"] == bare_id(&script)
-                && task["state"] == "killed"
-                && task["children"]["activeTasks"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|entry| {
-                        entry["taskId"] == bare_id(&child)
-                            && entry["state"] == "running"
-                            && entry["kind"] == "bash"
-                    })
-        }),
+        listed.contains(&format!("{} [killed]", bare_id(&script)))
+            && listed.contains(&format!("  └─ {} [running]", bare_id(&child))),
         "{listed}"
     );
-    let (active, _) = server.ok(json!({"action":"list", "state":"active"}));
+    let active = server.ok(json!({"action":"list", "state":"active"}));
     assert!(
-        active["tasks"].as_array().unwrap().iter().any(|task| {
-            task["taskId"] == bare_id(&child)
-                && task["state"] == "running"
-                && task["kind"] == "bash"
-                && task["parentTaskId"] == bare_id(&script)
-        }),
+        active.contains(&format!("{} [running]", bare_id(&child)))
+            && active.contains(&format!("via {}", bare_id(&script))),
         "{active}"
     );
     server.ok(json!({"action":"kill", "taskId":child}));
@@ -414,15 +345,8 @@ fn codemode_deadlines_stop_bytecode_and_microtasks() {
             json!({"code":code,"killAfterMs":300,"waitMs":10000}),
         );
         assert_eq!(result["isError"], false, "{result}");
-        assert_eq!(result["structuredContent"]["state"], "killed", "{result}");
-        assert_eq!(
-            result["structuredContent"]["lifetimeExpired"], true,
-            "{result}"
-        );
-        assert!(
-            result["structuredContent"]["exitCode"].is_null(),
-            "{result}"
-        );
+        let text = code_text(&result);
+        assert!(text.contains("[killed]") && text.contains("killAfterMs"), "{result}");
     }
 }
 
@@ -447,15 +371,13 @@ fn codemode_outer_request_cancellation_only_ends_its_wait() {
     }
     server.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":request_id,"reason":"test cancellation"}}));
     // rmcp may drop a cancelled response; list observes the task after cancellation.
-    let (listed, _) = server.ok(json!({"action":"list"}));
-    let script = listed["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|task| task["kind"] == "codemode")
-        .unwrap();
-    assert_eq!(script["state"], "running", "{listed}");
-    server.ok(json!({"action":"kill","taskId":script["taskId"]}));
+    let listed = server.ok(json!({"action":"list"}));
+    let line = listed
+        .lines()
+        .find(|line| line.contains("[running]"))
+        .unwrap_or_else(|| panic!("expected running codemode task: {listed}"));
+    let script_id = line.split_whitespace().next().unwrap();
+    server.ok(json!({"action":"kill","taskId":script_id}));
 }
 
 #[test]
@@ -465,22 +387,17 @@ fn codemode_script_admission_limit_is_released_after_kill() {
     for _ in 0..4 {
         let result = code_result(&mut server, json!({"code":"while (true) {}", "waitMs":0}));
         assert_eq!(result["isError"], false, "{result}");
-        ids.push(
-            result["structuredContent"]["taskId"]
-                .as_str()
-                .unwrap()
-                .to_owned(),
-        );
+        ids.push(task_id_of(code_text(&result)).to_owned());
     }
     let rejected = code_result(&mut server, json!({"code":"return 1", "waitMs":0}));
     assert_eq!(rejected["isError"], true, "{rejected}");
-    let (listed, _) = server.ok(json!({"action":"list"}));
-    assert_eq!(listed["tasks"].as_array().unwrap().len(), 4, "{listed}");
+    let listed = server.ok(json!({"action":"list"}));
+    assert_eq!(listed.lines().count(), 4, "{listed}");
     for id in ids {
         server.ok(json!({"action":"kill", "taskId":id}));
     }
     let next = code_result(&mut server, json!({"code":"return 'room again'"}));
-    assert_eq!(next["structuredContent"]["exitCode"], 0, "{next}");
+    assert!(code_text(&next).contains("[exited 0]"), "{next}");
 }
 
 #[test]
@@ -512,143 +429,100 @@ fn codemode_attach_packs_across_eof_polls_dedups_bare_task_id_and_skips_oversize
     };
     let small_png = image_data_url(4, 4);
 
-    for structured in [true, false] {
-        let mut server = Server::start_with(|command| {
-            command
-                .env("FASTEXEC_CODEMODE", "true")
-                .env(
-                    "FASTEXEC_STRUCTURED_CONTENT",
-                    if structured { "true" } else { "false" },
-                )
-                .env("FASTEXEC_TEST_OUTBOUND_LIMIT", "4600");
-        });
-        let code = format!(
-            "attach({med_mp4:?}); attach({med_mp4:?}); attach({huge_pdf:?}); attach({small_png:?}); text('tail');"
-        );
-        let first = code_result(
-            &mut server,
-            json!({"code": code, "truncate": "tail", "maxBytes": 100}),
-        );
-        assert_eq!(first["isError"], false, "{first}");
-        let blocks1 = first["content"].as_array().unwrap();
-        assert_eq!(
-            blocks1.iter().filter(|b| b["type"] == "resource").count(),
-            1,
-            "{first}"
-        );
-        let text1 = code_text(&first);
-        assert!(text1.contains("tail"), "{text1}");
-        let handle = if structured {
-            assert_eq!(
-                first["structuredContent"]["codemode"]["attachmentsDelivered"],
-                json!([{"index": 1, "kind": "video", "mimeType": "video/mp4", "bytes": 1800}]),
-                "{first}"
-            );
-            first["structuredContent"]["taskId"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        } else {
-            assert!(first["structuredContent"].is_null(), "{first}");
-            assert!(
-                text1.contains("Attached: #1 (video/mp4, 1800 B)"),
-                "{text1}"
-            );
-            text1
-                .lines()
-                .find(|line| line.starts_with("[exited 0] "))
-                .unwrap()
-                .split_whitespace()
-                .nth(2)
-                .unwrap()
-                .to_owned()
-        };
+    let mut server = Server::start_with(|command| {
+        command
+            .env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_TEST_OUTBOUND_LIMIT", "4600");
+    });
+    let code = format!(
+        "attach({med_mp4:?}); attach({med_mp4:?}); attach({huge_pdf:?}); attach({small_png:?}); text('tail');"
+    );
+    let first = code_result(
+        &mut server,
+        json!({"code": code, "truncate": "tail", "maxBytes": 100}),
+    );
+    assert_eq!(first["isError"], false, "{first}");
+    let blocks1 = first["content"].as_array().unwrap();
+    assert_eq!(
+        blocks1.iter().filter(|b| b["type"] == "resource").count(),
+        1,
+        "{first}"
+    );
+    let text1 = code_text(&first);
+    assert!(text1.contains("tail"), "{text1}");
+    assert!(
+        text1.contains("Attached: #1 (video/mp4, 1800 B)"),
+        "{text1}"
+    );
+    let handle = task_id_of(text1).to_owned();
 
-        // Text reached EOF in `first`; inputless poll #1 delivers byte-identical attachment #2.
-        let poll1 = server.request(
-            "tools/call",
-            json!({"name": "exec", "arguments": {"action": "poll", "taskId": handle, "waitMs": 0}}),
-        )["result"]
-            .clone();
-        assert_eq!(poll1["isError"], false, "{poll1}");
-        assert_eq!(
-            poll1["content"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|b| b["type"] == "resource")
-                .count(),
-            1,
-            "{poll1}"
-        );
-        if structured {
-            assert_eq!(
-                poll1["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 2,
-                "{poll1}"
-            );
-        } else {
-            assert!(
-                code_text(&poll1).contains("Attached: #2 (video/mp4, 1800 B)"),
-                "{poll1}"
-            );
-        }
+    // Text reached EOF in `first`; inputless poll #1 delivers byte-identical attachment #2.
+    let poll1 = server.request(
+        "tools/call",
+        json!({"name": "exec", "arguments": {"action": "poll", "taskId": &handle, "waitMs": 0}}),
+    )["result"]
+        .clone();
+    assert_eq!(poll1["isError"], false, "{poll1}");
+    assert!(poll1.get("structuredContent").is_none(), "{poll1}");
+    assert_eq!(
+        poll1["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["type"] == "resource")
+            .count(),
+        1,
+        "{poll1}"
+    );
+    assert!(
+        code_text(&poll1).contains("Attached: #2 (video/mp4, 1800 B)"),
+        "{poll1}"
+    );
 
-        // Inputless poll #2 delivers #4; across poll #1 and poll #2, oversized #3 is skipped once
-        // with a visible warning naming #3.
-        let poll2 = server.request(
-            "tools/call",
-            json!({"name": "exec", "arguments": {"action": "poll", "taskId": handle, "waitMs": 0}}),
-        )["result"]
-            .clone();
-        assert_eq!(poll2["isError"], false, "{poll2}");
-        assert_eq!(image_count(&poll2), 1, "{poll2}");
-        let combined_poll_text = format!("{}\n{}\n{}", text1, code_text(&poll1), code_text(&poll2));
-        assert_eq!(
-            combined_poll_text
-                .matches("attachment #3 [application/pdf]")
-                .count(),
-            1,
-            "{combined_poll_text}"
-        );
-        if structured {
-            assert_eq!(
-                poll2["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 4,
-                "{poll2}"
-            );
-        } else {
-            assert!(
-                code_text(&poll2).contains("Attached: #4 (image/png,"),
-                "{poll2}"
-            );
-        }
+    // Inputless poll #2 delivers #4; across poll #1 and poll #2, oversized #3 is skipped once
+    // with a visible warning naming #3.
+    let poll2 = server.request(
+        "tools/call",
+        json!({"name": "exec", "arguments": {"action": "poll", "taskId": &handle, "waitMs": 0}}),
+    )["result"]
+        .clone();
+    assert_eq!(poll2["isError"], false, "{poll2}");
+    assert!(poll2.get("structuredContent").is_none(), "{poll2}");
+    assert_eq!(image_count(&poll2), 1, "{poll2}");
+    let combined_poll_text = format!("{}\n{}\n{}", text1, code_text(&poll1), code_text(&poll2));
+    assert_eq!(
+        combined_poll_text
+            .matches("attachment #3 [application/pdf]")
+            .count(),
+        1,
+        "{combined_poll_text}"
+    );
+    assert!(
+        code_text(&poll2).contains("Attached: #4 (image/png,"),
+        "{poll2}"
+    );
 
-        // Inputless poll #3 is caught up.
-        let poll3 = server.request(
-            "tools/call",
-            json!({"name": "exec", "arguments": {"action": "poll", "taskId": handle, "waitMs": 0}}),
-        )["result"]
-            .clone();
-        assert_eq!(poll3["content"].as_array().unwrap().len(), 1, "{poll3}");
+    // Inputless poll #3 is caught up.
+    let poll3 = server.request(
+        "tools/call",
+        json!({"name": "exec", "arguments": {"action": "poll", "taskId": &handle, "waitMs": 0}}),
+    )["result"]
+        .clone();
+    assert!(poll3.get("structuredContent").is_none(), "{poll3}");
+    assert_eq!(poll3["content"].as_array().unwrap().len(), 1, "{poll3}");
 
-        // Bare taskId attaches a fresh reader from index 1 for deterministic deduplication.
-        let fresh = server.request(
-            "tools/call",
-            json!({"name": "exec", "arguments": {"action": "poll", "taskId": bare_id(&handle), "waitMs": 0}}),
-        )["result"]
-            .clone();
-        assert!(code_text(&fresh).contains("new reader"), "{fresh}");
-        if structured {
-            assert_eq!(
-                fresh["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 1,
-                "{fresh}"
-            );
-        } else {
-            assert!(
-                code_text(&fresh).contains("Attached: #1 (video/mp4, 1800 B)"),
-                "{fresh}"
-            );
-        }
-    }
+    // Bare taskId attaches a fresh reader from index 1 for deterministic deduplication.
+    let fresh = server.request(
+        "tools/call",
+        json!({"name": "exec", "arguments": {"action": "poll", "taskId": bare_id(&handle), "waitMs": 0}}),
+    )["result"]
+        .clone();
+    assert!(fresh.get("structuredContent").is_none(), "{fresh}");
+    assert!(code_text(&fresh).contains("new reader"), "{fresh}");
+    assert!(
+        code_text(&fresh).contains("Attached: #1 (video/mp4, 1800 B)"),
+        "{fresh}"
+    );
 }
 
 #[test]
@@ -678,8 +552,7 @@ fn codemode_attach_covers_compress_mode_r4_4_parity_and_nested_opaque_handles() 
     let mut server = Server::start_with(|command| {
         command
             .current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "structured");
+            .env("FASTEXEC_CODEMODE", "true");
     });
 
     // 1. Six attachments deliver in one call (no legacy 4-image limit); R4-4 parity across
@@ -708,16 +581,19 @@ fn codemode_attach_covers_compress_mode_r4_4_parity_and_nested_opaque_handles() 
         "#
     );
     let prod = code_result(&mut server, json!({"code": producer_code}));
-    assert_eq!(prod["structuredContent"]["exitCode"], 0, "{prod}");
+    assert!(code_text(&prod).contains("[exited 0]"), "{prod}");
     assert_eq!(
-        prod["structuredContent"]["codemode"]["attachmentsDelivered"]
+        prod["content"]
             .as_array()
             .unwrap()
-            .len(),
+            .iter()
+            .filter(|b| b["type"] == "resource")
+            .count(),
         6,
         "{prod}"
     );
-    let prod_bare = bare_id(prod["structuredContent"]["taskId"].as_str().unwrap()).to_owned();
+    assert!(code_text(&prod).contains("Attached: #1 "), "{prod}");
+    let prod_bare = bare_id(task_id_of(code_text(&prod))).to_owned();
 
     // 2. Nested `poll` receives unforgeable opaque handles in `codemode.attachments` that can be
     //    re-attached multiple times while forged JSON clones throw TypeError.
@@ -739,27 +615,30 @@ fn codemode_attach_covers_compress_mode_r4_4_parity_and_nested_opaque_handles() 
         "#
     );
     let cons = code_result(&mut server, json!({"code": consumer_code}));
-    assert_eq!(cons["structuredContent"]["exitCode"], 0, "{cons}");
+    assert!(code_text(&cons).contains("[exited 0]"), "{cons}");
+    assert_eq!(body_of(code_text(&cons)), "[1,2,\"video/mp4\"]", "{cons}");
     assert_eq!(
-        cons["structuredContent"]["output"], "[1,2,\"video/mp4\"]",
-        "{cons}"
-    );
-    assert_eq!(
-        cons["structuredContent"]["codemode"]["attachmentsDelivered"]
+        cons["content"]
             .as_array()
             .unwrap()
-            .len(),
+            .iter()
+            .filter(|b| b["type"] == "resource")
+            .count(),
         2,
         "{cons}"
     );
+    assert!(
+        code_text(&cons).contains("Attached: #1 (video/mp4,")
+            && code_text(&cons).contains("#2 (video/mp4,"),
+        "{cons}"
+    );
 
-    // 3. Opt-in `FASTEXEC_IMAGE_COMPRESS=true` scales 2400x6 PNG to <= 2000px while structured
-    //    output omits legacy `[image 1:]` stdout markers and carries `attachmentsDelivered`.
+    // 3. Opt-in `FASTEXEC_IMAGE_COMPRESS=true` scales 2400x6 PNG to <= 2000px while
+    //    output omits legacy `[image 1:]` stdout markers and carries `Attached: #1`.
     let mut compressed = Server::start_with(|command| {
         command
             .env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_IMAGE_COMPRESS", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "structured");
+            .env("FASTEXEC_IMAGE_COMPRESS", "true");
     });
     let comp_res = code_result(
         &mut compressed,
@@ -779,12 +658,9 @@ fn codemode_attach_covers_compress_mode_r4_4_parity_and_nested_opaque_handles() 
     .unwrap();
     let decoded = image::load_from_memory(&data).unwrap();
     assert!(decoded.width() <= 2000 && decoded.height() <= 2000);
-    assert_eq!(
-        comp_res["structuredContent"]["output"], "clean-body",
-        "{comp_res}"
-    );
-    assert_eq!(
-        comp_res["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 1,
+    assert_eq!(body_of(code_text(&comp_res)), "clean-body", "{comp_res}");
+    assert!(
+        code_text(&comp_res).contains("Attached: #1 (image/png,"),
         "{comp_res}"
     );
 }
@@ -792,17 +668,17 @@ fn codemode_attach_covers_compress_mode_r4_4_parity_and_nested_opaque_handles() 
 #[test]
 fn codemode_nested_poll_and_kill_do_not_consume_other_tasks_background_notifications() {
     let mut server = codemode_server();
-    let (task, _) = server.ok(json!({
+    let task = server.ok(json!({
         "action":"start", "eof":false, "command":"read -r reply", "loginShell":false, "waitMs":0
     }));
-    let other = task["taskId"].as_str().unwrap().to_owned();
+    let other = task_id_of(&task).to_owned();
     let code = format!(
         "await tools.exec({{action:'poll',taskId:{},input:'done\\n',waitMs:10000}}); await tools.exec({{action:'kill',taskId:{}}}); text('done');",
         json!(other),
         json!(other)
     );
     let result = code_result(&mut server, json!({"code":code}));
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(code_text(&result).contains("[exited 0]"), "{result}");
     assert!(
         code_text(&result).contains(bare_id(&other)) && code_text(&result).contains("Background:"),
         "{result}"
@@ -835,13 +711,13 @@ if (polled.exitCode !== 3) throw new Error('delayed helper exit');
 return 'clean';
 "#;
     let result = code_result(&mut server, json!({"code":code}));
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(code_text(&result).contains("[exited 0]"), "{result}");
     assert!(
         !code_text(&result).contains("Background:"),
         "awaited helper tasks leaked into outer Background footer: {}",
         code_text(&result)
     );
-    let (_, next_text) = server.ok(json!({
+    let next_text = server.ok(json!({
         "action":"start", "command":"printf outer", "loginShell":false
     }));
     assert!(
@@ -859,8 +735,7 @@ fn codemode_script_cwd_applies_to_file_tools_and_nested_exec() {
     let mut server = Server::start_with(|command| {
         command
             .current_dir(&*outer)
-            .env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "both");
+            .env("FASTEXEC_CODEMODE", "true");
     });
     let code = format!(
         r#"
@@ -877,7 +752,7 @@ return {{ file: readBack.text }};
         json!(outer.to_string_lossy())
     );
     let result = code_result(&mut server, json!({"code":code, "cwd": &*inner}));
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(code_text(&result).contains("[exited 0]"), "{result}");
     assert!(inner.join("sub/item.txt").is_file());
     assert!(!outer.join("sub/item.txt").exists());
     assert_eq!(
@@ -894,8 +769,7 @@ return {{ file: readBack.text }};
         "outer-ok"
     );
     assert!(!inner.join("from-override.txt").exists());
-    let parsed: Value =
-        serde_json::from_str(result["structuredContent"]["output"].as_str().unwrap()).unwrap();
+    let parsed: Value = serde_json::from_str(body_of(code_text(&result))).unwrap();
     assert_eq!(parsed["file"], "one\nTWO\n");
 }
 
@@ -911,14 +785,14 @@ fn codemode_waits_match_verbatim_output_on_start_and_poll() {
             "returnWhen": {"outputContains": [marker]},
         }),
     );
-    let start_data = &started["structuredContent"];
-    server.ok(json!({"action": "kill", "taskId": start_data["taskId"]}));
-    assert_eq!(
-        start_data["waitEndedBy"]["condition"], "output_contains",
+    let start_text = code_text(&started);
+    let start_id = task_id_of(start_text).to_owned();
+    server.ok(json!({"action": "kill", "taskId": start_id}));
+    assert!(
+        start_text.contains(&format!("wait: output matched {:?}", marker)),
         "{started}"
     );
-    assert_eq!(start_data["waitEndedBy"]["text"], marker, "{started}");
-    assert_eq!(start_data["output"], marker, "{started}");
+    assert_eq!(body_of(start_text), marker, "{started}");
 
     let (release, release_bash) = scratch("codemode-matcher-release");
     let wait_command = format!("while [ ! -f '{release_bash}' ]; do sleep 0.02; done");
@@ -933,42 +807,38 @@ fn codemode_waits_match_verbatim_output_on_start_and_poll() {
             "returnWhen": {"outputContains": ["boot"]},
         }),
     );
-    let handle = &started["structuredContent"]["taskId"];
+    let handle = task_id_of(code_text(&started)).to_owned();
     std::fs::write(&*release, "ready").unwrap();
-    let (polled, text) = server.ok(json!({
-        "action": "poll", "taskId": handle, "waitMs": 10000,
+    let text = server.ok(json!({
+        "action": "poll", "taskId": &handle, "waitMs": 10000,
         "returnWhen": {"outputContains": [marker]},
     }));
-    server.ok(json!({"action": "kill", "taskId": handle}));
-    assert_eq!(
-        polled["waitEndedBy"]["condition"], "output_contains",
-        "{text}"
-    );
-    assert_eq!(polled["waitEndedBy"]["text"], marker, "{text}");
+    server.ok(json!({"action": "kill", "taskId": &handle}));
     assert!(
-        polled["output"].as_str().unwrap().contains(marker),
+        text.contains(&format!("wait: output matched {:?}", marker)),
         "{text}"
     );
+    assert!(body_of(&text).contains(marker), "{text}");
 }
 
 #[test]
 fn nested_list_marks_tasks_started_by_an_outer_call() {
     let mut server = codemode_server();
-    let (started, _) = server.ok(json!({
+    let started = server.ok(json!({
         "action": "start", "command": "sleep 0.1; exit 4",
         "loginShell": false, "waitMs": 0,
     }));
-    let handle = started["taskId"].as_str().unwrap();
+    let handle = task_id_of(&started).to_owned();
     let listed = code_result(
         &mut server,
         json!({
             "code": format!(
                 "await tools.exec({{action:'poll', taskId:{}}}); const list = await tools.exec({{action:'list', state:'finished'}}); return list.tasks.find(task => task.taskId === {}).exitCode;",
-                json!(handle), json!(bare_id(handle)),
+                json!(handle), json!(bare_id(&handle)),
             ),
         }),
     );
-    assert_eq!(listed["structuredContent"]["output"], "4", "{listed}");
+    assert_eq!(body_of(code_text(&listed)), "4", "{listed}");
     assert!(
         !code_text(&listed).contains("(Background:"),
         "the delivered nested list already reported the finished outer task: {listed}",
@@ -979,7 +849,7 @@ fn nested_list_marks_tasks_started_by_an_outer_call() {
 fn codemode_drains_inflight_spawns_before_publishing_started_tasks() {
     let mut server = codemode_server();
     // Fire unawaited starts and return immediately; any child that actually spawned must already
-    // be present in the initial codemode result's startedTasks.
+    // be present in the initial codemode result's status line.
     let code = r#"
 for (let i = 0; i < 4; i++) {
   tools.exec({action:'start', command:'sleep 30', loginShell:false, waitMs:60000});
@@ -988,27 +858,29 @@ await Promise.resolve();
 return 'returned-early';
 "#;
     let result = code_result(&mut server, json!({"code":code}));
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
-    let reported: std::collections::HashSet<String> =
-        result["structuredContent"]["codemode"]["startedTasks"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|entry| bare_id(entry["taskId"].as_str().unwrap()).to_owned())
-            .collect();
-    let (listed, _) = server.ok(json!({"action":"list", "state":"active"}));
-    let running_bash: Vec<String> = listed["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|task| task["kind"] == "bash")
-        .map(|task| task["taskId"].as_str().unwrap().to_owned())
+    let text = code_text(&result);
+    assert!(text.contains("[exited 0]"), "{result}");
+    let script_bare = bare_id(task_id_of(text)).to_owned();
+    let active = server.ok(json!({"action":"list", "state":"active"}));
+    let running_bash: Vec<String> = active
+        .lines()
+        .filter(|line| line.contains(&format!("via {script_bare}")))
+        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
         .collect();
-    for id in &running_bash {
+    if running_bash.len() <= 3 {
+        for id in &running_bash {
+            assert!(
+                text.contains(id),
+                "spawned bash task {id} missed initial status report: {text}"
+            );
+        }
+    } else {
         assert!(
-            reported.contains(id),
-            "spawned bash task {id} missed initial startedTasks report {reported:?}: {result}"
+            text.contains(&format!("parentTaskId=\"{script_bare}\"")),
+            "expected parentTaskId hint for >3 active children: {text}"
         );
+    }
+    for id in &running_bash {
         server.ok(json!({"action":"kill", "taskId":id}));
     }
 }
@@ -1025,13 +897,10 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
             "maxBytes": 16384
         }),
     );
-    assert_eq!(big_json["structuredContent"]["exitCode"], 0, "{big_json}");
-    assert!(
-        big_json["structuredContent"].get("cutLines").is_none(),
-        "{big_json}"
-    );
-    let body = big_json["structuredContent"]["output"].as_str().unwrap();
-    let parsed: Value = serde_json::from_str(body.trim()).expect("whole JSON line parses");
+    let big_text = code_text(&big_json);
+    assert!(big_text.contains("[exited 0]"), "{big_json}");
+    assert!(!big_text.contains("line cut at "), "{big_json}");
+    let parsed: Value = serde_json::from_str(body_of(big_text).trim()).expect("whole JSON line parses");
     assert_eq!(parsed["payload"].as_str().unwrap().len(), 10_000);
 
     // P0-1 + P2-2: An 800-byte JSON line fits whole inside maxBytes: 1000 without NOTES_RESERVE
@@ -1049,18 +918,10 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
         "len={} {near_text}",
         body_of(near_text).len()
     );
-    assert!(
-        near_cap["structuredContent"].get("cutLines").is_none(),
-        "{near_cap}"
-    );
+    assert!(!near_text.contains("line cut at "), "{near_cap}");
     assert!(!near_text.contains(" · log "), "{near_text}");
-    let parsed_near: Value = serde_json::from_str(
-        near_cap["structuredContent"]["output"]
-            .as_str()
-            .unwrap()
-            .trim(),
-    )
-    .expect("near-cap JSON parses whole");
+    let parsed_near: Value =
+        serde_json::from_str(body_of(near_text).trim()).expect("near-cap JSON parses whole");
     assert_eq!(parsed_near["nearCap"].as_str().unwrap().len(), 780);
 
     for tight in [100_u64, 150, 220, 320] {
@@ -1072,7 +933,7 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
             }),
         );
         let tight_text = code_text(&tight_res);
-        let tight_body = tight_res["structuredContent"]["output"].as_str().unwrap();
+        let tight_body = body_of(tight_text);
         assert!(
             tight_body.len() <= tight as usize,
             "tight={tight} len={}: {tight_text}",
@@ -1084,7 +945,7 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
         );
     }
 
-    // P0-1: Over-maxBytes single line cuts within budget, sets cutLines: 1, and names log for recovery.
+    // P0-1: Over-maxBytes single line cuts within budget and names log for recovery.
     let over_budget = code_result(
         &mut server,
         json!({
@@ -1100,13 +961,7 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
     );
     assert!(over_text.contains(" … [line cut at "), "{over_text}");
     assert!(over_text.contains(" · log "), "{over_text}");
-    assert_eq!(
-        over_budget["structuredContent"]["cutLines"], 1,
-        "{over_budget}"
-    );
-    let log_path = over_budget["structuredContent"]["logPath"]
-        .as_str()
-        .unwrap();
+    let log_path = log_path_of(over_text).unwrap();
     assert_eq!(
         std::fs::read_to_string(log_path).unwrap().trim().len(),
         10_000
@@ -1119,8 +974,10 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
             "code": "text('first\\rsecond  '); text('\\x1b[31mred\\x1b[0m  ');"
         }),
     );
-    let raw_out = raw_kept["structuredContent"]["output"].as_str().unwrap();
-    assert_eq!(raw_out, "first\rsecond  \n\x1b[31mred\x1b[0m  ");
+    assert_eq!(
+        body_of(code_text(&raw_kept)),
+        "first\rsecond  \n\x1b[31mred\x1b[0m  "
+    );
 
     // P0-2, P0-3, P2-8: nested uncut lines, >240s waitMs, input 2s poll default, >4 MiB log recovery,
     // nested transcript maxBytes-only tail default, and sh.quote bash round-trip.
@@ -1242,12 +1099,9 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
             "#
         }),
     );
-    assert_eq!(nested["structuredContent"]["exitCode"], 0, "{nested}");
+    assert!(code_text(&nested).contains("[exited 0]"), "{nested}");
     assert!(
-        nested["structuredContent"]["output"]
-            .as_str()
-            .unwrap()
-            .contains("all-nested-checks-ok"),
+        body_of(code_text(&nested)).contains("all-nested-checks-ok"),
         "{nested}"
     );
 
@@ -1269,37 +1123,29 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
             "waitMs": 300
         }),
     );
-    assert_eq!(
-        started_long["structuredContent"]["state"], "running",
+    assert!(
+        code_text(&started_long).contains("[running]"),
         "{started_long}"
     );
-    let script_handle = started_long["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let (polled_long, polled_text) = server.ok(json!({
+    let script_handle = task_id_of(code_text(&started_long)).to_owned();
+    let polled_text = server.ok(json!({
         "action": "poll",
         "taskId": script_handle,
         "waitMs": 45000
     }));
-    assert_eq!(polled_long["state"], "exited", "{polled_text}");
-    assert_eq!(polled_long["exitCode"], 0, "{polled_text}");
+    assert!(polled_text.contains("[exited 0]"), "{polled_text}");
     assert!(polled_text.contains("long-wait-resolved"), "{polled_text}");
 }
 
 #[test]
 fn completed_screen_and_empty_codemode_lines_follow_the_rendered_body() {
     let mut server = codemode_server();
-    let (screen, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action":"start", "command":"printf %0220d 0", "loginShell":false,
         "pty":true, "cols":90, "rows":5, "screen":true, "maxBytes":360
     }));
-    assert!(screen.get("omittedRows").is_none(), "{text}");
-    assert_eq!(
-        screen["output"].as_str().unwrap().matches('0').count(),
-        220,
-        "{text}"
-    );
+    assert!(!text.contains("top rows omitted"), "{text}");
+    assert_eq!(body_of(&text).matches('0').count(), 220, "{text}");
     assert!(!text.contains(" · log "), "{text}");
     assert!(body_of(&text).len() <= 360, "{text}");
 
@@ -1309,8 +1155,7 @@ fn completed_screen_and_empty_codemode_lines_follow_the_rendered_body() {
         "{}",
         code_text(&blank)
     );
-    let (_, next) =
-        server.ok(json!({"action":"poll","taskId":blank["structuredContent"]["taskId"]}));
+    let next = server.ok(json!({"action":"poll","taskId":task_id_of(code_text(&blank))}));
     assert!(next.starts_with("(no new output)"), "{next}");
 }
 
@@ -1326,7 +1171,6 @@ fn nested_stream_and_transcript_fit_the_status_after_a_long_log_path_is_shortene
     let mut server = Server::start_with(|command| {
         command
             .env("TMPDIR", &dir)
-            .env("FASTEXEC_OUTPUT_MODE", "both")
             .env("FASTEXEC_CODEMODE", "true");
     });
     let result = code_result(
@@ -1343,9 +1187,8 @@ fn nested_stream_and_transcript_fit_the_status_after_a_long_log_path_is_shortene
         "#
         }),
     );
-    let bodies: Vec<String> =
-        serde_json::from_str(result["structuredContent"]["output"].as_str().unwrap())
-            .unwrap_or_else(|_| panic!("{result}"));
+    let bodies: Vec<String> = serde_json::from_str(body_of(code_text(&result)))
+        .unwrap_or_else(|_| panic!("{result}"));
     let expected = format!("{:0400}", 1);
     assert_eq!(bodies[0], expected);
     assert!(bodies[1].lines().any(|line| line == expected), "{bodies:?}");
@@ -1355,42 +1198,35 @@ fn nested_stream_and_transcript_fit_the_status_after_a_long_log_path_is_shortene
 fn kill_delivers_unseen_output_gates_concurrent_polls_and_attaches_codemode_images() {
     let mut server = codemode_server();
 
-    let (started, _) = server.ok(json!({
+    let started = server.ok(json!({
         "action": "start",
         "loginShell": false,
         "command": "printf 'first\\n'; sleep 0.3; printf 'after-start-before-kill\\n'; sleep 60",
         "waitMs": 100
     }));
-    let handle = started["taskId"].as_str().unwrap().to_owned();
+    let handle = task_id_of(&started).to_owned();
     let bare = bare_id(&handle).to_owned();
     std::thread::sleep(Duration::from_millis(500));
-    let (killed, kill_text) = server.ok(json!({"action": "kill", "taskId": &handle}));
-    assert_eq!(killed["state"], "killed", "{kill_text}");
-    assert!(killed.get("waitEndedBy").is_none(), "{killed}");
-    let combined = format!(
-        "{}{}",
-        started["output"].as_str().unwrap_or_default(),
-        killed["output"].as_str().unwrap_or_default()
-    );
+    let kill_text = server.ok(json!({"action": "kill", "taskId": &handle}));
+    assert!(kill_text.contains("[killed"), "{kill_text}");
+    assert!(!kill_text.contains(" · wait: "), "{kill_text}");
+    let combined = format!("{}{}", body_of(&started), body_of(&kill_text));
     assert!(combined.contains("after-start-before-kill"), "{combined}");
-    let (after_kill, _) = server.ok(json!({"action": "poll", "taskId": &handle, "waitMs": 0}));
-    assert_eq!(after_kill["output"], "", "{after_kill}");
+    let after_kill = server.ok(json!({"action": "poll", "taskId": &handle, "waitMs": 0}));
+    assert_eq!(body_of(&after_kill), "(no new output)", "{after_kill}");
 
-    let (bare_kill, bare_kill_text) = server.ok(json!({"action": "kill", "taskId": &bare}));
-    assert!(
-        bare_kill["output"].as_str().unwrap().contains("first"),
-        "{bare_kill}"
-    );
+    let bare_kill_text = server.ok(json!({"action": "kill", "taskId": &bare}));
+    assert!(body_of(&bare_kill_text).contains("first"), "{bare_kill_text}");
     assert!(bare_kill_text.contains("new reader"), "{bare_kill_text}");
 
-    let (conc_start, _) = server.ok(json!({
+    let conc_start = server.ok(json!({
         "action": "start",
         "loginShell": false,
         "command": "printf 'ready\\n'; sleep 0.2; printf 'before-concurrent-kill\\n'; sleep 60",
         "returnWhen": {"outputContains": ["ready"]},
         "waitMs": 5000
     }));
-    let conc_id = conc_start["taskId"].as_str().unwrap().to_owned();
+    let conc_id = task_id_of(&conc_start).to_owned();
     std::thread::sleep(Duration::from_millis(400));
     server.next_id += 1;
     let poll_req = server.next_id;
@@ -1414,12 +1250,10 @@ fn kill_delivers_unseen_output_gates_concurrent_polls_and_attaches_codemode_imag
     let r1 = server.response(poll_req);
     assert_eq!(r1["result"]["isError"], false, "{r1}");
     assert_eq!(r2["result"]["isError"], false, "{r2}");
-    let out1 = r1["result"]["structuredContent"]["output"]
-        .as_str()
-        .unwrap_or_default();
-    let out2 = r2["result"]["structuredContent"]["output"]
-        .as_str()
-        .unwrap_or_default();
+    assert!(r1["result"].get("structuredContent").is_none(), "{r1}");
+    assert!(r2["result"].get("structuredContent").is_none(), "{r2}");
+    let out1 = body_of(code_text(&r1["result"]));
+    let out2 = body_of(code_text(&r2["result"]));
     let merged = format!("{out1}{out2}");
     assert_eq!(
         merged.matches("before-concurrent-kill").count(),
@@ -1437,22 +1271,16 @@ fn kill_delivers_unseen_output_gates_concurrent_polls_and_attaches_codemode_imag
             "waitMs": 200
         }),
     );
-    let cm_handle = img_script["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let child_tasks: Vec<String> = img_script["structuredContent"]["codemode"]["startedTasks"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| t["taskId"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    let cm_handle = task_id_of(code_text(&img_script)).to_owned();
+    let cm_bare = bare_id(&cm_handle).to_owned();
     let already_attached = image_count(&img_script);
     let kill_reply = server.request(
         "tools/call",
-        json!({"name": "exec", "arguments": {"action": "kill", "taskId": cm_handle}}),
+        json!({"name": "exec", "arguments": {"action": "kill", "taskId": &cm_handle}}),
+    );
+    assert!(
+        kill_reply["result"].get("structuredContent").is_none(),
+        "{kill_reply}"
     );
     let kill_attached = image_count(&kill_reply["result"]);
     assert_eq!(
@@ -1460,8 +1288,17 @@ fn kill_delivers_unseen_output_gates_concurrent_polls_and_attaches_codemode_imag
         1,
         "{img_script} / {kill_reply}"
     );
-    for child in child_tasks {
-        let _ = server.call(json!({"action": "kill", "taskId": child}));
+    let children_list = server.ok(json!({
+        "action": "list",
+        "parentTaskId": &cm_bare,
+        "state": "active"
+    }));
+    for line in children_list.lines() {
+        if let Some(child_id) = line.split_whitespace().next()
+            && child_id.contains('-')
+        {
+            let _ = server.call(json!({"action": "kill", "taskId": child_id}));
+        }
     }
 }
 
@@ -1473,8 +1310,7 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
     let mut server = Server::start_with(|command| {
         command
             .current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "both");
+            .env("FASTEXEC_CODEMODE", "true");
     });
 
     let concurrency = code_result(
@@ -1563,7 +1399,7 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
                     }
                 }
 
-                // 1025th pending call rejects with RangeError and caller stack.
+                // 1025th pending call rejects with ToolError(LIMIT) and caller stack.
                 const sleepers = Array.from({ length: 1024 }, () => sleep(200));
                 let capErr = null;
                 try {
@@ -1572,18 +1408,18 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
                     capErr = e;
                 }
                 await Promise.all(sleepers);
-                if (!capErr || capErr.name !== "RangeError" || !String(capErr.stack).includes("codemode.js:")) {
-                    throw new Error("1025th call mismatch: " + (capErr && capErr.stack));
+                if (!capErr || capErr.name !== "ToolError" || capErr.code !== "LIMIT" || !String(capErr.stack).includes("codemode.js:")) {
+                    throw new Error("1025th call mismatch: " + (capErr && (capErr.name + ":" + capErr.code + " " + capErr.stack)));
                 }
                 return "concurrency-ok";
             "#
         }),
     );
-    assert_eq!(
-        concurrency["structuredContent"]["exitCode"], 0,
+    assert!(
+        code_text(&concurrency).contains("[exited 0]"),
         "{concurrency}"
     );
-    assert_eq!(concurrency["structuredContent"]["output"], "concurrency-ok");
+    assert_eq!(body_of(code_text(&concurrency)), "concurrency-ok");
 
     // P1-3: Line 2 uncaught async ToolError names codemode.js:2; caught stack also names it;
     // unserializable returns exit 1 while null and "a\nb" succeed.
@@ -1591,12 +1427,12 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
         &mut server,
         json!({"code": "const x = 1;\nawait tools.read({ path: 'missing-on-line-2.txt' });\nreturn x;"}),
     );
-    assert_eq!(uncaught_line2["structuredContent"]["exitCode"], 1);
     assert!(
-        uncaught_line2["structuredContent"]["output"]
-            .as_str()
-            .unwrap()
-            .contains("codemode.js:2"),
+        code_text(&uncaught_line2).contains("[exited 1]"),
+        "{uncaught_line2}"
+    );
+    assert!(
+        body_of(code_text(&uncaught_line2)).contains("codemode.js:2"),
         "{uncaught_line2}"
     );
 
@@ -1606,36 +1442,37 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
             "code": "let s1 = '';\ntry { await tools.read({ path: 'nope.txt' }); } catch (e) { s1 = e.stack; }\nlet s2 = '';\ntry { await tools.exec({ action: 123 }); } catch (e) { s2 = e.stack; }\nreturn [s1.includes('codemode.js:2'), s2.includes('codemode.js:4')];"
         }),
     );
-    assert_eq!(caught_stacks["structuredContent"]["output"], "[true,true]");
+    assert_eq!(body_of(code_text(&caught_stacks)), "[true,true]");
 
     for bad_ret in ["return Symbol('x');", "return () => 1;", "return 1n;"] {
         let bad = code_result(&mut server, json!({"code": bad_ret}));
-        assert_eq!(bad["structuredContent"]["exitCode"], 1, "{bad_ret}: {bad}");
         assert!(
-            bad["structuredContent"]["output"]
-                .as_str()
-                .unwrap()
+            code_text(&bad).contains("[exited 1]"),
+            "{bad_ret}: {bad}"
+        );
+        assert!(
+            body_of(code_text(&bad))
                 .contains("Script error: TypeError: the return value is not JSON-serializable"),
             "{bad_ret}: {bad}"
         );
     }
     let ret_null = code_result(&mut server, json!({"code": "return null;"}));
-    assert_eq!(ret_null["structuredContent"]["exitCode"], 0);
-    assert_eq!(ret_null["structuredContent"]["output"], "null");
+    assert!(code_text(&ret_null).contains("[exited 0]"), "{ret_null}");
+    assert_eq!(body_of(code_text(&ret_null)), "null");
     let ret_lines = code_result(&mut server, json!({"code": "return 'a\\nb';"}));
-    assert_eq!(ret_lines["structuredContent"]["exitCode"], 0);
-    assert_eq!(ret_lines["structuredContent"]["output"], "a\nb");
+    assert!(code_text(&ret_lines).contains("[exited 0]"), "{ret_lines}");
+    assert_eq!(body_of(code_text(&ret_lines)), "a\nb");
 }
 
 #[test]
 fn codemode_list_folds_batch_and_preserves_earlier_top_level_tasks() {
     let mut server = codemode_server();
-    let (earlier, _) = server.ok(json!({
+    let earlier = server.ok(json!({
         "action": "start",
         "command": "printf earlier-top-level",
         "loginShell": false,
     }));
-    let earlier_bare = bare_id(earlier["taskId"].as_str().unwrap()).to_owned();
+    let earlier_bare = bare_id(task_id_of(&earlier)).to_owned();
 
     let batch = code_result(
         &mut server,
@@ -1651,27 +1488,19 @@ fn codemode_list_folds_batch_and_preserves_earlier_top_level_tasks() {
             "#
         }),
     );
-    assert_eq!(batch["structuredContent"]["exitCode"], 0, "{batch}");
-    let parent_bare = bare_id(batch["structuredContent"]["taskId"].as_str().unwrap()).to_owned();
+    assert!(code_text(&batch).contains("[exited 0]"), "{batch}");
+    let parent_bare = bare_id(task_id_of(code_text(&batch))).to_owned();
 
-    let (listed, text) = server.ok(json!({"action": "list"}));
-    let tasks = listed["tasks"].as_array().unwrap();
-    assert_eq!(listed["totalCount"], 2, "{listed}");
-    assert_eq!(tasks.len(), 2, "{listed}");
-    assert_eq!(tasks[0]["taskId"], parent_bare, "{listed}");
-    assert_eq!(tasks[0]["children"]["total"], 30, "{listed}");
-    assert_eq!(tasks[0]["children"]["done"], 30, "{listed}");
-    assert!(
-        tasks[0]["children"].get("activeTasks").is_none(),
-        "{listed}"
-    );
-    assert_eq!(tasks[1]["taskId"], earlier_bare, "{listed}");
+    let text = server.ok(json!({"action": "list"}));
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with(&parent_bare), "{text}");
+    assert!(lines[1].starts_with(&earlier_bare), "{text}");
     assert!(text.contains("30 tasks (30 done)"), "{text}");
     assert!(
         text.contains("30 folded codemode children hidden; pass parentTaskId to inspect."),
         "{text}"
     );
-    assert!(text.contains(&earlier_bare), "{text}");
+    assert!(!text.contains("  └─ "), "{text}");
 }
 
 #[test]
@@ -1690,27 +1519,15 @@ fn codemode_kill_shows_orphans_cancelled_starts_and_clears_background() {
             "waitMs": 50
         }),
     );
-    assert_eq!(
-        started["structuredContent"]["state"], "running",
-        "{started}"
-    );
-    let script_handle = started["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    assert!(code_text(&started).contains("[running]"), "{started}");
+    let script_handle = task_id_of(code_text(&started)).to_owned();
     let parent_bare = bare_id(&script_handle).to_owned();
 
     // Wait until all 8 START_PERMITS are active and 2 starts are queued.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let (listed, _) = server.ok(json!({"action": "list"}));
-        let parent = listed["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["taskId"] == parent_bare)
-            .unwrap();
-        if parent["children"]["active"] == 8 && parent["children"]["queued"] == 2 {
+        let listed = server.ok(json!({"action": "list"}));
+        if listed.contains("8 tasks (8 active, 2 queued)") {
             break;
         }
         assert!(
@@ -1720,20 +1537,14 @@ fn codemode_kill_shows_orphans_cancelled_starts_and_clears_background() {
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    let (killed, _) = server.ok(json!({"action": "kill", "taskId": &script_handle}));
-    assert_eq!(killed["state"], "killed", "{killed}");
+    let killed = server.ok(json!({"action": "kill", "taskId": &script_handle}));
+    assert!(killed.contains("[killed]"), "{killed}");
 
-    let (listed, text) = server.ok(json!({"action": "list"}));
-    let parent = &listed["tasks"][0];
-    assert_eq!(parent["taskId"], parent_bare, "{listed}");
-    assert_eq!(parent["state"], "killed", "{listed}");
-    assert_eq!(parent["children"]["total"], 8, "{listed}");
-    assert_eq!(parent["children"]["active"], 8, "{listed}");
-    assert_eq!(parent["children"]["cancelled"], 2, "{listed}");
-    assert_eq!(
-        parent["children"]["activeTasks"].as_array().unwrap().len(),
-        8,
-        "{listed}"
+    let text = server.ok(json!({"action": "list"}));
+    let first = text.lines().next().unwrap();
+    assert!(
+        first.starts_with(&format!("{parent_bare} [killed]")),
+        "{text}"
     );
     assert!(text.contains("8 tasks (8 active, 2 cancelled)"), "{text}");
     assert_eq!(
@@ -1742,22 +1553,18 @@ fn codemode_kill_shows_orphans_cancelled_starts_and_clears_background() {
         "{text}"
     );
 
-    let (active, active_text) = server.ok(json!({"action": "list", "state": "active"}));
-    let active_tasks = active["tasks"].as_array().unwrap();
-    assert_eq!(active_tasks.len(), 8, "{active}");
+    let active_text = server.ok(json!({"action": "list", "state": "active"}));
     let via_tag = format!(" · via {parent_bare}");
-    for task in active_tasks {
-        assert_eq!(task["parentTaskId"], parent_bare, "{active}");
-        assert_eq!(task["state"], "running", "{active}");
-    }
+    assert_eq!(active_text.lines().count(), 8, "{active_text}");
     assert_eq!(active_text.matches(&via_tag).count(), 8, "{active_text}");
+    assert_eq!(active_text.matches("[running]").count(), 8, "{active_text}");
 
     // Release all 8 orphans and wait for them to finish without reporting finished tasks.
     std::fs::write(&*release, "go").unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let (active_now, _) = server.ok(json!({"action": "list", "state": "active"}));
-        if active_now["tasks"].as_array().unwrap().is_empty() {
+        let active_now = server.ok(json!({"action": "list", "state": "active"}));
+        if active_now.contains("No active tasks.") || active_now.contains("No tasks.") {
             break;
         }
         assert!(
@@ -1767,7 +1574,7 @@ fn codemode_kill_shows_orphans_cancelled_starts_and_clears_background() {
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    let (_, nag_text) = server.ok(json!({
+    let nag_text = server.ok(json!({
         "action": "start",
         "command": "true",
         "loginShell": false,
@@ -1778,21 +1585,13 @@ fn codemode_kill_shows_orphans_cancelled_starts_and_clears_background() {
     );
 
     // One default list reports the folded finished orphans via the parent summary.
-    let (after_list, after_text) = server.ok(json!({"action": "list"}));
-    let parent_after = after_list["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["taskId"] == parent_bare)
-        .unwrap();
-    assert_eq!(parent_after["children"]["done"], 8, "{after_list}");
-    assert_eq!(parent_after["children"]["cancelled"], 2, "{after_list}");
+    let after_text = server.ok(json!({"action": "list"}));
     assert!(
         after_text.contains("8 tasks (8 done, 2 cancelled)"),
         "{after_text}"
     );
 
-    let (_, cleared_text) = server.ok(json!({
+    let cleared_text = server.ok(json!({
         "action": "start",
         "command": "true",
         "loginShell": false,
@@ -1819,54 +1618,22 @@ fn codemode_list_reports_live_queued_starts_accurately() {
             "waitMs": 50
         }),
     );
-    assert_eq!(
-        started["structuredContent"]["state"], "running",
-        "{started}"
-    );
-    let script_handle = started["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let parent_bare = bare_id(&script_handle).to_owned();
+    assert!(code_text(&started).contains("[running]"), "{started}");
+    let script_handle = task_id_of(code_text(&started)).to_owned();
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let (matched_list, matched_text) = loop {
-        let (listed, text) = server.ok(json!({"action": "list"}));
-        let parent = listed["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["taskId"] == parent_bare)
-            .unwrap();
-        let active = parent["children"]["active"].as_u64().unwrap_or(0);
-        let queued = parent["children"]["queued"].as_u64().unwrap_or(0);
-        assert!(
-            active + queued <= 12,
-            "double-counted active ({active}) + queued ({queued}) > 12: {listed}"
-        );
-        if active == 8 {
-            break (listed, text);
+    let matched_text = loop {
+        let text = server.ok(json!({"action": "list"}));
+        if text.contains("8 tasks (8 active, 4 queued)") {
+            break text;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for 8 active starts: {listed}"
+            "timed out waiting for 8 active + 4 queued: {text}"
         );
         std::thread::sleep(Duration::from_millis(25));
     };
 
-    let parent = matched_list["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["taskId"] == parent_bare)
-        .unwrap();
-    assert_eq!(parent["children"]["total"], 8, "{matched_list}");
-    assert_eq!(parent["children"]["active"], 8, "{matched_list}");
-    assert_eq!(parent["children"]["queued"], 4, "{matched_list}");
-    assert!(
-        matched_text.contains("8 tasks (8 active, 4 queued)"),
-        "{matched_text}"
-    );
     assert_eq!(
         matched_text
             .lines()
@@ -1877,13 +1644,13 @@ fn codemode_list_reports_live_queued_starts_accurately() {
     );
 
     std::fs::write(&*release, "go").unwrap();
-    let (done, _) = server.ok(json!({
+    let done = server.ok(json!({
         "action": "poll",
         "taskId": &script_handle,
         "waitMs": 15000
     }));
-    assert_eq!(done["exitCode"], 0, "{done}");
-    assert_eq!(done["output"], "12", "{done}");
+    assert!(done.contains("[exited 0]"), "{done}");
+    assert_eq!(body_of(&done), "12", "{done}");
 }
 
 #[test]
@@ -1933,8 +1700,7 @@ fn codemode_list_parent_task_id_drill_down_and_cross_session() {
             cmd.env("FASTEXEC_DAEMON", "on")
                 .env("FASTEXEC_TEST_RUNTIME_DIR", &*runtime)
                 .env("FASTEXEC_NAMESPACE", &namespace)
-                .env("FASTEXEC_CODEMODE", "true")
-                .env("FASTEXEC_OUTPUT_MODE", "both");
+                .env("FASTEXEC_CODEMODE", "true");
         })
     };
 
@@ -1957,50 +1723,41 @@ fn codemode_list_parent_task_id_drill_down_and_cross_session() {
             "#
         }),
     );
-    assert_eq!(script["structuredContent"]["exitCode"], 0, "{script}");
-    let script_handle = script["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    assert!(code_text(&script).contains("[exited 0]"), "{script}");
+    let script_handle = task_id_of(code_text(&script)).to_owned();
     let script_bare = bare_id(&script_handle).to_owned();
 
-    let (plain, _) = session_a.ok(json!({
+    let plain = session_a.ok(json!({
         "action": "start",
         "command": "printf plain-bash",
         "loginShell": false,
     }));
-    let plain_bare = bare_id(plain["taskId"].as_str().unwrap()).to_owned();
+    let plain_bare = bare_id(task_id_of(&plain)).to_owned();
 
     // Same-session drill-down accepts both bare task ID and reader handle.
     for query_id in [&script_bare, &script_handle] {
-        let (listed, _) = session_a.ok(json!({
+        let listed = session_a.ok(json!({
             "action": "list",
             "parentTaskId": query_id,
         }));
-        let tasks = listed["tasks"].as_array().unwrap();
-        assert_eq!(listed["totalCount"], 3, "{query_id}: {listed}");
-        assert_eq!(tasks.len(), 3, "{query_id}: {listed}");
-        for task in tasks {
-            assert_eq!(task["parentTaskId"], script_bare, "{listed}");
-            assert_eq!(task["kind"], "bash", "{listed}");
-            assert!(task.get("children").is_none(), "{listed}");
-        }
+        assert_eq!(listed.lines().count(), 3, "{query_id}: {listed}");
+        assert!(
+            listed.contains("printf a1")
+                && listed.contains("printf a2")
+                && listed.contains("printf a3"),
+            "{query_id}: {listed}"
+        );
     }
 
     // Plain bash task ID returns an empty list.
-    let (plain_listed, plain_text) = session_a.ok(json!({
+    let plain_text = session_a.ok(json!({
         "action": "list",
         "parentTaskId": &plain_bare,
     }));
     assert_eq!(plain_text, "No tasks.", "{plain_text}");
-    assert_eq!(plain_listed["totalCount"], 0, "{plain_listed}");
-    assert!(
-        plain_listed["tasks"].as_array().unwrap().is_empty(),
-        "{plain_listed}"
-    );
 
     // Unknown parentTaskId errors cleanly.
-    let (_, err_text, is_err) = session_a.call(json!({
+    let (err_text, is_err) = session_a.call(json!({
         "action": "list",
         "parentTaskId": "nonexistent-99",
     }));
@@ -2012,30 +1769,24 @@ fn codemode_list_parent_task_id_drill_down_and_cross_session() {
 
     // Cross-session drill-down works by default for both bare ID and reader handle.
     for query_id in [&script_bare, &script_handle] {
-        let (cross, _) = session_b.ok(json!({
+        let cross = session_b.ok(json!({
             "action": "list",
             "parentTaskId": query_id,
         }));
-        assert_eq!(cross["totalCount"], 3, "{query_id}: {cross}");
-        assert_eq!(
-            cross["tasks"].as_array().unwrap().len(),
-            3,
+        assert_eq!(cross.lines().count(), 3, "{query_id}: {cross}");
+        assert!(
+            cross.contains("printf a1") && cross.contains("printf a3"),
             "{query_id}: {cross}"
         );
-        for task in cross["tasks"].as_array().unwrap() {
-            assert_eq!(task["parentTaskId"], script_bare, "{cross}");
-        }
     }
 
     // Explicit scope: "session" restricts drill-down to caller's session.
-    let (scoped, scoped_text) = session_b.ok(json!({
+    let scoped_text = session_b.ok(json!({
         "action": "list",
         "parentTaskId": &script_bare,
         "scope": "session",
     }));
     assert_eq!(scoped_text, "No tasks.", "{scoped_text}");
-    assert_eq!(scoped["totalCount"], 0, "{scoped}");
-    assert!(scoped["tasks"].as_array().unwrap().is_empty(), "{scoped}");
 }
 
 #[test]
@@ -2061,35 +1812,23 @@ fn codemode_list_finished_state_promotes_finished_children_of_running_parent() {
             "returnWhen": {"outputContains": ["children-done"]},
         }),
     );
-    assert_eq!(
-        started["structuredContent"]["state"], "running",
-        "{started}"
-    );
-    let script_handle = started["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    assert!(code_text(&started).contains("[running]"), "{started}");
+    let script_handle = task_id_of(code_text(&started)).to_owned();
     let parent_bare = bare_id(&script_handle).to_owned();
 
-    let (finished, text) = server.ok(json!({"action": "list", "state": "finished"}));
-    let tasks = finished["tasks"].as_array().unwrap();
-    assert_eq!(finished["totalCount"], 2, "{finished}");
-    assert_eq!(tasks.len(), 2, "{finished}");
+    let text = server.ok(json!({"action": "list", "state": "finished"}));
     let via_tag = format!(" · via {parent_bare}");
-    for task in tasks {
-        assert_eq!(task["kind"], "bash", "{finished}");
-        assert_eq!(task["state"], "exited", "{finished}");
-        assert_eq!(task["parentTaskId"], parent_bare, "{finished}");
-    }
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert_eq!(text.matches("[exited 0]").count(), 2, "{text}");
     assert_eq!(text.matches(&via_tag).count(), 2, "{text}");
 
     std::fs::write(&*release, "go").unwrap();
-    let (ended, _) = server.ok(json!({
+    let ended = server.ok(json!({
         "action": "poll",
         "taskId": &script_handle,
         "waitMs": 10000,
     }));
-    assert_eq!(ended["exitCode"], 0, "{ended}");
+    assert!(ended.contains("[exited 0]"), "{ended}");
 }
 
 #[test]
@@ -2113,74 +1852,66 @@ fn codemode_list_sorts_by_active_child_recency_with_stable_total_count() {
             "returnWhen": {"outputContains": ["ready"]},
         }),
     );
-    assert_eq!(p_old["structuredContent"]["state"], "running", "{p_old}");
-    let p_old_handle = p_old["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    assert!(code_text(&p_old).contains("[running]"), "{p_old}");
+    let p_old_handle = task_id_of(code_text(&p_old)).to_owned();
     let p_old_bare = bare_id(&p_old_handle).to_owned();
 
     // Create two newer finished top-level tasks after P_old.
-    let (p1, _) = server.ok(json!({
+    let p1 = server.ok(json!({
         "action": "start",
         "command": "printf p1",
         "loginShell": false,
     }));
-    let p1_bare = bare_id(p1["taskId"].as_str().unwrap()).to_owned();
-    let (p2, _) = server.ok(json!({
+    let p1_bare = bare_id(task_id_of(&p1)).to_owned();
+    let p2 = server.ok(json!({
         "action": "start",
         "command": "printf p2",
         "loginShell": false,
     }));
-    let p2_bare = bare_id(p2["taskId"].as_str().unwrap()).to_owned();
+    let p2_bare = bare_id(task_id_of(&p2)).to_owned();
 
     // Now trigger P_old to spawn fresh active child C_old (newer than P1 and P2).
     std::fs::write(&*spawn_gate, "go").unwrap();
-    let (polled, polled_text) = server.ok(json!({
+    let polled_text = server.ok(json!({
         "action": "poll",
         "taskId": &p_old_handle,
         "waitMs": 10000,
         "returnWhen": {"outputContains": ["spawned="]},
     }));
-    let c_old_handle = polled["output"]
-        .as_str()
-        .unwrap()
+    let c_old_handle = body_of(&polled_text)
         .lines()
         .find_map(|l| l.strip_prefix("spawned="))
         .unwrap_or_else(|| panic!("missing spawned= line: {polled_text}"))
         .to_owned();
     let c_old_bare = bare_id(&c_old_handle).to_owned();
 
-    let (limited, limited_text) = server.ok(json!({"action": "list", "limit": 2}));
-    let limited_tasks = limited["tasks"].as_array().unwrap();
-    assert_eq!(limited["totalCount"], 3, "{limited}");
-    assert_eq!(limited_tasks.len(), 2, "{limited}");
-    assert_eq!(limited_tasks[0]["taskId"], p_old_bare, "{limited}");
-    assert_eq!(
-        limited_tasks[0]["children"]["activeTasks"][0]["taskId"], c_old_bare,
-        "{limited}"
-    );
-    assert_eq!(limited_tasks[1]["taskId"], p2_bare, "{limited}");
-    let first_line = limited_text.lines().next().unwrap();
-    let second_line = limited_text.lines().nth(1).unwrap();
-    assert!(first_line.starts_with(&p_old_bare), "{limited_text}");
+    let limited_text = server.ok(json!({"action": "list", "limit": 2}));
+    let lines: Vec<&str> = limited_text.lines().collect();
+    assert!(lines[0].starts_with(&p_old_bare), "{limited_text}");
     assert!(
-        second_line.starts_with(&format!("  └─ {c_old_bare}")),
+        lines[1].starts_with(&format!("  └─ {c_old_bare}")),
+        "{limited_text}"
+    );
+    assert!(lines[2].starts_with(&p2_bare), "{limited_text}");
+    assert!(
+        limited_text.contains("Showing 2 of 3 top-level tasks"),
         "{limited_text}"
     );
 
-    let (full, _) = server.ok(json!({"action": "list", "limit": 20}));
-    assert_eq!(full["totalCount"], limited["totalCount"], "{full}");
-    let full_ids: Vec<&str> = full["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["taskId"].as_str().unwrap())
+    let full_text = server.ok(json!({"action": "list", "limit": 20}));
+    let top_ids: Vec<&str> = full_text
+        .lines()
+        .filter(|l| {
+            !l.starts_with("  └─ ")
+                && !l.starts_with("Showing ")
+                && !l.contains("folded codemode children")
+        })
+        .filter_map(|l| l.split_whitespace().next())
         .collect();
     assert_eq!(
-        full_ids,
+        top_ids,
         vec![p_old_bare.as_str(), p2_bare.as_str(), p1_bare.as_str()],
-        "{full}"
+        "{full_text}"
     );
 
     server.ok(json!({"action": "kill", "taskId": &p_old_handle}));
@@ -2208,13 +1939,12 @@ fn codemode_list_fit_lines_atomic_blocks_and_outbound_limit_no_partial_report() 
             "#
         }),
     );
-    assert_eq!(started["structuredContent"]["exitCode"], 0, "{started}");
-    let child_handles: Vec<String> =
-        serde_json::from_str(started["structuredContent"]["output"].as_str().unwrap()).unwrap();
+    assert!(code_text(&started).contains("[exited 0]"), "{started}");
+    let child_handles: Vec<String> = serde_json::from_str(body_of(code_text(&started))).unwrap();
 
     for truncate in ["head_tail", "tail"] {
         for max_bytes in [150_u64, 250, 350, 450, 600] {
-            let (_, text) = server.ok(json!({
+            let text = server.ok(json!({
                 "action": "list",
                 "maxBytes": max_bytes,
                 "truncate": truncate,
@@ -2243,9 +1973,16 @@ fn codemode_list_fit_lines_atomic_blocks_and_outbound_limit_no_partial_report() 
     // cleanly and does not partially mark unreported tasks reported.
     let mut bounded = Server::start_with(|cmd| {
         cmd.env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "both")
             .env("FASTEXEC_TEST_OUTBOUND_LIMIT", "2600");
     });
+
+    for i in 0..16 {
+        bounded.ok(json!({
+            "action": "start",
+            "command": format!("true # filler-{i:02}-{}", "p".repeat(100)),
+            "loginShell": false,
+        }));
+    }
 
     let eight = code_result(
         &mut bounded,
@@ -2253,30 +1990,29 @@ fn codemode_list_fit_lines_atomic_blocks_and_outbound_limit_no_partial_report() 
             "code": r#"
                 const ids = [];
                 for (let i = 0; i < 8; i++) {
-                    const c = await tools.exec({ action: "start", command: "sleep 30", waitMs: 0, loginShell: false });
+                    const c = await tools.exec({ action: "start", command: "sleep 30 # " + "p".repeat(100), waitMs: 0, loginShell: false });
                     ids.push(c.taskId);
                 }
                 return ids;
             "#
         }),
     );
-    assert_eq!(eight["structuredContent"]["exitCode"], 0, "{eight}");
-    let eight_handles: Vec<String> =
-        serde_json::from_str(eight["structuredContent"]["output"].as_str().unwrap()).unwrap();
+    assert!(code_text(&eight).contains("[exited 0]"), "{eight}");
+    let eight_handles: Vec<String> = serde_json::from_str(body_of(code_text(&eight))).unwrap();
 
     // Start an unreported failing task after `eight` so `eight`'s response cannot report it.
-    let (unreported, _) = bounded.ok(json!({
+    let unreported = bounded.ok(json!({
         "action": "start",
         "command": "sleep 0.05; exit 2",
         "loginShell": false,
         "waitMs": 0,
     }));
-    let unreported_bare = bare_id(unreported["taskId"].as_str().unwrap()).to_owned();
+    let unreported_bare = bare_id(task_id_of(&unreported)).to_owned();
 
     // Wait for the background task to exit before calling list.
     std::thread::sleep(Duration::from_millis(150));
 
-    let (_, err_text, is_err) = bounded.call(json!({"action": "list"}));
+    let (err_text, is_err) = bounded.call(json!({"action": "list"}));
     assert!(is_err, "expected outbound limit error on list: {err_text}");
     assert!(
         err_text.contains("over the frame limit"),
@@ -2284,7 +2020,7 @@ fn codemode_list_fit_lines_atomic_blocks_and_outbound_limit_no_partial_report() 
     );
 
     // Unreported finished task must still surface in the background footer.
-    let (_, bg_text) = bounded.ok(json!({
+    let bg_text = bounded.ok(json!({
         "action": "start",
         "command": "true",
         "loginShell": false,
@@ -2323,26 +2059,20 @@ fn codemode_list_overflows_over_8_active_children_and_status_line_hints() {
             "#
         }),
     );
-    assert_eq!(exited["structuredContent"]["state"], "exited", "{exited}");
-    assert_eq!(exited["structuredContent"]["exitCode"], 0, "{exited}");
-    let exited_bare = bare_id(exited["structuredContent"]["taskId"].as_str().unwrap()).to_owned();
+    let exited_text = code_text(&exited);
+    assert!(exited_text.contains("[exited 0]"), "{exited}");
+    let exited_bare = bare_id(task_id_of(exited_text)).to_owned();
     let expected_exited_hint =
         format!("; list active with exec list parentTaskId=\"{exited_bare}\" state=\"active\"");
     assert!(
-        code_text(&exited).contains(&expected_exited_hint),
-        "missing exited status_line hint: {}",
-        code_text(&exited)
+        exited_text.contains(&expected_exited_hint),
+        "missing exited status_line hint: {exited_text}"
     );
 
-    let (listed, list_text) = server.ok(json!({"action": "list"}));
-    let parent = &listed["tasks"][0];
-    assert_eq!(parent["taskId"], exited_bare, "{listed}");
-    assert_eq!(parent["children"]["total"], 10, "{listed}");
-    assert_eq!(parent["children"]["active"], 10, "{listed}");
-    assert_eq!(
-        parent["children"]["activeTasks"].as_array().unwrap().len(),
-        8,
-        "{listed}"
+    let list_text = server.ok(json!({"action": "list"}));
+    assert!(
+        list_text.lines().next().unwrap().starts_with(&exited_bare),
+        "{list_text}"
     );
     assert!(list_text.contains("10 tasks (10 active)"), "{list_text}");
     let overflow_line = format!(
@@ -2359,14 +2089,19 @@ fn codemode_list_overflows_over_8_active_children_and_status_line_hints() {
     assert_eq!(indented_task_lines, 8, "{list_text}");
 
     // Clean up all 10 active children via parentTaskId drill-down.
-    let (children, _) = server.ok(json!({
+    let children = server.ok(json!({
         "action": "list",
         "parentTaskId": &exited_bare,
         "state": "active",
     }));
-    assert_eq!(children["totalCount"], 10, "{children}");
-    for child in children["tasks"].as_array().unwrap() {
-        server.ok(json!({"action": "kill", "taskId": child["taskId"]}));
+    let child_ids: Vec<&str> = children
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with("Warning:"))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert_eq!(child_ids.len(), 10, "{children}");
+    for child in child_ids {
+        server.ok(json!({"action": "kill", "taskId": child}));
     }
 
     // Case B: killed codemode with > 3 active children also appends the status_line hint.
@@ -2389,13 +2124,10 @@ fn codemode_list_overflows_over_8_active_children_and_status_line_hints() {
             "returnWhen": {"outputContains": ["four-ready"]},
         }),
     );
-    let killed_handle = running["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let killed_handle = task_id_of(code_text(&running)).to_owned();
     let killed_bare = bare_id(&killed_handle).to_owned();
-    let (killed, kill_text) = server.ok(json!({"action": "kill", "taskId": &killed_handle}));
-    assert_eq!(killed["state"], "killed", "{kill_text}");
+    let kill_text = server.ok(json!({"action": "kill", "taskId": &killed_handle}));
+    assert!(kill_text.contains("[killed]"), "{kill_text}");
     let expected_killed_hint =
         format!("; list active with exec list parentTaskId=\"{killed_bare}\" state=\"active\"");
     assert!(
@@ -2403,14 +2135,19 @@ fn codemode_list_overflows_over_8_active_children_and_status_line_hints() {
         "missing killed status_line hint: {kill_text}"
     );
 
-    let (killed_children, _) = server.ok(json!({
+    let killed_children = server.ok(json!({
         "action": "list",
         "parentTaskId": &killed_bare,
         "state": "active",
     }));
-    assert_eq!(killed_children["totalCount"], 4, "{killed_children}");
-    for child in killed_children["tasks"].as_array().unwrap() {
-        server.ok(json!({"action": "kill", "taskId": child["taskId"]}));
+    let killed_child_ids: Vec<&str> = killed_children
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with("Warning:"))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert_eq!(killed_child_ids.len(), 4, "{killed_children}");
+    for child in killed_child_ids {
+        server.ok(json!({"action": "kill", "taskId": child}));
     }
 }
 
@@ -2424,35 +2161,281 @@ fn list_does_not_report_warnings_from_trimmed_active_children() {
             "waitMs": 0
         }),
     );
-    let parent = started["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let parent = task_id_of(code_text(&started)).to_owned();
     let parent_id = bare_id(&parent).to_owned();
     let deadline = Instant::now() + Duration::from_secs(15);
     let child_id = loop {
-        let (listed, _) =
-            server.ok(json!({"action":"list", "parentTaskId":parent_id, "state":"active"}));
-        if let Some(child) = listed["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|task| task["outputOpen"] == true)
-        {
-            break child["taskId"].as_str().unwrap().to_owned();
+        let listed =
+            server.ok(json!({"action":"list", "parentTaskId":&parent_id, "state":"active"}));
+        if listed.contains("Warning:") && listed.contains("hold the output open") {
+            break listed
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().next())
+                .unwrap()
+                .to_owned();
         }
         assert!(Instant::now() < deadline, "{listed}");
         std::thread::sleep(Duration::from_millis(25));
     };
-    let (listed, text) = server.ok(json!({"action":"list","limit":1,"maxBytes":100}));
+    let text = server.ok(json!({"action":"list","limit":1,"maxBytes":100}));
     assert!(text.contains(&parent_id), "{text}");
     assert!(!text.contains(&child_id), "{text}");
-    assert!(listed.get("warnings").is_none(), "{listed}");
     assert!(!text.contains("Warning:"), "{text}");
-    assert!(
-        listed["tasks"][0]["children"]["activeTasks"][0]["warnings"].is_array(),
-        "{listed}"
-    );
     server.ok(json!({"action":"kill","taskId":parent}));
     server.ok(json!({"action":"kill","taskId":child_id}));
+}
+
+#[test]
+fn program_channel_emits_pure_data_keeps_nul_and_enforces_program_validation() {
+    let mut server = codemode_server();
+    let code = r#"
+        const checkNoMarkers = (label, text) => {
+            for (const marker of ["lines omitted:", "line cut at", "top rows omitted", "[cut]"]) {
+                if (text.includes(marker)) {
+                    throw new Error(`${label} leaked marker ${marker}: ${JSON.stringify(text)}`);
+                }
+            }
+        };
+
+        // Head and tail overflow emit pure lines with zero inline markers and exact metadata.
+        for (const truncate of ["head", "tail"]) {
+            const res = await tools.exec({
+                action: "start",
+                loginShell: false,
+                command: "for i in $(seq 1 40); do printf 'row-%03d-payload\\n' \"$i\"; done",
+                truncate,
+                maxBytes: 120,
+            });
+            checkNoMarkers(`exec-${truncate}`, res.output);
+            if (res.truncated !== true || typeof res.omittedLines !== "number" || res.omittedLines <= 0) {
+                throw new Error(`exec-${truncate} missing truncation metadata: ${JSON.stringify(res)}`);
+            }
+            if (!Array.isArray(res.omittedRange) || res.omittedRange.length !== 2) {
+                throw new Error(`exec-${truncate} missing omittedRange: ${JSON.stringify(res)}`);
+            }
+            if (truncate === "head" && !res.output.startsWith("row-001-payload")) {
+                throw new Error(`exec-head did not start at row-001: ${JSON.stringify(res.output)}`);
+            }
+            if (truncate === "tail" && !res.output.endsWith("row-040-payload")) {
+                throw new Error(`exec-tail did not end at row-040: ${JSON.stringify(res.output)}`);
+            }
+        }
+
+        // Single-line overflow slices cleanly without `[line cut at ...]` while setting cutLines.
+        const single = await tools.exec({
+            action: "start",
+            loginShell: false,
+            command: "printf '%0500d\\n' 0",
+            truncate: "head",
+            maxBytes: 100,
+        });
+        checkNoMarkers("single-line", single.output);
+        if (single.truncated !== true || single.cutLines !== 1 || single.output.length > 100) {
+            throw new Error(`single-line metadata mismatch: ${JSON.stringify(single)}`);
+        }
+
+        // PTY screen: true overflow drops top rows and slices wide rows with zero markers.
+        const ptyScreen = await tools.exec({
+            action: "start",
+            pty: true,
+            cols: 80,
+            rows: 12,
+            screen: true,
+            loginShell: false,
+            maxBytes: 100,
+            command: "for i in $(seq 1 12); do printf 'scr-%02d-%040d\\r\\n' \"$i\" 0; done; read -r _",
+            returnWhen: { screenContains: ["scr-12-"] },
+        });
+        await tools.exec({ action: "kill", taskId: ptyScreen.taskId });
+        checkNoMarkers("pty-screen-rows", ptyScreen.output);
+        if (ptyScreen.truncated !== true || !(ptyScreen.omittedRows > 0)) {
+            throw new Error(`pty-screen-rows metadata mismatch: ${JSON.stringify(ptyScreen)}`);
+        }
+
+        const ptyWide = await tools.exec({
+            action: "start",
+            pty: true,
+            cols: 200,
+            rows: 5,
+            screen: true,
+            loginShell: false,
+            maxBytes: 100,
+            command: "printf '%0180d' 0; read -r _",
+            returnWhen: { screenContains: ["0000000000"] },
+        });
+        await tools.exec({ action: "kill", taskId: ptyWide.taskId });
+        checkNoMarkers("pty-screen-wide", ptyWide.output);
+        if (ptyWide.truncated !== true || ptyWide.cutLines !== 1 || ptyWide.output.length > 100) {
+            throw new Error(`pty-screen-wide metadata mismatch: ${JSON.stringify(ptyWide)}`);
+        }
+
+        // keep_nul: true preserves NUL bytes in default non-raw Program exec output.
+        const nul = await tools.exec({
+            action: "start",
+            loginShell: false,
+            command: "printf 'a\\0b\\n'",
+        });
+        if (nul.output !== "a\0b") {
+            throw new Error(`NUL byte not preserved: ${JSON.stringify(nul.output)}`);
+        }
+
+        // Program mode rejects head_tail and rejects list maxBytes/truncate with VALIDATION.
+        for (const badCall of [
+            () => tools.exec({ action: "start", loginShell: false, command: "true", truncate: "head_tail" }),
+            () => tools.exec({ action: "list", maxBytes: 500 }),
+            () => tools.exec({ action: "list", truncate: "head" }),
+        ]) {
+            let caught = null;
+            try {
+                await badCall();
+            } catch (e) {
+                caught = e;
+            }
+            if (!caught || caught.name !== "ToolError" || caught.code !== "VALIDATION") {
+                throw new Error(`expected ToolError(VALIDATION), got ${caught && (caught.name + ":" + caught.code + " " + caught.message)}`);
+            }
+        }
+        return "program-channel-ok";
+    "#;
+    let res = code_result(&mut server, json!({"code": code}));
+    assert!(code_text(&res).contains("[exited 0]"), "{res}");
+    assert_eq!(body_of(code_text(&res)), "program-channel-ok", "{res}");
+}
+
+#[test]
+fn program_tool_errors_file_shapes_and_outer_attached_summary() {
+    let dir = Scratch::new("program-contracts");
+    std::fs::create_dir_all(&*dir).unwrap();
+    std::fs::write(dir.join("over4m.txt"), vec![b'a'; (4 << 20) + 1]).unwrap();
+    std::fs::write(dir.join("badutf8.txt"), [0x61u8, 0xff, 0x62, 0x0a]).unwrap();
+    let png_bytes = {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([10, 20, 30]),
+        ));
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    };
+    std::fs::write(dir.join("dot.png"), &png_bytes).unwrap();
+
+    let mut server = Server::start_with(|cmd| {
+        cmd.current_dir(&*dir)
+            .env("FASTEXEC_CODEMODE", "true");
+    });
+
+    let code = format!(
+        r#"
+        // tools.write returns {{ path, bytes }}.
+        const w = await tools.write({{ path: "doc.txt", content: "hello\n\u201cquote\u201d\ndup\ndup\n" }});
+        if (typeof w.path !== "string" || !w.path.endsWith("/doc.txt") || w.bytes !== 26) {{
+            throw new Error("write shape: " + JSON.stringify(w));
+        }}
+
+        // tools.edit returns {{ path, replacements, edits: [{{ line, fuzzy }}] }} for exact and fuzzy matches.
+        const ed = await tools.edit({{
+            path: "doc.txt",
+            edits: [
+                {{ oldText: "hello", newText: "HELLO" }},
+                {{ oldText: '"quote"', newText: '"QUOTED"' }},
+            ],
+        }});
+        if (ed.replacements !== 2 || !Array.isArray(ed.edits) || ed.edits.length !== 2) {{
+            throw new Error("edit shape: " + JSON.stringify(ed));
+        }}
+        if (ed.edits[0].line !== 1 || ed.edits[0].fuzzy !== false || ed.edits[1].line !== 2 || ed.edits[1].fuzzy !== true) {{
+            throw new Error("edit matches mismatch: " + JSON.stringify(ed.edits));
+        }}
+
+        // EDIT_FAILED carries failures array on err.result.
+        let editErr = null;
+        try {{
+            await tools.edit({{
+                path: "doc.txt",
+                edits: [
+                    {{ oldText: "missing-token", newText: "x" }},
+                    {{ oldText: "dup", newText: "DUP" }},
+                ],
+            }});
+        }} catch (e) {{
+            editErr = e;
+        }}
+        if (!editErr || editErr.name !== "ToolError" || editErr.code !== "EDIT_FAILED") {{
+            throw new Error("expected EDIT_FAILED: " + (editErr && (editErr.code + " " + editErr.message)));
+        }}
+        const failures = editErr.result?.failures;
+        if (!Array.isArray(failures) || failures.length !== 2 || failures[0].problem !== "not_found" || failures[1].problem !== "ambiguous") {{
+            throw new Error("EDIT_FAILED failures mismatch: " + JSON.stringify(editErr.result));
+        }}
+
+        // NOT_FOUND on missing file and unknown taskId.
+        for (const call of [
+            () => tools.read({{ path: "no-such-file.txt" }}),
+            () => tools.exec({{ action: "poll", taskId: "missing-99" }}),
+        ]) {{
+            let err = null;
+            try {{ await call(); }} catch (e) {{ err = e; }}
+            if (!err || err.name !== "ToolError" || err.code !== "NOT_FOUND") {{
+                throw new Error("expected NOT_FOUND: " + (err && (err.code + " " + err.message)));
+            }}
+        }}
+
+        // strict_whole_file: true -> LIMIT on >4 MiB, IO on non-UTF-8.
+        let limErr = null;
+        try {{ await tools.read({{ path: "over4m.txt" }}); }} catch (e) {{ limErr = e; }}
+        if (!limErr || limErr.name !== "ToolError" || limErr.code !== "LIMIT") {{
+            throw new Error("expected LIMIT: " + (limErr && (limErr.code + " " + limErr.message)));
+        }}
+        let utfErr = null;
+        try {{ await tools.read({{ path: "badutf8.txt" }}); }} catch (e) {{ utfErr = e; }}
+        if (!utfErr || utfErr.name !== "ToolError" || utfErr.code !== "IO") {{
+            throw new Error("expected IO for non-UTF-8: " + (utfErr && (utfErr.code + " " + utfErr.message)));
+        }}
+
+        // task_io_ok == false rejects with ToolError(IO) while preserving partial report on err.result.
+        const closedStdin = await tools.exec({{
+            action: "start",
+            eof: false,
+            loginShell: false,
+            command: "exec 0<&-; printf 'partial-ok\\n'; sleep 30",
+            returnWhen: {{ outputContains: ["partial-ok"] }},
+        }});
+        try {{
+            await tools.exec({{ action: "poll", taskId: closedStdin.taskId, input: "x\\n", waitMs: 100 }});
+        }} catch (_e) {{
+            // Expected stdin-closed failure.
+        }}
+        let ioErr = null;
+        try {{
+            await tools.exec({{ action: "kill", taskId: closedStdin.taskId }});
+        }} catch (e) {{
+            ioErr = e;
+        }}
+        if (!ioErr || ioErr.name !== "ToolError" || ioErr.code !== "IO" || !ioErr.result || ioErr.result.state !== "killed" || !ioErr.result.inputError) {{
+            throw new Error("expected IO with preserved result: " + JSON.stringify({{ code: ioErr?.code, result: ioErr?.result }}));
+        }}
+
+        // Media descriptor returns {{ kind, path, mimeType, bytes, attachable }} and attaches cleanly.
+        const media = await tools.read({{ path: "dot.png" }});
+        if (media.kind !== "image" || media.mimeType !== "image/png" || media.bytes !== {} || media.attachable !== true || !media.path.endsWith("/dot.png") || "data" in media) {{
+            throw new Error("media descriptor mismatch: " + JSON.stringify(media));
+        }}
+        attach(media);
+        return "contracts-ok";
+        "#,
+        png_bytes.len()
+    );
+
+    let res = code_result(&mut server, json!({"code": code}));
+    let text = code_text(&res);
+    assert!(text.contains("[exited 0]"), "{res}");
+    assert_eq!(body_of(text), "contracts-ok", "{res}");
+    assert_eq!(image_count(&res), 1, "{res}");
+    assert!(
+        text.contains(&format!("Attached: #1 (image/png, {} B)", png_bytes.len())),
+        "expected Attached summary line on outer codemode result: {text}"
+    );
 }

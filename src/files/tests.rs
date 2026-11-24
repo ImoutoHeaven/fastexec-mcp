@@ -4,7 +4,6 @@ use super::read::*;
 use super::write::*;
 use super::*;
 use crate::lease::{BytePool, Lease};
-use crate::service::render::{OutputMode, Render};
 use crate::session::LaunchContext;
 use serde_json::{Value, json};
 use std::fs::File;
@@ -63,28 +62,140 @@ fn context(cwd: &Path, home: &Path) -> LaunchContext {
     )
 }
 
+struct ReadView {
+    text: String,
+    body: Option<String>,
+    attachment: Option<ContentBlock>,
+    structured: Value,
+}
+
+type EditView = Result<(String, Value), (String, Option<Value>)>;
+
+fn read_data_to_view(data: FileReadData) -> ReadView {
+    match data {
+        FileReadData::Text(slice) => {
+            let text = format_text_slice(&slice);
+            let structured = json!({
+                "kind": "text",
+                "path": slice.path,
+                "startLine": slice.start_line,
+                "endLine": slice.end_line,
+                "shownLines": slice.shown_lines,
+                "totalLines": slice.total_lines,
+                "truncated": slice.truncated,
+                "nextOffset": slice.next_offset,
+                "lineTooLong": slice.line_too_long,
+                "lossy": slice.lossy,
+            });
+            ReadView {
+                text,
+                body: Some(slice.text),
+                attachment: None,
+                structured,
+            }
+        }
+        FileReadData::Media(MediaPayload::Inline {
+            kind,
+            resolved_path,
+            mime_type,
+            encoded_base64,
+            summary_line,
+            ..
+        }) => {
+            let bytes = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &encoded_base64,
+            )
+            .map(|b| b.len() as u64)
+            .unwrap_or(0);
+            let block = crate::media::content_block(kind, &mime_type, encoded_base64, &resolved_path);
+            let structured = json!({
+                "kind": kind.as_str(),
+                "mimeType": mime_type,
+                "bytes": bytes,
+                "attached": true,
+            });
+            ReadView {
+                text: summary_line,
+                body: None,
+                attachment: Some(block),
+                structured,
+            }
+        }
+        FileReadData::Media(MediaPayload::Descriptor {
+            kind,
+            path,
+            mime_type,
+            bytes,
+            source_bytes,
+            attachable,
+            note,
+        }) => {
+            let text = note.clone().unwrap_or_else(|| {
+                format!(
+                    "Read {} file [{}] ({} B)",
+                    kind.as_str(),
+                    mime_type,
+                    bytes.unwrap_or(0)
+                )
+            });
+            let structured = json!({
+                "kind": kind.as_str(),
+                "path": path,
+                "mimeType": mime_type,
+                "bytes": bytes,
+                "sourceBytes": source_bytes,
+                "attachable": attachable,
+                "note": note,
+            });
+            ReadView {
+                text,
+                body: None,
+                attachment: None,
+                structured,
+            }
+        }
+    }
+}
+
 fn read_text(
     request: &ReadRequest,
     launch: &LaunchContext,
     transfer: bool,
     policy: ReadPolicy,
-) -> Result<Outcome, String> {
+) -> Result<ReadView, String> {
     let owned = read_blocking(request, launch, transfer, policy, None);
-    let owner = owned.owner.clone();
     owned
         .run(|read| read)
-        .map(|data| read_data_to_outcome(data, policy, owner))
+        .map(read_data_to_view)
         .map_err(FileError::into_message)
 }
 
 fn edit_owned_outcome(
     request: &EditRequest,
     launch: &LaunchContext,
-) -> crate::ipc::Owned<BlockingOutcome> {
+) -> crate::ipc::Owned<EditView> {
     let owned = edit_blocking(request, launch);
     let owner = owned.owner.clone();
     let value = owned.run(|res| match res {
-        Ok(data) => Ok(edit_data_to_agent(data)),
+        Ok(data) => {
+            let mut text = format!(
+                "Successfully replaced {} block(s) in {}.",
+                data.replacements, data.path
+            );
+            for (index, item) in data.edits.iter().enumerate() {
+                text.push_str(&format!("\nedits[{index}]: line {}", item.line));
+                if item.fuzzy {
+                    text.push_str(" (fuzzy match)");
+                }
+            }
+            let structured = json!({
+                "path": data.path,
+                "replacements": data.replacements,
+                "edits": data.edits,
+            });
+            Ok((text, structured))
+        }
         Err(err) => {
             let structured = err.failures.map(|failures| {
                 json!({
@@ -100,7 +211,7 @@ fn edit_owned_outcome(
     crate::ipc::Owned::new(value, owner)
 }
 
-fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> BlockingOutcome {
+fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> EditView {
     edit_owned_outcome(request, launch).run(|outcome| outcome)
 }
 
@@ -3119,51 +3230,34 @@ fn multimodal_read_enforces_zero_guards_nested_descriptors_and_output_modes() {
         .is_err()
     );
 
-    // Valid offset/limit are silently ignored on PDF, WAV, and MP4, and all output modes omit structured["text"].
+    // Valid offset/limit are silently ignored on PDF, WAV, and MP4, and Agent responses carry no structured_content.
     for (file, expected_kind, expected_mime) in [
         ("doc.pdf", "document", "application/pdf"),
         ("tone.wav", "audio", "audio/wav"),
         ("clip.mp4", "video", "video/mp4"),
     ] {
-        for mode in [OutputMode::Text, OutputMode::Both, OutputMode::Structured] {
-            for sc in [true, false] {
-                let out = read_text(
-                    &ReadRequest {
-                        path: scratch.path(file),
-                        offset: Some(-5),
-                        limit: Some(2),
-                    },
-                    &launch,
-                    true,
-                    ReadPolicy::AGENT,
-                )
-                .unwrap();
-                let tracked = out.into_tracked(
-                    Render {
-                        output_mode: mode,
-                        structured_content: sc,
-                    }
-                    .effective(),
-                );
-                assert_eq!(tracked.result.content.len(), 2);
-                let head = tracked.result.content[0].as_text().unwrap();
-                assert!(
-                    head.text
-                        .starts_with(&format!("Read {expected_kind} file [{expected_mime}]")),
-                    "{}",
-                    head.text
-                );
-                if sc {
-                    let meta = tracked.result.structured_content.as_ref().unwrap();
-                    assert_eq!(meta["kind"], expected_kind);
-                    assert_eq!(meta["mimeType"], expected_mime);
-                    assert_eq!(meta["attached"], true);
-                    assert!(meta.get("text").is_none());
-                } else {
-                    assert!(tracked.result.structured_content.is_none());
-                }
-            }
-        }
+        let owned = read_blocking(
+            &ReadRequest {
+                path: scratch.path(file),
+                offset: Some(-5),
+                limit: Some(2),
+            },
+            &launch,
+            true,
+            ReadPolicy::AGENT,
+            None,
+        );
+        let owner = owned.owner.clone();
+        let tracked = render_read_agent(owned.run(|r| r).unwrap(), owner);
+        assert_eq!(tracked.result.content.len(), 2);
+        let head = tracked.result.content[0].as_text().unwrap();
+        assert!(
+            head.text
+                .starts_with(&format!("Read {expected_kind} file [{expected_mime}]")),
+            "{}",
+            head.text
+        );
+        assert!(tracked.result.structured_content.is_none());
 
         // Nested codemode read returns attachable descriptor without base64 attachment.
         let nested = read_text(
@@ -3568,12 +3662,7 @@ async fn cancelled_nested_file_read_retains_io_permit_until_blocking_worker_fini
     std::fs::write(&path, "alpha\nbeta\n").unwrap();
     let launch = Arc::new(context(&scratch.0, &scratch.0));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-    let render = Render {
-        structured_content: true,
-        output_mode: OutputMode::Text,
-    };
-
-    // Hold MUTATION on a dedicated OS thread while write_nested enters spawn_blocking, then
+    // Hold MUTATION on a dedicated OS thread while write_core enters spawn_blocking, then
     // abort the awaiting future and verify the permit stays taken until MUTATION unlocks.
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -3587,21 +3676,20 @@ async fn cancelled_nested_file_read_retains_io_permit_until_blocking_worker_fini
     let permit = semaphore.clone().acquire_owned().await.unwrap();
     let write_launch = Arc::clone(&launch);
     let write_path = path.display().to_string();
-    let mut fut = Box::pin(write_nested(
+    let mut fut = Box::pin(write_core(
         WriteRequest {
             path: write_path,
             content: "updated\n".into(),
         },
         write_launch,
-        render,
-        permit,
+        Some(permit),
         Default::default(),
     ));
     let polled_once =
         std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_pending())).await;
     assert!(
         polled_once,
-        "write_nested must be pending while MUTATION is held"
+        "write_core must be pending while MUTATION is held"
     );
     drop(fut);
     assert_eq!(
@@ -3625,10 +3713,6 @@ async fn text_buffer_file_worker_results_keep_input_owner() {
     let pool = BytePool::new(1024 * 1024);
     let input_pool = BytePool::new(512);
     let launch = Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool)));
-    let render = Render {
-        output_mode: OutputMode::Both,
-        structured_content: true,
-    };
     for (tool, arguments, error) in [
         (
             "write",
@@ -3648,12 +3732,12 @@ async fn text_buffer_file_worker_results_keep_input_owner() {
             arguments,
             Arc::clone(&launch),
             false,
-            render,
             None,
             crate::lease::Owner::new(input_pool.try_acquire(512).unwrap()),
         )
         .await;
         assert_eq!(tracked.result.is_error, Some(error), "{:?}", tracked.result);
+        assert!(tracked.result.structured_content.is_none());
         assert_eq!(input_pool.used(), 512);
         assert!(pool.used() > 0);
         drop(tracked);
@@ -3678,15 +3762,12 @@ async fn path_workspace_admits_missing_file_errors_and_keeps_their_owner() {
             },
             Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool))),
             false,
-            Render {
-                output_mode: OutputMode::Both,
-                structured_content: true,
-            },
             None,
             Default::default(),
         )
         .await;
         assert_eq!(result.result.is_error, Some(true));
+        assert!(result.result.structured_content.is_none());
         assert_eq!(result.overload, budget < required);
         let text = result.result.content[0].as_text().unwrap();
         if budget < required {
@@ -3722,14 +3803,11 @@ async fn path_workspace_media_and_binary_errors_do_not_require_text_workspace() 
             },
             Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool))),
             false,
-            Render {
-                output_mode: OutputMode::Both,
-                structured_content: true,
-            },
             None,
             Default::default(),
         )
         .await;
+        assert!(result.result.structured_content.is_none());
         assert_eq!(
             result.result.is_error,
             Some(error),
@@ -4167,14 +4245,11 @@ async fn write_target_workspace_admits_before_publish_and_retains_errors() {
             json!({"path":path, "content":"changed"}),
             Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool))),
             false,
-            Render {
-                output_mode: OutputMode::Both,
-                structured_content: true,
-            },
             None,
             Default::default(),
         )
         .await;
+        assert!(result.result.structured_content.is_none());
         assert_eq!(result.result.is_error, Some(cap < required));
         assert_eq!(
             scratch.read(path),
@@ -4239,14 +4314,11 @@ async fn path_workspace_mutations_admit_before_touching_the_file() {
                 arguments,
                 Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool))),
                 false,
-                Render {
-                    output_mode: OutputMode::Both,
-                    structured_content: true,
-                },
                 None,
                 Default::default(),
             )
             .await;
+            assert!(result.result.structured_content.is_none());
             // Native targets and edit contents have independent reservations;
             // a request-path-only budget must leave both operations unchanged.
             let refused = true;
@@ -4295,41 +4367,31 @@ fn text_buffer_reads_admit_before_copy_and_keep_the_result_owned() {
             - SNIFF
             + 16 * retained;
         for (budget, fits) in [(peak - 1, false), (peak, true)] {
-            for mode in [OutputMode::Text, OutputMode::Both, OutputMode::Structured] {
-                let pool = BytePool::new(budget);
-                let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool));
-                let owned = read_blocking(&request, &launch, false, limits, None);
-                if !fits {
-                    assert!(matches!(owned.value, Err(FileError::Overload(_))));
-                    drop(owned);
-                    assert_eq!(pool.used(), 0);
-                    continue;
-                }
-                let owner = owned.owner.clone();
-                let outcome = match owned.run(|read| read) {
-                    Ok(data) => read_data_to_outcome(data, limits, owner),
-                    Err(_) => panic!("the exact text workspace must fit"),
-                };
-                assert_eq!(outcome.body.as_deref(), Some(expected));
-                assert_eq!(pool.used(), peak);
-                let tracked = outcome.into_tracked(Render {
-                    output_mode: mode,
-                    structured_content: true,
-                });
-                assert!(
-                    tracked.lease.as_ref().unwrap().bytes()
-                        >= service_render::result_payload_capacity(&tracked.result)
-                );
-                let data = tracked.result.structured_content.as_ref().unwrap();
-                if mode == OutputMode::Text {
-                    assert!(data.get("text").is_none());
-                } else {
-                    assert_eq!(data["text"], expected);
-                }
-                assert_eq!(pool.used(), peak);
-                drop(tracked);
+            let pool = BytePool::new(budget);
+            let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool));
+            let owned = read_blocking(&request, &launch, false, limits, None);
+            if !fits {
+                assert!(matches!(owned.value, Err(FileError::Overload(_))));
+                drop(owned);
                 assert_eq!(pool.used(), 0);
+                continue;
             }
+            let owner = owned.owner.clone();
+            let data = owned.run(|read| read).expect("the exact text workspace must fit");
+            let FileReadData::Text(ref slice) = data else {
+                panic!("expected text slice");
+            };
+            assert_eq!(slice.text, expected);
+            assert_eq!(pool.used(), peak);
+            let tracked = render_read_agent(data, owner);
+            assert!(
+                tracked.lease.as_ref().unwrap().bytes()
+                    >= crate::service::render::result_payload_capacity(&tracked.result)
+            );
+            assert!(tracked.result.structured_content.is_none());
+            assert_eq!(pool.used(), peak);
+            drop(tracked);
+            assert_eq!(pool.used(), 0);
         }
     }
 }
@@ -4418,11 +4480,7 @@ async fn ipc_ingress_file_worker_keeps_input_after_wait_is_dropped() {
         path: "owned.txt".into(),
         content: "ordinary input\n".into(),
     };
-    let render = Render {
-        output_mode: OutputMode::Text,
-        structured_content: true,
-    };
-    let mut waiting = Box::pin(write(request, launch, render, owner));
+    let mut waiting = Box::pin(write_tracked(request, launch, owner));
     assert!(
         std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending()))
             .await
@@ -5251,12 +5309,10 @@ async fn read_core_media_descriptor_only_vs_inline() {
         FileReadData::Media(MediaPayload::Inline {
             kind,
             encoded_base64,
-            bytes,
             ..
         }) => {
             assert_eq!(*kind, crate::media::MediaKind::Image);
             assert!(!encoded_base64.is_empty());
-            assert!(*bytes > 0);
         }
         other => panic!("expected MediaPayload::Inline, got {other:?}"),
     }
@@ -5472,10 +5528,6 @@ async fn write_and_edit_tracked_propagate_overload_when_pool_exhausted() {
     let pool = BytePool::new(64);
     let _held = pool.try_acquire(64).expect("exhaust pool");
     let launch = Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool)));
-    let render = Render {
-        output_mode: OutputMode::Both,
-        structured_content: true,
-    };
 
     let write_res = write_tracked(
         WriteRequest {
@@ -5483,11 +5535,11 @@ async fn write_and_edit_tracked_propagate_overload_when_pool_exhausted() {
             content: "data".into(),
         },
         Arc::clone(&launch),
-        render,
         Default::default(),
     )
     .await;
     assert_eq!(write_res.result.is_error, Some(true));
+    assert!(write_res.result.structured_content.is_none());
     assert!(write_res.overload, "{:?}", write_res.result);
 
     let edit_res = edit_tracked(
@@ -5501,10 +5553,10 @@ async fn write_and_edit_tracked_propagate_overload_when_pool_exhausted() {
             }],
         },
         launch,
-        render,
         Default::default(),
     )
     .await;
     assert_eq!(edit_res.result.is_error, Some(true));
+    assert!(edit_res.result.structured_content.is_none());
     assert!(edit_res.overload, "{:?}", edit_res.result);
 }

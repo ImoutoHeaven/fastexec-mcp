@@ -1209,11 +1209,17 @@ pub fn is_compressible_image(mime: &str, bytes: &[u8]) -> bool {
 pub struct CompressedImage {
     pub bytes: Vec<u8>,
     pub mime: String,
+    #[cfg(test)]
     pub original_bytes: u64,
+    #[cfg(test)]
     pub original_width: u32,
+    #[cfg(test)]
     pub original_height: u32,
+    #[cfg(test)]
     pub width: u32,
+    #[cfg(test)]
     pub height: u32,
+    #[cfg(test)]
     pub transformed: bool,
     pub hints: Vec<String>,
 }
@@ -1230,6 +1236,7 @@ pub fn compress_image(
     mime: &str,
     lease: &mut Lease,
 ) -> Result<CompressedImage, CompressFailure> {
+    #[cfg(test)]
     let original_bytes = bytes.len() as u64;
     let base = normalize_mime(mime);
     let passthrough_mime = match base.as_str() {
@@ -1307,6 +1314,7 @@ pub fn compress_image(
             h = resized.height,
         ));
     }
+    #[cfg(test)]
     let transformed = converted_from
         .as_ref()
         .is_some_and(|from| *from != resized.mime)
@@ -1314,11 +1322,17 @@ pub fn compress_image(
     Ok(CompressedImage {
         bytes: resized.bytes,
         mime: resized.mime,
+        #[cfg(test)]
         original_bytes,
+        #[cfg(test)]
         original_width: resized.original_width,
+        #[cfg(test)]
         original_height: resized.original_height,
+        #[cfg(test)]
         width: resized.width,
+        #[cfg(test)]
         height: resized.height,
+        #[cfg(test)]
         transformed,
         hints,
     })

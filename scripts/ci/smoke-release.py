@@ -81,8 +81,8 @@ class Client:
     def tool(self, name, arguments):
         result = self.request("tools/call", {"name": name, "arguments": arguments})
         assert not result.get("isError", False), result
-        text = "\n".join(item.get("text", "") for item in result.get("content", []))
-        return result.get("structuredContent"), text
+        assert "structuredContent" not in result, result
+        return "\n".join(item.get("text", "") for item in result.get("content", []))
 
     def close(self):
         if self.process.stdin and not self.process.stdin.closed:
@@ -96,9 +96,20 @@ class Client:
         assert status == 0, f"fastexec exited {status}"
 
 
-def finished(result, text, marker):
-    assert result["state"] == "exited" and result["exitCode"] == 0, (result, text)
-    assert marker in text, (result, text)
+def status_line(text):
+    for line in reversed(text.splitlines()):
+        if line.startswith("[") and "] " in line:
+            return line
+    raise AssertionError(f"missing status line: {text!r}")
+
+
+def task_handle(text):
+    return status_line(text).split("] ", 1)[1].split(" ", 1)[0]
+
+
+def finished(text, marker):
+    assert status_line(text).startswith("[exited 0] "), text
+    assert marker in text, text
 
 
 def smoke(binary, version):
@@ -117,27 +128,27 @@ def smoke(binary, version):
             client.tool("edit", {"path": path, "edits": [
                 {"oldText": "release:before", "newText": "release:after"},
             ]})
-            _, text = client.tool("read", {"path": path})
+            text = client.tool("read", {"path": path})
             assert text == "release:after\n", text
             assert Path(path).read_text() == "release:after\n"
-            result, text = client.tool("exec", {
+            text = client.tool("exec", {
                 "action": "start", "command": "printf '%s\\n' RELEASE_PIPE_OK",
                 "cwd": directory, "loginShell": False, "waitMs": 10000, "killAfterMs": 20000,
             })
-            finished(result, text, "RELEASE_PIPE_OK")
+            finished(text, "RELEASE_PIPE_OK")
 
-            result, text = client.tool("exec", {
+            text = client.tool("exec", {
                 "action": "start", "pty": True, "cols": 80, "rows": 24,
                 "command": "stty -echo; stty size; IFS= read -r line; stty size; printf 'PTY:%s\\n' \"$line\"",
                 "cwd": directory, "loginShell": False, "waitMs": 10000, "killAfterMs": 20000,
                 "returnWhen": {"outputContains": ["24 80"]},
             })
-            assert result["state"] == "running" and "24 80" in text, (result, text)
-            result, text = client.tool("exec", {
-                "action": "poll", "taskId": result["taskId"], "cols": 100, "rows": 40,
+            assert status_line(text).startswith("[running] ") and "24 80" in text, text
+            text = client.tool("exec", {
+                "action": "poll", "taskId": task_handle(text), "cols": 100, "rows": 40,
                 "input": "ready", "keys": ["Enter"], "keyDelayMs": 0, "waitMs": 10000,
             })
-            finished(result, text, "PTY:ready")
+            finished(text, "PTY:ready")
             assert "40 100" in text, text
         print("PASS: initialize, tools/list, files, pipe exec, PTY input and resize", flush=True)
 
@@ -159,20 +170,20 @@ def smoke(binary, version):
             assert "epoch " in daemon("status")
             env["FASTEXEC_DAEMON"] = "on"
             with contextlib.closing(Client(binary, env, version)) as first:
-                result, text = first.tool("exec", {
+                text = first.tool("exec", {
                     "action": "start", "command": "printf DAEMON_READY; IFS= read -r line; printf 'DAEMON:%s\\n' \"$line\"",
                     "cwd": directory, "loginShell": False, "eof": False, "waitMs": 10000, "killAfterMs": 30000,
                     "returnWhen": {"outputContains": ["DAEMON_READY"]},
                 })
-                assert result["state"] == "running" and "DAEMON_READY" in text, (result, text)
-                task = result["taskId"]
+                assert status_line(text).startswith("[running] ") and "DAEMON_READY" in text, text
+                task = task_handle(text)
             with contextlib.closing(Client(binary, env, version)) as second:
-                listed, _ = second.tool("exec", {"action": "list", "scope": "all"})
-                assert any(item["taskId"] == task.split(".", 1)[0] for item in listed["tasks"]), listed
-                result, text = second.tool("exec", {
+                listed = second.tool("exec", {"action": "list", "scope": "all"})
+                assert task.split(".", 1)[0] in listed, listed
+                text = second.tool("exec", {
                     "action": "poll", "taskId": task, "input": "again\n", "waitMs": 10000,
                 })
-                finished(result, text, "DAEMON:again")
+                finished(text, "DAEMON:again")
         finally:
             daemon("stop")
         assert daemon("status").startswith("No fastexec daemon"), "daemon still running"

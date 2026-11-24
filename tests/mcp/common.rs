@@ -19,6 +19,25 @@ pub(super) fn body_of(text: &str) -> &str {
     text.split_once("\n\n[").map_or(text, |(body, _)| body)
 }
 
+pub(super) fn status_line(text: &str) -> &str {
+    text.lines()
+        .rev()
+        .find(|line| line.starts_with('[') && line.contains("] "))
+        .unwrap_or_else(|| panic!("no status line: {text}"))
+}
+
+pub(super) fn task_id_of(text: &str) -> &str {
+    status_line(text)
+        .split_once("] ")
+        .and_then(|(_, rest)| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("no taskId in status line: {text}"))
+}
+
+pub(super) fn log_path_of(text: &str) -> Option<&str> {
+    let after = status_line(text).split_once(" · log ")?.1;
+    Some(after.split(" · ").next().unwrap_or(after))
+}
+
 pub(super) fn bare_id(handle: &str) -> &str {
     handle.split_once('.').expect("a reader handle").0
 }
@@ -236,8 +255,8 @@ impl Server {
         }
     }
 
-    /// Calls the tool and returns (structuredContent, text, isError).
-    pub(super) fn call(&mut self, arguments: Value) -> (Value, String, bool) {
+    /// Calls the exec tool and returns (text, isError), asserting no structuredContent.
+    pub(super) fn call(&mut self, arguments: Value) -> (String, bool) {
         let start = arguments["action"] == "start";
         let message = self.request(
             "tools/call",
@@ -245,27 +264,19 @@ impl Server {
         );
         let result = &message["result"];
         assert!(result.is_object(), "protocol error: {message}");
+        assert!(
+            result.get("structuredContent").is_none(),
+            "unexpected structuredContent: {result}"
+        );
         let text = result["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
             .to_string();
         let is_error = result["isError"] == json!(true);
         if start && !is_error {
-            // The status line, the last line that opens with `[`, names the task after the state.
-            let id = text
-                .lines()
-                .rev()
-                .find_map(|line| {
-                    line.strip_prefix('[')?
-                        .split_once("] ")?
-                        .1
-                        .split(' ')
-                        .next()
-                })
-                .unwrap_or_else(|| panic!("no status line: {text}"));
-            self.started.push(id.to_string());
+            self.started.push(task_id_of(&text).to_string());
         }
-        (result["structuredContent"].clone(), text, is_error)
+        (text, is_error)
     }
 
     /// How the server child ended, for a failure that has no answer to explain it.
@@ -286,17 +297,21 @@ impl Server {
         bare_id(&self.started[n - 1]).to_owned()
     }
 
-    pub(super) fn ok(&mut self, arguments: Value) -> (Value, String) {
-        let (structured, text, is_error) = self.call(arguments);
+    pub(super) fn ok(&mut self, arguments: Value) -> String {
+        let (text, is_error) = self.call(arguments);
         assert!(!is_error, "unexpected error: {text}");
-        (structured, text)
+        text
     }
 
-    /// Calls one of the file tools: (text, isError).
+    /// Calls one of the file tools: (text, isError), asserting no structuredContent.
     pub(super) fn file(&mut self, name: &str, arguments: Value) -> (String, bool) {
         let message = self.request("tools/call", json!({"name": name, "arguments": arguments}));
         let result = &message["result"];
         assert!(result.is_object(), "protocol error: {message}");
+        assert!(
+            result.get("structuredContent").is_none(),
+            "unexpected structuredContent: {result}"
+        );
         let text = result["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -380,9 +395,7 @@ pub(super) fn assert_stops_growing(path: &PathBuf) {
 
 pub(super) fn codemode_server() -> Server {
     Server::start_with(|command| {
-        command
-            .env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "both");
+        command.env("FASTEXEC_CODEMODE", "true");
     })
 }
 
@@ -392,6 +405,10 @@ pub(super) fn code_result(server: &mut Server, arguments: Value) -> Value {
         json!({"name":"codemode", "arguments":arguments}),
     );
     assert!(reply["result"].is_object(), "{reply}");
+    assert!(
+        reply["result"].get("structuredContent").is_none(),
+        "unexpected structuredContent: {reply}"
+    );
     reply["result"].clone()
 }
 

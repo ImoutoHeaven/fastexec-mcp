@@ -12,7 +12,7 @@ use crate::ipc;
 use crate::lease;
 use crate::mcp::{Backend, RequestLeases, Server, decode_mcp_header_value};
 use crate::service::Service;
-use crate::service::render::{self as service_render, OutputMode, Render};
+use crate::service::render as service_render;
 use crate::session::LaunchContext;
 use crate::tasks::{Limits, Tasks};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -37,10 +37,6 @@ mod event_budget_tests {
             let server = Server::new(
                 Backend::Local {
                     service: Arc::new(Service::new(Tasks::new(Limits::OFF).unwrap(), false)),
-                    render: Render {
-                        output_mode: OutputMode::Both,
-                        structured_content: true,
-                    },
                     session: Arc::new(OnceLock::new()),
                     launch: Arc::clone(&launch),
                     daemon: false,
@@ -371,15 +367,10 @@ mod stdio_transport_tests {
                     .with_control_memory(lease::BytePool::new(0)),
             );
             let tasks = Tasks::new(Limits::OFF).unwrap();
-            let render = Render {
-                output_mode: OutputMode::Both,
-                structured_content: true,
-            };
             let leases = Arc::new(RequestLeases::default());
             let mut server = Server::new(
                 Backend::Local {
                     service: Arc::new(Service::new(tasks, false)),
-                    render,
                     session: Arc::new(OnceLock::new()),
                     launch: Arc::clone(&launch),
                     daemon: false,
@@ -406,7 +397,7 @@ mod stdio_transport_tests {
                 payload_owner: lease::Owner::new(pool.try_acquire(payload_bytes).unwrap()),
             };
             assert_eq!(pool.used(), pool.limit());
-            let result = server.deliver_local(&context, tracked, &launch, render, false);
+            let result = server.deliver_local(&context, tracked, &launch, false);
             assert_eq!(result.is_error, Some(false), "{result:?}");
             assert_eq!(
                 result.content[0].as_text().unwrap().text,

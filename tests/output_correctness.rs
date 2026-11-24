@@ -16,18 +16,9 @@ struct Server {
 
 impl Server {
     fn start() -> Self {
-        Self::with_render("both", true)
-    }
-
-    fn with_render(mode: &str, structured: bool) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
         support::scrub_fastexec_env(&mut command);
         let mut child = command
-            .env(
-                "FASTEXEC_STRUCTURED_CONTENT",
-                if structured { "true" } else { "false" },
-            )
-            .env("FASTEXEC_OUTPUT_MODE", mode)
             .env("FASTEXEC_CODEMODE", "true")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -82,10 +73,34 @@ impl Server {
     }
 
     fn exec(&mut self, arguments: Value) -> Value {
-        self.request(
+        let result = self.request(
             "tools/call",
             json!({"name": "exec", "arguments": arguments}),
-        )
+        );
+        assert!(result.get("structuredContent").is_none(), "{result}");
+        result
+    }
+
+    fn codemode(&mut self, arguments: Value) -> Value {
+        let result = self.request(
+            "tools/call",
+            json!({"name": "codemode", "arguments": arguments}),
+        );
+        assert!(result.get("structuredContent").is_none(), "{result}");
+        result
+    }
+
+    fn log_path(&mut self, bare_task_id: &str) -> PathBuf {
+        let result = self.codemode(json!({
+            "code": format!(
+                "return (await tools.exec({{action: 'poll', taskId: {bare_task_id:?}, waitMs: 0}})).logPath;"
+            )
+        }));
+        assert_ne!(result["isError"], true, "{}", text(&result));
+        let rendered = text(&result);
+        let (body, status) = split_output(&rendered);
+        assert!(status.starts_with("[exited 0] "), "{status}");
+        PathBuf::from(body)
     }
 }
 
@@ -106,6 +121,33 @@ fn text(result: &Value) -> String {
         .join("\n")
 }
 
+fn split_output(rendered: &str) -> (&str, &str) {
+    if let Some(pos) = rendered.rfind("\n\n[") {
+        (&rendered[..pos], &rendered[pos + 2..])
+    } else {
+        ("", rendered)
+    }
+}
+
+fn status_line(body: &str) -> &str {
+    body.lines()
+        .rev()
+        .find(|line| line.starts_with('[') && line.contains("] "))
+        .unwrap_or_else(|| panic!("no status line: {body}"))
+}
+
+fn task_handle(result: &Value) -> String {
+    let body = text(result);
+    status_line(&body)
+        .split_once("] ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
 fn assert_log_recovers(command: &str, expected: &[u8], retained: usize, scan: bool) {
     let mut server = Server::start();
     let mut start = json!({"action": "start", "command": command, "waitMs": 10000});
@@ -114,18 +156,17 @@ fn assert_log_recovers(command: &str, expected: &[u8], retained: usize, scan: bo
     }
     let result = server.exec(start);
     assert_ne!(result["isError"], true, "{}", text(&result));
-    let metadata = &result["structuredContent"];
-    let task = metadata["taskId"].as_str().unwrap();
+    let task = task_handle(&result);
     if scan {
         // `start` returned as soon as `"A"` matched; wait for the task to finish so the full log
         // is flushed before reading and truncating it.
         let settled = server.exec(json!({"action": "poll", "taskId": task, "waitMs": 10000}));
         assert_ne!(settled["isError"], true, "{}", text(&settled));
     }
-    let path = PathBuf::from(metadata["logPath"].as_str().unwrap());
+    let bare = task.split_once('.').unwrap().0;
+    let path = server.log_path(bare);
     let original = std::fs::read(&path).unwrap();
     assert_eq!(original, expected);
-    let bare = task.split_once('.').unwrap().0;
     // A chosen new reader starts at byte zero, and can be retried after the error.
     let handle = format!("{bare}.abcd");
     std::fs::write(&path, &original[..retained]).unwrap();
@@ -145,13 +186,19 @@ fn assert_log_recovers(command: &str, expected: &[u8], retained: usize, scan: bo
     let recovered = server.exec(json!({"action": "poll", "taskId": handle,
         "waitMs": 0, "truncate": "head", "maxBytes": 4194304, "raw": true}));
     assert_ne!(recovered["isError"], true, "{}", text(&recovered));
-    let output = recovered["structuredContent"]["output"].as_str().unwrap();
+    let recovered_text = text(&recovered);
+    let (output, _) = split_output(&recovered_text);
     assert_eq!(
         output.as_bytes(),
         expected.strip_suffix(b"\n").unwrap_or(expected)
     );
     let consumed = server.exec(json!({"action": "poll", "taskId": handle, "waitMs": 0}));
-    assert_eq!(consumed["structuredContent"]["output"], "");
+    let consumed_text = text(&consumed);
+    let (consumed_body, _) = split_output(&consumed_text);
+    assert!(
+        consumed_body.is_empty() || consumed_body == "(no new output)",
+        "{consumed_text}"
+    );
 }
 
 #[test]
@@ -185,10 +232,9 @@ fn a_short_transcript_fails_without_advancing_its_reader() {
     let result = server.exec(json!({"action": "start", "pty": true,
         "command": "printf 'A\\nB\\nC\\nD\\n'", "waitMs": 10000}));
     assert_ne!(result["isError"], true, "{}", text(&result));
-    let metadata = &result["structuredContent"];
-    let handle = metadata["taskId"].as_str().unwrap();
-    let path =
-        PathBuf::from(metadata["logPath"].as_str().unwrap()).with_extension("transcript.txt");
+    let handle = task_handle(&result);
+    let bare = handle.split_once('.').unwrap().0;
+    let path = server.log_path(bare).with_extension("transcript.txt");
     let original = std::fs::read(&path).unwrap();
     assert!(original.starts_with(b"A\nB\nC\nD\n"));
     std::fs::write(&path, &original[..1]).unwrap();
@@ -203,102 +249,87 @@ fn a_short_transcript_fails_without_advancing_its_reader() {
     std::fs::write(&path, &original).unwrap();
     let recovered = server.exec(arguments.clone());
     assert_ne!(recovered["isError"], true, "{}", text(&recovered));
-    assert_eq!(recovered["structuredContent"]["output"], "A\nB\nC\nD");
-    assert_eq!(recovered["structuredContent"]["firstLine"], 1);
+    let recovered_text = text(&recovered);
+    let (body, status) = split_output(&recovered_text);
+    assert_eq!(body, "A\nB\nC\nD");
+    assert!(status.contains("this read starts at line 1"), "{status}");
     let consumed = server.exec(arguments);
-    assert_eq!(consumed["structuredContent"]["output"], "");
+    assert!(
+        text(&consumed).contains("(no transcript lines since the last read)"),
+        "{}",
+        text(&consumed)
+    );
 }
 
-fn task_location(result: &Value, structured: bool) -> (String, PathBuf) {
-    if structured {
-        (
-            result["structuredContent"]["taskId"]
-                .as_str()
+fn task_location(result: &Value) -> (String, PathBuf) {
+    let body = text(result);
+    let status = status_line(&body);
+    (
+        status
+            .split_once("] ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned(),
+        PathBuf::from(
+            status
+                .split_once(" · log ")
                 .unwrap()
-                .to_owned(),
-            PathBuf::from(result["structuredContent"]["logPath"].as_str().unwrap()),
-        )
-    } else {
-        let body = text(result);
-        let status = body
-            .lines()
-            .find(|line| line.starts_with("[exited 0] "))
-            .unwrap();
-        (
-            status.split_whitespace().nth(2).unwrap().to_owned(),
-            PathBuf::from(
-                status
-                    .split_once(" · log ")
-                    .unwrap()
-                    .1
-                    .split(" · ")
-                    .next()
-                    .unwrap(),
-            ),
-        )
-    }
+                .1
+                .split(" · ")
+                .next()
+                .unwrap(),
+        ),
+    )
 }
 
-fn assert_encoding_warning(result: &Value, structured: bool) {
+fn assert_encoding_warning(result: &Value) {
     assert_ne!(result["isError"], true, "{}", text(result));
+    assert!(result.get("structuredContent").is_none(), "{result}");
     let body = text(result);
     assert!(body.contains("Warning:"), "{body}");
     assert!(body.contains("invalid in UTF-8; pass encoding"), "{body}");
-    if structured {
-        assert_eq!(result["structuredContent"]["encodingErrors"], 1);
-        assert!(
-            result["structuredContent"]["warnings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|warning| warning.as_str().unwrap().contains("invalid in UTF-8"))
-        );
-    } else {
-        assert!(result.get("structuredContent").is_none());
-    }
 }
 
 #[test]
-fn encoding_warnings_survive_every_mode_and_small_output_budget() {
-    for mode in ["text", "both", "structured"] {
-        for structured in [false, true] {
-            let mut server = Server::with_render(mode, structured);
-            for raw in [false, true] {
-                let arguments = json!({"action": "start", "command": "printf '\\377DATA\\n'",
-                                       "waitMs": 10000, "maxBytes": 100, "raw": raw});
-                assert_encoding_warning(&server.exec(arguments), structured);
-            }
-
-            // ConPTY can normalize invalid program bytes; corrupt the retained files instead.
-            let started = server.exec(json!({"action": "start", "pty": true,
-                "command": "printf 'ADATA\\n'; seq 1 200", "maxBytes": 300, "waitMs": 10000}));
-            assert_ne!(started["isError"], true, "{}", text(&started));
-            let (handle, path) = task_location(&started, structured);
-            let task_id = handle.split_once('.').unwrap().0;
-            let mut log = std::fs::read(&path).unwrap();
-            assert!(!log.is_empty());
-            assert!(std::str::from_utf8(&log).is_ok());
-            let payload = log
-                .windows(b"ADATA".len())
-                .rposition(|part| part == b"ADATA")
-                .expect("the PTY log contains the displayed payload");
-            log[payload] = 0xff;
-            assert!(std::str::from_utf8(&log).is_err());
-            std::fs::write(&path, log).unwrap();
-            let screen = server.exec(json!({"action": "poll", "taskId": task_id,
-                "screen": true, "waitMs": 0, "maxBytes": 100}));
-            assert_encoding_warning(&screen, structured);
-
-            let path = path.with_extension("transcript.txt");
-            let mut bytes = std::fs::read(&path).unwrap();
-            assert!(bytes.starts_with(b"ADATA\n"));
-            bytes[0] = 0xff;
-            std::fs::write(&path, bytes).unwrap();
-            let result = server.exec(json!({"action": "transcript", "taskId": task_id,
-                                           "maxBytes": 100}));
-            assert_encoding_warning(&result, structured);
-        }
+fn encoding_warnings_survive_small_output_budget() {
+    let mut server = Server::start();
+    for raw in [false, true] {
+        let arguments = json!({"action": "start", "command": "printf '\\377DATA\\n'",
+                               "waitMs": 10000, "maxBytes": 100, "raw": raw});
+        assert_encoding_warning(&server.exec(arguments));
     }
+
+    // ConPTY can normalize invalid program bytes; corrupt the retained files instead.
+    let started = server.exec(json!({"action": "start", "pty": true,
+        "command": "printf 'ADATA\\n'; seq 1 200", "maxBytes": 300, "waitMs": 10000}));
+    assert_ne!(started["isError"], true, "{}", text(&started));
+    let (handle, path) = task_location(&started);
+    let task_id = handle.split_once('.').unwrap().0;
+    let mut log = std::fs::read(&path).unwrap();
+    assert!(!log.is_empty());
+    assert!(std::str::from_utf8(&log).is_ok());
+    let payload = log
+        .windows(b"ADATA".len())
+        .rposition(|part| part == b"ADATA")
+        .expect("the PTY log contains the displayed payload");
+    log[payload] = 0xff;
+    assert!(std::str::from_utf8(&log).is_err());
+    std::fs::write(&path, log).unwrap();
+    let screen = server.exec(json!({"action": "poll", "taskId": task_id,
+        "screen": true, "waitMs": 0, "maxBytes": 100}));
+    assert_encoding_warning(&screen);
+
+    let path = path.with_extension("transcript.txt");
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.starts_with(b"ADATA\n"));
+    bytes[0] = 0xff;
+    std::fs::write(&path, bytes).unwrap();
+    let result = server.exec(json!({"action": "transcript", "taskId": task_id,
+                                   "maxBytes": 100}));
+    assert_encoding_warning(&result);
 }
 
 #[test]
@@ -320,30 +351,27 @@ fn head_and_tail_use_the_body_budget_and_report_omissions_in_status() {
                 "raw": raw,
             });
             let direct = server.exec(arguments.clone());
-            let data = &direct["structuredContent"];
-            assert_eq!(data["output"], endpoint);
-            assert_eq!(data["omittedRange"], json!(omitted));
-            assert_eq!(data["cutLines"].as_u64().unwrap_or(0), 0);
             let rendered = text(&direct);
-            let (body, status) = rendered.split_once("\n\n").unwrap();
+            let (body, status) = split_output(&rendered);
             assert_eq!(body, endpoint);
-            assert!(status.contains(&format!(
-                "1 lines omitted: log lines {}-{}",
-                omitted[0], omitted[1]
-            )));
-            assert!(status.contains(data["logPath"].as_str().unwrap()));
-
-            let nested = server.request(
-                "tools/call",
-                json!({
-                    "name": "codemode",
-                    "arguments": {"code": format!("return await tools.exec({arguments});")}
-                }),
+            assert!(
+                status.contains(&format!(
+                    "1 lines omitted: log lines {}-{}",
+                    omitted[0], omitted[1]
+                )),
+                "{status}"
             );
-            assert_eq!(nested["structuredContent"]["exitCode"], 0, "{nested}");
-            let data: Value =
-                serde_json::from_str(nested["structuredContent"]["output"].as_str().unwrap())
-                    .unwrap();
+            assert!(status.contains(" · log "), "{status}");
+            assert!(!status.contains("cut"), "{status}");
+
+            let nested = server.codemode(json!({
+                "code": format!("return await tools.exec({arguments});")
+            }));
+            assert_ne!(nested["isError"], true, "{}", text(&nested));
+            let nested_text = text(&nested);
+            let (nested_body, nested_status) = split_output(&nested_text);
+            assert!(nested_status.starts_with("[exited 0] "), "{nested_status}");
+            let data: Value = serde_json::from_str(nested_body).unwrap();
             assert_eq!(data["output"], endpoint);
             assert_eq!(data["omittedRange"], json!(omitted));
             assert_eq!(data["cutLines"].as_u64().unwrap_or(0), 0);
@@ -353,42 +381,7 @@ fn head_and_tail_use_the_body_budget_and_report_omissions_in_status() {
 
 #[test]
 fn p0_1_and_p1_6_windows_and_nul_preservation_hold_direct_and_nested() {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
-    support::scrub_fastexec_env(&mut command);
-    let mut child = command
-        .env("FASTEXEC_STRUCTURED_CONTENT", "true")
-        .env("FASTEXEC_OUTPUT_MODE", "both")
-        .env("FASTEXEC_CODEMODE", "true")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let (send, lines) = channel();
-    let stdout = child.stdout.take().unwrap();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let line = line.unwrap();
-            if let Ok(value) = serde_json::from_str(&line)
-                && send.send(value).is_err()
-            {
-                break;
-            }
-        }
-    });
-    let mut server = Server {
-        child,
-        lines,
-        next: 0,
-    };
-    server.request(
-        "initialize",
-        json!({
-            "protocolVersion": "2025-06-18", "capabilities": {},
-            "clientInfo": {"name": "output-correctness-cm", "version": "1"}
-        }),
-    );
-    server.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let mut server = Server::start();
 
     // Direct 10,000 B JSON line under default parameters: whole, valid JSON, no cutLines.
     let payload_10k = "j".repeat(9980);
@@ -397,9 +390,10 @@ fn p0_1_and_p1_6_windows_and_nul_preservation_hold_direct_and_nested() {
         "command": format!("printf '{{\"k\":\"%s\"}}\\n' '{payload_10k}'")
     }));
     assert_ne!(json_10k["isError"], true, "{}", text(&json_10k));
-    assert!(json_10k["structuredContent"].get("cutLines").is_none());
-    let parsed_10k: Value =
-        serde_json::from_str(json_10k["structuredContent"]["output"].as_str().unwrap()).unwrap();
+    let json_10k_text = text(&json_10k);
+    let (body_10k, status_10k) = split_output(&json_10k_text);
+    assert!(!status_10k.contains("cut"), "{status_10k}");
+    let parsed_10k: Value = serde_json::from_str(body_10k).unwrap();
     assert_eq!(parsed_10k["k"].as_str().unwrap().len(), 9980);
 
     // Direct 20,000-char line followed by ERROR: final line: tail line whole, first line cut.
@@ -407,77 +401,56 @@ fn p0_1_and_p1_6_windows_and_nul_preservation_hold_direct_and_nested() {
         "action": "start",
         "command": "(printf '%20000s\\n' '' | tr ' ' x; printf 'ERROR: final line\\n')"
     }));
-    let err_body = err_tail["structuredContent"]["output"].as_str().unwrap();
+    let err_tail_text = text(&err_tail);
+    let (err_body, _) = split_output(&err_tail_text);
     assert!(err_body.len() <= 16_384, "len={}", err_body.len());
     assert!(err_body.ends_with("ERROR: final line"), "{err_body}");
-    assert_eq!(err_tail["structuredContent"]["cutLines"], 1, "{err_tail}");
+    assert!(err_body.contains("line cut at"), "{err_body}");
 
     // Single 200 KiB multi-byte UTF-8 line under default budget: cut on char boundary, logPath in status.
     let multi_200k = server.exec(json!({
         "action": "start",
         "command": "awk 'BEGIN { for (i = 0; i < 70000; i++) printf \"中\"; printf \"\\n\" }'"
     }));
-    let body_200k = multi_200k["structuredContent"]["output"].as_str().unwrap();
+    let multi_200k_text = text(&multi_200k);
+    let (body_200k, status_200k) = split_output(&multi_200k_text);
     assert!(body_200k.len() <= 16_384);
-    assert_eq!(multi_200k["structuredContent"]["cutLines"], 1);
-    let log_200k = multi_200k["structuredContent"]["logPath"].as_str().unwrap();
-    assert!(text(&multi_200k).contains(log_200k));
+    assert!(body_200k.contains("line cut at"), "{body_200k}");
+    assert!(status_200k.contains(" · log "), "{status_200k}");
 
     // Codemode script 1 & 2 from Spec P0-1.
-    let cm1 = server.request(
-        "tools/call",
-        json!({
-            "name": "codemode",
-            "arguments": {
-                "code": "text('x'.repeat(20000)); text('MIDDLE'); text('END-LINE-IMPORTANT'); return 'RET';"
-            }
-        }),
-    );
-    let cm1_body = cm1["structuredContent"]["output"].as_str().unwrap();
+    let cm1 = server.codemode(json!({
+        "code": "text('x'.repeat(20000)); text('MIDDLE'); text('END-LINE-IMPORTANT'); return 'RET';"
+    }));
+    let cm1_text = text(&cm1);
+    let (cm1_body, _) = split_output(&cm1_text);
     assert!(cm1_body.len() <= 16_384);
-    assert_eq!(cm1["structuredContent"]["cutLines"], 1);
+    assert!(cm1_body.contains("line cut at"), "{cm1_body}");
     assert!(
-        cm1_body.ends_with(
-            "MIDDLE
-END-LINE-IMPORTANT
-RET"
-        ),
+        cm1_body.ends_with("MIDDLE\nEND-LINE-IMPORTANT\nRET"),
         "{cm1_body}"
     );
 
-    let cm1_many = server.request(
-        "tools/call",
-        json!({
-            "name": "codemode",
-            "arguments": {
-                "code": "text('x'.repeat(20000)); for (let i = 0; i < 3000; i++) text('MIDDLE-' + i); text('END-LINE-IMPORTANT'); return 'RET';"
-            }
-        }),
-    );
-    let cm1_many_body = cm1_many["structuredContent"]["output"].as_str().unwrap();
+    let cm1_many = server.codemode(json!({
+        "code": "text('x'.repeat(20000)); for (let i = 0; i < 3000; i++) text('MIDDLE-' + i); text('END-LINE-IMPORTANT'); return 'RET';"
+    }));
+    let cm1_many_text = text(&cm1_many);
+    let (cm1_many_body, _) = split_output(&cm1_many_text);
     assert!(cm1_many_body.len() <= 16_384);
     assert!(
         cm1_many_body.contains("lines omitted: log lines "),
         "{cm1_many_body}"
     );
     assert!(
-        cm1_many_body.ends_with(
-            "END-LINE-IMPORTANT
-RET"
-        ),
+        cm1_many_body.ends_with("END-LINE-IMPORTANT\nRET"),
         "{cm1_many_body}"
     );
 
-    let cm2 = server.request(
-        "tools/call",
-        json!({
-            "name": "codemode",
-            "arguments": {
-                "code": "text('H'.repeat(15000)); return {tail: 'V'.repeat(12000), done: 'END'};"
-            }
-        }),
-    );
-    let cm2_body = cm2["structuredContent"]["output"].as_str().unwrap();
+    let cm2 = server.codemode(json!({
+        "code": "text('H'.repeat(15000)); return {tail: 'V'.repeat(12000), done: 'END'};"
+    }));
+    let cm2_text = text(&cm2);
+    let (cm2_body, _) = split_output(&cm2_text);
     assert!(cm2_body.len() <= 16_384);
     let last_line = cm2_body.lines().last().unwrap();
     let parsed_cm2: Value = serde_json::from_str(last_line).expect("12,000 B return line whole");
@@ -501,61 +474,53 @@ RET"
         "action": "start",
         "command": "printf 'a b\\0c\\nd\\0'"
     }));
-    assert_eq!(direct_nul["structuredContent"]["output"], "a bc\nd");
+    let direct_nul_text = text(&direct_nul);
+    let (direct_nul_body, _) = split_output(&direct_nul_text);
+    assert_eq!(direct_nul_body, "a bc\nd");
 
-    let nested_checks = server.request(
-        "tools/call",
-        json!({
-            "name": "codemode",
-            "arguments": {
-                "cwd": dir_str,
-                "code": r#"
-                    const r150 = await tools.exec({
-                        action: "start",
-                        maxBytes: 180,
-                        command: "awk 'BEGIN { for (i = 1; i <= 150; i++) printf \"row-%03d\\n\", i }'"
-                    });
-                    if (r150.output.length < 150 || r150.output.length > 180) {
-                        throw new Error("bad r150 len=" + r150.output.length + " out=" + JSON.stringify(r150.output));
-                    }
-                    if (!Array.isArray(r150.omittedRange) || r150.omittedRange[1] !== 150 || r150.omittedRange[0] < 15) {
-                        throw new Error("expected tail omission, got " + JSON.stringify(r150.omittedRange));
-                    }
-
-                    const nulOut = await tools.exec({
-                        action: "start",
-                        command: "printf 'a b\\0c\\nd\\0'"
-                    });
-                    if (nulOut.output !== "a b\u0000c\nd\u0000") {
-                        throw new Error("nested NUL mismatch: " + JSON.stringify(nulOut.output));
-                    }
-
-                    const found = await tools.exec({
-                        action: "start",
-                        command: "find . -maxdepth 1 -type f -print0"
-                    });
-                    const names = found.output
-                        .split("\0")
-                        .filter(Boolean)
-                        .map(p => p.replace(/^\.\//, ""))
-                        .sort();
-                    return names;
-                "#
+    let nested_checks = server.codemode(json!({
+        "cwd": dir_str,
+        "code": r#"
+            const r150 = await tools.exec({
+                action: "start",
+                maxBytes: 180,
+                command: "awk 'BEGIN { for (i = 1; i <= 150; i++) printf \"row-%03d\\n\", i }'"
+            });
+            if (r150.output.length < 150 || r150.output.length > 180) {
+                throw new Error("bad r150 len=" + r150.output.length + " out=" + JSON.stringify(r150.output));
             }
-        }),
+            if (!Array.isArray(r150.omittedRange) || r150.omittedRange[1] !== 150 || r150.omittedRange[0] < 15) {
+                throw new Error("expected tail omission, got " + JSON.stringify(r150.omittedRange));
+            }
+
+            const nulOut = await tools.exec({
+                action: "start",
+                command: "printf 'a b\\0c\\nd\\0'"
+            });
+            if (nulOut.output !== "a b\u0000c\nd\u0000") {
+                throw new Error("nested NUL mismatch: " + JSON.stringify(nulOut.output));
+            }
+
+            const found = await tools.exec({
+                action: "start",
+                command: "find . -maxdepth 1 -type f -print0"
+            });
+            const names = found.output
+                .split("\0")
+                .filter(Boolean)
+                .map(p => p.replace(/^\.\//, ""))
+                .sort();
+            return names;
+        "#
+    }));
+    assert_ne!(nested_checks["isError"], true, "{}", text(&nested_checks));
+    let nested_checks_text = text(&nested_checks);
+    let (nested_checks_body, nested_checks_status) = split_output(&nested_checks_text);
+    assert!(
+        nested_checks_status.starts_with("[exited 0] "),
+        "{nested_checks_status}"
     );
-    assert_eq!(
-        nested_checks["structuredContent"]["exitCode"],
-        0,
-        "{}",
-        text(&nested_checks)
-    );
-    let names: Vec<String> = serde_json::from_str(
-        nested_checks["structuredContent"]["output"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
+    let names: Vec<String> = serde_json::from_str(nested_checks_body).unwrap();
     assert_eq!(
         names,
         vec![

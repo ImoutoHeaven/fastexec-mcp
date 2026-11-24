@@ -165,7 +165,7 @@ execution, naming `exec` actions in lowercase.
 | `read` | `path`, `offset`, `limit` | Reads a text file, or attaches an image, audio, PDF, or video file. |
 | `write` | `path`, `content` | Saves a complete replacement of a regular file. |
 | `edit` | `path`, `edits` | Applies exact text replacements to a UTF-8 file. |
-| `transfer` | `path` | Publishes one regular file at a `/t/<id>` URL when `FASTEXEC_TRANSFER=true`, returning `{ ok, url, path, bytes }`. |
+| `transfer` | `path` | Publishes one regular file at a `/t/<id>` URL when `FASTEXEC_TRANSFER=true`, returning the capability URL, path, and current byte size. |
 
 ### `exec` Actions
 
@@ -174,7 +174,7 @@ execution, naming `exec` actions in lowercase.
 | `start` | `command`, `cwd`, `pty`, `loginShell`, `input`, `eof`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Rejects NUL bytes in `command` before execution, then spawns it in GNU bash (`loginShell: false` default with the session's login-environment snapshot; `loginShell: true` runs `bash -l -c`) and waits up to `waitMs` (default `30000`, range `0-240000` on direct calls; unbounded by default without `returnWhen` in nested `codemode` calls). Pipe mode defaults stdin to `/dev/null`, writes `input` (`<= 1` MiB UTF-8) and closes stdin unless `eof: false`, or keeps stdin open with `eof: false`; PTY mode rejects `input` and `eof: true` on `start` (`eof: false` is a no-op) and defaults size to `120x30`. |
 | `poll` | `taskId`, `cols`, `rows`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Normalizes `keys: []` (and any accompanying `keyDelayMs`) to absent before validation, resizes the terminal (PTY only), writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only, idempotent when already closed), waits (`2000` ms with a resize, `input`, or `keys` and no `returnWhen`; `30000` ms on direct calls or with `returnWhen`; unbounded by default on nested `codemode` waits without `returnWhen` or input), and returns unseen output. |
 | `kill` | `taskId`, `truncate`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns unseen output through the reader gate without `waitEndedBy` (`head_tail` / `16384` B default on direct calls; `head` / `4194304` B default on nested calls). On a finished `keepTree` task, ends held processes while keeping the root exit result. |
-| `list` | `scope`, `state`, `limit`, `parentTaskId`, `truncate`, `maxBytes` | Lists bare task IDs newest first filtered by `scope` (`"session"` default, or `"all"` by default when `parentTaskId` is set), `state` (`"active"` or `"finished"`; omitted lists both), and `limit` (`1-500`, default `20`), reporting `totalCount` before `limit`. Without `parentTaskId`, folds `codemode` children into their parent's summary (including `queued`/`cancelled` start counts) and indents up to `8` active children below it; with `parentTaskId`, lists that script's children flat. Creates no readers and marks only delivered entries and folded finished children of delivered parents. |
+| `list` | `scope`, `state`, `limit`, `parentTaskId`, `truncate`, `maxBytes` | Lists bare task IDs newest first filtered by `scope` (`"session"` default, or `"all"` by default when `parentTaskId` is set), `state` (`"active"` or `"finished"`; omitted lists both), and `limit` (`1-500`, default `20`), reporting `totalCount` before `limit`. `truncate` and `maxBytes` apply to direct MCP calls only and fail validation in nested `codemode` calls. Without `parentTaskId`, folds `codemode` children into their parent's summary (including `queued`/`cancelled` start counts) and indents up to `8` active children below it; with `parentTaskId`, lists that script's children flat. Creates no readers and marks only delivered entries and folded finished children of delivered parents. |
 | `transcript` | `taskId`, `truncate` (default `"tail"`), `maxBytes`, `waitMs` (ignored) | Reads a UTF-8 PTY task's terminal transcript from the first unseen final line, followed by pending lines. Does not wait or advance the `poll` cursor. |
 
 ### Key Parameter Rules
@@ -184,7 +184,7 @@ execution, naming `exec` actions in lowercase.
   reports that it came from an earlier daemon, whereas malformed IDs report
   `Unknown taskId`. `start`, `poll`, `kill`, and `transcript` return
   a reader handle, `<taskId>.<reader>` (four Crockford base32 characters), in
-  the status line and structured result. Reusing a handle in the same session
+  the status line (and as `taskId` in nested `codemode` results). Reusing a handle in the same session
   preserves its cursor; passing a bare task ID creates a new reader from the
   beginning of the retained log. An unknown valid reader key is recreated under
   that key, including after eviction or a session ending. Each task entry holds
@@ -243,25 +243,29 @@ execution, naming `exec` actions in lowercase.
 - **Window and encoding options**:
   - `maxBytes`: `100-4194304` (`4` MiB; default `16384` on direct `exec` and
     outer `codemode`, `4194304` on nested `tools.exec`). Bounds the output body
-    (`structuredContent.output`) only; the status line, background footer (`<= 512`
-    bytes), metadata, JSON framing, errors, and correctness warnings stay outside
-    that budget.
-  - `truncate`: `"head_tail"` (default for direct `start`/`poll`/`kill`/`list`
-    and outer `codemode`), `"head"` (default for nested `start`/`poll`/`kill`/`list`),
-    or `"tail"` (default for `transcript`, direct or nested). Placement and
-    `maxBytes` default independently. Direct bash calls clean ANSI/CR rewrites
-    unless `raw: true` and drop NUL (`0x00`) bytes; nested bash clean output
-    preserves NUL bytes so `find -print0` and `rg -0` streams parse cleanly.
-    There is no fixed per-line length cap: across all windows (bash or codemode,
-    direct or nested, clean or `raw`), fitting output returns whole; a single
-    overflowing line cuts its UTF-8 prefix so `<prefix> … [line cut at <B>; <n> more bytes]`
-    fits `B` and increments `cutLines`; and multi-line `head_tail` overflow
-    reserves the inline `... [<k> lines omitted: log lines <a>-<b>] ...` marker,
-    reserves `B / 10` for the head, fills the tail from the last line backward
-    (cutting the last line if needed), and returns unused tail bytes to the head.
-    `head` and `tail` use the full body budget for complete lines, cutting only
-    an oversized first or last line. Omitted ranges are also reported in the
-    status line, outside the body budget.
+    only; the status line, background footer (`<= 512` bytes), metadata,
+    errors, and correctness warnings stay outside that budget. Rejected on
+    nested `list` calls.
+  - `truncate`: Direct MCP calls (`ExecPolicy::AGENT`) default to `"head_tail"`
+    (`"tail"` for `transcript`), inject inline omission and cut markers
+    (`... [<k> lines omitted: log lines <a>-<b>] ...` and
+    `<prefix> … [line cut at <B>; <n> more bytes]`, plus
+    `... [<n> top rows omitted] ...` and ` … [cut]` for `screen: true`), and
+    drop NUL (`0x00`) bytes when cleaning (`keep_nul: false`). Multi-line
+    `head_tail` overflow reserves the inline marker and `B / 10` for the head,
+    fills the tail from the last line backward (cutting the last line if
+    needed), and returns unused tail bytes to the head. Nested `codemode` calls
+    (`ExecPolicy::PROGRAM`) default to `"head"` (`"tail"` for `transcript`),
+    preserve NUL bytes in clean output (`keep_nul: true`, so `find -print0` and
+    `rg -0` parse cleanly; pass `raw: true` for untransformed bytes), reject
+    `truncate: "head_tail"` and `list` `truncate`/`maxBytes` with
+    `ToolError` (`code: "VALIDATION"`), and omit all inline markers
+    (`inline_markers: false`). When a single line or screen row exceeds the
+    budget in Program mode, it slices cleanly at a UTF-8 boundary and reports
+    `truncated`, `omittedLines`, `omittedRange`, `cutLines`, and `omittedRows`
+    in the control channel. There is no fixed per-line length cap on either
+    path. Omitted ranges on direct calls also appear in the status line, outside
+    the body budget.
   - `encoding`: Any ASCII-compatible WHATWG label (such as `"utf-8"`, `"big5"`,
     `"gbk"`; UTF-16 is rejected). On `start`, sets the task default; on `poll`,
     overrides for that call.
@@ -285,10 +289,9 @@ nonempty after trimming and without NUL bytes. Unknown parameters are refused.
 It shares `exec start`'s directory, wait, and output options except `raw`:
 `cwd`, `waitMs`, `killAfterMs`, `truncate` (default `head_tail`, keeping lines
 uncut up to `maxBytes`), `maxBytes` (`100-4194304`, default `16384`), and
-`returnWhen` (`outputContains`, `quietMs`). Schema-decoding failures return a tool error
-without `structuredContent`; parameter validation and admission failures return
-`isError: true` with `structuredContent` (`ok: false`, `action: "codemode"`)
-without creating a task.
+`returnWhen` (`outputContains`, `quietMs`). Schema-decoding,
+parameter-validation, and admission failures return a text tool error
+(`isError: true`, no `structuredContent`) without creating a task.
 
 A script is a task with `kind: "codemode"`. The start result has
 `action: "codemode"`; later `exec poll`, `kill`, and `list` use the same task
@@ -332,36 +335,58 @@ functions, `BigInt`, or circular objects, end the script with exit `1` and
 ends successfully even inside a try/catch. Each script owns its globals; bridge
 and codec functions bind the built-ins they depend on before user code runs.
 
-Nested calls resolve directly to unwrapped structured objects (omitting `ok`).
-Schema-invalid argument shapes and unknown tools reject with `TypeError`;
-validation, file, and integrity failures reject with `ToolError` (`name:
-"ToolError"`, `tool`, `result` carrying full diagnostics such as `action`,
-`output`, `exitCode`, `inputError`, or `failures`), while non-zero command
-`exitCode`s resolve normally. Async rejections from `tools.*` and `sleep` carry
-the caller's script stack frame (`codemode.js:<line>:<col>`). `exec` returns
-`{action, taskId, state, exitCode, output, ...}` (defaulting to `truncate: "head"`,
-or `"tail"` for `transcript`, and `maxBytes: 4194304`, keeping NUL bytes in clean
-output and waiting with no `waitMs` ceiling unless `waitMs`, `returnWhen`, or
-input/resize/keys supplies one); text `read` without `offset` or `limit` returns
-the whole UTF-8 file up to `4` MiB or rejects with `ToolError` when larger or
-non-UTF-8, and with `offset` or `limit` reads a slice up to `4` MiB (no line cap,
-marking invalid UTF-8 with `lossy: true`), always returning `{kind: "text", path,
-text, startLine, endLine, shownLines, totalLines, truncated, nextOffset,
-lineTooLong, lossy}`; media `read` (image, audio, PDF, video) returns a
-lightweight descriptor `{kind, path, mimeType, bytes, attachable: true}` or
-`{kind, path, mimeType, sourceBytes?, attachable: false, note}` without sending
-base64 into QuickJS (`attach()` throws `TypeError` with `note` when `attachable`
-is `false`); `write` returns `{path, bytes}`; and `edit` returns
-`{path, replacements, edits}`. Each script has `8` `exec start` slots and `8`
-file/transcript I/O slots (`read`, `write`, and `edit` hold their slot inside the
-blocking worker until disk I/O finishes; `poll`, `kill`, `list`, and `sleep` take
-no slot), within `1024` pending calls. Starts waiting for a slot are admitted in
-script submission order. Additional calls past the pending limit reject with `RangeError`.
-Pending tool arguments and results have a separate 256 MiB budget per script;
-exceeding it rejects the call with `RangeError`. A completed result that cannot
-fit rejects after the operation ran; its error identifies this case, and the
-operation remains in effect. A script awaiting a promise with no pending tool
-call, `sleep`, or JavaScript job fails because it has no way to settle.
+Nested calls bypass MCP formatting and `CallToolResult` completely, resolving
+directly to typed objects (no `ok` wrapper). Their data channel (`output` on
+`exec`, `text` on `read`) is raw with zero status lines, footers, line-number
+prefixes, or inline omission/cut markers; truncation and diagnostics appear in
+explicit control fields. Wrong argument shapes (such as non-object arguments or
+non-finite `sleep` values) reject with `TypeError`. Operational, validation,
+quota, overload, cancellation, edit, and I/O failures reject with `ToolError`
+(`name: "ToolError"`, `tool`, `code`, `message`, `result`):
+
+- `"VALIDATION"`: argument or schema validation failures, including
+  `truncate: "head_tail"` and `list` `maxBytes`/`truncate` in Program mode.
+- `"NOT_FOUND"`: unknown `taskId` / `parentTaskId` or missing file.
+- `"OVERLOAD"`: active byte-pool or bridge-input memory overload (`err.result`
+  carries `{ taskId, logPath }` when a task already ran).
+- `"LIMIT"`: pending-call cap (`1024`), `256` MiB pending bridge budget, `4096`
+  start cap, oversized result, or strict whole-file `read` size limit.
+- `"CANCELLED"`: cancelled call.
+- `"EDIT_FAILED"`: `tools.edit` match, ambiguity, overlap, or no-op failure
+  (`err.result` carries `{ path, failures }`).
+- `"IO"`: file I/O errors and task I/O failures (`task_io_ok == false`, i.e.,
+  `inputError`, `captureError`, or `logError`), where `err.result` preserves
+  the full structured exec report (`output`, `exitCode`, `state`, `taskId`,
+  `logPath`, error fields, `warnings`).
+
+Non-zero command `exitCode`s resolve normally. Async rejections from `tools.*`
+and `sleep` carry the caller's script stack frame (`codemode.js:<line>:<col>`).
+`exec` returns `{action, taskId, kind, state, exitCode, pty, elapsedMs, output,
+truncated, logPath, ...}` (defaulting to `truncate: "head"`, or `"tail"` for
+`transcript`, and `maxBytes: 4194304`, keeping NUL bytes in clean output and
+waiting with no `waitMs` ceiling unless `waitMs`, `returnWhen`, or
+input/resize/keys supplies one); text `read` uses `strict_whole_file: true`
+when both `offset` and `limit` are omitted (returning the whole UTF-8 file up
+to `4` MiB or rejecting with `ToolError` when larger or non-UTF-8), and with
+`offset` or `limit` reads a slice up to `4` MiB (no line cap, marking invalid
+UTF-8 with `lossy: true`), always returning `{kind: "text", path, text,
+startLine, endLine, shownLines, totalLines, truncated, nextOffset?,
+lineTooLong?, lossy?}`; media `read` (image, audio, PDF, video) uses
+`MediaReadMode::DescriptorOnly`, returning `{kind, path, mimeType, bytes,
+attachable: true}` or `{kind, path, mimeType, sourceBytes?, attachable: false,
+note}` without sending base64 into QuickJS (`attach()` throws `TypeError` with
+`note` when `attachable` is `false`); `write` returns `{path, bytes}`; and
+`edit` returns `{path, replacements, edits}` (`edits: [{ line, fuzzy }]`).
+Each script has `8` `exec start` slots and `8` file/transcript I/O slots
+(`read`, `write`, and `edit` hold their slot inside the blocking worker until
+disk I/O finishes; `poll`, `kill`, `list`, and `sleep` take no slot), within
+`1024` pending calls. Starts waiting for a slot are admitted in script
+submission order. Additional calls past the pending limit, the `256` MiB
+pending bridge budget, or the `4096` start cap reject with `ToolError`
+(`code: "LIMIT"` or `"OVERLOAD"`). A completed result that cannot fit rejects
+after the operation ran; its error identifies this case, and the operation
+remains in effect. A script awaiting a promise with no pending tool call,
+`sleep`, or JavaScript job fails because it has no way to settle.
 
 Calls use the script's session and launch context (with `cwd` overridden when
 the script sets `cwd`). A nested task's reader can be polled by the caller, and
@@ -379,7 +404,7 @@ ends, in-flight nested calls are cancelled and drained before publishing the
 final script report, so any `exec start` already inside process creation is
 recorded in `startedTasks`. Each script accepts at most 4096 validated exec
 start calls, counting calls that later fail or are cancelled. Further starts
-reject with RangeError, so the complete startedTasks history stays bounded.
+reject with `ToolError` (`code: "LIMIT"`), so the complete `startedTasks` history stays bounded.
 
 Script output streams through the existing pipe capture and task log. The
 64 MiB per-script text limit reserves 4 KiB for final diagnostics, while stored
@@ -441,10 +466,9 @@ and the `1` GiB process active-byte pool, committing the text cursor and
 attachments stay queued for subsequent inputless `exec poll` calls even after
 text reaches EOF. A single attachment that exceeds the outbound frame ceiling on
 its own advances the watermark only alongside a visible warning naming its
-`index` and retained path. When `FASTEXEC_STRUCTURED_CONTENT=true`,
-`codemode.attachmentsDelivered` lists `[{index, kind, mimeType, bytes}]` in
-`content[]` block order; when `false`, the text summary appends `Attached:
-#<index> (<mime>, <bytes> B)`. Nested `exec poll` and `kill` return unforgeable
+`index` and retained path. Outer responses always append
+`Attached: #<index> (<mime>, <bytes> B)` to the text summary alongside the
+media `content[]` blocks (with no `structuredContent`). Nested `exec poll` and `kill` return unforgeable
 script-scoped handles in `result.codemode.attachments`, holding short-term read
 leases across source-task eviction until the calling script exits or cancels. If
 a transport write is interrupted, attaching a fresh reader via the bare `taskId`
@@ -473,9 +497,10 @@ re-reads retained output and attachments from index `1` for deduplication by
   up to `FASTEXEC_MAX_MEDIA_BYTES` (`100` MiB default, `1` MiB to `360` MiB),
   returning verbatim bytes by default (`FASTEXEC_IMAGE_COMPRESS=false`) or
   scaling compressible images when `FASTEXEC_IMAGE_COMPRESS=true`. Files over
-  `FASTEXEC_MAX_MEDIA_BYTES` or rejected during opt-in compression return
-  `attached: false` with `note` (and `sourceBytes` when exact) without `bytes`,
-  while genuine I/O failures return `isError: true`. Media reads ignore valid
+  `FASTEXEC_MAX_MEDIA_BYTES` or rejected during opt-in compression return a text
+  notice on direct calls (and `{ kind, path, mimeType, sourceBytes?, attachable:
+  false, note }` on nested `codemode` calls), while genuine I/O failures return
+  `isError: true` (or `ToolError` in `codemode`). Media reads ignore valid
   `offset` and `limit` values. A non-regular file, and one
   that is not a recognized media format and has a NUL byte in its first `8` KiB, are
   refused (binary files suggest `exec`, and also `transfer` when
@@ -527,9 +552,10 @@ re-reads retained output and attachments from index `1` for deduplication by
   partner indices in `with`). `lines` and `with` cap at `20` items (`more`
   counts any remainder), and a batch that matches uniquely without overlap but
   leaves the file unchanged fails with `failures: []`. Instead of stopping at
-  the first bad entry, `edit` evaluates every entry and reports `{ ok: false,
-  error, path, failures }`, counting line numbers on real `\n` breaks so they
-  match `read`. The file must be UTF-8; a byte-order mark
+  the first bad entry, `edit` evaluates every entry and reports all failures
+  (as a text error on direct calls, or `ToolError` with `code: "EDIT_FAILED"`
+  and `result: { path, failures }` in `codemode`), counting line numbers on
+  real `\n` breaks so they match `read`. The file must be UTF-8; a byte-order mark
   and every unmatched byte are kept, including mixed CRLF, LF, and CR line
   endings, and inserted text follows the file's first line ending style. The
   success result names each replaced block's first line in the original file,
@@ -540,8 +566,8 @@ re-reads retained output and attachments from index `1` for deduplication by
   before publishing.
 - **`transfer`**: Resolves `path` with the unified path rules, refuses
   directories and non-regular files (hinting `tar` via `exec`) and non-missing
-  metadata errors, and returns `{ ok, url, path, bytes }` where `bytes` is a
-  size snapshot at mint time or `null` when the file does not exist yet.
+  metadata errors, and returns plain text with the capability URL, path, and
+  byte size snapshot at mint time (or noting the file does not exist yet).
 - **Paths**: Every tool `cwd` and `path` resolves through one path helper:
   expands `~` / `~/...`, resolves relative paths against the effective `cwd`
   (a `codemode` call's `cwd` or the session's working directory), strips `.` and
@@ -556,7 +582,7 @@ re-reads retained output and attachments from index `1` for deduplication by
   process. They do not coordinate with `exec`, with a `transfer` upload, or with
   another process.
 
-## 2. Host Configuration and Output Modes
+## 2. Host Configuration and Response Format
 
 ### Progress Notifications and Timeouts
 
@@ -569,24 +595,18 @@ keep the MCP server connected for the task's lifetime: an idle disconnect ends
 its tasks. In `on` mode a disconnect ends nothing; the daemon keeps the tasks
 (section 6).
 
-### `FASTEXEC_STRUCTURED_CONTENT` and `FASTEXEC_OUTPUT_MODE`
+### Direct MCP Responses vs. Codemode Programmatic Results
 
-Set these strings in the MCP server's `env` configuration. Both are read at
-startup; invalid values exit with status `1`. They shape tool results across
-`exec`, `codemode`, `read`, `write`, `edit`, and `transfer`.
+Direct MCP tool calls (`exec`, `codemode`, `read`, `write`, `edit`, and
+`transfer`) return `content` text and media blocks with `structuredContent`
+omitted (`None`). Status lines, inline omission and cut markers, `Attached:`
+summaries, warnings, and background footers appear in the text body.
 
-- **`FASTEXEC_STRUCTURED_CONTENT`**: `"true"` (default) attaches
-  `structuredContent` JSON metadata; `"false"` omits `structuredContent` on all
-  results and uses text output placement.
-- **`FASTEXEC_OUTPUT_MODE`** (when structured content is enabled):
-  - `"text"` (default): `content` holds the full text (output body + status/footer
-    for tasks, or file text + notices for `read`); `structuredContent` holds
-    metadata without duplicating task output or file text.
-  - `"both"`: `content` holds the full text, and `structuredContent.output`
-    (tasks) or `structuredContent.text` (text `read`) also holds the clean body.
-  - `"structured"`: `content` holds only the status/notice line;
-    `structuredContent.output` (tasks) or `structuredContent.text` (text `read`)
-    holds the clean body (for hosts like Codex that consume structured tool output).
+Nested `codemode` calls (`tools.exec`, `tools.read`, `tools.write`,
+`tools.edit`) skip MCP presentation and `CallToolResult` completely. They
+encode typed DTOs directly in `src/codemode/encode.rs` so JavaScript callers
+receive raw data (`output` or `text`) and explicit control fields without
+Fastexec-injected prose.
 
 ### `FASTEXEC_DAEMON`
 
@@ -618,8 +638,7 @@ Host line. Local stdio and daemon endpoints use their own startup environment;
 HTTP uses the daemon's. The daemon accepts forwarded codemode calls regardless
 of its advertised setting, within the same session and task permissions as exec.
 Invalid values fail stdio startup, daemon start, and daemon run with exit 1,
-without blocking `daemon status` or `daemon stop`. The IPC protocol version is
-unchanged.
+without blocking `daemon status` or `daemon stop`.
 
 ### `FASTEXEC_TRANSFER` and `FASTEXEC_TRANSFER_ADDR`
 
@@ -638,7 +657,7 @@ without blocking `daemon status` or `daemon stop`.
 - **Daemon stdio (`FASTEXEC_DAEMON=on`)**: Each endpoint advertises `transfer`
   from its own `FASTEXEC_TRANSFER` setting (validating `FASTEXEC_PUBLIC_URL` and
   `FASTEXEC_TRANSFER_ADDR` at startup when `true`) and forwards `"transfer"`
-  over the unchanged IPC protocol. A non-HTTP daemon started with
+  over IPC. A non-HTTP daemon started with
   `FASTEXEC_TRANSFER=false` leaves `FASTEXEC_PUBLIC_URL` and
   `FASTEXEC_TRANSFER_ADDR` unread and binds no `/t/` port; it binds one shared
   `/t/` listener at startup when both `FASTEXEC_TRANSFER=true` and
@@ -746,7 +765,7 @@ Text windows reserve their working peak before entering a blocking reader. Retai
 line prefixes release unused capacity after truncation and terminal padding removal;
 legacy encoding boundary checks stream through fixed buffers. The text workspace
 travels with blocking read and attachment workers, including after cancellation.
-The completed result retains a smaller owner for its text and structured strings.
+The completed result retains a smaller owner for its text payload.
 
 Output matching reserves its whole application workspace in `wait::mark`, before
 a poll resizes the terminal or sends input. With scan size `C = 64 KiB`, longest
@@ -984,32 +1003,28 @@ the queue keeps the wire owner until the VM consumes or drops the reply. Workers
 keep the input owner through cancellation and final report construction. This
 does not change the separate QuickJS heap limit.
 
-Nested exec candidates reserve their actual payload capacity `P` plus
-`W = json_len(CallToolResult) + 256` before committing a reader cursor, attachment
-watermark or reported state. Moving fields into `{ok,value}` adds at most 64 encoded
-bytes, including the fixed missing-content fallback; 128 bytes cover new envelope
-keys and fallback text. The 256-byte allowance covers both that temporary workspace
-and the final encoding without a second admission after commit. The script report
-atomically replaces this pending call's argument/result quota with `W`; refusal
-preserves its previous charge. A failed memory growth likewise keeps the old lease
-until a replacement is acquired. Only short list/kill replies can use control space.
-Temporary opaque attachment handles are removed on every uncommitted exit.
-
-The result carries its payload owner separately from the prepaid wire lease. Host
-exec hands that lease to the bridge encoder; it stays intact until encoding finishes
-and the old envelope is dropped, then shrinks to the String's actual capacity. The
-report's quota shrinks from `W` to the final byte length. Nested file results retain
-their own payload lease and reserve a separate encoding. Wake queue items keep the
-wire owner through synchronous VM consumption or queue disposal.
+Nested tool results admit memory in a single peak (`admit_bridge_result` in
+`src/codemode/encode.rs`) without constructing `CallToolResult`. Before
+committing a reader cursor, attachment watermark, or reported state, the
+encoder measures `wire_len = ipc::json_len(&dto)` without allocating, checks
+`wire_len <= BRIDGE_LIMIT`, resizes the held workspace or `TextSlice.lease` in
+place to cover retained data plus `wire_len` (falling back to
+`control_memory()` for `kill` and `list`), and reserves `wire_len` once against
+the script's pending-result quota. It then serializes directly into a pre-sized
+buffer, commits state and disarms `NestedAttachments`, drops the source data,
+and shrinks the lease to the serialized buffer's capacity. Any earlier failure
+unregisters temporary opaque attachment handles, drops uncommitted state in
+safe lock/lease order, and preserves the prior quota charge. Wake queue items
+keep the wire owner through synchronous VM consumption or queue disposal.
 
 A refusal before commit leaves reader, attachment and reported state available for
 a later poll. Already-executed start/input operations are not rolled back or replayed.
 When the detailed error fits, it includes the task handle, log path and recovery
-instructions. If the remaining script quota cannot hold even that error, the
-existing fixed `RangeError` explains that the operation was not undone and must not
-be repeated. Accepted starts are recorded before waiting; their handles remain in
-the outer codemode report even in this small-quota case. This does not reserve an
-extra unbudgeted error frame.
+instructions. If the remaining script quota cannot hold even that error, a fixed
+`ToolError` (`code: "LIMIT"` or `"OVERLOAD"`) explains that the operation was
+not undone and must not be repeated. Accepted starts are recorded before waiting;
+their handles remain in the outer codemode report even in this small-quota case.
+This does not reserve an extra unbudgeted error frame.
 Result payload sizing includes resource URIs, MIME strings, annotations and
 metadata strings as well as text and Base64, and subtracts an existing payload
 lease when sizing additional delivery storage.
@@ -1180,7 +1195,7 @@ responses. Local stdio (`FASTEXEC_DAEMON=off`), daemon stdio endpoints
 `daemon start --http` probes for an already-running daemon first and skips
 reading the file when reusing one, pre-validating it only on a cold HTTP start.
 Non-HTTP `daemon start` and `daemon run`, plus `daemon status` and
-`daemon stop`, leave the variable unread. The IPC protocol version is unchanged.
+`daemon stop`, leave the variable unread.
 
 ### `FASTEXEC_INSTRUCTIONS_TOOL`
 
@@ -1203,87 +1218,88 @@ daemon commands ignore the caller's flag. Changes take effect when the serving
 process restarts. Do not include secrets: clients allowed to discover tools
 can receive the description as part of discovery.
 
-A nonzero command `exitCode` is a normal result (`ok: true`). Operational
-failures set `isError` and `ok: false`; schema-decoding errors may have no
-`structuredContent`.
+A nonzero command `exitCode` is a normal result (`isError: false` on direct
+calls; resolves normally in `codemode`). Operational failures set
+`isError: true` on direct MCP calls (with no `structuredContent`) and reject
+with `ToolError` in `codemode`.
 
-### `structuredContent` Fields
+### Programmatic Result Fields (`codemode`)
 
-These fields describe `exec` results; codemode adds `codemode` when non-empty.
-Default-valued flags, zero counters, empty arrays, and null diagnostics are
-omitted on final serialization unless noted as always-present below.
+These fields describe typed objects returned by nested `tools.*` calls in
+`codemode` (direct MCP calls return text and media blocks with no
+`structuredContent`). Default-valued flags, zero counters, empty arrays, and
+null diagnostics are omitted via `skip_serializing_if` unless noted as
+always-present below.
 
-- **Always present on `start`, `poll`, `kill`**: `ok` (outer calls only),
-  `action`, `kind` (`"bash"` or `"codemode"`), `taskId` (reader handle),
-  `state` (`"running"`, `"exited"`, `"killed"`), `exitCode`, `pty`,
-  `elapsedMs`, `logPath`, and `waitEndedBy` (`start` and `poll` only; `kill`
-  omits `waitEndedBy`). Status lines omit ` · log <path>` when a finished task
-  has no omitted or cut output, no log-loss warning, and no open output or kept
-  processes, while `structuredContent.logPath` stays present. Diagnostics
-  omitted when false, zero, empty, or null: `keepTree`, `keptRunning`,
-  `forcedEnd`, `lifetimeExpired`, `logEvicted`, `logError`, `captureError`,
+- **Always present on `start`, `poll`, `kill`**: `action`, `kind` (`"bash"` or
+  `"codemode"`), `taskId` (reader handle), `state` (`"running"`, `"exited"`,
+  `"killed"`), `exitCode`, `pty`, `elapsedMs`, `output` (raw string with zero
+  inline markers or footers), `truncated`, and `logPath`. On direct MCP calls,
+  status lines omit ` · log <path>` when a finished task has no omitted or cut
+  output, no log-loss warning, and no open output or kept processes. Fields
+  omitted when false, zero, empty, or null: `waitEndedBy` (`start` and `poll`
+  only; `kill` omits it), `keepTree`, `keptRunning`, `forcedEnd`,
+  `lifetimeExpired`, `logEvicted`, `logError`, `captureError`,
   `outputIncomplete`, `outputOpen`, `droppedBytes`, `inputWarning`,
   `inputError`, `warnings`, `leftovers` (`[{ pid, name }]`), `held` (`[{ pid,
   name }]`), `killError`, `encodingErrors`, `omittedLines`, `omittedRange`
-  (`[first, last]`), and `cutLines`. With `screen: true`, `cols`, `rows`, and
-  `cursor` (`[row, col]`) are always present and `omittedRows` is included when
-  non-zero.
-- **`transcript`**: Always includes `ok` (outer), `action`, `kind`, `taskId`,
-  `state`, `exitCode`, `pty`, `elapsedMs`, `logPath`, `transcriptPath`,
-  `transcriptLines`, `finalLines`, and `firstLine`, plus non-default window and
-  task diagnostics when set.
-- **`codemode` report**: Included when any array is non-empty
-  (`attachmentsDelivered`, nested `attachments`, `cancelledCalls`, `startedTasks`).
-- **`read`**: Keeps its data fields unchanged (`endLine: null`,
-  `nextOffset: null`, `lineTooLong`, `lossy`, and `attached: false` are data;
-  nested calls strip `ok` and return `{attachable, ...}` media descriptors without base64).
-- **`list`**: Always includes `ok` (outer), `action`, `tasks` (built after
-  `limit`), and `totalCount`; each entry always carries `taskId` as a bare task
-  ID, `kind`, `state`, `exitCode`, `pty`, `elapsedMs`, `command` up to 120
-  chars, `owner`, and `logPath`, omitting `cols`, `rows`, `session`, `callId`,
-  `parentTaskId`, and task diagnostics when null/false/zero/empty. Flat child
-  entries (in `parentTaskId` drill-down or as promoted orphans) set
+  (`[first, last]`), `cutLines`, and `newReader`. With `screen: true`, `cols`,
+  `rows`, and `cursor` (`[row, col]`) are present and `omittedRows` is included
+  when non-zero.
+- **`transcript`**: Always includes `action`, `kind`, `taskId`, `state`,
+  `exitCode`, `pty`, `elapsedMs`, `output`, `truncated`, `logPath`,
+  `transcriptPath`, `transcriptLines`, `finalLines`, and `firstLine`, plus
+  non-default window and task diagnostics when set.
+- **`codemode` report**: Included when any array is non-empty (nested
+  `attachments` sealed handles, `cancelledCalls`, `startedTasks`).
+- **`read`**: Text reads return `{ kind: "text", path, text, startLine,
+  endLine, shownLines, totalLines, truncated, nextOffset?, lineTooLong?,
+  lossy? }`. Media reads return `{ kind, path, mimeType, bytes, sourceBytes?,
+  attachable, note? }` without base64.
+- **`list`**: Returns `{ action: "list", totalCount, tasks }` (built after
+  `limit`, rejecting `maxBytes` and `truncate`). Each entry carries `taskId` as
+  a bare task ID, `kind`, `state`, `exitCode`, `pty`, `elapsedMs`, `command` up
+  to 120 chars, `owner`, and `logPath`, omitting `cols`, `rows`, `session`,
+  `callId`, `parentTaskId`, and task diagnostics when null/false/zero/empty.
+  Flat child entries (in `parentTaskId` drill-down or as promoted orphans) set
   `parentTaskId` to the bare parent ID. `codemode` entries include `children`
-  (`{ total, done, failed, warned, active, queued, cancelled, activeTasks }`)
-  only when `total > 0`, `running && queued > 0`, or `!running && cancelled > 0`;
-  `prune_task_diagnostics` strips zero-valued counters and empty `activeTasks`
-  and recurses into `children.activeTasks` (up to `8` active child entries,
-  without redundant `parentTaskId`). `warnings` covers rendered concrete rows
-  only (top-level items and indented active children) and is omitted when empty;
-  warnings on folded finished children appear as `children.warned` and in full
-  under `parentTaskId`. Behavior change: callers parsing `structuredContent.tasks`
-  directly without passing `parentTaskId` now receive `codemode` children folded
-  under `parent.children` (with active children in `parent.children.activeTasks`
-  and promoted orphans in top-level `tasks` with `parentTaskId`) instead of flat
-  top-level rows.
+  (`{ total, done, failed, warned, active, queued, cancelled, activeTasks }`,
+  omitting zero counters and empty `activeTasks`) only when `total > 0`,
+  `running && queued > 0`, or `!running && cancelled > 0`. Up to `8` active
+  children appear in `children.activeTasks` (without redundant `parentTaskId`).
+  Each task entry carries its own `warnings` array; nested `list` omits the
+  redundant top-level formatted warning string list.
 - **Integrity and initial-input diagnostics**: On pipe `start`, an early child
   close (`BrokenPipe` or Windows pipe-closed codes `109`/`232`/`233`) sets
-  `inputWarning: "stdin closed after N of M bytes"` with `ok: true`, whereas
-  other initial write failures or any `poll` write failure set `ok: false` and
-  `inputError`; the writer joins within the `2` s post-tree output drain before
-  final state publication. Output capture or log write failures also set
-  `ok: false` and `isError: true` while preserving `exitCode` and captured
-  output. Warnings stay whole regardless of `maxBytes`.
-- **Background footer**: Appended to `start`, `poll`, `kill`, `transcript`, and
-  `codemode` results (up to `512` bytes, outside `maxBytes`) naming up to three
-  other tasks this session has addressed, using bare task IDs. HTTP clients
-  sharing a token share this scope. While scanning `session.touched`,
-  `Tasks::background` collects running `codemode` task IDs before excluding the
-  current call's task (`exclude`), and skips running children
-  (`parent_task_id: Some(pid)`) whose parent `pid` is also running in `touched`
-  so an active batch does not flood the three-slot footer (including when
-  polling the parent itself). Once the parent exits or is killed, surviving
-  running or unreported finished children surface normally until reported by
-  `poll`, `kill`, or a delivered `list` (including via a delivered parent
-  summary). Running tasks (or tasks holding processes)
-  outside this session appear **at most once per session** as `1 task running
-  outside this session; use list with scope "all".` or `<n> tasks running
-  outside this session; use list with scope "all".`; the session flag is
-  consumed atomically when a delivered response shows that clause or when the
-  session's first committed footer-bearing result finds no outside tasks (never
-  on nested or cancelled calls). A footer marks only session tasks it names; `list`
-  marks existing session entries shown in direct text (plus folded finished
-  children of delivered parents) or delivered in a nested `tasks` array.
+  `inputWarning: "stdin closed after N of M bytes"` as a non-fatal warning,
+  whereas other initial write failures, any `poll` write failure, or output
+  capture and log write failures (`task_io_ok == false`) return `isError: true`
+  on direct MCP calls and reject with `ToolError` (`code: "IO"`) in `codemode`
+  while preserving `exitCode`, captured `output`, error fields, and `warnings`
+  on `err.result`. Warnings stay whole regardless of `maxBytes`.
+- **Background footer (direct MCP calls only)**: Appended to direct `start`,
+  `poll`, `kill`, `transcript`, and `codemode` results (up to `512` bytes,
+  outside `maxBytes`) naming up to three other tasks this session has
+  addressed, using bare task IDs. Nested `codemode` calls never emit background
+  footers, never touch `external_background_cursor`, and never suppress outer
+  session task reporting when polling an outer task. HTTP clients sharing a
+  token share this scope. While scanning `session.touched`, `Tasks::background`
+  collects running `codemode` task IDs before excluding the current call's task
+  (`exclude`), and skips running children (`parent_task_id: Some(pid)`) whose
+  parent `pid` is also running in `touched` so an active batch does not flood
+  the three-slot footer (including when polling the parent itself). Once the
+  parent exits or is killed, surviving running or unreported finished children
+  surface normally until reported by `poll`, `kill`, or a delivered `list`
+  (including via a delivered parent summary). Running tasks (or tasks holding
+  processes) outside this session appear **at most once per session** as `1 task
+  running outside this session; use list with scope "all".` or `<n> tasks
+  running outside this session; use list with scope "all".`; the session flag
+  is consumed atomically when a delivered response shows that clause or when
+  the session's first committed footer-bearing result finds no outside tasks
+  (never on nested or cancelled calls). A footer marks only session tasks it
+  names; `list` marks existing session entries shown in direct text (plus
+  folded finished children of delivered parents) or delivered in a nested
+  `tasks` array.
 
 ## 3. Logs, Terminal Emulator, and Transcript Spool
 
@@ -1524,7 +1540,7 @@ omitted on final serialization unless noted as always-present below.
   call whose serialized arguments pass `3` MiB before writing it (sizing for up
   to `1` MiB of JSON-escaped `start` `input`), a request frame
   is at most `4` MiB (a `Hello` carries the endpoint's environment), a response
-  frame at most `512` MiB (protocol version `4`), one connection carries at most `32` concurrent calls,
+  frame at most `512` MiB (protocol version `5`), one connection carries at most `32` concurrent calls,
   and the daemon serves at most `128` connections.
 - **Sessions**: Each endpoint process holds one random session ID with its own
   task entries and readers, and a reconnect keeps them. An endpoint session with

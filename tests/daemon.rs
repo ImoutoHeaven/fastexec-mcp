@@ -368,8 +368,8 @@ impl Endpoint {
         }
     }
 
-    /// Calls the tool: (structured content, text, isError).
-    fn call(&mut self, arguments: Value) -> (Value, String, bool) {
+    /// Calls the tool: (text, isError).
+    fn call(&mut self, arguments: Value) -> (String, bool) {
         let message = self.request(
             "tools/call",
             json!({"name": "exec", "arguments": arguments}),
@@ -377,24 +377,21 @@ impl Endpoint {
         Endpoint::answer(&message)
     }
 
-    /// Calls a file tool: (structured content, text, isError).
-    fn file(&mut self, tool: &str, arguments: Value) -> (Value, String, bool) {
+    /// Calls a file tool: (text, isError).
+    fn file(&mut self, tool: &str, arguments: Value) -> (String, bool) {
         let message = self.request("tools/call", json!({"name": tool, "arguments": arguments}));
         Endpoint::answer(&message)
     }
 
-    fn answer(message: &Value) -> (Value, String, bool) {
+    fn answer(message: &Value) -> (String, bool) {
         let result = &message["result"];
         assert!(result.is_object(), "protocol error: {message}");
+        assert!(result.get("structuredContent").is_none(), "{message}");
         let text = result["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
             .to_string();
-        (
-            result["structuredContent"].clone(),
-            text,
-            result["isError"] == json!(true),
-        )
+        (text, result["isError"] == json!(true))
     }
 
     /// Closes stdin and waits for the endpoint to exit, as a host does at shutdown.
@@ -426,10 +423,7 @@ impl Endpoint {
     }
 
     /// The task ID a `start` answer named.
-    fn task_id(structured: &Value, text: &str) -> String {
-        if let Some(id) = structured["taskId"].as_str() {
-            return id.to_string();
-        }
+    fn task_id(text: &str) -> String {
         // The status line, the last line that opens with `[`, names the task after the state.
         text.lines()
             .rev()
@@ -442,6 +436,21 @@ impl Endpoint {
             })
             .unwrap_or_else(|| panic!("no task ID: {text}"))
             .to_string()
+    }
+
+    fn status_line(text: &str) -> &str {
+        text.lines()
+            .rev()
+            .find(|line| line.starts_with('[') && line.contains("] "))
+            .unwrap_or_else(|| panic!("no status line: {text}"))
+    }
+
+    fn split_output(text: &str) -> (&str, &str) {
+        if let Some(pos) = text.rfind("\n\n[") {
+            (&text[..pos], &text[pos + 2..])
+        } else {
+            ("", text)
+        }
     }
 }
 
@@ -810,7 +819,7 @@ fn two_sessions_send_their_input_whole() {
     // Each read gets one session's input and then that session's key, or the two would mix.
     let command = r#"stty -echo; IFS= read -r a; IFS= read -r b; printf '<%s><%s>
 ' "$a" "$b""#;
-    let (started, text, error) = first.call(json!({
+    let (text, error) = first.call(json!({
         "action": "start",
         "command": command,
         "pty": true,
@@ -818,14 +827,13 @@ fn two_sessions_send_their_input_whole() {
         "waitMs": 0
     }));
     assert!(!error, "{text}");
-    let id = Endpoint::task_id(&started, &text);
+    let id = Endpoint::task_id(&text);
     // A second endpoint is a second session: each has its own read gate, so only the task's
     // input gate keeps one session's input and keys together. Its first call connects, which is
     // done here so the two polls below are what overlap.
     let mut second = Endpoint::start(&fixture);
-    let (listed, text, error) = second.call(json!({"action": "list"}));
+    let (text, error) = second.call(json!({"action": "list"}));
     assert!(!error, "{text}");
-    assert!(listed["tasks"].is_array(), "{listed}");
     let poll = |input: &str, key: &str| {
         json!({
             "action": "poll", "taskId": id, "input": input,
@@ -843,11 +851,14 @@ fn two_sessions_send_their_input_whole() {
     for (endpoint, call) in [(&mut first, first_call), (&mut second, second_call)] {
         let message = endpoint.response(call);
         assert!(message["result"]["isError"] != json!(true), "{message}");
+        assert!(message["result"].get("structuredContent").is_none(), "{message}");
     }
-    let (out, text, error) = first.call(json!({"action": "poll", "taskId": id, "waitMs": 30000}));
+    let (text, error) = first.call(json!({"action": "poll", "taskId": id, "waitMs": 30000}));
     assert!(!error, "{text}");
-    assert_eq!(out["state"], json!("exited"), "{text}");
-    let log = std::fs::read_to_string(out["logPath"].as_str().unwrap()).unwrap();
+    assert!(Endpoint::status_line(&text).starts_with("[exited "), "{text}");
+    let bare = id.split_once('.').unwrap().0;
+    let (log, error) = first.call(json!({"action": "poll", "taskId": bare, "waitMs": 0}));
+    assert!(!error, "{log}");
     let whole = log.contains("<aaaa-1><bbbb-2>") || log.contains("<bbbb-2><aaaa-1>");
     assert!(whole, "the two inputs arrived whole: {log:?}");
     first.close();
@@ -863,7 +874,7 @@ fn a_pending_watch_sees_another_sessions_resize() {
     // together on one row, which is the change the pending watch is waiting for. Nothing else about
     // the program changes: it prints once and then blocks.
     let command = "stty -echo; printf 'prefix-padding-18SPLITTOKENfiller-filler-filler\r\n'; while IFS= read -r line; do :; done";
-    let (started, text, error) = first.call(json!({
+    let (text, error) = first.call(json!({
         "action": "start",
         "command": command,
         "pty": true,
@@ -873,12 +884,12 @@ fn a_pending_watch_sees_another_sessions_resize() {
         "waitMs": 0
     }));
     assert!(!error, "{text}");
-    let id = Endpoint::task_id(&started, &text);
+    let id = Endpoint::task_id(&text);
     // The filler text is on the screen before the watch starts: read as a screen, not as a wait a
     // timeout would also satisfy, and with no row holding the whole token at this width.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let (_, screen, error) = first.call(json!({
+        let (screen, error) = first.call(json!({
             "action": "poll", "taskId": id, "screen": true, "waitMs": 100
         }));
         assert!(!error, "the screen never arrived: {screen}");
@@ -905,28 +916,27 @@ fn a_pending_watch_sees_another_sessions_resize() {
     );
     std::thread::sleep(Duration::from_millis(200));
     let mut second = Endpoint::start(&fixture);
-    let (_, listed, error) = second.call(json!({"action": "list", "scope": "all"}));
+    let (listed, error) = second.call(json!({"action": "list", "scope": "all"}));
     assert!(!error, "{listed}");
     assert!(listed.contains(" pty 20x30"), "{listed}");
-    let (_, text, error) = second.call(json!({
+    let (text, error) = second.call(json!({
         "action": "poll", "taskId": id, "cols": 60, "rows": 30, "waitMs": 0
     }));
     assert!(!error, "the resize failed: {text}");
     // The pending watch ends on the condition, not on its timeout, and the screen it reads holds the
     // token on one row again: the resize woke the wait and rewrapped the terminal.
     let message = first.response(watch);
-    let (out, text, error) = Endpoint::answer(&message);
+    let (text, error) = Endpoint::answer(&message);
     assert!(!error, "{text}");
-    assert_eq!(
-        out["waitEndedBy"],
-        json!({"condition": "screen_contains", "text": "SPLITTOKEN"}),
+    assert!(
+        Endpoint::status_line(&text).contains("wait: screen matched \"SPLITTOKEN\""),
         "{text}"
     );
     assert!(
         text.lines().any(|line| line.contains("SPLITTOKEN")),
         "the wider terminal holds the token on one row: {text}"
     );
-    let (_, listed, error) = second.call(json!({"action": "list"}));
+    let (listed, error) = second.call(json!({"action": "list"}));
     assert!(!error, "{listed}");
     assert!(listed.contains(" pty 60x30"), "the task is 60x30: {listed}");
     first.close();
@@ -938,9 +948,9 @@ fn a_closed_endpoint_leaves_no_session_behind() {
     let fixture = Fixture::new("bye");
     let mut endpoint = Endpoint::start(&fixture);
     // A call is what starts the daemon and attaches this session to it.
-    let (listed, text, error) = endpoint.call(json!({"action": "list"}));
+    let (text, error) = endpoint.call(json!({"action": "list"}));
     assert!(!error, "{text}");
-    assert!(listed["tasks"].is_array(), "{listed}");
+    assert_eq!(text, "No tasks.");
     endpoint.close();
     // The endpoint exits after the daemon reads its Bye, so one status is enough.
     let (code, status, err) = fixture.run(&["daemon", "status"]);
@@ -952,53 +962,42 @@ fn a_closed_endpoint_leaves_no_session_behind() {
 fn a_task_outlives_the_endpoint_that_started_it() {
     let fixture = Fixture::new("e2e-outlive");
     let mut first = Endpoint::start(&fixture);
-    let (started, text, error) = first.call(json!({
+    let (text, error) = first.call(json!({
         "action": "start",
         "command": "echo one; sleep 60",
         "waitMs": 0
     }));
     assert!(!error, "{text}");
-    let id = Endpoint::task_id(&started, &text);
+    let id = Endpoint::task_id(&text);
+    let bare = id.split_once('.').unwrap().0;
     // The session this endpoint runs as, and the call that started the task.
-    let (listed, text, error) = first.call(json!({"action": "list"}));
+    let (text, error) = first.call(json!({"action": "list"}));
     assert!(!error, "{text}");
-    let entry = listed["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["taskId"] == json!(id.split_once('.').unwrap().0))
-        .unwrap_or_else(|| panic!("no task in {listed}"))
-        .clone();
-    assert_eq!(entry["callId"], json!(1), "{listed}");
-    let session = entry["session"]
-        .as_str()
-        .expect("a started task has a session")
+    let first_line = text
+        .lines()
+        .find(|line| line.starts_with(bare))
+        .unwrap_or_else(|| panic!("no task in {text}"))
         .to_string();
-    assert_eq!(session.len(), 26, "{session}");
+    assert!(first_line.contains("call 1"), "{first_line}");
     first.close();
 
     let mut second = Endpoint::start(&fixture);
-    let (polled, text, error) =
-        second.call(json!({"action": "poll", "taskId": id, "waitMs": 5000}));
+    let (text, error) = second.call(json!({"action": "poll", "taskId": id, "waitMs": 5000}));
     assert!(!error, "{text}");
     assert!(text.contains("one"), "{text}");
-    assert_eq!(polled["state"], json!("running"), "{polled}");
+    assert!(Endpoint::status_line(&text).starts_with("[running] "), "{text}");
 
-    let (listed, text, error) = second.call(json!({"action": "list"}));
+    let (text, error) = second.call(json!({"action": "list"}));
     assert!(!error, "{text}");
-    let entry = listed["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["taskId"] == json!(id.split_once('.').unwrap().0))
-        .unwrap_or_else(|| panic!("the second endpoint does not see the task: {listed}"));
-    assert_eq!(entry["session"], json!(session), "{listed}");
-    assert_eq!(entry["callId"], json!(1), "{listed}");
-    assert!(text.contains("call 1"), "{text}");
+    let second_line = text
+        .lines()
+        .find(|line| line.starts_with(bare))
+        .unwrap_or_else(|| panic!("the second endpoint does not see the task: {text}"));
+    assert!(second_line.contains("call 1"), "{second_line}");
 
-    let (killed, text, error) = second.call(json!({"action": "kill", "taskId": id}));
+    let (text, error) = second.call(json!({"action": "kill", "taskId": id}));
     assert!(!error, "{text}");
-    assert_ne!(killed["state"], json!("running"), "{killed}");
+    assert!(!Endpoint::status_line(&text).starts_with("[running] "), "{text}");
     second.close();
 }
 
@@ -1006,17 +1005,17 @@ fn a_task_outlives_the_endpoint_that_started_it() {
 fn two_endpoints_read_one_task_through_independent_cursors() {
     let fixture = Fixture::new("e2e-cursors");
     let mut first = Endpoint::start(&fixture);
-    let (started, text, error) = first.call(json!({
+    let (text, error) = first.call(json!({
         "action": "start",
         "command": "IFS= read -r line; printf 'x%sy\\n' \"$line\"; sleep 60",
         "eof": false,
         "waitMs": 0
     }));
     assert!(!error, "{text}");
-    let id = Endpoint::task_id(&started, &text);
+    let id = Endpoint::task_id(&text);
     // The poll supplies the input that makes the marker, and waits for it: no output can come
     // before this call, and a slow start is a slow answer rather than a miss.
-    let (_, seen_by_first, error) = first.call(json!({
+    let (seen_by_first, error) = first.call(json!({
         "action": "poll",
         "taskId": id,
         "waitMs": 30000,
@@ -1027,7 +1026,7 @@ fn two_endpoints_read_one_task_through_independent_cursors() {
     assert!(seen_by_first.contains("x42y"), "{seen_by_first}");
 
     let mut second = Endpoint::start(&fixture);
-    let (_, seen_by_second, error) =
+    let (seen_by_second, error) =
         second.call(json!({"action": "poll", "taskId": id, "waitMs": 30000}));
     assert!(!error, "{seen_by_second}");
     assert!(
@@ -1036,11 +1035,10 @@ fn two_endpoints_read_one_task_through_independent_cursors() {
     );
 
     // Each cursor is its own: what one endpoint read is gone for it, and only for it.
-    let (_, again_by_first, error) =
-        first.call(json!({"action": "poll", "taskId": id, "waitMs": 0}));
+    let (again_by_first, error) = first.call(json!({"action": "poll", "taskId": id, "waitMs": 0}));
     assert!(!error, "{again_by_first}");
     assert!(!again_by_first.contains("x42y"), "{again_by_first}");
-    let (_, again_by_second, error) =
+    let (again_by_second, error) =
         second.call(json!({"action": "poll", "taskId": id, "waitMs": 0}));
     assert!(!error, "{again_by_second}");
     assert!(!again_by_second.contains("x42y"), "{again_by_second}");
@@ -1054,22 +1052,22 @@ fn two_endpoints_read_one_task_through_independent_cursors() {
 fn a_kill_after_ms_survives_the_endpoint_that_started_the_task() {
     let fixture = Fixture::new("e2e-lifetime");
     let mut first = Endpoint::start(&fixture);
-    let (started, text, error) = first.call(json!({
+    let (text, error) = first.call(json!({
         "action": "start",
         "command": "sleep 60",
         "killAfterMs": 3000,
         "waitMs": 0
     }));
     assert!(!error, "{text}");
-    let id = Endpoint::task_id(&started, &text);
+    let id = Endpoint::task_id(&text);
     first.close();
 
     let mut second = Endpoint::start(&fixture);
-    let (polled, text, error) =
-        second.call(json!({"action": "poll", "taskId": id, "waitMs": 10000}));
+    let (text, error) = second.call(json!({"action": "poll", "taskId": id, "waitMs": 10000}));
     assert!(!error, "{text}");
-    assert_ne!(polled["state"], json!("running"), "{polled}");
-    assert_eq!(polled["lifetimeExpired"], json!(true), "{polled}");
+    let status = Endpoint::status_line(&text);
+    assert!(!status.starts_with("[running] "), "{text}");
+    assert!(status.contains("killed by killAfterMs"), "{text}");
     second.close();
 }
 
@@ -1077,13 +1075,13 @@ fn a_kill_after_ms_survives_the_endpoint_that_started_the_task() {
 fn a_lost_call_after_a_daemon_stop_is_reported_and_the_next_call_starts_a_daemon() {
     let fixture = Fixture::new("e2e-restart");
     let mut endpoint = Endpoint::start(&fixture);
-    let (started, text, error) = endpoint.call(json!({
+    let (text, error) = endpoint.call(json!({
         "action": "start",
         "command": "sleep 60",
         "waitMs": 0
     }));
     assert!(!error, "{text}");
-    let old = Endpoint::task_id(&started, &text);
+    let old = Endpoint::task_id(&text);
 
     // The poll is waiting on the daemon when the daemon goes away. Its progress notification is
     // what proves the call was dispatched, not merely sent.
@@ -1110,7 +1108,7 @@ fn a_lost_call_after_a_daemon_stop_is_reported_and_the_next_call_starts_a_daemon
 
     // The call that was in flight may have run, so it is reported, never replayed.
     let message = endpoint.response(waiting);
-    let (_, text, error) = Endpoint::answer(&message);
+    let (text, error) = Endpoint::answer(&message);
     assert!(error, "{text}");
     assert!(text.contains("closed during poll call 2"), "{text}");
     assert!(text.contains("request 3"), "{text}");
@@ -1118,12 +1116,12 @@ fn a_lost_call_after_a_daemon_stop_is_reported_and_the_next_call_starts_a_daemon
     assert!(text.contains("the operation may have run"), "{text}");
 
     // The next call on the same endpoint starts a daemon and succeeds, with no new initialize.
-    let (listed, text, error) = endpoint.call(json!({"action": "list"}));
+    let (text, error) = endpoint.call(json!({"action": "list"}));
     assert!(!error, "{text}");
-    assert_eq!(listed["tasks"], json!([]), "{listed}");
+    assert_eq!(text, "No tasks.");
 
     // The old ID belongs to the daemon that is gone, and says so.
-    let (_, text, error) = endpoint.call(json!({"action": "poll", "taskId": old, "waitMs": 0}));
+    let (text, error) = endpoint.call(json!({"action": "poll", "taskId": old, "waitMs": 0}));
     assert!(error, "{text}");
     assert!(
         text.contains("it comes from an earlier fastexec daemon"),
@@ -1138,7 +1136,7 @@ fn a_call_over_three_mib_is_refused_before_it_reaches_a_daemon() {
     let fixture = Fixture::new("e2e-limit");
     let mut endpoint = Endpoint::start(&fixture);
     let command = "x".repeat((3 << 20) + 1024);
-    let (_, text, error) = endpoint.call(json!({
+    let (text, error) = endpoint.call(json!({
         "action": "start",
         "command": command,
         "waitMs": 0
@@ -1221,7 +1219,7 @@ fn file_tools_run_in_the_endpoints_directory_and_not_the_daemons() {
         .join("notes/missing.txt")
         .to_string_lossy()
         .replace('\\', "/");
-    let (_, written, error) = endpoint.file(
+    let (written, error) = endpoint.file(
         "write",
         json!({"path": "notes/a.txt", "content": "one\ntwo\n"}),
     );
@@ -1231,10 +1229,10 @@ fn file_tools_run_in_the_endpoints_directory_and_not_the_daemons() {
         std::fs::read(dir.join("notes/a.txt")).unwrap(),
         b"one\ntwo\n"
     );
-    let (_, read, error) = endpoint.file("read", json!({"path": "notes/a.txt"}));
+    let (read, error) = endpoint.file("read", json!({"path": "notes/a.txt"}));
     assert!(!error, "{read}");
     assert_eq!(read, "one\ntwo\n");
-    let (_, edited, error) = endpoint.file(
+    let (edited, error) = endpoint.file(
         "edit",
         json!({"path": "notes/a.txt", "edits": [{"oldText": "two", "newText": "TWO"}]}),
     );
@@ -1243,10 +1241,10 @@ fn file_tools_run_in_the_endpoints_directory_and_not_the_daemons() {
         edited,
         format!("Successfully replaced 1 block(s) in {expected_note}.\nedits[0]: line 2")
     );
-    let (_, read, _) = endpoint.file("read", json!({"path": "notes/a.txt"}));
+    let (read, _) = endpoint.file("read", json!({"path": "notes/a.txt"}));
     assert_eq!(read, "one\nTWO\n");
     // A missing file is an error result, not a lost call.
-    let (_, text, error) = endpoint.file("read", json!({"path": "notes/missing.txt"}));
+    let (text, error) = endpoint.file("read", json!({"path": "notes/missing.txt"}));
     assert!(error, "{text}");
     assert!(
         text.starts_with(&format!("Cannot read {expected_missing}: ")),
@@ -1304,13 +1302,13 @@ fn an_image_read_crosses_the_daemon_link() {
 fn a_cancelled_call_does_not_disturb_another_call_on_the_same_endpoint() {
     let fixture = Fixture::new("e2e-cancel");
     let mut endpoint = Endpoint::start(&fixture);
-    let (started, text, error) = endpoint.call(json!({
+    let (text, error) = endpoint.call(json!({
         "action": "start",
         "command": "sleep 60",
         "waitMs": 0
     }));
     assert!(!error, "{text}");
-    let id = Endpoint::task_id(&started, &text);
+    let id = Endpoint::task_id(&text);
 
     // One call waits on the daemon while another one runs beside it on the same connection.
     let waiting = endpoint.request_later(
@@ -1342,7 +1340,7 @@ fn a_cancelled_call_does_not_disturb_another_call_on_the_same_endpoint() {
         }
         message["id"] == json!(beside)
     });
-    let (_, text, error) = Endpoint::answer(&listed);
+    let (text, error) = Endpoint::answer(&listed);
     assert!(!error, "{text}");
 
     // The client cancels the wait; rmcp ends that call's token and drops its answer, so nothing
@@ -1359,13 +1357,13 @@ fn a_cancelled_call_does_not_disturb_another_call_on_the_same_endpoint() {
     let listed = endpoint.next_matching("the list answer beside the cancelled call", |message| {
         message["id"] == json!(listing)
     });
-    let (_, text, error) = Endpoint::answer(&listed);
+    let (text, error) = Endpoint::answer(&listed);
     assert!(!error, "{text}");
 
     // Cancelling the wait did not touch the task.
-    let (polled, text, error) = endpoint.call(json!({"action": "poll", "taskId": id, "waitMs": 0}));
+    let (text, error) = endpoint.call(json!({"action": "poll", "taskId": id, "waitMs": 0}));
     assert!(!error, "{text}");
-    assert_eq!(polled["state"], json!("running"), "{polled}");
+    assert!(Endpoint::status_line(&text).starts_with("[running] "), "{text}");
     endpoint.call(json!({"action": "kill", "taskId": id}));
     endpoint.close();
 }
@@ -1380,17 +1378,17 @@ fn each_endpoint_starts_its_tasks_with_its_own_environment() {
         command.env("FASTEXEC_TEST_MARKER", "from-the-second");
     });
 
-    let (started, text, error) = first.call(json!({
+    let (text, error) = first.call(json!({
         "action": "start",
         "command": "echo \"$FASTEXEC_TEST_MARKER\"; sleep 60",
         "waitMs": 10000
     }));
     assert!(!error, "{text}");
     assert!(text.contains("from-the-first"), "{text}");
-    let id = Endpoint::task_id(&started, &text);
+    let id = Endpoint::task_id(&text);
 
     // The task keeps the environment of the endpoint that started it, not of this one.
-    let (_, seen, error) = second.call(json!({
+    let (seen, error) = second.call(json!({
         "action": "poll",
         "taskId": id,
         "waitMs": 0
@@ -1398,7 +1396,7 @@ fn each_endpoint_starts_its_tasks_with_its_own_environment() {
     assert!(!error, "{seen}");
     assert!(!seen.contains("from-the-second"), "{seen}");
 
-    let (_, text, error) = second.call(json!({
+    let (text, error) = second.call(json!({
         "action": "start",
         "command": "echo \"$FASTEXEC_TEST_MARKER\"; sleep 60",
         "waitMs": 10000
@@ -1406,7 +1404,7 @@ fn each_endpoint_starts_its_tasks_with_its_own_environment() {
     assert!(!error, "{text}");
     assert!(text.contains("from-the-second"), "{text}");
 
-    let (_, text, error) = second.call(json!({"action": "kill", "taskId": id}));
+    let (text, error) = second.call(json!({"action": "kill", "taskId": id}));
     assert!(!error, "{text}");
     second.close();
     first.close();
@@ -1647,14 +1645,14 @@ fn a_foreground_daemon_announces_readiness_and_a_status_finds_it() {
 
     // A task runs on that daemon, through an endpoint that would otherwise start one of its own.
     let mut endpoint = Endpoint::start(&fixture);
-    let (started, text, error) = endpoint.call(json!({
+    let (text, error) = endpoint.call(json!({
         "action": "start",
         "command": "sleep 60",
         "waitMs": 0
     }));
     assert!(!error, "{text}");
-    assert_eq!(started["state"], json!("running"), "{started}");
-    let id = Endpoint::task_id(&started, &text);
+    assert!(Endpoint::status_line(&text).starts_with("[running] "), "{text}");
+    let id = Endpoint::task_id(&text);
     // The same daemon served it: no second one was started behind the endpoint.
     let (_, after, err) = fixture.run(&["daemon", "status"]);
     assert_eq!(
@@ -1759,15 +1757,15 @@ fn a_stopped_foreground_daemon_ends_and_takes_its_task_with_it() {
     let mut endpoint = Endpoint::start(&fixture);
     // The wait belongs to the start call itself: its own reply may already carry the output, and
     // a later read would only see what this one had not shown. READY follows the whole number.
-    let (started, text, error) = endpoint.call(json!({
+    let (text, error) = endpoint.call(json!({
         "action": "start",
         "command": NAMED_TASK,
         "waitMs": 30000,
         "returnWhen": {"outputContains": ["READY"]}
     }));
     assert!(!error, "{text}");
-    assert_eq!(started["state"], json!("running"), "{started}");
-    let _id = Endpoint::task_id(&started, &text);
+    assert!(Endpoint::status_line(&text).starts_with("[running] "), "{text}");
+    let _id = Endpoint::task_id(&text);
     let task = printed_pid(&text);
     assert!(
         is_alive(task),
@@ -1845,28 +1843,18 @@ fn two_endpoints_on_one_daemon_keep_independent_yolo_annotations() {
     }
 
     // Auto-starting the daemon under FASTEXEC_YOLO=true succeeds and shares tasks with plain endpoints.
-    let (started, text, error) =
-        yolo.call(json!({"action": "start", "command": "true", "waitMs": 10000}));
+    let (text, error) = yolo.call(json!({"action": "start", "command": "true", "waitMs": 10000}));
     assert!(!error, "{text}");
-    let bare = started["taskId"]
-        .as_str()
-        .unwrap()
+    let bare = Endpoint::task_id(&text)
         .split_once('.')
         .unwrap()
         .0
         .to_owned();
 
     let mut plain = Endpoint::start(&fixture);
-    let (listed_tasks, text, error) = plain.call(json!({"action": "list", "scope": "all"}));
+    let (text, error) = plain.call(json!({"action": "list", "scope": "all"}));
     assert!(!error, "{text}");
-    assert!(
-        listed_tasks["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|task| task["taskId"] == bare),
-        "{listed_tasks}"
-    );
+    assert!(text.contains(&bare), "{text}");
     let listed = plain.request("tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
     for (name, expected) in [
@@ -1904,16 +1892,6 @@ fn invalid_yolo_refuses_start_without_blocking_status_or_stop() {
             "FASTEXEC_TRANSFER",
             "on",
             "invalid FASTEXEC_TRANSFER \"on\"; expected true or false",
-        ),
-        (
-            "FASTEXEC_OUTPUT_MODE",
-            "bogus",
-            "invalid FASTEXEC_OUTPUT_MODE \"bogus\"; expected text, both, or structured",
-        ),
-        (
-            "FASTEXEC_STRUCTURED_CONTENT",
-            "bogus",
-            "invalid FASTEXEC_STRUCTURED_CONTENT \"bogus\"; expected true or false",
         ),
         (
             "FASTEXEC_IMAGE_COMPRESS",
@@ -2026,8 +2004,7 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
     let mut enabled = Endpoint::start_with(&fixture, |command| {
         command
             .current_dir(&fixture.runtime)
-            .env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "both");
+            .env("FASTEXEC_CODEMODE", "true");
     });
     let mut plain = Endpoint::start(&fixture);
     for (endpoint, expected) in [(&mut enabled, true), (&mut plain, false)] {
@@ -2048,8 +2025,12 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
     )["result"]
         .clone();
     assert_eq!(invalid["isError"], true, "{invalid}");
-    assert_eq!(
-        invalid["structuredContent"]["action"], "codemode",
+    assert!(invalid.get("structuredContent").is_none(), "{invalid}");
+    assert!(
+        invalid["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("code"),
         "{invalid}"
     );
     let read_img = enabled.request(
@@ -2057,16 +2038,13 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
         json!({"name":"read","arguments":{"path":"shot.png"}}),
     )["result"]
         .clone();
-    assert_eq!(read_img["structuredContent"]["kind"], "image", "{read_img}");
+    assert!(read_img.get("structuredContent").is_none(), "{read_img}");
     assert_eq!(
-        read_img["structuredContent"]["bytes"],
-        png.len(),
+        read_img["content"][0]["text"],
+        json!(format!("Read image file [image/png] ({} B)", png.len())),
         "{read_img}"
     );
-    assert_eq!(
-        read_img["structuredContent"]["attached"], true,
-        "{read_img}"
-    );
+    assert_eq!(read_img["content"][1]["type"], json!("image"), "{read_img}");
 
     // Per-session scoping on the same daemon: an endpoint with FASTEXEC_IMAGE_COMPRESS=true
     // scales oversized images while `enabled` (default false) passes original bytes through.
@@ -2092,24 +2070,26 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
         json!({"name":"read","arguments":{"path":"wide.png"}}),
     )["result"]
         .clone();
+    assert!(raw_wide.get("structuredContent").is_none(), "{raw_wide}");
+    let raw_wide_text = raw_wide["content"][0]["text"].as_str().unwrap();
     assert_eq!(
-        raw_wide["structuredContent"]["bytes"],
-        wide_png.len(),
+        raw_wide_text,
+        format!("Read image file [image/png] ({} B)", wide_png.len()),
         "{raw_wide}"
     );
-    assert!(raw_wide["structuredContent"].get("width").is_none());
     let scaled_wide = compressing.request(
         "tools/call",
         json!({"name":"read","arguments":{"path":"wide.png"}}),
     )["result"]
         .clone();
-    assert_eq!(
-        scaled_wide["structuredContent"]["width"], 2000,
+    assert!(
+        scaled_wide.get("structuredContent").is_none(),
         "{scaled_wide}"
     );
-    assert_eq!(
-        scaled_wide["structuredContent"]["originalBytes"],
-        wide_png.len(),
+    let scaled_wide_text = scaled_wide["content"][0]["text"].as_str().unwrap();
+    assert!(scaled_wide_text.contains("2000"), "{scaled_wide}");
+    assert!(
+        scaled_wide_text.contains("2400x20"),
         "{scaled_wide}"
     );
     compressing.close();
@@ -2117,7 +2097,12 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
         "code":"attach(await tools.read({path:'shot.png'})); const child = await tools.exec({action:'start',command:'printf nested',loginShell:false}); text(child.taskId); return child.output;"
     }}))["result"].clone();
     assert_eq!(result["isError"], false, "{result}");
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(result.get("structuredContent").is_none(), "{result}");
+    let result_text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        Endpoint::status_line(result_text).starts_with("[exited 0] "),
+        "{result}"
+    );
     assert_eq!(
         result["content"]
             .as_array()
@@ -2128,7 +2113,7 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
         1,
         "{result}"
     );
-    let handle = result["structuredContent"]["taskId"].as_str().unwrap();
+    let handle = Endpoint::task_id(result_text);
     let bare = handle.split_once('.').unwrap().0;
     let fresh = plain.request(
         "tools/call",
@@ -2136,13 +2121,10 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
     )["result"]
         .clone();
     assert_eq!(fresh["isError"], false, "{fresh}");
-    assert!(
-        fresh["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("nested"),
-        "{fresh}"
-    );
+    assert!(fresh.get("structuredContent").is_none(), "{fresh}");
+    let fresh_text = fresh["content"][0]["text"].as_str().unwrap();
+    assert!(fresh_text.contains("nested"), "{fresh}");
+    assert!(fresh_text.contains("Attached: "), "{fresh}");
     let block = fresh["content"]
         .as_array()
         .unwrap()
@@ -2154,30 +2136,17 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png),
         "{fresh}"
     );
-    assert_eq!(
-        fresh["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 1,
-        "{fresh}"
-    );
-    let (listed, text, error) = enabled.call(json!({"action":"list"}));
-    assert!(!error, "{text}");
-    let tasks = listed["tasks"].as_array().unwrap();
-    let script = tasks
-        .iter()
-        .find(|task| task["kind"] == "codemode")
-        .unwrap();
-    assert_eq!(script["children"]["done"], 1, "{listed}");
-    let (children, children_text, children_error) =
-        enabled.call(json!({"action":"list","parentTaskId": script["taskId"]}));
+    let (listed_text, error) = enabled.call(json!({"action":"list"}));
+    assert!(!error, "{listed_text}");
+    let script_line = listed_text
+        .lines()
+        .find(|line| line.starts_with(bare))
+        .unwrap_or_else(|| panic!("no codemode task in {listed_text}"));
+    assert!(script_line.contains("1 done"), "{listed_text}");
+    let (children_text, children_error) =
+        enabled.call(json!({"action":"list","parentTaskId": bare}));
     assert!(!children_error, "{children_text}");
-    let child = children["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|task| task["kind"] == "bash")
-        .unwrap();
-    assert!(!script["callId"].is_null(), "{listed}");
-    assert_eq!(script["callId"], child["callId"], "{listed}\n{children}");
-    assert_eq!(script["session"], child["session"], "{listed}\n{children}");
+    assert!(children_text.contains("printf nested"), "{children_text}");
 }
 
 #[test]
@@ -2286,14 +2255,17 @@ fn daemon_ipc_accepts_1mib_escaped_input_refuses_over_3mib_and_matches_stdio_sch
     }
 
     for unit in ["x", "\n", "é"] {
-        let (wc_sc, wc_text, wc_err) = daemon_ep.call(json!({
+        let (wc_text, wc_err) = daemon_ep.call(json!({
             "action": "start",
             "loginShell": false,
             "command": "wc -c",
             "input": unit.repeat((1 << 20) / unit.len())
         }));
         assert!(!wc_err, "{wc_text}");
-        assert_eq!(wc_sc["exitCode"], 0, "{wc_text}");
+        assert!(
+            Endpoint::status_line(&wc_text).starts_with("[exited 0] "),
+            "{wc_text}"
+        );
         assert!(
             wc_text.lines().any(|line| line.trim() == "1048576"),
             "{wc_text}"
@@ -2301,23 +2273,23 @@ fn daemon_ipc_accepts_1mib_escaped_input_refuses_over_3mib_and_matches_stdio_sch
     }
 
     let big_file = fixture.runtime.join("near-1mib.txt");
-    let (_, w_text, w_err) = daemon_ep.file(
+    let (w_text, w_err) = daemon_ep.file(
         "write",
         json!({"path": big_file.to_string_lossy(), "content": "\n".repeat(900_000)}),
     );
     assert!(!w_err, "{w_text}");
     assert_eq!(std::fs::metadata(&big_file).unwrap().len(), 900_000);
 
-    let (_, nul_text, nul_err) = daemon_ep.call(json!({
+    let (nul_text, nul_err) = daemon_ep.call(json!({
         "action": "start",
         "loginShell": false,
         "command": "cat",
         "input": "\0".repeat(1 << 20)
     }));
     assert!(nul_err && nul_text.contains("3 MiB"), "{nul_text}");
-    let (listed, text, err) = daemon_ep.call(json!({"action": "list"}));
+    let (text, err) = daemon_ep.call(json!({"action": "list"}));
     assert!(!err, "{text}");
-    assert_eq!(listed["totalCount"], 3, "{listed}");
+    assert_eq!(text.lines().count(), 3, "{text}");
 }
 
 #[test]
@@ -2326,13 +2298,13 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
     let mut ep_a = Endpoint::start(&fixture);
     let mut ep_b = Endpoint::start(&fixture);
 
-    let (t1, t1_text, e1) = ep_a
+    let (t1_text, e1) = ep_a
         .call(json!({"action": "start", "loginShell": false, "command": "sleep 30", "waitMs": 50}));
-    let (t2, t2_text, e2) = ep_a
+    let (t2_text, e2) = ep_a
         .call(json!({"action": "start", "loginShell": false, "command": "sleep 30", "waitMs": 50}));
     assert!(!e1 && !e2);
-    let id1 = Endpoint::task_id(&t1, &t1_text);
-    let id2 = Endpoint::task_id(&t2, &t2_text);
+    let id1 = Endpoint::task_id(&t1_text);
+    let id2 = Endpoint::task_id(&t2_text);
 
     let mut ep_cm = Endpoint::start_with(&fixture, |cmd| {
         cmd.env("FASTEXEC_CODEMODE", "true");
@@ -2346,6 +2318,10 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
             }
         }),
     );
+    assert!(
+        nested_first["result"].get("structuredContent").is_none(),
+        "{nested_first}"
+    );
     let nested_outer_text = nested_first["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
@@ -2358,7 +2334,7 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
 
     // Footer lives outside the body maxBytes budget, so even maxBytes: 100 delivers the
     // outside-session notice once on the first call and omits it on subsequent calls.
-    let (_, first_text, first_err) = ep_b.call(json!({
+    let (first_text, first_err) = ep_b.call(json!({
         "action": "start",
         "command": "true",
         "maxBytes": 100
@@ -2371,7 +2347,7 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
         "{first_text}"
     );
 
-    let (_, second_text, second_err) = ep_b.call(json!({
+    let (second_text, second_err) = ep_b.call(json!({
         "action": "start",
         "command": "true"
     }));
@@ -2380,25 +2356,23 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
         "{second_text}"
     );
 
-    let (sess_list, _, _) = ep_b.call(json!({"action": "list"}));
-    assert_eq!(sess_list["totalCount"], 2, "{sess_list}");
-    let (all_list, _, _) = ep_b.call(json!({"action": "list", "scope": "all"}));
-    assert_eq!(all_list["totalCount"], 5, "{all_list}");
-    let cm_task = all_list["tasks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|task| task["kind"] == "codemode")
-        .unwrap();
-    assert_eq!(cm_task["children"]["done"], 1, "{all_list}");
+    let (sess_list, _) = ep_b.call(json!({"action": "list"}));
+    assert_eq!(sess_list.lines().count(), 2, "{sess_list}");
+    let (all_list, _) = ep_b.call(json!({"action": "list", "scope": "all"}));
+    assert_eq!(
+        all_list.lines().filter(|line| line.contains(" [")).count(),
+        5,
+        "{all_list}"
+    );
+    assert!(all_list.contains("1 done"), "{all_list}");
 
     // Stale 8-char base32 epoch in daemon mode reports an earlier daemon; malformed ID says Unknown taskId.
-    let (_, stale_text, stale_err) = ep_b.call(json!({"action": "poll", "taskId": "01234567-9z"}));
+    let (stale_text, stale_err) = ep_b.call(json!({"action": "poll", "taskId": "01234567-9z"}));
     assert!(
         stale_err && stale_text.contains("earlier fastexec daemon"),
         "{stale_text}"
     );
-    let (_, bad_text, bad_err) = ep_b.call(json!({"action": "poll", "taskId": "foo-bar"}));
+    let (bad_text, bad_err) = ep_b.call(json!({"action": "poll", "taskId": "foo-bar"}));
     assert!(
         bad_err
             && bad_text.contains("Unknown taskId")
@@ -2409,7 +2383,7 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
     // Closing ep_b sends Bye (dropping its session); a newly connected session starts fresh and shows the count again.
     drop(ep_b);
     let mut ep_c = Endpoint::start(&fixture);
-    let (_, fresh_text, fresh_err) = ep_c.call(json!({
+    let (fresh_text, fresh_err) = ep_c.call(json!({
         "action": "start",
         "loginShell": false,
         "command": "true"
@@ -2428,7 +2402,7 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
 }
 
 #[test]
-fn daemon_delivers_4mib_both_mode_window_and_probes_login_profile_once_per_session() {
+fn daemon_delivers_4mib_window_and_probes_login_profile_once_per_session() {
     let fixture = Fixture::new("four-mib-and-probe");
     let home = fixture.runtime.join("test-home");
     let sub_a = fixture.runtime.join("test-sub-a");
@@ -2447,17 +2421,16 @@ fn daemon_delivers_4mib_both_mode_window_and_probes_login_profile_once_per_sessi
     let mut ep1 = Endpoint::start_with(&fixture, |cmd| {
         cmd.env("HOME", &home)
             .env("USERPROFILE", &home)
-            .env("FASTEXEC_OUTPUT_MODE", "both")
             .env("FASTEXEC_CODEMODE", "true");
     });
 
     for _ in 0..2 {
-        let (out, text, err) = ep1.call(json!({
+        let (text, err) = ep1.call(json!({
             "action": "start",
             "command": "printf '%s' \"$FX_DAEMON_SNAP\""
         }));
         assert!(!err, "{text}");
-        assert_eq!(out["output"], "from_profile");
+        assert_eq!(Endpoint::split_output(&text).0, "from_profile");
         assert!(!text.contains("BannerNoise"), "{text}");
     }
 
@@ -2473,7 +2446,9 @@ fn daemon_delivers_4mib_both_mode_window_and_probes_login_profile_once_per_sessi
             }),
         );
         assert_ne!(cm["result"]["isError"], true, "{cm}");
-        assert_eq!(cm["result"]["structuredContent"]["output"], "from_profile");
+        assert!(cm["result"].get("structuredContent").is_none(), "{cm}");
+        let cm_text = cm["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(Endpoint::split_output(cm_text).0, "from_profile");
     }
 
     let count_ep1 = std::fs::read_to_string(home.join("probe_count")).unwrap();
@@ -2487,7 +2462,7 @@ fn daemon_delivers_4mib_both_mode_window_and_probes_login_profile_once_per_sessi
     let mut ep2 = Endpoint::start_with(&fixture, |cmd| {
         cmd.env("HOME", &home).env("USERPROFILE", &home);
     });
-    let (_, text2, err2) = ep2.call(json!({
+    let (text2, err2) = ep2.call(json!({
         "action": "start",
         "command": "printf '%s' \"$FX_DAEMON_SNAP\""
     }));
@@ -2496,16 +2471,15 @@ fn daemon_delivers_4mib_both_mode_window_and_probes_login_profile_once_per_sessi
     assert_eq!(count_ep2.lines().count(), 2, "{count_ep2:?}");
     drop(ep2);
 
-    // 4 MiB body in FASTEXEC_OUTPUT_MODE=both carries both text and structuredContent.output
-    // comfortably within ipc::RESPONSE_LIMIT (512 MiB).
-    let (four_mib, _, four_err) = ep1.call(json!({
+    // 4 MiB body carries pure-text output comfortably within ipc::RESPONSE_LIMIT (512 MiB).
+    let (four_text, four_err) = ep1.call(json!({
         "action": "start",
         "maxBytes": 4194304,
         "truncate": "head",
         "command": "head -c 4194300 /dev/zero | tr '\\0' M"
     }));
     assert!(!four_err);
-    assert_eq!(four_mib["output"].as_str().unwrap().len(), 4_194_300);
+    assert_eq!(Endpoint::split_output(&four_text).0.len(), 4_194_300);
 }
 
 #[test]
@@ -2547,14 +2521,17 @@ fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() 
                 cmd.env("FASTEXEC_TRANSFER", value);
             }
         });
-        let (exec_sc, exec_text, exec_err) = lazy_ep.call(json!({
+        let (exec_text, exec_err) = lazy_ep.call(json!({
             "action": "start",
             "command": "printf LAZY_OK",
             "loginShell": false,
         }));
-        assert!(!exec_err && exec_sc["exitCode"] == 0, "{exec_text}");
+        assert!(
+            !exec_err && Endpoint::status_line(&exec_text).starts_with("[exited 0] "),
+            "{exec_text}"
+        );
         assert!(exec_text.contains("LAZY_OK"), "{exec_text}");
-        let (_, read_text, read_err) = lazy_ep.file("read", json!({"path": "note.txt"}));
+        let (read_text, read_err) = lazy_ep.file("read", json!({"path": "note.txt"}));
         assert!(!read_err && read_text == "hello\n", "{read_text}");
         lazy_ep.close();
         drop(lazy_fixture);
@@ -2603,9 +2580,13 @@ fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() 
         )["result"]
             .clone();
         assert_eq!(minted["isError"], false, "{minted}");
+        assert!(minted.get("structuredContent").is_none(), "{minted}");
         assert!(
-            minted["structuredContent"]["url"]
+            minted["content"][0]["text"]
                 .as_str()
+                .unwrap()
+                .lines()
+                .next()
                 .unwrap()
                 .starts_with("https://files.example/t/"),
             "{minted}"
@@ -2656,13 +2637,13 @@ fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() 
     assert_eq!(plain_tools.len(), 4, "{plain_tools:?}");
     assert!(!plain_tools.iter().any(|tool| tool["name"] == "transfer"));
 
-    let (_, xfer_bin_text, xfer_bin_err) = transfer_ep.file("read", json!({"path": "blob.bin"}));
+    let (xfer_bin_text, xfer_bin_err) = transfer_ep.file("read", json!({"path": "blob.bin"}));
     assert!(xfer_bin_err, "{xfer_bin_text}");
     assert!(
         xfer_bin_text.contains("Inspect it with exec or download it with transfer."),
         "{xfer_bin_text}"
     );
-    let (_, plain_bin_text, plain_bin_err) = plain_ep.file("read", json!({"path": "blob.bin"}));
+    let (plain_bin_text, plain_bin_err) = plain_ep.file("read", json!({"path": "blob.bin"}));
     assert!(plain_bin_err, "{plain_bin_text}");
     assert!(
         plain_bin_text.ends_with("Inspect it with exec.")
@@ -2676,7 +2657,13 @@ fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() 
     )["result"]
         .clone();
     assert_eq!(minted["isError"], false, "{minted}");
-    let url = minted["structuredContent"]["url"].as_str().unwrap();
+    assert!(minted.get("structuredContent").is_none(), "{minted}");
+    let url = minted["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
     let rest = url.strip_prefix("http://").expect("http:// URL");
     let (authority, path_part) = rest.split_once('/').unwrap();
     let addr: std::net::SocketAddr = authority.parse().unwrap();
@@ -2718,8 +2705,9 @@ fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() 
     )["result"]
         .clone();
     assert_eq!(conflict["isError"], true, "{conflict}");
+    assert!(conflict.get("structuredContent").is_none(), "{conflict}");
     assert_eq!(
-        conflict["structuredContent"]["error"],
+        conflict["content"][0]["text"],
         json!(format!(
             "the daemon already serves /t/ on {addr}, not 0.0.0.0:0; stop it first"
         ))
@@ -2744,6 +2732,10 @@ fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() 
             )["result"]
                 .clone();
             assert_eq!(dir_refused["isError"], true, "{dir_refused}");
+            assert!(
+                dir_refused.get("structuredContent").is_none(),
+                "{dir_refused}"
+            );
             dir_ep.close();
 
             let candidate = transfer_http::free_loopback_addr();
@@ -2758,8 +2750,9 @@ fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() 
                 json!({"name": "transfer", "arguments": {"path": "proxied.bin"}}),
             )["result"]
                 .clone();
+            assert!(minted.get("structuredContent").is_none(), "{minted}");
             if minted["isError"] == true {
-                let err_text = minted["structuredContent"]["error"]
+                let err_text = minted["content"][0]["text"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
@@ -2772,7 +2765,12 @@ fn transfer_endpoints_share_a_non_http_daemon_with_independent_hints_and_yolo() 
             Some((candidate, proxied_fixture, proxied_ep, minted))
         })
         .expect("bound fixed loopback port for daemon transfer");
-    let url = minted["structuredContent"]["url"].as_str().unwrap();
+    let url = minted["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
     let id = url
         .strip_prefix("https://files.example/daemon/t/")
         .unwrap_or_else(|| panic!("unexpected proxied URL: {url}"));
@@ -3133,7 +3131,7 @@ fn endpoint_control_reserve_survives_output_admission_failure() {
 
     // 1. `start` runs the task; its overload receipt (`taskId: <bare_id>`) passes through Daemon
     // `RESERVED`, Endpoint `control_pool`, and `StdioTransport` `control_pool`.
-    let (_, start_text, start_err) = ep.call(json!({
+    let (start_text, start_err) = ep.call(json!({
         "action": "start",
         "command": "sleep 30",
         "waitMs": 50
@@ -3150,25 +3148,38 @@ fn endpoint_control_reserve_survives_output_admission_failure() {
         }),
     );
     assert_eq!(read_res["result"]["isError"], json!(true), "{read_res}");
+    assert!(
+        read_res["result"].get("structuredContent").is_none(),
+        "{read_res}"
+    );
 
     // 3. `list` succeeds (`isError: false`) through all three 8 MiB control reserves!
-    let (listed, list_text, list_err) = ep.call(json!({
+    let (list_text, list_err) = ep.call(json!({
         "action": "list",
         "scope": "all"
     }));
     assert!(!list_err, "{list_text}");
-    let tasks = listed["tasks"].as_array().unwrap();
-    assert_eq!(tasks.len(), 1, "{listed}");
-    let bare_id = tasks[0]["taskId"].as_str().unwrap().to_owned();
+    assert_eq!(list_text.lines().count(), 1, "{list_text}");
+    let bare_id = list_text
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
     assert!(start_text.contains(&bare_id), "{start_text}");
 
     // 4. `kill` succeeds (`isError: false`) through all three 8 MiB control reserves!
-    let (killed, kill_text, kill_err) = ep.call(json!({
+    let (kill_text, kill_err) = ep.call(json!({
         "action": "kill",
         "taskId": bare_id
     }));
     assert!(!kill_err, "{kill_text}");
-    assert_eq!(killed["state"], json!("killed"));
+    assert!(
+        Endpoint::status_line(&kill_text).starts_with("[killed"),
+        "{kill_text}"
+    );
     drop(ep);
 
     // 5. Standalone stdio with the same small main pool also
@@ -3178,28 +3189,35 @@ fn endpoint_control_reserve_survives_output_admission_failure() {
             .env("FASTEXEC_DAEMON", "off")
             .env("FASTEXEC_TEST_MEMORY_LIMIT", "131072");
     });
-    let (_, local_start_text, local_start_err) = local_stdio.call(json!({
+    let (local_start_text, local_start_err) = local_stdio.call(json!({
         "action": "start",
         "command": "sleep 30",
         "waitMs": 50
     }));
     assert!(local_start_err, "{local_start_text}");
-    let (local_listed, local_list_text, local_list_err) = local_stdio.call(json!({
+    let (local_list_text, local_list_err) = local_stdio.call(json!({
         "action": "list",
         "scope": "all"
     }));
     assert!(!local_list_err, "{local_list_text}");
-    let local_id = local_listed["tasks"][0]["taskId"]
-        .as_str()
+    let local_id = local_list_text
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
         .unwrap()
         .to_owned();
     assert!(local_start_text.contains(&local_id), "{local_start_text}");
-    let (local_killed, local_kill_text, local_kill_err) = local_stdio.call(json!({
+    let (local_kill_text, local_kill_err) = local_stdio.call(json!({
         "action": "kill",
         "taskId": local_id
     }));
     assert!(!local_kill_err, "{local_kill_text}");
-    assert_eq!(local_killed["state"], json!("killed"));
+    assert!(
+        Endpoint::status_line(&local_kill_text).starts_with("[killed"),
+        "{local_kill_text}"
+    );
 }
 
 #[test]
@@ -3405,3 +3423,74 @@ fn event_stream_resumes_after_endpoint_backpressure_and_ends_on_daemon_stop() {
     });
     assert_eq!(ended["params"]["error"]["code"], -32000, "{ended}");
 }
+
+#[cfg(unix)]
+#[test]
+fn protocol_4_hello_is_rejected_by_protocol_5_daemon() {
+    use std::io::Read;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixStream;
+
+    let fixture = Fixture::new("proto4");
+    let (_, status_before, _) = fixture.run(&["daemon", "status"]);
+    let namespace = status_before
+        .trim_end()
+        .trim_end_matches('.')
+        .rsplit(' ')
+        .next()
+        .unwrap_or_else(|| panic!("no namespace in {status_before:?}"))
+        .to_string();
+    let (code, out, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "{out}{err}");
+
+    let ns_dir = fixture.runtime.join("ns").join(&namespace);
+    let socket = std::fs::read_dir(&ns_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            std::fs::symlink_metadata(path)
+                .map(|meta| meta.file_type().is_socket())
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| panic!("no daemon socket in {}", ns_dir.display()));
+
+    for frame in [
+        json!({
+            "type": "hello",
+            "protocol": 4,
+            "namespace": namespace,
+            "build": "test",
+            "session": "0123456789abcdef0123456789",
+            "connection": 1,
+            "client_name": "proto4-test",
+            "cwd": "/tmp",
+            "env": []
+        }),
+        json!({
+            "type": "hello_emit",
+            "protocol": 4,
+            "build": "test"
+        }),
+    ] {
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let body = serde_json::to_vec(&frame).unwrap();
+        let mut wire = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+        wire.extend_from_slice(&body);
+        stream.write_all(&wire).unwrap();
+        stream.flush().unwrap();
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let reply_len = u32::from_le_bytes(len_buf) as usize;
+        let mut reply_buf = vec![0u8; reply_len];
+        stream.read_exact(&mut reply_buf).unwrap();
+        let reply: Value = serde_json::from_slice(&reply_buf).unwrap();
+        assert_eq!(reply["type"], json!("reject"), "{reply}");
+        assert_eq!(reply["message"], json!("protocol 4 is not 5"), "{reply}");
+    }
+}
+

@@ -1,6 +1,10 @@
 #[cfg(windows)]
 use super::common::codemode_server;
-use super::common::{Scratch, Server, bare_id, code_result, code_text, scratch};
+#[cfg(windows)]
+use super::common::log_path_of;
+use super::common::{
+    Scratch, Server, bare_id, body_of, code_result, code_text, scratch, task_id_of,
+};
 use serde_json::{Value, json};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -219,24 +223,17 @@ fn read_omits_an_image_past_the_encoded_ceiling_without_loading_it() {
     );
     let result = &message["result"];
     assert_eq!(result["isError"], json!(false), "{message}");
+    assert!(result.get("structuredContent").is_none(), "{message}");
     let content = result["content"].as_array().expect("content blocks");
     assert_eq!(content.len(), 1, "no image is attached: {message}");
     let text = content[0]["text"].as_str().unwrap();
     assert!(
-        text.contains("exceeds FASTEXEC_MAX_MEDIA_BYTES (104857600 bytes)")
+        text.contains("image/png")
+            && text.contains("exceeds FASTEXEC_MAX_MEDIA_BYTES (104857600 bytes)")
             && text.contains("Inspect it with exec."),
         "{text}"
     );
-    let sc = &result["structuredContent"];
-    assert_eq!(sc["ok"], json!(true));
-    assert_eq!(sc["kind"], json!("image"));
-    assert_eq!(sc["mimeType"], json!("image/png"));
-    assert_eq!(sc["attached"], json!(false));
-    assert_eq!(sc["sourceBytes"], json!(size));
-    assert!(
-        sc.get("bytes").is_none(),
-        "unattached media must omit bytes: {sc}"
-    );
+    let _ = size;
 }
 
 #[test]
@@ -291,18 +288,11 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
 
     let b64 = |raw: &[u8]| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw);
 
-    // Check output modes (`text`, `both`, `structured`) and `FASTEXEC_STRUCTURED_CONTENT=false`
-    // with default `FASTEXEC_IMAGE_COMPRESS=false` (exact byte passthrough even for 2400x40 PNG).
-    for (mode, sc_enabled) in [
-        ("text", "true"),
-        ("both", "true"),
-        ("structured", "true"),
-        ("both", "false"),
-    ] {
+    // Default `FASTEXEC_IMAGE_COMPRESS=false` passes through exact bytes even for 2400x40 PNG
+    // and omits structuredContent on every media read response.
+    {
         let mut server = Server::start_with(|cmd| {
-            cmd.current_dir(&*dir)
-                .env("FASTEXEC_OUTPUT_MODE", mode)
-                .env("FASTEXEC_STRUCTURED_CONTENT", sc_enabled);
+            cmd.current_dir(&*dir);
         });
 
         let pdf_res = &server.request(
@@ -310,6 +300,7 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
             json!({"name": "read", "arguments": {"path": "spec #1.pdf", "offset": 2, "limit": 5}}),
         )["result"];
         assert_eq!(pdf_res["isError"], json!(false), "{pdf_res}");
+        assert!(pdf_res.get("structuredContent").is_none(), "{pdf_res}");
         assert_eq!(pdf_res["content"][1]["type"], json!("resource"));
         assert_eq!(
             pdf_res["content"][1]["resource"]["mimeType"],
@@ -326,6 +317,7 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
             "tools/call",
             json!({"name": "read", "arguments": {"path": "clip.wav"}}),
         )["result"];
+        assert!(wav_res.get("structuredContent").is_none(), "{wav_res}");
         assert_eq!(wav_res["content"][1]["type"], json!("audio"));
         assert_eq!(wav_res["content"][1]["mimeType"], json!("audio/wav"));
         assert_eq!(wav_res["content"][1]["data"], json!(b64(&wav)));
@@ -334,6 +326,7 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
             "tools/call",
             json!({"name": "read", "arguments": {"path": "movie.mp4"}}),
         )["result"];
+        assert!(mp4_res.get("structuredContent").is_none(), "{mp4_res}");
         assert_eq!(mp4_res["content"][1]["type"], json!("resource"));
         assert_eq!(
             mp4_res["content"][1]["resource"]["mimeType"],
@@ -345,14 +338,8 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
             "tools/call",
             json!({"name": "read", "arguments": {"path": "wide.png"}}),
         )["result"];
+        assert!(png_res.get("structuredContent").is_none(), "{png_res}");
         assert_eq!(png_res["content"][1]["data"], json!(b64(&wide_png)));
-        if sc_enabled == "true" {
-            assert!(png_res["structuredContent"].get("text").is_none());
-            assert!(png_res["structuredContent"].get("width").is_none());
-            assert_eq!(png_res["structuredContent"]["bytes"], json!(wide_png.len()));
-        } else {
-            assert!(png_res.get("structuredContent").is_none());
-        }
     }
 
     // With FASTEXEC_IMAGE_COMPRESS=true, wide.png is scaled down and reports original/displayed metadata.
@@ -364,6 +351,7 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
         "tools/call",
         json!({"name": "read", "arguments": {"path": "wide.png"}}),
     )["result"];
+    assert!(scaled.get("structuredContent").is_none(), "{scaled}");
     assert!(
         scaled["content"][0]["text"]
             .as_str()
@@ -371,12 +359,6 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
             .contains("original 2400x40, displayed at 2000x33"),
         "{scaled}"
     );
-    assert_eq!(
-        scaled["structuredContent"]["originalBytes"],
-        json!(wide_png.len())
-    );
-    assert_eq!(scaled["structuredContent"]["originalWidth"], json!(2400));
-    assert_eq!(scaled["structuredContent"]["width"], json!(2000));
 
     #[cfg(debug_assertions)]
     {
@@ -396,12 +378,17 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
             json!({"name": "read", "arguments": {"path": "spec #1.pdf"}}),
         )["result"];
         assert_eq!(first["isError"], json!(false), "{first}");
-        assert_eq!(first["structuredContent"]["bytes"], json!(pdf.len()));
+        assert!(first.get("structuredContent").is_none(), "{first}");
+        assert_eq!(first["content"][1]["resource"]["blob"], json!(b64(pdf)));
         let overloaded = &tight.request(
             "tools/call",
             json!({"name": "read", "arguments": {"path": "budget.pdf"}}),
         )["result"];
         assert_eq!(overloaded["isError"], json!(true), "{overloaded}");
+        assert!(
+            overloaded.get("structuredContent").is_none(),
+            "{overloaded}"
+        );
         assert!(
             overloaded["content"][0]["text"]
                 .as_str()
@@ -416,7 +403,7 @@ fn multimodal_read_delivers_pdf_audio_video_image_and_compress_and_env_bounds() 
             json!({"name": "read", "arguments": {"path": "spec #1.pdf"}}),
         )["result"];
         assert_eq!(fits["isError"], json!(false), "{fits}");
-        assert_eq!(fits["structuredContent"]["attached"], json!(true));
+        assert!(fits.get("structuredContent").is_none(), "{fits}");
         assert_eq!(fits["content"][1]["resource"]["blob"], json!(b64(pdf)));
     }
 }
@@ -541,7 +528,7 @@ fn editing_a_fifo_returns_an_error_without_blocking_other_file_tools() {
 }
 
 #[test]
-fn file_tools_paginate_via_structured_content_and_honor_output_modes() {
+fn file_tools_paginate_nested_and_direct_reads_cleanly() {
     let dir = Scratch::new("file-structured");
     std::fs::create_dir_all(&*dir).unwrap();
     let big: String = (1..=2500)
@@ -558,8 +545,7 @@ fn file_tools_paginate_via_structured_content_and_honor_output_modes() {
     let mut server = Server::start_with(|command| {
         command
             .current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "both");
+            .env("FASTEXEC_CODEMODE", "true");
     });
     let code = r#"
 const single = await tools.read({path:'big.txt'});
@@ -567,7 +553,7 @@ if (single.truncated !== false || single.shownLines !== 2500 || single.totalLine
   throw new Error('2500-line file must fit in one nested read window');
 }
 const jsonl = await tools.read({path:'long-single.jsonl'});
-if (jsonl.lineTooLong !== false || JSON.parse(jsonl.text).blob.length !== 80 * 1024) {
+if (jsonl.lineTooLong || JSON.parse(jsonl.text).blob.length !== 80 * 1024) {
   throw new Error('nested read must accept >50 KiB single lines up to 1 MiB');
 }
 const utf8 = "你好，fastexec 🚀";
@@ -578,7 +564,7 @@ if (roundtrip !== utf8) throw new Error('TextEncoder/TextDecoder roundtrip faile
 let offset = 1;
 let pages = 0;
 const parts = [];
-while (offset !== null) {
+while (offset != null) {
   const page = await tools.read({path:'huge-multi.txt', offset});
   if (page.text.includes('[Showing lines')) {
     throw new Error('truncation notice leaked into text');
@@ -591,44 +577,18 @@ const joined = parts.join('');
 return {singleBytes: single.text.length, pages, bytes: joined.length};
 "#;
     let result = code_result(&mut server, json!({"code":code}));
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
-    let summary: Value =
-        serde_json::from_str(result["structuredContent"]["output"].as_str().unwrap()).unwrap();
+    assert!(code_text(&result).contains("[exited 0]"), "{result}");
+    let summary: Value = serde_json::from_str(body_of(code_text(&result))).unwrap();
     assert_eq!(summary["singleBytes"].as_u64().unwrap(), big.len() as u64);
     assert!(summary["pages"].as_u64().unwrap() >= 2, "{summary}");
     assert_eq!(summary["bytes"].as_u64().unwrap(), huge_multi.len() as u64);
 
-    // Direct MCP structured-only mode keeps the 2000-line / 50 KiB cap and places text in structuredContent.text only.
-    let mut structured_only = Server::start_with(|command| {
-        command
-            .current_dir(&*dir)
-            .env("FASTEXEC_OUTPUT_MODE", "structured");
-    });
-    let reply = structured_only.request(
-        "tools/call",
-        json!({"name":"read", "arguments":{"path":"big.txt"}}),
-    );
-    let read_res = &reply["result"];
-    assert_eq!(read_res["isError"], false, "{reply}");
-    assert_eq!(read_res["structuredContent"]["truncated"], true, "{reply}");
-    assert!(
-        read_res["structuredContent"]["nextOffset"].is_u64(),
-        "{reply}"
-    );
-    assert!(
-        !read_res["structuredContent"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("[Showing lines"),
-        "{reply}"
-    );
-    assert!(
-        read_res["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("[Showing lines"),
-        "{reply}"
-    );
+    // Direct MCP read keeps the 2000-line / 50 KiB cap with pure text and no structuredContent.
+    let (read_text, is_err) = server.file("read", json!({"path":"big.txt"}));
+    assert!(!is_err, "{read_text}");
+    assert!(read_text.contains("line-0001-payload-text"), "{read_text}");
+    assert!(read_text.contains("[Showing lines 1-"), "{read_text}");
+    assert!(read_text.contains("Use offset="), "{read_text}");
 }
 
 #[test]
@@ -642,65 +602,47 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
     let mut server = Server::start_with(|cmd| {
         cmd.current_dir(&work_dir)
             .env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "both")
             .env("HOME", &home_dir)
             .env("USERPROFILE", &home_dir);
     });
 
-    let w_rel = server.request(
-        "tools/call",
-        json!({"name": "write", "arguments": {"path": "sub/empty.txt", "content": ""}}),
+    let (w_text, w_err) = server.file(
+        "write",
+        json!({"path": "sub/empty.txt", "content": ""}),
     );
-    let w_path = w_rel["result"]["structuredContent"]["path"]
-        .as_str()
-        .unwrap();
+    assert!(!w_err, "{w_text}");
     assert!(
-        !w_path.contains('\\') && w_path.ends_with("/sub/empty.txt"),
-        "{w_path}"
+        !w_text.contains('\\') && w_text.contains("/sub/empty.txt"),
+        "{w_text}"
     );
 
-    let r_empty = server.request(
-        "tools/call",
-        json!({"name": "read", "arguments": {"path": "sub/empty.txt", "offset": 1}}),
+    let (r_empty_text, r_empty_err) = server.file(
+        "read",
+        json!({"path": "sub/empty.txt", "offset": 1}),
     );
-    let r_sc = &r_empty["result"]["structuredContent"];
-    assert_eq!(r_sc["totalLines"], 0, "{r_empty}");
-    assert_eq!(r_sc["startLine"], 1, "{r_empty}");
-    assert!(r_sc["endLine"].is_null(), "{r_empty}");
-    assert_eq!(r_sc["shownLines"], 0, "{r_empty}");
-    assert_eq!(r_sc["text"], "", "{r_empty}");
+    assert!(!r_empty_err, "{r_empty_text}");
+    assert!(
+        r_empty_text.is_empty() || r_empty_text.contains("0 lines"),
+        "{r_empty_text:?}"
+    );
 
-    server.request(
-        "tools/call",
-        json!({"name": "write", "arguments": {"path": "~/tilde.txt", "content": "alpha\r\nbeta"}}),
+    let (_, w_tilde_err) = server.file(
+        "write",
+        json!({"path": "~/tilde.txt", "content": "alpha\r\nbeta"}),
     );
+    assert!(!w_tilde_err);
     assert_eq!(
         std::fs::read_to_string(home_dir.join("tilde.txt")).unwrap(),
         "alpha\r\nbeta"
     );
-    let r_tilde = server.request(
-        "tools/call",
-        json!({"name": "read", "arguments": {"path": "~/tilde.txt"}}),
-    );
-    assert_eq!(
-        r_tilde["result"]["structuredContent"]["totalLines"], 2,
-        "{r_tilde}"
-    );
-    assert_eq!(
-        r_tilde["result"]["structuredContent"]["text"], "alpha\r\nbeta",
-        "{r_tilde}"
-    );
+    let (r_tilde_text, r_tilde_err) = server.file("read", json!({"path": "~/tilde.txt"}));
+    assert!(!r_tilde_err, "{r_tilde_text}");
+    assert_eq!(r_tilde_text, "alpha\r\nbeta");
 
-    let r_lim0 = server.request(
-        "tools/call",
-        json!({"name": "read", "arguments": {"path": "~/tilde.txt", "limit": 0}}),
-    );
-    assert_eq!(r_lim0["result"]["isError"], true, "{r_lim0}");
-    let r_past = server.request(
-        "tools/call",
-        json!({"name": "read", "arguments": {"path": "~/tilde.txt", "offset": 99, "limit": 1}}),
-    );
-    let past_text = r_past["result"]["content"][0]["text"].as_str().unwrap();
+    let (_, r_lim0_err) = server.file("read", json!({"path": "~/tilde.txt", "limit": 0}));
+    assert!(r_lim0_err);
+    let (past_text, _past_err) =
+        server.file("read", json!({"path": "~/tilde.txt", "offset": 99, "limit": 1}));
     assert!(
         !past_text.starts_with('\n'),
         "no leading blank lines on empty body: {past_text:?}"
@@ -721,26 +663,18 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
             .into_owned();
         let sym_dir = real_b.join("link/..").to_string_lossy().into_owned();
 
-        let via_read = server.request(
-            "tools/call",
-            json!({"name": "read", "arguments": {"path": &sym_file}}),
-        );
-        assert_eq!(
-            via_read["result"]["structuredContent"]["text"], "via-symlink-parent\n",
-            "{via_read}"
-        );
+        let (via_read, via_read_err) = server.file("read", json!({"path": &sym_file}));
+        assert!(!via_read_err, "{via_read}");
+        assert_eq!(via_read, "via-symlink-parent\n");
 
-        let via_edit = server.request(
-            "tools/call",
+        let (via_edit, via_edit_err) = server.file(
+            "edit",
             json!({
-                "name": "edit",
-                "arguments": {
-                    "path": &sym_file,
-                    "edits": [{"oldText": "via-symlink-parent", "newText": "edited-via-symlink"}]
-                }
+                "path": &sym_file,
+                "edits": [{"oldText": "via-symlink-parent", "newText": "edited-via-symlink"}]
             }),
         );
-        assert_eq!(via_edit["result"]["isError"], false, "{via_edit}");
+        assert!(!via_edit_err, "{via_edit}");
         assert_eq!(
             std::fs::read_to_string(real_a.join("sibling.txt")).unwrap(),
             "edited-via-symlink\n"
@@ -754,24 +688,24 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
             .join("link/../created.txt")
             .to_string_lossy()
             .into_owned();
-        let via_write = server.request(
-            "tools/call",
-            json!({"name": "write", "arguments": {"path": &sym_written, "content": "created-in-real-a\n"}}),
+        let (via_write, via_write_err) = server.file(
+            "write",
+            json!({"path": &sym_written, "content": "created-in-real-a\n"}),
         );
-        assert_eq!(via_write["result"]["isError"], false, "{via_write}");
+        assert!(!via_write_err, "{via_write}");
         assert_eq!(
             std::fs::read_to_string(real_a.join("created.txt")).unwrap(),
             "created-in-real-a\n"
         );
         assert!(!real_b.join("created.txt").exists());
 
-        let (via_cwd, _) = server.ok(json!({
+        let via_cwd = server.ok(json!({
             "action": "start",
             "loginShell": false,
             "cwd": &sym_dir,
             "command": "cat sibling.txt"
         }));
-        assert_eq!(via_cwd["output"], "edited-via-symlink", "{via_cwd}");
+        assert_eq!(body_of(&via_cwd), "edited-via-symlink", "{via_cwd}");
 
         let via_cm_cwd = code_result(
             &mut server,
@@ -781,66 +715,48 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
             }),
         );
         assert_eq!(
-            via_cm_cwd["structuredContent"]["output"], "edited-via-symlink",
+            body_of(code_text(&via_cm_cwd)),
+            "edited-via-symlink",
             "{via_cm_cwd}"
         );
     }
 
-    server.request(
-        "tools/call",
-        json!({"name": "write", "arguments": {"path": "sub/edit.txt", "content": "L1 start\nL2 mid\nL3 end\ndup\ndup\nkeep\n"}}),
+    server.file(
+        "write",
+        json!({"path": "sub/edit.txt", "content": "L1 start\nL2 mid\nL3 end\ndup\ndup\nkeep\n"}),
     );
-    let bad_edit = server.request(
-        "tools/call",
+    let (bad_edit_text, bad_edit_err) = server.file(
+        "edit",
         json!({
-            "name": "edit",
-            "arguments": {
-                "path": "sub/edit.txt",
-                "edits": [
-                    {"oldText": "L1 start\nL2 mid\nL3 end\n", "newText": "SPAN0\n"},
-                    {"oldText": "L1 start", "newText": "SPAN1"},
-                    {"oldText": "L3 end", "newText": "SPAN2"},
-                    {"oldText": "missing-token", "newText": "x"},
-                    {"oldText": "dup", "newText": "DUP"},
-                    {"oldText": "keep", "newText": "keep"}
-                ]
-            }
+            "path": "sub/edit.txt",
+            "edits": [
+                {"oldText": "L1 start\nL2 mid\nL3 end\n", "newText": "SPAN0\n"},
+                {"oldText": "L1 start", "newText": "SPAN1"},
+                {"oldText": "L3 end", "newText": "SPAN2"},
+                {"oldText": "missing-token", "newText": "x"},
+                {"oldText": "dup", "newText": "DUP"},
+                {"oldText": "keep", "newText": "keep"}
+            ]
         }),
     );
-    assert_eq!(bad_edit["result"]["isError"], true, "{bad_edit}");
-    let failures = bad_edit["result"]["structuredContent"]["failures"]
-        .as_array()
-        .unwrap();
-    let problems: Vec<&str> = failures
-        .iter()
-        .filter_map(|f| f["problem"].as_str())
-        .collect();
-    assert!(problems.contains(&"not_found"), "{failures:?}");
-    assert!(problems.contains(&"ambiguous"), "{failures:?}");
+    assert!(bad_edit_err, "{bad_edit_text}");
     assert!(
-        failures
-            .iter()
-            .any(|f| f["problem"] == "overlap" && f["index"] == 0 && f["with"] == json!([1, 2])),
-        "expected containment overlap [1, 2] on entry 0: {failures:?}"
+        bad_edit_text.contains("overlaps edits[1], edits[2]")
+            && bad_edit_text.contains("not found")
+            && bad_edit_text.contains("occurs 2 times"),
+        "{bad_edit_text}"
     );
-    let noop_edit = server.request(
-        "tools/call",
+    let (noop_text, noop_err) = server.file(
+        "edit",
         json!({
-            "name": "edit",
-            "arguments": {
-                "path": "sub/edit.txt",
-                "edits": [{"oldText": "keep", "newText": "keep"}]
-            }
+            "path": "sub/edit.txt",
+            "edits": [{"oldText": "keep", "newText": "keep"}]
         }),
     );
-    assert_eq!(noop_edit["result"]["isError"], true, "{noop_edit}");
-    assert_eq!(
-        noop_edit["result"]["structuredContent"]["failures"],
-        json!([]),
-        "{noop_edit}"
-    );
+    assert!(noop_err, "{noop_text}");
+    assert!(noop_text.contains("identical content"), "{noop_text}");
 
-    let (t_ok, _) = server.ok(json!({
+    let t_ok = server.ok(json!({
         "action": "start",
         "loginShell": false,
         "command": "true",
@@ -849,62 +765,58 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
         "screen": false,
         "waitMs": null
     }));
-    let bare_t = bare_id(t_ok["taskId"].as_str().unwrap());
+    let bare_t = bare_id(task_id_of(&t_ok));
     let (epoch, _seq) = bare_t.split_once('-').expect("epoch-seq");
     assert_eq!(epoch.len(), 8, "8-char Crockford base32 epoch: {bare_t}");
 
-    let (t_run, _) = server.ok(json!({
+    let t_run = server.ok(json!({
         "action": "start",
         "loginShell": false,
         "command": "sleep 30",
         "waitMs": 50
     }));
-    let run_id = t_run["taskId"].as_str().unwrap().to_owned();
-    let (t_kill, _) = server.ok(json!({
+    let run_id = task_id_of(&t_run).to_owned();
+    let t_kill = server.ok(json!({
         "action": "start",
         "loginShell": false,
         "command": "sleep 30",
         "waitMs": 50
     }));
-    server.ok(json!({"action": "kill", "taskId": t_kill["taskId"]}));
+    server.ok(json!({"action": "kill", "taskId": task_id_of(&t_kill)}));
 
-    let (list_active, _) = server.ok(json!({
+    let list_active = server.ok(json!({
         "action": "list",
         "state": "active",
         "raw": false,
         "eof": null
     }));
-    assert_eq!(list_active["totalCount"], 1, "{list_active}");
-    let (list_finished, _) = server.ok(json!({
+    assert_eq!(list_active.lines().count(), 1, "{list_active}");
+    let list_finished = server.ok(json!({
         "action": "list",
         "state": "finished"
     }));
     assert!(
-        list_finished["totalCount"].as_u64().unwrap() >= 2,
+        list_finished.lines().count() >= 2,
         "{list_finished}"
     );
 
-    let (list_lim, list_lim_text) = server.ok(json!({"action": "list", "limit": 2}));
-    assert_eq!(list_lim["tasks"].as_array().unwrap().len(), 2, "{list_lim}");
-    assert!(list_lim["totalCount"].as_u64().unwrap() >= 3, "{list_lim}");
+    let list_lim_text = server.ok(json!({"action": "list", "limit": 2}));
     assert!(list_lim_text.contains("Showing 2 of "), "{list_lim_text}");
 
     // P1-6: keepTree task after root exit counts as state "active" until killed.
-    let (kt_out, _) = server.ok(json!({
+    let kt_out = server.ok(json!({
         "action": "start",
         "loginShell": false,
         "keepTree": true,
         "command": "sleep 30 </dev/null >/dev/null 2>&1 &"
     }));
-    let kt_handle = kt_out["taskId"].as_str().unwrap().to_owned();
+    let kt_handle = task_id_of(&kt_out).to_owned();
     let kt_bare = bare_id(&kt_handle).to_owned();
-    let (active_with_kt, _) = server.ok(json!({"action": "list", "state": "active"}));
+    let active_with_kt = server.ok(json!({"action": "list", "state": "active"}));
     assert!(
-        active_with_kt["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["taskId"] == kt_bare && t["keptRunning"] == true),
+        active_with_kt
+            .lines()
+            .any(|line| line.starts_with(&kt_bare) && line.contains("keeps ")),
         "{active_with_kt}"
     );
     server.ok(json!({"action": "kill", "taskId": &kt_handle}));
@@ -916,16 +828,13 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
         "command": "head -c 5",
         "input": "w".repeat(1 << 20)
     }));
-    let (with_warning, text) = server.ok(json!({"action": "list", "limit": 1}));
+    let text = server.ok(json!({"action": "list", "limit": 1}));
     assert!(text.contains("Warning:"), "{text}");
     assert!(
-        text.ends_with(&format!(
-            "Showing 1 of {} tasks; raise limit to see more.",
-            with_warning["totalCount"]
-        )),
+        text.contains("Showing 1 of ") && text.ends_with("tasks; raise limit to see more."),
         "{text}"
     );
-    let (_, bounded) = server.ok(json!({"action":"list", "limit":1, "maxBytes":100}));
+    let bounded = server.ok(json!({"action":"list", "limit":1, "maxBytes":100}));
     let bounded_body = bounded.split("\n\nWarning:").next().unwrap();
     assert!(
         bounded_body.len() <= 100 && bounded.contains("Warning:"),
@@ -933,24 +842,24 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
     );
     assert!(bounded.ends_with("raise limit to see more."), "{bounded}");
     let _ = server.ok(json!({"action": "start", "loginShell": false, "command": "true"}));
-    let (latest_only, latest_only_text) = server.ok(json!({"action": "list", "limit": 1}));
+    let latest_only_text = server.ok(json!({"action": "list", "limit": 1}));
     assert!(
-        latest_only.get("warnings").is_none() && !latest_only_text.contains("Warning:"),
-        "{latest_only} / {latest_only_text}"
+        !latest_only_text.contains("Warning:"),
+        "{latest_only_text}"
     );
 
     // P1-6: Tiny maxBytes on direct list leaves undelivered background notices due; nested list
     // marks script-owned tasks it delivers.
-    let (due_bg, _) = server.ok(json!({
+    let due_bg = server.ok(json!({
         "action": "start",
         "loginShell": false,
         "command": "sleep 0.15; exit 4",
         "waitMs": 10
     }));
-    let due_bare = bare_id(due_bg["taskId"].as_str().unwrap()).to_owned();
+    let due_bare = bare_id(task_id_of(&due_bg)).to_owned();
     std::thread::sleep(Duration::from_millis(300));
     let _ = server.ok(json!({"action": "list", "maxBytes": 100}));
-    let (_, after_tiny_list) =
+    let after_tiny_list =
         server.ok(json!({"action": "start", "loginShell": false, "command": "true"}));
     assert!(
         after_tiny_list.contains(&due_bare),
@@ -981,11 +890,7 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
             "#
         }),
     );
-    let nested_bare = nested_marks["structuredContent"]["output"]
-        .as_str()
-        .unwrap()
-        .trim()
-        .to_owned();
+    let nested_bare = body_of(code_text(&nested_marks)).trim().to_owned();
     assert!(
         !code_text(&nested_marks)
             .lines()
@@ -998,19 +903,19 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
 
     server.ok(json!({"action": "kill", "taskId": run_id}));
 
-    let (_, bad_id_msg, bad_id_err) = server.call(json!({"action": "poll", "taskId": "BAD_ID!"}));
+    let (bad_id_msg, bad_id_err) = server.call(json!({"action": "poll", "taskId": "BAD_ID!"}));
     assert!(
         bad_id_err && bad_id_msg.contains("Unknown taskId"),
         "{bad_id_msg}"
     );
 
-    let (_, true_msg, true_err) = server.call(json!({"action": "list", "eof": true}));
+    let (true_msg, true_err) = server.call(json!({"action": "list", "eof": true}));
     assert!(
         true_err && true_msg.contains("action list; remove it."),
         "{true_msg}"
     );
 
-    let (pty_scr, _) = server.ok(json!({
+    let pty_scr = server.ok(json!({
         "action": "start",
         "pty": true,
         "loginShell": false,
@@ -1018,10 +923,10 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
         "screen": true,
         "raw": false
     }));
-    assert!(pty_scr["cursor"].is_array(), "{pty_scr}");
+    assert!(pty_scr.contains("cursor row "), "{pty_scr}");
 
     let cm_done = code_result(&mut server, json!({"code": "return 'cm-ok';"}));
-    let cm_id = cm_done["structuredContent"]["taskId"].as_str().unwrap();
+    let cm_id = task_id_of(code_text(&cm_done)).to_owned();
     server.ok(json!({
         "action": "poll",
         "taskId": cm_id,
@@ -1095,32 +1000,34 @@ fn windows_git_bash_drive_paths_and_forward_slash_reports() {
         "Host line has backslash: {host_line}"
     );
 
-    let w = server.request(
-        "tools/call",
-        json!({"name": "write", "arguments": {"path": &git_bash_file, "content": "win-ok\n"}}),
+    let (w_text, w_err) = server.file(
+        "write",
+        json!({"path": &git_bash_file, "content": "win-ok\n"}),
     );
-    let reported = w["result"]["structuredContent"]["path"].as_str().unwrap();
+    assert!(!w_err, "{w_text}");
     assert!(
-        !reported.contains('\\') && reported.ends_with("/dir with spaces/hello.txt"),
-        "{reported}"
+        !w_text.contains('\\') && w_text.contains("/dir with spaces/hello.txt"),
+        "{w_text}"
     );
 
-    let (ran, _) = server.ok(json!({
+    let ran = server.ok(json!({
         "action": "start",
         "loginShell": false,
         "cwd": &git_bash_dir,
         "command": "cat hello.txt"
     }));
-    assert_eq!(ran["output"], "win-ok", "{ran}");
-    assert!(!ran["logPath"].as_str().unwrap().contains('\\'), "{ran}");
+    assert_eq!(body_of(&ran), "win-ok", "{ran}");
+    if let Some(lp) = log_path_of(&ran) {
+        assert!(!lp.contains('\\'), "{ran}");
+    }
 
-    let (root_drive, _) = server.ok(json!({
+    let root_drive = server.ok(json!({
         "action": "start",
         "loginShell": false,
         "cwd": format!("/{}", drive.to_ascii_lowercase()),
         "command": "pwd"
     }));
-    assert_eq!(root_drive["exitCode"], 0, "{root_drive}");
+    assert!(root_drive.contains("[exited 0]"), "{root_drive}");
 
     let (tmp_msg, tmp_err) = server.file("read", json!({"path": "/tmp/x"}));
     assert!(tmp_err && tmp_msg.contains("cygpath -m"), "{tmp_msg}");
@@ -1130,35 +1037,27 @@ fn windows_git_bash_drive_paths_and_forward_slash_reports() {
     // P1-1 Windows: default start PATH matches loginShell: true order, git & ls resolve, and
     // non-login snapshot execution runs at non-login speed.
     let path_cmd = "git --version >/dev/null && ls >/dev/null && IFS=: && for p in $PATH; do cygpath -m \"$p\"; done";
-    let (snap_path, _) = server.ok(json!({
+    let snap_path = server.ok(json!({
         "action": "start",
         "command": path_cmd
     }));
-    let (login_path, _) = server.ok(json!({
+    let login_path = server.ok(json!({
         "action": "start",
         "loginShell": true,
         "command": path_cmd
     }));
-    let snap_entries: Vec<&str> = snap_path["output"]
-        .as_str()
-        .unwrap()
-        .lines()
-        .take(5)
-        .collect();
-    let login_entries: Vec<&str> = login_path["output"]
-        .as_str()
-        .unwrap()
-        .lines()
-        .take(5)
-        .collect();
+    let snap_entries: Vec<&str> = body_of(&snap_path).lines().take(5).collect();
+    let login_entries: Vec<&str> = body_of(&login_path).lines().take(5).collect();
     assert_eq!(
         snap_entries, login_entries,
         "Windows snapshot PATH order must match login shell"
     );
-    let (fast_true, _) = server.ok(json!({"action": "start", "command": "true"}));
+    let begun = Instant::now();
+    server.ok(json!({"action": "start", "command": "true"}));
     assert!(
-        fast_true["elapsedMs"].as_u64().unwrap() < 800,
-        "expected fast non-login start on Windows, got {fast_true}"
+        begun.elapsed() < Duration::from_millis(800),
+        "expected fast non-login start on Windows, got {:?}",
+        begun.elapsed()
     );
 }
 
@@ -1169,8 +1068,7 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
     let mut server = Server::start_with(|command| {
         command
             .current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true")
-            .env("FASTEXEC_OUTPUT_MODE", "both");
+            .env("FASTEXEC_CODEMODE", "true");
     });
 
     // Schema assertions (P0-1, P0-2, P1-2, P1-4).
@@ -1200,18 +1098,18 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
 
     // P0-1: maxBytes 4194304 accepted with all 3 placements; 4194305 and truncate "none" rejected.
     for placement in ["head_tail", "head", "tail"] {
-        let (out, _) = server.ok(json!({
+        let out = server.ok(json!({
             "action": "start",
             "command": "printf ok",
             "truncate": placement,
             "maxBytes": 4_194_304
         }));
-        assert_eq!(out["output"], "ok");
+        assert_eq!(body_of(&out), "ok", "{out}");
         let cm = code_result(
             &mut server,
             json!({"code": "return 'ok';", "truncate": placement, "maxBytes": 4_194_304}),
         );
-        assert_eq!(cm["structuredContent"]["output"], "ok");
+        assert_eq!(body_of(code_text(&cm)), "ok", "{cm}");
     }
     let bad_cm_none = code_result(
         &mut server,
@@ -1248,11 +1146,11 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
         json!({
             "code": r#"
                 const full50k = await tools.read({ path: "lines50k.txt" });
-                if (full50k.totalLines !== 50003 || full50k.text.length !== 100006 || full50k.truncated !== false || full50k.nextOffset !== null) {
+                if (full50k.totalLines !== 50003 || full50k.text.length !== 100006 || full50k.truncated !== false || full50k.nextOffset !== undefined) {
                     throw new Error("50k mismatch: " + JSON.stringify({ ...full50k, text: full50k.text.length }));
                 }
                 const full1m = await tools.read({ path: "line1m.txt" });
-                if (full1m.text.length !== 1048580 || full1m.lineTooLong !== false) {
+                if (full1m.text.length !== 1048580 || full1m.lineTooLong) {
                     throw new Error("1m line mismatch: " + full1m.text.length);
                 }
                 let overErr = null;
@@ -1261,8 +1159,8 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
                 } catch (e) {
                     overErr = e;
                 }
-                if (!overErr || overErr.name !== "ToolError" || !overErr.message.includes("offset") || !overErr.message.includes("limit") || ("text" in (overErr.result || {}))) {
-                    throw new Error("over4m error mismatch: " + (overErr && overErr.message));
+                if (!overErr || overErr.name !== "ToolError" || overErr.code !== "LIMIT" || !overErr.message.includes("offset") || !overErr.message.includes("limit") || ("text" in (overErr.result || {}))) {
+                    throw new Error("over4m error mismatch: " + (overErr && (overErr.code + ": " + overErr.message)));
                 }
                 let utfErr = null;
                 try {
@@ -1270,8 +1168,8 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
                 } catch (e) {
                     utfErr = e;
                 }
-                if (!utfErr || utfErr.name !== "ToolError") {
-                    throw new Error("badutf8 whole-file must reject");
+                if (!utfErr || utfErr.name !== "ToolError" || utfErr.code !== "IO") {
+                    throw new Error("badutf8 whole-file must reject with IO");
                 }
                 const lossySlice = await tools.read({ path: "badutf8.txt", offset: 1 });
                 if (lossySlice.lossy !== true || lossySlice.text !== "o\uFFFDk\n") {
@@ -1281,66 +1179,54 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
                 if (slice5m.truncated !== true || slice5m.nextOffset !== 101 || slice5m.shownLines !== 100) {
                     throw new Error("slice5m mismatch: " + JSON.stringify({ ...slice5m, text: slice5m.text.length }));
                 }
-                const wholeKeys = Object.keys(full50k).sort().join(",");
-                const sliceKeys = Object.keys(slice5m).sort().join(",");
-                if (wholeKeys !== sliceKeys) {
-                    throw new Error("key set mismatch: " + wholeKeys + " vs " + sliceKeys);
-                }
                 const negTail = await tools.read({ path: "lines50k.txt", offset: -50 });
-                if (negTail.startLine !== 49954 || negTail.endLine !== 50003 || negTail.nextOffset !== null) {
+                if (negTail.startLine !== 49954 || negTail.endLine !== 50003 || negTail.nextOffset !== undefined) {
                     throw new Error("negTail mismatch: " + JSON.stringify(negTail));
                 }
                 return "p02-ok";
             "#
         }),
     );
-    assert_eq!(p02["structuredContent"]["exitCode"], 0, "{p02}");
-    assert_eq!(p02["structuredContent"]["output"], "p02-ok");
+    assert!(code_text(&p02).contains("[exited 0]"), "{p02}");
+    assert_eq!(body_of(code_text(&p02)), "p02-ok", "{p02}");
 
     // Direct negative offset & P1-4 edit startLine/endLine over MCP.
-    let direct_neg = server.request(
-        "tools/call",
-        json!({"name": "read", "arguments": {"path": "lines50k.txt", "offset": -5}}),
-    )["result"]
-        .clone();
-    assert_eq!(direct_neg["structuredContent"]["startLine"], 49_999);
-    assert_eq!(direct_neg["structuredContent"]["endLine"], 50_003);
-    assert_eq!(direct_neg["structuredContent"]["nextOffset"], Value::Null);
+    let (direct_neg, direct_neg_err) =
+        server.file("read", json!({"path": "lines50k.txt", "offset": -5}));
+    assert!(!direct_neg_err, "{direct_neg}");
+    assert_eq!(direct_neg.lines().count(), 5, "{direct_neg}");
 
     std::fs::write(dir.join("dup.txt"), "v = 1;\nkeep\nv = 1;\n").unwrap();
-    let scoped_edit = server.request(
-        "tools/call",
+    let (scoped_edit, scoped_edit_err) = server.file(
+        "edit",
         json!({
-            "name": "edit",
-            "arguments": {
-                "path": "dup.txt",
-                "edits": [{"oldText": "v = 1;", "newText": "v = 9;", "startLine": 3, "endLine": 3}]
-            }
+            "path": "dup.txt",
+            "edits": [{"oldText": "v = 1;", "newText": "v = 9;", "startLine": 3, "endLine": 3}]
         }),
-    )["result"]
-        .clone();
-    assert_ne!(scoped_edit["isError"], true, "{scoped_edit}");
+    );
+    assert!(!scoped_edit_err, "{scoped_edit}");
     assert_eq!(
         std::fs::read_to_string(dir.join("dup.txt")).unwrap(),
         "v = 1;\nkeep\nv = 9;\n"
     );
 
     // P2-1: keys: [] (with and without keyDelayMs) on pipe, PTY, and codemode; transcript ignores waitMs.
-    let (pipe_task, _) = server.ok(json!({
+    let pipe_task = server.ok(json!({
         "action": "start",
         "command": "printf pipe-done"
     }));
-    let (pipe_poll, _) = server.ok(json!({
+    let pipe_id = task_id_of(&pipe_task).to_owned();
+    let pipe_poll = server.ok(json!({
         "action": "poll",
-        "taskId": pipe_task["taskId"],
+        "taskId": &pipe_id,
         "keys": [],
         "keyDelayMs": 500,
         "waitMs": 0
     }));
-    assert_eq!(pipe_poll["state"], "exited");
-    let (_, lone_delay_text, lone_delay_err) = server.call(json!({
+    assert!(pipe_poll.contains("[exited 0]"), "{pipe_poll}");
+    let (lone_delay_text, lone_delay_err) = server.call(json!({
         "action": "poll",
-        "taskId": pipe_task["taskId"],
+        "taskId": &pipe_id,
         "keyDelayMs": 500,
         "waitMs": 0
     }));
@@ -1349,27 +1235,28 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
         "{lone_delay_text}"
     );
 
-    let (pty_task, _) = server.ok(json!({
+    let pty_task = server.ok(json!({
         "action": "start",
         "pty": true,
         "command": "printf 'pty-ready\\n'; sleep 30",
         "returnWhen": {"outputContains": ["pty-ready"]}
     }));
+    let pty_id = task_id_of(&pty_task).to_owned();
     let t0 = Instant::now();
-    let (pty_poll, _) = server.ok(json!({
+    let pty_poll = server.ok(json!({
         "action": "poll",
-        "taskId": pty_task["taskId"],
+        "taskId": &pty_id,
         "keys": [],
         "keyDelayMs": 500,
         "waitMs": 50
     }));
-    assert_eq!(pty_poll["state"], "running");
+    assert!(pty_poll.contains("[running]"), "{pty_poll}");
     assert!(t0.elapsed() < Duration::from_millis(1500));
 
     let t_tr = Instant::now();
-    let (tr_out, _) = server.ok(json!({
+    let tr_out = server.ok(json!({
         "action": "transcript",
-        "taskId": pty_task["taskId"],
+        "taskId": &pty_id,
         "waitMs": 5000
     }));
     assert!(
@@ -1377,8 +1264,8 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
         "transcript must ignore waitMs: {:?}",
         t_tr.elapsed()
     );
-    assert!(tr_out["output"].as_str().unwrap().contains("pty-ready"));
-    server.ok(json!({"action": "kill", "taskId": pty_task["taskId"]}));
+    assert!(tr_out.contains("pty-ready"), "{tr_out}");
+    server.ok(json!({"action": "kill", "taskId": &pty_id}));
 
     let cm_running = code_result(
         &mut server,
@@ -1388,22 +1275,19 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
             "returnWhen": {"outputContains": ["sleep-started"]}
         }),
     );
-    let cm_id = cm_running["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let (cm_poll, _) = server.ok(json!({
+    let cm_id = task_id_of(code_text(&cm_running)).to_owned();
+    let cm_poll = server.ok(json!({
         "action": "poll",
         "taskId": &cm_id,
         "keys": [],
         "keyDelayMs": 250,
         "waitMs": 20
     }));
-    assert_eq!(cm_poll["state"], "running");
-    let (cm_killed, cm_killed_text) = server.ok(json!({"action": "kill", "taskId": &cm_id}));
-    assert_eq!(cm_killed["state"], "killed", "{cm_killed_text}");
-    assert_eq!(
-        cm_killed["codemode"]["cancelledCalls"],
-        json!([{"tool": "sleep"}])
+    assert!(cm_poll.contains("[running]"), "{cm_poll}");
+    let cm_killed_text = server.ok(json!({"action": "kill", "taskId": &cm_id}));
+    assert!(cm_killed_text.contains("[killed"), "{cm_killed_text}");
+    assert!(
+        cm_killed_text.contains("cancelled 1 pending call(s): sleep"),
+        "{cm_killed_text}"
     );
 }

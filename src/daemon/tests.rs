@@ -110,8 +110,6 @@ fn hello(session: &str, connection: u64) -> ToDaemon {
         session: session.to_owned(),
         connection,
         client_name: "client".to_owned(),
-        output_mode: "both".to_owned(),
-        structured_content: true,
         cwd,
         env,
     }
@@ -232,12 +230,24 @@ fn text_of(result: &CallToolResult) -> String {
         .collect()
 }
 
-fn json_of(result: &CallToolResult) -> Value {
-    result.structured_content.clone().unwrap_or(Value::Null)
+fn task_handle_of(result: &CallToolResult) -> String {
+    assert!(result.structured_content.is_none(), "{result:?}");
+    let text = text_of(result);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix('[')
+            && let Some((_, after)) = rest.split_once("] ")
+            && let Some(token) = after.split(" · ").next()
+            && token.contains('.')
+        {
+            return token.to_owned();
+        }
+    }
+    panic!("no task handle found in:\n{text}");
 }
 
-/// Starts `command` and returns the call's structured result.
-async fn start(client: &mut Client, id: u64, command: &str) -> Value {
+#[cfg(windows)]
+/// Starts `command` and returns `(taskId handle, full text)`.
+async fn start(client: &mut Client, id: u64, command: &str) -> (String, String) {
     client
         .send(&call(
             id,
@@ -248,18 +258,22 @@ async fn start(client: &mut Client, id: u64, command: &str) -> Value {
         .await;
     let result = client.result(id).await;
     assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
-    json_of(&result)
+    assert!(result.structured_content.is_none(), "{result:?}");
+    (task_handle_of(&result), text_of(&result))
 }
 
-/// The structured result of a `poll` that does not wait.
-async fn poll(client: &mut Client, id: u64, task_id: &str) -> Value {
+#[cfg(windows)]
+/// The text result of a `poll` that does not wait.
+async fn poll(client: &mut Client, id: u64, task_id: &str) -> String {
     client
         .send(&call(
             id,
             json!({"action": "poll", "taskId": task_id, "waitMs": 0}),
         ))
         .await;
-    json_of(&client.result(id).await)
+    let result = client.result(id).await;
+    assert!(result.structured_content.is_none(), "{result:?}");
+    text_of(&result)
 }
 
 /// Waits until `test` holds, so a test never guesses at a delay.
@@ -364,28 +378,20 @@ async fn a_start_runs_in_the_hellos_environment_and_list_names_its_session_and_c
     // A second session whose first six characters match, starting its own call 1.
     let mut other = connect(daemon).await;
     other.welcome("sessabc999", 1).await;
-    let second = start(&mut other, 1, "printf other").await;
-    let second_id = second["taskId"].as_str().expect("a task ID").to_owned();
+    let (second_id, _) = start(&mut other, 1, "printf other").await;
 
     client
         .send(&call(2, json!({"action": "list", "scope": "all"})))
         .await;
     let list = client.result(2).await;
-    let entries = json_of(&list)["tasks"].clone();
-    let entries = entries.as_array().expect("a task list");
-    let entry = |id: &str| {
-        entries
-            .iter()
-            .find(|entry| entry["taskId"] == json!(id.split_once('.').unwrap().0))
-            .expect("the task is listed")
-            .clone()
-    };
-    assert_eq!(entry(&task_id)["session"], json!("sessabc123"));
-    assert_eq!(entry(&second_id)["session"], json!("sessabc999"));
-    assert_eq!(entry(&task_id)["callId"], json!(1));
-    assert_eq!(entry(&second_id)["callId"], json!(1));
-    assert_eq!(entry(&task_id)["owner"], json!("client-sessab"));
-    assert!(text_of(&list).contains(" call 1"), "{}", text_of(&list));
+    assert!(list.structured_content.is_none());
+    let text = text_of(&list);
+    let bare1 = task_id.split_once('.').unwrap().0;
+    let bare2 = second_id.split_once('.').unwrap().0;
+    assert!(text.contains(bare1), "{text}");
+    assert!(text.contains(bare2), "{text}");
+    assert!(text.contains("client-sessab"), "{text}");
+    assert!(text.contains(" call 1"), "{text}");
 }
 
 // shortcut: on Unix a task runs under the fastexec binary as its task host, which a unit-test
@@ -479,7 +485,9 @@ async fn a_new_connection_takes_the_session_and_closes_the_old_one() {
     .expect("the drained bytes end");
     // And the connection that took the session still works.
     second.send(&call(2, json!({"action": "list"}))).await;
-    assert_eq!(json_of(&second.result(2).await)["action"], json!("list"));
+    let list = second.result(2).await;
+    assert_ne!(list.is_error, Some(true));
+    assert!(list.structured_content.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -503,10 +511,6 @@ async fn a_call_on_a_closed_connection_queues_nothing() {
         run_call(
             Arc::clone(daemon),
             Arc::clone(&session),
-            Render {
-                output_mode: OutputMode::Text,
-                structured_content: true,
-            },
             connection,
             CancellationToken::new(),
             id,
@@ -545,8 +549,7 @@ async fn a_stop_ends_in_flight_waits_with_eof_and_no_result() {
             }),
         ))
         .await;
-    let started = json_of(&client.result(1).await);
-    let task_id = started["taskId"].as_str().expect("a task ID").to_owned();
+    let task_id = task_handle_of(&client.result(1).await);
     for id in 2..10 {
         client
             .send(&call(
@@ -597,8 +600,9 @@ async fn a_cancel_answers_the_wait_and_leaves_the_task_running() {
     assert!(cancelled.contains("the task keeps running."), "{cancelled}");
 
     client.send(&call(2, json!({"action": "list"}))).await;
-    let list = json_of(&client.result(2).await);
-    assert_eq!(list["tasks"][0]["state"], json!("running"));
+    let list = client.result(2).await;
+    assert!(list.structured_content.is_none());
+    assert!(text_of(&list).contains("running"), "{}", text_of(&list));
 }
 
 // shortcut: on Unix a task runs under the fastexec binary as its task host, which a unit-test
@@ -612,8 +616,7 @@ async fn bye_ends_the_session_so_the_next_connection_starts_fresh() {
     let daemon = &fixture.daemon;
     let mut first = connect(daemon).await;
     first.welcome("sess44", 1).await;
-    let started = start(&mut first, 1, "printf hi").await;
-    let task_id = started["taskId"].as_str().expect("a task ID").to_owned();
+    let (task_id, _) = start(&mut first, 1, "printf hi").await;
     first.send(&ToDaemon::Bye).await;
     // The daemon is done with this connection once its stream ends.
     assert_eq!(
@@ -625,9 +628,8 @@ async fn bye_ends_the_session_so_the_next_connection_starts_fresh() {
 
     let mut second = connect(daemon).await;
     second.welcome("sess44", 2).await;
-    assert_eq!(
-        poll(&mut second, 1, &task_id).await["output"],
-        json!("hi"),
+    assert!(
+        poll(&mut second, 1, &task_id).await.contains("hi"),
         "a Bye left no session behind, so this one reads from the beginning"
     );
 }
@@ -651,8 +653,7 @@ async fn the_connection_runs_at_most_32_calls_and_refuses_a_duplicate_id() {
             json!({"action": "start", "command": "sleep 30", "loginShell": false, "waitMs": 0}),
         ))
         .await;
-    let started = json_of(&client.result(1).await);
-    let task_id = started["taskId"].as_str().expect("a task ID").to_owned();
+    let task_id = task_handle_of(&client.result(1).await);
     for id in 2..=MAX_IN_FLIGHT as u64 + 1 {
         client
             .send(&call(
@@ -732,8 +733,7 @@ async fn a_kill_or_list_or_overload_receipt_uses_reserved_when_main_memory_is_fu
         })
         .await;
     let started = client.result(1).await;
-    let started_json = json_of(&started);
-    let handle = started_json["taskId"].as_str().unwrap().to_owned();
+    let handle = task_handle_of(&started);
     let bare = handle.split_once('.').unwrap().0.to_owned();
     // Wait until the attachment is stored on the task.
     let task = daemon.tasks.find(&bare).unwrap();
@@ -768,9 +768,9 @@ async fn a_kill_or_list_or_overload_receipt_uses_reserved_when_main_memory_is_fu
         .await;
     let killed = client.result(4).await;
     assert_eq!(killed.is_error, Some(false), "{killed:?}");
-    let killed_json = json_of(&killed);
-    assert_eq!(killed_json["state"], "killed");
-    let kill_handle = killed_json["taskId"].as_str().unwrap().to_owned();
+    let killed_text = text_of(&killed);
+    assert!(killed_text.contains("[killed]"), "{killed_text}");
+    let kill_handle = task_handle_of(&killed);
     assert_eq!(
         killed
             .content
@@ -818,27 +818,22 @@ async fn kill_narrows_over_reserved_dual_frame_and_overload_preserves_cursor_and
     });
     let daemon = &fixture.daemon;
 
-    // Client with output_mode="both" and structured_content=false? First test output_mode="both"
-    // (structured_content=true) so 4 MiB body + 4 MiB structuredContent.output > 8 MiB RESERVED.
     let mut both_client = connect(daemon).await;
-    let mut h = hello("bothkill", 1);
-    if let ToDaemon::Hello { output_mode, .. } = &mut h {
-        *output_mode = "both".into();
-    }
+    let h = hello("bothkill", 1);
     both_client.send(&h).await;
     assert!(matches!(
         both_client.next().await,
         Some(ToEndpoint::Welcome { .. })
     ));
 
-    // Start a codemode script whose dual-written JSON-escaped output (~11.5 MiB) exceeds 8 MiB RESERVED.
+    // Start a codemode script whose JSON-escaped output (~11.5 MiB) exceeds 8 MiB RESERVED.
     both_client
         .send(&ToDaemon::Call {
             id: 1,
             tool: "codemode".into(),
             request_id: "1".into(),
             arguments: json!({
-                "code": "for (let i = 0; i < 16; i++) text('\\x01'.repeat(60000)); await sleep(30000);",
+                "code": "for (let i = 0; i < 32; i++) text('\\x01'.repeat(60000)); await sleep(30000);",
                 "waitMs": 50,
                 "maxBytes": 100
             }),
@@ -846,13 +841,13 @@ async fn kill_narrows_over_reserved_dual_frame_and_overload_preserves_cursor_and
         .await;
     let started = both_client.result(1).await;
     assert_eq!(started.is_error, Some(false), "{started:?}");
-    let start_handle = json_of(&started)["taskId"].as_str().unwrap().to_owned();
+    let start_handle = task_handle_of(&started);
     let bare_id = start_handle.split_once('.').unwrap().0.to_owned();
     let task = daemon.tasks.find(&bare_id).unwrap();
-    until(|| task.snapshot().lines >= 16).await;
+    until(|| task.snapshot().lines >= 32).await;
 
-    // Exhaust 100% of main pool: kill with maxBytes=4194304 in `both` mode would exceed 8 MiB
-    // RESERVED (~8.4 MiB), so kill must narrow its window to fit RESERVED and still succeed!
+    // Exhaust 100% of main pool: kill with maxBytes=4194304 would exceed 8 MiB
+    // RESERVED (~11.5 MiB JSON-escaped), so kill must narrow its window to fit RESERVED and still succeed!
     let held = pool.try_acquire(pool.limit() - pool.used()).unwrap();
     both_client
         .send(&call(
@@ -866,26 +861,19 @@ async fn kill_narrows_over_reserved_dual_frame_and_overload_preserves_cursor_and
         .await;
     let killed = both_client.result(2).await;
     assert_eq!(killed.is_error, Some(false), "{killed:?}");
-    let killed_sc = json_of(&killed);
-    assert_eq!(killed_sc["state"], "killed");
+    assert!(killed.structured_content.is_none());
+    let killed_text = text_of(&killed);
+    assert!(killed_text.contains("[killed]"), "{killed_text}");
     assert!(
-        text_of(&killed).contains("narrowed to fit the 8 MiB control reserve"),
-        "{}",
-        text_of(&killed)
+        killed_text.contains("narrowed to fit the 8 MiB control reserve"),
+        "{killed_text}"
     );
     drop(held);
 
-    // Now connect a session with FASTEXEC_STRUCTURED_CONTENT=false: when start/poll hits
-    // active-memory overload, read.commit() must NOT advance the cursor, and the error
-    // receipt must name the bare taskId (never advising a blind retry of start).
+    // When start/poll hits active-memory overload, read.commit() must NOT advance the cursor,
+    // and the error receipt must name the bare taskId (never advising a blind retry of start).
     let mut nosc_client = connect(daemon).await;
-    let mut h2 = hello("nosc01", 1);
-    if let ToDaemon::Hello {
-        structured_content, ..
-    } = &mut h2
-    {
-        *structured_content = false;
-    }
+    let h2 = hello("nosc01", 1);
     nosc_client.send(&h2).await;
     assert!(matches!(
         nosc_client.next().await,
@@ -979,8 +967,17 @@ async fn zero_progress_write_stall_disconnects_reclaims_lease_and_recovers_via_b
     fresh
         .send(&call(1, json!({"action": "list", "scope": "all"})))
         .await;
-    let listed = json_of(&fresh.result(1).await);
-    let bare_id = listed["tasks"][0]["taskId"].as_str().unwrap().to_owned();
+    let listed_res = fresh.result(1).await;
+    assert!(listed_res.structured_content.is_none());
+    let listed_text = text_of(&listed_res);
+    let bare_id = listed_text
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
     assert!(!bare_id.contains('.'));
 
     fresh
@@ -1033,13 +1030,8 @@ async fn held_render_slots_leave_a_receipt_and_do_not_block_kill_or_list() {
             .await;
         let receipt = client.result(call_id).await;
         assert_eq!(receipt.is_error, Some(true));
-        let structured = json_of(&receipt);
+        assert!(receipt.structured_content.is_none());
         let receipt = text_of(&receipt);
-        assert_eq!(structured["error"], receipt);
-        assert_eq!(
-            structured["action"],
-            if tool == "exec" { "start" } else { tool }
-        );
         let mut lines = receipt.lines();
         assert!(
             lines
@@ -1061,15 +1053,12 @@ async fn held_render_slots_leave_a_receipt_and_do_not_block_kill_or_list() {
         client
             .send(&call(call_id + 1, json!({"action": "list"})))
             .await;
-        let listed = json_of(&client.result(call_id + 1).await);
+        let listed_res = client.result(call_id + 1).await;
+        assert!(listed_res.structured_content.is_none());
+        let listed_text = text_of(&listed_res);
         let (task_id, _) = handle.split_once('.').unwrap();
-        let task = listed["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["taskId"] == task_id)
-            .expect("task is listed");
-        assert_eq!(task["logPath"], path);
+        assert!(listed_text.contains(task_id), "{listed_text}");
+        assert!(std::path::Path::new(path).exists(), "missing logPath {path}");
 
         client
             .send(&call(
@@ -1079,6 +1068,7 @@ async fn held_render_slots_leave_a_receipt_and_do_not_block_kill_or_list() {
             .await;
         let poll_receipt = client.result(call_id + 3).await;
         assert_eq!(poll_receipt.is_error, Some(true));
+        assert!(poll_receipt.structured_content.is_none());
         assert!(text_of(&poll_receipt).contains("Do not resend input, keys, or resize."));
 
         // Read the same handle through the separate kill lane. The cursor was not advanced,
@@ -1089,14 +1079,12 @@ async fn held_render_slots_leave_a_receipt_and_do_not_block_kill_or_list() {
                 json!({"action": "kill", "taskId": handle}),
             ))
             .await;
-        let killed = json_of(&client.result(call_id + 2).await);
-        assert_eq!(killed["action"], "kill");
+        let killed = client.result(call_id + 2).await;
+        assert!(killed.structured_content.is_none());
+        let killed_text = text_of(&killed);
         assert!(
-            killed["output"]
-                .as_str()
-                .unwrap()
-                .contains("render-slot-test"),
-            "{killed:?}"
+            killed_text.contains("render-slot-test"),
+            "{killed_text}"
         );
     }
     drop(held);
@@ -1137,7 +1125,9 @@ async fn cancelling_waiting_file_work_does_not_dispatch_it() {
     drop(held);
 
     client.send(&call(2, json!({"action": "list"}))).await;
-    assert_eq!(json_of(&client.result(2).await)["action"], "list");
+    let listed = client.result(2).await;
+    assert_ne!(listed.is_error, Some(true));
+    assert!(listed.structured_content.is_none());
     assert!(!path.exists());
 }
 
@@ -1521,10 +1511,6 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let no_sc_render = Render {
-        output_mode: OutputMode::Text,
-        structured_content: false,
-    };
     let plain_launch = Arc::new(LaunchContext::new(dir.clone(), Vec::new()));
     let plain_session = Session::new("u1".into(), "u1".into(), Arc::clone(&plain_launch));
     let (outgoing, mut queued) = mpsc::unbounded_channel();
@@ -1533,7 +1519,6 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
     run_call(
         Arc::clone(&daemon),
         Arc::clone(&plain_session),
-        no_sc_render,
         CancellationToken::new(),
         CancellationToken::new(),
         1,
@@ -1557,7 +1542,7 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
     assert_eq!(result.is_error, Some(true));
     assert!(
         result.structured_content.is_none(),
-        "FASTEXEC_STRUCTURED_CONTENT=false suppresses structured_content"
+        "direct MCP errors carry no structured_content"
     );
     assert_eq!(
         result.content,
@@ -1567,7 +1552,7 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
     );
     assert!(daemon.transfer_listener.get().is_none());
 
-    // Malformed arguments on an enabled session also honor `render` without binding `/t/`.
+    // Malformed arguments on an enabled session also return pure text without binding `/t/`.
     let enabled_launch = Arc::new(LaunchContext::new(
         dir.clone(),
         vec![("FASTEXEC_TRANSFER".into(), "true".into())],
@@ -1576,7 +1561,6 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
     run_call(
         Arc::clone(&daemon),
         Arc::clone(&enabled_session),
-        no_sc_render,
         CancellationToken::new(),
         CancellationToken::new(),
         2,
@@ -1608,20 +1592,16 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
     );
     assert!(daemon.transfer_listener.get().is_none());
 
-    let text_render = Render {
-        output_mode: OutputMode::Text,
-        structured_content: true,
-    };
     // Passing a directory fails before `ensure_transfer_listener` binds any port.
     let dir_result = daemon
         .transfer(
             crate::transfer::Request { path: ".".into() },
             &enabled_launch,
-            text_render,
             Default::default(),
         )
         .await;
     assert_eq!(dir_result.result.is_error, Some(true));
+    assert!(dir_result.result.structured_content.is_none());
     assert!(
         daemon.transfer_listener.get().is_none(),
         "directory target must not bind /t/ listener"
@@ -1642,15 +1622,13 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
                 path: "ok.bin".into(),
             },
             &unspec_no_root,
-            text_render,
             Default::default(),
         )
         .await;
     assert_eq!(unspec_err.result.is_error, Some(true));
+    assert!(unspec_err.result.structured_content.is_none());
     assert!(
-        unspec_err.result.structured_content.as_ref().unwrap()["error"]
-            .as_str()
-            .unwrap()
+        text_of(&unspec_err.result)
             .contains("is an unspecified address; set FASTEXEC_PUBLIC_URL")
     );
     assert!(daemon.transfer_listener.get().is_none());
@@ -1663,11 +1641,11 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
                 path: "ok.bin".into(),
             },
             &enabled_launch,
-            text_render,
             Default::default(),
         )
         .await;
     assert_eq!(minted.result.is_error, Some(false));
+    assert!(minted.result.structured_content.is_none());
     let bound = *daemon.transfer_listener.get().expect("listener bound");
     assert_eq!(bound.ip(), std::net::Ipv4Addr::LOCALHOST);
 
@@ -1689,16 +1667,14 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
                 path: "other.bin".into(),
             },
             &conflict_launch,
-            text_render,
             Default::default(),
         )
         .await;
     assert_eq!(conflict.result.is_error, Some(true));
+    assert!(conflict.result.structured_content.is_none());
     assert_eq!(
-        conflict.result.structured_content.as_ref().unwrap()["error"],
-        json!(format!(
-            "the daemon already serves /t/ on {bound}, not 0.0.0.0:0; stop it first"
-        ))
+        text_of(&conflict.result),
+        format!("the daemon already serves /t/ on {bound}, not 0.0.0.0:0; stop it first")
     );
 
     daemon.stop();
@@ -1718,16 +1694,14 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
                 path: "ok.bin".into(),
             },
             &enabled_launch,
-            text_render,
             Default::default(),
         )
         .await;
     assert_eq!(wildcard_err.result.is_error, Some(true));
+    assert!(wildcard_err.result.structured_content.is_none());
     assert_eq!(
-        wildcard_err.result.structured_content.as_ref().unwrap()["error"],
-        json!(
-            "--http 0.0.0.0:8765 is an unspecified address; set FASTEXEC_PUBLIC_URL to the URL clients reach"
-        )
+        text_of(&wildcard_err.result),
+        "--http 0.0.0.0:8765 is an unspecified address; set FASTEXEC_PUBLIC_URL to the URL clients reach"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

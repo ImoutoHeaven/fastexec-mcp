@@ -313,9 +313,8 @@ mod ids {
 #[allow(clippy::module_inception)]
 mod tests {
     use super::*;
-    use crate::service::render::{OutputMode, Render};
     use crate::service::schema::Request;
-    use crate::service::{Call, Service};
+    use crate::service::{AgentDelivery, ExecContext, Service};
     use crate::term::output::{Cleaner, Matcher, Truncate};
 
     /// A `Tasks` for a test: it needs a runtime for its `killAfterMs` timer, which these tests
@@ -435,25 +434,19 @@ mod tests {
         let service = Service::new(Arc::clone(&tasks), false);
         let request: Request =
             serde_json::from_value(serde_json::json!({"action": "list"})).unwrap();
-        let call = Call {
+        let ctx = ExecContext {
             session: &session,
             launch: None,
-            render: Render {
-                output_mode: OutputMode::Text,
-                structured_content: true,
-            },
             cancel: tokio_util::sync::CancellationToken::new(),
             progress: None,
             call_id: None,
-            nested: false,
-            http_response: false,
-            rpc_id_bytes: 0,
-            started: None,
+            parent_task_id: None,
             queued_guard: None,
-            render_slot: None,
+            on_started: None,
             input_owner: Default::default(),
         };
-        runtime.block_on(service.call_tracked(request, call));
+        let list_res = runtime.block_on(service.exec_agent(request, ctx, AgentDelivery::default()));
+        assert!(list_res.result.structured_content.is_none());
         assert!(
             session.existing(retired).is_none(),
             "a retired task's entry survived a list call"
@@ -649,13 +642,14 @@ mod tests {
         let mut state = ReadState::default();
         // Every read path that opens the deleted file reports the eviction instead of an error.
         let window = task
-            .read_window(
+            .read_window_with_markers(
                 &mut state,
                 Truncate::Head,
                 4096,
                 false,
                 true,
                 false,
+                true,
                 encoding_rs::UTF_8,
                 None,
             )
@@ -666,13 +660,14 @@ mod tests {
         assert_eq!(state.cursor, written, "the cursor moved past the output");
         // A second read has nothing more to move past and stays empty.
         let again = task
-            .read_window(
+            .read_window_with_markers(
                 &mut state,
                 Truncate::Head,
                 4096,
                 false,
                 true,
                 false,
+                true,
                 encoding_rs::UTF_8,
                 None,
             )
@@ -681,13 +676,14 @@ mod tests {
         assert_eq!(state.cursor, written);
         // A legacy encoding takes its own path through the same read.
         assert!(
-            task.read_window(
+            task.read_window_with_markers(
                 &mut ReadState::default(),
                 Truncate::Tail,
                 1024,
                 false,
                 true,
                 false,
+                true,
                 encoding_rs::BIG5,
                 None,
             )
@@ -750,36 +746,33 @@ mod tests {
             format!("printf '%s|%s|%s' \"$FASTEXEC_CTX_PROBE\" \"$(pwd -P)\" \"{probe}\"");
         let service = crate::service::Service::new(Arc::clone(&tasks), false);
         let session = Session::new("ctx-1".into(), "ctx-1".into(), Arc::clone(&launch));
-        let call = || crate::service::Call {
+        let ctx = || ExecContext {
             session: &session,
             launch: None,
-            render: crate::service::render::Render {
-                output_mode: crate::service::render::OutputMode::Text,
-                structured_content: true,
-            },
             cancel: tokio_util::sync::CancellationToken::new(),
             progress: None,
             call_id: None,
-            nested: false,
-            http_response: false,
-            rpc_id_bytes: 0,
-            started: None,
+            parent_task_id: None,
             queued_guard: None,
-            render_slot: None,
+            on_started: None,
             input_owner: Default::default(),
         };
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         // A pipe task and a PTY task see the same environment and the same default directory.
         for pty in [false, true] {
-            let result = runtime.block_on(service.call_json(
-                serde_json::json!({
-                    "action": "start",
-                    "command": command,
-                    "pty": pty,
-                    "waitMs": 30000,
-                }),
-                call(),
-            ));
+            let result = runtime
+                .block_on(service.exec_agent_json(
+                    serde_json::json!({
+                        "action": "start",
+                        "command": command,
+                        "pty": pty,
+                        "waitMs": 30000,
+                    }),
+                    ctx(),
+                    AgentDelivery::default(),
+                ))
+                .result;
+            assert!(result.structured_content.is_none());
             let text = result_text(&result);
             assert!(
                 text.contains("xyz|"),
@@ -1047,13 +1040,14 @@ mod tests {
             let reader = session.entry(&task).reader(Some("test")).unwrap();
             let mut state = reader.read.try_lock().expect("the read gate is free");
             let window = task
-                .read_window(
+                .read_window_with_markers(
                     &mut state,
                     Truncate::Tail,
                     1024,
                     false,
                     true,
                     false,
+                    true,
                     encoding_rs::UTF_8,
                     None,
                 )
@@ -2473,23 +2467,16 @@ mod script_tests {
         }
     }
 
-    fn test_service_call(session: &Arc<Session>) -> crate::service::Call<'_> {
-        crate::service::Call {
+    fn test_exec_context(session: &Arc<Session>) -> crate::service::ExecContext<'_> {
+        crate::service::ExecContext {
             session,
             launch: None,
-            render: crate::service::render::Render {
-                output_mode: crate::service::render::OutputMode::Both,
-                structured_content: true,
-            },
             cancel: CancellationToken::new(),
             progress: None,
             call_id: None,
-            nested: false,
-            started: None,
+            parent_task_id: None,
             queued_guard: None,
-            render_slot: None,
-            http_response: false,
-            rpc_id_bytes: 0,
+            on_started: None,
             input_owner: Default::default(),
         }
     }
@@ -2522,45 +2509,48 @@ mod script_tests {
 
         runtime.block_on(async {
             let default_list = service
-                .call_json(
+                .exec_agent_json(
                     serde_json::json!({ "action": "list" }),
-                    test_service_call(&session),
+                    test_exec_context(&session),
+                    crate::service::AgentDelivery::default(),
                 )
-                .await;
+                .await
+                .result;
             assert_ne!(default_list.is_error, Some(true), "{default_list:?}");
+            assert!(default_list.structured_content.is_none());
             let text = default_list.content[0].as_text().unwrap().text.as_str();
             assert!(
                 text.contains(&format!("via {}", parent.id)) && text.contains(&child.id),
                 "expected promoted orphan with via <pid>: {text}"
             );
-            let structured = default_list.structured_content.as_ref().unwrap();
-            assert_eq!(structured["totalCount"], 1);
-            let listed = structured["tasks"].as_array().unwrap();
-            assert_eq!(listed.len(), 1);
-            assert_eq!(listed[0]["taskId"], child.id);
-            assert_eq!(listed[0]["parentTaskId"], parent.id);
+            assert_eq!(text.lines().count(), 1, "expected 1 listed task:\n{text}");
 
             let drill = service
-                .call_json(
+                .exec_agent_json(
                     serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
-                    test_service_call(&session),
+                    test_exec_context(&session),
+                    crate::service::AgentDelivery::default(),
                 )
-                .await;
+                .await
+                .result;
             assert_ne!(drill.is_error, Some(true), "{drill:?}");
-            let drill_structured = drill.structured_content.as_ref().unwrap();
-            assert_eq!(drill_structured["totalCount"], 1);
-            let drill_tasks = drill_structured["tasks"].as_array().unwrap();
-            assert_eq!(drill_tasks.len(), 1);
-            assert_eq!(drill_tasks[0]["taskId"], child.id);
-            assert_eq!(drill_tasks[0]["parentTaskId"], parent.id);
+            assert!(drill.structured_content.is_none());
+            let drill_text = drill.content[0].as_text().unwrap().text.as_str();
+            assert!(
+                drill_text.contains(&child.id) && drill_text.lines().count() == 1,
+                "expected drilled child in text: {drill_text}"
+            );
 
             let missing = service
-                .call_json(
+                .exec_agent_json(
                     serde_json::json!({ "action": "list", "parentTaskId": "zzzzzzzz-99" }),
-                    test_service_call(&session),
+                    test_exec_context(&session),
+                    crate::service::AgentDelivery::default(),
                 )
-                .await;
+                .await
+                .result;
             assert_eq!(missing.is_error, Some(true), "{missing:?}");
+            assert!(missing.structured_content.is_none());
             let missing_text = missing.content[0].as_text().unwrap().text.as_str();
             assert!(
                 missing_text.contains("Unknown parentTaskId"),
@@ -2620,12 +2610,17 @@ mod script_tests {
         runtime.block_on(async {
             // Outbound frame rejection must leave parent, active children, and folded children unreported.
             let small_frame = Arc::new(session.launch.for_session().with_outbound_limit(512));
-            let mut refused_call = test_service_call(&session);
-            refused_call.launch = Some(&small_frame);
+            let mut refused_ctx = test_exec_context(&session);
+            refused_ctx.launch = Some(&small_frame);
             let refused = service
-                .call_json_tracked(serde_json::json!({ "action": "list" }), refused_call)
+                .exec_agent_json(
+                    serde_json::json!({ "action": "list" }),
+                    refused_ctx,
+                    crate::service::AgentDelivery::default(),
+                )
                 .await;
             assert!(refused.overload, "{:?}", refused.result);
+            assert!(refused.result.structured_content.is_none());
             assert!(
                 refused.result.content[0]
                     .as_text()
@@ -2643,12 +2638,15 @@ mod script_tests {
 
             // Budget sized so parent + active_top fit while active_bottom is trimmed from the bottom.
             let trimmed = service
-                .call_json(
+                .exec_agent_json(
                     serde_json::json!({ "action": "list", "maxBytes": 210 }),
-                    test_service_call(&session),
+                    test_exec_context(&session),
+                    crate::service::AgentDelivery::default(),
                 )
-                .await;
+                .await
+                .result;
             assert_ne!(trimmed.is_error, Some(true), "{trimmed:?}");
+            assert!(trimmed.structured_content.is_none());
             let text = trimmed.content[0].as_text().unwrap().text.as_str();
             assert!(text.contains(&parent.id), "missing parent in:\n{text}");
             assert!(
@@ -2716,22 +2714,19 @@ mod script_tests {
             // Default scope with parentTaskId is "all": Session B sees Session A's child without
             // creating session entries in Session B for cross-session tasks.
             let all_view = service
-                .call_json(
+                .exec_agent_json(
                     serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
-                    test_service_call(&session_b),
+                    test_exec_context(&session_b),
+                    crate::service::AgentDelivery::default(),
                 )
-                .await;
+                .await
+                .result;
             assert_ne!(all_view.is_error, Some(true), "{all_view:?}");
-            let structured = all_view.structured_content.as_ref().unwrap();
-            assert_eq!(structured["totalCount"], 2);
-            let ids: Vec<&str> = structured["tasks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entry| entry["taskId"].as_str().unwrap())
-                .collect();
-            assert!(ids.contains(&child_a.id.as_str()), "{ids:?}");
-            assert!(ids.contains(&child_b.id.as_str()), "{ids:?}");
+            assert!(all_view.structured_content.is_none());
+            let all_text = all_view.content[0].as_text().unwrap().text.as_str();
+            assert_eq!(all_text.lines().count(), 2, "{all_text}");
+            assert!(all_text.contains(&child_a.id), "{all_text}");
+            assert!(all_text.contains(&child_b.id), "{all_text}");
             assert!(session_b.existing(&parent).is_none());
             assert!(session_b.existing(&child_a).is_none());
             assert!(!child_a_entry.is_reported());
@@ -2739,25 +2734,23 @@ mod script_tests {
 
             // Explicit scope: "session" restricts to Session B's own children.
             let session_view = service
-                .call_json(
+                .exec_agent_json(
                     serde_json::json!({
                         "action": "list",
                         "parentTaskId": parent.id,
                         "scope": "session"
                     }),
-                    test_service_call(&session_b),
+                    test_exec_context(&session_b),
+                    crate::service::AgentDelivery::default(),
                 )
-                .await;
+                .await
+                .result;
             assert_ne!(session_view.is_error, Some(true), "{session_view:?}");
-            let session_structured = session_view.structured_content.as_ref().unwrap();
-            assert_eq!(session_structured["totalCount"], 1);
-            let session_ids: Vec<&str> = session_structured["tasks"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entry| entry["taskId"].as_str().unwrap())
-                .collect();
-            assert_eq!(session_ids, vec![child_b.id.as_str()]);
+            assert!(session_view.structured_content.is_none());
+            let session_text = session_view.content[0].as_text().unwrap().text.as_str();
+            assert_eq!(session_text.lines().count(), 1, "{session_text}");
+            assert!(session_text.contains(&child_b.id), "{session_text}");
+            assert!(!session_text.contains(&child_a.id), "{session_text}");
             assert!(session_b.existing(&parent).is_none());
             assert!(session_b.existing(&child_a).is_none());
         });

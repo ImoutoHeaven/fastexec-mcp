@@ -546,15 +546,15 @@ impl Client {
         answer["result"].clone()
     }
 
-    /// A sessionless exec result, its structured content and its text.
-    fn modern_result(&mut self, arguments: Value) -> (Value, String) {
+    /// A sessionless exec result's text.
+    fn modern_result(&mut self, arguments: Value) -> String {
         let result = self.modern(
             "tools/call",
             json!({"name": "exec", "arguments": arguments}),
         );
         assert_ne!(result["isError"], true, "{result}");
-        let text = result["content"][0]["text"].as_str().unwrap().to_owned();
-        (result["structuredContent"].clone(), text)
+        assert!(result.get("structuredContent").is_none(), "{result}");
+        result["content"][0]["text"].as_str().unwrap().to_owned()
     }
 
     /// The MCP handshake, which names the session every later request carries.
@@ -627,6 +627,10 @@ impl Client {
         assert_eq!(response.status, 200, "{:?}", response.body);
         let answer = response.answer(id);
         assert!(answer["result"].is_object(), "protocol error: {answer}");
+        assert!(
+            answer["result"].get("structuredContent").is_none(),
+            "{answer}"
+        );
         answer["result"].clone()
     }
 
@@ -642,21 +646,42 @@ impl Client {
         response.answer(id)
     }
 
-    /// The text a tool result carries, and its structured content.
+    /// The text a tool result carries.
     fn text(&mut self, arguments: Value) -> String {
-        self.result(arguments).1
+        self.result(arguments)
     }
 
-    /// The structured content a tool result carries, and its text.
-    fn result(&mut self, arguments: Value) -> (Value, String) {
+    /// The text a tool result carries, asserting success and no structuredContent.
+    fn result(&mut self, arguments: Value) -> String {
         let answer = self.call(arguments);
         assert_ne!(answer["result"]["isError"], json!(true), "{answer}");
-        let text = answer["result"]["content"][0]["text"]
+        assert!(
+            answer["result"].get("structuredContent").is_none(),
+            "{answer}"
+        );
+        answer["result"]["content"][0]["text"]
             .as_str()
             .unwrap_or_else(|| panic!("no text in {answer}"))
-            .to_owned();
-        (answer["result"]["structuredContent"].clone(), text)
+            .to_owned()
     }
+}
+
+fn status_line(text: &str) -> &str {
+    text.lines()
+        .rev()
+        .find(|line| line.starts_with('[') && line.contains("] "))
+        .unwrap_or_else(|| panic!("no status line: {text}"))
+}
+
+fn task_handle(text: &str) -> String {
+    status_line(text)
+        .split_once("] ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned()
 }
 
 /// Sends one request with a method, a target and headers of the test's own choosing.
@@ -783,21 +808,19 @@ impl Stdio {
         }
     }
 
-    /// What the endpoint sees across the daemon, and its structured content.
-    fn list(&mut self) -> (String, Value) {
+    /// What the endpoint sees across the daemon.
+    fn list(&mut self) -> String {
         let answer = self.request(
             "tools/call",
             json!({"name": "exec", "arguments": {"action": "list", "scope": "all"}}),
         );
         let result = &answer["result"];
         assert_ne!(result["isError"], json!(true), "{answer}");
-        (
-            result["content"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
-            result["structuredContent"].clone(),
-        )
+        assert!(result.get("structuredContent").is_none(), "{answer}");
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
     }
 }
 
@@ -833,19 +856,17 @@ fn modern_discovery_and_task_polls_work_without_a_handshake() {
         }}),
     );
     assert_ne!(started["isError"], true, "{started}");
-    assert!(
-        started["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("MODERN_FIRST")
-    );
-    let id = &started["structuredContent"]["taskId"];
+    assert!(started.get("structuredContent").is_none(), "{started}");
+    let started_text = started["content"][0]["text"].as_str().unwrap();
+    assert!(started_text.contains("MODERN_FIRST"));
+    let id = task_handle(started_text);
     let polled = client.modern(
         "tools/call",
         json!({"name": "exec", "arguments": {
             "action": "poll", "taskId": id, "input": "go\n", "waitMs": 30000,
         }}),
     );
+    assert!(polled.get("structuredContent").is_none(), "{polled}");
     let text = polled["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("MODERN_SECOND"), "{polled}");
     assert!(
@@ -871,68 +892,60 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     let mut b = Client::new(fixture.addr, fixture.tokens[0].clone());
     let mut other = Client::new(fixture.addr, fixture.tokens[1].clone());
 
-    let (started, text) = a.modern_result(json!({
+    let text = a.modern_result(json!({
         "action": "start", "eof": false,
         "command": "printf 'A_FIRST\\n'; read -r line; printf 'A_SECOND\\n'; read -r line",
         "waitMs": 30000, "returnWhen": {"outputContains": ["A_FIRST"]},
     }));
-    let a_handle = started["taskId"].as_str().unwrap();
-    let a_id = a_handle.split_once('.').unwrap().0;
-    assert!(
-        text.contains(a_handle) && text.contains("A_FIRST"),
-        "{text}"
-    );
+    let a_handle = task_handle(&text);
+    let a_id = a_handle.split_once('.').unwrap().0.to_owned();
+    assert!(text.contains(&a_handle) && text.contains("A_FIRST"), "{text}");
     assert!(!text.contains("new reader"), "{text}");
 
-    let (other_started, text) = other.modern_result(json!({
+    let text = other.modern_result(json!({
         "action": "start", "eof": false, "command": "printf 'OTHER_FIRST\\n'; read -r line",
         "waitMs": 30000, "returnWhen": {"outputContains": ["OTHER_FIRST"]},
     }));
-    let other_handle = other_started["taskId"].as_str().unwrap();
-    let other_id = other_handle.split_once('.').unwrap().0;
+    let other_handle = task_handle(&text);
+    let other_id = other_handle.split_once('.').unwrap().0.to_owned();
     assert!(
         text.contains("1 task running outside this session; use list with scope \"all\"."),
         "{text}"
     );
     assert!(
-        !text.contains(a_id),
+        !text.contains(&a_id),
         "another principal has counts only: {text}"
     );
 
-    let (b_started, text) = b.modern_result(json!({
+    let text = b.modern_result(json!({
         "action": "start", "eof": false, "command": "printf 'B_FIRST\\n'; read -r line",
         "waitMs": 30000, "returnWhen": {"outputContains": ["B_FIRST"]},
     }));
-    let b_id = b_started["taskId"]
-        .as_str()
-        .unwrap()
-        .split_once('.')
-        .unwrap()
-        .0;
+    let b_id = task_handle(&text).split_once('.').unwrap().0.to_owned();
     assert!(
-        text.contains(a_id),
+        text.contains(&a_id),
         "the same token sees its own tasks: {text}"
     );
-    assert!(!text.contains(a_handle), "footer task IDs are bare: {text}");
+    assert!(!text.contains(&a_handle), "footer task IDs are bare: {text}");
     assert!(
         !text.contains("running outside this session"),
         "a already consumed token 0's first-result outside count: {text}"
     );
-    assert!(!text.contains(other_id), "{text}");
+    assert!(!text.contains(&other_id), "{text}");
 
-    let (attached, text) = b.modern_result(json!({
+    let text = b.modern_result(json!({
         "action": "poll", "taskId": a_id, "waitMs": 0,
     }));
-    let b_handle = attached["taskId"].as_str().unwrap();
+    let b_handle = task_handle(&text);
     assert_ne!(b_handle, a_handle);
     assert_eq!(b_handle.split_once('.').unwrap().0, a_id);
     assert!(
         text.contains("A_FIRST") && text.contains(" · new reader"),
         "{text}"
     );
-    assert!(text.contains(b_handle), "{text}");
+    assert!(text.contains(&b_handle), "{text}");
 
-    let (_, text) = a.modern_result(json!({
+    let text = a.modern_result(json!({
         "action": "poll", "taskId": a_handle, "input": "go\n",
         "waitMs": 30000, "returnWhen": {"outputContains": ["A_SECOND"]},
     }));
@@ -942,7 +955,7 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     );
     assert!(!text.contains("new reader"), "{text}");
 
-    let (_, text) = b.modern_result(json!({
+    let text = b.modern_result(json!({
         "action": "poll", "taskId": b_handle, "waitMs": 0,
     }));
     assert!(
@@ -951,25 +964,30 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     );
     assert!(!text.contains("new reader"), "{text}");
 
-    let (own_listed, _) = other.modern_result(json!({"action": "list"}));
-    let own_tasks = own_listed["tasks"].as_array().unwrap();
-    assert_eq!(own_tasks.len(), 1, "{own_listed}");
-    assert_eq!(own_tasks[0]["taskId"], other_id, "{own_listed}");
-    let (listed, _) = other.modern_result(json!({"action": "list", "scope": "all"}));
-    let tasks = listed["tasks"].as_array().unwrap();
-    assert_eq!(tasks.len(), 3, "{listed}");
-    for (id, owner) in [(a_id, "http-t1"), (b_id, "http-t1"), (other_id, "http-t2")] {
-        let task = tasks.iter().find(|task| task["taskId"] == id).unwrap();
-        assert_eq!(task["owner"], owner, "{task}");
-        assert!(!task["taskId"].as_str().unwrap().contains('.'), "{task}");
+    let own_listed = other.modern_result(json!({"action": "list"}));
+    assert_eq!(own_listed.lines().count(), 1, "{own_listed}");
+    assert!(own_listed.starts_with(&other_id), "{own_listed}");
+    let listed = other.modern_result(json!({"action": "list", "scope": "all"}));
+    assert_eq!(listed.lines().count(), 3, "{listed}");
+    for (id, owner) in [
+        (a_id.as_str(), "http-t1"),
+        (b_id.as_str(), "http-t1"),
+        (other_id.as_str(), "http-t2"),
+    ] {
+        let line = listed
+            .lines()
+            .find(|line| line.starts_with(&format!("{id} ")))
+            .unwrap_or_else(|| panic!("missing {id} in {listed}"));
+        assert!(line.contains(owner), "{line}");
+        assert!(!line.split_whitespace().next().unwrap().contains('.'), "{line}");
     }
     // Once shown in the session's first result, outside counts do not repeat on later polls.
     for _ in 0..2 {
-        let (_, text) = other.modern_result(json!({
+        let text = other.modern_result(json!({
             "action": "poll", "taskId": other_handle, "waitMs": 0,
         }));
         assert!(!text.contains("running outside this session"), "{text}");
-        assert!(!text.contains(a_id) && !text.contains(b_id), "{text}");
+        assert!(!text.contains(&a_id) && !text.contains(&b_id), "{text}");
     }
 }
 
@@ -978,36 +996,38 @@ fn sessionless_exit_reporting_is_local_to_each_reader() {
     let fixture = Fixture::new("reader-exit");
     let mut a = Client::new(fixture.addr, fixture.tokens[0].clone());
     let mut b = Client::new(fixture.addr, fixture.tokens[0].clone());
-    let (started, text) = a.modern_result(json!({
+    let text = a.modern_result(json!({
         "action": "start", "command": "sleep 60 & echo ROOT_EXIT",
         "keepTree": true, "loginShell": false, "waitMs": 30000,
     }));
-    assert_eq!(started["state"], "exited", "{text}");
-    assert_eq!(started["keptRunning"], true, "{text}");
-    assert_eq!(started["waitEndedBy"]["condition"], "task_ended", "{text}");
-    let a_handle = started["taskId"].as_str().unwrap();
-    let id = a_handle.split_once('.').unwrap().0;
+    let started_status = status_line(&text);
+    assert!(started_status.starts_with("[exited 0] "), "{text}");
+    assert!(started_status.contains("running; kill ends them"), "{text}");
+    let a_handle = task_handle(&text);
+    let id = a_handle.split_once('.').unwrap().0.to_owned();
 
-    let (waited, text) = a.modern_result(json!({
+    let text = a.modern_result(json!({
         "action": "poll", "taskId": a_handle, "waitMs": 150,
     }));
-    assert_eq!(waited["keptRunning"], true, "{text}");
-    assert_eq!(waited["waitEndedBy"]["condition"], "max_wait", "{text}");
+    let waited_status = status_line(&text);
+    assert!(waited_status.contains("running; kill ends them"), "{text}");
+    assert!(text.contains("(no new output)"), "{text}");
 
-    let (attached, text) = b.modern_result(json!({
+    let text = b.modern_result(json!({
         "action": "poll", "taskId": id, "waitMs": 1000,
     }));
-    assert_eq!(attached["keptRunning"], true, "{text}");
-    assert_eq!(attached["waitEndedBy"]["condition"], "task_ended", "{text}");
+    let attached_status = status_line(&text);
+    assert!(attached_status.contains("running; kill ends them"), "{text}");
     assert!(
         text.contains("ROOT_EXIT") && text.contains(" · new reader"),
         "{text}"
     );
-    assert_ne!(attached["taskId"], started["taskId"]);
+    assert_ne!(task_handle(&text), a_handle);
 
-    let (killed, text) = a.modern_result(json!({"action": "kill", "taskId": a_handle}));
-    assert!(killed.get("keptRunning").is_none(), "{text}");
-    assert_eq!(killed["taskId"], a_handle, "{text}");
+    let text = a.modern_result(json!({"action": "kill", "taskId": a_handle}));
+    let killed_status = status_line(&text);
+    assert!(!killed_status.contains("running; kill ends them"), "{text}");
+    assert_eq!(task_handle(&text), a_handle, "{text}");
 }
 
 #[test]
@@ -1026,13 +1046,13 @@ fn invalid_http_requests_create_no_reader_and_change_no_task_state() {
         } else {
             arguments["eof"] = json!(false);
         }
-        let (started, _) = client.modern_result(arguments);
-        let handle = started["taskId"].as_str().unwrap();
-        let id = handle.split_once('.').unwrap().0;
+        let started_text = client.modern_result(arguments);
+        let handle = task_handle(&started_text);
+        let id = handle.split_once('.').unwrap().0.to_owned();
         // The start reader is now the oldest of 16 idle readers. Any invalid call that allocates
         // a reader would evict it; its final poll below would replay READY and say new reader.
         for _ in 0..15 {
-            let (_, text) = client.modern_result(json!({
+            let text = client.modern_result(json!({
                 "action": "poll", "taskId": id, "waitMs": 0,
             }));
             assert!(text.contains(" · new reader"), "{text}");
@@ -1066,25 +1086,23 @@ fn invalid_http_requests_create_no_reader_and_change_no_task_state() {
                 json!({"name": "exec", "arguments": arguments}),
             );
             assert_eq!(result["isError"], true, "pty={pty}: {result}");
+            assert!(result.get("structuredContent").is_none(), "{result}");
         }
 
-        let (listed, _) = client.modern_result(json!({"action": "list"}));
-        let task = listed["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|task| task["taskId"] == id)
-            .unwrap();
-        assert_eq!(task["state"], "running", "{task}");
+        let listed = client.modern_result(json!({"action": "list"}));
+        let task_line = listed
+            .lines()
+            .find(|line| line.starts_with(&format!("{id} ")))
+            .unwrap_or_else(|| panic!("missing {id} in {listed}"));
+        assert!(task_line.contains("[running]"), "{task_line}");
         if pty {
-            assert_eq!(task["cols"], 80, "{task}");
-            assert_eq!(task["rows"], 24, "{task}");
+            assert!(task_line.contains(" pty 80x24"), "{task_line}");
         }
-        let (polled, text) = client.modern_result(json!({
+        let text = client.modern_result(json!({
             "action": "poll", "taskId": handle, "input": "SAFE\n",
             "waitMs": 30000, "returnWhen": {"outputContains": ["GOT_SAFE"]},
         }));
-        assert_eq!(polled["taskId"], handle);
+        assert_eq!(task_handle(&text), handle);
         assert!(text.contains("GOT_SAFE"), "pty={pty}: {text}");
         assert!(!text.contains("POISON"), "pty={pty}: {text}");
         assert!(
@@ -1107,7 +1125,8 @@ fn inline_requests_with_an_older_version_use_the_principal_session() {
         },
     }));
     assert_ne!(started["isError"], true, "{started}");
-    let handle = started["structuredContent"]["taskId"].as_str().unwrap();
+    assert!(started.get("structuredContent").is_none(), "{started}");
+    let handle = task_handle(started["content"][0]["text"].as_str().unwrap());
     let polled = client.inline(
         "2025-06-18",
         "tools/call",
@@ -1117,18 +1136,19 @@ fn inline_requests_with_an_older_version_use_the_principal_session() {
             },
         }),
     );
+    assert!(polled.get("structuredContent").is_none(), "{polled}");
     let text = polled["content"][0]["text"].as_str().unwrap();
     assert!(
         text.contains("OLD_SECOND") && !text.contains("OLD_FIRST"),
         "{polled}"
     );
     assert!(!text.contains("new reader"), "{polled}");
-    assert_eq!(polled["structuredContent"]["taskId"], handle);
+    assert_eq!(task_handle(text), handle);
 
-    let (listed, _) = client.modern_result(json!({"action": "list"}));
-    let task = &listed["tasks"][0];
-    assert_eq!(task["taskId"], handle.split_once('.').unwrap().0);
-    assert_eq!(task["owner"], "http-t1");
+    let listed = client.modern_result(json!({"action": "list"}));
+    let bare = handle.split_once('.').unwrap().0;
+    assert!(listed.starts_with(&format!("{bare} ")), "{listed}");
+    assert!(listed.contains("http-t1"), "{listed}");
 }
 
 #[test]
@@ -1191,24 +1211,13 @@ fn legacy_initialize_with_a_modern_version_keeps_its_client_session() {
     let fixture = Fixture::new("legacy-new");
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize_version("2026-07-28");
-    let (started, _) = client.result(json!({
+    let started = client.result(json!({
         "action": "start", "command": "true", "waitMs": 30000,
     }));
-    let (listed, _) = client.result(json!({"action": "list"}));
-    let task = &listed["tasks"][0];
-    assert_eq!(
-        task["taskId"],
-        started["taskId"]
-            .as_str()
-            .unwrap()
-            .split_once('.')
-            .unwrap()
-            .0
-    );
-    assert!(
-        task["owner"].as_str().unwrap().starts_with("http-test-"),
-        "{task}"
-    );
+    let bare = task_handle(&started).split_once('.').unwrap().0.to_owned();
+    let listed = client.result(json!({"action": "list"}));
+    assert!(listed.starts_with(&format!("{bare} ")), "{listed}");
+    assert!(listed.contains("http-test-"), "{listed}");
 }
 
 #[test]
@@ -1218,37 +1227,28 @@ fn minimum_body_budget_keeps_outside_tenant_footer_whole_and_once_per_session() 
     fixture.start();
     let mut tenant = Client::new(fixture.addr, fixture.tokens[0].clone());
     let mut caller = Client::new(fixture.addr, fixture.tokens[1].clone());
-    let (started, _) = tenant.modern_result(json!({
+    let started = tenant.modern_result(json!({
         "action": "start", "eof": false, "command": "read -r line", "waitMs": 0,
     }));
+    let bare = task_handle(&started).split_once('.').unwrap().0.to_owned();
     // Footer lives outside the body maxBytes budget, so a 100-byte body still carries the
     // outside-task notice on the session's first call and does not repeat it on the second.
-    let (_, first_full) = caller.modern_result(json!({
+    let first_full = caller.modern_result(json!({
         "action": "start", "command": "true", "waitMs": 30000, "maxBytes": 100,
     }));
     assert!(
         first_full.contains("1 task running outside this session; use list with scope \"all\"."),
         "{first_full}"
     );
-    let (_, second_call) = caller.modern_result(json!({
+    let second_call = caller.modern_result(json!({
         "action": "start", "command": "true", "waitMs": 30000,
     }));
     assert!(
         !second_call.contains("running outside this session"),
         "{second_call}"
     );
-    assert!(
-        !first_full.contains(
-            started["taskId"]
-                .as_str()
-                .unwrap()
-                .split_once('.')
-                .unwrap()
-                .0
-        ),
-        "{first_full}"
-    );
-    let (_, second_full) = caller.modern_result(json!({
+    assert!(!first_full.contains(&bare), "{first_full}");
+    let second_full = caller.modern_result(json!({
         "action": "start", "command": "true", "waitMs": 30000,
     }));
     assert!(
@@ -1289,16 +1289,13 @@ fn a_session_runs_a_task_over_http() {
     // The program reads a line and prints a marker, so the marker can only appear once this poll
     // delivered the input: a start that had already finished could not produce it. It also says
     // whether the token reached it, which it must not have.
-    let (structured, started) = client.result(json!({
+    let started = client.result(json!({
         "action": "start",
         "eof": false,
         "command": "read -r line; printf 'GOT %s\\n' \"$line\"; printf 'TOKEN=%s\\n' \"${FASTEXEC_HTTP_TOKEN:+SET}\"",
         "waitMs": 0,
     }));
-    let id = structured["taskId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no task id in {started}"))
-        .to_owned();
+    let id = task_handle(&started);
     let polled = client.text(json!({
         "action": "poll", "taskId": id, "input": "http-ok\n", "waitMs": 30000,
     }));
@@ -1318,28 +1315,21 @@ fn a_stdio_endpoint_lists_the_task_an_http_session_started() {
     let fixture = Fixture::new("shared");
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
     client.initialize();
-    let (structured, started) = client.result(json!({
+    let started = client.result(json!({
         "action": "start", "command": "sleep 60", "waitMs": 0,
     }));
-    let id = structured["taskId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no task id in {started}"))
-        .to_owned();
+    let bare = task_handle(&started).split_once('.').unwrap().0.to_owned();
     // An endpoint of its own, in `on` mode over the same namespace, sees that task and names the
     // HTTP session as its owner.
     let mut stdio = Stdio::start(&fixture);
-    let (text, structured) = stdio.list();
-    let tasks = structured["tasks"].as_array().cloned().unwrap_or_default();
-    let task = tasks
-        .iter()
-        .find(|task| task["taskId"] == json!(id.split_once('.').unwrap().0))
+    let text = stdio.list();
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(&format!("{bare} ")))
         .unwrap_or_else(|| panic!("the HTTP task is not listed: {text}"));
     assert!(
-        task["owner"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("http-test-"),
-        "the owner names the HTTP client: {task}"
+        line.contains("http-test-"),
+        "the owner names the HTTP client: {line}"
     );
 }
 
@@ -1546,12 +1536,10 @@ fn file_tools_round_trip_over_http_and_name_transfer_for_a_binary() {
         json!({"path": path.display().to_string(), "content": "one\ntwo\n"}),
     );
     assert_eq!(written["isError"], json!(false), "{written}");
-    assert_eq!(
-        written["content"][0]["text"],
-        json!(format!(
-            "Successfully wrote to {}",
-            written["structuredContent"]["path"].as_str().unwrap()
-        ))
+    let written_text = written["content"][0]["text"].as_str().unwrap();
+    assert!(
+        written_text.starts_with("Successfully wrote to ") && written_text.ends_with("notes.txt"),
+        "{written}"
     );
     let read = client.call_tool("read", json!({"path": path.display().to_string()}));
     assert_eq!(read["isError"], json!(false), "{read}");
@@ -1592,9 +1580,9 @@ fn publish(client: &mut Client, path: &Path) -> String {
     let text = result["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("no url in {result}"));
-    let url = text.lines().next().expect("url line").to_owned();
-    assert_eq!(result["structuredContent"]["url"], json!(url), "{result}");
-    assert!(result["structuredContent"]["path"].is_string(), "{result}");
+    let mut lines = text.lines();
+    let url = lines.next().expect("url line").to_owned();
+    assert!(lines.next().is_some(), "missing path line in {result}");
     url
 }
 
@@ -2355,18 +2343,9 @@ fn http_a_long_tool_call_outlives_the_header_deadline() {
         }),
     );
     assert_ne!(result["isError"], json!(true), "{result}");
-    assert_eq!(
-        result["structuredContent"]["exitCode"],
-        json!(0),
-        "{result}"
-    );
-    assert!(
-        result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("after-header-deadline"),
-        "{result}"
-    );
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(status_line(text).starts_with("[exited 0] "), "{result}");
+    assert!(text.contains("after-header-deadline"), "{result}");
 }
 
 #[cfg(target_os = "linux")]
@@ -2713,8 +2692,10 @@ fn stdio_transfer_endpoint_shares_the_http_daemons_transfer_route() {
             && msg["id"] == 2
         {
             assert_ne!(msg["result"]["isError"], true, "{msg}");
-            url = msg["result"]["structuredContent"]["url"]
+            assert!(msg["result"].get("structuredContent").is_none(), "{msg}");
+            url = msg["result"]["content"][0]["text"]
                 .as_str()
+                .and_then(|text| text.lines().next())
                 .map(str::to_owned);
             break;
         }
@@ -2768,14 +2749,14 @@ fn codemode_http_runs_nested_tools_and_attaches_images() {
         json!({"name":"codemode","arguments":{"code":code}}),
     );
     assert_eq!(result["isError"], false, "{result}");
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    assert!(result.get("structuredContent").is_none(), "{result}");
+    let result_text = result["content"][0]["text"].as_str().unwrap();
     assert!(
-        result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("http-codemode"),
+        status_line(result_text).starts_with("[exited 0] "),
         "{result}"
     );
+    assert!(result_text.contains("http-codemode"), "{result}");
+    assert!(result_text.contains("Attached: "), "{result}");
     let block = result["content"]
         .as_array()
         .unwrap()
@@ -2787,21 +2768,15 @@ fn codemode_http_runs_nested_tools_and_attaches_images() {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png),
         "{result}"
     );
-    assert_eq!(
-        result["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 1,
-        "{result}"
-    );
     let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
     legacy.initialize();
     let result = legacy.call_tool("codemode", json!({"code":"return 'legacy-codemode'"}));
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+    let legacy_text = result["content"][0]["text"].as_str().unwrap();
     assert!(
-        result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("legacy-codemode"),
+        status_line(legacy_text).starts_with("[exited 0] "),
         "{result}"
     );
+    assert!(legacy_text.contains("legacy-codemode"), "{result}");
 }
 
 #[test]
@@ -2832,23 +2807,17 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
 
     let existing = client.call_tool("transfer", json!({"path": "sub/existing.bin"}));
     assert_eq!(existing["isError"], false, "{existing}");
-    let ex_sc = &existing["structuredContent"];
-    assert_eq!(ex_sc["ok"], true, "{existing}");
-    assert_eq!(ex_sc["bytes"], 11, "{existing}");
-    let ex_path = ex_sc["path"].as_str().unwrap();
+    let ex_text = existing["content"][0]["text"].as_str().unwrap();
+    let ex_meta = ex_text.lines().nth(1).unwrap();
+    let (ex_path, ex_size) = ex_meta.split_once(" · ").unwrap();
+    assert_eq!(ex_size, "11 bytes", "{ex_text}");
     assert!(
         !ex_path.contains('\\') && ex_path.ends_with("/sub/existing.bin"),
         "{ex_path}"
     );
-    let ex_text = existing["content"][0]["text"].as_str().unwrap();
-    assert!(
-        ex_text.contains(&format!("{ex_path} · 11 bytes")),
-        "{ex_text}"
-    );
 
     let missing = client.call_tool("transfer", json!({"path": "sub/not-yet.bin"}));
     assert_eq!(missing["isError"], false, "{missing}");
-    assert!(missing["structuredContent"]["bytes"].is_null(), "{missing}");
     assert!(!cwd_dir.join("sub/not-yet.bin").exists());
     assert!(
         missing["content"][0]["text"]
@@ -2901,9 +2870,13 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
         symlink("new/nested/target", &link).unwrap();
         let result = client.call_tool("transfer", json!({"path": "upload-link"}));
         assert_eq!(result["isError"], false, "{result}");
-        assert_eq!(result["structuredContent"]["bytes"], Value::Null);
+        let result_text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            result_text.contains("does not exist yet; a PUT creates it"),
+            "{result}"
+        );
         assert!(!cwd_dir.join("new").exists());
-        let target = target_of(result["structuredContent"]["url"].as_str().unwrap());
+        let target = target_of(result_text.lines().next().unwrap());
         assert_eq!(
             send(fixture.addr, "PUT", &target, "", b"uploaded").status,
             200
@@ -2926,7 +2899,13 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
             .unwrap();
         let sym_xfer = client.call_tool("transfer", json!({"path": "base_t/link/../xfer.bin"}));
         assert_eq!(sym_xfer["isError"], false, "{sym_xfer}");
-        assert_eq!(sym_xfer["structuredContent"]["bytes"], 15, "{sym_xfer}");
+        assert!(
+            sym_xfer["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(" · 15 bytes"),
+            "{sym_xfer}"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&cwd_dir);
@@ -3029,13 +3008,10 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
             }),
         );
         assert_eq!(result["isError"], false, "{result}");
-        assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+        let result_text = result["content"][0]["text"].as_str().unwrap();
+        assert!(status_line(result_text).starts_with("[exited 0] "), "{result}");
         assert!(
-            result["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .lines()
-                .any(|line| line.trim() == "1048576"),
+            result_text.lines().any(|line| line.trim() == "1048576"),
             "{result}"
         );
     }
@@ -3057,16 +3033,21 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
     let resp_413 = exchange(fixture.addr, req_head.as_bytes());
     assert_eq!(resp_413.status, 413, "{}", resp_413.body);
     let listed = c1.call_tool("exec", json!({"action": "list"}));
-    assert_eq!(listed["structuredContent"]["totalCount"], 3, "{listed}");
+    assert_eq!(
+        listed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .count(),
+        3,
+        "{listed}"
+    );
 
     let started = c1.call_tool(
         "exec",
         json!({"action": "start", "loginShell": false, "command": "sleep 30", "waitMs": 50}),
     );
-    let task_id = started["structuredContent"]["taskId"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let task_id = task_handle(started["content"][0]["text"].as_str().unwrap());
 
     let first = c2.call_tool(
         "exec",
@@ -3139,8 +3120,8 @@ fn http_login_snapshots_are_session_scoped_and_strip_removed_variables() {
         "action": "start",
         "command": "printf '%s|%s' \"$FX_HTTP_PROFILE\" \"${FASTEXEC_HTTP_TOKEN:-absent}\""
     });
-    let check = |(out, text): (Value, String), expected: &str| {
-        assert_eq!(out["exitCode"], 0, "{text}");
+    let check = |text: String, expected: &str| {
+        assert!(status_line(&text).starts_with("[exited 0] "), "{text}");
         assert!(
             text.starts_with(&format!("{expected}|absent\n\n")),
             "{text}"
@@ -3588,7 +3569,14 @@ fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops()
         json!({"name": "read", "arguments": {"path": "big.pdf"}}),
     );
     assert_eq!(fits["isError"], json!(false), "one response must fit");
-    assert_eq!(fits["structuredContent"]["bytes"], json!(pdf.len()));
+    assert!(fits.get("structuredContent").is_none(), "{fits}");
+    assert!(
+        fits["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("({} B)", pdf.len())),
+        "{fits}"
+    );
     drop(fits);
     client.initialize();
 
@@ -3665,8 +3653,15 @@ fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops()
             json!({"name": "read", "arguments": {"path": "big.pdf"}}),
         );
         if third["isError"] == json!(false) {
-            assert_eq!(third["structuredContent"]["attached"], json!(true));
-            assert_eq!(third["structuredContent"]["bytes"], json!(pdf.len()));
+            assert!(third.get("structuredContent").is_none(), "{third}");
+            assert!(
+                third["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("({} B)", pdf.len())),
+                "{third}"
+            );
+            assert_eq!(third["content"][1]["type"], json!("resource"), "{third}");
             recovered = true;
             break;
         }
@@ -3710,9 +3705,17 @@ fn http_control_reserve_survives_output_admission_failure() {
         }),
     );
     assert_eq!(listed["isError"], json!(false), "{listed}");
-    let tasks = listed["structuredContent"]["tasks"].as_array().unwrap();
-    assert_eq!(tasks.len(), 1, "{listed}");
-    let bare_id = tasks[0]["taskId"].as_str().unwrap().to_owned();
+    assert!(listed.get("structuredContent").is_none(), "{listed}");
+    let list_text = listed["content"][0]["text"].as_str().unwrap();
+    assert_eq!(list_text.lines().count(), 1, "{listed}");
+    let bare_id = list_text
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
     assert!(overload_text.contains(&bare_id), "{overload_text}");
 
     // `kill` also succeeds via the 8 MiB control reserve and stops the task.
@@ -3724,5 +3727,9 @@ fn http_control_reserve_survives_output_admission_failure() {
         }),
     );
     assert_eq!(killed["isError"], json!(false), "{killed}");
-    assert_eq!(killed["structuredContent"]["state"], json!("killed"));
+    assert!(killed.get("structuredContent").is_none(), "{killed}");
+    assert!(
+        status_line(killed["content"][0]["text"].as_str().unwrap()).starts_with("[killed"),
+        "{killed}"
+    );
 }

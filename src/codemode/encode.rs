@@ -1171,7 +1171,6 @@ pub(crate) fn encode_service_error(
         fallback_meta,
     ) {
         Ok((text, mut lease)) => {
-            drop(meta_dto);
             drop(message);
             lease.shrink_to(text.capacity());
             ProgramOutcome::value(text, lease)
@@ -1227,7 +1226,6 @@ pub(crate) fn encode_read_program(
                 Some(cancel),
                 None,
             );
-            drop(dto);
             drop(slice);
             match encoded {
                 Ok((text, mut lease)) => {
@@ -1268,7 +1266,6 @@ pub(crate) fn encode_read_program(
                 Some(cancel),
                 None,
             );
-            drop(dto);
             drop(path);
             drop(mime_type);
             drop(note);
@@ -1322,7 +1319,6 @@ pub(crate) fn encode_write_program(
                 value: &dto,
             };
             let encoded = admit_bridge_result(&envelope, None, 0, launch, delivery, None, None);
-            drop(dto);
             drop(data);
             match encoded {
                 Ok((text, mut lease)) => {
@@ -1372,7 +1368,6 @@ pub(crate) fn encode_edit_program(
                 value: &dto,
             };
             let encoded = admit_bridge_result(&envelope, None, 0, launch, delivery, None, None);
-            drop(dto);
             drop(data);
             match encoded {
                 Ok((text, mut lease)) => {
@@ -1397,7 +1392,6 @@ pub(crate) fn encode_edit_program(
                     result: Some(&details),
                 };
                 let encoded = admit_bridge_result(&envelope, None, 0, launch, delivery, None, None);
-                drop(details);
                 drop(path);
                 drop(failures);
                 drop(msg);

@@ -553,19 +553,21 @@ mod tests {
 
     #[test]
     fn policy_constants_match_spec() {
-        assert!(!ExecPolicy::AGENT.unbounded_default_wait);
+        const {
+            assert!(!ExecPolicy::AGENT.unbounded_default_wait);
+            assert!(ExecPolicy::AGENT.inline_markers);
+            assert!(!ExecPolicy::AGENT.keep_nul);
+            assert!(ExecPolicy::PROGRAM.unbounded_default_wait);
+            assert!(!ExecPolicy::PROGRAM.inline_markers);
+            assert!(ExecPolicy::PROGRAM.keep_nul);
+        }
         assert_eq!(ExecPolicy::AGENT.max_wait_ms, Some(240_000));
         assert_eq!(ExecPolicy::AGENT.default_truncate, Truncate::HeadTail);
         assert_eq!(ExecPolicy::AGENT.default_max_bytes, 16_384);
-        assert!(ExecPolicy::AGENT.inline_markers);
-        assert!(!ExecPolicy::AGENT.keep_nul);
 
-        assert!(ExecPolicy::PROGRAM.unbounded_default_wait);
         assert_eq!(ExecPolicy::PROGRAM.max_wait_ms, None);
         assert_eq!(ExecPolicy::PROGRAM.default_truncate, Truncate::Head);
         assert_eq!(ExecPolicy::PROGRAM.default_max_bytes, 4 << 20);
-        assert!(!ExecPolicy::PROGRAM.inline_markers);
-        assert!(ExecPolicy::PROGRAM.keep_nul);
     }
 
     #[test]

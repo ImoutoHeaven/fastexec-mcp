@@ -1,5 +1,5 @@
-use super::common::{Server, scratch};
-use serde_json::{Value, json};
+use super::common::{Server, log_path_of, scratch, status_line, task_id_of};
+use serde_json::json;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -7,15 +7,15 @@ use std::time::{Duration, Instant};
 fn pty_task_sees_a_terminal_and_accepts_a_hidden_password() {
     let mut server = Server::start();
     let command = "[ -t 0 ] && echo tty; read -r -s -p 'Password: ' p; echo; echo \"len=${#p}\"";
-    let (out, text) = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["Password:"]}}));
-    assert_eq!(out["state"], "running", "{text}");
+    let text = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["Password:"]}}));
+    assert!(text.contains("[running]"), "{text}");
     assert!(text.contains("tty") && text.contains("Password:"), "{text}");
-    let (out, text) = server.ok(
+    let text = server.ok(
         json!({"action": "poll", "taskId": server.id(1), "input": "secret\r", "waitMs": 10000}),
     );
-    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("[exited 0]"), "{text}");
     assert!(text.contains("len=6") && !text.contains("secret"), "{text}");
-    let (_, text, is_error) =
+    let (text, is_error) =
         server.call(json!({"action": "poll", "taskId": server.id(1), "eof": true}));
     assert!(
         is_error && text.contains("EOF_UNSUPPORTED_IN_PTY"),
@@ -51,15 +51,15 @@ fn pty_keys_follow_input_and_the_programs_cursor_mode() {
     let mut server = Server::start();
     // The program switches to application cursor mode (DECCKM), then dumps what it reads.
     let command = "stty raw -echo; printf '\\033[?1hready\\r\\n'; head -c 9 | od -An -tx1";
-    let (_, text) = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["ready"]}}));
+    let text = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["ready"]}}));
     assert!(text.contains("ready"), "{text}");
-    let (_, text, is_error) =
+    let (text, is_error) =
         server.call(json!({"action": "poll", "taskId": server.id(1), "keys": ["Up", "C-Enter"]}));
     assert!(is_error && text.contains("C-Enter"), "{text}");
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(1), "input": "ab", "keys": ["Enter", "Up", "C-c", "M-x"], "waitMs": 10000
     }));
-    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("[exited 0]"), "{text}");
     let text = od(&text);
     assert!(
         text.contains("61 62 0d 1b 4f 41 03 1b 78"),
@@ -67,7 +67,7 @@ fn pty_keys_follow_input_and_the_programs_cursor_mode() {
     );
 
     server.ok(json!({"action": "start", "command": "cat", "waitMs": 0}));
-    let (_, text, is_error) =
+    let (text, is_error) =
         server.call(json!({"action": "poll", "taskId": server.id(2), "keys": ["Enter"]}));
     assert!(is_error && text.contains("PTY tasks only"), "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(2)}));
@@ -91,13 +91,12 @@ fn ctrl_c_interrupts_the_program_of_a_pty_task() {
         });
     });
     for mut server in [Server::start(), hostile] {
-        let (_, text) = server.ok(json!({"action": "start", "command": "echo ready; sleep 30; echo after", "pty": true, "waitMs": 10000, "returnWhen": {"outputContains": ["ready"]}}));
+        let text = server.ok(json!({"action": "start", "command": "echo ready; sleep 30; echo after", "pty": true, "waitMs": 10000, "returnWhen": {"outputContains": ["ready"]}}));
         assert!(text.contains("[running]"), "{text}");
-        let (out, text) = server.ok(
+        let text = server.ok(
             json!({"action": "poll", "taskId": server.id(1), "keys": ["C-c"], "waitMs": 10000}),
         );
-        assert_eq!(out["state"], "exited", "{text}");
-        assert_eq!(out["exitCode"], 130, "{text}");
+        assert!(text.contains("[exited 130]"), "{text}");
         assert!(!text.contains("after"), "{text}");
     }
 }
@@ -120,11 +119,11 @@ fn keys_pause_after_input_and_follow_the_modes_set_meanwhile() {
         (Some(0), " 61 62 0d 1b 5b 41\n", "1b 5b 41"),
         (None, "", ""),
     ] {
-        let (out, _) = server.ok(json!({
+        let started = server.ok(json!({
             "action": "start", "command": command, "pty": true, "waitMs": 20000,
             "returnWhen": {"outputContains": ["ready"]}
         }));
-        let task = out["taskId"].clone();
+        let task = task_id_of(&started).to_owned();
         let mut poll = json!({
             "action": "poll", "taskId": task, "input": "ab", "keys": ["Enter", "Up"],
             "waitMs": 10000, "returnWhen": {"outputContains": [" 41"]}
@@ -133,7 +132,7 @@ fn keys_pause_after_input_and_follow_the_modes_set_meanwhile() {
             poll["keyDelayMs"] = json!(delay);
         }
         let begun = Instant::now();
-        let (_, text) = server.ok(poll);
+        let text = server.ok(poll);
         let text = od(&text);
         if delay.is_none() {
             // 150 ms before each of the two keys.
@@ -157,9 +156,9 @@ fn pty_keys_follow_the_kitty_keyboard_protocol_the_program_pushes() {
         "printf 'flags=%s\\r\\n' \"${flags#?}\"; head -c 14 | od -An -tx1; ",
         "printf '\\033[<upopped\\r\\n'; head -c 2 | od -An -tx1"
     );
-    let (_, text) = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["flags=[?1"]}}));
+    let text = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["flags=[?1"]}}));
     assert!(text.contains("flags=[?1"), "{text}");
-    let (_, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(1), "keys": ["Escape", "C-i", "Tab"], "waitMs": 30000,
         "returnWhen": {"outputContains": ["popped"]}
     }));
@@ -168,10 +167,10 @@ fn pty_keys_follow_the_kitty_keyboard_protocol_the_program_pushes() {
         text.contains("1b 5b 32 37 75 1b 5b 31 30 35 3b 35 75 09") && text.contains("popped"),
         "Escape and C-i as CSI u, Tab as itself: {text}"
     );
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(1), "keys": ["Escape", "Tab"], "waitMs": 10000
     }));
-    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("[exited 0]"), "{text}");
     let text = od(&text);
     assert!(text.contains("1b 09"), "legacy bytes once popped: {text}");
 }
@@ -182,22 +181,22 @@ fn keyboard_stack_overflow_keeps_screen_keys_and_output_working() {
     // This used to trigger alacritty_terminal 0.26's 4097th-push panic. The bounded wrapper
     // must leave both raw output and the emulator's screen and keyboard modes usable.
     let command = "printf '\\033[>1u%.0s' $(seq 1 4097); printf 'alive\\r\\n'; read -r x; printf 'done\\r\\n'";
-    let (_, text) = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["alive"]}}));
+    let text = server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000, "returnWhen": {"outputContains": ["alive"]}}));
     assert!(text.contains("alive"), "{text}");
-    let (out, screen) = server.ok(json!({
+    let screen = server.ok(json!({
         "action": "poll", "taskId": server.id(1), "screen": true, "waitMs": 0
     }));
-    assert_eq!(out["state"], "running", "{screen}");
+    assert!(screen.contains("[running]"), "{screen}");
     assert!(
         screen.split("\n\n[").next().unwrap().contains("alive"),
         "{screen}"
     );
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(1), "keys": ["Enter"], "waitMs": 10000
     }));
-    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("[exited 0]"), "{text}");
     assert!(text.contains("done"), "{text}");
-    let (_, transcript) = server.ok(json!({
+    let transcript = server.ok(json!({
         "action": "transcript", "taskId": server.id(1), "maxBytes": 4194304
     }));
     assert!(
@@ -212,30 +211,30 @@ fn screen_shows_the_rendered_terminal_and_marks_the_stream_read() {
     // Frame 1 is printed, then cleared and overwritten in place at row 2.
     let command =
         "printf 'frame-1\\r\\n'; sleep 0.5; printf '\\033[H\\033[2J\\033[2;3Hframe-2'; read -r x";
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 30000,
         "returnWhen": {"screenContains": ["frame-2"]}
     }));
-    assert_eq!(out["state"], "running", "{text}");
+    assert!(text.contains("[running]"), "{text}");
     let body = text.split("\n\n[").next().unwrap();
     assert_eq!(body.trim_end(), "\n  frame-2", "{text}");
-    assert_eq!(out["cursor"], json!([2, 10]), "{text}");
-    let (_, text) = server.ok(json!({"action": "poll", "taskId": server.id(1), "waitMs": 0}));
+    assert!(text.contains("cursor row 2 col 10"), "{text}");
+    let text = server.ok(json!({"action": "poll", "taskId": server.id(1), "waitMs": 0}));
     assert!(text.starts_with("(no new output)"), "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(1)}));
 
     // A full first row leaves the cursor in the last column, pending the wrap.
     let command = "printf '%0120d' 0; read -r x";
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 30000,
         "returnWhen": {"screenContains": ["0000000000"]}
     }));
-    assert_eq!(out["cursor"], json!([1, 120]), "{text}");
+    assert!(text.contains("cursor row 1 col 120"), "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(2)}));
 
     // A synchronized update the program leaves open shows once it times out.
     let command = "printf 'shown\\r\\n\\033[?2026hheld'; read -r x";
-    let (_, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "pty": true, "screen": true, "waitMs": 30000,
         "returnWhen": {"screenContains": ["held"]}
     }));
@@ -248,40 +247,28 @@ fn screen_contains_and_quiet_see_only_committed_frames() {
     let mut server = Server::start();
     // The visible text is assembled by cursor moves; the earlier text is erased.
     let command = "printf 'GONE\\r\\n'; sleep 0.3; printf '\\033[2J\\033[H\\033[1;4Hdy\\033[1;1HRea'; read -r x";
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "pty": true, "waitMs": 20000,
         "returnWhen": {"screenContains": ["Ready"]}
     }));
-    assert_eq!(
-        out["waitEndedBy"],
-        json!({"condition": "screen_contains", "text": "Ready"}),
-        "{text}"
-    );
-    let (out, text) = server.ok(json!({
+    assert!(text.contains("wait: screen matched \"Ready\""), "{text}");
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(1), "waitMs": 500,
         "returnWhen": {"screenContains": ["GONE"]}
     }));
-    assert_eq!(
-        out["waitEndedBy"],
-        json!({"condition": "max_wait"}),
-        "{text}"
-    );
+    assert!(text.contains("wait: waitMs elapsed"), "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(1)}));
 
     // A synchronized update the program leaves open shows at its timeout, while the program
     // writes nothing more; until then the output is not quiet.
     let command = "printf 'shown\\r\\n\\033[?2026hheld'; read -r x";
     let begun = Instant::now();
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "pty": true, "waitMs": 20000,
         "returnWhen": {"screenContains": ["held"]}
     }));
     assert!(begun.elapsed() < Duration::from_secs(10), "{text}");
-    assert_eq!(
-        out["waitEndedBy"],
-        json!({"condition": "screen_contains", "text": "held"}),
-        "{text}"
-    );
+    assert!(text.contains("wait: screen matched \"held\""), "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(2)}));
     let command =
         "stty -echo; printf 'shown\\r\\n'; read -r x; printf '\\033[?2026hheld'; read -r x";
@@ -289,11 +276,11 @@ fn screen_contains_and_quiet_see_only_committed_frames() {
         "action": "start", "command": command, "pty": true, "waitMs": 20000,
         "returnWhen": {"screenContains": ["shown"]}
     }));
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(3), "keys": ["Enter"], "screen": true, "waitMs": 20000,
         "returnWhen": {"quietMs": 100}
     }));
-    assert_eq!(out["waitEndedBy"], json!({"condition": "quiet"}), "{text}");
+    assert!(text.contains("wait: output quiet"), "{text}");
     assert_eq!(text.split("\n\n[").next().unwrap(), "shown\nheld", "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(3)}));
 }
@@ -311,15 +298,11 @@ fn screen_appears_and_gone_compare_with_the_screen_before_the_input() {
         "returnWhen": {"screenContains": ["Done 1"]}
     }));
     // The old done line shows throughout; only the second one is new.
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(1), "keys": ["Enter"], "screen": true, "waitMs": 20000,
         "returnWhen": {"screenAppears": ["Done 1"]}
     }));
-    assert_eq!(
-        out["waitEndedBy"],
-        json!({"condition": "screen_appears", "text": "Done 1"}),
-        "{text}"
-    );
+    assert!(text.contains("wait: screen text appeared \"Done 1\""), "{text}");
     assert_eq!(
         text.split("\n\n[").next().unwrap(),
         "Done 1\nDone 1",
@@ -334,15 +317,11 @@ fn screen_appears_and_gone_compare_with_the_screen_before_the_input() {
         "returnWhen": {"screenContains": ["Done 1"]}
     }));
     let begun = Instant::now();
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(2), "keys": ["Enter"], "screen": true, "waitMs": 20000,
         "returnWhen": {"screenGone": ["Busy"]}
     }));
-    assert_eq!(
-        out["waitEndedBy"],
-        json!({"condition": "screen_gone", "text": "Busy"}),
-        "{text}"
-    );
+    assert!(text.contains("wait: screen text gone \"Busy\""), "{text}");
     assert!(begun.elapsed() >= Duration::from_millis(400), "{text}");
     assert!(
         !text.split("\n\n[").next().unwrap().contains("Busy"),
@@ -382,18 +361,18 @@ fn screen_and_transcript_render_the_same_terminal() {
         "action": "start", "command": command, "pty": true, "waitMs": 0
     }));
     let task = server.id(1);
-    let (out, text) = wait_for_screen(&mut server, &task, &expected, json!([7, 1]));
-    assert_eq!(out["state"], "running", "{text}");
+    let text = wait_for_screen(&mut server, &task, &expected, "cursor row 7 col 1");
+    assert!(text.contains("[running]"), "{text}");
     assert_eq!(
         text.split("\n\n[").next().unwrap(),
         expected,
         "screen: {text}"
     );
-    assert_eq!(out["cursor"], json!([7, 1]), "{text}");
+    assert!(text.contains("cursor row 7 col 1"), "{text}");
     #[cfg(unix)]
     {
         // The rendering cap must not alter the bytes captured from the Unix PTY.
-        let raw = std::fs::read(out["logPath"].as_str().unwrap()).unwrap();
+        let raw = std::fs::read(log_path_of(&text).unwrap()).unwrap();
         let full_run = format!("cap e{}", "\u{301}\u{7f}".repeat(40));
         assert!(
             raw.windows(full_run.len())
@@ -401,7 +380,7 @@ fn screen_and_transcript_render_the_same_terminal() {
             "all 40 original marks and DEL bytes must remain in the raw log"
         );
     }
-    let (_, text) =
+    let text =
         server.ok(json!({"action": "transcript", "taskId": server.id(1), "maxBytes": 4194304}));
     assert_eq!(
         text.split("\n\n[").next().unwrap(),
@@ -422,10 +401,10 @@ fn pty_programs_get_answers_to_terminal_queries() {
     );
     // What the program waits for is a terminal answer, not a profile: a login shell spends seconds
     // sourcing one under load, for nothing this test reads.
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "pty": true, "loginShell": false, "waitMs": 10000
     }));
-    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("[exited 0]"), "{text}");
     assert!(text.contains("cpr=[1;3 da=[?"), "{text}");
 }
 
@@ -443,10 +422,10 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
         "for k in $(seq 1 40); do ",
         "printf '\\033[1;29r\\033[29;1H\\r\\ninsert %d\\033[r\\033[30;1H> composer\\033[K' $k; done"
     );
-    let (out, text) =
+    let text =
         server.ok(json!({"action": "start", "command": command, "pty": true, "waitMs": 30000}));
-    assert_eq!(out["state"], "exited", "{text}");
-    let (out, text) =
+    assert!(text.contains("[exited 0]"), "{text}");
+    let text =
         server.ok(json!({"action": "transcript", "taskId": server.id(1), "maxBytes": 4194304}));
     let body = text.split("\n\n[").next().unwrap();
     let lines: Vec<&str> = body.lines().collect();
@@ -465,16 +444,30 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
         })
         .collect();
     assert!(positions.is_sorted(), "lines out of order: {text}");
-    let file = std::fs::read_to_string(out["transcriptPath"].as_str().unwrap()).unwrap();
+    let transcript_path = status_line(&text)
+        .rsplit_once(" · ")
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| panic!("no transcript path: {text}"));
+    let file = std::fs::read_to_string(transcript_path).unwrap();
     assert_eq!(file.trim_end(), body.trim_end());
     // Output ended, so every line is final, and a second read has none left.
-    assert_eq!(out["finalLines"], out["transcriptLines"], "{text}");
-    let (out, text) = server.ok(json!({"action": "transcript", "taskId": server.id(1)}));
+    assert!(
+        text.contains(&format!(
+            "transcript {} lines, final through {}",
+            lines.len(),
+            lines.len()
+        )),
+        "{text}"
+    );
+    let text = server.ok(json!({"action": "transcript", "taskId": server.id(1)}));
     assert!(
         text.starts_with("(no transcript lines since the last read)"),
         "{text}"
     );
-    assert_eq!(out["firstLine"], json!(lines.len() + 1), "{text}");
+    assert!(
+        text.contains(&format!("this read starts at line {}", lines.len() + 1)),
+        "{text}"
+    );
 
     // A program on the alternate screen: the normal screen's history, then the session merged
     // from its frames. Each page is held back by a gate file the test creates only after the
@@ -501,41 +494,41 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
         second_gate.display()
     );
     // The first page is on screen before anything replaces it.
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "pty": true, "waitMs": 60000,
         "returnWhen": {"screenContains": ["first 30"]}
     }));
-    assert_eq!(
-        out["waitEndedBy"]["condition"], "screen_contains",
+    assert!(
+        text.contains("wait: screen matched \"first 30\""),
         "the program drew its first page: {text}"
     );
     // Then the second page, and it is on screen before the next one is drawn.
     std::fs::write(&first_gate, b"").unwrap();
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(2), "waitMs": 60000,
         "returnWhen": {"screenContains": ["second 30"]}
     }));
-    assert_eq!(
-        out["waitEndedBy"]["condition"], "screen_contains",
+    assert!(
+        text.contains("wait: screen matched \"second 30\""),
         "the program drew its second page: {text}"
     );
     // Wait for the last line to be on screen before allowing a quiet interval to end the wait:
     // a quiet window that elapses early must not stand in for the drawing being done. A quiet
     // read after it then settles the frames.
     std::fs::write(&second_gate, b"").unwrap();
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": server.id(2), "waitMs": 60000,
         "returnWhen": {"screenContains": ["scrolled 40"]}
     }));
-    assert_eq!(
-        out["waitEndedBy"]["condition"], "screen_contains",
+    assert!(
+        text.contains("wait: screen matched \"scrolled 40\""),
         "the program drew its last line: {text}"
     );
     server.ok(json!({
         "action": "poll", "taskId": server.id(2), "waitMs": 15000,
         "returnWhen": {"quietMs": 3000}
     }));
-    let (out, text) =
+    let text =
         server.ok(json!({"action": "transcript", "taskId": server.id(2), "maxBytes": 4194304}));
     let lines: Vec<&str> = text.lines().collect();
     let normal = lines.iter().position(|line| *line == "normal 1");
@@ -560,32 +553,46 @@ fn transcript_recovers_every_line_a_program_pushed_off_the_screen() {
     );
     // The screen's rows are pending; the next read starts after the final lines and shows
     // the pending rows again, with the line typed since.
-    let first = out["finalLines"].as_u64().unwrap() + 1;
-    assert!(out["transcriptLines"].as_u64().unwrap() >= first, "{text}");
+    let status = status_line(&text);
+    let total_lines: u64 = status
+        .split_once("transcript ")
+        .and_then(|(_, rest)| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("missing transcript line count: {text}"));
+    let final_lines: u64 = status
+        .split_once("final through ")
+        .and_then(|(_, rest)| rest.split(';').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("missing finalLines: {text}"));
+    let first = final_lines + 1;
+    assert!(total_lines >= first, "{text}");
     server.ok(json!({"action": "poll", "taskId": server.id(2), "input": "typed", "waitMs": 30000, "returnWhen": {"screenContains": ["40typed"]}}));
-    let (out, text) =
+    let text =
         server.ok(json!({"action": "transcript", "taskId": server.id(2), "maxBytes": 4194304}));
-    assert_eq!(out["firstLine"], json!(first), "{text}");
+    assert!(
+        text.contains(&format!("this read starts at line {first}")),
+        "{text}"
+    );
     assert!(!text.contains("normal 1\n"), "{text}");
     assert!(text.contains("scrolled 40typed"), "{text}");
     server.ok(json!({"action": "kill", "taskId": server.id(2)}));
     let _ = std::fs::remove_dir_all(&gate);
 
     server.ok(json!({"action": "start", "command": "echo pipe"}));
-    let (_, text, is_error) = server.call(json!({"action": "transcript", "taskId": server.id(3)}));
+    let (text, is_error) = server.call(json!({"action": "transcript", "taskId": server.id(3)}));
     assert!(is_error && text.contains("PTY tasks only"), "{text}");
 }
 
 /// Polls a task's screen until it and the cursor are exactly `rows` and `cursor`, with a bounded
 /// wait: the state the test means, not merely text that appears on the way there.
-fn wait_for_screen(server: &mut Server, task: &str, rows: &str, cursor: Value) -> (Value, String) {
+fn wait_for_screen(server: &mut Server, task: &str, rows: &str, cursor: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let (out, text) = server.ok(json!({
+        let text = server.ok(json!({
             "action": "poll", "taskId": task, "screen": true, "waitMs": 100
         }));
-        if text.split("\n\n[").next().unwrap_or_default() == rows && out["cursor"] == cursor {
-            return (out, text);
+        if text.split("\n\n[").next().unwrap_or_default() == rows && text.contains(cursor) {
+            return text;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -599,7 +606,7 @@ fn wait_for_screen(server: &mut Server, task: &str, rows: &str, cursor: Value) -
 fn transcript_body(server: &mut Server, id: &str) -> String {
     let mut body = String::new();
     for _ in 0..20 {
-        let (out, text) = server.ok(json!({
+        let text = server.ok(json!({
             "action": "transcript", "taskId": id, "maxBytes": 4194304
         }));
         let part = text
@@ -616,7 +623,8 @@ fn transcript_body(server: &mut Server, id: &str) -> String {
             other if other.starts_with("... [") && other.ends_with("] ...") => "",
             _ => part,
         };
-        let ended = ["exited", "killed"].contains(&out["state"].as_str().unwrap_or_default());
+        let status = status_line(&text);
+        let ended = status.starts_with("[exited ") || status.starts_with("[killed]");
         if part.is_empty() {
             if ended {
                 break;
@@ -636,7 +644,7 @@ fn transcript_body(server: &mut Server, id: &str) -> String {
 #[test]
 fn a_pty_task_starts_at_the_default_size_and_the_program_sees_it() {
     let mut server = Server::start();
-    let (_, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "pty": true, "waitMs": 2000,
         "command": "stty size; sleep 30"
     }));
@@ -645,13 +653,11 @@ fn a_pty_task_starts_at_the_default_size_and_the_program_sees_it() {
         "the program's terminal is 120x30: {text}"
     );
     let task = server.id(1);
-    let (list, text) = server.ok(json!({"action": "list"}));
+    let text = server.ok(json!({"action": "list"}));
     assert!(text.contains(" pty 120x30"), "{text}");
-    assert_eq!(list["tasks"][0]["cols"], json!(120), "{list}");
-    assert_eq!(list["tasks"][0]["rows"], json!(30), "{list}");
     // The screen is read as it stands: the command sleeps, so a poll that waited would wait out
     // its own timeout for output that cannot arrive.
-    let (_, text) = server.ok(json!(
+    let text = server.ok(json!(
         {"action": "poll", "taskId": task, "screen": true, "waitMs": 0}
     ));
     assert!(
@@ -670,14 +676,14 @@ fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
     let (done, done_bash) = scratch("keyboard-mode-done");
     let (stderr, stderr_bash) = scratch("keyboard-mode-stderr");
     let mut server = Server::start();
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "pty": true, "loginShell": false,
         "cols": 100, "rows": 40, "waitMs": 0,
         "command": format!("set -e; stty raw -echo; printf '\\033[?2026h\\033[?1h'; : > '{ready_bash}'; dd bs=1 count=3 of='{received_bash}' 2> '{stderr_bash}'; : > '{done_bash}'")
     }));
     assert!(!text.contains("Cannot"), "{text}");
     let task = server.id(1);
-    let log = PathBuf::from(out["logPath"].as_str().unwrap());
+    let log = PathBuf::from(log_path_of(&text).unwrap());
     // ConPTY can query CPR during startup. The ready file follows stty; the exact
     // declarations in the raw log prove capture has already fed the emulator.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -693,7 +699,7 @@ fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let (poll_out, poll_text) = server.ok(json!({
+    let poll_text = server.ok(json!({
         "action": "poll", "taskId": task, "cols": 80, "rows": 20,
         "keys": ["Up"], "keyDelayMs": 0, "waitMs": 1000
     }));
@@ -702,11 +708,11 @@ fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !done.exists() {
         if Instant::now() >= deadline {
-            let (state, state_text, state_error) = server.call(json!({
+            let (state_text, state_error) = server.call(json!({
                 "action": "poll", "taskId": task, "waitMs": 0, "raw": true
             }));
             panic!(
-                "the program never finished reading the key: raw={:?}; received={:?}; reader stderr={:?}; start={out} {text:?}; poll={poll_out} {poll_text:?}; failure state={state} {state_text:?} isError={state_error}",
+                "the program never finished reading the key: raw={:?}; received={:?}; reader stderr={:?}; start={text:?}; poll={poll_text:?}; failure state={state_text:?} isError={state_error}",
                 std::fs::read_to_string(&log).unwrap_or_default(),
                 std::fs::read(&*received).ok(),
                 std::fs::read_to_string(&*stderr).ok()
@@ -729,7 +735,7 @@ fn a_zero_delay_burst_carries_the_declared_keyboard_mode() {
 #[test]
 fn a_poll_resizes_the_terminal_before_its_input() {
     let mut server = Server::start();
-    let (_, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "pty": true, "cols": 100, "rows": 40, "waitMs": 5000,
         "command": "stty size; while read -r line; do stty size; done"
     }));
@@ -739,7 +745,7 @@ fn a_poll_resizes_the_terminal_before_its_input() {
         "the program's terminal is 100x40: {text}"
     );
     let task = server.id(1);
-    let (_, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": task, "cols": 60, "rows": 20, "input": "x
     ", "waitMs": 500
     }));
@@ -748,7 +754,7 @@ fn a_poll_resizes_the_terminal_before_its_input() {
         "the program read the new size, after the resize: {text}"
     );
     // One axis alone keeps the other.
-    let (_, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": task, "rows": 25, "input": "y
     ", "waitMs": 500
     }));
@@ -756,11 +762,10 @@ fn a_poll_resizes_the_terminal_before_its_input() {
         text.contains("25 60"),
         "rows changed and cols stayed: {text}"
     );
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": task, "screen": true, "waitMs": 100
     }));
-    assert_eq!(out["cols"], json!(60), "{text}");
-    assert_eq!(out["rows"], json!(25), "{text}");
+    assert!(text.contains("screen 60x25"), "{text}");
     server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
 }
 
@@ -772,7 +777,7 @@ fn a_poll_resizes_the_terminal_before_its_input() {
 #[test]
 fn a_resize_sends_sigwinch_and_the_program_reads_the_new_size() {
     let mut server = Server::start();
-    let (_, started) = server.ok(json!({
+    let started = server.ok(json!({
         "action": "start", "pty": true, "waitMs": 5000,
         "command": "trap 'printf \"winch %s\n\" \"$(stty size)\"' WINCH; printf 'ready\n'; while :; do sleep 0.02; done"
     }));
@@ -784,7 +789,7 @@ fn a_resize_sends_sigwinch_and_the_program_reads_the_new_size() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut text = String::new();
     while !text.contains("winch 22 70") {
-        let (_, polled) = server.ok(json!({
+        let polled = server.ok(json!({
             "action": "poll", "taskId": task, "cols": 70, "rows": 22, "waitMs": 2000,
             "returnWhen": {"outputContains": ["winch 22 70"]}
         }));
@@ -804,7 +809,7 @@ fn a_resize_sends_sigwinch_and_the_program_reads_the_new_size() {
 #[test]
 fn a_resize_is_seen_by_the_program_as_its_new_size() {
     let mut server = Server::start();
-    let (_, started) = server.ok(json!({
+    let started = server.ok(json!({
         "action": "start", "pty": true, "waitMs": 5000,
         "command": "printf 'ready\n'; while IFS= read -r line; do printf 'native %s\n' \"$(stty size)\"; done"
     }));
@@ -814,7 +819,7 @@ fn a_resize_is_seen_by_the_program_as_its_new_size() {
     server.ok(json!({
         "action": "poll", "taskId": task, "cols": 70, "rows": 22, "waitMs": 2000
     }));
-    let (_, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": task, "input": "measure
     ", "waitMs": 5000,
         "returnWhen": {"outputContains": ["native 22 70"]}
@@ -830,21 +835,21 @@ fn a_resize_is_seen_by_the_program_as_its_new_size() {
 #[test]
 fn sizes_out_of_range_or_on_a_pipe_task_are_refused() {
     let mut server = Server::start();
-    let (_, text, is_error) = server.call(json!({
+    let (text, is_error) = server.call(json!({
         "action": "start", "pty": true, "cols": 19, "command": "printf hi"
     }));
     assert!(
         is_error && text.contains("cols 19 is out of range 20-500"),
         "{text}"
     );
-    let (_, text, is_error) = server.call(json!({
+    let (text, is_error) = server.call(json!({
         "action": "start", "pty": true, "rows": 201, "command": "printf hi"
     }));
     assert!(
         is_error && text.contains("rows 201 is out of range 5-200"),
         "{text}"
     );
-    let (_, text, is_error) = server.call(json!({
+    let (text, is_error) = server.call(json!({
         "action": "start", "pty": false, "cols": 100, "command": "printf hi"
     }));
     assert!(
@@ -853,7 +858,7 @@ fn sizes_out_of_range_or_on_a_pipe_task_are_refused() {
     );
     server.ok(json!({"action": "start", "pty": false, "waitMs": 5000, "command": "printf hi"}));
     let pipe = server.id(1);
-    let (_, text, is_error) = server.call(json!({"action": "poll", "taskId": pipe, "rows": 10}));
+    let (text, is_error) = server.call(json!({"action": "poll", "taskId": pipe, "rows": 10}));
     assert!(
         is_error && text.contains("applies to PTY tasks only"),
         "{text}"
@@ -869,7 +874,7 @@ fn an_invalid_combined_poll_neither_resizes_nor_delivers_input() {
         "command": "stty size; while read -r line; do printf 'got %s\\n' \"$line\"; done"
     }));
     let task = server.id(1);
-    let (_, text, is_error) = server.call(json!({
+    let (text, is_error) = server.call(json!({
         "action": "poll", "taskId": task, "cols": 100, "rows": 40, "input": "hello\n",
         "keys": ["NotAKey"], "waitMs": 200
     }));
@@ -877,7 +882,7 @@ fn an_invalid_combined_poll_neither_resizes_nor_delivers_input() {
         is_error && text.contains("NotAKey"),
         "the key name is refused: {text}"
     );
-    let (_, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "poll", "taskId": task, "input": "second\n", "waitMs": 500
     }));
     assert!(
@@ -888,13 +893,12 @@ fn an_invalid_combined_poll_neither_resizes_nor_delivers_input() {
         text.contains("got second"),
         "the next poll's input was: {text}"
     );
-    let (out, text) =
+    let text =
         server.ok(json!({"action": "poll", "taskId": task, "screen": true, "waitMs": 200}));
     assert!(
         text.contains("screen 120x30"),
         "the refused poll's size was not applied: {text}"
     );
-    assert_eq!(out["cols"], json!(120), "{text}");
     server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
 }
 
@@ -914,7 +918,7 @@ fn an_unchanged_size_sends_nothing() {
     let (mut cols, mut sent) = (121u16, 0u16);
     while !text.contains("winch 1") {
         sent = cols;
-        let (_, polled) = server.ok(json!({
+        let polled = server.ok(json!({
             "action": "poll", "taskId": task, "cols": cols, "waitMs": 2000,
             "returnWhen": {"outputContains": ["winch 1"]}
         }));
@@ -924,7 +928,7 @@ fn an_unchanged_size_sends_nothing() {
     }
     // The size it now has, named again: the program has already answered one change, so a second
     // answer could only come from a resize that should not have been sent.
-    let (_, unchanged) = server.ok(json!({
+    let unchanged = server.ok(json!({
         "action": "poll", "taskId": task, "cols": sent, "waitMs": 1500
     }));
     assert!(
@@ -940,15 +944,14 @@ fn a_resize_after_exit_is_refused() {
     let mut server = Server::start();
     server.ok(json!({"action": "start", "pty": true, "waitMs": 30000, "command": "printf hi"}));
     let task = server.id(1);
-    let (_, text, is_error) = server.call(json!({"action": "poll", "taskId": task, "cols": 100}));
+    let (text, is_error) = server.call(json!({"action": "poll", "taskId": task, "cols": 100}));
     assert!(
         is_error && (text.contains("terminal is closed") || text.contains("tree has ended")),
         "the resize is refused: {text}"
     );
     // The task's own record is unchanged, and it still renders its screen.
-    let (out, text) =
+    let text =
         server.ok(json!({"action": "poll", "taskId": task, "screen": true, "waitMs": 100}));
-    assert_eq!(out["cols"], json!(120), "{text}");
     assert!(text.contains("screen 120x30"), "{text}");
 }
 
@@ -989,7 +992,7 @@ fn sustained_output_through_resizes_keeps_every_line() {
             "the resizes passed their bound at {k}"
         );
         let (cols, rows) = sizes[k % sizes.len()];
-        let (_, text) = server.ok(json!({
+        let text = server.ok(json!({
             "action": "poll", "taskId": task, "cols": cols, "rows": rows, "waitMs": 50
         }));
         assert!(!text.contains("Cannot resize"), "a resize failed: {text}");

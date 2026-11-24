@@ -1,14 +1,13 @@
 use super::bridge::{
     BRIDGE_ERROR, BRIDGE_LIMIT, DIAGNOSTIC_RESERVE, DIAGNOSTIC_WORKSPACE, Host, MAX_STARTS,
-    SLEEP_CHUNK_MS, STARTS_ERROR, encode_nested_result, nested_envelope, queue_permit, sleep,
-    split_sleep,
+    SLEEP_CHUNK_MS, STARTS_ERROR, SyncCallError, queue_permit, sleep, split_sleep,
 };
 use super::control::{
     CallInfo, InFlightGuard, MAX_CODE, Outcome, Report, Request, Wake, lock, validate,
 };
+use super::encode::encode_service_error;
 use super::vm::{STALLED, describe, pending_text};
 use super::*;
-use crate::files;
 use crate::lease::BytePool;
 use crate::service::Service;
 use crate::session::{LaunchContext, Session};
@@ -100,54 +99,6 @@ async fn complete(task: &Task) {
 }
 
 #[test]
-fn nested_precommit_prepaid_wire_covers_envelope_and_needs_no_new_admission() {
-    let mut structured = rmcp::model::CallToolResult::success(Vec::new());
-    structured.structured_content =
-        Some(json!({"ok":true,"text":"hello λ\n","nested":{"value":"quote\""}}));
-    let cases = [
-        (
-            structured,
-            json!({"ok":true,"value":{"text":"hello λ\n","nested":{"value":"quote\""}}}),
-        ),
-        (
-            rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
-                "ordinary error",
-            )]),
-            json!({"ok":false,"value":{"error":"ordinary error"}}),
-        ),
-        (
-            rmcp::model::CallToolResult::success(Vec::new()),
-            json!({"ok":false,"value":{"error":"Tool operation failed."}}),
-        ),
-    ];
-    for (result, expected) in cases {
-        let encoded = serde_json::to_string(&expected).unwrap();
-        let wire = crate::ipc::json_len(&result).unwrap() + 256;
-        assert!(128 + encoded.len() <= wire);
-        let payload = crate::service::render::result_payload_capacity(&result);
-        let pool = BytePool::new(payload + wire);
-        let tracked = files::TrackedResult::owned(
-            result,
-            crate::lease::Owner::new(pool.try_acquire(payload).unwrap()),
-        );
-        let prepaid = pool.try_acquire(wire).unwrap();
-        assert!(pool.try_acquire(1).is_none());
-        let outcome = encode_nested_result(tracked, &pool, None, Some(prepaid));
-        let Outcome::Value(value) = outcome else {
-            panic!("the prepaid result must encode");
-        };
-        assert_eq!(value.value, encoded);
-        assert_eq!(pool.used(), value.value.capacity());
-        let (sender, receiver) = mpsc::channel();
-        sender.send(value).unwrap();
-        drop(sender);
-        assert_eq!(pool.used(), encoded.len());
-        drop(receiver);
-        assert_eq!(pool.used(), 0);
-    }
-}
-
-#[test]
 fn nested_precommit_small_quota_replacement_is_atomic() {
     let info = || CallInfo {
         tool: "exec".into(),
@@ -171,59 +122,76 @@ fn nested_precommit_small_quota_replacement_is_atomic() {
     assert_eq!(report.bridge_bytes, 0);
 }
 
-#[test]
-fn text_buffer_nested_envelope_moves_existing_strings() {
-    let pool = BytePool::new(512);
-    let mut body = String::with_capacity(128);
-    body.push_str("hello");
-    let pointer = body.as_ptr();
-    let mut fields = serde_json::Map::new();
-    fields.insert("text".into(), serde_json::Value::String(body));
-    let mut result = rmcp::model::CallToolResult::success(Vec::new());
-    result.structured_content = Some(serde_json::Value::Object(fields));
-    let tracked = files::TrackedResult {
-        result,
-        lease: pool.try_acquire(160),
-        overload: false,
-        task_meta: None,
-        payload_owner: Default::default(),
-    };
-    let workspace = pool.try_acquire(128).unwrap();
-    let envelope = nested_envelope(tracked);
-    assert_eq!(
-        envelope.value["value"]["text"].as_str().unwrap().as_ptr(),
-        pointer
-    );
-    assert_eq!(pool.used(), 288);
-    drop(envelope);
-    assert_eq!(pool.used(), 128);
-    drop(workspace);
-    assert_eq!(pool.used(), 0);
+fn sync_error_message(err: &SyncCallError) -> &str {
+    match err {
+        SyncCallError::Type(msg) | SyncCallError::Limit(msg) | SyncCallError::Overload(msg) => msg,
+    }
 }
 
-#[test]
-fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() {
-    let expected = serde_json::to_string(&json!({
-        "ok": false, "value": { "error": "hello λ\n" }
-    }))
-    .unwrap();
-    for (budget, fits) in [
-        (128 + 128 + expected.len() - 1, false),
-        (128 + 128 + expected.len(), true),
-    ] {
+fn unwrap_sync_ok(res: Result<u64, crate::ipc::Owned<SyncCallError>>) -> u64 {
+    match res {
+        Ok(id) => id,
+        Err(err) => panic!("expected Ok, got SyncCallError: {}", sync_error_message(&err.value)),
+    }
+}
+
+fn unwrap_sync_err(res: Result<u64, crate::ipc::Owned<SyncCallError>>) -> crate::ipc::Owned<SyncCallError> {
+    match res {
+        Ok(id) => panic!("expected Err, got Ok({id})"),
+        Err(err) => err,
+    }
+}
+
+#[tokio::test]
+async fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() {
+    let expected = r#"{"ok":false,"code":"IO","error":"hello λ\n"}"#.to_owned();
+    let fixture = Fixture::new();
+    let target = expected.len().max(128);
+    for (budget, fits) in [(target - 1, false), (target, true)] {
         let pool = BytePool::new(budget);
-        let mut body = String::with_capacity(128);
-        body.push_str("hello λ\n");
-        let tracked = files::TrackedResult {
-            result: rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(body)]),
-            lease: pool.try_acquire(128),
-            overload: false,
-            task_meta: None,
-            payload_owner: Default::default(),
+        let launch = Arc::new(
+            LaunchContext::new(fixture.dir.clone(), Vec::new())
+                .with_memory(Arc::clone(&pool))
+                .with_control_memory(BytePool::new(0)),
+        );
+        let (script, worker) = prepare(Handle::current()).unwrap();
+        drop(worker);
+        lock(&script.0.report)
+            .admit(
+                1,
+                CallInfo {
+                    tool: "exec".into(),
+                    action: None,
+                    task_id: None,
+                },
+                0,
+                Default::default(),
+            )
+            .unwrap();
+        let ctx = crate::service::ExecContext {
+            session: &fixture.session,
+            launch: Some(&launch),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            progress: None,
+            call_id: None,
+            parent_task_id: None,
+            queued_guard: None,
+            on_started: None,
+            input_owner: Default::default(),
         };
-        let outcome = encode_nested_result(tracked, &pool, None, None);
+        let delivery = crate::service::ProgramDelivery {
+            script: &script,
+            pending_id: 1,
+            is_control: false,
+        };
+        let outcome = encode_service_error(
+            crate::service::ServiceError::Plain("hello λ\n".into()),
+            &ctx,
+            &delivery,
+        )
+        .outcome;
         if !fits {
-            assert!(matches!(outcome, Outcome::Memory));
+            assert!(matches!(outcome, Outcome::Memory(_)));
             assert_eq!(pool.used(), 0);
             continue;
         }
@@ -243,7 +211,7 @@ fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() {
         let context = Context::full(&runtime).unwrap();
         context.with(|ctx| {
             let parse: Function = ctx
-                .eval("(value) => JSON.parse(value).value.error === 'hello λ\\n'")
+                .eval("(value) => { const p = JSON.parse(value); return p.error === 'hello λ\\n' && p.code === 'IO'; }")
                 .unwrap();
             assert!(parse.call::<_, bool>((payload.value.as_str(),)).unwrap());
             assert_eq!(pool.used(), expected.len());
@@ -253,24 +221,58 @@ fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() {
     }
 }
 
-#[test]
-fn nested_control_wire_uses_bounded_reserve_and_keeps_queue_owner() {
-    let expected = serde_json::to_string(&json!({"ok":true,"value":{"tasks":[]}})).unwrap();
-    for main_limit in [0, 128] {
+#[tokio::test]
+async fn nested_control_wire_uses_bounded_reserve_and_keeps_queue_owner() {
+    let expected = r#"{"ok":false,"code":"NOT_FOUND","error":"Unknown taskId."}"#.to_owned();
+    let fixture = Fixture::new();
+    let needed = expected.len().max(128);
+    for main_limit in [0, 64] {
         for extra in [-1isize, 0, 1] {
-            let mut result = rmcp::model::CallToolResult::success(Vec::new());
-            result.structured_content = Some(json!({"ok":true,"tasks":[]}));
-            let payload = crate::service::render::result_payload_capacity(&result);
             let pool = BytePool::new(main_limit);
-            let needed = payload + 128 + expected.len();
             let control = BytePool::new(needed.saturating_add_signed(extra));
-            let result = files::TrackedResult::owned(
-                result,
-                crate::lease::Owner::new(control.try_acquire(payload).unwrap()),
+            let launch = Arc::new(
+                LaunchContext::new(fixture.dir.clone(), Vec::new())
+                    .with_memory(Arc::clone(&pool))
+                    .with_control_memory(Arc::clone(&control)),
             );
-            let outcome = encode_nested_result(result, &pool, Some(&control), None);
+            let (script, worker) = prepare(Handle::current()).unwrap();
+            drop(worker);
+            lock(&script.0.report)
+                .admit(
+                    1,
+                    CallInfo {
+                        tool: "exec".into(),
+                        action: Some("kill".into()),
+                        task_id: None,
+                    },
+                    0,
+                    Default::default(),
+                )
+                .unwrap();
+            let ctx = crate::service::ExecContext {
+                session: &fixture.session,
+                launch: Some(&launch),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                progress: None,
+                call_id: None,
+                parent_task_id: None,
+                queued_guard: None,
+                on_started: None,
+                input_owner: Default::default(),
+            };
+            let delivery = crate::service::ProgramDelivery {
+                script: &script,
+                pending_id: 1,
+                is_control: true,
+            };
+            let outcome = encode_service_error(
+                crate::service::ServiceError::NotFound("Unknown taskId.".into()),
+                &ctx,
+                &delivery,
+            )
+            .outcome;
             if extra < 0 {
-                assert!(matches!(outcome, Outcome::Memory));
+                assert!(matches!(outcome, Outcome::Memory(_)));
                 assert_eq!((pool.used(), control.used()), (0, 0));
                 continue;
             }
@@ -379,8 +381,8 @@ async fn text_buffer_bridge_control_classification_preserves_main_admission() {
         next: 1,
         starts: 0,
     };
-    let error = host.call("read", r#"{"path":"small.txt"}"#).unwrap_err();
-    assert!(error.value.contains("not dispatched"));
+    let error = unwrap_sync_err(host.call("read", r#"{"path":"small.txt"}"#));
+    assert!(sync_error_message(&error.value).contains("not dispatched"));
     assert!(lock(&script.0.report).pending.is_empty());
     assert!(
         control.used() > 0,
@@ -388,13 +390,12 @@ async fn text_buffer_bridge_control_classification_preserves_main_admission() {
     );
     drop(error);
     assert_eq!(control.used(), 0);
-    let sleep_error = host.call("sleep", "0").unwrap_err();
-    assert!(sleep_error.value.contains("not dispatched"));
+    let sleep_error = unwrap_sync_err(host.call("sleep", "0"));
+    assert!(sync_error_message(&sleep_error.value).contains("not dispatched"));
     assert!(lock(&script.0.report).pending.is_empty());
     drop(sleep_error);
     assert_eq!(control.used(), 0);
-    host.call("exec", r#"{"action":"kill","taskId":"aaaaaaaa-1"}"#)
-        .unwrap();
+    unwrap_sync_ok(host.call("exec", r#"{"action":"kill","taskId":"aaaaaaaa-1"}"#));
     assert!(control.used() > 0);
     script.kill();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -534,17 +535,18 @@ async fn start_history_limit_counts_admitted_calls_without_spawning_processes() 
         starts: MAX_STARTS - 1,
     };
     let args = json!({"action":"start","command":"true"}).to_string();
-    host.call("exec", &args).unwrap();
+    unwrap_sync_ok(host.call("exec", &args));
     assert_eq!(host.starts, MAX_STARTS);
-    assert_eq!(host.call("exec", &args).unwrap_err().value, STARTS_ERROR);
+    assert_eq!(
+        sync_error_message(&unwrap_sync_err(host.call("exec", &args)).value),
+        STARTS_ERROR
+    );
     assert_eq!(host.starts, MAX_STARTS);
     // Unvalidated start requests resolve as tool errors without consuming start slots.
-    host.call("exec", &json!({"action":"start","command":""}).to_string())
-        .unwrap();
+    unwrap_sync_ok(host.call("exec", &json!({"action":"start","command":""}).to_string()));
     assert_eq!(host.starts, MAX_STARTS);
     assert_eq!(lock(&script.0.report).pending.len(), 2);
-    host.call("read", &json!({"path":"missing"}).to_string())
-        .unwrap();
+    unwrap_sync_ok(host.call("read", &json!({"path":"missing"}).to_string()));
     assert_eq!(host.starts, MAX_STARTS);
     script.kill();
     tokio::task::yield_now().await;
@@ -787,10 +789,10 @@ async fn file_tools_resolve_errors_reject_bad_arguments_and_queue() {
         if ('ok' in edit || edit.replacements !== 1 || edit.edits[0].line !== 1) throw new Error('edit failed');
         let missingErr = null;
         try { await tools.read({path:'missing.txt'}); } catch (e) { missingErr = e; }
-        if (!missingErr || missingErr.name !== 'ToolError' || missingErr.tool !== 'read' || typeof missingErr.result?.error !== 'string') throw new Error('missing file must reject with ToolError');
+        if (!missingErr || missingErr.name !== 'ToolError' || missingErr.tool !== 'read' || missingErr.code !== 'NOT_FOUND') throw new Error('missing file must reject with ToolError');
         let badExecErr = null;
         try { await tools.exec({action:'start',command:''}); } catch (e) { badExecErr = e; }
-        if (!badExecErr || badExecErr.name !== 'ToolError' || badExecErr.tool !== 'exec' || badExecErr.result?.action !== 'start') throw new Error('empty exec must reject with ToolError');
+        if (!badExecErr || badExecErr.name !== 'ToolError' || badExecErr.tool !== 'exec' || badExecErr.code !== 'VALIDATION') throw new Error('empty exec must reject with ToolError');
         for (const args of [null, [], 'x', {path:'fixture.txt',surprise:true}]) {
             let rejected = false;
             try { await tools.read(args); } catch (e) { if (e instanceof TypeError) rejected = true; }
@@ -1686,11 +1688,11 @@ async fn sh_quote_image_notes_queue_cap_and_integrity_tool_errors() {
             const settled = await Promise.allSettled(
                 Array.from({{length: 1025}}, () => tools.read({{path: "ok.png"}}))
             );
-            const rangeErrors = settled.filter(
-                s => s.status === "rejected" && s.reason instanceof RangeError
+            const limitErrors = settled.filter(
+                s => s.status === "rejected" && s.reason?.name === "ToolError" && s.reason.code === "LIMIT"
             );
-            if (rangeErrors.length !== 1) {{
-                throw new Error("expected 1 RangeError at 1025th pending call, got " + rangeErrors.length);
+            if (limitErrors.length !== 1) {{
+                throw new Error("expected 1 ToolError(LIMIT) at 1025th pending call, got " + limitErrors.length);
             }}
             return "io-and-queue-ok";
             "#
@@ -1698,29 +1700,6 @@ async fn sh_quote_image_notes_queue_cap_and_integrity_tool_errors() {
         .await;
     assert_eq!(io_state.exit_code, Some(0), "{io_out}");
     assert!(io_out.contains("io-and-queue-ok"), "{io_out}");
-
-    // Integrity failure without top-level `error` builds ToolError.message from inputError
-    // and preserves output, exitCode, and diagnostics in ToolError.result.
-    let mut synth =
-        rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text("status")]);
-    synth.structured_content = Some(json!({
-        "ok": false,
-        "action": "poll",
-        "taskId": "abcdefgh-1.2345",
-        "state": "exited",
-        "exitCode": 0,
-        "output": "captured-before-err",
-        "inputError": "INPUT_WRITE_FAILED: broken pipe",
-    }));
-    let parsed = nested_envelope(files::TrackedResult::plain(synth)).value;
-    assert_eq!(parsed["ok"], false);
-    assert!(parsed["value"].get("ok").is_none());
-    assert_eq!(parsed["value"]["output"], "captured-before-err");
-    assert_eq!(parsed["value"]["exitCode"], 0);
-    assert_eq!(
-        parsed["value"]["inputError"],
-        "INPUT_WRITE_FAILED: broken pipe"
-    );
 }
 
 #[tokio::test]
@@ -1740,11 +1719,11 @@ async fn call_site_stacks_and_serializable_return_values() {
             let typeStack = "";
             try { await tools.exec({action: "bogus"}); } catch (e) { typeStack = e.stack; }
             const holds = Array.from({length: 1024}, () => sleep(60000));
-            let rangeStack = "";
-            try { await sleep(60000); } catch (e) { if (e instanceof RangeError) rangeStack = e.stack; }
+            let limitStack = "";
+            try { await sleep(60000); } catch (e) { if (e?.name === "ToolError" && e.code === "LIMIT") limitStack = e.stack; }
             if (!toolStack.includes("codemode.js:3")) throw new Error("toolStack: " + toolStack);
             if (!typeStack.includes("codemode.js:5")) throw new Error("typeStack: " + typeStack);
-            if (!rangeStack.includes("codemode.js:8")) throw new Error("rangeStack: " + rangeStack);
+            if (!limitStack.includes("codemode.js:8")) throw new Error("limitStack: " + limitStack);
             return "stacks-ok";
             "#,
         )
@@ -2203,18 +2182,15 @@ async fn queued_start_guard_tracks_queued_disarmed_and_cancelled_starts() {
         starts: 0,
     };
     let start_args = json!({"action":"start","command":"true"}).to_string();
-    host.call("exec", &start_args).unwrap();
-    host.call("exec", &start_args).unwrap();
-    host.call(
+    unwrap_sync_ok(host.call("exec", &start_args));
+    unwrap_sync_ok(host.call("exec", &start_args));
+    unwrap_sync_ok(host.call(
         "exec",
         &json!({"action":"start","command":"true","keys":[]}).to_string(),
-    )
-    .unwrap();
+    ));
     // Invalid start and non-start calls must not affect queued_starts.
-    host.call("exec", &json!({"action":"start","command":""}).to_string())
-        .unwrap();
-    host.call("read", &json!({"path":"missing"}).to_string())
-        .unwrap();
+    unwrap_sync_ok(host.call("exec", &json!({"action":"start","command":""}).to_string()));
+    unwrap_sync_ok(host.call("read", &json!({"path":"missing"}).to_string()));
     assert_eq!(host.starts, 3);
     assert_eq!(script.list_counts(), (3, 0));
 
@@ -2245,4 +2221,171 @@ async fn queued_start_guard_tracks_queued_disarmed_and_cancelled_starts() {
     assert_eq!(err_script.list_counts(), (1, 0));
     drop(err_guard);
     assert_eq!(err_script.list_counts(), (0, 0));
+}
+
+#[tokio::test]
+async fn program_tool_error_codes_partial_results_and_edit_matches() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.dir.join("edit.txt"),
+        "exact line\n\u{201c}curly\u{201d} line\n",
+    )
+    .unwrap();
+    // >4 MiB file for strict_whole_file LIMIT check.
+    std::fs::write(fixture.dir.join("huge.txt"), vec![b'a'; (4 << 20) + 16]).unwrap();
+
+    // Create a finished task with injected I/O errors so polling it via tools.exec triggers IO
+    // while retaining output and exitCode on err.result.
+    let io_task = fixture.start("text('retained-output'); throw new Error('boom');", Some(5000));
+    complete(&io_task).await;
+    io_task.inject_io_errors(Some("pipe broken"), Some("disk full"));
+    let io_id = io_task.id.clone();
+
+    let script = format!(
+        r#"
+        const check = (cond, msg) => {{ if (!cond) throw new Error(msg); }};
+
+        // 1. VALIDATION: head_tail on poll, maxBytes on list, empty start command
+        for (const req of [
+            {{ action: "list", maxBytes: 100 }},
+            {{ action: "list", truncate: "head" }},
+            {{ action: "poll", taskId: {io_id:?}, truncate: "head_tail", waitMs: 0 }},
+            {{ action: "start", command: "" }},
+        ]) {{
+            let caught = null;
+            try {{ await tools.exec(req); }} catch (e) {{ caught = e; }}
+            check(caught?.name === "ToolError" && caught.code === "VALIDATION", "VALIDATION failed for " + JSON.stringify(req) + ": " + caught?.code);
+        }}
+
+        // 2. NOT_FOUND: missing file and unknown taskId
+        let nfFile = null;
+        try {{ await tools.read({{ path: "does-not-exist.txt" }}); }} catch (e) {{ nfFile = e; }}
+        check(nfFile?.name === "ToolError" && nfFile.code === "NOT_FOUND", "NOT_FOUND file: " + nfFile?.code);
+        let nfTask = null;
+        try {{ await tools.exec({{ action: "poll", taskId: "zzzzzzzz-99", waitMs: 0 }}); }} catch (e) {{ nfTask = e; }}
+        check(nfTask?.name === "ToolError" && nfTask.code === "NOT_FOUND", "NOT_FOUND task: " + nfTask?.code);
+
+        // 3. LIMIT: strict_whole_file > 4 MiB on tools.read without offset/limit
+        let limErr = null;
+        try {{ await tools.read({{ path: "huge.txt" }}); }} catch (e) {{ limErr = e; }}
+        check(limErr?.name === "ToolError" && limErr.code === "LIMIT", "LIMIT whole file: " + limErr?.code);
+
+        // 4. EDIT_FAILED: structured failures array
+        let editFail = null;
+        try {{
+            await tools.edit({{
+                path: "edit.txt",
+                edits: [{{ oldText: "missing-snippet", newText: "x" }}],
+            }});
+        }} catch (e) {{ editFail = e; }}
+        check(
+            editFail?.name === "ToolError"
+                && editFail.code === "EDIT_FAILED"
+                && Array.isArray(editFail.result?.failures)
+                && editFail.result.failures.length === 1
+                && editFail.result.failures[0].problem === "not_found",
+            "EDIT_FAILED: " + JSON.stringify(editFail?.result)
+        );
+
+        // 5. tools.edit success: exact (fuzzy: false) + curly-quote (fuzzy: true)
+        const edited = await tools.edit({{
+            path: "edit.txt",
+            edits: [
+                {{ oldText: "exact line", newText: "EXACT" }},
+                {{ oldText: "\"curly\" line", newText: "CURLY" }},
+            ],
+        }});
+        check(
+            edited.replacements === 2
+                && edited.edits.length === 2
+                && edited.edits[0].line === 1 && edited.edits[0].fuzzy === false
+                && edited.edits[1].line === 2 && edited.edits[1].fuzzy === true,
+            "edit matches: " + JSON.stringify(edited)
+        );
+
+        // 6. IO: task_io_ok == false rejects with ToolError(code="IO") retaining output & exitCode
+        let ioErr = null;
+        try {{ await tools.exec({{ action: "poll", taskId: {io_id:?}, waitMs: 0 }}); }} catch (e) {{ ioErr = e; }}
+        check(
+            ioErr?.name === "ToolError"
+                && ioErr.code === "IO"
+                && ioErr.result?.exitCode === 1
+                && typeof ioErr.result?.output === "string"
+                && ioErr.result.output.startsWith("retained-output\n")
+                && ioErr.result.captureError === "pipe broken"
+                && ioErr.result.logError === "disk full",
+            "IO partial result: " + ioErr?.code + " " + JSON.stringify(ioErr?.result)
+        );
+
+        return "all-codes-ok";
+        "#
+    );
+    let (state, out) = fixture.result(&script).await;
+    assert_eq!(state.exit_code, Some(0), "{out}");
+    assert_eq!(out, "all-codes-ok\n");
+
+    // 7. OVERLOAD & CANCELLED via encode_service_error
+    let (handle, worker) = prepare(Handle::current()).unwrap();
+    drop(worker);
+    let ctx = crate::service::ExecContext {
+        session: &fixture.session,
+        launch: None,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        progress: None,
+        call_id: None,
+        parent_task_id: None,
+        queued_guard: None,
+        on_started: None,
+        input_owner: Default::default(),
+    };
+    for (id, err, want_code, want_tid) in [
+        (
+            1u64,
+            crate::service::ServiceError::Overload(
+                "memory full".into(),
+                Some(crate::files::TaskMeta {
+                    bare_task_id: "aaaaaaaa-1".into(),
+                    log_path: "/tmp/a.log".into(),
+                }),
+            ),
+            "OVERLOAD",
+            Some("aaaaaaaa-1"),
+        ),
+        (
+            2u64,
+            crate::service::ServiceError::Cancelled("cancelled".into()),
+            "CANCELLED",
+            None,
+        ),
+    ] {
+        lock(&handle.0.report)
+            .admit(
+                id,
+                CallInfo {
+                    tool: "exec".into(),
+                    action: None,
+                    task_id: None,
+                },
+                0,
+                Default::default(),
+            )
+            .unwrap();
+        let outcome = encode_service_error(
+            err,
+            &ctx,
+            &crate::service::ProgramDelivery {
+                script: &handle,
+                pending_id: id,
+                is_control: false,
+            },
+        )
+        .outcome;
+        let Outcome::Value(payload) = outcome else {
+            panic!("expected encoded error envelope");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&payload.value).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["code"], want_code);
+        assert_eq!(parsed["result"]["taskId"].as_str(), want_tid);
+    }
 }

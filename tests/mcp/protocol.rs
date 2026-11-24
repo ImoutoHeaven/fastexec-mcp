@@ -93,16 +93,16 @@ fn processes_that_start_their_own_session_stay_in_the_tree() {
         (_, bin_bash),
     ] = &files;
     let command = format!("{} echo started", daemon("bash", plain_bash));
-    let (out, text) = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
-    assert_eq!(out["state"], "exited", "{text}");
+    let text = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
+    assert!(text.contains("[exited 0]"), "{text}");
     assert!(text.contains("ended with bash: bash ("), "{text}");
     assert!(file_len(plain) > 0, "the daemon never started");
     assert_stops_growing(plain);
 
     // A command's `kill 0` reaches the task host too, which must outlive it.
     let command = format!("{} kill -TERM 0", daemon("bash", term_bash));
-    let (out, text) = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
-    assert_eq!(out["exitCode"], 143, "{text}");
+    let text = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
+    assert!(text.contains("[exited 143]"), "{text}");
     assert!(text.contains("ended with bash: bash ("), "{text}");
     assert_stops_growing(term);
 
@@ -111,8 +111,8 @@ fn processes_that_start_their_own_session_stay_in_the_tree() {
         "mkdir -p {bin_bash}; cp \"$(command -v bash)\" {bin_bash}/$'\\xff'beat; {}",
         daemon(&format!("{bin_bash}/$'\\xff'beat"), odd_bash)
     );
-    let (out, text) = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
-    assert!(text.contains("ended with bash: \u{fffd}beat ("), "{out}");
+    let text = server.ok(json!({"action": "start", "command": command, "waitMs": 10000}));
+    assert!(text.contains("ended with bash: \u{fffd}beat ("), "{text}");
     assert!(file_len(odd) > 0, "the daemon never started");
     assert_stops_growing(odd);
 }
@@ -155,21 +155,19 @@ fn wait_for_mark(path: &std::path::Path) -> u32 {
 #[cfg(target_os = "macos")]
 fn wait_for_held_pid(server: &mut Server, task: &str, pid: u32) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let task_bare = bare_id(task);
+    let pid_needle = format!("({pid})");
     loop {
-        let (list, text) = server.ok(json!({"action": "list"}));
-        for entry in list["tasks"].as_array().into_iter().flatten() {
-            if entry["taskId"] != json!(bare_id(task)) {
-                continue;
-            }
-            for member in entry["held"].as_array().into_iter().flatten() {
-                if member["pid"] == json!(pid) {
-                    return pid;
-                }
-            }
+        let text = server.ok(json!({"action": "list"}));
+        if text
+            .lines()
+            .any(|line| line.starts_with(task_bare) && line.contains(&pid_needle))
+        {
+            return pid;
         }
         assert!(
             Instant::now() < deadline,
-            "the task never reported the process {pid} as held: {list} {text}"
+            "the task never reported the process {pid} as held: {text}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -367,7 +365,7 @@ fn an_unobserved_escape_is_never_claimed() {
         pid = pid_file.display(),
         beat = beat_bash
     );
-    let (_, started) = server.ok(json!({
+    let started = server.ok(json!({
         "action": "start", "command": command, "keepTree": true, "waitMs": 1000
     }));
     let host: i32 = started
@@ -404,25 +402,14 @@ fn an_unobserved_escape_is_never_claimed() {
     stopped.resume();
     // The root ends, so the task reports what it left behind.
     wait_until("the root ended", || {
-        let (list, _) = server.ok(json!({"action": "list"}));
-        let state = list["tasks"][0]["state"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        (state == "exited").then_some(())
+        let text = server.ok(json!({"action": "list"}));
+        text.contains("[exited ").then_some(())
     });
-    let (list, listing) = server.ok(json!({"action": "list"}));
-    let mut claimed = false;
-    for entry in list["tasks"].as_array().into_iter().flatten() {
-        if entry["taskId"] != json!(bare_id(&task)) {
-            continue;
-        }
-        for field in ["held", "leftovers"] {
-            for member in entry[field].as_array().into_iter().flatten() {
-                claimed |= member["pid"] == json!(escaped.pid);
-            }
-        }
-    }
+    let listing = server.ok(json!({"action": "list"}));
+    let pid_needle = format!("({})", escaped.pid);
+    let claimed = listing
+        .lines()
+        .any(|line| line.starts_with(bare_id(&task)) && line.contains(&pid_needle));
     assert!(
         !claimed,
         "a descendant created while the host could not scan is never claimed: {listing}"
@@ -453,10 +440,10 @@ fn a_stopped_host_is_woken_for_a_list_and_a_kill() {
         "printf 'host %s\n' \"$PPID\"; {} echo started",
         daemon_until_released("bash", &beat_bash, &mark, &go)
     );
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "keepTree": true, "waitMs": 10000
     }));
-    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("[exited "), "{text}");
     let host: i32 = text
         .lines()
         .find_map(|line| line.trim().strip_prefix("host "))
@@ -473,20 +460,13 @@ fn a_stopped_host_is_woken_for_a_list_and_a_kill() {
     // A list asks the stopped host which processes the task holds: it answers because the request
     // woke it, and the answer names the daemon rather than blocking on a host that never runs.
     let begun = Instant::now();
-    let (list, listing) = server.ok(json!({"action": "list"}));
+    let listing = server.ok(json!({"action": "list"}));
     assert!(
         begun.elapsed() < Duration::from_secs(10),
         "the list waited on a stopped host: {listing}"
     );
-    let held = list["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|entry| entry["held"].as_array().into_iter().flatten())
-        .filter_map(|member| member["pid"].as_i64())
-        .collect::<Vec<_>>();
     assert!(
-        held.contains(&(daemon as i64)),
+        listing.contains(&format!("({daemon})")),
         "the list names the held daemon {daemon}: {listing}"
     );
     stopped.resume();
@@ -500,14 +480,14 @@ fn a_stopped_host_is_woken_for_a_list_and_a_kill() {
     }));
     let task = server.id(1);
     let begun = Instant::now();
-    let (_, text) = server.ok(json!({"action": "kill", "taskId": task, "waitMs": 20000}));
+    let text = server.ok(json!({"action": "kill", "taskId": task, "waitMs": 20000}));
     assert!(
         begun.elapsed() < Duration::from_secs(15),
         "the kill waited on a stopped host: {text}"
     );
-    let (list, listing) = server.ok(json!({"action": "list"}));
+    let listing = server.ok(json!({"action": "list"}));
     assert!(
-        list["tasks"][0].get("held").is_none(),
+        !listing.contains("keeps "),
         "the stopped tree ended: {listing}"
     );
 }
@@ -545,19 +525,18 @@ fn a_crashed_host_leaves_cleanup_unconfirmed() {
         // The server stays alive; SIGKILL reaches only its task host.
         assert_eq!(unsafe { libc::kill(host, libc::SIGKILL) }, 0);
         wait_until("the lost host is reported", || {
-            let (list, _) = server.ok(json!({"action": "list"}));
-            (list["tasks"][0]["killError"].is_string() && list["tasks"][0]["keptRunning"] == true)
-                .then_some(())
+            let text = server.ok(json!({"action": "list"}));
+            (text.contains("Warning:") && text.contains("keeps ")).then_some(())
         });
         for _ in 0..2 {
-            let (_, text, is_error) = server.call(json!({"action": "kill", "taskId": task}));
+            let (text, is_error) = server.call(json!({"action": "kill", "taskId": task}));
             assert!(
                 is_error,
                 "a disconnected host cannot confirm cleanup: {text}"
             );
-            let (list, text) = server.ok(json!({"action": "list"}));
-            assert_eq!(list["tasks"][0]["keptRunning"], true, "{text}");
-            assert!(list["tasks"][0]["killError"].is_string(), "{text}");
+            let text = server.ok(json!({"action": "list"}));
+            assert!(text.contains("keeps "), "{text}");
+            assert!(text.contains("Warning:"), "{text}");
         }
         let before = file_len(&beat);
         wait_until("the child still runs after host loss", || {
@@ -582,10 +561,10 @@ fn a_detached_descendant_stays_owned_once_observed() {
         "{} echo started",
         daemon_until_released("bash", &beat_bash, &mark, &go)
     );
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "keepTree": true, "waitMs": 10000
     }));
-    assert_eq!(out["state"], "exited", "{text}");
+    assert!(text.contains("[exited "), "{text}");
     let pid = wait_for_mark(&mark);
     let task = server.id(1);
     // The acknowledgement names this process, under this task, before it detaches.
@@ -594,17 +573,11 @@ fn a_detached_descendant_stays_owned_once_observed() {
     wait_for_heartbeat(&beat);
     // It has detached by now, and is still the task's: the explicit kill reaches it.
     std::thread::sleep(Duration::from_millis(300));
-    let (list, listing) = server.ok(json!({"action": "list"}));
-    let held = list["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|entry| entry["taskId"] == json!(bare_id(&task)))
-        .flat_map(|entry| entry["held"].as_array().into_iter().flatten())
-        .filter_map(|member| member["pid"].as_i64())
-        .collect::<Vec<_>>();
+    let listing = server.ok(json!({"action": "list"}));
     assert!(
-        held.contains(&(pid as i64)),
+        listing
+            .lines()
+            .any(|line| line.starts_with(bare_id(&task)) && line.contains(&format!("({pid})"))),
         "the detached descendant is still held: {listing}"
     );
     server.ok(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
@@ -626,10 +599,10 @@ fn a_killed_server_takes_its_task_trees_with_it() {
         "{} echo started",
         daemon_until_released("bash", daemon_bash, &mark, &go)
     );
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "command": command, "keepTree": true, "pty": true, "waitMs": 10000
     }));
-    assert_eq!(out["keptRunning"], true, "{text}");
+    assert!(text.contains("keeps "), "{text}");
     let daemon = wait_for_mark(&mark);
     let second = server.id(2);
     wait_for_held_pid(&mut server, &second, daemon);
@@ -653,8 +626,8 @@ fn a_killed_server_takes_its_task_trees_with_it() {
     let command = format!("{} sleep 300", heartbeat(beat_bash));
     server.ok(json!({"action": "start", "command": command, "keepTree": true, "waitMs": 1000}));
     let command = format!("{} echo started", daemon("bash", daemon_bash));
-    let (out, text) = server.ok(json!({"action": "start", "command": command, "keepTree": true, "pty": true, "waitMs": 10000}));
-    assert_eq!(out["keptRunning"], true, "{text}");
+    let text = server.ok(json!({"action": "start", "command": command, "keepTree": true, "pty": true, "waitMs": 10000}));
+    assert!(text.contains("keeps "), "{text}");
     // SIGKILL: no shutdown code runs, so only the hosts' lifelines can end the trees.
     server.child.kill().unwrap();
     server.child.wait().unwrap();
@@ -697,43 +670,30 @@ fn a_sudo_child_the_server_may_not_kill_is_held_and_reported() {
     let rooted = Rooted::new(&pid_file);
     let task = server.id(1);
     // The kill fails and the tree stays held, as on Linux.
-    let (_, text, is_error) =
+    let (text, is_error) =
         server.call(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
     assert!(
         is_error && text.contains("Cannot terminate"),
         "a member this user may not signal fails the kill: {text}"
     );
     // The refusal is reported, and the task still holds that exact root process.
-    let (list, listing) = server.ok(json!({"action": "list"}));
-    let entry = list["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|entry| entry["taskId"] == json!(bare_id(&task)))
+    let listing = server.ok(json!({"action": "list"}));
+    let line = listing
+        .lines()
+        .find(|line| line.starts_with(bare_id(&task)))
         .unwrap_or_else(|| panic!("the task is listed: {listing}"));
-    assert_eq!(
-        entry["keptRunning"],
-        json!(true),
+    assert!(
+        line.contains("keeps "),
         "the task keeps the tree it could not end: {listing}"
     );
     assert!(
-        entry["killError"]
-            .as_str()
-            .is_some_and(|error| !error.is_empty()),
-        "the refusal is reported: {listing}"
-    );
-    // Held only: `leftovers` is cached from the root's exit, so an old pid there would satisfy the
-    // assertion even after membership lost it.
-    let held = entry["held"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|member| member["pid"].as_i64())
-        .collect::<Vec<_>>();
-    assert!(
-        held.contains(&(rooted.pid as i64)),
-        "the held tree names the root process {}: {listing}",
+        line.contains(&format!("({})", rooted.pid)),
+        "the task still holds the root process {}: {listing}",
         rooted.pid
+    );
+    assert!(
+        listing.contains("Warning:"),
+        "the refusal is reported: {listing}"
     );
     let before = file_len(&beat);
     std::thread::sleep(Duration::from_millis(600));
@@ -817,21 +777,20 @@ fn native_birth(pid: i32) -> Option<u64> {
 #[test]
 fn freebsd_a_continuous_pty_writer_does_not_delay_the_kept_roots_status() {
     let mut server = Server::start();
-    let (out, text) = server.ok(json!({
+    let text = server.ok(json!({
         "action": "start", "pty": true, "keepTree": true, "loginShell": false,
         "waitMs": 3000, "killAfterMs": 15000, "maxBytes": 1024,
         "command": "(end=$((SECONDS + 20)); while (( SECONDS < end )); do printf 'background-output\\n'; done) & printf 'root-ended\\n'; exit 23",
     }));
-    assert_eq!(out["state"], "exited", "{text}");
-    assert_eq!(out["exitCode"], 23, "{text}");
-    assert_eq!(out["keptRunning"], true, "{text}");
-    let (out, text) = server.ok(json!({
-        "action": "kill", "taskId": out["taskId"], "waitMs": 5000,
+    assert!(text.contains("[exited 23]"), "{text}");
+    assert!(text.contains("keeps "), "{text}");
+    let task = server.id(1);
+    let text = server.ok(json!({
+        "action": "kill", "taskId": task, "waitMs": 5000,
     }));
-    assert_eq!(out["exitCode"], 23, "{text}");
-    assert!(out.get("keptRunning").is_none(), "{text}");
-    assert!(out.get("held").is_none(), "{text}");
-    assert!(out.get("killError").is_none(), "{text}");
+    assert!(text.contains("[exited 23]"), "{text}");
+    assert!(!text.contains("keeps "), "{text}");
+    assert!(!text.contains("Warning:"), "{text}");
 }
 
 /// A host killed externally no longer has a reaper, but its unreaped PID still reserves its group.
@@ -843,14 +802,14 @@ fn freebsd_a_dead_host_still_cleans_up_its_reserved_process_group() {
     let command = format!(
         "(for i in {{1..200}}; do printf x >> '{beat_bash}'; sleep 0.1; done) & while [ ! -s '{beat_bash}' ]; do sleep 0.01; done; read -r gate; kill -KILL \"$PPID\"; sleep 20"
     );
-    let (out, _) = server.ok(json!({
+    server.ok(json!({
         "action": "start", "eof": false, "command": command, "waitMs": 0,
     }));
     // Start has observed READY before the command is allowed to kill its host.
-    let (out, text) = server.ok(json!({
-        "action": "poll", "taskId": out["taskId"], "input": "kill\n", "waitMs": 10000,
+    let text = server.ok(json!({
+        "action": "poll", "taskId": server.id(1), "input": "kill\n", "waitMs": 10000,
     }));
-    assert_eq!(out["exitCode"], 137, "{text}");
+    assert!(text.contains("[exited 137]"), "{text}");
     assert_stops_growing(&beat);
 }
 
@@ -864,10 +823,10 @@ fn freebsd_realtime_group_signals_preserve_the_host_and_tree_cleanup() {
         let command = format!(
             "trap ':' {signal}; perl -MPOSIX -e 'exit if fork; POSIX::setsid() or die; exec @ARGV' /bin/sh -c 'for i in $(seq 300); do printf x >> \"{beat_bash}\"; sleep 0.1; done'; while [ ! -s '{beat_bash}' ]; do sleep 0.01; done; kill -{signal} 0; printf 'survived\\n'"
         );
-        let (out, text) = server.ok(json!({
+        let text = server.ok(json!({
             "action": "start", "command": command, "waitMs": 10000,
         }));
-        assert_eq!(out["exitCode"], 0, "signal {signal}: {text}");
+        assert!(text.contains("[exited 0]"), "signal {signal}: {text}");
         assert!(text.contains("survived"), "{text}");
         assert_stops_growing(&beat);
     }
@@ -909,12 +868,12 @@ fn freebsd_nested_reapers_keep_detached_descendants_owned() {
             String::new()
         };
         let mut server = Server::start();
-        let (out, text) = server.ok(json!({
+        let text = server.ok(json!({
             "action": "start", "keepTree": true, "waitMs": 10000,
             "command": format!("'{}' '{}' '{}'{release_arg} & echo started",
                 fixture.display(), beat.display(), mark.display()),
         }));
-        assert_eq!(out["keptRunning"], true, "{text}");
+        assert!(text.contains("keeps "), "{text}");
         wait_for_heartbeat(&beat);
         let pids: Vec<u64> = std::fs::read_to_string(mark)
             .unwrap()
@@ -922,11 +881,10 @@ fn freebsd_nested_reapers_keep_detached_descendants_owned() {
             .map(|pid| pid.parse().unwrap())
             .collect();
         assert_eq!(pids.len(), 2);
-        let (list, text) = server.ok(json!({"action": "list"}));
-        let held = list["tasks"][0]["held"].as_array().unwrap();
+        let text = server.ok(json!({"action": "list"}));
         for &pid in &pids {
             assert!(
-                held.iter().any(|member| member["pid"] == pid),
+                text.contains(&format!("({pid})")),
                 "the nested reaper member {pid} was lost: {text}"
             );
         }
@@ -935,12 +893,11 @@ fn freebsd_nested_reapers_keep_detached_descendants_owned() {
             wait_until(
                 "the nested reaper naturally hands its child to the host",
                 || {
-                    let (list, _) = server.ok(json!({"action": "list"}));
-                    let held = list["tasks"][0]["held"].as_array().unwrap();
-                    (list["tasks"][0]["keptRunning"] == true
-                        && held.len() == 1
-                        && held[0]["pid"] == pids[1])
-                        .then_some(())
+                    let text = server.ok(json!({"action": "list"}));
+                    (text.contains("keeps ")
+                        && !text.contains(&format!("({})", pids[0]))
+                        && text.contains(&format!("({})", pids[1])))
+                    .then_some(())
                 },
             );
             let before = file_len(&beat);
@@ -1218,7 +1175,13 @@ fn transfer_over_local_stdio_serves_put_head_get_and_validates_settings() {
         )["result"]
             .clone();
         assert_eq!(minted["isError"], false, "{minted}");
-        let url = minted["structuredContent"]["url"].as_str().unwrap();
+        assert!(minted.get("structuredContent").is_none(), "{minted}");
+        let url = minted["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap();
         let rest = url.strip_prefix("http://").expect("http:// URL");
         let (authority, path_part) = rest.split_once('/').unwrap();
         let addr: std::net::SocketAddr = authority.parse().unwrap();
@@ -1282,7 +1245,13 @@ fn transfer_over_local_stdio_serves_put_head_get_and_validates_settings() {
     )["result"]
         .clone();
     assert_eq!(minted["isError"], false, "{minted}");
-    let url = minted["structuredContent"]["url"].as_str().unwrap();
+    assert!(minted.get("structuredContent").is_none(), "{minted}");
+    let url = minted["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
     let id = url
         .strip_prefix("https://files.example/stdio/t/")
         .unwrap_or_else(|| panic!("unexpected proxied URL: {url}"));
@@ -1335,8 +1304,15 @@ fn transfer_over_local_stdio_serves_put_head_get_and_validates_settings() {
         .clone();
     assert_eq!(wildcard_minted["isError"], false, "{wildcard_minted}");
     assert!(
-        wildcard_minted["structuredContent"]["url"]
+        wildcard_minted.get("structuredContent").is_none(),
+        "{wildcard_minted}"
+    );
+    assert!(
+        wildcard_minted["content"][0]["text"]
             .as_str()
+            .unwrap()
+            .lines()
+            .next()
             .unwrap()
             .starts_with("https://files.example/t/"),
         "{wildcard_minted}"
@@ -1583,27 +1559,20 @@ fn instructions_tool_move_mode_contract_and_annotations() {
         "additionalProperties": false,
     });
 
-    for (yolo, output_mode) in [
-        ("false", None),
-        ("true", Some("structured")),
-        ("false", Some("both")),
-    ] {
+    for yolo in ["false", "true"] {
         let mut server = Server::start_with(|command| {
             command
                 .current_dir(&*dir)
                 .env("FASTEXEC_INSTRUCTIONS_TOOL", "move")
                 .env("FASTEXEC_INSTRUCTIONS_FILE", "host.txt")
                 .env("FASTEXEC_YOLO", yolo);
-            if let Some(mode) = output_mode {
-                command.env("FASTEXEC_OUTPUT_MODE", mode);
-            }
         });
 
         let init = server.request("initialize", stdio_init_params())["result"]["instructions"]
             .as_str()
             .unwrap()
             .to_owned();
-        assert_eq!(init, expected_proto, "yolo={yolo} output={output_mode:?}");
+        assert_eq!(init, expected_proto, "yolo={yolo}");
         assert!(!init.contains(marker), "file text leaked into initialize");
 
         let listed = server.request("tools/list", json!({}));
@@ -1613,10 +1582,7 @@ fn instructions_tool_move_mode_contract_and_annotations() {
         assert_eq!(tool["inputSchema"], expected_schema, "{tool}");
         let mut annotations = expected_annotations.clone();
         annotations["idempotentHint"] = json!(yolo == "false");
-        assert_eq!(
-            tool["annotations"], annotations,
-            "yolo={yolo} output={output_mode:?}: {tool}"
-        );
+        assert_eq!(tool["annotations"], annotations, "yolo={yolo}: {tool}");
 
         for (label, params) in [
             (
@@ -1630,11 +1596,7 @@ fn instructions_tool_move_mode_contract_and_annotations() {
             ),
         ] {
             let reply = server.request("tools/call", params);
-            assert_instructions_call_ok(
-                &reply,
-                &normalized,
-                &format!("yolo={yolo} output={output_mode:?} {label}"),
-            );
+            assert_instructions_call_ok(&reply, &normalized, &format!("yolo={yolo} {label}"));
         }
 
         let extra_err = server.request(
@@ -1648,13 +1610,9 @@ fn instructions_tool_move_mode_contract_and_annotations() {
         );
 
         // Calling instructions must not allocate or leave any tasks.
-        let (structured, text, is_error) = server.call(json!({"action": "list", "scope": "all"}));
+        let (text, is_error) = server.call(json!({"action": "list", "scope": "all"}));
         assert!(!is_error, "{text}");
-        if output_mode.is_some() {
-            assert_eq!(structured["tasks"], json!([]), "{structured}");
-        } else {
-            assert!(text.contains("No tasks."), "unexpected tasks: {text}");
-        }
+        assert!(text.contains("No tasks."), "unexpected tasks: {text}");
     }
 
     // move without FASTEXEC_INSTRUCTIONS_FILE returns built-in lines on both surfaces.

@@ -512,13 +512,7 @@ mod tests {
         let retained = text.capacity();
         let ended = WaitEnd::OutputContains(text, lease);
         assert_eq!(memory.used(), retained);
-        assert_eq!(
-            ended.json(),
-            serde_json::json!({
-                "condition": "output_contains",
-                "text": "ready 世界"
-            })
-        );
+        assert_eq!(ended.parts(), ("output_contains", Some("ready 世界")));
         assert_eq!(ended.note(true), " · wait: output matched \"ready 世界\"");
         drop(ended);
         assert_eq!(memory.used(), 0);

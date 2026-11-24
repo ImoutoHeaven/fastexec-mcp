@@ -876,8 +876,14 @@ impl Service {
 
             if !planned.is_empty() {
                 let task_for_pack = Arc::clone(&task);
-                let (encoded_steps, blocks, evicted_mid_pack, held) =
-                    tokio::task::spawn_blocking(move || {
+                let (encoded_steps, blocks, evicted_mid_pack, held) = tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => {
+                        return Err(ServiceError::Cancelled(
+                            "Cancelled before output was committed; the task keeps running.".into(),
+                        ));
+                    }
+                    packed = tokio::task::spawn_blocking(move || {
                         let held = (pack_lease, workspace, permit, read);
                         let mut out = Vec::with_capacity(planned.len());
                         let mut blocks = Vec::with_capacity(planned.len());
@@ -937,11 +943,10 @@ impl Service {
                             }
                         }
                         Ok::<_, String>((out, blocks, saw_eviction, held))
-                    })
-                    .await
-                    .map_err(|error| {
+                    }) => packed.map_err(|error| {
                         format!("Internal failure while encoding attachments: {error}.")
-                    })??;
+                    })??,
+                };
                 let (pack_lease, packed_workspace, packed_permit, packed_read) = held;
                 read = packed_read;
                 permit = packed_permit;

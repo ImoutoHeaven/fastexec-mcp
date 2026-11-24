@@ -18,7 +18,6 @@ impl Server {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
         support::scrub_fastexec_env(&mut command);
         let mut child = command
-            .env("FASTEXEC_STRUCTURED_CONTENT", "true")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -72,19 +71,18 @@ impl Server {
     }
 
     fn exec(&mut self, arguments: Value) -> Value {
-        self.request(
+        let result = self.request(
             "tools/call",
             json!({"name": "exec", "arguments": arguments}),
-        )
+        );
+        assert!(result.get("structuredContent").is_none(), "{result}");
+        result
     }
 
     fn task(&mut self, arguments: Value) -> String {
         let result = self.exec(arguments);
         assert_ne!(result["isError"], true, "{result}");
-        result["structuredContent"]["taskId"]
-            .as_str()
-            .unwrap()
-            .to_owned()
+        task_id(&text(&result))
     }
 }
 
@@ -103,6 +101,24 @@ fn text(result: &Value) -> String {
         .filter_map(|block| block["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn status_line(body: &str) -> &str {
+    body.lines()
+        .rev()
+        .find(|line| line.starts_with('[') && line.contains("] "))
+        .unwrap_or_else(|| panic!("no status line: {body}"))
+}
+
+fn task_id(body: &str) -> String {
+    status_line(body)
+        .split_once("] ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned()
 }
 
 #[test]
@@ -139,9 +155,11 @@ fn empty_poll_input_requires_an_open_pipe_and_eof_alone_is_idempotent() {
     let closed = server.exec(json!({
         "action": "poll", "taskId": open, "input": "", "eof": true, "waitMs": 10_000
     }));
-    assert_eq!(closed["structuredContent"]["exitCode"], 0, "{closed}");
+    assert_ne!(closed["isError"], true, "{closed}");
+    let closed_text = text(&closed);
+    assert!(status_line(&closed_text).starts_with("[exited 0] "), "{closed}");
     assert!(
-        text(&closed).lines().any(|line| line.trim() == "0"),
+        closed_text.lines().any(|line| line.trim() == "0"),
         "{closed}"
     );
 
@@ -178,10 +196,7 @@ fn the_first_write_to_closed_stdin_reports_the_writer_error() {
     assert!(text(&result).contains("INPUT_WRITE_FAILED"), "{result}");
     let state = server.exec(json!({"action": "poll", "taskId": task, "waitMs": 0}));
     assert!(
-        state["structuredContent"]["inputError"]
-            .as_str()
-            .unwrap()
-            .contains("INPUT_WRITE_FAILED"),
+        text(&state).contains("INPUT_WRITE_FAILED"),
         "{state}"
     );
 }
@@ -203,29 +218,16 @@ fn windows_resize_input_risk_stays_explicit_for_short_keys_and_later_input() {
     ] {
         let result = server.exec(arguments);
         assert_ne!(result["isError"], true, "{result}");
-        let warning = result["structuredContent"]["inputWarning"]
-            .as_str()
-            .unwrap();
+        let body = text(&result);
+        assert!(body.contains("Warning:"), "full warning beyond maxBytes: {result}");
         for risk in [
             "leading input byte",
             "after a resize",
             "short keys",
             "does not confirm delivery to the program",
         ] {
-            assert!(warning.contains(risk), "{result}");
+            assert!(body.contains(risk), "{result}");
         }
-        assert!(
-            text(&result).contains(warning),
-            "full warning beyond maxBytes: {result}"
-        );
-        assert!(
-            result["structuredContent"]["warnings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry.as_str() == Some(warning)),
-            "{result}"
-        );
     }
     let ended = server.exec(json!({"action": "kill", "taskId": task, "waitMs": 10_000}));
     assert_ne!(ended["isError"], true, "{ended}");
@@ -275,17 +277,16 @@ fn canonical_input_keys_and_cross_poll_lines_always_report_the_risk() {
         }
         let result = server.exec(poll);
         assert_ne!(result["isError"], true, "{result}");
-        let warning = result["structuredContent"]["inputWarning"]
-            .as_str()
-            .unwrap();
-        assert!(warning.contains("across multiple polls"), "{result}");
-        assert!(warning.contains("Use pipe stdin or a file"), "{result}");
         let body = text(&result);
         assert!(
-            body.contains(warning),
+            body.contains("across multiple polls"),
             "the full warning survives maxBytes: {result}"
         );
-        assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
+        assert!(
+            body.contains("Use pipe stdin or a file"),
+            "the full warning survives maxBytes: {result}"
+        );
+        assert!(status_line(&body).starts_with("[exited 0] "), "{result}");
     }
 }
 
@@ -303,12 +304,11 @@ fn noncanonical_pty_delivers_a_full_keys_burst_without_a_canonical_warning() {
         "keyDelayMs": 0, "waitMs": 10_000
     }));
     assert_ne!(result["isError"], true, "{result}");
+    let body = text(&result);
+    assert!(!body.contains("Canonical PTY"), "{result}");
+    assert!(!body.contains("across multiple polls"), "{result}");
     assert!(
-        result["structuredContent"]["inputWarning"].is_null(),
-        "{result}"
-    );
-    assert!(
-        text(&result).contains("f3336bea752b5a28743033dd2c844a4a63fba08871aaee2586a2bf2d69be83a2"),
+        body.contains("f3336bea752b5a28743033dd2c844a4a63fba08871aaee2586a2bf2d69be83a2"),
         "{result}"
     );
 }

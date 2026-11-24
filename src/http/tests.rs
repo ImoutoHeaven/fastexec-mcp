@@ -819,10 +819,6 @@ fn real_http_service(
         transfer: false,
         yolo: false,
     };
-    let render = Render {
-        output_mode: crate::service::render::OutputMode::Text,
-        structured_content: true,
-    };
     let (instructions, tool_instructions) =
         crate::config::compose_instructions(true, false, None, InstructionsToolMode::Off);
     let router = Arc::new(Server::build_router(&launch, tools, None));
@@ -837,7 +833,6 @@ fn real_http_service(
     let factory = move || {
         let backend = Backend::Local {
             service: Arc::clone(&svc_clone),
-            render,
             session: Arc::new(OnceLock::new()),
             launch: Arc::clone(&launch),
             daemon: true,

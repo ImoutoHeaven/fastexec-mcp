@@ -89,11 +89,10 @@ Codemode result, check what happened before retrying.
 | `FASTEXEC_YOLO` | `false` | Override hints for all exposed tools. Does not restrict what tools can do. |
 | `FASTEXEC_IMAGE_COMPRESS` | `false` | Set `true` to scale and re-encode compressible images for size-constrained hosts. |
 | `FASTEXEC_MAX_MEDIA_BYTES` | `104857600` | Set the maximum raw size per media file or attachment (`1 MiB` to `360 MiB`). |
-| `FASTEXEC_STRUCTURED_CONTENT` | `true` | Set `false` to omit structured metadata. |
-| `FASTEXEC_OUTPUT_MODE` | `text` | Use `both` or `structured` to include the output body in structured results. |
 
-For stdio, set environment variables on the client entry. For HTTP, set them
-on the daemon and restart it.
+Direct MCP tool calls return text and media content blocks with no
+`structuredContent`. For stdio, set environment variables on the client entry.
+For HTTP, set them on the daemon and restart it.
 
 ### Instructions
 
@@ -124,6 +123,14 @@ text(run.output);
 text(file.text);
 attach(shot);
 ```
+
+Nested `tools.exec`, `tools.read`, `tools.write`, and `tools.edit` calls return
+typed JavaScript objects directly. Their `output` and `text` fields hold raw
+data with no status lines, footers, or inline truncation markers; truncation
+and diagnostics appear in explicit fields (`truncated`, `omittedRange`,
+`cutLines`, `nextOffset`, `warnings`). Failed tool calls reject with
+`ToolError` carrying `code` (`VALIDATION`, `NOT_FOUND`, `OVERLOAD`, `LIMIT`,
+`CANCELLED`, `EDIT_FAILED`, or `IO`) and partial `result` data when available.
 
 `attach` adds a media file, `read` descriptor, inline media block, or nested
 task attachment to the result. Poll or stop the script with `exec`. Stopping

@@ -1185,26 +1185,6 @@ impl Task {
         let _ = self.kill();
     }
 
-    /// Returns the output after the session's cursor, up to `until` when given, as a window,
-    /// and advances that cursor past it.
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub fn read_window(
-        &self,
-        state: &mut ReadState,
-        truncate: Truncate,
-        budget: usize,
-        raw: bool,
-        clean: bool,
-        keep_nul: bool,
-        encoding: &'static Encoding,
-        until: Option<u64>,
-    ) -> std::io::Result<Window> {
-        self.read_window_with_markers(
-            state, truncate, budget, raw, clean, keep_nul, true, encoding, until,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn read_window_with_markers(
         &self,
