@@ -9,7 +9,6 @@ use crate::term::output::{Cleaner, Matcher};
 use encoding_rs::Encoding;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -104,7 +103,7 @@ pub enum WaitEnd {
 }
 
 impl WaitEnd {
-    fn parts(&self) -> (&'static str, Option<&str>) {
+    pub(crate) fn parts(&self) -> (&'static str, Option<&str>) {
         match self {
             WaitEnd::TaskEnded => ("task_ended", None),
             WaitEnd::TreeEnded => ("tree_ended", None),
@@ -117,14 +116,6 @@ impl WaitEnd {
             WaitEnd::ScreenGone(text) => ("screen_gone", Some(text)),
             WaitEnd::Quiet => ("quiet", None),
             WaitEnd::MaxWait => ("max_wait", None),
-        }
-    }
-
-    /// `waitEndedBy`: the condition, and the text that matched.
-    pub fn json(&self) -> Value {
-        match self.parts() {
-            (condition, Some(text)) => json!({"condition": condition, "text": text}),
-            (condition, None) => json!({"condition": condition}),
         }
     }
 

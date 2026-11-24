@@ -8,7 +8,6 @@
 
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::platform::runtime;
-use crate::service::render::Render;
 use crate::session::LaunchContext;
 use crate::transport;
 use crate::wait;
@@ -65,7 +64,6 @@ pub struct Endpoint {
     /// wait never hangs on a task that died.
     ready: watch::Receiver<bool>,
     launch: Arc<LaunchContext>,
-    render: Render,
     /// This process's session, fixed for its life: a reconnect keeps the same session name.
     session: String,
     /// Call IDs are endpoint-wide, so one never names two calls, across reconnects included.
@@ -245,7 +243,7 @@ impl Link {
 impl Endpoint {
     /// Creates the endpoint and starts identifying this build at once: the hash reads the whole
     /// image, so one task owns it from start to finish and callers only wait on the result.
-    pub fn new(launch: Arc<LaunchContext>, render: Render) -> std::io::Result<Self> {
+    pub fn new(launch: Arc<LaunchContext>) -> std::io::Result<Self> {
         let session = crate::tasks::random_chars(26)?;
         let identity: Arc<OnceCell<Identity>> = Arc::new(OnceCell::new());
         let (announce, ready) = watch::channel(false);
@@ -269,7 +267,6 @@ impl Endpoint {
             identity,
             ready,
             launch,
-            render,
             session,
             next_call: AtomicU64::new(1),
             generation: AtomicU64::new(1),
@@ -479,7 +476,6 @@ impl Endpoint {
             &self.session,
             self.generation.fetch_add(1, Ordering::Relaxed),
             client_name,
-            self.render,
         )?;
         let epoch = match tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
@@ -819,10 +815,6 @@ impl Endpoint {
             identity: Arc::new(settled),
             ready,
             launch: Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new())),
-            render: Render {
-                output_mode: crate::service::render::OutputMode::Text,
-                structured_content: true,
-            },
             session: "s".repeat(26),
             next_call: AtomicU64::new(1),
             generation: AtomicU64::new(1),
@@ -945,15 +937,13 @@ pub(crate) fn hello_owned(
     session: &str,
     connection: u64,
     client_name: &str,
-    render: Render,
 ) -> Result<ipc::Owned<ToDaemon>, SetupError> {
     let copied = launch
         .wire_capacity()
         .saturating_add(identity.namespace.len())
         .saturating_add(identity.build.len())
         .saturating_add(session.len())
-        .saturating_add(client_name.len())
-        .saturating_add(render.output_mode.name().len());
+        .saturating_add(client_name.len());
     let lease = launch
         .memory()
         .try_acquire(copied)
@@ -972,8 +962,6 @@ pub(crate) fn hello_owned(
             session: session.to_owned(),
             connection,
             client_name: client_name.to_owned(),
-            output_mode: render.output_mode.name().to_owned(),
-            structured_content: render.structured_content,
             cwd,
             env,
         },
@@ -1171,8 +1159,6 @@ mod tests {
             session: "s".repeat(26),
             connection: 1,
             client_name: "test".to_owned(),
-            output_mode: "text".to_owned(),
-            structured_content: true,
             cwd: OsText::Text("/work".to_owned()),
             env: Vec::new(),
         }
@@ -1181,23 +1167,19 @@ mod tests {
     #[test]
     fn ipc_ingress_hello_reserves_copies_before_construction() {
         let identity = identity();
-        let render = Render {
-            output_mode: crate::service::render::OutputMode::Text,
-            structured_content: true,
-        };
         let launch = LaunchContext::new(
             std::env::temp_dir(),
             vec![("SAMPLE".into(), "hello λ".into())],
         );
         let copied =
-            launch.wire_capacity() + identity.namespace.len() + identity.build.len() + 1 + 4 + 4;
+            launch.wire_capacity() + identity.namespace.len() + identity.build.len() + 1 + 4;
         for (limit, fits) in [(copied - 1, false), (copied, true)] {
             let pool = crate::lease::BytePool::new(limit);
             let launch = launch
                 .for_session()
                 .with_memory(Arc::clone(&pool))
                 .with_control_memory(crate::lease::BytePool::new(0));
-            let hello = hello_owned(&launch, &identity, "s", 1, "test", render);
+            let hello = hello_owned(&launch, &identity, "s", 1, "test");
             assert_eq!(hello.is_ok(), fits);
             assert_eq!(pool.used(), if fits { copied } else { 0 });
             drop(hello);
@@ -1207,7 +1189,7 @@ mod tests {
         let launch = launch
             .with_memory(crate::lease::BytePool::new(0))
             .with_control_memory(Arc::clone(&control));
-        let hello = hello_owned(&launch, &identity, "s", 1, "test", render).unwrap();
+        let hello = hello_owned(&launch, &identity, "s", 1, "test").unwrap();
         assert_eq!(control.used(), copied);
         drop(hello);
         assert_eq!(control.used(), 0);

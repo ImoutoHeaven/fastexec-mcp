@@ -9,9 +9,9 @@ use crate::http;
 use crate::ingress;
 use crate::ipc;
 use crate::lease;
-use crate::service::render::{self as service_render, Render};
+use crate::service::render as service_render;
 use crate::service::schema::{Action, Request};
-use crate::service::{Call, Service};
+use crate::service::{AgentDelivery, ExecContext, Service};
 use crate::session::{LaunchContext, Session};
 use crate::tasks;
 use crate::transfer::{self, TransferEndpoint, publish_transfer, transfer_error};
@@ -63,7 +63,6 @@ pub(crate) struct Server {
 pub(crate) enum Backend {
     Local {
         service: Arc<Service>,
-        render: Render,
         /// Created by initialize, or the first tool call of a stdio client that skips it.
         session: Arc<OnceLock<Result<Arc<Session>, String>>>,
         /// What this server's tasks inherit: the environment captured at startup, so a later
@@ -918,43 +917,34 @@ impl Server {
             }
             Backend::Local {
                 service,
-                render,
                 session: _,
                 launch,
                 daemon: _,
             } => match self.session(&context) {
                 Ok(session) => {
                     let (progress, _forwarder) = progress(&context);
-                    let call = Call {
+                    let ctx = ExecContext {
                         session: &session,
                         launch: None,
-                        render: *render,
                         cancel: context.ct.clone(),
                         progress,
                         call_id: None,
-                        nested: false,
-                        started: None,
+                        parent_task_id: None,
                         queued_guard: None,
+                        on_started: None,
+                        input_owner: request_input_owner(&context),
+                    };
+                    let delivery = AgentDelivery {
                         render_slot: None,
                         http_response: http_context(&context),
                         rpc_id_bytes: ipc::json_len(&context.id).unwrap_or(usize::MAX),
-                        input_owner: request_input_owner(&context),
                     };
-                    let tracked = service.call_tracked(request, call).await;
-                    self.deliver_local(&context, tracked, launch, *render, is_control)
+                    let tracked = service.exec_agent(request, ctx, delivery).await;
+                    self.deliver_local(&context, tracked, launch, is_control)
                 }
                 Err(message) => {
-                    let err = service_render::suppress(
-                        service_render::error_result(request.action, &message),
-                        *render,
-                    );
-                    self.deliver_local(
-                        &context,
-                        files::TrackedResult::plain(err),
-                        launch,
-                        *render,
-                        true,
-                    )
+                    let err = CallToolResult::error(vec![ContentBlock::text(message)]);
+                    self.deliver_local(&context, files::TrackedResult::plain(err), launch, true)
                 }
             },
         }
@@ -991,40 +981,35 @@ impl Server {
                     .await
             }
             Backend::Local {
-                service,
-                render,
-                launch,
-                ..
+                service, launch, ..
             } => {
                 let session = match self.session(&context) {
                     Ok(session) => session,
                     Err(message) => {
-                        return service_render::suppress(
-                            service_render::codemode_error(&message),
-                            *render,
-                        );
+                        return CallToolResult::error(vec![ContentBlock::text(message)]);
                     }
                 };
                 let (progress, _forwarder) = progress(&context);
-                let call = Call {
+                let ctx = ExecContext {
                     session: &session,
                     launch: None,
-                    render: *render,
                     cancel: context.ct.clone(),
                     progress,
                     call_id: None,
-                    nested: false,
-                    started: None,
+                    parent_task_id: None,
                     queued_guard: None,
+                    on_started: None,
+                    input_owner: request_input_owner(&context),
+                };
+                let delivery = AgentDelivery {
                     render_slot: None,
                     http_response: http_context(&context),
                     rpc_id_bytes: ipc::json_len(&context.id).unwrap_or(usize::MAX),
-                    input_owner: request_input_owner(&context),
                 };
                 let tracked = service
-                    .codemode_tracked(request, call, self.tools.transfer)
+                    .codemode_agent(request, ctx, delivery, self.tools.transfer)
                     .await;
-                self.deliver_local(&context, tracked, launch, *render, false)
+                self.deliver_local(&context, tracked, launch, false)
             }
         }
     }
@@ -1041,17 +1026,16 @@ impl Server {
             return error;
         }
         match &self.backend {
-            Backend::Local { launch, render, .. } => {
+            Backend::Local { launch, .. } => {
                 let tracked = files::read_tracked(
                     request,
                     Arc::clone(launch),
                     self.tools.transfer,
-                    *render,
                     Some(context.ct.clone()),
                     request_input_owner(&context),
                 )
                 .await;
-                self.deliver_local(&context, tracked, launch, *render, false)
+                self.deliver_local(&context, tracked, launch, false)
             }
             Backend::Daemon(endpoint) => {
                 self.forward_daemon(endpoint, "read", &request, &context)
@@ -1075,15 +1059,14 @@ impl Server {
             return error;
         }
         match &self.backend {
-            Backend::Local { launch, render, .. } => {
+            Backend::Local { launch, .. } => {
                 let res = files::write_tracked(
                     request,
                     Arc::clone(launch),
-                    *render,
                     request_input_owner(&context),
                 )
                 .await;
-                self.deliver_local(&context, res, launch, *render, false)
+                self.deliver_local(&context, res, launch, false)
             }
             Backend::Daemon(endpoint) => {
                 self.forward_daemon(endpoint, "write", &request, &context)
@@ -1107,15 +1090,11 @@ impl Server {
             return error;
         }
         match &self.backend {
-            Backend::Local { launch, render, .. } => {
-                let res = files::edit_tracked(
-                    request,
-                    Arc::clone(launch),
-                    *render,
-                    request_input_owner(&context),
-                )
-                .await;
-                self.deliver_local(&context, res, launch, *render, false)
+            Backend::Local { launch, .. } => {
+                let res =
+                    files::edit_tracked(request, Arc::clone(launch), request_input_owner(&context))
+                        .await;
+                self.deliver_local(&context, res, launch, false)
             }
             Backend::Daemon(endpoint) => {
                 self.forward_daemon(endpoint, "edit", &request, &context)
@@ -1147,11 +1126,10 @@ impl Server {
                 self.forward_daemon(endpoint, "transfer", &request, &context)
                     .await
             }
-            Backend::Local { launch, render, .. } => {
+            Backend::Local { launch, .. } => {
                 let res = match &self.transfer {
                     None => files::TrackedResult::plain(transfer_error(
                         "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
-                        *render,
                     )),
                     Some(TransferEndpoint::Fixed { table, base }) => {
                         publish_transfer(
@@ -1159,7 +1137,6 @@ impl Server {
                             Arc::clone(launch),
                             table,
                             base,
-                            *render,
                             request_input_owner(&context),
                         )
                         .await
@@ -1182,18 +1159,15 @@ impl Server {
                                     Arc::clone(launch),
                                     table,
                                     &base,
-                                    *render,
                                     request_input_owner(&context),
                                 )
                                 .await
                             }
-                            Err(message) => {
-                                files::TrackedResult::plain(transfer_error(message, *render))
-                            }
+                            Err(message) => files::TrackedResult::plain(transfer_error(message)),
                         }
                     }
                 };
-                self.deliver_local(&context, res, launch, *render, false)
+                self.deliver_local(&context, res, launch, false)
             }
         }
     }
@@ -1241,7 +1215,6 @@ impl Server {
         context: &RequestContext<RoleServer>,
         mut tracked: files::TrackedResult,
         launch: &LaunchContext,
-        render: Render,
         is_control: bool,
     ) -> CallToolResult {
         // Official rmcp owns HTTP response models and encodings after this
@@ -1277,16 +1250,13 @@ impl Server {
                     launch.memory().limit()
                 ),
             };
-            let effective = render.effective();
-            let mut err = CallToolResult::error(vec![ContentBlock::text(msg.clone())]);
-            err.structured_content = Some(serde_json::json!({ "ok": false, "error": msg }));
-            let suppressed = service_render::suppress(err, effective);
-            let err_outbound = ipc::json_len(&suppressed)
+            let err = CallToolResult::error(vec![ContentBlock::text(msg)]);
+            let err_outbound = ipc::json_len(&err)
                 .unwrap_or(usize::MAX)
                 .saturating_add(id_bytes)
                 .saturating_add(256);
             let err_peak =
-                service_render::result_payload_capacity(&suppressed).saturating_add(err_outbound);
+                service_render::result_payload_capacity(&err).saturating_add(err_outbound);
             if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
                 .then(|| launch.control_memory().try_acquire(err_peak))
                 .flatten()
@@ -1296,13 +1266,13 @@ impl Server {
                 return stdio.deliver(
                     context.id.clone(),
                     &context.ct,
-                    suppressed,
+                    err,
                     err_lease,
                     outbound,
                     Default::default(),
                 );
             }
-            return suppressed;
+            return err;
         };
         if let Some(stdio) = &self.stdio_leases {
             let outbound = held.split_off(outbound_bytes.min(held.bytes()));
@@ -1995,10 +1965,6 @@ mod portable_schema_tests {
         let launch = Arc::new(LaunchContext::current().unwrap());
         let backend = Backend::Local {
             service: Arc::new(Service::new(tasks, true)),
-            render: Render {
-                output_mode: service_render::OutputMode::Text,
-                structured_content: true,
-            },
             session: Arc::new(OnceLock::new()),
             launch: Arc::clone(&launch),
             daemon: true,
@@ -2402,10 +2368,6 @@ mod event_notification_tests {
         let server = Server::new(
             Backend::Local {
                 service,
-                render: Render {
-                    output_mode: service_render::OutputMode::Text,
-                    structured_content: true,
-                },
                 session: Arc::new(OnceLock::new()),
                 launch: Arc::clone(&launch),
                 daemon: false,

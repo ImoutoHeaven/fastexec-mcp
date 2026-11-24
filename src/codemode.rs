@@ -2,6 +2,7 @@
 
 pub(crate) mod bridge;
 pub(crate) mod control;
+pub(crate) mod encode;
 #[cfg(test)]
 mod tests;
 mod vm;

@@ -1,13 +1,12 @@
 //! Asynchronous host bridge, 256 MiB pending-call budget, permits, and script output writer.
 
 use super::control::{
-    CallInfo, InFlightGuard, NestedCall, Outcome, QueuedStartGuard, ScriptHandle, Wake, lock,
+    CallInfo, InFlightGuard, Outcome, QueuedStartGuard, ScriptHandle, Wake, lock,
 };
+use super::encode::{self, ProgramOutcome};
 use crate::files;
-use crate::lease::{BytePool, Lease};
-use crate::service::render::{OutputMode, Render};
 use crate::service::schema::{self as service_schema, Action};
-use crate::service::{Call, Service};
+use crate::service::{ExecContext, ProgramDelivery, Service};
 use crate::session::{LaunchContext, Session};
 use crate::tasks::TASK_LOG_LIMIT;
 use std::io::{PipeWriter, Write};
@@ -28,6 +27,12 @@ pub(super) const START_PERMITS: usize = 8;
 pub(super) const IO_PERMITS: usize = 8;
 pub(super) const MAX_STARTS: usize = 4096;
 pub(super) const STARTS_ERROR: &str = "A script may accept at most 4096 exec start calls.";
+
+pub(super) enum SyncCallError {
+    Type(String),
+    Limit(String),
+    Overload(String),
+}
 
 pub(super) struct Output {
     pub(super) writer: PipeWriter,
@@ -163,7 +168,6 @@ pub(super) async fn sleep(mut ms: f64) {
     let mut deferred = Vec::new();
     loop {
         ms = split_sleep(ms, &mut deferred);
-        // Keep each timer representable without shortening the requested delay.
         while ms > 0.0 {
             let chunk = ms.min(SLEEP_CHUNK_MS as f64);
             let duration = if chunk == SLEEP_CHUNK_MS as f64 {
@@ -205,10 +209,10 @@ impl Host {
         &mut self,
         tool: &str,
         arguments: &str,
-    ) -> Result<u64, crate::ipc::Owned<String>> {
+    ) -> Result<u64, crate::ipc::Owned<SyncCallError>> {
         if self.script.interrupted() || self.script.0.cancel.is_cancelled() {
             return Err(crate::ipc::Owned::new(
-                "The script is ending; no new tool calls can start.".into(),
+                SyncCallError::Type("The script is ending; no new tool calls can start.".into()),
                 Default::default(),
             ));
         }
@@ -223,13 +227,16 @@ impl Host {
                     .control_memory()
                     .try_acquire(bytes)
                     .ok_or_else(|| {
-                        crate::ipc::Owned::new(bridge_input_error(), Default::default())
+                        crate::ipc::Owned::new(
+                            SyncCallError::Overload(bridge_input_error()),
+                            Default::default(),
+                        )
                     })?,
                 true,
             )
         } else {
             return Err(crate::ipc::Owned::new(
-                bridge_input_error(),
+                SyncCallError::Overload(bridge_input_error()),
                 Default::default(),
             ));
         };
@@ -247,7 +254,9 @@ impl Host {
                 arguments.len(),
                 input_owner.clone(),
             )
-            .map_err(|error| crate::ipc::Owned::new(error, input_owner.clone()))?;
+            .map_err(|error| {
+                crate::ipc::Owned::new(SyncCallError::Limit(error), input_owner.clone())
+            })?;
         let parsed = (|| {
             if tool == "sleep" {
                 let ms = arguments
@@ -282,7 +291,10 @@ impl Host {
             Ok(request) => request,
             Err(error) => {
                 lock(&self.script.0.report).remove(id);
-                return Err(crate::ipc::Owned::new(error, input_owner));
+                return Err(crate::ipc::Owned::new(
+                    SyncCallError::Type(error),
+                    input_owner,
+                ));
             }
         };
         let is_control = matches!(&request,
@@ -291,7 +303,10 @@ impl Host {
         if control && !is_control {
             let Some(lease) = self.launch.memory().try_acquire(bytes) else {
                 lock(&self.script.0.report).remove(id);
-                return Err(crate::ipc::Owned::new(bridge_input_error(), input_owner));
+                return Err(crate::ipc::Owned::new(
+                    SyncCallError::Overload(bridge_input_error()),
+                    input_owner,
+                ));
             };
             input_owner = crate::lease::Owner::new(lease);
             lock(&self.script.0.report)
@@ -306,7 +321,10 @@ impl Host {
         {
             if self.starts >= MAX_STARTS {
                 lock(&self.script.0.report).remove(id);
-                return Err(crate::ipc::Owned::new(STARTS_ERROR.into(), input_owner));
+                return Err(crate::ipc::Owned::new(
+                    SyncCallError::Limit(STARTS_ERROR.into()),
+                    input_owner,
+                ));
             }
             self.starts += 1;
             Some(QueuedStartGuard::new(&self.script))
@@ -334,12 +352,6 @@ impl Host {
         let call_id = self.call_id;
         let parent_task_id = self.parent_task_id.clone();
         let cancel = script.0.cancel.child_token();
-        let nested_render = Render {
-            output_mode: OutputMode::Structured,
-            structured_content: true,
-        };
-        let response_pool = Arc::clone(launch.memory());
-        let response_control = is_control.then(|| Arc::clone(launch.control_memory()));
         self.runtime.spawn(input_owner.clone().hold_future(async move {
             let _in_flight = in_flight;
             let queued_guard = queued_guard;
@@ -351,8 +363,15 @@ impl Host {
                 }),
                 None => None,
             };
-            let exec_result = matches!(&request, ToolCall::Exec(_));
-            let mut result = match request {
+            let delivery = ProgramDelivery {
+                script: &script,
+                pending_id: id,
+                is_control,
+            };
+            let ProgramOutcome {
+                mut outcome,
+                pre_reserved,
+            } = match request {
                 ToolCall::Sleep(ms) => {
                     tokio::select! {
                         biased;
@@ -362,74 +381,91 @@ impl Host {
                     let _ = lock(&script.0.report).result(id, 0);
                     let _ = script.0.wake.send(Wake::Settled {
                         id,
-                        outcome: Outcome::Value(crate::ipc::Owned::new(String::new(), Default::default())),
+                        outcome: Outcome::Value(crate::ipc::Owned::new(
+                            String::new(),
+                            Default::default(),
+                        )),
                     });
                     return;
                 }
                 ToolCall::Exec(request) => {
                     let _permit = permit;
                     service
-                        .call_tracked(
+                        .exec_program(
                             *request,
-                            Call {
+                            ExecContext {
                                 session: &session,
                                 launch: Some(&launch),
-                                render: nested_render,
                                 cancel: cancel.clone(),
                                 progress: None,
                                 call_id,
-                                nested: true,
-                                started: Some(NestedCall {
-                                    script: &script,
-                                    pending_id: id,
-                                    parent_task_id: &parent_task_id,
-                                }),
+                                parent_task_id: Some(parent_task_id),
                                 queued_guard,
-                                render_slot: None,
-                                http_response: false,
-                                rpc_id_bytes: 0,
+                                on_started: Some(&script),
                                 input_owner: input_owner.clone(),
                             },
+                            delivery,
                         )
                         .await
                 }
                 ToolCall::Read(request) => {
                     let permit = permit.expect("read acquires an I/O permit");
                     let read_cancel = cancel.clone();
-                    tokio::select! {
+                    let result = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        result = files::read_nested(request, launch, transfer, nested_render, permit, read_cancel, input_owner.clone()) => result,
-                    }
+                        result = files::read_core(
+                            request,
+                            Arc::clone(&launch),
+                            transfer,
+                            files::ReadPolicy::PROGRAM,
+                            Some(permit),
+                            Some(read_cancel),
+                            input_owner.clone(),
+                        ) => result,
+                    };
+                    result.run(|res| encode::encode_read_program(res, &launch, &delivery, &cancel))
                 }
                 ToolCall::Write(request) => {
                     let permit = permit.expect("write acquires an I/O permit");
-                    tokio::select! {
+                    let result = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        result = files::write_nested(request, launch, nested_render, permit, input_owner.clone()) => result,
-                    }
+                        result = files::write_core(
+                            request,
+                            Arc::clone(&launch),
+                            Some(permit),
+                            input_owner.clone(),
+                        ) => result,
+                    };
+                    result.run(|res| encode::encode_write_program(res, &launch, &delivery, &cancel))
                 }
                 ToolCall::Edit(request) => {
                     let permit = permit.expect("edit acquires an I/O permit");
-                    tokio::select! {
+                    let result = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        result = files::edit_nested(request, launch, nested_render, permit, input_owner.clone()) => result,
-                    }
+                        result = files::edit_core(
+                            request,
+                            Arc::clone(&launch),
+                            Some(permit),
+                            input_owner.clone(),
+                        ) => result,
+                    };
+                    result.run(|res| encode::encode_edit_program(res, &launch, &delivery, &cancel))
                 }
             };
-            // Only exec's reader/report commit prepaid its wire. File leases
-            // still own the file payload and must stay with the envelope.
-            let prepaid = exec_result.then(|| result.lease.take()).flatten();
-            let mut outcome = encode_nested_result(result, &response_pool, response_control.as_ref(), prepaid);
-            let bytes = match &outcome {
-                Outcome::Value(value) => value.value.len(),
-                Outcome::Error(error) => error.len(),
-                Outcome::Limit | Outcome::Memory => 0,
-            };
-            if !lock(&script.0.report).result(id, bytes) {
-                outcome = Outcome::Limit;
+            // `admit_bridge_result` already called `script.reserve_result(id, wire_len)` once.
+            // Only unreserved error outcomes update the pending bridge byte count here.
+            if !pre_reserved {
+                let bytes = match &outcome {
+                    Outcome::Value(value) => value.value.len(),
+                    Outcome::Error(error) | Outcome::Cancelled(error) => error.len(),
+                    Outcome::Limit | Outcome::Memory(_) => 0,
+                };
+                if !lock(&script.0.report).result(id, bytes) {
+                    outcome = Outcome::Limit;
+                }
             }
             let _ = script.0.wake.send(Wake::Settled { id, outcome });
         }));
@@ -439,74 +475,4 @@ impl Host {
 
 fn bridge_input_error() -> String {
     "Server active memory budget is full while copying nested tool arguments; the call was not dispatched.".into()
-}
-
-pub(super) fn nested_envelope(
-    mut tracked: files::TrackedResult,
-) -> crate::ipc::Owned<serde_json::Value> {
-    let prior = std::mem::take(&mut tracked.payload_owner);
-    let owner = crate::lease::Owner::new((prior, tracked.lease.take()));
-    let mut result = crate::ipc::Owned::new(tracked.result, owner);
-    let mut ok = !result.value.is_error.unwrap_or(false);
-    let mut map = match result.value.structured_content.take() {
-        Some(serde_json::Value::Object(map)) => map,
-        _ => {
-            let text = match std::mem::take(&mut result.value.content).into_iter().next() {
-                Some(rmcp::model::ContentBlock::Text(text)) => text.text,
-                _ => "Tool operation failed.".to_owned(),
-            };
-            let mut fallback = serde_json::Map::new();
-            fallback.insert("error".into(), serde_json::Value::String(text));
-            ok = false;
-            fallback
-        }
-    };
-    if map.remove("ok") == Some(serde_json::Value::Bool(false)) {
-        ok = false;
-    }
-    let mut envelope = serde_json::Map::new();
-    envelope.insert("ok".into(), serde_json::Value::Bool(ok));
-    envelope.insert("value".into(), serde_json::Value::Object(map));
-    crate::ipc::Owned::new(serde_json::Value::Object(envelope), result.owner)
-}
-
-pub(super) fn encode_nested_result(
-    result: files::TrackedResult,
-    pool: &Arc<BytePool>,
-    control: Option<&Arc<BytePool>>,
-    prepaid: Option<Lease>,
-) -> Outcome {
-    // The service reserves exec's envelope workspace and wire before committing
-    // its reader. Keep that full allowance until the old payload is gone.
-    let precommitted = prepaid.is_some();
-    let Some(mut wire) =
-        prepaid.or_else(|| pool.try_acquire(128).or_else(|| control?.try_acquire(128)))
-    else {
-        return Outcome::Memory;
-    };
-    let envelope = nested_envelope(result);
-    let Ok(length) = crate::ipc::json_len(&envelope.value) else {
-        return Outcome::Error("Cannot measure the nested tool result.");
-    };
-    let peak = length.saturating_add(128);
-    if wire.bytes() < peak {
-        // A committed exec result must never need another admission here.
-        if precommitted {
-            return Outcome::Memory;
-        }
-        if !wire.try_grow(peak - wire.bytes()) {
-            let Some(replacement) = control.and_then(|pool| pool.try_acquire(peak)) else {
-                return Outcome::Memory;
-            };
-            wire = replacement;
-        }
-    }
-    let mut bytes = Vec::with_capacity(length);
-    if serde_json::to_writer(&mut bytes, &envelope.value).is_err() {
-        return Outcome::Error("Cannot encode the nested tool result.");
-    }
-    let text = String::from_utf8(bytes).expect("JSON serialization emits UTF-8");
-    drop(envelope);
-    wire.shrink_to(text.capacity());
-    Outcome::Value(crate::ipc::Owned::new(text, crate::lease::Owner::new(wire)))
 }

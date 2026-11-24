@@ -200,11 +200,12 @@ impl Report {
     }
 }
 
-pub(super) enum Outcome {
+pub(crate) enum Outcome {
     Value(crate::ipc::Owned<String>),
     Error(&'static str),
+    Cancelled(&'static str),
     Limit,
-    Memory,
+    Memory(Option<(String, String)>),
 }
 
 pub(super) enum Wake {
@@ -264,13 +265,6 @@ impl Drop for QueuedStartGuard {
             }
         }
     }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct NestedCall<'a> {
-    pub script: &'a ScriptHandle,
-    pub pending_id: u64,
-    pub parent_task_id: &'a str,
 }
 
 pub(super) struct InFlightGuard(ScriptHandle);

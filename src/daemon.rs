@@ -7,8 +7,8 @@ use crate::http::{self, Http};
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::lease::{self, BytePool, Lease};
 use crate::platform::runtime;
-use crate::service::render::{self as service_render, OutputMode, Render, RenderSlot};
-use crate::service::{Call, Service};
+use crate::service::render::{self as service_render, RenderSlot};
+use crate::service::{AgentDelivery, ExecContext, Service};
 use crate::session::{LaunchContext, Session};
 use crate::tasks::{Limits, Tasks};
 use crate::transfer::Transfers;
@@ -233,7 +233,6 @@ struct Attached {
     session_id: String,
     connection: u64,
     token: CancellationToken,
-    render: Render,
 }
 
 impl Daemon {
@@ -360,14 +359,13 @@ impl Daemon {
         &self,
         request: crate::transfer::Request,
         launch: &Arc<LaunchContext>,
-        render: Render,
         input_owner: crate::lease::Owner,
     ) -> crate::files::TrackedResult {
         let session_root = match http::root_of(launch.var(http::PUBLIC_URL)) {
             Ok(root) => root,
             Err(message) => {
                 return crate::files::TrackedResult::plain(crate::transfer::transfer_error(
-                    message, render,
+                    message,
                 ));
             }
         };
@@ -379,7 +377,6 @@ impl Daemon {
                         "cannot set {} with --http; --http already serves /t/",
                         crate::config::TRANSFER_ADDR
                     ),
-                    render,
                 ));
             }
             if public_root.is_none()
@@ -387,7 +384,7 @@ impl Daemon {
                 && let Err(message) = crate::config::check_routable_addr("--http", addr, false)
             {
                 return crate::files::TrackedResult::plain(crate::transfer::transfer_error(
-                    message, render,
+                    message,
                 ));
             }
         }
@@ -407,7 +404,7 @@ impl Daemon {
                 owner,
             } => {
                 return crate::files::TrackedResult::owned(
-                    crate::transfer::transfer_error(message, render),
+                    crate::transfer::transfer_error(message),
                     owner,
                 );
             }
@@ -423,7 +420,7 @@ impl Daemon {
                     Ok(addr) => addr,
                     Err(message) => {
                         return crate::files::TrackedResult::plain(
-                            crate::transfer::transfer_error(message, render),
+                            crate::transfer::transfer_error(message),
                         );
                     }
                 };
@@ -432,7 +429,7 @@ impl Daemon {
         };
         let owner = inspected.owner.clone();
         let result = inspected.run(|(path, shown_path, bytes)| {
-            crate::transfer::mint_transfer(path, shown_path, bytes, &self.transfers, &base, render)
+            crate::transfer::mint_transfer(path, shown_path, bytes, &self.transfers, &base)
         });
         crate::files::TrackedResult::owned(result, owner)
     }
@@ -706,8 +703,6 @@ impl Daemon {
             session,
             connection,
             client_name,
-            output_mode,
-            structured_content,
             cwd,
             env,
         } = message
@@ -757,18 +752,6 @@ impl Daemon {
             )
             .await;
         }
-        let mode = match OutputMode::parse(&output_mode) {
-            Ok(mode) => mode,
-            Err(message) => {
-                return reject(
-                    writer,
-                    self.config.write_stall,
-                    &self.stopped,
-                    format!("output_mode: {message}"),
-                )
-                .await;
-            }
-        };
         let launch = match LaunchContext::from_wire(&cwd, &env) {
             Ok(launch) => launch,
             Err(message) => {
@@ -796,10 +779,6 @@ impl Daemon {
                 session_id,
                 connection,
                 token,
-                render: Render {
-                    output_mode: mode,
-                    structured_content,
-                },
             },
         };
         let welcome = ToEndpoint::Welcome {
@@ -1030,7 +1009,6 @@ impl Daemon {
                             tokio::spawn(owner.clone().hold_future(run_call(
                                 Arc::clone(self),
                                 Arc::clone(&attached.session),
-                                attached.render,
                                 attached.token.clone(),
                                 token,
                                 id,
@@ -1208,7 +1186,6 @@ impl Daemon {
 async fn run_call(
     daemon: Arc<Daemon>,
     session: Arc<Session>,
-    render: Render,
     connection: CancellationToken,
     token: CancellationToken,
     id: u64,
@@ -1244,20 +1221,21 @@ async fn run_call(
     };
     let (progress, latest) = watch::channel(None);
     let forwarder = Forwarder(tokio::spawn(forward_progress(id, latest, outgoing.clone())));
-    let call = Call {
+    let ctx = ExecContext {
         session: &session,
         launch: None,
-        render,
         cancel: token.clone(),
         progress: Some(progress),
         call_id: Some(id),
-        nested: false,
-        started: None,
+        parent_task_id: None,
         queued_guard: None,
+        on_started: None,
+        input_owner: input_owner.clone(),
+    };
+    let delivery = AgentDelivery {
         render_slot: Some(&render_slot),
         http_response: false,
         rpc_id_bytes,
-        input_owner: input_owner.clone(),
     };
     let transfer = session.launch.var("FASTEXEC_TRANSFER") == Some(std::ffi::OsStr::new("true"));
     let mut tracked = if cancelled_before_dispatch {
@@ -1265,13 +1243,16 @@ async fn run_call(
             "Cancelled before the operation started; nothing was executed.".into(),
         ))
     } else if tool == "exec" {
-        daemon.service.call_json_tracked(arguments, call).await
+        daemon
+            .service
+            .exec_agent_json(arguments, ctx, delivery)
+            .await
     } else if tool == "codemode" {
         match serde_json::from_value::<crate::codemode::control::Request>(arguments) {
             Ok(request) => {
                 daemon
                     .service
-                    .codemode_tracked(request, call, transfer)
+                    .codemode_agent(request, ctx, delivery, transfer)
                     .await
             }
             Err(problem) => crate::files::TrackedResult::plain(error(problem.to_string())),
@@ -1280,20 +1261,18 @@ async fn run_call(
         if !transfer {
             crate::files::TrackedResult::plain(crate::transfer::transfer_error(
                 "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
-                render,
             ))
         } else {
             match serde_json::from_value::<crate::transfer::Request>(arguments) {
                 Ok(request) => {
                     daemon
-                        .transfer(request, &session.launch, render, input_owner.clone())
+                        .transfer(request, &session.launch, input_owner.clone())
                         .await
                 }
                 Err(problem) => {
-                    crate::files::TrackedResult::plain(crate::transfer::transfer_error(
-                        format!("failed to deserialize parameters: {problem}"),
-                        render,
-                    ))
+                    crate::files::TrackedResult::plain(crate::transfer::transfer_error(format!(
+                        "failed to deserialize parameters: {problem}"
+                    )))
                 }
             }
         }
@@ -1305,7 +1284,6 @@ async fn run_call(
             arguments,
             launch,
             transfer,
-            render,
             Some(token.clone()),
             input_owner.clone(),
         )
@@ -1730,13 +1708,6 @@ async fn serve_daemon(
     // The HTTP front door is opened before the pipe or socket, so a daemon that cannot serve it
     // never becomes reachable the other way, and it never exits on idleness: a client that speaks
     // HTTP expects it to be there.
-    let render = match crate::config::render() {
-        Ok(render) => render,
-        Err(message) => {
-            eprintln!("fastexec: {message}");
-            return 1;
-        }
-    };
     let tools = match crate::config::Tools::from_env() {
         Ok(tools) => tools,
         Err(message) => {
@@ -1821,7 +1792,6 @@ async fn serve_daemon(
                 Some(Http {
                     listener,
                     digests,
-                    render,
                     tools,
                     launch,
                     public_root: public_root.clone(),

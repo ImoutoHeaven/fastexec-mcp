@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// What a Hello and a Welcome must agree on.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 /// The largest frame the daemon accepts. A Hello carries the endpoint's whole environment, which
 /// is the reason this is larger than a call.
@@ -885,8 +885,8 @@ pub enum EventWireFrame {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToDaemon {
-    /// The first frame on a connection: who this endpoint is, what it can render, and the
-    /// directory and environment its tasks start with.
+    /// The first frame on a connection: who this endpoint is, and the directory and environment
+    /// its tasks start with.
     Hello {
         protocol: u32,
         namespace: String,
@@ -894,8 +894,6 @@ pub enum ToDaemon {
         session: String,
         connection: u64,
         client_name: String,
-        output_mode: String,
-        structured_content: bool,
         cwd: OsText,
         env: Vec<(OsText, OsText)>,
     },
@@ -1051,7 +1049,6 @@ impl crate::session::LaunchContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::render::OutputMode;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -1187,8 +1184,6 @@ mod tests {
             session: "s".into(),
             connection: 1,
             client_name: "test".into(),
-            output_mode: "text".into(),
-            structured_content: true,
             cwd: OsText::Units {
                 units: vec![47, 119],
             },
@@ -1281,8 +1276,6 @@ mod tests {
             session: "3f2a".to_owned(),
             connection: 2,
             client_name: "probe".to_owned(),
-            output_mode: "both".to_owned(),
-            structured_content: true,
             cwd: OsText::Text("/work".to_owned()),
             env: vec![(
                 OsText::Text("PATH".to_owned()),
@@ -1301,11 +1294,9 @@ mod tests {
 
     #[tokio::test]
     async fn every_message_survives_the_wire() {
-        let mut result =
-            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::Text(
-                rmcp::model::TextContent::new("done"),
-            )]);
-        result.structured_content = Some(json!({"state": "exited"}));
+        let result = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::Text(
+            rmcp::model::TextContent::new("done"),
+        )]);
         let sent = [
             hello(),
             ToDaemon::Call {
@@ -1594,23 +1585,9 @@ mod tests {
         assert_eq!(back.env, [(OsString::from("TERM"), OsString::new())]);
     }
 
-    #[test]
-    fn an_output_mode_round_trips_by_name() {
-        for mode in [OutputMode::Text, OutputMode::Both, OutputMode::Structured] {
-            assert_eq!(OutputMode::parse(mode.name()).unwrap(), mode);
-        }
-        assert_eq!(OutputMode::Text.name(), "text");
-        assert_eq!(OutputMode::Both.name(), "both");
-        assert_eq!(OutputMode::Structured.name(), "structured");
-        assert_eq!(
-            OutputMode::parse("Text").unwrap_err(),
-            "unknown output mode \"Text\""
-        );
-    }
-
     #[tokio::test]
     async fn idle_writes_reset_on_forward_progress_and_fail_on_stall() {
-        assert_eq!(PROTOCOL, 4);
+        assert_eq!(PROTOCOL, 5);
         assert_eq!(RESPONSE_LIMIT, 512 << 20);
 
         let payload = vec![b'x'; 256];

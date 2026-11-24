@@ -1188,6 +1188,7 @@ impl Task {
     /// Returns the output after the session's cursor, up to `until` when given, as a window,
     /// and advances that cursor past it.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn read_window(
         &self,
         state: &mut ReadState,
@@ -1199,20 +1200,62 @@ impl Task {
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> std::io::Result<Window> {
+        self.read_window_with_markers(
+            state, truncate, budget, raw, clean, keep_nul, true, encoding, until,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_window_with_markers(
+        &self,
+        state: &mut ReadState,
+        truncate: Truncate,
+        budget: usize,
+        raw: bool,
+        clean: bool,
+        keep_nul: bool,
+        include_markers: bool,
+        encoding: &'static Encoding,
+        until: Option<u64>,
+    ) -> std::io::Result<Window> {
         if lock(&self.out).evicted {
             return Ok(self.read_evicted(
-                state, truncate, budget, raw, clean, keep_nul, encoding, until,
+                state,
+                truncate,
+                budget,
+                raw,
+                clean,
+                keep_nul,
+                include_markers,
+                encoding,
+                until,
             ));
         }
         match self.read_stored(
-            state, truncate, budget, raw, clean, keep_nul, encoding, until,
+            state,
+            truncate,
+            budget,
+            raw,
+            clean,
+            keep_nul,
+            include_markers,
+            encoding,
+            until,
         ) {
             Ok(window) => Ok(window),
             Err(_) if lock(&self.out).evicted => {
                 // Eviction deleted the log between the flags above and the read. The window is
                 // empty either way, so the half-read state is simply not committed.
                 Ok(self.read_evicted(
-                    state, truncate, budget, raw, clean, keep_nul, encoding, until,
+                    state,
+                    truncate,
+                    budget,
+                    raw,
+                    clean,
+                    keep_nul,
+                    include_markers,
+                    encoding,
+                    until,
                 ))
             }
             Err(error) => Err(error),
@@ -1231,6 +1274,7 @@ impl Task {
         raw: bool,
         clean: bool,
         keep_nul: bool,
+        include_markers: bool,
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> Window {
@@ -1243,7 +1287,7 @@ impl Task {
             raw,
             clean,
             keep_nul,
-            include_markers: true,
+            include_markers,
             encoding,
             source: "log",
         };
@@ -1261,6 +1305,7 @@ impl Task {
         raw: bool,
         clean: bool,
         keep_nul: bool,
+        include_markers: bool,
         encoding: &'static Encoding,
         until: Option<u64>,
     ) -> std::io::Result<Window> {
@@ -1284,7 +1329,7 @@ impl Task {
             raw,
             clean,
             keep_nul,
-            include_markers: true,
+            include_markers,
             encoding,
             source: "log",
         };

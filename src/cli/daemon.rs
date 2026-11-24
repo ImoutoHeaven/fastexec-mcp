@@ -2,7 +2,7 @@
 
 use crate::config::{
     TRANSFER_ADDR, Tools, check_listen_addr, check_routable_addr, http_addr, http_token,
-    instructions_file, instructions_tool_mode, render, transfer_addr,
+    instructions_file, instructions_tool_mode, transfer_addr,
 };
 use crate::daemon;
 use crate::endpoint;
@@ -11,7 +11,6 @@ use crate::http;
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::lease;
 use crate::platform::runtime;
-use crate::service::render::{OutputMode, Render};
 use crate::session::LaunchContext;
 use crate::tasks;
 use crate::transport;
@@ -571,9 +570,6 @@ async fn cli_start(
     deadline: std::time::Instant,
     flags: DaemonFlags,
 ) -> i32 {
-    if let Err(message) = render() {
-        return fail(&message);
-    }
     let tools = match Tools::from_env() {
         Ok(tools) => tools,
         Err(message) => return fail(&message),
@@ -789,18 +785,7 @@ fn hello(
 ) -> Result<ipc::Owned<ToDaemon>, String> {
     let session =
         tasks::random_chars(26).map_err(|error| format!("cannot name the session: {error}"))?;
-    endpoint::hello_owned(
-        launch,
-        identity,
-        &session,
-        1,
-        "cli",
-        Render {
-            output_mode: OutputMode::Text,
-            structured_content: true,
-        },
-    )
-    .map_err(|error| error.to_string())
+    endpoint::hello_owned(launch, identity, &session, 1, "cli").map_err(|error| error.to_string())
 }
 
 /// Says Bye and reads until the daemon ends the connection, so the session is gone before the CLI

@@ -2,7 +2,6 @@
 
 use crate::files;
 use crate::http;
-use crate::service::render::{OutputMode, Render};
 use crate::session::{self, LaunchContext};
 use std::sync::Arc;
 
@@ -142,42 +141,6 @@ pub(crate) fn instructions_file(launch: &LaunchContext) -> Result<Option<String>
         return Ok(None);
     }
     Ok(Some(content.to_owned()))
-}
-
-/// The output mode `FASTEXEC_OUTPUT_MODE` names, or the message saying what it held instead.
-pub fn output_mode() -> Result<OutputMode, String> {
-    output_mode_of(std::env::var_os("FASTEXEC_OUTPUT_MODE").as_deref())
-}
-
-fn output_mode_of(value: Option<&std::ffi::OsStr>) -> Result<OutputMode, String> {
-    let Some(value) = value else {
-        return Ok(OutputMode::Text);
-    };
-    match value.to_str() {
-        Some("text") => Ok(OutputMode::Text),
-        Some("both") => Ok(OutputMode::Both),
-        Some("structured") => Ok(OutputMode::Structured),
-        _ => Err(format!(
-            "invalid FASTEXEC_OUTPUT_MODE {value:?}; expected text, both, or structured"
-        )),
-    }
-}
-
-/// What `FASTEXEC_STRUCTURED_CONTENT` asks for, or the message saying what it held instead.
-pub fn structured_content() -> Result<bool, String> {
-    parse_bool_env(
-        "FASTEXEC_STRUCTURED_CONTENT",
-        std::env::var_os("FASTEXEC_STRUCTURED_CONTENT").as_deref(),
-        true,
-    )
-}
-
-/// How this process renders results: both settings, or the message naming the one that is wrong.
-pub fn render() -> Result<Render, String> {
-    Ok(Render {
-        output_mode: output_mode()?,
-        structured_content: structured_content()?,
-    })
 }
 
 /// What `FASTEXEC_YOLO` asks for, or the message saying what it held instead.
@@ -388,10 +351,8 @@ mod http_token_tests {
 #[cfg(test)]
 mod yolo_tests {
     use super::{
-        TRANSFER_ADDR, check_listen_addr, check_routable_addr, output_mode_of, parse_bool_env,
-        transfer_addr_of,
+        TRANSFER_ADDR, check_listen_addr, check_routable_addr, parse_bool_env, transfer_addr_of,
     };
-    use crate::service::render::OutputMode;
     use std::ffi::OsStr;
 
     #[test]
@@ -431,25 +392,11 @@ mod yolo_tests {
             parse_bool_env("FASTEXEC_YOLO", Some(OsStr::new("true")), false),
             Ok(true)
         );
-        assert_eq!(
-            parse_bool_env("FASTEXEC_STRUCTURED_CONTENT", None, true),
-            Ok(true)
-        );
-        assert_eq!(output_mode_of(None), Ok(OutputMode::Text));
-        assert_eq!(
-            output_mode_of(Some(OsStr::new("both"))),
-            Ok(OutputMode::Both)
-        );
         for bad in ["", "on", "off", "1", "0", "TRUE", "True", " true "] {
             let error = parse_bool_env("FASTEXEC_YOLO", Some(OsStr::new(bad)), false).unwrap_err();
             assert_eq!(
                 error,
                 format!("invalid FASTEXEC_YOLO {bad:?}; expected true or false")
-            );
-            let mode_error = output_mode_of(Some(OsStr::new(bad))).unwrap_err();
-            assert_eq!(
-                mode_error,
-                format!("invalid FASTEXEC_OUTPUT_MODE {bad:?}; expected text, both, or structured")
             );
         }
     }
@@ -465,12 +412,6 @@ mod yolo_tests {
                 && error.ends_with("; expected true or false"),
             "{error}"
         );
-        let mode_error = output_mode_of(Some(bad)).unwrap_err();
-        assert!(
-            mode_error.starts_with("invalid FASTEXEC_OUTPUT_MODE ")
-                && mode_error.ends_with("; expected text, both, or structured"),
-            "{mode_error}"
-        );
     }
 
     #[cfg(windows)]
@@ -483,12 +424,6 @@ mod yolo_tests {
             error.starts_with("invalid FASTEXEC_YOLO ")
                 && error.ends_with("; expected true or false"),
             "{error}"
-        );
-        let mode_error = output_mode_of(Some(&value)).unwrap_err();
-        assert!(
-            mode_error.starts_with("invalid FASTEXEC_OUTPUT_MODE ")
-                && mode_error.ends_with("; expected text, both, or structured"),
-            "{mode_error}"
         );
     }
 }

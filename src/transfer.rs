@@ -471,15 +471,8 @@ pub(crate) enum TransferEndpoint {
     },
 }
 
-pub(crate) fn transfer_error(
-    message: String,
-    render: crate::service::render::Render,
-) -> rmcp::model::CallToolResult {
-    let effective = render.effective();
-    let mut result =
-        rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message.clone())]);
-    result.structured_content = Some(serde_json::json!({ "ok": false, "error": message }));
-    crate::service::render::suppress(result, effective)
+pub(crate) fn transfer_error(message: String) -> rmcp::model::CallToolResult {
+    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message)])
 }
 
 pub(crate) type TransferInspection = Result<(std::path::PathBuf, String, Option<u64>), String>;
@@ -520,27 +513,17 @@ pub(crate) fn mint_transfer(
     bytes: Option<u64>,
     table: &Arc<Transfers>,
     base: &str,
-    render: crate::service::render::Render,
 ) -> rmcp::model::CallToolResult {
-    let effective = render.effective();
     let id = match table.create(path) {
         Ok(id) => id,
-        Err(message) => return transfer_error(message, render),
+        Err(message) => return transfer_error(message),
     };
     let url = format!("{base}t/{id}");
     let text = match bytes {
         Some(size) => format!("{url}\n{shown_path} · {size} bytes"),
         None => format!("{url}\n{shown_path} · does not exist yet; a PUT creates it"),
     };
-    let mut result =
-        rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]);
-    result.structured_content = Some(serde_json::json!({
-        "ok": true,
-        "url": url,
-        "path": shown_path,
-        "bytes": bytes,
-    }));
-    crate::service::render::suppress(result, effective)
+    rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)])
 }
 
 pub(crate) fn publish_transfer<'a>(
@@ -548,7 +531,6 @@ pub(crate) fn publish_transfer<'a>(
     launch: Arc<crate::session::LaunchContext>,
     table: &'a Arc<Transfers>,
     base: &'a str,
-    render: crate::service::render::Render,
     input_owner: crate::lease::Owner,
 ) -> impl std::future::Future<Output = crate::files::TrackedResult> + 'a {
     let inspection = inspect_transfer_request(request, launch, input_owner);
@@ -556,10 +538,8 @@ pub(crate) fn publish_transfer<'a>(
         let inspected = inspection.await;
         let owner = inspected.owner.clone();
         let result = inspected.run(|inspected| match inspected {
-            Ok((path, shown_path, bytes)) => {
-                mint_transfer(path, shown_path, bytes, table, base, render)
-            }
-            Err(message) => transfer_error(message, render),
+            Ok((path, shown_path, bytes)) => mint_transfer(path, shown_path, bytes, table, base),
+            Err(message) => transfer_error(message),
         });
         crate::files::TrackedResult::owned(result, owner)
     }
@@ -626,7 +606,6 @@ fn inspect_transfer_target(
 #[cfg(test)]
 mod transfer_owner_tests {
     use super::*;
-    use crate::service::render::{OutputMode, Render};
     use std::future::Future;
     use std::time::Duration;
 
@@ -671,14 +650,11 @@ mod transfer_owner_tests {
             launch(),
             &table,
             "http://localhost/",
-            Render {
-                output_mode: OutputMode::Both,
-                structured_content: true,
-            },
             crate::lease::Owner::new(pool.try_acquire(64).unwrap()),
         )
         .await;
         assert_eq!(result.result.is_error, Some(false));
+        assert!(result.result.structured_content.is_none());
         assert_eq!(pool.used(), 64);
         drop(result);
         assert_eq!(pool.used(), 0);

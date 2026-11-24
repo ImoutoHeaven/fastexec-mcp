@@ -2,8 +2,8 @@
 
 use super::Work;
 use super::bridge::{
-    BRIDGE_ERROR, BRIDGE_MEMORY_RESULT_ERROR, BRIDGE_RESULT_ERROR, DIAGNOSTIC_RESERVE,
-    DIAGNOSTIC_WORKSPACE, Host, IO_PERMITS, Output, START_PERMITS, STARTS_ERROR,
+    BRIDGE_MEMORY_RESULT_ERROR, BRIDGE_RESULT_ERROR, DIAGNOSTIC_RESERVE, DIAGNOSTIC_WORKSPACE,
+    Host, IO_PERMITS, Output, START_PERMITS, SyncCallError,
 };
 use super::control::{CallInfo, Outcome, ScriptHandle, Wake, lock};
 use crate::files;
@@ -316,18 +316,22 @@ fn run_vm(
             let launch_ctx = Arc::clone(&host.borrow().launch);
             let call = Function::new(
                 ctx.clone(),
-                move |ctx: Ctx<'_>, tool: rquickjs::CString<'_>, args: rquickjs::CString<'_>| {
-                    host.borrow_mut().call(tool.as_str(), args.as_str()).map_err(|error| {
-                        let message = &error.value;
-                        if message.starts_with("At most")
-                            || message == BRIDGE_ERROR
-                            || message == STARTS_ERROR
-                        {
-                            Exception::throw_range(&ctx, message)
-                        } else {
-                            Exception::throw_type(&ctx, message)
-                        }
-                    })
+                move |ctx: Ctx<'_>,
+                      tool: rquickjs::CString<'_>,
+                      args: rquickjs::CString<'_>|
+                      -> rquickjs::Result<String> {
+                    match host.borrow_mut().call(tool.as_str(), args.as_str()) {
+                        Ok(id) => Ok(id.to_string()),
+                        Err(error) => match &error.value {
+                            SyncCallError::Type(message) => Err(Exception::throw_type(&ctx, message)),
+                            SyncCallError::Limit(message) => {
+                                Ok(json!({ "code": "LIMIT", "message": message }).to_string())
+                            }
+                            SyncCallError::Overload(message) => {
+                                Ok(json!({ "code": "OVERLOAD", "message": message }).to_string())
+                            }
+                        },
+                    }
                 },
             )
             .map_err(|error| js_error(&ctx, error))?;
@@ -703,14 +707,24 @@ fn run_vm(
                             .map_err(|error| js_error(&ctx, error))?;
                         let settle: Function =
                             api.get("settle").map_err(|error| js_error(&ctx, error))?;
-                        let (ok, range, payload) = match &outcome {
-                            Outcome::Value(value) => (true, false, value.value.as_str()),
-                            Outcome::Error(error) => (false, false, *error),
-                            Outcome::Limit => (false, true, BRIDGE_RESULT_ERROR),
-                            Outcome::Memory => (false, true, BRIDGE_MEMORY_RESULT_ERROR),
+                        let (ok, err_code, payload, task_id, log_path) = match &outcome {
+                            Outcome::Value(value) => (true, "", value.value.as_str(), "", ""),
+                            Outcome::Error(error) => (false, "IO", *error, "", ""),
+                            Outcome::Cancelled(error) => (false, "CANCELLED", *error, "", ""),
+                            Outcome::Limit => (false, "LIMIT", BRIDGE_RESULT_ERROR, "", ""),
+                            Outcome::Memory(Some((tid, lpath))) => (
+                                false,
+                                "OVERLOAD",
+                                BRIDGE_MEMORY_RESULT_ERROR,
+                                tid.as_str(),
+                                lpath.as_str(),
+                            ),
+                            Outcome::Memory(None) => {
+                                (false, "OVERLOAD", BRIDGE_MEMORY_RESULT_ERROR, "", "")
+                            }
                         };
                         settle
-                            .call::<_, ()>((id, ok, payload, range))
+                            .call::<_, ()>((id, ok, payload, err_code, task_id, log_path))
                             .map_err(|error| js_error(&ctx, error))
                     });
                     lock(&script.0.report).remove(id);
@@ -931,8 +945,8 @@ const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
         return "Tool operation failed.";
     }
     class ToolError extends ErrorCtor {
-        constructor(tool, result) {
-            super(toolErrorMessage(result));
+        constructor(tool, code, message, result) {
+            super(typeof message === "string" && message.length > 0 ? message : toolErrorMessage(result));
             defineProperty(this, "name", {
                 __proto__: null,
                 value: "ToolError",
@@ -943,6 +957,13 @@ const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
             defineProperty(this, "tool", {
                 __proto__: null,
                 value: tool,
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            });
+            defineProperty(this, "code", {
+                __proto__: null,
+                value: code || "IO",
                 writable: true,
                 enumerable: true,
                 configurable: true,
@@ -966,9 +987,15 @@ const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
                     return;
                 }
                 try {
-                    const id = __call(name, stringify(args));
-                    set(pending, id, { resolve, reject, tool: name, stack: callStack });
-                    waiting++;
+                    const res = __call(name, stringify(args));
+                    if (charCodeAt(res, 0) === 123) {
+                        const err = parse(res);
+                        reject(withCallStack(new ToolError(name, err.code, err.message, undefined), callStack));
+                    } else {
+                        const id = +res;
+                        set(pending, id, { resolve, reject, tool: name, stack: callStack });
+                        waiting++;
+                    }
                 } catch (error) { reject(withCallStack(error, callStack)); }
             });
         };
@@ -981,9 +1008,15 @@ const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
                 return;
             }
             try {
-                const id = __call("sleep", ms <= 0 ? "0" : StringCtor(ms));
-                set(pending, id, { resolve, reject, tool: "sleep", stack: callStack });
-                waiting++;
+                const res = __call("sleep", ms <= 0 ? "0" : StringCtor(ms));
+                if (charCodeAt(res, 0) === 123) {
+                    const err = parse(res);
+                    reject(withCallStack(new ToolError("sleep", err.code, err.message, undefined), callStack));
+                } else {
+                    const id = +res;
+                    set(pending, id, { resolve, reject, tool: "sleep", stack: callStack });
+                    waiting++;
+                }
             } catch (error) { reject(withCallStack(error, callStack)); }
         });
     }
@@ -1615,14 +1648,14 @@ const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
                 catch (error) { failure = error; state = 2; }
             }, error => { failure = error; state = 2; });
         },
-        settle(id, ok, payload, range) {
+        settle(id, ok, payload, errCode, taskId, logPath) {
             const entry = get(pending, id);
             if (!entry) return;
             remove(pending, id);
             waiting--;
             if (!ok) {
-                const error = range ? new RangeErrorCtor(payload) : new ErrorCtor(payload);
-                entry.reject(withCallStack(error, entry.stack));
+                const partial = taskId ? { taskId, logPath } : undefined;
+                entry.reject(withCallStack(new ToolError(entry.tool, errCode, payload, partial), entry.stack));
                 return;
             }
             if (entry.tool === "sleep") {
@@ -1634,7 +1667,8 @@ const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
             if (envelope.ok) {
                 entry.resolve(sealNestedAttachments(envelope.value));
             } else {
-                entry.reject(withCallStack(new ToolError(entry.tool, envelope.value), entry.stack));
+                const partial = envelope.result !== undefined ? sealNestedAttachments(envelope.result) : undefined;
+                entry.reject(withCallStack(new ToolError(entry.tool, envelope.code, envelope.error, partial), entry.stack));
             }
         },
         status() { return state || (waiting ? 0 : 3); },

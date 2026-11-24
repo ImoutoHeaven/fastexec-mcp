@@ -12,20 +12,17 @@ pub(crate) mod write;
 #[cfg(test)]
 mod tests;
 
-use self::edit::{EditError, FileEditData};
-pub use self::edit::edit_core;
-use self::read::{FileReadData, MediaPayload, MediaReadMode, TextSlice, format_size};
-pub use self::read::{ReadPolicy, read_core};
-use self::write::FileWriteData;
-pub use self::write::write_core;
+pub use self::edit::{EditError, EditFailure, EditMatch, FileEditData, edit_core};
+use self::read::format_size;
+pub use self::read::{FileReadData, MediaPayload, ReadPolicy, TextSlice, read_core};
+pub use self::write::{FileWriteData, write_core};
 use crate::lease::Lease;
 use crate::media;
-use crate::service::render::{self as service_render, OutputMode, Render};
 use crate::session::LaunchContext;
 use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -168,211 +165,123 @@ pub async fn call_tracked(
     arguments: Value,
     launch: Arc<LaunchContext>,
     transfer: bool,
-    render: Render,
     cancel: Option<tokio_util::sync::CancellationToken>,
     input_owner: crate::lease::Owner,
 ) -> TrackedResult {
     match tool {
         "read" => match serde_json::from_value::<ReadRequest>(arguments) {
-            Ok(request) => {
-                read_tracked(request, launch, transfer, render, cancel, input_owner).await
-            }
-            Err(error) => TrackedResult::plain(schema_failed(format!(
+            Ok(request) => read_tracked(request, launch, transfer, cancel, input_owner).await,
+            Err(error) => TrackedResult::plain(failed(format!(
                 "failed to deserialize parameters: {error}"
             ))),
         },
         "write" => match serde_json::from_value::<WriteRequest>(arguments) {
-            Ok(request) => write_tracked(request, launch, render, input_owner).await,
-            Err(error) => TrackedResult::plain(schema_failed(format!(
+            Ok(request) => write_tracked(request, launch, input_owner).await,
+            Err(error) => TrackedResult::plain(failed(format!(
                 "failed to deserialize parameters: {error}"
             ))),
         },
         "edit" => match serde_json::from_value::<EditRequest>(arguments) {
-            Ok(request) => edit_tracked(request, launch, render, input_owner).await,
-            Err(error) => TrackedResult::plain(schema_failed(format!(
+            Ok(request) => edit_tracked(request, launch, input_owner).await,
+            Err(error) => TrackedResult::plain(failed(format!(
                 "failed to deserialize parameters: {error}"
             ))),
         },
-        other => TrackedResult::plain(schema_failed(format!("unknown tool {other}"))),
+        other => TrackedResult::plain(failed(format!("unknown tool {other}"))),
     }
 }
 
-/// Reads one file: its text, media attachment, or the message saying why it is not shown.
+/// Reads one file for an Agent caller: pure text or media blocks with `structured_content: None`.
 pub async fn read_tracked(
     request: ReadRequest,
     launch: Arc<LaunchContext>,
     transfer: bool,
-    render: Render,
     cancel: Option<tokio_util::sync::CancellationToken>,
     input_owner: crate::lease::Owner,
 ) -> TrackedResult {
-    read_with_policy_and_permit(
+    let outcome = read_core(
         request,
         launch,
         transfer,
-        render,
         ReadPolicy::AGENT,
         None,
         cancel,
         input_owner,
     )
-    .await
-}
-
-/// Reads one file for an in-process codemode script: whole-file when neither `offset` nor
-/// `limit` is given, or a 4 MiB slice otherwise. `permit` stays inside the blocking worker
-/// until disk I/O finishes, even if the awaiting task is cancelled.
-pub(crate) async fn read_nested(
-    request: ReadRequest,
-    launch: Arc<LaunchContext>,
-    transfer: bool,
-    render: Render,
-    permit: tokio::sync::OwnedSemaphorePermit,
-    cancel: tokio_util::sync::CancellationToken,
-    input_owner: crate::lease::Owner,
-) -> TrackedResult {
-    read_with_policy_and_permit(
-        request,
-        launch,
-        transfer,
-        render,
-        ReadPolicy::PROGRAM,
-        Some(permit),
-        Some(cancel),
-        input_owner,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn read_with_policy_and_permit(
-    request: ReadRequest,
-    launch: Arc<LaunchContext>,
-    transfer: bool,
-    render: Render,
-    policy: ReadPolicy,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    cancel: Option<tokio_util::sync::CancellationToken>,
-    input_owner: crate::lease::Owner,
-) -> TrackedResult {
-    let effective = render.effective();
-    let outcome =
-        read_core(request, launch, transfer, policy, permit, cancel, input_owner).await;
+    .await;
     let owner = outcome.owner.clone();
     let mut tracked = outcome.run(|read| match read {
-        Ok(data) => read_data_to_outcome(data, policy, owner.clone()).into_tracked(effective),
+        Ok(data) => render_read_agent(data, owner.clone()),
         Err(FileError::Overload(message)) => TrackedResult {
-            result: service_render::suppress(failed(message), effective),
+            result: failed(message),
             lease: None,
             overload: true,
             task_meta: None,
             payload_owner: Default::default(),
         },
-        Err(error) => TrackedResult::plain(service_render::suppress(
-            failed(error.into_message()),
-            effective,
-        )),
+        Err(error) => TrackedResult::plain(failed(error.into_message())),
     });
     tracked.payload_owner = owner;
     tracked
 }
 
-pub(super) fn read_data_to_outcome(
-    data: FileReadData,
-    policy: ReadPolicy,
-    owner: crate::lease::Owner,
-) -> Outcome {
+fn render_read_agent(data: FileReadData, owner: crate::lease::Owner) -> TrackedResult {
     match data {
-        FileReadData::Text(slice) => text_slice_to_outcome(slice, owner),
+        FileReadData::Text(slice) => {
+            let text = format_text_slice(&slice);
+            TrackedResult {
+                result: CallToolResult::success(vec![ContentBlock::text(text)]),
+                lease: Some(slice.lease),
+                overload: false,
+                task_meta: None,
+                payload_owner: owner,
+            }
+        }
         FileReadData::Media(MediaPayload::Inline {
             kind,
-            path,
             resolved_path,
             mime_type,
-            bytes,
             encoded_base64,
             summary_line,
-            image_transform,
             lease,
+            ..
         }) => {
             let block = media::content_block(kind, &mime_type, encoded_base64, &resolved_path);
-            let mut map = serde_json::Map::new();
-            map.insert("ok".into(), json!(true));
-            map.insert("kind".into(), json!(kind.as_str()));
-            map.insert("path".into(), json!(path));
-            map.insert("mimeType".into(), json!(mime_type));
-            map.insert("bytes".into(), json!(bytes));
-            map.insert("attached".into(), json!(true));
-            if let Some(transform) = image_transform {
-                map.insert("originalBytes".into(), json!(transform.original_bytes));
-                map.insert("originalWidth".into(), json!(transform.original_width));
-                map.insert("originalHeight".into(), json!(transform.original_height));
-                map.insert("width".into(), json!(transform.width));
-                map.insert("height".into(), json!(transform.height));
-            }
-            Outcome {
-                owner,
-                notice: summary_line.clone(),
-                text: summary_line,
-                body: None,
-                attachment: Some(block),
+            TrackedResult {
+                result: CallToolResult::success(vec![ContentBlock::text(summary_line), block]),
                 lease: Some(lease),
-                structured: Value::Object(map),
+                overload: false,
+                task_meta: None,
+                payload_owner: owner,
             }
         }
         FileReadData::Media(MediaPayload::Descriptor {
             kind,
-            path,
             mime_type,
             bytes,
-            source_bytes,
-            attachable,
             note,
+            ..
         }) => {
-            let descriptor_only = policy.media_mode == MediaReadMode::DescriptorOnly;
-            let flag_key = if descriptor_only {
-                "attachable"
-            } else {
-                "attached"
-            };
-            let mut map = serde_json::Map::new();
-            map.insert("ok".into(), json!(true));
-            map.insert("kind".into(), json!(kind.as_str()));
-            map.insert("path".into(), json!(path));
-            map.insert("mimeType".into(), json!(mime_type));
-            if let Some(size) = bytes {
-                map.insert("bytes".into(), json!(size));
-            }
-            map.insert(flag_key.into(), json!(attachable));
-            if let Some(size) = source_bytes {
-                map.insert("sourceBytes".into(), json!(size));
-            }
-            let summary = match note {
-                Some(note) => {
-                    map.insert("note".into(), json!(note.clone()));
-                    note
-                }
-                None => format!(
+            let summary = note.unwrap_or_else(|| {
+                format!(
                     "Read {} file [{}] ({} B)",
                     kind.as_str(),
                     mime_type,
                     bytes.unwrap_or(0)
-                ),
-            };
-            Outcome {
-                owner,
-                notice: summary.clone(),
-                text: summary,
-                body: None,
-                attachment: None,
+                )
+            });
+            TrackedResult {
+                result: CallToolResult::success(vec![ContentBlock::text(summary)]),
                 lease: None,
-                structured: Value::Object(map),
+                overload: false,
+                task_meta: None,
+                payload_owner: owner,
             }
         }
     }
 }
 
-pub(super) fn text_slice_to_outcome(slice: TextSlice, owner: crate::lease::Owner) -> Outcome {
+fn format_text_slice(slice: &TextSlice) -> String {
     let mut notices = Vec::new();
     if slice.line_too_long {
         let shell_path = slice.path.replace('\'', "'\\''");
@@ -413,81 +322,14 @@ pub(super) fn text_slice_to_outcome(slice: TextSlice, owner: crate::lease::Owner
         notices.push("[Invalid UTF-8 was replaced with U+FFFD.]".to_owned());
     }
     let notice_block = notices.join("\n\n");
-    let text = if slice.line_too_long || slice.text.is_empty() {
-        notice_block.clone()
+    if slice.line_too_long || slice.text.is_empty() {
+        notice_block
     } else if notice_block.is_empty() {
         slice.text.clone()
     } else if slice.text.ends_with('\n') {
         format!("{}\n{notice_block}", slice.text)
     } else {
         format!("{}\n\n{notice_block}", slice.text)
-    };
-    let notice = if notice_block.is_empty() {
-        format!("[read] {} · {} lines", slice.path, slice.shown_lines)
-    } else {
-        notice_block
-    };
-    let structured = json!({
-        "ok": true,
-        "kind": "text",
-        "path": slice.path,
-        "startLine": slice.start_line,
-        "endLine": slice.end_line,
-        "shownLines": slice.shown_lines,
-        "totalLines": slice.total_lines,
-        "truncated": slice.truncated,
-        "nextOffset": slice.next_offset,
-        "lineTooLong": slice.line_too_long,
-        "lossy": slice.lossy,
-    });
-    Outcome {
-        owner,
-        text,
-        notice,
-        body: Some(slice.text),
-        attachment: None,
-        lease: Some(slice.lease),
-        structured,
-    }
-}
-
-/// What a read answers with: its text, and its media block when a media file is attached.
-pub struct Outcome {
-    pub text: String,
-    pub notice: String,
-    pub body: Option<String>,
-    pub attachment: Option<ContentBlock>,
-    pub structured: Value,
-    pub lease: Option<Lease>,
-    pub(super) owner: crate::lease::Owner,
-}
-
-impl Outcome {
-    fn into_tracked(self, render: Render) -> TrackedResult {
-        let mut structured = self.structured;
-        if render.output_mode != OutputMode::Text
-            && let Some(body) = self.body
-        {
-            structured["text"] = Value::String(body);
-        }
-        let shown = if render.output_mode == OutputMode::Structured && self.attachment.is_none() {
-            self.notice
-        } else {
-            self.text
-        };
-        let mut blocks = vec![ContentBlock::text(shown)];
-        if let Some(attachment) = self.attachment {
-            blocks.push(attachment);
-        }
-        let mut result = CallToolResult::success(blocks);
-        result.structured_content = Some(structured);
-        TrackedResult {
-            result: service_render::suppress(result, render),
-            lease: self.lease,
-            overload: false,
-            task_meta: None,
-            payload_owner: self.owner,
-        }
     }
 }
 
@@ -495,45 +337,21 @@ impl Outcome {
 pub async fn write_tracked(
     request: WriteRequest,
     launch: Arc<LaunchContext>,
-    render: Render,
     input_owner: crate::lease::Owner,
 ) -> TrackedResult {
-    write_with_permit(request, launch, render, None, input_owner).await
-}
-
-pub(crate) async fn write_nested(
-    request: WriteRequest,
-    launch: Arc<LaunchContext>,
-    render: Render,
-    permit: tokio::sync::OwnedSemaphorePermit,
-    input_owner: crate::lease::Owner,
-) -> TrackedResult {
-    write_with_permit(request, launch, render, Some(permit), input_owner).await
-}
-
-async fn write_with_permit(
-    request: WriteRequest,
-    launch: Arc<LaunchContext>,
-    render: Render,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    input_owner: crate::lease::Owner,
-) -> TrackedResult {
-    let effective = render.effective();
-    let outcome = write_core(request, launch, permit, input_owner).await;
+    let outcome = write_core(request, launch, None, input_owner).await;
     let owner = outcome.owner.clone();
     let (result, overload) = outcome.run(|res| match res {
-        Ok(FileWriteData { path, bytes }) => {
+        Ok(FileWriteData { path, .. }) => {
             let text = format!("Successfully wrote to {path}");
-            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-            result.structured_content = Some(json!({ "ok": true, "path": path, "bytes": bytes }));
-            (result, false)
+            (CallToolResult::success(vec![ContentBlock::text(text)]), false)
         }
         Err(FileError::Overload(message)) => (failed(message), true),
         Err(err) => (failed(err.into_message()), false),
     });
     TrackedResult {
         overload,
-        ..TrackedResult::owned(service_render::suppress(result, effective), owner)
+        ..TrackedResult::owned(result, owner)
     }
 }
 
@@ -541,110 +359,36 @@ async fn write_with_permit(
 pub async fn edit_tracked(
     request: EditRequest,
     launch: Arc<LaunchContext>,
-    render: Render,
     input_owner: crate::lease::Owner,
 ) -> TrackedResult {
-    edit_with_permit(request, launch, render, None, input_owner).await
-}
-
-pub(crate) async fn edit_nested(
-    request: EditRequest,
-    launch: Arc<LaunchContext>,
-    render: Render,
-    permit: tokio::sync::OwnedSemaphorePermit,
-    input_owner: crate::lease::Owner,
-) -> TrackedResult {
-    edit_with_permit(request, launch, render, Some(permit), input_owner).await
-}
-
-async fn edit_with_permit(
-    request: EditRequest,
-    launch: Arc<LaunchContext>,
-    render: Render,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    input_owner: crate::lease::Owner,
-) -> TrackedResult {
-    let effective = render.effective();
-    let outcome = edit_core(request, launch, permit, input_owner).await;
+    let outcome = edit_core(request, launch, None, input_owner).await;
     let owner = outcome.owner.clone();
     let (result, overload) = outcome.run(|res| match res {
         Ok(data) => {
-            let (text, structured) = edit_data_to_agent(data);
-            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-            result.structured_content = Some(structured);
-            (result, false)
+            let mut text = format!(
+                "Successfully replaced {} block(s) in {}.",
+                data.replacements, data.path
+            );
+            for (index, item) in data.edits.iter().enumerate() {
+                text.push_str(&format!("\nedits[{index}]: line {}", item.line));
+                if item.fuzzy {
+                    text.push_str(" (fuzzy match)");
+                }
+            }
+            (CallToolResult::success(vec![ContentBlock::text(text)]), false)
         }
         Err(EditError {
             error: FileError::Overload(message),
             ..
         }) => (failed(message), true),
-        Err(err) => (edit_error_to_agent(err), false),
+        Err(err) => (failed(err.error.into_message()), false),
     });
     TrackedResult {
         overload,
-        ..TrackedResult::owned(service_render::suppress(result, effective), owner)
+        ..TrackedResult::owned(result, owner)
     }
 }
 
-pub(super) fn edit_data_to_agent(data: FileEditData) -> (String, Value) {
-    let mut text = format!(
-        "Successfully replaced {} block(s) in {}.",
-        data.replacements, data.path
-    );
-    for (index, item) in data.edits.iter().enumerate() {
-        text.push_str(&format!("\nedits[{index}]: line {}", item.line));
-        if item.fuzzy {
-            text.push_str(" (fuzzy match)");
-        }
-    }
-    let structured = json!({
-        "ok": true,
-        "path": data.path,
-        "replacements": data.replacements,
-        "edits": data.edits,
-    });
-    (text, structured)
-}
-
-fn edit_error_to_agent(err: EditError) -> CallToolResult {
-    match err.failures {
-        Some(failures) => {
-            let message = err.error.into_message();
-            let structured = json!({
-                "ok": false,
-                "error": message,
-                "path": err.path.unwrap_or_default(),
-                "failures": failures,
-            });
-            let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
-            result.structured_content = Some(structured);
-            result
-        }
-        None => failed(err.error.into_message()),
-    }
-}
-
-#[cfg(test)]
-pub(super) type BlockingOutcome = Result<(String, Value), (String, Option<Value>)>;
-
-#[cfg(test)]
-pub(super) async fn write(
-    request: WriteRequest,
-    launch: Arc<LaunchContext>,
-    render: Render,
-    input_owner: crate::lease::Owner,
-) -> CallToolResult {
-    write_tracked(request, launch, render, input_owner)
-        .await
-        .result
-}
-
-pub(super) fn failed(message: String) -> CallToolResult {
-    let mut result = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
-    result.structured_content = Some(json!({ "ok": false, "error": message }));
-    result
-}
-
-fn schema_failed(message: String) -> CallToolResult {
+fn failed(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }

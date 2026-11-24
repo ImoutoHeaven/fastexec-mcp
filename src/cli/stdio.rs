@@ -1,7 +1,7 @@
 //! MCP stdio transport, request-ID memory leases, and the stdio server entrypoint.
 
 use crate::config::{
-    TRANSFER_ADDR, Tools, check_routable_addr, instructions_file, instructions_tool_mode, render,
+    TRANSFER_ADDR, Tools, check_routable_addr, instructions_file, instructions_tool_mode,
     transfer_addr,
 };
 use crate::endpoint;
@@ -339,13 +339,6 @@ where
 
 #[tokio::main]
 pub(crate) async fn serve() {
-    let render = match render() {
-        Ok(render) => render,
-        Err(message) => {
-            eprintln!("fastexec: {message}");
-            std::process::exit(1);
-        }
-    };
     let tools = match Tools::from_env() {
         Ok(tools) => tools,
         Err(message) => {
@@ -409,7 +402,7 @@ pub(crate) async fn serve() {
         }
     };
     let (backend, tasks, transfer_endpoint, transfer_stop) = if daemon {
-        let endpoint = match endpoint::Endpoint::new(Arc::clone(&launch), render) {
+        let endpoint = match endpoint::Endpoint::new(Arc::clone(&launch)) {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 eprintln!("fastexec: cannot name this endpoint's session: {error}");
@@ -465,7 +458,6 @@ pub(crate) async fn serve() {
         };
         let backend = Backend::Local {
             service: Arc::new(Service::new(Arc::clone(&tasks), false)),
-            render,
             session: Arc::new(OnceLock::new()),
             launch: Arc::clone(&launch),
             daemon: false,

@@ -185,10 +185,11 @@ pub struct Request {
 
 /// Output options shared by start and poll.
 pub(crate) struct View {
-    pub(super) nested: bool,
+    pub(super) inline_markers: bool,
+    pub(super) keep_nul: bool,
     pub(super) owned_by_script: bool,
     pub(super) truncate: Truncate,
-    pub(super) max_bytes: usize,
+    pub(crate) max_bytes: usize,
     pub(super) raw: bool,
     pub(super) encoding: Option<&'static encoding_rs::Encoding>,
     pub(super) screen: bool,
@@ -479,7 +480,8 @@ pub(crate) fn validate(request: &Request, policy: ExecPolicy) -> Result<View, St
         policy.default_truncate
     };
     Ok(View {
-        nested: !policy.inline_markers,
+        inline_markers: policy.inline_markers,
+        keep_nul: policy.keep_nul,
         owned_by_script: false,
         truncate: request.truncate.unwrap_or(default_truncate),
         max_bytes: request

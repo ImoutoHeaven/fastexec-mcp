@@ -77,26 +77,14 @@ pub struct TextSlice {
     pub lease: Lease,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageTransform {
-    pub original_bytes: u64,
-    pub original_width: u32,
-    pub original_height: u32,
-    pub width: u32,
-    pub height: u32,
-}
-
 #[derive(Debug)]
 pub enum MediaPayload {
     Inline {
         kind: MediaKind,
-        path: String,
         resolved_path: PathBuf,
         mime_type: String,
-        bytes: u64,
         encoded_base64: String,
         summary_line: String,
-        image_transform: Option<ImageTransform>,
         lease: Lease,
     },
     Descriptor {
@@ -549,22 +537,12 @@ fn read_media_core(
                     summary_line.push('\n');
                     summary_line.push_str(hint);
                 }
-                let image_transform = compressed.transformed.then_some(ImageTransform {
-                    original_bytes: compressed.original_bytes,
-                    original_width: compressed.original_width,
-                    original_height: compressed.original_height,
-                    width: compressed.width,
-                    height: compressed.height,
-                });
                 return Ok(MediaPayload::Inline {
                     kind: MediaKind::Image,
-                    path: shown_path,
                     resolved_path: resolved.to_path_buf(),
                     mime_type: compressed.mime,
-                    bytes: sent_bytes,
                     encoded_base64: encoded,
                     summary_line,
-                    image_transform,
                     lease,
                 });
             }
@@ -610,13 +588,10 @@ fn read_media_core(
     );
     Ok(MediaPayload::Inline {
         kind: detected.kind,
-        path: shown_path,
         resolved_path: resolved.to_path_buf(),
         mime_type: detected.mime.to_owned(),
-        bytes: sent_bytes,
         encoded_base64: encoded,
         summary_line,
-        image_transform: None,
         lease,
     })
 }

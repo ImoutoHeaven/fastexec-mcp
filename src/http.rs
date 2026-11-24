@@ -4,7 +4,6 @@
 use crate::config::{InstructionsToolMode, Tools};
 use crate::daemon::Daemon;
 use crate::mcp::{Backend, Server};
-use crate::service::render::Render;
 use crate::session::{LaunchContext, Session};
 use crate::transfer::{self, Admitted, TransferEndpoint, Transfers};
 use bytes::Bytes;
@@ -53,14 +52,11 @@ const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The value that names the address clients reach, when a proxy stands in front of the listener.
 pub const PUBLIC_URL: &str = "FASTEXEC_PUBLIC_URL";
 
-/// The daemon's HTTP front door: one listener, the token digests that admit requests, and the
-/// render its sessions use.
+/// The daemon's HTTP front door: one listener and the token digests that admit requests.
 pub struct Http {
     pub listener: TcpListener,
     /// The SHA-256 digests of tokens accepted as `Authorization: Bearer`.
     pub digests: Vec<[u8; 32]>,
-    /// How results are rendered for the sessions this listener serves.
-    pub render: Render,
     /// Which optional tools and annotation overrides HTTP sessions advertise.
     pub tools: Tools,
     /// What the sessions this listener serves inherit: captured before the daemon leaves the
@@ -225,7 +221,6 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     let Http {
         listener,
         digests,
-        render,
         tools,
         launch,
         public_root,
@@ -271,7 +266,6 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
             let launch = Arc::new(launch.for_session());
             let backend = Backend::Local {
                 service: Arc::clone(&service),
-                render,
                 session: Arc::new(OnceLock::new()),
                 launch: Arc::clone(&launch),
                 daemon: true,
