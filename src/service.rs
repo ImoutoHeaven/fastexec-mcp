@@ -147,9 +147,6 @@ pub(crate) enum PreparedExec {
 }
 
 pub(crate) struct PreparedWindow {
-    // Drop-order invariant: `workspace` and `permit` MUST be declared before `read` (`read_gate`).
-    pub(crate) workspace: Lease,
-    pub(crate) permit: Option<Arc<OwnedSemaphorePermit>>,
     pub(crate) metadata: RenderSnapshot,
     pub(crate) script: Option<ScriptReport>,
     pub(crate) unseen: Vec<AttachmentLease>,
@@ -165,13 +162,13 @@ pub(crate) struct PreparedWindow {
     pub(crate) ended: Option<WaitEnd>,
     pub(crate) startup_warning: Option<ProbeWarning>,
     pub(crate) mark_session_entry: bool,
+    // Drop data, its workspace and render permit before unlocking the reader.
+    pub(crate) workspace: Lease,
+    pub(crate) permit: Option<Arc<OwnedSemaphorePermit>>,
     pub(crate) read: StagedRead,
 }
 
 pub(crate) struct PreparedTranscript {
-    // Drop-order invariant: `workspace` and `permit` MUST be declared before `read`.
-    pub(crate) workspace: Lease,
-    pub(crate) permit: Option<Arc<OwnedSemaphorePermit>>,
     pub(crate) metadata: RenderSnapshot,
     pub(crate) window: Window,
     pub(crate) transcript_path: String,
@@ -186,13 +183,13 @@ pub(crate) struct PreparedTranscript {
     pub(crate) reader: Arc<Reader>,
     pub(crate) view: View,
     pub(crate) mark_session_entry: bool,
+    // Drop data, its workspace and render permit before unlocking the reader.
+    pub(crate) workspace: Lease,
+    pub(crate) permit: Option<Arc<OwnedSemaphorePermit>>,
     pub(crate) read: StagedRead,
 }
 
 pub(crate) struct PreparedScreen {
-    // Drop-order invariant: `workspace` and `permit` MUST be declared before `read`.
-    pub(crate) workspace: Lease,
-    pub(crate) permit: Option<Arc<OwnedSemaphorePermit>>,
     pub(crate) metadata: RenderSnapshot,
     pub(crate) screen_rows: Vec<String>,
     pub(crate) cols: u16,
@@ -207,17 +204,20 @@ pub(crate) struct PreparedScreen {
     pub(crate) ended: WaitEnd,
     pub(crate) startup_warning: Option<ProbeWarning>,
     pub(crate) mark_session_entry: bool,
+    // Drop data, its workspace and render permit before unlocking the reader.
+    pub(crate) workspace: Lease,
+    pub(crate) permit: Option<Arc<OwnedSemaphorePermit>>,
     pub(crate) read: StagedRead,
 }
 
 pub(crate) struct PreparedList {
-    pub(crate) workspace: Lease,
-    pub(crate) permit: Option<Arc<OwnedSemaphorePermit>>,
     pub(crate) total_count: usize,
     pub(crate) items: Vec<ListedTask>,
     pub(crate) parent_filter: Option<String>,
     pub(crate) state_filter: Option<ListState>,
     pub(crate) view: View,
+    pub(crate) workspace: Lease,
+    pub(crate) permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 impl PreparedList {
@@ -895,7 +895,7 @@ impl Service {
                 ServiceError::Overload(overload_task_message(pool.limit(), &meta), Some(meta))
             })?;
         let encoding = view.encoding.unwrap_or(task.encoding);
-        let mut metadata = RenderSnapshot::new(&task, launch, action)?;
+        let initial_metadata = RenderSnapshot::new(&task, launch, action)?;
         let clean = !task.is_script();
         let keep_nul = view.keep_nul;
         let include_markers = view.inline_markers;
@@ -903,36 +903,39 @@ impl Service {
         let initial_seen = state.attachments_seen;
         let truncate = view.truncate;
         let raw = view.raw;
-        // Tuple drops left-to-right: `workspace` and `permit` release before `read` (`read_gate`).
-        let (window, unseen, had_new_text, workspace, permit, read) =
-            tokio::task::spawn_blocking(move || {
-                let workspace = workspace;
-                let mut read = StagedRead::new(state);
-                let start = read.state.cursor;
-                let window = reader.read_window_with_markers(
-                    &mut read.state,
-                    truncate,
-                    budget,
-                    raw,
-                    clean,
-                    keep_nul,
-                    include_markers,
-                    encoding,
-                    None,
-                );
-                let had_new_text = read.state.cursor > start;
-                let unseen = if window.is_ok() {
-                    reader.unseen_attachments(initial_seen)
-                } else {
-                    Vec::new()
-                };
-                (window, unseen, had_new_text, workspace, permit, read)
-            })
-            .await
-            .map_err(|error| format!("Internal failure while reading output: {error}."))?;
-        let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
+        let staged = (workspace, permit, StagedRead::new(state));
+        let pending = tokio::task::spawn_blocking(move || {
+            let mut held = staged;
+            let start = held.2.state.cursor;
+            let window = reader.read_window_with_markers(
+                &mut held.2.state,
+                truncate,
+                budget,
+                raw,
+                clean,
+                keep_nul,
+                include_markers,
+                encoding,
+                None,
+            );
+            let had_new_text = held.2.state.cursor > start;
+            let unseen = if window.is_ok() {
+                reader.unseen_attachments(initial_seen)
+            } else {
+                Vec::new()
+            };
+            (window, unseen, had_new_text, held)
+        })
+        .await
+        .map_err(|error| format!("Internal failure while reading output: {error}."))?;
+        // Preserve the owner tuple until all fallible preparation has finished.
+        let mut metadata = initial_metadata;
+        let window = pending
+            .0
+            .map_err(|error| format!("Cannot read the task log: {error}."))?;
         metadata.refresh(&task, launch, action)?;
         let script = script_report(&self.tasks, &task, launch, action)?;
+        let (_, unseen, had_new_text, (workspace, permit, read)) = pending;
         Ok(PreparedExec::Window(Box::new(PreparedWindow {
             workspace,
             permit,
@@ -971,17 +974,16 @@ impl Service {
         mark_session_entry: bool,
     ) -> Result<PreparedExec, ServiceError> {
         let launch = ctx.launch();
-        let metadata = RenderSnapshot::new(&task, launch, action)?;
+        let initial_metadata = RenderSnapshot::new(&task, launch, action)?;
         let screen = task
             .screen(launch.memory())
             .map_err(|error| task_read_error(error, &task))?;
         let (reader, until) = (Arc::clone(&task), screen.log_end);
-        // Tuple drops left-to-right: `screen` (lease) and `permit` release before `read`.
-        let (window, screen, permit, read) = tokio::task::spawn_blocking(move || {
-            let owned_screen = screen;
-            let mut read = StagedRead::new(state);
+        let staged = (screen, permit, StagedRead::new(state));
+        let pending = tokio::task::spawn_blocking(move || {
+            let mut held = staged;
             let window = reader.read_window_with_markers(
-                &mut read.state,
+                &mut held.2.state,
                 Truncate::Tail,
                 MIN_BODY_BUDGET,
                 false,
@@ -991,11 +993,15 @@ impl Service {
                 reader.encoding,
                 Some(until),
             );
-            (window, owned_screen, permit, read)
+            (window, held)
         })
         .await
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
-        let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
+        let metadata = initial_metadata;
+        let window = pending
+            .0
+            .map_err(|error| format!("Cannot read the task log: {error}."))?;
+        let (_, (screen, permit, read)) = pending;
         Ok(PreparedExec::Screen(Box::new(PreparedScreen {
             workspace: screen._lease,
             permit,
@@ -1039,9 +1045,8 @@ impl Service {
             &task_reader,
         )
         .await?;
-        let metadata = RenderSnapshot::new(&task, launch, Action::Transcript)?;
+        let initial_metadata = RenderSnapshot::new(&task, launch, Action::Transcript)?;
         let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
-        let first_permit = permit.clone();
         let memory = Arc::clone(launch.memory());
         let workspace = memory
             .try_acquire(text_workspace_bytes(view.max_bytes))
@@ -1052,15 +1057,16 @@ impl Service {
                 };
                 ServiceError::Overload(overload_task_message(memory.limit(), &meta), Some(meta))
             })?;
-        let (transcript, workspace, _first_permit, read) = tokio::task::spawn_blocking(move || {
-            let owned_workspace = workspace;
-            let read = StagedRead::new(state);
-            let transcript = reader.transcript(&tasks, &read.state, &memory);
-            (transcript, owned_workspace, first_permit, read)
+        let staged = (workspace, permit, StagedRead::new(state));
+        let pending = tokio::task::spawn_blocking(move || {
+            let held = staged;
+            let transcript = reader.transcript(&tasks, &held.2.state, &memory);
+            (transcript, held)
         })
         .await
         .map_err(|error| format!("Internal failure while reading: {error}."))?;
-        let transcript = transcript.map_err(|error| task_read_error(error, &task))?;
+        let metadata = initial_metadata;
+        let transcript = pending.0.map_err(|error| task_read_error(error, &task))?;
         let pending_lines = transcript.pending.matches('\n').count() as u64;
         let total = transcript.lines + pending_lines;
         let transcript_path = files::path::display_path(&transcript.path);
@@ -1094,50 +1100,53 @@ impl Service {
             source: "transcript",
         };
         let logged = Arc::clone(&task);
-        let (window, (snapshot_owner, workspace), permit, read) =
-            tokio::task::spawn_blocking(move || {
-                let held = (transcript._lease, workspace);
-                let mut read = read;
-                fn read_into(
-                    path: &std::path::Path,
-                    start: u64,
-                    bytes: u64,
-                    builder: &mut WindowBuilder<'_>,
-                ) -> std::io::Result<()> {
-                    let mut file = File::open(path)?;
-                    file.seek(SeekFrom::Start(start))?;
-                    let mut remaining = bytes - start;
-                    let mut buffer = vec![0_u8; 64 * 1024];
-                    while remaining > 0 {
-                        let want = remaining.min(buffer.len() as u64) as usize;
-                        file.read_exact(&mut buffer[..want])?;
-                        builder.push(&buffer[..want]);
-                        remaining -= want as u64;
-                    }
-                    Ok(())
+        let descriptions = (
+            metadata,
+            transcript_path,
+            transcript_error,
+            transcript_warnings,
+        );
+        let staged = (transcript, pending.1);
+        let pending = tokio::task::spawn_blocking(move || {
+            let mut held = staged;
+            fn read_into(
+                path: &std::path::Path,
+                start: u64,
+                bytes: u64,
+                builder: &mut WindowBuilder<'_>,
+            ) -> std::io::Result<()> {
+                let mut file = File::open(path)?;
+                file.seek(SeekFrom::Start(start))?;
+                let mut remaining = bytes - start;
+                let mut buffer = vec![0_u8; 64 * 1024];
+                while remaining > 0 {
+                    let want = remaining.min(buffer.len() as u64) as usize;
+                    file.read_exact(&mut buffer[..want])?;
+                    builder.push(&buffer[..want]);
+                    remaining -= want as u64;
                 }
-                let mut cleaner = Cleaner::default();
-                let mut builder = WindowBuilder::new(spec, &mut cleaner, transcript.first_line);
-                let window = match read_into(
-                    &transcript.path,
-                    transcript.start,
-                    transcript.bytes,
-                    &mut builder,
-                ) {
-                    Err(_) if logged.evicted() => Err(EVICTED_TRANSCRIPT.to_string()),
-                    Err(error) => Err(format!("Cannot read the transcript file: {error}.")),
-                    Ok(()) => {
-                        builder.push(transcript.pending.as_bytes());
-                        read.state.shown = (transcript.bytes, transcript.lines);
-                        Ok(builder.finish())
-                    }
-                };
-                (window, held, permit, read)
-            })
-            .await
-            .map_err(|error| format!("Internal failure while reading: {error}."))?;
-        drop(snapshot_owner);
-        let window = window?;
+                Ok(())
+            }
+            let mut cleaner = Cleaner::default();
+            let mut builder = WindowBuilder::new(spec, &mut cleaner, held.0.first_line);
+            let window = match read_into(&held.0.path, held.0.start, held.0.bytes, &mut builder) {
+                Err(_) if logged.evicted() => Err(EVICTED_TRANSCRIPT.to_string()),
+                Err(error) => Err(format!("Cannot read the transcript file: {error}.")),
+                Ok(()) => {
+                    builder.push(held.0.pending.as_bytes());
+                    held.1.2.state.shown = (held.0.bytes, held.0.lines);
+                    Ok(builder.finish())
+                }
+            };
+            let (transcript, staged) = held;
+            drop(transcript);
+            (window, staged)
+        })
+        .await
+        .map_err(|error| format!("Internal failure while reading: {error}."))?;
+        let (metadata, transcript_path, transcript_error, transcript_warnings) = descriptions;
+        let window = pending.0?;
+        let (_, (workspace, permit, read)) = pending;
         Ok(PreparedExec::Transcript(Box::new(PreparedTranscript {
             workspace,
             permit,
@@ -1378,8 +1387,8 @@ async fn read_gate(
 
 /// A blocking read owns the gate, but only a delivered result commits its working copy.
 pub(crate) struct StagedRead {
-    pub(crate) guard: tokio::sync::OwnedMutexGuard<ReadState>,
     pub(crate) state: ReadState,
+    pub(crate) guard: tokio::sync::OwnedMutexGuard<ReadState>,
 }
 
 impl StagedRead {

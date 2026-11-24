@@ -541,11 +541,11 @@ fn list_task_dto<'a>(
 /// 2. Resize existing held lease in place to `max(held, retained_data + wire_len)` (falling back
 ///    to `control_memory()` for `Kill`/`List`).
 /// 3. Reserve `wire_len` on `script.reserve_result(pending_id, wire_len)` once.
-/// 4. Serialize into `Vec::with_capacity(wire_len)` and return `(text, lease)` so the caller can
-///    commit state and drop raw data BEFORE calling `lease.shrink_to(text.capacity())`.
+/// 4. Serialize the result, then transfer the lease on success.
+///    Failure leaves the caller's raw data charged; success drops data before shrinking.
 fn admit_bridge_result<T: Serialize>(
     envelope: &T,
-    held_lease: Option<Lease>,
+    held_lease: Option<&mut Lease>,
     retained_data: usize,
     launch: &LaunchContext,
     delivery: &ProgramDelivery<'_>,
@@ -564,8 +564,9 @@ fn admit_bridge_result<T: Serialize>(
     let Some(peak) = retained_data.checked_add(wire_len) else {
         return Err(ProgramOutcome::memory(task_meta));
     };
+    let mut new_lease;
     let lease = match held_lease {
-        Some(mut existing) => {
+        Some(existing) => {
             let target = existing.bytes().max(peak);
             if target > existing.bytes() && !existing.try_grow(target - existing.bytes()) {
                 let replacement = launch.memory().try_acquire(target).or_else(|| {
@@ -576,7 +577,7 @@ fn admit_bridge_result<T: Serialize>(
                 let Some(replacement) = replacement else {
                     return Err(ProgramOutcome::memory(task_meta));
                 };
-                existing = replacement;
+                *existing = replacement;
             }
             existing
         }
@@ -590,7 +591,8 @@ fn admit_bridge_result<T: Serialize>(
             let Some(acquired) = acquired else {
                 return Err(ProgramOutcome::memory(task_meta));
             };
-            acquired
+            new_lease = acquired;
+            &mut new_lease
         }
     };
     if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -612,7 +614,7 @@ fn admit_bridge_result<T: Serialize>(
         ));
     }
     let text = String::from_utf8(buf).expect("JSON serialization emits UTF-8");
-    Ok((text, lease))
+    Ok((text, lease.split_off(lease.bytes())))
 }
 
 pub(crate) fn encode_exec_program(
@@ -757,7 +759,6 @@ fn encode_window(
     let io_msg = (!io_ok).then(|| io_failure_message(snapshot));
     let retained_data = prepared.window.text.capacity();
     let launch = ctx.launch();
-    let workspace = std::mem::replace(&mut prepared.workspace, Lease::empty(launch.memory()));
 
     let encoded = if io_ok {
         let envelope = OkEnvelope {
@@ -766,7 +767,7 @@ fn encode_window(
         };
         admit_bridge_result(
             &envelope,
-            Some(workspace),
+            Some(&mut prepared.workspace),
             retained_data,
             launch,
             delivery,
@@ -782,7 +783,7 @@ fn encode_window(
         };
         admit_bridge_result(
             &envelope,
-            Some(workspace),
+            Some(&mut prepared.workspace),
             retained_data,
             launch,
             delivery,
@@ -792,9 +793,11 @@ fn encode_window(
     };
 
     drop(dto);
+    drop(io_msg);
     match encoded {
         Ok((text, mut lease)) => {
             registrations.disarm();
+            drop(registrations);
             if let Some(warning) = prepared.startup_warning.take() {
                 warning.commit();
             }
@@ -808,9 +811,11 @@ fn encode_window(
             drop(prepared.window);
             drop(prepared.metadata);
             drop(prepared.script);
+            drop(prepared.ended);
+            drop(prepared.unseen);
+            lease.shrink_to(text.capacity());
             drop(prepared.permit);
             drop(state);
-            lease.shrink_to(text.capacity());
             ProgramOutcome::value(text, lease)
         }
         Err(outcome) => outcome,
@@ -883,7 +888,6 @@ fn encode_transcript(
     let io_msg = (!io_ok).then(|| io_failure_message(snapshot));
     let retained_data = prepared.window.text.capacity();
     let launch = ctx.launch();
-    let workspace = std::mem::replace(&mut prepared.workspace, Lease::empty(launch.memory()));
 
     let encoded = if io_ok {
         let envelope = OkEnvelope {
@@ -892,7 +896,7 @@ fn encode_transcript(
         };
         admit_bridge_result(
             &envelope,
-            Some(workspace),
+            Some(&mut prepared.workspace),
             retained_data,
             launch,
             delivery,
@@ -908,7 +912,7 @@ fn encode_transcript(
         };
         admit_bridge_result(
             &envelope,
-            Some(workspace),
+            Some(&mut prepared.workspace),
             retained_data,
             launch,
             delivery,
@@ -918,6 +922,7 @@ fn encode_transcript(
     };
 
     drop(dto);
+    drop(io_msg);
     match encoded {
         Ok((text, mut lease)) => {
             let state = prepared.read.commit();
@@ -928,9 +933,12 @@ fn encode_transcript(
             }
             drop(prepared.window);
             drop(prepared.metadata);
+            drop(prepared.transcript_path);
+            drop(prepared.transcript_error);
+            drop(prepared.transcript_warnings);
+            lease.shrink_to(text.capacity());
             drop(prepared.permit);
             drop(state);
-            lease.shrink_to(text.capacity());
             ProgramOutcome::value(text, lease)
         }
         Err(outcome) => outcome,
@@ -1007,7 +1015,6 @@ fn encode_screen(
     let io_msg = (!io_ok).then(|| io_failure_message(snapshot));
     let retained_data = body.capacity();
     let launch = ctx.launch();
-    let workspace = std::mem::replace(&mut prepared.workspace, Lease::empty(launch.memory()));
 
     let encoded = if io_ok {
         let envelope = OkEnvelope {
@@ -1016,7 +1023,7 @@ fn encode_screen(
         };
         admit_bridge_result(
             &envelope,
-            Some(workspace),
+            Some(&mut prepared.workspace),
             retained_data,
             launch,
             delivery,
@@ -1032,7 +1039,7 @@ fn encode_screen(
         };
         admit_bridge_result(
             &envelope,
-            Some(workspace),
+            Some(&mut prepared.workspace),
             retained_data,
             launch,
             delivery,
@@ -1043,6 +1050,7 @@ fn encode_screen(
 
     drop(dto);
     drop(body);
+    drop(io_msg);
     match encoded {
         Ok((text, mut lease)) => {
             if let Some(warning) = prepared.startup_warning.take() {
@@ -1057,9 +1065,10 @@ fn encode_screen(
             drop(prepared.screen_rows);
             drop(prepared.window);
             drop(prepared.metadata);
+            drop(prepared.ended);
+            lease.shrink_to(text.capacity());
             drop(prepared.permit);
             drop(state);
-            lease.shrink_to(text.capacity());
             ProgramOutcome::value(text, lease)
         }
         Err(outcome) => outcome,
@@ -1118,10 +1127,9 @@ fn encode_list(
         value: &dto,
     };
     let launch = ctx.launch();
-    let workspace = std::mem::replace(&mut prepared.workspace, Lease::empty(launch.memory()));
     let encoded = admit_bridge_result(
         &envelope,
-        Some(workspace),
+        Some(&mut prepared.workspace),
         0,
         launch,
         delivery,
@@ -1131,8 +1139,10 @@ fn encode_list(
     drop(dto);
     match encoded {
         Ok((text, mut lease)) => {
+            let permit = prepared.permit.take();
             prepared.commit_all(ctx.session);
             lease.shrink_to(text.capacity());
+            drop(permit);
             ProgramOutcome::value(text, lease)
         }
         Err(outcome) => outcome,
@@ -1219,10 +1229,9 @@ pub(crate) fn encode_read_program(
                 value: &dto,
             };
             let retained_data = slice.text.capacity();
-            let lease = std::mem::replace(&mut slice.lease, Lease::empty(launch.memory()));
             let encoded = admit_bridge_result(
                 &envelope,
-                Some(lease),
+                Some(&mut slice.lease),
                 retained_data,
                 launch,
                 delivery,
@@ -1417,6 +1426,52 @@ pub(crate) fn encode_edit_program(
                     Err(outcome) => outcome,
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn refused_bridge_admission_keeps_the_callers_workspace_charged() {
+        for cancelled in [false, true] {
+            let memory = crate::lease::BytePool::new(4096);
+            let launch = LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(std::sync::Arc::clone(&memory));
+            let mut lease = memory.try_acquire(4096).unwrap();
+            let body = String::from("retained output");
+            let (script, worker) =
+                crate::codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+            script.test_pending_result(1, 0, if cancelled { 4096 } else { 1 });
+            let cancel = CancellationToken::new();
+            if cancelled {
+                cancel.cancel();
+            }
+            let result = admit_bridge_result(
+                &body,
+                Some(&mut lease),
+                body.capacity(),
+                &launch,
+                &ProgramDelivery {
+                    script: &script,
+                    pending_id: 1,
+                    is_control: false,
+                },
+                Some(&cancel),
+                None,
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                memory.used(),
+                4096,
+                "the raw output still needs its workspace"
+            );
+            drop(body);
+            drop(lease);
+            assert_eq!(memory.used(), 0);
+            drop(worker);
         }
     }
 }

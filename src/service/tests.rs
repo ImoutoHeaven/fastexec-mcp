@@ -9,6 +9,27 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::json;
 use tokio::sync::Semaphore;
 
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Wake, Waker};
+
+struct ReadWake {
+    memory: Arc<crate::lease::BytePool>,
+    slots: Arc<Semaphore>,
+    used: AtomicUsize,
+    permits: AtomicUsize,
+    woken: AtomicBool,
+}
+
+impl Wake for ReadWake {
+    fn wake(self: Arc<Self>) {
+        self.used.store(self.memory.used(), Ordering::Relaxed);
+        self.permits
+            .store(self.slots.available_permits(), Ordering::Relaxed);
+        self.woken.store(true, Ordering::Release);
+    }
+}
+
 fn script_fixture() -> (Arc<Service>, Arc<Tasks>, Arc<Session>) {
     let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
     let service = Arc::new(Service::new(Arc::clone(&tasks), false));
@@ -212,26 +233,6 @@ async fn response_snapshot_owns_its_workspace_and_uses_control_only_for_kill() {
 
 #[test]
 fn response_snapshot_cancellation_releases_metadata_but_keeps_queued_window_owned() {
-    use std::future::Future;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::task::{Context, Wake, Waker};
-
-    struct ReadWake {
-        memory: Arc<crate::lease::BytePool>,
-        slots: Arc<Semaphore>,
-        used: AtomicUsize,
-        permits: AtomicUsize,
-        woken: AtomicBool,
-    }
-
-    impl Wake for ReadWake {
-        fn wake(self: Arc<Self>) {
-            self.used.store(self.memory.used(), Ordering::Relaxed);
-            self.permits
-                .store(self.slots.available_permits(), Ordering::Relaxed);
-            self.woken.store(true, Ordering::Release);
-        }
-    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
@@ -331,6 +332,190 @@ fn response_snapshot_cancellation_releases_metadata_but_keeps_queued_window_owne
         drop(state);
         tasks.shutdown();
     });
+}
+
+#[tokio::test]
+async fn preparation_errors_release_workspace_before_waking_the_next_reader() {
+    for failure in ["log", "transcript", "report"] {
+        let (service, tasks, session) = script_fixture();
+        let (task, entry, _) = tasks
+            .start_script(
+                tasks::ScriptArgs {
+                    code: "text('retained output');".into(),
+                    launch: Arc::clone(&session.launch),
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                "read".into(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+        let reader = entry.reader(Some("next")).unwrap();
+        let metadata = RenderSnapshot::new(&task, &session.launch, Action::Poll).unwrap();
+        let required = text_workspace_bytes(100) + metadata.workspace.bytes();
+        drop(metadata);
+        if failure == "report" {
+            task.script()
+                .unwrap()
+                .record_started(reader.handle(&task.id));
+        } else if failure == "log" {
+            std::fs::remove_file(&task.log_path).unwrap();
+        }
+        let memory = crate::lease::BytePool::new(required);
+        let launch = Arc::new(
+            session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&memory)),
+        );
+        let slots = Arc::new(Semaphore::new(1));
+        let observed = Arc::new(ReadWake {
+            memory: Arc::clone(&memory),
+            slots,
+            used: AtomicUsize::new(usize::MAX),
+            permits: AtomicUsize::new(usize::MAX),
+            woken: AtomicBool::new(false),
+        });
+        let gate = reader.read_gate().lock_owned().await;
+        let waker = Waker::from(Arc::clone(&observed));
+        let mut next_read = Box::pin(reader.read_gate().lock_owned());
+        assert!(
+            next_read
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let mut ctx = script_ctx(&session);
+        ctx.launch = Some(&launch);
+        let request: Request = serde_json::from_value(json!({
+            "action": "poll", "taskId": reader.handle(&task.id), "maxBytes": 100
+        }))
+        .unwrap();
+        let view = validate(&request, ExecPolicy::PROGRAM).unwrap();
+        let result = if failure == "transcript" {
+            service
+                .prepare_transcript(
+                    &ctx,
+                    None,
+                    Arc::clone(&task),
+                    Arc::clone(&entry),
+                    Arc::clone(&reader),
+                    gate,
+                    view,
+                    false,
+                )
+                .await
+        } else {
+            service
+                .prepare_window_or_screen(
+                    &ctx,
+                    None,
+                    Action::Poll,
+                    Arc::clone(&task),
+                    Arc::clone(&entry),
+                    Arc::clone(&reader),
+                    gate,
+                    view,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+        };
+        assert!(
+            result.is_err(),
+            "{failure} must fail after the blocking read"
+        );
+        assert!(observed.woken.load(Ordering::Acquire));
+        assert_eq!(
+            observed.used.load(Ordering::Relaxed),
+            0,
+            "{failure} unlocked before cleanup"
+        );
+        assert_eq!(observed.permits.load(Ordering::Relaxed), 1);
+        let state = next_read.await;
+        assert_eq!((state.cursor, state.attachments_seen), (0, 0));
+        assert!(reader.is_fresh());
+        assert!(!entry.is_reported());
+        drop(state);
+        tasks.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn program_result_shrinks_workspace_before_waking_the_next_reader() {
+    let (service, tasks, session, entry) = list_fixture().await;
+    let task = tasks.all().pop().unwrap();
+    let reader = entry.reader(Some("next")).unwrap();
+    let memory = crate::lease::BytePool::new(2 << 20);
+    let launch = Arc::new(
+        session
+            .launch
+            .for_session()
+            .with_memory(Arc::clone(&memory)),
+    );
+    let mut ctx = script_ctx(&session);
+    ctx.launch = Some(&launch);
+    let request = serde_json::from_value(json!({
+        "action": "poll", "taskId": reader.handle(&task.id), "waitMs": 0, "maxBytes": 100
+    }))
+    .unwrap();
+    let PreparedExec::Window(mut prepared) = service
+        .exec_core(request, ExecPolicy::PROGRAM, &mut ctx, None)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a window");
+    };
+    let slots = Arc::new(Semaphore::new(1));
+    prepared.permit = Some(Arc::new(Arc::clone(&slots).try_acquire_owned().unwrap()));
+    let observed = Arc::new(ReadWake {
+        memory: Arc::clone(&memory),
+        slots,
+        used: AtomicUsize::new(usize::MAX),
+        permits: AtomicUsize::new(usize::MAX),
+        woken: AtomicBool::new(false),
+    });
+    let waker = Waker::from(Arc::clone(&observed));
+    let mut next_read = Box::pin(reader.read_gate().lock_owned());
+    assert!(
+        next_read
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+    script.test_pending_result(1, 0, 16 << 10);
+    let encoded = codemode::encode::encode_exec_program(
+        PreparedExec::Window(prepared),
+        &ctx,
+        &ProgramDelivery {
+            script: &script,
+            pending_id: 1,
+            is_control: false,
+        },
+    );
+    let codemode::control::Outcome::Value(payload) = encoded.outcome else {
+        panic!("expected a Program result");
+    };
+    assert!(observed.woken.load(Ordering::Acquire));
+    assert_eq!(
+        observed.used.load(Ordering::Relaxed),
+        payload.value.capacity()
+    );
+    assert_eq!(observed.permits.load(Ordering::Relaxed), 1);
+    drop(next_read.await);
+    drop(payload);
+    assert_eq!(memory.used(), 0);
+    drop(worker);
+    tasks.shutdown();
 }
 
 #[tokio::test]
