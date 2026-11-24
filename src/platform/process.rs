@@ -345,13 +345,10 @@ pub(crate) fn msys_signal_exit(code: i32) -> i32 {
 /// Creates a command that never allocates a console window on Windows.
 #[cfg(windows)]
 pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    #[allow(unused_mut)]
+    use std::os::windows::process::CommandExt;
+
     let mut command = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    }
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     command
 }
 
