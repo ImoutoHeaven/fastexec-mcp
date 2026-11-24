@@ -598,7 +598,10 @@ fn admit_bridge_result<T: Serialize>(
             "Cancelled before nested output was committed.",
         ));
     }
-    if !delivery.script.reserve_result(delivery.pending_id, wire_len) {
+    if !delivery
+        .script
+        .reserve_result(delivery.pending_id, wire_len)
+    {
         return Err(ProgramOutcome::limit());
     }
     let mut buf = Vec::with_capacity(wire_len);
@@ -1257,15 +1260,8 @@ pub(crate) fn encode_read_program(
                 ok: true,
                 value: &dto,
             };
-            let encoded = admit_bridge_result(
-                &envelope,
-                None,
-                0,
-                launch,
-                delivery,
-                Some(cancel),
-                None,
-            );
+            let encoded =
+                admit_bridge_result(&envelope, None, 0, launch, delivery, Some(cancel), None);
             drop(path);
             drop(mime_type);
             drop(note);

@@ -851,11 +851,17 @@ fn two_sessions_send_their_input_whole() {
     for (endpoint, call) in [(&mut first, first_call), (&mut second, second_call)] {
         let message = endpoint.response(call);
         assert!(message["result"]["isError"] != json!(true), "{message}");
-        assert!(message["result"].get("structuredContent").is_none(), "{message}");
+        assert!(
+            message["result"].get("structuredContent").is_none(),
+            "{message}"
+        );
     }
     let (text, error) = first.call(json!({"action": "poll", "taskId": id, "waitMs": 30000}));
     assert!(!error, "{text}");
-    assert!(Endpoint::status_line(&text).starts_with("[exited "), "{text}");
+    assert!(
+        Endpoint::status_line(&text).starts_with("[exited "),
+        "{text}"
+    );
     let bare = id.split_once('.').unwrap().0;
     let (log, error) = first.call(json!({"action": "poll", "taskId": bare, "waitMs": 0}));
     assert!(!error, "{log}");
@@ -985,7 +991,10 @@ fn a_task_outlives_the_endpoint_that_started_it() {
     let (text, error) = second.call(json!({"action": "poll", "taskId": id, "waitMs": 5000}));
     assert!(!error, "{text}");
     assert!(text.contains("one"), "{text}");
-    assert!(Endpoint::status_line(&text).starts_with("[running] "), "{text}");
+    assert!(
+        Endpoint::status_line(&text).starts_with("[running] "),
+        "{text}"
+    );
 
     let (text, error) = second.call(json!({"action": "list"}));
     assert!(!error, "{text}");
@@ -997,7 +1006,10 @@ fn a_task_outlives_the_endpoint_that_started_it() {
 
     let (text, error) = second.call(json!({"action": "kill", "taskId": id}));
     assert!(!error, "{text}");
-    assert!(!Endpoint::status_line(&text).starts_with("[running] "), "{text}");
+    assert!(
+        !Endpoint::status_line(&text).starts_with("[running] "),
+        "{text}"
+    );
     second.close();
 }
 
@@ -1363,7 +1375,10 @@ fn a_cancelled_call_does_not_disturb_another_call_on_the_same_endpoint() {
     // Cancelling the wait did not touch the task.
     let (text, error) = endpoint.call(json!({"action": "poll", "taskId": id, "waitMs": 0}));
     assert!(!error, "{text}");
-    assert!(Endpoint::status_line(&text).starts_with("[running] "), "{text}");
+    assert!(
+        Endpoint::status_line(&text).starts_with("[running] "),
+        "{text}"
+    );
     endpoint.call(json!({"action": "kill", "taskId": id}));
     endpoint.close();
 }
@@ -1651,7 +1666,10 @@ fn a_foreground_daemon_announces_readiness_and_a_status_finds_it() {
         "waitMs": 0
     }));
     assert!(!error, "{text}");
-    assert!(Endpoint::status_line(&text).starts_with("[running] "), "{text}");
+    assert!(
+        Endpoint::status_line(&text).starts_with("[running] "),
+        "{text}"
+    );
     let id = Endpoint::task_id(&text);
     // The same daemon served it: no second one was started behind the endpoint.
     let (_, after, err) = fixture.run(&["daemon", "status"]);
@@ -1764,7 +1782,10 @@ fn a_stopped_foreground_daemon_ends_and_takes_its_task_with_it() {
         "returnWhen": {"outputContains": ["READY"]}
     }));
     assert!(!error, "{text}");
-    assert!(Endpoint::status_line(&text).starts_with("[running] "), "{text}");
+    assert!(
+        Endpoint::status_line(&text).starts_with("[running] "),
+        "{text}"
+    );
     let _id = Endpoint::task_id(&text);
     let task = printed_pid(&text);
     assert!(
@@ -2088,10 +2109,7 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
     );
     let scaled_wide_text = scaled_wide["content"][0]["text"].as_str().unwrap();
     assert!(scaled_wide_text.contains("2000"), "{scaled_wide}");
-    assert!(
-        scaled_wide_text.contains("2400x20"),
-        "{scaled_wide}"
-    );
+    assert!(scaled_wide_text.contains("2400x20"), "{scaled_wide}");
     compressing.close();
     let result = enabled.request("tools/call", json!({"name":"codemode","arguments":{
         "code":"attach(await tools.read({path:'shot.png'})); const child = await tools.exec({action:'start',command:'printf nested',loginShell:false}); text(child.taskId); return child.output;"
@@ -3493,4 +3511,3 @@ fn protocol_4_hello_is_rejected_by_protocol_5_daemon() {
         assert_eq!(reply["message"], json!("protocol 4 is not 5"), "{reply}");
     }
 }
-

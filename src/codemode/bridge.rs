@@ -352,123 +352,130 @@ impl Host {
         let call_id = self.call_id;
         let parent_task_id = self.parent_task_id.clone();
         let cancel = script.0.cancel.child_token();
-        self.runtime.spawn(input_owner.clone().hold_future(async move {
-            let _in_flight = in_flight;
-            let queued_guard = queued_guard;
-            let permit = match permit_wait {
-                Some(wait) => Some(tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return,
-                    permit = wait => permit,
-                }),
-                None => None,
-            };
-            let delivery = ProgramDelivery {
-                script: &script,
-                pending_id: id,
-                is_control,
-            };
-            let ProgramOutcome {
-                mut outcome,
-                pre_reserved,
-            } = match request {
-                ToolCall::Sleep(ms) => {
-                    tokio::select! {
+        self.runtime
+            .spawn(input_owner.clone().hold_future(async move {
+                let _in_flight = in_flight;
+                let queued_guard = queued_guard;
+                let permit = match permit_wait {
+                    Some(wait) => Some(tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        () = sleep(ms) => {}
-                    }
-                    let _ = lock(&script.0.report).result(id, 0);
-                    let _ = script.0.wake.send(Wake::Settled {
-                        id,
-                        outcome: Outcome::Value(crate::ipc::Owned::new(
-                            String::new(),
-                            Default::default(),
-                        )),
-                    });
-                    return;
-                }
-                ToolCall::Exec(request) => {
-                    let _permit = permit;
-                    service
-                        .exec_program(
-                            *request,
-                            ExecContext {
-                                session: &session,
-                                launch: Some(&launch),
-                                cancel: cancel.clone(),
-                                progress: None,
-                                call_id,
-                                parent_task_id: Some(parent_task_id),
-                                queued_guard,
-                                on_started: Some(&script),
-                                input_owner: input_owner.clone(),
-                            },
-                            delivery,
-                        )
-                        .await
-                }
-                ToolCall::Read(request) => {
-                    let permit = permit.expect("read acquires an I/O permit");
-                    let read_cancel = cancel.clone();
-                    let result = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return,
-                        result = files::read_core(
-                            request,
-                            Arc::clone(&launch),
-                            transfer,
-                            files::ReadPolicy::PROGRAM,
-                            Some(permit),
-                            Some(read_cancel),
-                            input_owner.clone(),
-                        ) => result,
-                    };
-                    result.run(|res| encode::encode_read_program(res, &launch, &delivery, &cancel))
-                }
-                ToolCall::Write(request) => {
-                    let permit = permit.expect("write acquires an I/O permit");
-                    let result = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return,
-                        result = files::write_core(
-                            request,
-                            Arc::clone(&launch),
-                            Some(permit),
-                            input_owner.clone(),
-                        ) => result,
-                    };
-                    result.run(|res| encode::encode_write_program(res, &launch, &delivery, &cancel))
-                }
-                ToolCall::Edit(request) => {
-                    let permit = permit.expect("edit acquires an I/O permit");
-                    let result = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return,
-                        result = files::edit_core(
-                            request,
-                            Arc::clone(&launch),
-                            Some(permit),
-                            input_owner.clone(),
-                        ) => result,
-                    };
-                    result.run(|res| encode::encode_edit_program(res, &launch, &delivery, &cancel))
-                }
-            };
-            // `admit_bridge_result` already called `script.reserve_result(id, wire_len)` once.
-            // Only unreserved error outcomes update the pending bridge byte count here.
-            if !pre_reserved {
-                let bytes = match &outcome {
-                    Outcome::Value(value) => value.value.len(),
-                    Outcome::Error(error) | Outcome::Cancelled(error) => error.len(),
-                    Outcome::Limit | Outcome::Memory(_) => 0,
+                        permit = wait => permit,
+                    }),
+                    None => None,
                 };
-                if !lock(&script.0.report).result(id, bytes) {
-                    outcome = Outcome::Limit;
+                let delivery = ProgramDelivery {
+                    script: &script,
+                    pending_id: id,
+                    is_control,
+                };
+                let ProgramOutcome {
+                    mut outcome,
+                    pre_reserved,
+                } = match request {
+                    ToolCall::Sleep(ms) => {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            () = sleep(ms) => {}
+                        }
+                        let _ = lock(&script.0.report).result(id, 0);
+                        let _ = script.0.wake.send(Wake::Settled {
+                            id,
+                            outcome: Outcome::Value(crate::ipc::Owned::new(
+                                String::new(),
+                                Default::default(),
+                            )),
+                        });
+                        return;
+                    }
+                    ToolCall::Exec(request) => {
+                        let _permit = permit;
+                        service
+                            .exec_program(
+                                *request,
+                                ExecContext {
+                                    session: &session,
+                                    launch: Some(&launch),
+                                    cancel: cancel.clone(),
+                                    progress: None,
+                                    call_id,
+                                    parent_task_id: Some(parent_task_id),
+                                    queued_guard,
+                                    on_started: Some(&script),
+                                    input_owner: input_owner.clone(),
+                                },
+                                delivery,
+                            )
+                            .await
+                    }
+                    ToolCall::Read(request) => {
+                        let permit = permit.expect("read acquires an I/O permit");
+                        let read_cancel = cancel.clone();
+                        let result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            result = files::read_core(
+                                request,
+                                Arc::clone(&launch),
+                                transfer,
+                                files::ReadPolicy::PROGRAM,
+                                Some(permit),
+                                Some(read_cancel),
+                                input_owner.clone(),
+                            ) => result,
+                        };
+                        result.run(|res| {
+                            encode::encode_read_program(res, &launch, &delivery, &cancel)
+                        })
+                    }
+                    ToolCall::Write(request) => {
+                        let permit = permit.expect("write acquires an I/O permit");
+                        let result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            result = files::write_core(
+                                request,
+                                Arc::clone(&launch),
+                                Some(permit),
+                                input_owner.clone(),
+                            ) => result,
+                        };
+                        result.run(|res| {
+                            encode::encode_write_program(res, &launch, &delivery, &cancel)
+                        })
+                    }
+                    ToolCall::Edit(request) => {
+                        let permit = permit.expect("edit acquires an I/O permit");
+                        let result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return,
+                            result = files::edit_core(
+                                request,
+                                Arc::clone(&launch),
+                                Some(permit),
+                                input_owner.clone(),
+                            ) => result,
+                        };
+                        result.run(|res| {
+                            encode::encode_edit_program(res, &launch, &delivery, &cancel)
+                        })
+                    }
+                };
+                // `admit_bridge_result` already called `script.reserve_result(id, wire_len)` once.
+                // Only unreserved error outcomes update the pending bridge byte count here.
+                if !pre_reserved {
+                    let bytes = match &outcome {
+                        Outcome::Value(value) => value.value.len(),
+                        Outcome::Error(error) | Outcome::Cancelled(error) => error.len(),
+                        Outcome::Limit | Outcome::Memory(_) => 0,
+                    };
+                    if !lock(&script.0.report).result(id, bytes) {
+                        outcome = Outcome::Limit;
+                    }
                 }
-            }
-            let _ = script.0.wake.send(Wake::Settled { id, outcome });
-        }));
+                let _ = script.0.wake.send(Wake::Settled { id, outcome });
+            }));
         Ok(id)
     }
 }

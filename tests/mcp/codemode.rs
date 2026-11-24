@@ -202,9 +202,7 @@ fn codemode_nested_results_keep_their_program_shape_while_outer_is_pure_text() {
     let dir = Scratch::new("codemode-files");
     std::fs::create_dir_all(&*dir).unwrap();
     let mut server = Server::start_with(|command| {
-        command
-            .current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true");
+        command.current_dir(&*dir).env("FASTEXEC_CODEMODE", "true");
     });
     let code = r#"
 const written = await tools.write({path:'note.txt', content:'alpha\nbeta\n'});
@@ -319,7 +317,10 @@ fn codemode_kill_reports_pending_calls_and_leaves_started_tasks_running() {
         text.contains("tasks it started") && text.contains("keep running"),
         "{text}"
     );
-    assert!(text.contains("cancelled 1 pending call(s): exec poll"), "{text}");
+    assert!(
+        text.contains("cancelled 1 pending call(s): exec poll"),
+        "{text}"
+    );
     assert!(text.contains(&child), "{text}");
     let listed = server.ok(json!({"action":"list"}));
     assert!(
@@ -346,7 +347,10 @@ fn codemode_deadlines_stop_bytecode_and_microtasks() {
         );
         assert_eq!(result["isError"], false, "{result}");
         let text = code_text(&result);
-        assert!(text.contains("[killed]") && text.contains("killAfterMs"), "{result}");
+        assert!(
+            text.contains("[killed]") && text.contains("killAfterMs"),
+            "{result}"
+        );
     }
 }
 
@@ -550,9 +554,7 @@ fn codemode_attach_covers_compress_mode_r4_4_parity_and_nested_opaque_handles() 
     let webm_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &webm_bytes);
 
     let mut server = Server::start_with(|command| {
-        command
-            .current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true");
+        command.current_dir(&*dir).env("FASTEXEC_CODEMODE", "true");
     });
 
     // 1. Six attachments deliver in one call (no legacy 4-image limit); R4-4 parity across
@@ -900,7 +902,8 @@ fn codemode_preserves_long_json_raw_text_nested_windows_waits_and_sh_quote() {
     let big_text = code_text(&big_json);
     assert!(big_text.contains("[exited 0]"), "{big_json}");
     assert!(!big_text.contains("line cut at "), "{big_json}");
-    let parsed: Value = serde_json::from_str(body_of(big_text).trim()).expect("whole JSON line parses");
+    let parsed: Value =
+        serde_json::from_str(body_of(big_text).trim()).expect("whole JSON line parses");
     assert_eq!(parsed["payload"].as_str().unwrap().len(), 10_000);
 
     // P0-1 + P2-2: An 800-byte JSON line fits whole inside maxBytes: 1000 without NOTES_RESERVE
@@ -1169,9 +1172,7 @@ fn nested_stream_and_transcript_fit_the_status_after_a_long_log_path_is_shortene
     }
     std::fs::create_dir_all(&dir).unwrap();
     let mut server = Server::start_with(|command| {
-        command
-            .env("TMPDIR", &dir)
-            .env("FASTEXEC_CODEMODE", "true");
+        command.env("TMPDIR", &dir).env("FASTEXEC_CODEMODE", "true");
     });
     let result = code_result(
         &mut server,
@@ -1187,8 +1188,8 @@ fn nested_stream_and_transcript_fit_the_status_after_a_long_log_path_is_shortene
         "#
         }),
     );
-    let bodies: Vec<String> = serde_json::from_str(body_of(code_text(&result)))
-        .unwrap_or_else(|_| panic!("{result}"));
+    let bodies: Vec<String> =
+        serde_json::from_str(body_of(code_text(&result))).unwrap_or_else(|_| panic!("{result}"));
     let expected = format!("{:0400}", 1);
     assert_eq!(bodies[0], expected);
     assert!(bodies[1].lines().any(|line| line == expected), "{bodies:?}");
@@ -1216,7 +1217,10 @@ fn kill_delivers_unseen_output_gates_concurrent_polls_and_attaches_codemode_imag
     assert_eq!(body_of(&after_kill), "(no new output)", "{after_kill}");
 
     let bare_kill_text = server.ok(json!({"action": "kill", "taskId": &bare}));
-    assert!(body_of(&bare_kill_text).contains("first"), "{bare_kill_text}");
+    assert!(
+        body_of(&bare_kill_text).contains("first"),
+        "{bare_kill_text}"
+    );
     assert!(bare_kill_text.contains("new reader"), "{bare_kill_text}");
 
     let conc_start = server.ok(json!({
@@ -1308,9 +1312,7 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
     std::fs::create_dir_all(&*dir).unwrap();
     std::fs::write(dir.join("hello.txt"), "hello-world\n").unwrap();
     let mut server = Server::start_with(|command| {
-        command
-            .current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true");
+        command.current_dir(&*dir).env("FASTEXEC_CODEMODE", "true");
     });
 
     let concurrency = code_result(
@@ -1446,10 +1448,7 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
 
     for bad_ret in ["return Symbol('x');", "return () => 1;", "return 1n;"] {
         let bad = code_result(&mut server, json!({"code": bad_ret}));
-        assert!(
-            code_text(&bad).contains("[exited 1]"),
-            "{bad_ret}: {bad}"
-        );
+        assert!(code_text(&bad).contains("[exited 1]"), "{bad_ret}: {bad}");
         assert!(
             body_of(code_text(&bad))
                 .contains("Script error: TypeError: the return value is not JSON-serializable"),
@@ -2323,8 +2322,7 @@ fn program_tool_errors_file_shapes_and_outer_attached_summary() {
     std::fs::write(dir.join("dot.png"), &png_bytes).unwrap();
 
     let mut server = Server::start_with(|cmd| {
-        cmd.current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true");
+        cmd.current_dir(&*dir).env("FASTEXEC_CODEMODE", "true");
     });
 
     let code = format!(

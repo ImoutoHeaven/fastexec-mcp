@@ -670,8 +670,7 @@ fn a_sudo_child_the_server_may_not_kill_is_held_and_reported() {
     let rooted = Rooted::new(&pid_file);
     let task = server.id(1);
     // The kill fails and the tree stays held, as on Linux.
-    let (text, is_error) =
-        server.call(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
+    let (text, is_error) = server.call(json!({"action": "kill", "taskId": task, "waitMs": 5000}));
     assert!(
         is_error && text.contains("Cannot terminate"),
         "a member this user may not signal fails the kill: {text}"

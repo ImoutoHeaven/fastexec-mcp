@@ -195,7 +195,11 @@ async fn response_snapshot_owns_its_workspace_and_uses_control_only_for_kill() {
         assert!(
             matches!(&error, ServiceError::Overload(_, Some(meta)) if meta.bare_task_id == task.id)
         );
-        assert!(error.message().contains("Do not retry start or resend input"));
+        assert!(
+            error
+                .message()
+                .contains("Do not retry start or resend input")
+        );
         assert_eq!((memory.used(), control.used()), (0, 0));
     }
     let snapshot = RenderSnapshot::new(&task, &launch, Action::Kill).unwrap();
@@ -557,7 +561,11 @@ async fn list_refusal_and_cancellation_leave_entries_due() {
     cancelled.cancel.cancel();
     cancelled.launch = Some(&small_frame);
     let refused = service
-        .exec_agent_json(json!({"action":"list"}), cancelled, AgentDelivery::default())
+        .exec_agent_json(
+            json!({"action":"list"}),
+            cancelled,
+            AgentDelivery::default(),
+        )
         .await;
     assert_eq!(refused.result.is_error, Some(true));
     assert!(refused.result.structured_content.is_none());
@@ -749,7 +757,9 @@ async fn rpc_id_budget_refusal_precedes_reader_commit_on_local_and_daemon_paths(
             "action":"poll", "taskId":format!("{}.9999", task.id),
             "waitMs":0, "maxBytes":100,
         });
-        let refused = service.exec_agent_json(request.clone(), ctx, delivery).await;
+        let refused = service
+            .exec_agent_json(request.clone(), ctx, delivery)
+            .await;
         assert!(refused.overload, "{:?}", refused.result);
         assert!(refused.result.structured_content.is_none());
         assert!(
@@ -982,7 +992,9 @@ async fn cancellation_keeps_attachment_worker_memory_and_reader_pinned() {
     let metadata_charge = {
         let before = pool.used();
         let mut metadata = RenderSnapshot::new(&task, &session.launch, Action::Poll).unwrap();
-        metadata.refresh(&task, &session.launch, Action::Poll).unwrap();
+        metadata
+            .refresh(&task, &session.launch, Action::Poll)
+            .unwrap();
         let charge = pool.used() - before;
         assert!(charge > 0);
         drop(metadata);
@@ -1325,7 +1337,10 @@ async fn nested_task_reads_consume_reader_state_without_consuming_session_notice
             },
         )
         .await;
-    assert!(matches!(poll_out.outcome, codemode::control::Outcome::Value(_)));
+    assert!(matches!(
+        poll_out.outcome,
+        codemode::control::Outcome::Value(_)
+    ));
     assert!(reader.is_reported());
     assert!(!entry.is_reported());
 
@@ -1345,7 +1360,10 @@ async fn nested_task_reads_consume_reader_state_without_consuming_session_notice
             },
         )
         .await;
-    assert!(matches!(kill_out.outcome, codemode::control::Outcome::Value(_)));
+    assert!(matches!(
+        kill_out.outcome,
+        codemode::control::Outcome::Value(_)
+    ));
     assert!(!entry.is_reported());
     assert!(
         tasks
@@ -1372,7 +1390,10 @@ async fn nested_task_reads_consume_reader_state_without_consuming_session_notice
         .result;
     let outer_text = text_of(&outer);
     assert!(outer_text.contains(&task.id), "{outer_text}");
-    assert!(outer_text.contains("External events: 1 new"), "{outer_text}");
+    assert!(
+        outer_text.contains("External events: 1 new"),
+        "{outer_text}"
+    );
     assert!(entry.is_reported());
     drop(worker);
     tasks.shutdown();
@@ -1573,8 +1594,14 @@ async fn critical_warnings_survive_small_budgets() {
     assert!(polled.structured_content.is_none());
     let text = text_of(&polled);
     assert!(text.find("[exited 0]").unwrap() < text.find("Warning:").unwrap());
-    assert!(text.contains("Warning: output capture failed (read failed)"), "{text}");
-    assert!(text.contains("Warning: log write failed (log write failed)"), "{text}");
+    assert!(
+        text.contains("Warning: output capture failed (read failed)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Warning: log write failed (log write failed)"),
+        "{text}"
+    );
     tasks.shutdown();
 }
 
@@ -1852,7 +1879,10 @@ async fn a_large_list_row_does_not_hide_the_opposite_end() {
     assert_eq!(listed.is_error, Some(false), "{listed:?}");
     assert!(listed.structured_content.is_none());
     let text = text_of(&listed);
-    assert!(text.contains(&second.id), "short row should remain visible: {text}");
+    assert!(
+        text.contains(&second.id),
+        "short row should remain visible: {text}"
+    );
     assert!(text.contains("omitted"), "omission marker expected: {text}");
     tasks.shutdown();
 }
@@ -2046,7 +2076,11 @@ async fn list_warnings_follow_the_delivered_rows_for_direct_and_nested_calls() {
 
     let request = json!({"action":"list", "truncate":"head", "maxBytes":100});
     let direct = service
-        .exec_agent_json(request.clone(), script_ctx(&session), AgentDelivery::default())
+        .exec_agent_json(
+            request.clone(),
+            script_ctx(&session),
+            AgentDelivery::default(),
+        )
         .await
         .result;
     assert!(direct.structured_content.is_none());
@@ -2101,9 +2135,9 @@ async fn list_warnings_follow_the_delivered_rows_for_direct_and_nested_calls() {
             .unwrap()
             .iter()
             .any(|task| task["taskId"] == warned.id
-                && task["warnings"]
-                    .as_array()
-                    .is_some_and(|w| w.iter().any(|s| s.as_str().unwrap().contains("omitted-row-warning")))),
+                && task["warnings"].as_array().is_some_and(|w| w
+                    .iter()
+                    .any(|s| s.as_str().unwrap().contains("omitted-row-warning")))),
         "{data}"
     );
     assert!(warned_entry.is_reported());
@@ -2316,7 +2350,8 @@ async fn program_bridge_admission_rollback_and_control_memory_fallback() {
         .unwrap();
 
     // Verify ProbeWarning rolls back on uncommitted drop (such as failed bridge admission).
-    let (_, _, probe_opt) = launch.task_env(std::path::Path::new("/nonexistent-bash-for-probe"), false);
+    let (_, _, probe_opt) =
+        launch.task_env(std::path::Path::new("/nonexistent-bash-for-probe"), false);
     if let Some(mut probe) = probe_opt {
         assert!(probe.message().is_some());
         drop(probe);

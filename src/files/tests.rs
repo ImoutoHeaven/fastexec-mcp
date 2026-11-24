@@ -102,13 +102,12 @@ fn read_data_to_view(data: FileReadData) -> ReadView {
             summary_line,
             ..
         }) => {
-            let bytes = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &encoded_base64,
-            )
-            .map(|b| b.len() as u64)
-            .unwrap_or(0);
-            let block = crate::media::content_block(kind, &mime_type, encoded_base64, &resolved_path);
+            let bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded_base64)
+                    .map(|b| b.len() as u64)
+                    .unwrap_or(0);
+            let block =
+                crate::media::content_block(kind, &mime_type, encoded_base64, &resolved_path);
             let structured = json!({
                 "kind": kind.as_str(),
                 "mimeType": mime_type,
@@ -4377,7 +4376,9 @@ fn text_buffer_reads_admit_before_copy_and_keep_the_result_owned() {
                 continue;
             }
             let owner = owned.owner.clone();
-            let data = owned.run(|read| read).expect("the exact text workspace must fit");
+            let data = owned
+                .run(|read| read)
+                .expect("the exact text workspace must fit");
             let FileReadData::Text(ref slice) = data else {
                 panic!("expected text slice");
             };
@@ -4411,7 +4412,13 @@ fn text_buffer_growth_uses_nonblocking_admission() {
             assert_eq!(result.as_ref().unwrap().text, "hello\n");
         } else {
             assert!(matches!(result, Err(FileError::Overload(_))));
-            assert!(result.err().unwrap().message().contains("active memory budget"));
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .message()
+                    .contains("active memory budget")
+            );
             assert_eq!(pool.used(), 0);
             continue;
         }
@@ -5366,7 +5373,10 @@ async fn edit_core_returns_matches_and_structured_failures() {
     let scratch = Scratch::new("edit-core");
     let pool = BytePool::new(16 << 20);
     let launch = Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool)));
-    scratch.file("doc.txt", "line1\n\u{201c}quoted\u{201d}\nline3\n".as_bytes());
+    scratch.file(
+        "doc.txt",
+        "line1\n\u{201c}quoted\u{201d}\nline3\n".as_bytes(),
+    );
 
     let ok_owned = edit_core(
         EditRequest {
@@ -5515,7 +5525,10 @@ async fn edit_core_returns_matches_and_structured_failures() {
     .await;
     assert!(pool.used() > 0);
     let missing = missing_owned.value.as_ref().unwrap_err();
-    assert!(matches!(missing.error, FileError::NotFound(_)), "{missing:?}");
+    assert!(
+        matches!(missing.error, FileError::NotFound(_)),
+        "{missing:?}"
+    );
     assert_eq!(missing.failures, None);
     drop(missing_owned);
     assert_eq!(pool.used(), 0);

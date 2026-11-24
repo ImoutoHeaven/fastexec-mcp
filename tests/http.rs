@@ -899,7 +899,10 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     }));
     let a_handle = task_handle(&text);
     let a_id = a_handle.split_once('.').unwrap().0.to_owned();
-    assert!(text.contains(&a_handle) && text.contains("A_FIRST"), "{text}");
+    assert!(
+        text.contains(&a_handle) && text.contains("A_FIRST"),
+        "{text}"
+    );
     assert!(!text.contains("new reader"), "{text}");
 
     let text = other.modern_result(json!({
@@ -926,7 +929,10 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
         text.contains(&a_id),
         "the same token sees its own tasks: {text}"
     );
-    assert!(!text.contains(&a_handle), "footer task IDs are bare: {text}");
+    assert!(
+        !text.contains(&a_handle),
+        "footer task IDs are bare: {text}"
+    );
     assert!(
         !text.contains("running outside this session"),
         "a already consumed token 0's first-result outside count: {text}"
@@ -979,7 +985,10 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
             .find(|line| line.starts_with(&format!("{id} ")))
             .unwrap_or_else(|| panic!("missing {id} in {listed}"));
         assert!(line.contains(owner), "{line}");
-        assert!(!line.split_whitespace().next().unwrap().contains('.'), "{line}");
+        assert!(
+            !line.split_whitespace().next().unwrap().contains('.'),
+            "{line}"
+        );
     }
     // Once shown in the session's first result, outside counts do not repeat on later polls.
     for _ in 0..2 {
@@ -1017,7 +1026,10 @@ fn sessionless_exit_reporting_is_local_to_each_reader() {
         "action": "poll", "taskId": id, "waitMs": 1000,
     }));
     let attached_status = status_line(&text);
-    assert!(attached_status.contains("running; kill ends them"), "{text}");
+    assert!(
+        attached_status.contains("running; kill ends them"),
+        "{text}"
+    );
     assert!(
         text.contains("ROOT_EXIT") && text.contains(" · new reader"),
         "{text}"
@@ -3009,7 +3021,10 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
         );
         assert_eq!(result["isError"], false, "{result}");
         let result_text = result["content"][0]["text"].as_str().unwrap();
-        assert!(status_line(result_text).starts_with("[exited 0] "), "{result}");
+        assert!(
+            status_line(result_text).starts_with("[exited 0] "),
+            "{result}"
+        );
         assert!(
             result_text.lines().any(|line| line.trim() == "1048576"),
             "{result}"

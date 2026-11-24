@@ -1058,7 +1058,10 @@ async fn held_render_slots_leave_a_receipt_and_do_not_block_kill_or_list() {
         let listed_text = text_of(&listed_res);
         let (task_id, _) = handle.split_once('.').unwrap();
         assert!(listed_text.contains(task_id), "{listed_text}");
-        assert!(std::path::Path::new(path).exists(), "missing logPath {path}");
+        assert!(
+            std::path::Path::new(path).exists(),
+            "missing logPath {path}"
+        );
 
         client
             .send(&call(
@@ -1082,10 +1085,7 @@ async fn held_render_slots_leave_a_receipt_and_do_not_block_kill_or_list() {
         let killed = client.result(call_id + 2).await;
         assert!(killed.structured_content.is_none());
         let killed_text = text_of(&killed);
-        assert!(
-            killed_text.contains("render-slot-test"),
-            "{killed_text}"
-        );
+        assert!(killed_text.contains("render-slot-test"), "{killed_text}");
     }
     drop(held);
 }
@@ -1628,8 +1628,7 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
     assert_eq!(unspec_err.result.is_error, Some(true));
     assert!(unspec_err.result.structured_content.is_none());
     assert!(
-        text_of(&unspec_err.result)
-            .contains("is an unspecified address; set FASTEXEC_PUBLIC_URL")
+        text_of(&unspec_err.result).contains("is an unspecified address; set FASTEXEC_PUBLIC_URL")
     );
     assert!(daemon.transfer_listener.get().is_none());
 

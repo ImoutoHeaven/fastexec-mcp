@@ -531,7 +531,9 @@ impl Service {
                 let base_launch = ctx.launch();
                 let cwd = match request.cwd {
                     None => base_launch.cwd.clone(),
-                    Some(dir) => validate_cwd(&dir, base_launch).map_err(ServiceError::Validation)?,
+                    Some(dir) => {
+                        validate_cwd(&dir, base_launch).map_err(ServiceError::Validation)?
+                    }
                 };
                 let args = StartArgs {
                     command: request.command.unwrap_or_default(),
@@ -1206,16 +1208,17 @@ impl Service {
                     let target = held.bytes().saturating_add(metadata_workspace_bytes(bytes));
                     resize_metadata_workspace(&mut held, target, launch, Action::List)
                 },
-                &mut |tree| metadata_members(tree, &mut workspace.borrow_mut(), launch, Action::List),
+                &mut |tree| {
+                    metadata_members(tree, &mut workspace.borrow_mut(), launch, Action::List)
+                },
             )
             .map_err(|message| ServiceError::Overload(message, None))?
         {
             Some(result) => result,
             None => {
-                return Err(ServiceError::NotFound(self.unknown_task_error(
-                    "parentTaskId",
-                    parent_id.unwrap_or_default(),
-                )));
+                return Err(ServiceError::NotFound(
+                    self.unknown_task_error("parentTaskId", parent_id.unwrap_or_default()),
+                ));
             }
         };
         Ok(PreparedExec::List(PreparedList {
@@ -1259,11 +1262,14 @@ impl Service {
         &self,
         handle: Option<&'a str>,
     ) -> Result<(Arc<Task>, Option<&'a str>), ServiceError> {
-        let (id, key) = parse_handle(handle.unwrap_or_default()).map_err(ServiceError::Validation)?;
+        let (id, key) =
+            parse_handle(handle.unwrap_or_default()).map_err(ServiceError::Validation)?;
         if let Some(task) = self.tasks.find(id) {
             return Ok((task, key));
         }
-        Err(ServiceError::NotFound(self.unknown_task_error("taskId", id)))
+        Err(ServiceError::NotFound(
+            self.unknown_task_error("taskId", id),
+        ))
     }
 }
 

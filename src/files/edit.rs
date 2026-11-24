@@ -545,14 +545,12 @@ fn edit_retained_bytes(result: &Result<FileEditData, EditError>) -> Option<usize
                     .capacity()
                     .checked_mul(std::mem::size_of::<EditFailure>())?;
                 let vecs = failures.iter().try_fold(0usize, |sum, item| {
-                    let lines = item
-                        .lines
-                        .as_ref()
-                        .map_or(Some(0), |v| v.capacity().checked_mul(std::mem::size_of::<usize>()))?;
-                    let with = item
-                        .with
-                        .as_ref()
-                        .map_or(Some(0), |v| v.capacity().checked_mul(std::mem::size_of::<usize>()))?;
+                    let lines = item.lines.as_ref().map_or(Some(0), |v| {
+                        v.capacity().checked_mul(std::mem::size_of::<usize>())
+                    })?;
+                    let with = item.with.as_ref().map_or(Some(0), |v| {
+                        v.capacity().checked_mul(std::mem::size_of::<usize>())
+                    })?;
                     edit_sum(&[sum, lines, with])
                 })?;
                 items.checked_add(vecs)
@@ -598,9 +596,10 @@ pub(super) fn edit_outcome_reserved(
     }
     for (index, edit) in request.edits.iter().enumerate() {
         if edit.old_text.is_empty() {
-            return Err(
-                FileError::Validation(format!("edits[{index}].oldText must not be empty.")).into(),
-            );
+            return Err(FileError::Validation(format!(
+                "edits[{index}].oldText must not be empty."
+            ))
+            .into());
         }
         if edit.start_line == Some(0) {
             return Err(FileError::Validation(format!(

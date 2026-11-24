@@ -937,7 +937,11 @@ const MARK: &str = " … [cut]";
 
 /// Fits PTY screen rows into `room` bytes by dropping top rows first, then cutting the remaining
 /// bottom row if needed. Returns `(body, omitted_rows, line_cut)`.
-pub fn fit_screen_rows(rows: &[String], room: usize, include_markers: bool) -> (String, usize, bool) {
+pub fn fit_screen_rows(
+    rows: &[String],
+    room: usize,
+    include_markers: bool,
+) -> (String, usize, bool) {
     let mut body = rows.join("\n");
     let mut omitted = 0;
     while body.len() > room && omitted + 1 < rows.len() {
@@ -1814,12 +1818,7 @@ mod tests {
         assert!(small_out.text.len() <= 25);
     }
 
-    fn program_window(
-        input: &[u8],
-        truncate: Truncate,
-        budget: usize,
-        keep_nul: bool,
-    ) -> Window {
+    fn program_window(input: &[u8], truncate: Truncate, budget: usize, keep_nul: bool) -> Window {
         let mut cleaner = Cleaner::default();
         let spec = WindowSpec {
             truncate,
@@ -1839,7 +1838,10 @@ mod tests {
     fn assert_no_markers(text: &str) {
         assert!(!text.contains("lines omitted:"), "marker leaked: {text:?}");
         assert!(!text.contains("line cut at"), "marker leaked: {text:?}");
-        assert!(!text.contains("top rows omitted"), "marker leaked: {text:?}");
+        assert!(
+            !text.contains("top rows omitted"),
+            "marker leaked: {text:?}"
+        );
         assert!(!text.contains("[cut]"), "marker leaked: {text:?}");
     }
 
@@ -1941,8 +1943,14 @@ mod tests {
     #[test]
     fn fit_screen_rows_separates_agent_markers_from_raw_program_slicing() {
         let empty: Vec<String> = Vec::new();
-        assert_eq!(fit_screen_rows(&empty, 100, false), (String::new(), 0, false));
-        assert_eq!(fit_screen_rows(&empty, 100, true), (String::new(), 0, false));
+        assert_eq!(
+            fit_screen_rows(&empty, 100, false),
+            (String::new(), 0, false)
+        );
+        assert_eq!(
+            fit_screen_rows(&empty, 100, true),
+            (String::new(), 0, false)
+        );
 
         let rows: Vec<String> = vec!["top-1".into(), "top-2".into(), "bottom".into()];
         assert_eq!(
@@ -1953,7 +1961,10 @@ mod tests {
             fit_screen_rows(&rows, 12, false),
             ("top-2\nbottom".into(), 1, false)
         );
-        assert_eq!(fit_screen_rows(&rows, 6, false), ("bottom".into(), 2, false));
+        assert_eq!(
+            fit_screen_rows(&rows, 6, false),
+            ("bottom".into(), 2, false)
+        );
 
         // Program mode drops top rows without markers and slices UTF-8 cleanly with zero [cut].
         let utf8_rows: Vec<String> = vec!["top-1".into(), "top-2".into(), "中文😀tail".into()];
@@ -1968,7 +1979,10 @@ mod tests {
         let (body, omitted, line_cut) = fit_screen_rows(&long_rows, 100, true);
         assert_eq!(omitted, 2);
         assert!(line_cut);
-        assert!(body.starts_with("... [2 top rows omitted] ...\nbottom-"), "{body}");
+        assert!(
+            body.starts_with("... [2 top rows omitted] ...\nbottom-"),
+            "{body}"
+        );
         assert!(body.ends_with(MARK), "{body}");
         assert!(body.len() <= 100);
 

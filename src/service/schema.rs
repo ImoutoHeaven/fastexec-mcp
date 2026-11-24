@@ -611,19 +611,49 @@ mod tests {
         let err = validate(&over_cap, ExecPolicy::AGENT)
             .err()
             .expect("agent must reject waitMs > 240_000");
-        assert!(err.contains("waitMs 240001 is out of range 0-240000"), "{err}");
+        assert!(
+            err.contains("waitMs 240001 is out of range 0-240000"),
+            "{err}"
+        );
         assert!(validate(&over_cap, ExecPolicy::PROGRAM).is_ok());
 
-        assert_eq!(ExecPolicy::AGENT.resolve_wait_ms(None, false, false), Some(30_000));
-        assert_eq!(ExecPolicy::AGENT.resolve_wait_ms(None, false, true), Some(2_000));
-        assert_eq!(ExecPolicy::AGENT.resolve_wait_ms(None, true, true), Some(30_000));
-        assert_eq!(ExecPolicy::AGENT.resolve_wait_ms(Some(500), false, false), Some(500));
+        assert_eq!(
+            ExecPolicy::AGENT.resolve_wait_ms(None, false, false),
+            Some(30_000)
+        );
+        assert_eq!(
+            ExecPolicy::AGENT.resolve_wait_ms(None, false, true),
+            Some(2_000)
+        );
+        assert_eq!(
+            ExecPolicy::AGENT.resolve_wait_ms(None, true, true),
+            Some(30_000)
+        );
+        assert_eq!(
+            ExecPolicy::AGENT.resolve_wait_ms(Some(500), false, false),
+            Some(500)
+        );
 
-        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(None, false, false), None);
-        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(None, false, true), Some(2_000));
-        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(None, true, false), Some(30_000));
-        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(None, true, true), Some(30_000));
-        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(Some(500), false, false), Some(500));
+        assert_eq!(
+            ExecPolicy::PROGRAM.resolve_wait_ms(None, false, false),
+            None
+        );
+        assert_eq!(
+            ExecPolicy::PROGRAM.resolve_wait_ms(None, false, true),
+            Some(2_000)
+        );
+        assert_eq!(
+            ExecPolicy::PROGRAM.resolve_wait_ms(None, true, false),
+            Some(30_000)
+        );
+        assert_eq!(
+            ExecPolicy::PROGRAM.resolve_wait_ms(None, true, true),
+            Some(30_000)
+        );
+        assert_eq!(
+            ExecPolicy::PROGRAM.resolve_wait_ms(Some(500), false, false),
+            Some(500)
+        );
     }
 
     #[test]
@@ -660,7 +690,10 @@ mod tests {
             ("maxBytes", json!({"action": "list", "maxBytes": 1024})),
             ("truncate", json!({"action": "list", "truncate": "head"})),
             ("truncate", json!({"action": "list", "truncate": "tail"})),
-            ("truncate", json!({"action": "list", "truncate": "head_tail"})),
+            (
+                "truncate",
+                json!({"action": "list", "truncate": "head_tail"}),
+            ),
         ] {
             let parsed = parse(req);
             assert!(validate(&parsed, ExecPolicy::AGENT).is_ok());

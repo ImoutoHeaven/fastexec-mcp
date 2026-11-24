@@ -302,7 +302,10 @@ fn screen_appears_and_gone_compare_with_the_screen_before_the_input() {
         "action": "poll", "taskId": server.id(1), "keys": ["Enter"], "screen": true, "waitMs": 20000,
         "returnWhen": {"screenAppears": ["Done 1"]}
     }));
-    assert!(text.contains("wait: screen text appeared \"Done 1\""), "{text}");
+    assert!(
+        text.contains("wait: screen text appeared \"Done 1\""),
+        "{text}"
+    );
     assert_eq!(
         text.split("\n\n[").next().unwrap(),
         "Done 1\nDone 1",
@@ -893,8 +896,7 @@ fn an_invalid_combined_poll_neither_resizes_nor_delivers_input() {
         text.contains("got second"),
         "the next poll's input was: {text}"
     );
-    let text =
-        server.ok(json!({"action": "poll", "taskId": task, "screen": true, "waitMs": 200}));
+    let text = server.ok(json!({"action": "poll", "taskId": task, "screen": true, "waitMs": 200}));
     assert!(
         text.contains("screen 120x30"),
         "the refused poll's size was not applied: {text}"
@@ -950,8 +952,7 @@ fn a_resize_after_exit_is_refused() {
         "the resize is refused: {text}"
     );
     // The task's own record is unchanged, and it still renders its screen.
-    let text =
-        server.ok(json!({"action": "poll", "taskId": task, "screen": true, "waitMs": 100}));
+    let text = server.ok(json!({"action": "poll", "taskId": task, "screen": true, "waitMs": 100}));
     assert!(text.contains("screen 120x30"), "{text}");
 }
 

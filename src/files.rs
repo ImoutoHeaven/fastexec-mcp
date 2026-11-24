@@ -171,21 +171,21 @@ pub async fn call_tracked(
     match tool {
         "read" => match serde_json::from_value::<ReadRequest>(arguments) {
             Ok(request) => read_tracked(request, launch, transfer, cancel, input_owner).await,
-            Err(error) => TrackedResult::plain(failed(format!(
-                "failed to deserialize parameters: {error}"
-            ))),
+            Err(error) => {
+                TrackedResult::plain(failed(format!("failed to deserialize parameters: {error}")))
+            }
         },
         "write" => match serde_json::from_value::<WriteRequest>(arguments) {
             Ok(request) => write_tracked(request, launch, input_owner).await,
-            Err(error) => TrackedResult::plain(failed(format!(
-                "failed to deserialize parameters: {error}"
-            ))),
+            Err(error) => {
+                TrackedResult::plain(failed(format!("failed to deserialize parameters: {error}")))
+            }
         },
         "edit" => match serde_json::from_value::<EditRequest>(arguments) {
             Ok(request) => edit_tracked(request, launch, input_owner).await,
-            Err(error) => TrackedResult::plain(failed(format!(
-                "failed to deserialize parameters: {error}"
-            ))),
+            Err(error) => {
+                TrackedResult::plain(failed(format!("failed to deserialize parameters: {error}")))
+            }
         },
         other => TrackedResult::plain(failed(format!("unknown tool {other}"))),
     }
@@ -344,7 +344,10 @@ pub async fn write_tracked(
     let (result, overload) = outcome.run(|res| match res {
         Ok(FileWriteData { path, .. }) => {
             let text = format!("Successfully wrote to {path}");
-            (CallToolResult::success(vec![ContentBlock::text(text)]), false)
+            (
+                CallToolResult::success(vec![ContentBlock::text(text)]),
+                false,
+            )
         }
         Err(FileError::Overload(message)) => (failed(message), true),
         Err(err) => (failed(err.into_message()), false),
@@ -375,7 +378,10 @@ pub async fn edit_tracked(
                     text.push_str(" (fuzzy match)");
                 }
             }
-            (CallToolResult::success(vec![ContentBlock::text(text)]), false)
+            (
+                CallToolResult::success(vec![ContentBlock::text(text)]),
+                false,
+            )
         }
         Err(EditError {
             error: FileError::Overload(message),

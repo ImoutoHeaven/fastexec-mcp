@@ -131,11 +131,16 @@ fn sync_error_message(err: &SyncCallError) -> &str {
 fn unwrap_sync_ok(res: Result<u64, crate::ipc::Owned<SyncCallError>>) -> u64 {
     match res {
         Ok(id) => id,
-        Err(err) => panic!("expected Ok, got SyncCallError: {}", sync_error_message(&err.value)),
+        Err(err) => panic!(
+            "expected Ok, got SyncCallError: {}",
+            sync_error_message(&err.value)
+        ),
     }
 }
 
-fn unwrap_sync_err(res: Result<u64, crate::ipc::Owned<SyncCallError>>) -> crate::ipc::Owned<SyncCallError> {
+fn unwrap_sync_err(
+    res: Result<u64, crate::ipc::Owned<SyncCallError>>,
+) -> crate::ipc::Owned<SyncCallError> {
     match res {
         Ok(id) => panic!("expected Err, got Ok({id})"),
         Err(err) => err,
@@ -2236,7 +2241,10 @@ async fn program_tool_error_codes_partial_results_and_edit_matches() {
 
     // Create a finished task with injected I/O errors so polling it via tools.exec triggers IO
     // while retaining output and exitCode on err.result.
-    let io_task = fixture.start("text('retained-output'); throw new Error('boom');", Some(5000));
+    let io_task = fixture.start(
+        "text('retained-output'); throw new Error('boom');",
+        Some(5000),
+    );
     complete(&io_task).await;
     io_task.inject_io_errors(Some("pipe broken"), Some("disk full"));
     let io_id = io_task.id.clone();

@@ -543,9 +543,7 @@ fn file_tools_paginate_nested_and_direct_reads_cleanly() {
     std::fs::write(dir.join("long-single.jsonl"), &long_single).unwrap();
 
     let mut server = Server::start_with(|command| {
-        command
-            .current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true");
+        command.current_dir(&*dir).env("FASTEXEC_CODEMODE", "true");
     });
     let code = r#"
 const single = await tools.read({path:'big.txt'});
@@ -606,20 +604,15 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
             .env("USERPROFILE", &home_dir);
     });
 
-    let (w_text, w_err) = server.file(
-        "write",
-        json!({"path": "sub/empty.txt", "content": ""}),
-    );
+    let (w_text, w_err) = server.file("write", json!({"path": "sub/empty.txt", "content": ""}));
     assert!(!w_err, "{w_text}");
     assert!(
         !w_text.contains('\\') && w_text.contains("/sub/empty.txt"),
         "{w_text}"
     );
 
-    let (r_empty_text, r_empty_err) = server.file(
-        "read",
-        json!({"path": "sub/empty.txt", "offset": 1}),
-    );
+    let (r_empty_text, r_empty_err) =
+        server.file("read", json!({"path": "sub/empty.txt", "offset": 1}));
     assert!(!r_empty_err, "{r_empty_text}");
     assert!(
         r_empty_text.is_empty() || r_empty_text.contains("0 lines"),
@@ -641,8 +634,10 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
 
     let (_, r_lim0_err) = server.file("read", json!({"path": "~/tilde.txt", "limit": 0}));
     assert!(r_lim0_err);
-    let (past_text, _past_err) =
-        server.file("read", json!({"path": "~/tilde.txt", "offset": 99, "limit": 1}));
+    let (past_text, _past_err) = server.file(
+        "read",
+        json!({"path": "~/tilde.txt", "offset": 99, "limit": 1}),
+    );
     assert!(
         !past_text.starts_with('\n'),
         "no leading blank lines on empty body: {past_text:?}"
@@ -795,10 +790,7 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
         "action": "list",
         "state": "finished"
     }));
-    assert!(
-        list_finished.lines().count() >= 2,
-        "{list_finished}"
-    );
+    assert!(list_finished.lines().count() >= 2, "{list_finished}");
 
     let list_lim_text = server.ok(json!({"action": "list", "limit": 2}));
     assert!(list_lim_text.contains("Showing 2 of "), "{list_lim_text}");
@@ -843,10 +835,7 @@ fn paths_read_edit_list_false_null_and_cli_contracts_hold_end_to_end() {
     assert!(bounded.ends_with("raise limit to see more."), "{bounded}");
     let _ = server.ok(json!({"action": "start", "loginShell": false, "command": "true"}));
     let latest_only_text = server.ok(json!({"action": "list", "limit": 1}));
-    assert!(
-        !latest_only_text.contains("Warning:"),
-        "{latest_only_text}"
-    );
+    assert!(!latest_only_text.contains("Warning:"), "{latest_only_text}");
 
     // P1-6: Tiny maxBytes on direct list leaves undelivered background notices due; nested list
     // marks script-owned tasks it delivers.
@@ -1066,9 +1055,7 @@ fn p0_p1_p2_schemas_windows_reads_edits_and_tolerances_hold_end_to_end() {
     let dir = Scratch::new("ergonomics-e2e");
     std::fs::create_dir_all(&*dir).unwrap();
     let mut server = Server::start_with(|command| {
-        command
-            .current_dir(&*dir)
-            .env("FASTEXEC_CODEMODE", "true");
+        command.current_dir(&*dir).env("FASTEXEC_CODEMODE", "true");
     });
 
     // Schema assertions (P0-1, P0-2, P1-2, P1-4).

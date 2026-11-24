@@ -979,32 +979,33 @@ impl Service {
         );
 
         if total_unseen > 0 {
-            let update_queued_warning =
-                |steps: &[PackStep], tail: &mut Vec<String>, evicted: bool| {
-                    tail.retain(|w| w.contains("evicted under the 4 GiB"));
-                    if evicted {
-                        return;
-                    }
-                    let remaining = total_unseen.saturating_sub(steps.len());
-                    if remaining > 0 {
-                        if action == Action::Kill {
-                            tail.push(
+            let update_queued_warning = |steps: &[PackStep],
+                                         tail: &mut Vec<String>,
+                                         evicted: bool| {
+                tail.retain(|w| w.contains("evicted under the 4 GiB"));
+                if evicted {
+                    return;
+                }
+                let remaining = total_unseen.saturating_sub(steps.len());
+                if remaining > 0 {
+                    if action == Action::Kill {
+                        tail.push(
                                 "unseen attachment(s) deferred to fit the 8 MiB control reserve or active memory budget; poll taskId without input to retrieve them".into(),
                             );
-                        } else {
-                            let seen_now = steps.last().map_or(initial_seen, PackStep::index);
-                            if seen_now > initial_seen {
-                                tail.push(format!(
+                    } else {
+                        let seen_now = steps.last().map_or(initial_seen, PackStep::index);
+                        if seen_now > initial_seen {
+                            tail.push(format!(
                                     "{remaining} attachment(s) remain queued after #{seen_now}; poll taskId without input to retrieve the next batch"
                                 ));
-                            } else {
-                                tail.push(format!(
+                        } else {
+                            tail.push(format!(
                                     "{remaining} attachment(s) remain queued; poll taskId without input to retrieve them"
                                 ));
-                            }
                         }
                     }
-                };
+                }
+            };
 
             let evicted_now = snapshot.evicted || task.evicted();
             update_queued_warning(&bundle.steps, &mut bundle.tail_warnings, evicted_now);
@@ -1066,7 +1067,14 @@ impl Service {
             }
         }
 
-        let mut lease = match admit_mcp_frame(ctx, delivery, action, &task, &candidate, &mut bundle.lease) {
+        let mut lease = match admit_mcp_frame(
+            ctx,
+            delivery,
+            action,
+            &task,
+            &candidate,
+            &mut bundle.lease,
+        ) {
             Ok(lease) => lease,
             Err(ServiceError::Overload(..))
                 if action == Action::Kill && !bundle.steps.is_empty() =>
@@ -1181,7 +1189,14 @@ impl Service {
             "(no transcript lines since the last read)",
         );
         let candidate = success(text, task_io_ok(snapshot), &warnings);
-        let mut lease = admit_mcp_frame(ctx, delivery, Action::Transcript, &task, &candidate, &mut None)?;
+        let mut lease = admit_mcp_frame(
+            ctx,
+            delivery,
+            Action::Transcript,
+            &task,
+            &candidate,
+            &mut None,
+        )?;
         drop(window);
         let (candidate, payload_owner) =
             retain_text_result(candidate, workspace, &mut lease, launch, &task)?;

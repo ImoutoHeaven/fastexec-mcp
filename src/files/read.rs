@@ -117,9 +117,8 @@ pub async fn read_core(
     let input = crate::ipc::Owned::new(request, input_owner);
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        input.flat_map(|request| {
-            read_blocking(&request, &launch, transfer, policy, cancel.as_ref())
-        })
+        input
+            .flat_map(|request| read_blocking(&request, &launch, transfer, policy, cancel.as_ref()))
     })
     .await
     {
@@ -489,9 +488,7 @@ fn read_media_core(
             });
         }
         Err(MediaReadError::Io(error)) => {
-            return Err(FileError::Io(format!(
-                "Cannot read {shown_path}: {error}."
-            )));
+            return Err(FileError::Io(format!("Cannot read {shown_path}: {error}.")));
         }
         Err(MediaReadError::Cancelled) => {
             return Err(FileError::Cancelled("Cancelled while reading file.".into()));

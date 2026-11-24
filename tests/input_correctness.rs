@@ -157,7 +157,10 @@ fn empty_poll_input_requires_an_open_pipe_and_eof_alone_is_idempotent() {
     }));
     assert_ne!(closed["isError"], true, "{closed}");
     let closed_text = text(&closed);
-    assert!(status_line(&closed_text).starts_with("[exited 0] "), "{closed}");
+    assert!(
+        status_line(&closed_text).starts_with("[exited 0] "),
+        "{closed}"
+    );
     assert!(
         closed_text.lines().any(|line| line.trim() == "0"),
         "{closed}"
@@ -195,10 +198,7 @@ fn the_first_write_to_closed_stdin_reports_the_writer_error() {
     assert_eq!(result["isError"], true, "{result}");
     assert!(text(&result).contains("INPUT_WRITE_FAILED"), "{result}");
     let state = server.exec(json!({"action": "poll", "taskId": task, "waitMs": 0}));
-    assert!(
-        text(&state).contains("INPUT_WRITE_FAILED"),
-        "{state}"
-    );
+    assert!(text(&state).contains("INPUT_WRITE_FAILED"), "{state}");
 }
 
 #[cfg(windows)]
@@ -219,7 +219,10 @@ fn windows_resize_input_risk_stays_explicit_for_short_keys_and_later_input() {
         let result = server.exec(arguments);
         assert_ne!(result["isError"], true, "{result}");
         let body = text(&result);
-        assert!(body.contains("Warning:"), "full warning beyond maxBytes: {result}");
+        assert!(
+            body.contains("Warning:"),
+            "full warning beyond maxBytes: {result}"
+        );
         for risk in [
             "leading input byte",
             "after a resize",
