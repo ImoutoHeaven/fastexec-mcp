@@ -441,9 +441,7 @@ impl Service {
                     kill_after_ms: request.kill_after_ms,
                     owner: session.label.clone(),
                     started_by: call.call_id.map(|id| (session.id.clone(), id)),
-                    parent_task_id: call
-                        .started
-                        .map(|nested| nested.parent_task_id.to_owned()),
+                    parent_task_id: call.started.map(|nested| nested.parent_task_id.to_owned()),
                     queued_guard: call.queued_guard.take(),
                     launch: Arc::clone(base_launch),
                     input_owner: call.input_owner.clone(),

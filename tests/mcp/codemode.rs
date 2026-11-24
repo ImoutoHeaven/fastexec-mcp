@@ -377,14 +377,30 @@ fn codemode_kill_reports_pending_calls_and_leaves_started_tasks_running() {
     );
     let (listed, _) = server.ok(json!({"action":"list"}));
     assert!(
-        listed["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|task| task["taskId"] == bare_id(&child)
-                && task["state"] == "running"
-                && task["kind"] == "bash"),
+        listed["tasks"].as_array().unwrap().iter().any(|task| {
+            task["taskId"] == bare_id(&script)
+                && task["state"] == "killed"
+                && task["children"]["activeTasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| {
+                        entry["taskId"] == bare_id(&child)
+                            && entry["state"] == "running"
+                            && entry["kind"] == "bash"
+                    })
+        }),
         "{listed}"
+    );
+    let (active, _) = server.ok(json!({"action":"list", "state":"active"}));
+    assert!(
+        active["tasks"].as_array().unwrap().iter().any(|task| {
+            task["taskId"] == bare_id(&child)
+                && task["state"] == "running"
+                && task["kind"] == "bash"
+                && task["parentTaskId"] == bare_id(&script)
+        }),
+        "{active}"
     );
     server.ok(json!({"action":"kill", "taskId":child}));
 }
@@ -980,7 +996,7 @@ return 'returned-early';
             .flatten()
             .map(|entry| bare_id(entry["taskId"].as_str().unwrap()).to_owned())
             .collect();
-    let (listed, _) = server.ok(json!({"action":"list"}));
+    let (listed, _) = server.ok(json!({"action":"list", "state":"active"}));
     let running_bash: Vec<String> = listed["tasks"]
         .as_array()
         .unwrap()
@@ -1469,11 +1485,14 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
                 const eightStarts = Promise.all(
                     Array.from({ length: 8 }, () => tools.exec({ action: "start", command: "sleep 60" }))
                 );
+                const activeBash = (listed) => listed.tasks
+                    .flatMap(t => t.kind === "codemode" ? (t.children?.activeTasks ?? []) : [t])
+                    .filter(t => t.kind === "bash");
                 let active = [];
                 while (active.length < 8) {
                     await sleep(20);
                     const listed = await tools.exec({ action: "list", state: "active" });
-                    active = listed.tasks.filter(t => t.kind === "bash");
+                    active = activeBash(listed);
                 }
                 const readDuringStarts = await tools.read({ path: "hello.txt" });
                 if (readDuringStarts.text !== "hello-world\n") {
@@ -1526,8 +1545,7 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
                     sleep(100).then(() => "timeout")
                 ]);
                 if (winner !== "timeout") throw new Error("expected timeout winner");
-                const remaining = (await tools.exec({ action: "list", state: "active" }))
-                    .tasks.filter(t => t.kind === "bash");
+                const remaining = activeBash(await tools.exec({ action: "list", state: "active" }));
                 await Promise.all(remaining.map(t => tools.exec({ action: "kill", taskId: t.taskId })));
                 await raceHolder;
 
@@ -1607,4 +1625,791 @@ fn p0_3_p1_3_p1_5_codemode_permits_sleep_stacks_and_serializable_returns() {
     let ret_lines = code_result(&mut server, json!({"code": "return 'a\\nb';"}));
     assert_eq!(ret_lines["structuredContent"]["exitCode"], 0);
     assert_eq!(ret_lines["structuredContent"]["output"], "a\nb");
+}
+
+#[test]
+fn codemode_list_folds_batch_and_preserves_earlier_top_level_tasks() {
+    let mut server = codemode_server();
+    let (earlier, _) = server.ok(json!({
+        "action": "start",
+        "command": "printf earlier-top-level",
+        "loginShell": false,
+    }));
+    let earlier_bare = bare_id(earlier["taskId"].as_str().unwrap()).to_owned();
+
+    let batch = code_result(
+        &mut server,
+        json!({
+            "code": r#"
+                const results = await Promise.all(
+                    Array.from({ length: 30 }, () =>
+                        tools.exec({ action: "start", command: "true", loginShell: false })
+                    )
+                );
+                if (results.some(r => r.exitCode !== 0)) throw new Error("batch child failed");
+                return "batch-done";
+            "#
+        }),
+    );
+    assert_eq!(batch["structuredContent"]["exitCode"], 0, "{batch}");
+    let parent_bare = bare_id(batch["structuredContent"]["taskId"].as_str().unwrap()).to_owned();
+
+    let (listed, text) = server.ok(json!({"action": "list"}));
+    let tasks = listed["tasks"].as_array().unwrap();
+    assert_eq!(listed["totalCount"], 2, "{listed}");
+    assert_eq!(tasks.len(), 2, "{listed}");
+    assert_eq!(tasks[0]["taskId"], parent_bare, "{listed}");
+    assert_eq!(tasks[0]["children"]["total"], 30, "{listed}");
+    assert_eq!(tasks[0]["children"]["done"], 30, "{listed}");
+    assert!(
+        tasks[0]["children"].get("activeTasks").is_none(),
+        "{listed}"
+    );
+    assert_eq!(tasks[1]["taskId"], earlier_bare, "{listed}");
+    assert!(text.contains("30 tasks (30 done)"), "{text}");
+    assert!(
+        text.contains("30 folded codemode children hidden; pass parentTaskId to inspect."),
+        "{text}"
+    );
+    assert!(text.contains(&earlier_bare), "{text}");
+}
+
+#[test]
+fn codemode_kill_shows_orphans_cancelled_starts_and_clears_background() {
+    let mut server = codemode_server();
+    let (release, release_bash) = scratch("codemode-kill-orphans-release");
+    let wait_cmd = format!("while [ ! -f '{release_bash}' ]; do sleep 0.02; done");
+
+    let started = code_result(
+        &mut server,
+        json!({
+            "code": format!(
+                "return await Promise.all(Array.from({{ length: 10 }}, () => tools.exec({{ action: 'start', command: {}, loginShell: false }})));",
+                json!(wait_cmd)
+            ),
+            "waitMs": 50
+        }),
+    );
+    assert_eq!(
+        started["structuredContent"]["state"], "running",
+        "{started}"
+    );
+    let script_handle = started["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let parent_bare = bare_id(&script_handle).to_owned();
+
+    // Wait until all 8 START_PERMITS are active and 2 starts are queued.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let (listed, _) = server.ok(json!({"action": "list"}));
+        let parent = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["taskId"] == parent_bare)
+            .unwrap();
+        if parent["children"]["active"] == 8 && parent["children"]["queued"] == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for 8 active + 2 queued: {listed}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let (killed, _) = server.ok(json!({"action": "kill", "taskId": &script_handle}));
+    assert_eq!(killed["state"], "killed", "{killed}");
+
+    let (listed, text) = server.ok(json!({"action": "list"}));
+    let parent = &listed["tasks"][0];
+    assert_eq!(parent["taskId"], parent_bare, "{listed}");
+    assert_eq!(parent["state"], "killed", "{listed}");
+    assert_eq!(parent["children"]["total"], 8, "{listed}");
+    assert_eq!(parent["children"]["active"], 8, "{listed}");
+    assert_eq!(parent["children"]["cancelled"], 2, "{listed}");
+    assert_eq!(
+        parent["children"]["activeTasks"].as_array().unwrap().len(),
+        8,
+        "{listed}"
+    );
+    assert!(text.contains("8 tasks (8 active, 2 cancelled)"), "{text}");
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("  └─ ")).count(),
+        8,
+        "{text}"
+    );
+
+    let (active, active_text) = server.ok(json!({"action": "list", "state": "active"}));
+    let active_tasks = active["tasks"].as_array().unwrap();
+    assert_eq!(active_tasks.len(), 8, "{active}");
+    let via_tag = format!(" · via {parent_bare}");
+    for task in active_tasks {
+        assert_eq!(task["parentTaskId"], parent_bare, "{active}");
+        assert_eq!(task["state"], "running", "{active}");
+    }
+    assert_eq!(active_text.matches(&via_tag).count(), 8, "{active_text}");
+
+    // Release all 8 orphans and wait for them to finish without reporting finished tasks.
+    std::fs::write(&*release, "go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let (active_now, _) = server.ok(json!({"action": "list", "state": "active"}));
+        if active_now["tasks"].as_array().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "orphans did not finish after release: {active_now}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let (_, nag_text) = server.ok(json!({
+        "action": "start",
+        "command": "true",
+        "loginShell": false,
+    }));
+    assert!(
+        nag_text.contains("(Background:") && nag_text.contains("use list."),
+        "expected unreported finished orphans in background footer: {nag_text}"
+    );
+
+    // One default list reports the folded finished orphans via the parent summary.
+    let (after_list, after_text) = server.ok(json!({"action": "list"}));
+    let parent_after = after_list["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["taskId"] == parent_bare)
+        .unwrap();
+    assert_eq!(parent_after["children"]["done"], 8, "{after_list}");
+    assert_eq!(parent_after["children"]["cancelled"], 2, "{after_list}");
+    assert!(
+        after_text.contains("8 tasks (8 done, 2 cancelled)"),
+        "{after_text}"
+    );
+
+    let (_, cleared_text) = server.ok(json!({
+        "action": "start",
+        "command": "true",
+        "loginShell": false,
+    }));
+    assert!(
+        !cleared_text.contains("(Background:"),
+        "background nag persisted after list reported parent summary: {cleared_text}"
+    );
+}
+
+#[test]
+fn codemode_list_reports_live_queued_starts_accurately() {
+    let mut server = codemode_server();
+    let (release, release_bash) = scratch("codemode-queued-release");
+    let wait_cmd = format!("while [ ! -f '{release_bash}' ]; do sleep 0.02; done");
+
+    let started = code_result(
+        &mut server,
+        json!({
+            "code": format!(
+                "const all = await Promise.all(Array.from({{ length: 12 }}, () => tools.exec({{ action: 'start', command: {}, loginShell: false }}))); return all.length;",
+                json!(wait_cmd)
+            ),
+            "waitMs": 50
+        }),
+    );
+    assert_eq!(
+        started["structuredContent"]["state"], "running",
+        "{started}"
+    );
+    let script_handle = started["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let parent_bare = bare_id(&script_handle).to_owned();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (matched_list, matched_text) = loop {
+        let (listed, text) = server.ok(json!({"action": "list"}));
+        let parent = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["taskId"] == parent_bare)
+            .unwrap();
+        let active = parent["children"]["active"].as_u64().unwrap_or(0);
+        let queued = parent["children"]["queued"].as_u64().unwrap_or(0);
+        assert!(
+            active + queued <= 12,
+            "double-counted active ({active}) + queued ({queued}) > 12: {listed}"
+        );
+        if active == 8 {
+            break (listed, text);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for 8 active starts: {listed}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let parent = matched_list["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["taskId"] == parent_bare)
+        .unwrap();
+    assert_eq!(parent["children"]["total"], 8, "{matched_list}");
+    assert_eq!(parent["children"]["active"], 8, "{matched_list}");
+    assert_eq!(parent["children"]["queued"], 4, "{matched_list}");
+    assert!(
+        matched_text.contains("8 tasks (8 active, 4 queued)"),
+        "{matched_text}"
+    );
+    assert_eq!(
+        matched_text
+            .lines()
+            .filter(|l| l.starts_with("  └─ "))
+            .count(),
+        8,
+        "{matched_text}"
+    );
+
+    std::fs::write(&*release, "go").unwrap();
+    let (done, _) = server.ok(json!({
+        "action": "poll",
+        "taskId": &script_handle,
+        "waitMs": 15000
+    }));
+    assert_eq!(done["exitCode"], 0, "{done}");
+    assert_eq!(done["output"], "12", "{done}");
+}
+
+#[test]
+fn codemode_list_parent_task_id_drill_down_and_cross_session() {
+    struct DaemonStopGuard(Command);
+    impl Drop for DaemonStopGuard {
+        fn drop(&mut self) {
+            let _ = self.0.output();
+        }
+    }
+
+    let runtime = Scratch::new("codemode-parent-drilldown-rt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&*runtime)
+            .unwrap();
+    }
+    #[cfg(windows)]
+    crate::support::create_private_runtime(&runtime);
+
+    let namespace = format!("cm-drill-{}", std::process::id());
+    let daemon_cmd = |action: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+        crate::support::scrub_fastexec_env(&mut cmd);
+        cmd.args(["daemon", action])
+            .env("FASTEXEC_TEST_RUNTIME_DIR", &*runtime)
+            .env("FASTEXEC_NAMESPACE", &namespace)
+            .stdin(Stdio::null());
+        cmd
+    };
+
+    let _stop = DaemonStopGuard(daemon_cmd("stop"));
+    let start_out = daemon_cmd("start").output().unwrap();
+    assert!(
+        start_out.status.success(),
+        "daemon start failed: {}{}",
+        String::from_utf8_lossy(&start_out.stdout),
+        String::from_utf8_lossy(&start_out.stderr)
+    );
+
+    let start_session = || {
+        Server::start_with(|cmd| {
+            cmd.env("FASTEXEC_DAEMON", "on")
+                .env("FASTEXEC_TEST_RUNTIME_DIR", &*runtime)
+                .env("FASTEXEC_NAMESPACE", &namespace)
+                .env("FASTEXEC_CODEMODE", "true")
+                .env("FASTEXEC_OUTPUT_MODE", "both");
+        })
+    };
+
+    let mut session_a = start_session();
+    let mut session_b = start_session();
+
+    let script = code_result(
+        &mut session_a,
+        json!({
+            "code": r#"
+                for (const label of ["a1", "a2", "a3"]) {
+                    const r = await tools.exec({
+                        action: "start",
+                        command: "printf " + label,
+                        loginShell: false
+                    });
+                    if (r.exitCode !== 0) throw new Error("child failed");
+                }
+                return "three-done";
+            "#
+        }),
+    );
+    assert_eq!(script["structuredContent"]["exitCode"], 0, "{script}");
+    let script_handle = script["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let script_bare = bare_id(&script_handle).to_owned();
+
+    let (plain, _) = session_a.ok(json!({
+        "action": "start",
+        "command": "printf plain-bash",
+        "loginShell": false,
+    }));
+    let plain_bare = bare_id(plain["taskId"].as_str().unwrap()).to_owned();
+
+    // Same-session drill-down accepts both bare task ID and reader handle.
+    for query_id in [&script_bare, &script_handle] {
+        let (listed, _) = session_a.ok(json!({
+            "action": "list",
+            "parentTaskId": query_id,
+        }));
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(listed["totalCount"], 3, "{query_id}: {listed}");
+        assert_eq!(tasks.len(), 3, "{query_id}: {listed}");
+        for task in tasks {
+            assert_eq!(task["parentTaskId"], script_bare, "{listed}");
+            assert_eq!(task["kind"], "bash", "{listed}");
+            assert!(task.get("children").is_none(), "{listed}");
+        }
+    }
+
+    // Plain bash task ID returns an empty list.
+    let (plain_listed, plain_text) = session_a.ok(json!({
+        "action": "list",
+        "parentTaskId": &plain_bare,
+    }));
+    assert_eq!(plain_text, "No tasks.", "{plain_text}");
+    assert_eq!(plain_listed["totalCount"], 0, "{plain_listed}");
+    assert!(
+        plain_listed["tasks"].as_array().unwrap().is_empty(),
+        "{plain_listed}"
+    );
+
+    // Unknown parentTaskId errors cleanly.
+    let (_, err_text, is_err) = session_a.call(json!({
+        "action": "list",
+        "parentTaskId": "nonexistent-99",
+    }));
+    assert!(
+        is_err,
+        "expected error for unknown parentTaskId: {err_text}"
+    );
+    assert!(err_text.contains("Unknown parentTaskId"), "{err_text}");
+
+    // Cross-session drill-down works by default for both bare ID and reader handle.
+    for query_id in [&script_bare, &script_handle] {
+        let (cross, _) = session_b.ok(json!({
+            "action": "list",
+            "parentTaskId": query_id,
+        }));
+        assert_eq!(cross["totalCount"], 3, "{query_id}: {cross}");
+        assert_eq!(
+            cross["tasks"].as_array().unwrap().len(),
+            3,
+            "{query_id}: {cross}"
+        );
+        for task in cross["tasks"].as_array().unwrap() {
+            assert_eq!(task["parentTaskId"], script_bare, "{cross}");
+        }
+    }
+
+    // Explicit scope: "session" restricts drill-down to caller's session.
+    let (scoped, scoped_text) = session_b.ok(json!({
+        "action": "list",
+        "parentTaskId": &script_bare,
+        "scope": "session",
+    }));
+    assert_eq!(scoped_text, "No tasks.", "{scoped_text}");
+    assert_eq!(scoped["totalCount"], 0, "{scoped}");
+    assert!(scoped["tasks"].as_array().unwrap().is_empty(), "{scoped}");
+}
+
+#[test]
+fn codemode_list_finished_state_promotes_finished_children_of_running_parent() {
+    let mut server = codemode_server();
+    let (release, release_bash) = scratch("codemode-finished-promote-release");
+    let wait_cmd = format!("while [ ! -f '{release_bash}' ]; do sleep 0.02; done");
+
+    let started = code_result(
+        &mut server,
+        json!({
+            "code": format!(
+                r#"
+                await tools.exec({{ action: "start", command: "printf done-1", loginShell: false }});
+                await tools.exec({{ action: "start", command: "printf done-2", loginShell: false }});
+                text("children-done");
+                await tools.exec({{ action: "start", command: {}, loginShell: false }});
+                return "all-done";
+                "#,
+                json!(wait_cmd)
+            ),
+            "waitMs": 10000,
+            "returnWhen": {"outputContains": ["children-done"]},
+        }),
+    );
+    assert_eq!(
+        started["structuredContent"]["state"], "running",
+        "{started}"
+    );
+    let script_handle = started["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let parent_bare = bare_id(&script_handle).to_owned();
+
+    let (finished, text) = server.ok(json!({"action": "list", "state": "finished"}));
+    let tasks = finished["tasks"].as_array().unwrap();
+    assert_eq!(finished["totalCount"], 2, "{finished}");
+    assert_eq!(tasks.len(), 2, "{finished}");
+    let via_tag = format!(" · via {parent_bare}");
+    for task in tasks {
+        assert_eq!(task["kind"], "bash", "{finished}");
+        assert_eq!(task["state"], "exited", "{finished}");
+        assert_eq!(task["parentTaskId"], parent_bare, "{finished}");
+    }
+    assert_eq!(text.matches(&via_tag).count(), 2, "{text}");
+
+    std::fs::write(&*release, "go").unwrap();
+    let (ended, _) = server.ok(json!({
+        "action": "poll",
+        "taskId": &script_handle,
+        "waitMs": 10000,
+    }));
+    assert_eq!(ended["exitCode"], 0, "{ended}");
+}
+
+#[test]
+fn codemode_list_sorts_by_active_child_recency_with_stable_total_count() {
+    let mut server = codemode_server();
+    let (spawn_gate, spawn_gate_bash) = scratch("codemode-recency-spawn-gate");
+
+    let p_old = code_result(
+        &mut server,
+        json!({
+            "code": format!(
+                r#"
+                text("ready");
+                await tools.exec({{ action: "start", command: "while [ ! -f '{spawn_gate_bash}' ]; do sleep 0.02; done", loginShell: false }});
+                const child = await tools.exec({{ action: "start", command: "sleep 30", waitMs: 0, loginShell: false }});
+                text("spawned=" + child.taskId);
+                await sleep(30000);
+                "#
+            ),
+            "waitMs": 10000,
+            "returnWhen": {"outputContains": ["ready"]},
+        }),
+    );
+    assert_eq!(p_old["structuredContent"]["state"], "running", "{p_old}");
+    let p_old_handle = p_old["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let p_old_bare = bare_id(&p_old_handle).to_owned();
+
+    // Create two newer finished top-level tasks after P_old.
+    let (p1, _) = server.ok(json!({
+        "action": "start",
+        "command": "printf p1",
+        "loginShell": false,
+    }));
+    let p1_bare = bare_id(p1["taskId"].as_str().unwrap()).to_owned();
+    let (p2, _) = server.ok(json!({
+        "action": "start",
+        "command": "printf p2",
+        "loginShell": false,
+    }));
+    let p2_bare = bare_id(p2["taskId"].as_str().unwrap()).to_owned();
+
+    // Now trigger P_old to spawn fresh active child C_old (newer than P1 and P2).
+    std::fs::write(&*spawn_gate, "go").unwrap();
+    let (polled, polled_text) = server.ok(json!({
+        "action": "poll",
+        "taskId": &p_old_handle,
+        "waitMs": 10000,
+        "returnWhen": {"outputContains": ["spawned="]},
+    }));
+    let c_old_handle = polled["output"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("spawned="))
+        .unwrap_or_else(|| panic!("missing spawned= line: {polled_text}"))
+        .to_owned();
+    let c_old_bare = bare_id(&c_old_handle).to_owned();
+
+    let (limited, limited_text) = server.ok(json!({"action": "list", "limit": 2}));
+    let limited_tasks = limited["tasks"].as_array().unwrap();
+    assert_eq!(limited["totalCount"], 3, "{limited}");
+    assert_eq!(limited_tasks.len(), 2, "{limited}");
+    assert_eq!(limited_tasks[0]["taskId"], p_old_bare, "{limited}");
+    assert_eq!(
+        limited_tasks[0]["children"]["activeTasks"][0]["taskId"], c_old_bare,
+        "{limited}"
+    );
+    assert_eq!(limited_tasks[1]["taskId"], p2_bare, "{limited}");
+    let first_line = limited_text.lines().next().unwrap();
+    let second_line = limited_text.lines().nth(1).unwrap();
+    assert!(first_line.starts_with(&p_old_bare), "{limited_text}");
+    assert!(
+        second_line.starts_with(&format!("  └─ {c_old_bare}")),
+        "{limited_text}"
+    );
+
+    let (full, _) = server.ok(json!({"action": "list", "limit": 20}));
+    assert_eq!(full["totalCount"], limited["totalCount"], "{full}");
+    let full_ids: Vec<&str> = full["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["taskId"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        full_ids,
+        vec![p_old_bare.as_str(), p2_bare.as_str(), p1_bare.as_str()],
+        "{full}"
+    );
+
+    server.ok(json!({"action": "kill", "taskId": &p_old_handle}));
+    server.ok(json!({"action": "kill", "taskId": &c_old_handle}));
+}
+
+#[test]
+fn codemode_list_fit_lines_atomic_blocks_and_outbound_limit_no_partial_report() {
+    // Part 1: atomic fit_lines under small maxBytes never strands an indented child line.
+    let mut server = codemode_server();
+    for i in 1..=3 {
+        server.ok(json!({
+            "action": "start",
+            "command": format!("printf top-{i}"),
+            "loginShell": false,
+        }));
+    }
+    let started = code_result(
+        &mut server,
+        json!({
+            "code": r#"
+                const c1 = await tools.exec({ action: "start", command: "sleep 30", waitMs: 0, loginShell: false });
+                const c2 = await tools.exec({ action: "start", command: "sleep 30", waitMs: 0, loginShell: false });
+                return [c1.taskId, c2.taskId];
+            "#
+        }),
+    );
+    assert_eq!(started["structuredContent"]["exitCode"], 0, "{started}");
+    let child_handles: Vec<String> =
+        serde_json::from_str(started["structuredContent"]["output"].as_str().unwrap()).unwrap();
+
+    for truncate in ["head_tail", "tail"] {
+        for max_bytes in [150_u64, 250, 350, 450, 600] {
+            let (_, text) = server.ok(json!({
+                "action": "list",
+                "maxBytes": max_bytes,
+                "truncate": truncate,
+            }));
+            let lines: Vec<&str> = text.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                if line.starts_with("  └─ ") {
+                    assert!(
+                        idx > 0,
+                        "orphaned child line at top (truncate={truncate}, maxBytes={max_bytes}): {text}"
+                    );
+                    let prev = lines[idx - 1];
+                    assert!(
+                        !prev.starts_with("... ["),
+                        "orphaned child line after omission marker (truncate={truncate}, maxBytes={max_bytes}): {text}"
+                    );
+                }
+            }
+        }
+    }
+    for handle in child_handles {
+        server.ok(json!({"action": "kill", "taskId": handle}));
+    }
+
+    // Part 2: FASTEXEC_TEST_OUTBOUND_LIMIT rejects an oversized list with 8 inline active children
+    // cleanly and does not partially mark unreported tasks reported.
+    let mut bounded = Server::start_with(|cmd| {
+        cmd.env("FASTEXEC_CODEMODE", "true")
+            .env("FASTEXEC_OUTPUT_MODE", "both")
+            .env("FASTEXEC_TEST_OUTBOUND_LIMIT", "2600");
+    });
+
+    let eight = code_result(
+        &mut bounded,
+        json!({
+            "code": r#"
+                const ids = [];
+                for (let i = 0; i < 8; i++) {
+                    const c = await tools.exec({ action: "start", command: "sleep 30", waitMs: 0, loginShell: false });
+                    ids.push(c.taskId);
+                }
+                return ids;
+            "#
+        }),
+    );
+    assert_eq!(eight["structuredContent"]["exitCode"], 0, "{eight}");
+    let eight_handles: Vec<String> =
+        serde_json::from_str(eight["structuredContent"]["output"].as_str().unwrap()).unwrap();
+
+    // Start an unreported failing task after `eight` so `eight`'s response cannot report it.
+    let (unreported, _) = bounded.ok(json!({
+        "action": "start",
+        "command": "sleep 0.05; exit 2",
+        "loginShell": false,
+        "waitMs": 0,
+    }));
+    let unreported_bare = bare_id(unreported["taskId"].as_str().unwrap()).to_owned();
+
+    // Wait for the background task to exit before calling list.
+    std::thread::sleep(Duration::from_millis(150));
+
+    let (_, err_text, is_err) = bounded.call(json!({"action": "list"}));
+    assert!(is_err, "expected outbound limit error on list: {err_text}");
+    assert!(
+        err_text.contains("over the frame limit"),
+        "unexpected outbound error: {err_text}"
+    );
+
+    // Unreported finished task must still surface in the background footer.
+    let (_, bg_text) = bounded.ok(json!({
+        "action": "start",
+        "command": "true",
+        "loginShell": false,
+    }));
+    assert!(
+        bg_text.contains("(Background:") && bg_text.contains(&unreported_bare),
+        "failed list partially marked {unreported_bare} reported: {bg_text}"
+    );
+
+    for handle in eight_handles {
+        bounded.ok(json!({"action": "kill", "taskId": handle}));
+    }
+}
+
+#[test]
+fn codemode_list_overflows_over_8_active_children_and_status_line_hints() {
+    let mut server = codemode_server();
+
+    // Case A: normal exited codemode with 10 active keepTree children (> 8 overflow + > 3 hint).
+    let exited = code_result(
+        &mut server,
+        json!({
+            "code": r#"
+                for (let i = 0; i < 10; i++) {
+                    const r = await tools.exec({
+                        action: "start",
+                        command: "sleep 30 &",
+                        keepTree: true,
+                        loginShell: false,
+                    });
+                    if (r.exitCode !== 0 || !r.keptRunning) {
+                        throw new Error("expected keptRunning child: " + JSON.stringify(r));
+                    }
+                }
+                return "ten-kept";
+            "#
+        }),
+    );
+    assert_eq!(exited["structuredContent"]["state"], "exited", "{exited}");
+    assert_eq!(exited["structuredContent"]["exitCode"], 0, "{exited}");
+    let exited_bare = bare_id(exited["structuredContent"]["taskId"].as_str().unwrap()).to_owned();
+    let expected_exited_hint =
+        format!("; list active with exec list parentTaskId=\"{exited_bare}\" state=\"active\"");
+    assert!(
+        code_text(&exited).contains(&expected_exited_hint),
+        "missing exited status_line hint: {}",
+        code_text(&exited)
+    );
+
+    let (listed, list_text) = server.ok(json!({"action": "list"}));
+    let parent = &listed["tasks"][0];
+    assert_eq!(parent["taskId"], exited_bare, "{listed}");
+    assert_eq!(parent["children"]["total"], 10, "{listed}");
+    assert_eq!(parent["children"]["active"], 10, "{listed}");
+    assert_eq!(
+        parent["children"]["activeTasks"].as_array().unwrap().len(),
+        8,
+        "{listed}"
+    );
+    assert!(list_text.contains("10 tasks (10 active)"), "{list_text}");
+    let overflow_line = format!(
+        "  └─ ... 2 more active; list with parentTaskId=\"{exited_bare}\" state=\"active\""
+    );
+    assert!(
+        list_text.lines().any(|l| l == overflow_line),
+        "missing overflow hint line: {list_text}"
+    );
+    let indented_task_lines = list_text
+        .lines()
+        .filter(|l| l.starts_with("  └─ ") && !l.starts_with("  └─ ... "))
+        .count();
+    assert_eq!(indented_task_lines, 8, "{list_text}");
+
+    // Clean up all 10 active children via parentTaskId drill-down.
+    let (children, _) = server.ok(json!({
+        "action": "list",
+        "parentTaskId": &exited_bare,
+        "state": "active",
+    }));
+    assert_eq!(children["totalCount"], 10, "{children}");
+    for child in children["tasks"].as_array().unwrap() {
+        server.ok(json!({"action": "kill", "taskId": child["taskId"]}));
+    }
+
+    // Case B: killed codemode with > 3 active children also appends the status_line hint.
+    let running = code_result(
+        &mut server,
+        json!({
+            "code": r#"
+                for (let i = 0; i < 4; i++) {
+                    await tools.exec({
+                        action: "start",
+                        command: "sleep 30 &",
+                        keepTree: true,
+                        loginShell: false,
+                    });
+                }
+                text("four-ready");
+                await sleep(30000);
+            "#,
+            "waitMs": 10000,
+            "returnWhen": {"outputContains": ["four-ready"]},
+        }),
+    );
+    let killed_handle = running["structuredContent"]["taskId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let killed_bare = bare_id(&killed_handle).to_owned();
+    let (killed, kill_text) = server.ok(json!({"action": "kill", "taskId": &killed_handle}));
+    assert_eq!(killed["state"], "killed", "{kill_text}");
+    let expected_killed_hint =
+        format!("; list active with exec list parentTaskId=\"{killed_bare}\" state=\"active\"");
+    assert!(
+        kill_text.contains(&expected_killed_hint),
+        "missing killed status_line hint: {kill_text}"
+    );
+
+    let (killed_children, _) = server.ok(json!({
+        "action": "list",
+        "parentTaskId": &killed_bare,
+        "state": "active",
+    }));
+    assert_eq!(killed_children["totalCount"], 4, "{killed_children}");
+    for child in killed_children["tasks"].as_array().unwrap() {
+        server.ok(json!({"action": "kill", "taskId": child["taskId"]}));
+    }
 }

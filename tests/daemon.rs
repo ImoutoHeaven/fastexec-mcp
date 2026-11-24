@@ -2165,10 +2165,19 @@ fn codemode_endpoint_enables_an_existing_daemon_and_another_reader_gets_images()
         .iter()
         .find(|task| task["kind"] == "codemode")
         .unwrap();
-    let child = tasks.iter().find(|task| task["kind"] == "bash").unwrap();
+    assert_eq!(script["children"]["done"], 1, "{listed}");
+    let (children, children_text, children_error) =
+        enabled.call(json!({"action":"list","parentTaskId": script["taskId"]}));
+    assert!(!children_error, "{children_text}");
+    let child = children["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["kind"] == "bash")
+        .unwrap();
     assert!(!script["callId"].is_null(), "{listed}");
-    assert_eq!(script["callId"], child["callId"], "{listed}");
-    assert_eq!(script["session"], child["session"], "{listed}");
+    assert_eq!(script["callId"], child["callId"], "{listed}\n{children}");
+    assert_eq!(script["session"], child["session"], "{listed}\n{children}");
 }
 
 #[test]
@@ -2374,7 +2383,14 @@ fn outside_session_running_footer_is_delivered_once_and_preserved_across_tiny_bu
     let (sess_list, _, _) = ep_b.call(json!({"action": "list"}));
     assert_eq!(sess_list["totalCount"], 2, "{sess_list}");
     let (all_list, _, _) = ep_b.call(json!({"action": "list", "scope": "all"}));
-    assert_eq!(all_list["totalCount"], 6, "{all_list}");
+    assert_eq!(all_list["totalCount"], 5, "{all_list}");
+    let cm_task = all_list["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["kind"] == "codemode")
+        .unwrap();
+    assert_eq!(cm_task["children"]["done"], 1, "{all_list}");
 
     // Stale 8-char base32 epoch in daemon mode reports an earlier daemon; malformed ID says Unknown taskId.
     let (_, stale_text, stale_err) = ep_b.call(json!({"action": "poll", "taskId": "01234567-9z"}));

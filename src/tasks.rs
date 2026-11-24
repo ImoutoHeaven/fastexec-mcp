@@ -699,8 +699,7 @@ impl Tasks {
                                         .rev()
                                         .take(MAX_INLINE_ACTIVE)
                                     {
-                                        let child_snapshot =
-                                            snapshot_listed_task(&child, reserve)?;
+                                        let child_snapshot = snapshot_listed_task(&child, reserve)?;
                                         fold.summary.active_tasks.push((child, child_snapshot));
                                     }
                                 }

@@ -258,7 +258,9 @@ impl Drop for QueuedStartGuard {
             self.armed = false;
             self.control.queued_starts.fetch_sub(1, Ordering::Relaxed);
             if self.control.cancel.is_cancelled() {
-                self.control.cancelled_starts.fetch_add(1, Ordering::Relaxed);
+                self.control
+                    .cancelled_starts
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }

@@ -2759,7 +2759,7 @@ fn cancelled_start_leaves_the_login_probe_warning_for_the_next_delivery() {
     let code = r#"
         const command = "read -r keep_open";
         const waiting = tools.exec({action: "start", command, eof: false});
-        while (!(await tools.exec({action: "list"})).tasks.some(t => t.command === command)) {
+        while (!(await tools.exec({action: "list"})).tasks.some(t => t.command === command || t.children?.activeTasks?.some(c => c.command === command))) {
             await sleep(10);
         }
         const other = await tools.exec({action: "start", command: "true"});

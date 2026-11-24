@@ -1824,8 +1824,16 @@ fn a_large_list_row_does_not_hide_the_opposite_end() {
         folded_count: 0,
     };
     for (rows, want, omitted_at_start) in [
-        (vec![block(vec!["x".repeat(200)]), block(vec!["short".into()])], 1, true),
-        (vec![block(vec!["short".into()]), block(vec!["x".repeat(200)])], 0, false),
+        (
+            vec![block(vec!["x".repeat(200)]), block(vec!["short".into()])],
+            1,
+            true,
+        ),
+        (
+            vec![block(vec!["short".into()]), block(vec!["x".repeat(200)])],
+            0,
+            false,
+        ),
     ] {
         let (kept, text) = fit_lines(&rows, Truncate::HeadTail, 100);
         let indexes: Vec<usize> = kept.into_iter().map(|(index, _)| index).collect();
@@ -1858,7 +1866,10 @@ fn fit_lines_keeps_parent_and_children_atomic_and_trims_single_block_bottom_up()
     ];
     let (kept, text) = fit_lines(&blocks, Truncate::HeadTail, 215);
     assert!(text.len() <= 215, "{text}");
-    assert!(text.contains("... [1 tasks omitted; raise maxBytes to see them] ..."), "{text}");
+    assert!(
+        text.contains("... [1 tasks omitted; raise maxBytes to see them] ..."),
+        "{text}"
+    );
     // Never emits an indented child without its parent header right above it.
     let mut saw_parent = false;
     for line in text.lines() {
@@ -1903,4 +1914,246 @@ fn screen_row_omission_keeps_and_cuts_the_bottom_row_when_it_exceeds_budget() {
     );
     assert!(body.ends_with(" … [cut]"), "{body}");
     assert!(body.len() <= 100);
+}
+
+#[tokio::test]
+async fn fit_lines_trims_real_delivered_tasks_bottom_up_and_keeps_mark_reported_consistent() {
+    let (service, tasks, session) = script_fixture();
+    let mut created = Vec::new();
+    for key in ["pr01", "at01", "ab01", "fp01", "fk01"] {
+        let (task, entry, _) = tasks
+            .start_script(
+                tasks::ScriptArgs {
+                    code: "return undefined;".into(),
+                    launch: Arc::clone(&session.launch),
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                key.into(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+        created.push((task, entry));
+    }
+    let mut created = created.into_iter();
+    let (parent, parent_entry) = created.next().unwrap();
+    let (active_top, active_top_entry) = created.next().unwrap();
+    let (active_bottom, active_bottom_entry) = created.next().unwrap();
+    let (folded_plain, folded_plain_entry) = created.next().unwrap();
+    let (folded_kept, folded_kept_entry) = created.next().unwrap();
+
+    let exited_snapshot = || Snapshot {
+        state: "exited",
+        exit_code: Some(0),
+        forced_end: false,
+        elapsed: Duration::from_millis(10),
+        lines: 0,
+        dropped: 0,
+        evicted: false,
+        output_open: false,
+        expired: false,
+        log_error: None,
+        capture_error: None,
+        input_warning: None,
+        input_error: None,
+        leftovers: Vec::new(),
+        kept: true,
+        tree_ended: false,
+        held: Vec::new(),
+        kill_error: None,
+    };
+
+    let parent_line = format!("{} [exited 0] 0.1s · owner · [codemode] parent", parent.id);
+    let top_line = format!("  └─ {} [exited 0] 0.1s · keeps sleep · top", active_top.id);
+    let bottom_line = format!(
+        "  └─ {} [exited 0] 0.1s · keeps sleep · bottom-padding-0123456789",
+        active_bottom.id
+    );
+    let budget = parent_line.len() + 1 + top_line.len();
+    let blocks = vec![ListBlock {
+        lines: vec![parent_line, top_line, bottom_line],
+        delivered_tasks: vec![
+            (Arc::clone(&parent), parent.snapshot()),
+            (Arc::clone(&active_top), exited_snapshot()),
+            (Arc::clone(&active_bottom), exited_snapshot()),
+        ],
+        folded_finished: vec![
+            (Arc::clone(&folded_plain), false),
+            (Arc::clone(&folded_kept), true),
+        ],
+        folded_count: 2,
+    }];
+
+    let (kept, text) = fit_lines(&blocks, Truncate::HeadTail, budget);
+    assert_eq!(kept, vec![(0, 2)]);
+    assert!(text.contains(&parent.id), "{text}");
+    assert!(text.contains(&active_top.id), "{text}");
+    assert!(!text.contains(&active_bottom.id), "{text}");
+
+    // Mirror Service::list commit on surviving kept_tasks and folded_finished.
+    for (block_index, kept_tasks) in kept {
+        let block = &blocks[block_index];
+        for (task, snapshot) in &block.delivered_tasks[..kept_tasks] {
+            if let Some(entry) = session.existing(task) {
+                entry.mark_reported(snapshot);
+                entry.mark_keeps_reported(snapshot);
+            }
+        }
+        for (child, tree_ended) in &block.folded_finished {
+            if let Some(entry) = session.existing(child) {
+                entry.mark_finished_reported(*tree_ended);
+            }
+        }
+    }
+
+    assert!(parent_entry.is_reported());
+    assert!(active_top_entry.is_reported());
+    assert!(!active_bottom_entry.is_reported());
+    assert!(folded_plain_entry.is_reported());
+    assert!(!folded_plain_entry.tree_end_reported());
+    assert!(folded_kept_entry.is_reported());
+    assert!(folded_kept_entry.tree_end_reported());
+
+    tasks.shutdown();
+}
+
+#[tokio::test]
+async fn status_line_appends_parent_task_id_hint_only_when_more_than_three_children_running() {
+    let (service, tasks, session) = script_fixture();
+    // Keep at most 3 background script slots occupied so the 4th slot remains free for the
+    // parent script under test; a 4th distinct reader handle on the first running task exercises
+    // report.running.len() == 4 without exceeding the 4-script concurrency cap.
+    let mut running_handles = Vec::new();
+    let mut first_running_id = String::new();
+    for idx in 0..3usize {
+        let (child, _, reader) = tasks
+            .start_script(
+                tasks::ScriptArgs {
+                    code: "await sleep(30000);".into(),
+                    launch: Arc::clone(&session.launch),
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                format!("rn0{idx}"),
+            )
+            .unwrap();
+        if idx == 0 {
+            first_running_id = child.id.clone();
+        }
+        running_handles.push(reader.handle(&child.id));
+    }
+    running_handles.push(format!("{first_running_id}.rn03"));
+
+    for (count, expect_hint) in [(3usize, false), (4usize, true)] {
+        // Exited branch.
+        let (exited_task, _, exited_reader) = tasks
+            .start_script(
+                tasks::ScriptArgs {
+                    code: "return undefined;".into(),
+                    launch: Arc::clone(&session.launch),
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                format!("ex0{count}"),
+            )
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            exited_task.done().wait_for(|done| *done),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for handle in &running_handles[..count] {
+            exited_task.script().unwrap().record_started(handle.clone());
+        }
+        let polled = service
+            .call_json(
+                json!({
+                    "action": "poll",
+                    "taskId": exited_reader.handle(&exited_task.id),
+                    "waitMs": 0
+                }),
+                script_call(&session, false),
+            )
+            .await;
+        assert_ne!(polled.is_error, Some(true), "{polled:?}");
+        let exited_text = polled.content[0].as_text().unwrap().text.as_str();
+        let exited_hint = format!(
+            "; list active with exec list parentTaskId=\"{}\" state=\"active\"",
+            exited_task.id
+        );
+        assert!(exited_text.contains("[exited 0]"), "{exited_text}");
+        assert!(
+            exited_text.contains("tasks it started still running:"),
+            "{exited_text}"
+        );
+        assert_eq!(
+            exited_text.contains(&exited_hint),
+            expect_hint,
+            "exited branch count={count}: {exited_text}"
+        );
+
+        // Killed branch.
+        let (killed_task, _, killed_reader) = tasks
+            .start_script(
+                tasks::ScriptArgs {
+                    code: "await sleep(30000);".into(),
+                    launch: Arc::clone(&session.launch),
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                format!("kk0{count}"),
+            )
+            .unwrap();
+        for handle in &running_handles[..count] {
+            killed_task.script().unwrap().record_started(handle.clone());
+        }
+        let killed = service
+            .call_json(
+                json!({
+                    "action": "kill",
+                    "taskId": killed_reader.handle(&killed_task.id)
+                }),
+                script_call(&session, false),
+            )
+            .await;
+        assert_ne!(killed.is_error, Some(true), "{killed:?}");
+        let killed_text = killed.content[0].as_text().unwrap().text.as_str();
+        let killed_hint = format!(
+            "; list active with exec list parentTaskId=\"{}\" state=\"active\"",
+            killed_task.id
+        );
+        assert!(killed_text.contains("[killed]"), "{killed_text}");
+        assert!(
+            killed_text.contains("tasks it started keep running:"),
+            "{killed_text}"
+        );
+        assert_eq!(
+            killed_text.contains(&killed_hint),
+            expect_hint,
+            "killed branch count={count}: {killed_text}"
+        );
+    }
+
+    tasks.shutdown();
 }

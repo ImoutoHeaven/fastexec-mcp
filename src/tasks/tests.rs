@@ -2404,4 +2404,364 @@ mod script_tests {
 
         tasks.shutdown();
     }
+
+    fn make_synthetic_task(
+        tasks: &Tasks,
+        session: &Session,
+        command: &str,
+        parent_task_id: Option<String>,
+        end: Option<Final>,
+        tree_done: bool,
+    ) -> (Arc<Task>, Arc<TaskEntry>) {
+        let id = tasks.next_id();
+        let log_path = tasks.dir.join(format!("{id}.log"));
+        let _log = private_file(&log_path).unwrap();
+        let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
+        let task = Arc::new(Task {
+            id,
+            command: command.into(),
+            pty: false,
+            log_path,
+            encoding: encoding_rs::UTF_8,
+            keep: end.as_ref().is_some_and(|final_state| final_state.kept),
+            owner: session.label.clone(),
+            session_id: Some(session.id.clone()),
+            started_by: None,
+            parent_task_id,
+            started: Instant::now(),
+            root: Root::Script(script),
+            tree_done: watch::Sender::new(tree_done),
+            tree_ended_at: OnceLock::new(),
+            kill_error: Mutex::new(None),
+            kill_requested: AtomicBool::new(false),
+            expired: AtomicBool::new(false),
+            out: Mutex::default(),
+            end: Mutex::new(end),
+            done: watch::Sender::new(true),
+            activity: watch::Sender::new(()),
+            input: Mutex::new(None),
+            writer_done: WriterDone::new(true),
+            input_warning: Mutex::new(None),
+            input_error: Mutex::new(None),
+            queued: AtomicUsize::new(0),
+            input_gate: tokio::sync::Mutex::new(()),
+            terminal: None,
+            transcript_file: Mutex::new(None),
+            size: Mutex::new((0, 0)),
+            pty_control: Mutex::new(None),
+            size_error: Mutex::new(None),
+        });
+        let entry = {
+            let mut registry = lock(&tasks.registry);
+            let entry = session.entry(&task);
+            registry.tasks.push(Arc::clone(&task));
+            entry
+        };
+        (task, entry)
+    }
+
+    fn finished_final(kept: bool) -> Final {
+        Final {
+            exit_code: Some(0),
+            killed: false,
+            expired: false,
+            forced_end: false,
+            elapsed: Duration::from_millis(10),
+            output_open: false,
+            leftovers: Vec::new(),
+            kept,
+        }
+    }
+
+    fn test_service_call(session: &Arc<Session>) -> crate::service::Call<'_> {
+        crate::service::Call {
+            session,
+            launch: None,
+            render: crate::service::render::Render {
+                output_mode: crate::service::render::OutputMode::Both,
+                structured_content: true,
+            },
+            cancel: CancellationToken::new(),
+            progress: None,
+            call_id: None,
+            nested: false,
+            started: None,
+            queued_guard: None,
+            render_slot: None,
+            http_response: false,
+            rpc_id_bytes: 0,
+            input_owner: Default::default(),
+        }
+    }
+
+    #[test]
+    fn evicted_parent_promotes_child_and_preserves_parent_task_id_drill_down() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let service = Arc::new(crate::service::Service::new(Arc::clone(&tasks), false));
+        let (parent, _) = make_synthetic_task(
+            &tasks,
+            &session,
+            "[codemode] parent()",
+            None,
+            Some(finished_final(false)),
+            true,
+        );
+        let (child, _) = make_synthetic_task(
+            &tasks,
+            &session,
+            "echo orphan-child",
+            Some(parent.id.clone()),
+            Some(finished_final(false)),
+            true,
+        );
+
+        // Simulate retire_finished evicting the finished parent while keeping its child.
+        lock(&tasks.registry)
+            .tasks
+            .retain(|task| task.id != parent.id);
+
+        runtime.block_on(async {
+            let default_list = service
+                .call_json(
+                    serde_json::json!({ "action": "list" }),
+                    test_service_call(&session),
+                )
+                .await;
+            assert_ne!(default_list.is_error, Some(true), "{default_list:?}");
+            let text = default_list.content[0].as_text().unwrap().text.as_str();
+            assert!(
+                text.contains(&format!("via {}", parent.id)) && text.contains(&child.id),
+                "expected promoted orphan with via <pid>: {text}"
+            );
+            let structured = default_list.structured_content.as_ref().unwrap();
+            assert_eq!(structured["totalCount"], 1);
+            let listed = structured["tasks"].as_array().unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0]["taskId"], child.id);
+            assert_eq!(listed[0]["parentTaskId"], parent.id);
+
+            let drill = service
+                .call_json(
+                    serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
+                    test_service_call(&session),
+                )
+                .await;
+            assert_ne!(drill.is_error, Some(true), "{drill:?}");
+            let drill_structured = drill.structured_content.as_ref().unwrap();
+            assert_eq!(drill_structured["totalCount"], 1);
+            let drill_tasks = drill_structured["tasks"].as_array().unwrap();
+            assert_eq!(drill_tasks.len(), 1);
+            assert_eq!(drill_tasks[0]["taskId"], child.id);
+            assert_eq!(drill_tasks[0]["parentTaskId"], parent.id);
+
+            let missing = service
+                .call_json(
+                    serde_json::json!({ "action": "list", "parentTaskId": "zzzzzzzz-99" }),
+                    test_service_call(&session),
+                )
+                .await;
+            assert_eq!(missing.is_error, Some(true), "{missing:?}");
+            let missing_text = missing.content[0].as_text().unwrap().text.as_str();
+            assert!(
+                missing_text.contains("Unknown parentTaskId"),
+                "expected Unknown parentTaskId error: {missing_text}"
+            );
+        });
+
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn list_bottom_up_trim_and_outbound_rejection_keep_mark_reported_consistent() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let service = Arc::new(crate::service::Service::new(Arc::clone(&tasks), false));
+        let (parent, parent_entry) = make_synthetic_task(
+            &tasks,
+            &session,
+            "[codemode] parent()",
+            None,
+            Some(finished_final(false)),
+            true,
+        );
+        let (_folded_plain, folded_plain_entry) = make_synthetic_task(
+            &tasks,
+            &session,
+            "echo plain",
+            Some(parent.id.clone()),
+            Some(finished_final(false)),
+            true,
+        );
+        let (_folded_kept, folded_kept_entry) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 0.1 &",
+            Some(parent.id.clone()),
+            Some(finished_final(true)),
+            true,
+        );
+        // Active kept children: started older first so active_bottom sits at the bottom.
+        let (active_bottom, active_bottom_entry) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 30 & # bottom-child-padding-0123456789abcdef0123456789abcdef0123456789abcdef",
+            Some(parent.id.clone()),
+            Some(finished_final(true)),
+            false,
+        );
+        let (active_top, active_top_entry) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 30 & # top-child-padding-0123456789abcdef0123456789",
+            Some(parent.id.clone()),
+            Some(finished_final(true)),
+            false,
+        );
+
+        runtime.block_on(async {
+            // Outbound frame rejection must leave parent, active children, and folded children unreported.
+            let small_frame = Arc::new(session.launch.for_session().with_outbound_limit(512));
+            let mut refused_call = test_service_call(&session);
+            refused_call.launch = Some(&small_frame);
+            let refused = service
+                .call_json_tracked(serde_json::json!({ "action": "list" }), refused_call)
+                .await;
+            assert!(refused.overload, "{:?}", refused.result);
+            assert!(
+                refused.result.content[0]
+                    .as_text()
+                    .unwrap()
+                    .text
+                    .contains("frame limit")
+            );
+            assert!(!parent_entry.is_reported());
+            assert!(!active_top_entry.is_reported());
+            assert!(!active_bottom_entry.is_reported());
+            assert!(!folded_plain_entry.is_reported());
+            assert!(!folded_kept_entry.is_reported());
+            assert!(!folded_kept_entry.tree_end_reported());
+            drop(refused);
+
+            // Budget sized so parent + active_top fit while active_bottom is trimmed from the bottom.
+            let trimmed = service
+                .call_json(
+                    serde_json::json!({ "action": "list", "maxBytes": 210 }),
+                    test_service_call(&session),
+                )
+                .await;
+            assert_ne!(trimmed.is_error, Some(true), "{trimmed:?}");
+            let text = trimmed.content[0].as_text().unwrap().text.as_str();
+            assert!(text.contains(&parent.id), "missing parent in:\n{text}");
+            assert!(
+                text.contains(&active_top.id),
+                "missing surviving top active child in:\n{text}"
+            );
+            assert!(
+                !text.contains(&active_bottom.id),
+                "bottom active child should have been trimmed:\n{text}"
+            );
+
+            assert!(parent_entry.is_reported());
+            assert!(active_top_entry.is_reported());
+            assert!(
+                !active_bottom_entry.is_reported(),
+                "trimmed bottom active child must remain unreported"
+            );
+            assert!(folded_plain_entry.is_reported());
+            assert!(!folded_plain_entry.tree_end_reported());
+            assert!(folded_kept_entry.is_reported());
+            assert!(folded_kept_entry.tree_end_reported());
+        });
+
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn cross_session_parent_task_id_respects_scope_without_creating_session_entries() {
+        let (runtime, tasks, session_a) = fixture(Limits::OFF);
+        let service = Arc::new(crate::service::Service::new(Arc::clone(&tasks), false));
+        let session_b = Session::new(
+            "session-b".into(),
+            "session-b".into(),
+            Arc::clone(&session_a.launch),
+        );
+
+        let (parent, _) = make_synthetic_task(
+            &tasks,
+            &session_a,
+            "[codemode] parent()",
+            None,
+            Some(finished_final(false)),
+            true,
+        );
+        let (child_a, child_a_entry) = make_synthetic_task(
+            &tasks,
+            &session_a,
+            "echo from-a",
+            Some(parent.id.clone()),
+            Some(finished_final(false)),
+            true,
+        );
+        let (child_b, child_b_entry) = make_synthetic_task(
+            &tasks,
+            &session_b,
+            "echo from-b",
+            Some(parent.id.clone()),
+            Some(finished_final(false)),
+            true,
+        );
+        assert!(session_b.existing(&parent).is_none());
+        assert!(session_b.existing(&child_a).is_none());
+
+        runtime.block_on(async {
+            // Default scope with parentTaskId is "all": Session B sees Session A's child without
+            // creating session entries in Session B for cross-session tasks.
+            let all_view = service
+                .call_json(
+                    serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
+                    test_service_call(&session_b),
+                )
+                .await;
+            assert_ne!(all_view.is_error, Some(true), "{all_view:?}");
+            let structured = all_view.structured_content.as_ref().unwrap();
+            assert_eq!(structured["totalCount"], 2);
+            let ids: Vec<&str> = structured["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["taskId"].as_str().unwrap())
+                .collect();
+            assert!(ids.contains(&child_a.id.as_str()), "{ids:?}");
+            assert!(ids.contains(&child_b.id.as_str()), "{ids:?}");
+            assert!(session_b.existing(&parent).is_none());
+            assert!(session_b.existing(&child_a).is_none());
+            assert!(!child_a_entry.is_reported());
+            assert!(child_b_entry.is_reported());
+
+            // Explicit scope: "session" restricts to Session B's own children.
+            let session_view = service
+                .call_json(
+                    serde_json::json!({
+                        "action": "list",
+                        "parentTaskId": parent.id,
+                        "scope": "session"
+                    }),
+                    test_service_call(&session_b),
+                )
+                .await;
+            assert_ne!(session_view.is_error, Some(true), "{session_view:?}");
+            let session_structured = session_view.structured_content.as_ref().unwrap();
+            assert_eq!(session_structured["totalCount"], 1);
+            let session_ids: Vec<&str> = session_structured["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["taskId"].as_str().unwrap())
+                .collect();
+            assert_eq!(session_ids, vec![child_b.id.as_str()]);
+            assert!(session_b.existing(&parent).is_none());
+            assert!(session_b.existing(&child_a).is_none());
+        });
+
+        tasks.shutdown();
+    }
 }

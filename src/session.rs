@@ -448,7 +448,10 @@ pub fn parse_handle(handle: &str) -> Result<(&str, Option<&str>), String> {
 }
 
 /// Splits an optional reader suffix, naming `field` on malformed handles.
-pub fn parse_handle_for<'a>(handle: &'a str, field: &str) -> Result<(&'a str, Option<&'a str>), String> {
+pub fn parse_handle_for<'a>(
+    handle: &'a str,
+    field: &str,
+) -> Result<(&'a str, Option<&'a str>), String> {
     let Some((id, key)) = handle.split_once('.') else {
         return Ok((handle, None));
     };
