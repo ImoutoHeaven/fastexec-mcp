@@ -633,8 +633,8 @@ pub(super) fn edit_outcome_reserved(
         }
     };
     let _guard = lock();
-    let source = EditSource::read(resolved, launch.memory()).map_err(&map_io)?;
-    reserve_target_workspace(&source.target.value, lease, launch.memory()).map_err(&map_io)?;
+    let source = EditSource::read(resolved, launch.memory()).map_err(map_io)?;
+    reserve_target_workspace(&source.target.value, lease, launch.memory()).map_err(map_io)?;
     let mut workspace = EditWorkspace::new(lease, launch.memory().limit());
     let (mut written, starts, fuzzy_flags) =
         apply_edits_budgeted(&source.content, request, &shown_path, &mut workspace)?;
@@ -652,7 +652,7 @@ pub(super) fn edit_outcome_reserved(
     }
     source
         .save(written.as_bytes(), launch.memory())
-        .map_err(&map_io)?;
+        .map_err(map_io)?;
     Ok(FileEditData {
         path: shown_path,
         replacements: request.edits.len(),

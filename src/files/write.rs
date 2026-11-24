@@ -82,16 +82,16 @@ pub(super) fn write_text_reserved(
             _ => FileError::Io(message),
         }
     };
-    let target = write_target(&resolved, launch.memory()).map_err(&map_io)?;
-    reserve_target_workspace(&target.value, lease, launch.memory()).map_err(&map_io)?;
-    create_target_directories(&target.value, launch.memory()).map_err(&map_io)?;
+    let target = write_target(&resolved, launch.memory()).map_err(map_io)?;
+    reserve_target_workspace(&target.value, lease, launch.memory()).map_err(map_io)?;
+    create_target_directories(&target.value, launch.memory()).map_err(map_io)?;
     save_target(
         &target.value,
         request.content.as_bytes(),
         None,
         launch.memory(),
     )
-    .map_err(&map_io)?;
+    .map_err(map_io)?;
     Ok(FileWriteData {
         path: shown_path,
         bytes: request.content.len() as u64,
