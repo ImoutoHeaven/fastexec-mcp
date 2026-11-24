@@ -56,8 +56,9 @@ and no glibc compatibility package. Alpine uses these Linux archives.
 
 The FreeBSD archive is built natively and checked on FreeBSD 15.1 amd64. Its binary uses the
 FreeBSD base-system libraries; it does not require Rust at runtime. The FreeBSD and Alpine
-archive checks cover MCP initialization and tool discovery, file write/edit/read, pipe exec,
-PTY input and resizing, and daemon tasks carried between sessions.
+archive checks verify MCP `2026-07-28` discovery and tool listing, file write/edit/read,
+pipe exec, PTY input and resizing, and daemon tasks carried between sessions.
+Discovery must advertise only the supported protocol revision and the release version.
 
 Windows binaries link the C runtime statically (`.cargo/config.toml`) and embed the ConPTY
 of their architecture. macOS binaries are unsigned.

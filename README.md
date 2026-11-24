@@ -9,6 +9,9 @@
 `exec`, or use `read`, `write`, and `edit` for files. Tasks run with the
 server account's permissions, without a sandbox.
 
+Clients must support MCP `2026-07-28`, including `server/discover` and
+per-request metadata. See the [protocol contract](docs/fastexec-design.md#mcp-protocol).
+
 ## Quick start
 
 Install GNU bash on Linux, macOS, or FreeBSD, or
@@ -118,6 +121,11 @@ task attachment to the result. Poll or stop the script with `exec`. Stopping
 the script cancels pending tool calls and leaves Bash tasks it already started
 running. Set `killAfterMs` to bound the script itself. See the
 [Codemode tool contract](src/description-codemode.md) for arguments and limits.
+
+`exec` with `action: "list"` groups child tasks under their script. Script
+rows summarize their children and include up to eight active children. To list
+all of a script's children, pass its task ID as `parentTaskId`; add
+`state: "active"` or `state: "finished"` to filter them.
 
 ### Shared daemon and remote HTTP
 
