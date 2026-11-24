@@ -63,6 +63,53 @@ fn context(cwd: &Path, home: &Path) -> LaunchContext {
     )
 }
 
+fn read_text(
+    request: &ReadRequest,
+    launch: &LaunchContext,
+    transfer: bool,
+    policy: ReadPolicy,
+) -> Result<Outcome, String> {
+    let owned = read_blocking(request, launch, transfer, policy, None);
+    let owner = owned.owner.clone();
+    owned
+        .run(|read| read)
+        .map(|data| read_data_to_outcome(data, policy, owner))
+        .map_err(FileError::into_message)
+}
+
+fn edit_owned_outcome(
+    request: &EditRequest,
+    launch: &LaunchContext,
+) -> crate::ipc::Owned<BlockingOutcome> {
+    let owned = edit_blocking(request, launch);
+    let owner = owned.owner.clone();
+    let value = owned.run(|res| match res {
+        Ok(data) => Ok(edit_data_to_agent(data)),
+        Err(err) => {
+            let structured = err.failures.map(|failures| {
+                json!({
+                    "ok": false,
+                    "error": err.error.message(),
+                    "path": err.path.unwrap_or_default(),
+                    "failures": failures,
+                })
+            });
+            Err((err.error.into_message(), structured))
+        }
+    });
+    crate::ipc::Owned::new(value, owner)
+}
+
+fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> BlockingOutcome {
+    edit_owned_outcome(request, launch).run(|outcome| outcome)
+}
+
+fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, String> {
+    edit_outcome(request, launch)
+        .map(|(text, _)| text)
+        .map_err(|(msg, _)| msg)
+}
+
 fn whole(path: &str, launch: &LaunchContext, transfer: bool) -> Result<String, String> {
     read_text(
         &ReadRequest {
@@ -72,7 +119,7 @@ fn whole(path: &str, launch: &LaunchContext, transfer: bool) -> Result<String, S
         },
         launch,
         transfer,
-        ReadLimits::DIRECT,
+        ReadPolicy::AGENT,
     )
     .map(|outcome| outcome.text)
 }
@@ -91,7 +138,7 @@ fn window(
         },
         launch,
         false,
-        ReadLimits::DIRECT,
+        ReadPolicy::AGENT,
     )
     .map(|outcome| outcome.text)
 }
@@ -321,7 +368,7 @@ fn read_counts_selected_empty_lines_before_the_end_of_file() {
             },
             &launch,
             false,
-            ReadLimits::DIRECT,
+            ReadPolicy::AGENT,
         )
         .unwrap();
         assert_eq!(outcome.body.as_deref(), Some(body));
@@ -338,7 +385,7 @@ fn read_counts_selected_empty_lines_before_the_end_of_file() {
         },
         &launch,
         false,
-        ReadLimits::DIRECT,
+        ReadPolicy::AGENT,
     )
     .unwrap();
     assert_eq!(empty.structured["shownLines"], 0);
@@ -389,7 +436,7 @@ fn read_cuts_at_the_line_and_byte_budgets() {
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .unwrap();
     assert_eq!(nested_huge.body.as_deref(), Some(huge.as_str()));
@@ -409,7 +456,7 @@ fn read_cuts_at_the_line_and_byte_budgets() {
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .unwrap();
     assert_eq!(nested_whole.body.as_deref(), Some(nested_many.as_str()));
@@ -429,7 +476,7 @@ fn read_cuts_at_the_line_and_byte_budgets() {
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .unwrap();
     assert_eq!(whole_mib.body.as_deref(), Some(one_mib_plus.as_str()));
@@ -447,7 +494,7 @@ fn read_cuts_at_the_line_and_byte_budgets() {
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .err()
     .unwrap();
@@ -463,7 +510,7 @@ fn read_cuts_at_the_line_and_byte_budgets() {
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .unwrap();
     assert_eq!(slice_long.structured["lineTooLong"], true);
@@ -480,7 +527,7 @@ fn read_cuts_at_the_line_and_byte_budgets() {
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .err()
     .unwrap();
@@ -498,7 +545,7 @@ fn read_cuts_at_the_line_and_byte_budgets() {
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .unwrap();
     assert_eq!(inv_slice.structured["lossy"], true);
@@ -518,7 +565,7 @@ fn read_cuts_at_the_line_and_byte_budgets() {
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .unwrap();
     assert_eq!(five_slice.structured["startLine"], 1);
@@ -2792,7 +2839,7 @@ fn read_answers_a_png_with_its_bytes_and_its_mime_type() {
         },
         &launch,
         false,
-        ReadLimits::DIRECT,
+        ReadPolicy::AGENT,
     )
     .unwrap();
     assert_eq!(
@@ -2844,7 +2891,7 @@ fn read_attaches_animated_png_by_default_and_passes_through_under_compress_mode(
             },
             &launch,
             false,
-            ReadLimits::DIRECT,
+            ReadPolicy::AGENT,
         )
         .unwrap();
         assert_eq!(outcome.structured["attached"], true);
@@ -3054,7 +3101,7 @@ fn multimodal_read_enforces_zero_guards_nested_descriptors_and_output_modes() {
             },
             &launch,
             false,
-            ReadLimits::DIRECT
+            ReadPolicy::AGENT
         )
         .is_err()
     );
@@ -3067,7 +3114,7 @@ fn multimodal_read_enforces_zero_guards_nested_descriptors_and_output_modes() {
             },
             &launch,
             false,
-            ReadLimits::DIRECT
+            ReadPolicy::AGENT
         )
         .is_err()
     );
@@ -3088,7 +3135,7 @@ fn multimodal_read_enforces_zero_guards_nested_descriptors_and_output_modes() {
                     },
                     &launch,
                     true,
-                    ReadLimits::DIRECT,
+                    ReadPolicy::AGENT,
                 )
                 .unwrap();
                 let tracked = out.into_tracked(
@@ -3127,7 +3174,7 @@ fn multimodal_read_enforces_zero_guards_nested_descriptors_and_output_modes() {
             },
             &launch,
             false,
-            ReadLimits::NESTED,
+            ReadPolicy::PROGRAM,
         )
         .unwrap();
         assert!(nested.attachment.is_none());
@@ -3164,7 +3211,7 @@ fn read_real_line_table_pagination_and_empty_offsets() {
             },
             &launch,
             false,
-            ReadLimits::DIRECT,
+            ReadPolicy::AGENT,
         )
         .unwrap();
         assert_eq!(out.structured["totalLines"], expected_total, "{sample:?}");
@@ -3186,7 +3233,7 @@ fn read_real_line_table_pagination_and_empty_offsets() {
                     },
                     &launch,
                     false,
-                    ReadLimits::DIRECT,
+                    ReadPolicy::AGENT,
                 )
                 .unwrap();
                 joined.push_str(page.body.as_deref().unwrap());
@@ -3332,18 +3379,18 @@ fn edit_counts_exact_matches_absorbed_by_normalization_and_partial_fuzzy_copies(
         ("ｅ\ne\u{301}\nｅ\n", vec![1, 2, 3]),
         ("e\u{301}\n⒠", vec![1, 2]), // A fuzzy start inside the expansion "(e)".
     ] {
-        let failure = apply_edits(sample, &request, "sources.txt")
+        let failures = apply_edits(sample, &request, "sources.txt")
             .unwrap_err()
-            .1
+            .failures
             .unwrap();
-        assert_eq!(failure["failures"][0]["lines"], json!(lines), "{sample:?}");
+        assert_eq!(failures[0].lines, Some(lines), "{sample:?}");
     }
     let same_line = format!("e\u{301} ｅ Z{}\u{0323}\n", "\u{301}".repeat(36));
-    let failure = apply_edits(&same_line, &request, "sources.txt")
+    let failures = apply_edits(&same_line, &request, "sources.txt")
         .unwrap_err()
-        .1
+        .failures
         .unwrap();
-    assert_eq!(failure["failures"][0]["lines"], json!([1, 1]));
+    assert_eq!(failures[0].lines, Some(vec![1, 1]));
     let mark_request = EditRequest {
         path: "marks.txt".into(),
         edits: vec![Edit {
@@ -3353,11 +3400,11 @@ fn edit_counts_exact_matches_absorbed_by_normalization_and_partial_fuzzy_copies(
             end_line: None,
         }],
     };
-    let failure = apply_edits("a\u{301}\u{341}", &mark_request, "marks.txt")
+    let failures = apply_edits("a\u{301}\u{341}", &mark_request, "marks.txt")
         .unwrap_err()
-        .1
+        .failures
         .unwrap();
-    assert_eq!(failure["failures"][0]["lines"], json!([1, 1]));
+    assert_eq!(failures[0].lines, Some(vec![1, 1]));
     // A mark that moved past a different mark still comes from the exact span.
     assert_eq!(
         apply_edits("q\u{301}\u{327}", &mark_request, "marks.txt")
@@ -3381,15 +3428,12 @@ fn edit_counts_exact_matches_absorbed_by_normalization_and_partial_fuzzy_copies(
         "E\u{301}!"
     );
     let sample = format!("e\u{301}\n{}", "ｅ\n".repeat(23));
-    let failure = apply_edits(&sample, &request, "sources.txt")
+    let failures = apply_edits(&sample, &request, "sources.txt")
         .unwrap_err()
-        .1
+        .failures
         .unwrap();
-    assert_eq!(
-        failure["failures"][0]["lines"],
-        json!((1..=20).collect::<Vec<_>>())
-    );
-    assert_eq!(failure["failures"][0]["more"], 4);
+    assert_eq!(failures[0].lines, Some((1..=20).collect::<Vec<_>>()));
+    assert_eq!(failures[0].more, Some(4));
 }
 
 #[test]
@@ -4238,8 +4282,8 @@ fn text_buffer_reads_admit_before_copy_and_keep_the_result_owned() {
     let source = "alpha\nbeta\n";
     std::fs::write(&path, source).unwrap();
     for (limits, selected, retained, expected) in [
-        (ReadLimits::NESTED, None, source.len() + 1, source),
-        (ReadLimits::DIRECT, Some(1), "alpha\n".len(), "alpha\n"),
+        (ReadPolicy::PROGRAM, None, source.len() + 1, source),
+        (ReadPolicy::AGENT, Some(1), "alpha\n".len(), "alpha\n"),
     ] {
         let request = ReadRequest {
             path: "small.txt".into(),
@@ -4254,15 +4298,16 @@ fn text_buffer_reads_admit_before_copy_and_keep_the_result_owned() {
             for mode in [OutputMode::Text, OutputMode::Both, OutputMode::Structured] {
                 let pool = BytePool::new(budget);
                 let launch = context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool));
-                let read =
-                    read_cancellable(&request, &launch, false, limits, None).run(|read| read);
+                let owned = read_blocking(&request, &launch, false, limits, None);
                 if !fits {
-                    assert!(matches!(read, Err(ReadFailure::Overload(_))));
+                    assert!(matches!(owned.value, Err(FileError::Overload(_))));
+                    drop(owned);
                     assert_eq!(pool.used(), 0);
                     continue;
                 }
-                let outcome = match read {
-                    Ok(outcome) => outcome,
+                let owner = owned.owner.clone();
+                let outcome = match owned.run(|read| read) {
+                    Ok(data) => read_data_to_outcome(data, limits, owner),
                     Err(_) => panic!("the exact text workspace must fit"),
                 };
                 assert_eq!(outcome.body.as_deref(), Some(expected));
@@ -4296,20 +4341,19 @@ fn text_buffer_growth_uses_nonblocking_admission() {
     std::fs::write(&path, "hello\n").unwrap();
     for (kept, fits) in [(5, false), (6, true)] {
         let pool = BytePool::new(TEXT_FIXED_WORKSPACE + 32 * "small.txt".len() + 16 * kept);
-        let mut workspace = TextWorkspace::new(&pool, "small.txt".len()).unwrap();
+        let workspace = TextWorkspace::new(&pool, "small.txt".len()).unwrap();
         let mut file = File::open(&path).unwrap();
-        let result = read_whole_utf8(&mut file, 0, &[], "small.txt", 64, None, &mut workspace);
+        let result = read_whole_utf8(&mut file, 0, &[], "small.txt", 64, None, workspace);
         assert_eq!(result.is_ok(), fits);
         if fits {
-            assert_eq!(result.as_ref().unwrap().body.as_deref(), Some("hello\n"));
+            assert_eq!(result.as_ref().unwrap().text, "hello\n");
         } else {
-            assert!(result.err().unwrap().contains("active memory budget"));
-            drop(workspace);
+            assert!(matches!(result, Err(FileError::Overload(_))));
+            assert!(result.err().unwrap().message().contains("active memory budget"));
             assert_eq!(pool.used(), 0);
             continue;
         }
         drop(result);
-        drop(workspace);
         assert_eq!(pool.used(), 0);
     }
 }
@@ -4323,7 +4367,7 @@ async fn text_buffer_worker_retains_output_after_its_waiter_is_dropped() {
     let (ready, observed) = tokio::sync::oneshot::channel();
     let (release, blocked) = std::sync::mpsc::channel();
     let worker = tokio::task::spawn_blocking(move || {
-        let outcome = read_cancellable(
+        let outcome = read_blocking(
             &ReadRequest {
                 path: "small.txt".into(),
                 offset: None,
@@ -4331,12 +4375,10 @@ async fn text_buffer_worker_retains_output_after_its_waiter_is_dropped() {
             },
             &launch,
             false,
-            ReadLimits::NESTED,
+            ReadPolicy::PROGRAM,
             None,
-        )
-        .run(|read| read)
-        .ok()
-        .expect("small text read");
+        );
+        assert!(outcome.value.is_ok(), "small text read");
         ready.send(()).unwrap();
         blocked
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -4417,7 +4459,7 @@ fn read_supports_negative_offsets_across_sizes_empty_files_and_line_endings() {
         thousand.push_str(&format!("line-{i}\n"));
     }
     std::fs::write(&thousand_path, &thousand).unwrap();
-    for limits in [ReadLimits::DIRECT, ReadLimits::NESTED] {
+    for limits in [ReadPolicy::AGENT, ReadPolicy::PROGRAM] {
         let tail = read_text(
             &ReadRequest {
                 path: "thousand.txt".into(),
@@ -4451,7 +4493,7 @@ fn read_supports_negative_offsets_across_sizes_empty_files_and_line_endings() {
         },
         &launch,
         false,
-        ReadLimits::DIRECT,
+        ReadPolicy::AGENT,
     )
     .unwrap();
     assert_eq!(slice.structured["startLine"], 10_001);
@@ -4473,7 +4515,7 @@ fn read_supports_negative_offsets_across_sizes_empty_files_and_line_endings() {
             },
             &launch,
             false,
-            ReadLimits::DIRECT,
+            ReadPolicy::AGENT,
         )
         .unwrap();
         assert_eq!(clamped.structured["startLine"], 1);
@@ -4490,7 +4532,7 @@ fn read_supports_negative_offsets_across_sizes_empty_files_and_line_endings() {
         },
         &launch,
         false,
-        ReadLimits::DIRECT,
+        ReadPolicy::AGENT,
     )
     .unwrap();
     let empty_pos = read_text(
@@ -4501,7 +4543,7 @@ fn read_supports_negative_offsets_across_sizes_empty_files_and_line_endings() {
         },
         &launch,
         false,
-        ReadLimits::DIRECT,
+        ReadPolicy::AGENT,
     )
     .unwrap();
     assert_eq!(empty_neg.structured, empty_pos.structured);
@@ -4521,7 +4563,7 @@ fn read_supports_negative_offsets_across_sizes_empty_files_and_line_endings() {
             },
             &launch,
             false,
-            ReadLimits::DIRECT,
+            ReadPolicy::AGENT,
         )
         .unwrap();
         let b = read_text(
@@ -4532,7 +4574,7 @@ fn read_supports_negative_offsets_across_sizes_empty_files_and_line_endings() {
             },
             &launch,
             false,
-            ReadLimits::DIRECT,
+            ReadPolicy::AGENT,
         )
         .unwrap();
         assert_eq!(a.structured, b.structured, "neg={neg} pos={pos}");
@@ -4557,14 +4599,20 @@ fn a_tail_slice_rechecks_its_own_line_count_after_growth_or_shrinkage() {
                 Source::new(BufReader::with_capacity(TEXT_BLOCK, &mut file), None),
                 from,
                 None,
-                ReadLimits::DIRECT,
+                ReadPolicy::AGENT,
                 &mut workspace,
             )
         })
         .unwrap();
         assert_eq!(observed, start);
-        let result = window.render(observed, None, "changes.txt", ReadLimits::DIRECT);
-        assert_eq!(result.body.as_deref(), Some(expected));
+        let result = window.into_slice(
+            observed,
+            None,
+            "changes.txt".into(),
+            ReadPolicy::AGENT,
+            Lease::empty(crate::lease::process_pool()),
+        );
+        assert_eq!(result.text, expected);
     }
 
     let mut totals = [5, 6].into_iter();
@@ -4576,7 +4624,7 @@ fn a_tail_slice_rechecks_its_own_line_count_after_growth_or_shrinkage() {
     })
     .err()
     .unwrap();
-    assert!(error.contains("changed while reading; retry"));
+    assert!(error.message().contains("changed while reading; retry"));
 }
 
 #[test]
@@ -4593,9 +4641,11 @@ fn outside_range_hints_count_exact_and_editable_fuzzy_sources_once() {
         };
         apply_edits(source, &request, "sources.txt")
             .unwrap_err()
-            .1
-            .unwrap()["failures"][0]
-            .clone()
+            .failures
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
     };
     for (source, old, line, starts) in [
         ("q\u{301}\n“a”\n", "q", 2, vec![1]),
@@ -4603,12 +4653,12 @@ fn outside_range_hints_count_exact_and_editable_fuzzy_sources_once() {
         ("e\nｅ\n⒠\ne\u{301}\n", "e", 5, vec![1, 2, 4]),
     ] {
         let failure = outside(source, old, line);
-        assert_eq!(failure["lines"], json!(starts));
-        assert!(failure.get("more").is_none());
+        assert_eq!(failure.lines, Some(starts));
+        assert_eq!(failure.more, None);
     }
     let failure = outside(&"e\u{301}\n".repeat(23), "e", 24);
-    assert_eq!(failure["lines"], json!((1..=20).collect::<Vec<_>>()));
-    assert_eq!(failure["more"], 3);
+    assert_eq!(failure.lines, Some((1..=20).collect::<Vec<_>>()));
+    assert_eq!(failure.more, Some(3));
 }
 
 #[test]
@@ -4784,13 +4834,16 @@ fn edit_start_line_and_end_line_disambiguate_report_outside_and_detect_overlap()
         "grown.txt",
         NESTED_MAX_BYTES,
         None,
-        &mut TextWorkspace::new(crate::lease::process_pool(), "grown.txt".len()).unwrap(),
+        TextWorkspace::new(crate::lease::process_pool(), "grown.txt".len()).unwrap(),
     )
     .err()
     .unwrap();
+    assert!(matches!(grown_err, FileError::Limit(_)));
     assert!(
-        grown_err.contains("4194306 bytes")
-            && grown_err.contains("exceeds the 4194304 byte (4 MiB) limit"),
+        grown_err.message().contains("4194306 bytes")
+            && grown_err
+                .message()
+                .contains("exceeds the 4194304 byte (4 MiB) limit"),
         "{grown_err}"
     );
 
@@ -4806,7 +4859,7 @@ fn edit_start_line_and_end_line_disambiguate_report_outside_and_detect_overlap()
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .err()
     .unwrap();
@@ -4827,7 +4880,7 @@ fn edit_start_line_and_end_line_disambiguate_report_outside_and_detect_overlap()
         },
         &launch,
         false,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
     )
     .unwrap();
     assert!(
@@ -4940,4 +4993,518 @@ fn resolve_from_rejects_windows_device_paths_named_pipes_and_reserved_names() {
             "expected rejection for {rejected}"
         );
     }
+}
+
+#[tokio::test]
+async fn read_core_program_strict_whole_file_and_raw_slices() {
+    let scratch = Scratch::new("read-core-program");
+    let pool = BytePool::new(16 << 20);
+    let launch = Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool)));
+
+    // Whole-file raw text: no line-number prefixes or notices.
+    let sample = "alpha\nbeta\ngamma\n";
+    scratch.file("sample.txt", sample.as_bytes());
+    let owned = read_core(
+        ReadRequest {
+            path: "sample.txt".into(),
+            offset: None,
+            limit: None,
+        },
+        Arc::clone(&launch),
+        false,
+        ReadPolicy::PROGRAM,
+        None,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    match owned.value.as_ref().unwrap() {
+        FileReadData::Text(slice) => {
+            assert_eq!(slice.text, sample);
+            assert_eq!(slice.start_line, 1);
+            assert_eq!(slice.end_line, Some(3));
+            assert_eq!(slice.shown_lines, 3);
+            assert_eq!(slice.total_lines, 3);
+            assert!(!slice.truncated);
+            assert_eq!(slice.next_offset, None);
+            assert!(!slice.lossy);
+        }
+        FileReadData::Media(_) => panic!("expected text slice"),
+    }
+    drop(owned);
+    assert_eq!(pool.used(), 0);
+
+    // Sliced read: raw lines only, explicit control metadata, zero inline notices.
+    let sliced = read_core(
+        ReadRequest {
+            path: "sample.txt".into(),
+            offset: Some(1),
+            limit: Some(2),
+        },
+        Arc::clone(&launch),
+        false,
+        ReadPolicy::PROGRAM,
+        None,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    match sliced.value.as_ref().unwrap() {
+        FileReadData::Text(slice) => {
+            assert_eq!(slice.text, "alpha\nbeta\n");
+            assert!(!slice.text.contains("more lines"));
+            assert!(!slice.text.contains("Showing lines"));
+            assert_eq!(slice.start_line, 1);
+            assert_eq!(slice.end_line, Some(2));
+            assert_eq!(slice.shown_lines, 2);
+            assert_eq!(slice.total_lines, 3);
+            assert!(slice.truncated);
+            assert_eq!(slice.next_offset, Some(3));
+        }
+        FileReadData::Media(_) => panic!("expected text slice"),
+    }
+    drop(sliced);
+    assert_eq!(pool.used(), 0);
+
+    // >4 MiB file with strict_whole_file: true returns FileError::Limit.
+    scratch.file("over4m.txt", &vec![b'a'; (4 << 20) + 1]);
+    let limit_owned = read_core(
+        ReadRequest {
+            path: "over4m.txt".into(),
+            offset: None,
+            limit: None,
+        },
+        Arc::clone(&launch),
+        false,
+        ReadPolicy::PROGRAM,
+        None,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    let limit_err = limit_owned.value.as_ref().unwrap_err();
+    assert!(matches!(limit_err, FileError::Limit(_)), "{limit_err:?}");
+    drop(limit_owned);
+    assert_eq!(pool.used(), 0);
+
+    // Invalid UTF-8 file with strict_whole_file: true returns FileError::Io (not Limit).
+    scratch.file("bad_utf8.txt", &[b'h', b'i', 0xff, b'\n']);
+    let utf8_owned = read_core(
+        ReadRequest {
+            path: "bad_utf8.txt".into(),
+            offset: None,
+            limit: None,
+        },
+        Arc::clone(&launch),
+        false,
+        ReadPolicy::PROGRAM,
+        None,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    let utf8_err = utf8_owned.value.as_ref().unwrap_err();
+    assert!(matches!(utf8_err, FileError::Io(_)), "{utf8_err:?}");
+    assert!(utf8_err.message().contains("not valid UTF-8"), "{utf8_err}");
+    drop(utf8_owned);
+    assert_eq!(pool.used(), 0);
+
+    // Missing file returns FileError::NotFound.
+    let missing_owned = read_core(
+        ReadRequest {
+            path: "does-not-exist.txt".into(),
+            offset: None,
+            limit: None,
+        },
+        Arc::clone(&launch),
+        false,
+        ReadPolicy::PROGRAM,
+        None,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    let missing_err = missing_owned.value.as_ref().unwrap_err();
+    assert!(
+        matches!(missing_err, FileError::NotFound(_)),
+        "{missing_err:?}"
+    );
+    drop(missing_owned);
+    assert_eq!(pool.used(), 0);
+}
+
+#[tokio::test]
+async fn read_core_media_descriptor_only_vs_inline() {
+    let scratch = Scratch::new("read-core-media");
+    let png = png_bytes(1, 1);
+    scratch.file("pixel.png", &png);
+    let pool = BytePool::new(16 << 20);
+    let launch = Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool)));
+
+    // Program policy: DescriptorOnly sniffs without loading base64.
+    let descriptor = read_core(
+        ReadRequest {
+            path: "pixel.png".into(),
+            offset: None,
+            limit: None,
+        },
+        Arc::clone(&launch),
+        false,
+        ReadPolicy::PROGRAM,
+        None,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    match descriptor.value.as_ref().unwrap() {
+        FileReadData::Media(MediaPayload::Descriptor {
+            kind,
+            mime_type,
+            bytes,
+            source_bytes,
+            attachable,
+            note,
+            ..
+        }) => {
+            assert_eq!(*kind, crate::media::MediaKind::Image);
+            assert_eq!(mime_type, "image/png");
+            assert_eq!(*bytes, Some(png.len() as u64));
+            assert_eq!(*source_bytes, None);
+            assert!(*attachable);
+            assert_eq!(*note, None);
+        }
+        other => panic!("expected MediaPayload::Descriptor, got {other:?}"),
+    }
+    drop(descriptor);
+    assert_eq!(pool.used(), 0);
+
+    // Program policy on oversized media: Descriptor with attachable=false and note.
+    let mut big_png = png.clone();
+    big_png.resize((1 << 20) + 1, 0);
+    scratch.file("big.png", &big_png);
+    let small_cap = Arc::new(
+        LaunchContext::new(
+            scratch.0.clone(),
+            vec![
+                ("HOME".into(), scratch.0.as_os_str().to_owned()),
+                (crate::session::MAX_MEDIA_BYTES.into(), "1048576".into()),
+            ],
+        )
+        .with_memory(Arc::clone(&pool)),
+    );
+    let oversized = read_core(
+        ReadRequest {
+            path: "big.png".into(),
+            offset: None,
+            limit: None,
+        },
+        small_cap,
+        false,
+        ReadPolicy::PROGRAM,
+        None,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    match oversized.value.as_ref().unwrap() {
+        FileReadData::Media(MediaPayload::Descriptor {
+            attachable,
+            bytes,
+            source_bytes,
+            note,
+            ..
+        }) => {
+            assert!(!attachable);
+            assert_eq!(*bytes, None);
+            assert_eq!(*source_bytes, Some(big_png.len() as u64));
+            assert!(note.as_deref().unwrap_or("").contains("exceeds"));
+        }
+        other => panic!("expected oversized MediaPayload::Descriptor, got {other:?}"),
+    }
+    drop(oversized);
+    assert_eq!(pool.used(), 0);
+
+    // Agent policy: InlineBlock loads base64 payload and lease.
+    let inline = read_core(
+        ReadRequest {
+            path: "pixel.png".into(),
+            offset: None,
+            limit: None,
+        },
+        launch,
+        false,
+        ReadPolicy::AGENT,
+        None,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    match inline.value.as_ref().unwrap() {
+        FileReadData::Media(MediaPayload::Inline {
+            kind,
+            encoded_base64,
+            bytes,
+            ..
+        }) => {
+            assert_eq!(*kind, crate::media::MediaKind::Image);
+            assert!(!encoded_base64.is_empty());
+            assert!(*bytes > 0);
+        }
+        other => panic!("expected MediaPayload::Inline, got {other:?}"),
+    }
+    drop(inline);
+    assert_eq!(pool.used(), 0);
+}
+
+#[tokio::test]
+async fn write_core_writes_file_and_validates() {
+    let scratch = Scratch::new("write-core");
+    let pool = BytePool::new(16 << 20);
+    let launch = Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool)));
+
+    let owned = write_core(
+        WriteRequest {
+            path: "nested/out.txt".into(),
+            content: "hello core\n".into(),
+        },
+        Arc::clone(&launch),
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    let data = owned.value.as_ref().unwrap();
+    assert_eq!(data.path, scratch.path("nested/out.txt"));
+    assert_eq!(data.bytes, "hello core\n".len() as u64);
+    assert_eq!(scratch.read("nested/out.txt"), b"hello core\n");
+    drop(owned);
+    assert_eq!(pool.used(), 0);
+
+    let err_owned = write_core(
+        WriteRequest {
+            path: String::new(),
+            content: "x".into(),
+        },
+        launch,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    let err = err_owned.value.as_ref().unwrap_err();
+    assert!(matches!(err, FileError::Validation(_)), "{err:?}");
+    drop(err_owned);
+    assert_eq!(pool.used(), 0);
+}
+
+#[tokio::test]
+async fn edit_core_returns_matches_and_structured_failures() {
+    let scratch = Scratch::new("edit-core");
+    let pool = BytePool::new(16 << 20);
+    let launch = Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool)));
+    scratch.file("doc.txt", "line1\n\u{201c}quoted\u{201d}\nline3\n".as_bytes());
+
+    let ok_owned = edit_core(
+        EditRequest {
+            path: "doc.txt".into(),
+            edits: vec![
+                Edit {
+                    old_text: "line1".into(),
+                    new_text: "LINE1".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+                Edit {
+                    old_text: "\"quoted\"".into(),
+                    new_text: "\"QUOTED\"".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            ],
+        },
+        Arc::clone(&launch),
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    let ok = ok_owned.value.as_ref().unwrap();
+    assert_eq!(ok.path, scratch.path("doc.txt"));
+    assert_eq!(ok.replacements, 2);
+    assert_eq!(
+        ok.edits,
+        vec![
+            EditMatch {
+                line: 1,
+                fuzzy: false,
+            },
+            EditMatch {
+                line: 2,
+                fuzzy: true,
+            },
+        ]
+    );
+    drop(ok_owned);
+    assert_eq!(pool.used(), 0);
+
+    // Structured failures: not_found + ambiguous + overlap.
+    scratch.file("fail.txt", b"dup\ndup\nabcdef\n");
+    let err_owned = edit_core(
+        EditRequest {
+            path: "fail.txt".into(),
+            edits: vec![
+                Edit {
+                    old_text: "missing".into(),
+                    new_text: "x".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+                Edit {
+                    old_text: "dup".into(),
+                    new_text: "y".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+                Edit {
+                    old_text: "abcd".into(),
+                    new_text: "1".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+                Edit {
+                    old_text: "cdef".into(),
+                    new_text: "2".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            ],
+        },
+        Arc::clone(&launch),
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    let err = err_owned.value.as_ref().unwrap_err();
+    assert_eq!(err.path.as_deref(), Some(scratch.path("fail.txt").as_str()));
+    let failures = err.failures.as_ref().expect("structured failures");
+    assert_eq!(
+        failures,
+        &vec![
+            EditFailure {
+                index: 0,
+                problem: EditProblem::NotFound,
+                lines: None,
+                with: None,
+                more: None,
+            },
+            EditFailure {
+                index: 1,
+                problem: EditProblem::Ambiguous,
+                lines: Some(vec![1, 2]),
+                with: None,
+                more: None,
+            },
+            EditFailure {
+                index: 2,
+                problem: EditProblem::Overlap,
+                lines: None,
+                with: Some(vec![3]),
+                more: None,
+            },
+            EditFailure {
+                index: 3,
+                problem: EditProblem::Overlap,
+                lines: None,
+                with: Some(vec![2]),
+                more: None,
+            },
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(failures).unwrap(),
+        json!([
+            { "index": 0, "problem": "not_found" },
+            { "index": 1, "problem": "ambiguous", "lines": [1, 2] },
+            { "index": 2, "problem": "overlap", "with": [3] },
+            { "index": 3, "problem": "overlap", "with": [2] },
+        ])
+    );
+    drop(err_owned);
+    assert_eq!(pool.used(), 0);
+
+    // Missing file maps to FileError::NotFound with failures: None.
+    let missing_owned = edit_core(
+        EditRequest {
+            path: "missing.txt".into(),
+            edits: vec![Edit {
+                old_text: "a".into(),
+                new_text: "b".into(),
+                start_line: None,
+                end_line: None,
+            }],
+        },
+        launch,
+        None,
+        Default::default(),
+    )
+    .await;
+    assert!(pool.used() > 0);
+    let missing = missing_owned.value.as_ref().unwrap_err();
+    assert!(matches!(missing.error, FileError::NotFound(_)), "{missing:?}");
+    assert_eq!(missing.failures, None);
+    drop(missing_owned);
+    assert_eq!(pool.used(), 0);
+}
+
+#[tokio::test]
+async fn write_and_edit_tracked_propagate_overload_when_pool_exhausted() {
+    let scratch = Scratch::new("write-edit-overload");
+    scratch.file("doc.txt", b"hello world\n");
+    let pool = BytePool::new(64);
+    let _held = pool.try_acquire(64).expect("exhaust pool");
+    let launch = Arc::new(context(&scratch.0, &scratch.0).with_memory(Arc::clone(&pool)));
+    let render = Render {
+        output_mode: OutputMode::Both,
+        structured_content: true,
+    };
+
+    let write_res = write_tracked(
+        WriteRequest {
+            path: "out.txt".into(),
+            content: "data".into(),
+        },
+        Arc::clone(&launch),
+        render,
+        Default::default(),
+    )
+    .await;
+    assert_eq!(write_res.result.is_error, Some(true));
+    assert!(write_res.overload, "{:?}", write_res.result);
+
+    let edit_res = edit_tracked(
+        EditRequest {
+            path: "doc.txt".into(),
+            edits: vec![Edit {
+                old_text: "hello".into(),
+                new_text: "hi".into(),
+                start_line: None,
+                end_line: None,
+            }],
+        },
+        launch,
+        render,
+        Default::default(),
+    )
+    .await;
+    assert_eq!(edit_res.result.is_error, Some(true));
+    assert!(edit_res.overload, "{:?}", edit_res.result);
 }

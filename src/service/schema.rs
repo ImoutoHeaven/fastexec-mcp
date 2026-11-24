@@ -8,6 +8,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+const DEFAULT_WAIT_MS: u64 = 30_000;
+const DEFAULT_INTERACT_WAIT_MS: u64 = 2_000;
 const MAX_WAIT_MS: u64 = 240_000;
 pub(super) const MAX_INPUT_BYTES: usize = 16 * 1024;
 const MAX_START_INPUT_BYTES: usize = 1 << 20;
@@ -15,10 +17,61 @@ pub(super) const DEFAULT_KEY_DELAY_MS: u64 = 150;
 const MAX_KEY_DELAY_MS: u64 = 2_000;
 /// Longest pause the keys of one poll add up to before its wait begins.
 const MAX_KEY_PAUSE_MS: u64 = 30_000;
-const DEFAULT_MAX_BYTES: u64 = 16 * 1024;
-const DEFAULT_NESTED_MAX_BYTES: u64 = 4 << 20;
+const DEFAULT_MAX_BYTES: usize = 16_384;
+const DEFAULT_PROGRAM_MAX_BYTES: usize = 4 << 20;
 const MAX_BYTES_RANGE: std::ops::RangeInclusive<u64> = 100..=4 << 20;
 const LIST_LIMIT_RANGE: std::ops::RangeInclusive<u64> = 1..=500;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ExecPolicy {
+    /// When true, waitMs omits a default deadline unless returnWhen (30s) or input/keys/resize (2s) applies.
+    pub unbounded_default_wait: bool,
+    /// Upper bound on waitMs (Some(240_000) for Agent, None for Program).
+    pub max_wait_ms: Option<u64>,
+    pub default_truncate: Truncate,
+    pub default_max_bytes: usize,
+    /// When true, injects omission/cut markers and permits `head_tail`.
+    /// When false, output is a single contiguous raw slice (rejects `head_tail` and list `maxBytes`/`truncate`).
+    pub inline_markers: bool,
+    /// Preserves NUL bytes during non-raw cleaning (true for Program, false for Agent).
+    pub keep_nul: bool,
+}
+
+impl ExecPolicy {
+    pub const AGENT: Self = Self {
+        unbounded_default_wait: false,
+        max_wait_ms: Some(MAX_WAIT_MS),
+        default_truncate: Truncate::HeadTail,
+        default_max_bytes: DEFAULT_MAX_BYTES,
+        inline_markers: true,
+        keep_nul: false,
+    };
+
+    pub const PROGRAM: Self = Self {
+        unbounded_default_wait: true,
+        max_wait_ms: None,
+        default_truncate: Truncate::Head,
+        default_max_bytes: DEFAULT_PROGRAM_MAX_BYTES,
+        inline_markers: false,
+        keep_nul: true,
+    };
+
+    /// Resolves `waitMs` to an effective timeout in milliseconds (`None` waits until exit).
+    pub(crate) fn resolve_wait_ms(
+        self,
+        wait_ms: Option<u64>,
+        has_return_when: bool,
+        interacts: bool,
+    ) -> Option<u64> {
+        match wait_ms {
+            Some(ms) => Some(ms),
+            None if has_return_when => Some(DEFAULT_WAIT_MS),
+            None if interacts => Some(DEFAULT_INTERACT_WAIT_MS),
+            None if self.unbounded_default_wait => None,
+            None => Some(DEFAULT_WAIT_MS),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -156,7 +209,7 @@ pub(crate) fn normalize_request(request: &mut Request) {
     }
 }
 
-pub(crate) fn validate(request: &Request, nested: bool) -> Result<View, String> {
+pub(crate) fn validate(request: &Request, policy: ExecPolicy) -> Result<View, String> {
     let present = [
         ("command", request.command.is_some()),
         ("cwd", request.cwd.is_some()),
@@ -221,14 +274,13 @@ pub(crate) fn validate(request: &Request, nested: bool) -> Result<View, String> 
         .chain(VIEW)
         .collect(),
         Action::Kill => vec!["taskId", "waitMs", "truncate", "maxBytes"],
-        Action::List => vec![
-            "truncate",
-            "maxBytes",
-            "scope",
-            "state",
-            "limit",
-            "parentTaskId",
-        ],
+        Action::List => {
+            let mut fields = vec!["scope", "state", "limit", "parentTaskId"];
+            if policy.inline_markers {
+                fields.extend(["truncate", "maxBytes"]);
+            }
+            fields
+        }
         Action::Transcript => vec!["taskId", "waitMs", "truncate", "maxBytes"],
     };
     for (name, set) in present {
@@ -334,8 +386,16 @@ pub(crate) fn validate(request: &Request, nested: bool) -> Result<View, String> 
             ));
         }
     }
-    if !nested && let Some(wait) = request.wait_ms.filter(|&wait| wait > MAX_WAIT_MS) {
-        return Err(format!("waitMs {wait} is out of range 0-{MAX_WAIT_MS}."));
+    if let Some(max_wait) = policy.max_wait_ms
+        && let Some(wait) = request.wait_ms.filter(|&wait| wait > max_wait)
+    {
+        return Err(format!("waitMs {wait} is out of range 0-{max_wait}."));
+    }
+    if !policy.inline_markers && request.truncate == Some(Truncate::HeadTail) {
+        return Err(
+            "`truncate: \"head_tail\"` is not supported without inline markers; use \"head\" or \"tail\"."
+                .into(),
+        );
     }
     // A size belongs to a PTY task's terminal; a pipe task's output is a byte stream. `start`
     // reads an omitted `pty` as false, so a size there needs `pty: true`.
@@ -415,21 +475,16 @@ pub(crate) fn validate(request: &Request, nested: bool) -> Result<View, String> 
     }
     let default_truncate = if request.action == Action::Transcript {
         Truncate::Tail
-    } else if nested {
-        Truncate::Head
     } else {
-        Truncate::HeadTail
-    };
-    let default_max_bytes = if nested {
-        DEFAULT_NESTED_MAX_BYTES
-    } else {
-        DEFAULT_MAX_BYTES
+        policy.default_truncate
     };
     Ok(View {
-        nested,
+        nested: !policy.inline_markers,
         owned_by_script: false,
         truncate: request.truncate.unwrap_or(default_truncate),
-        max_bytes: request.max_bytes.unwrap_or(default_max_bytes) as usize,
+        max_bytes: request
+            .max_bytes
+            .map_or(policy.default_max_bytes, |bytes| bytes as usize),
         raw: flag(request.raw),
         encoding,
         screen,
@@ -466,15 +521,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn parse(value: serde_json::Value) -> Request {
+        serde_json::from_value(value).expect("request deserializes")
+    }
+
     #[test]
     fn parent_task_id_allowed_only_on_list() {
-        let list: Request = serde_json::from_value(json!({
+        let list = parse(json!({
             "action": "list",
             "parentTaskId": "p1-1"
-        }))
-        .expect("list request deserializes");
+        }));
         assert_eq!(list.parent_task_id.as_deref(), Some("p1-1"));
-        assert!(validate(&list, false).is_ok());
+        assert!(validate(&list, ExecPolicy::AGENT).is_ok());
+        assert!(validate(&list, ExecPolicy::PROGRAM).is_ok());
 
         for req in [
             json!({"action": "start", "command": "true", "parentTaskId": "p1-1"}),
@@ -482,11 +541,129 @@ mod tests {
             json!({"action": "kill", "taskId": "p1-1", "parentTaskId": "p1-1"}),
             json!({"action": "transcript", "taskId": "p1-1", "parentTaskId": "p1-1"}),
         ] {
-            let parsed: Request = serde_json::from_value(req).expect("request deserializes");
-            let err = validate(&parsed, false)
+            let parsed = parse(req);
+            let err = validate(&parsed, ExecPolicy::AGENT)
                 .err()
                 .expect("non-list action must reject parentTaskId");
             assert!(err.contains("`parentTaskId` does not apply"), "{err}");
+        }
+    }
+
+    #[test]
+    fn policy_constants_match_spec() {
+        assert!(!ExecPolicy::AGENT.unbounded_default_wait);
+        assert_eq!(ExecPolicy::AGENT.max_wait_ms, Some(240_000));
+        assert_eq!(ExecPolicy::AGENT.default_truncate, Truncate::HeadTail);
+        assert_eq!(ExecPolicy::AGENT.default_max_bytes, 16_384);
+        assert!(ExecPolicy::AGENT.inline_markers);
+        assert!(!ExecPolicy::AGENT.keep_nul);
+
+        assert!(ExecPolicy::PROGRAM.unbounded_default_wait);
+        assert_eq!(ExecPolicy::PROGRAM.max_wait_ms, None);
+        assert_eq!(ExecPolicy::PROGRAM.default_truncate, Truncate::Head);
+        assert_eq!(ExecPolicy::PROGRAM.default_max_bytes, 4 << 20);
+        assert!(!ExecPolicy::PROGRAM.inline_markers);
+        assert!(ExecPolicy::PROGRAM.keep_nul);
+    }
+
+    #[test]
+    fn defaults_follow_policy_and_transcript_uses_tail() {
+        let start = parse(json!({"action": "start", "command": "true"}));
+        let agent_start = validate(&start, ExecPolicy::AGENT).expect("agent start valid");
+        assert_eq!(agent_start.truncate, Truncate::HeadTail);
+        assert_eq!(agent_start.max_bytes, 16_384);
+
+        let program_start = validate(&start, ExecPolicy::PROGRAM).expect("program start valid");
+        assert_eq!(program_start.truncate, Truncate::Head);
+        assert_eq!(program_start.max_bytes, 4 << 20);
+
+        let transcript = parse(json!({"action": "transcript", "taskId": "t1"}));
+        let agent_tr = validate(&transcript, ExecPolicy::AGENT).expect("agent transcript valid");
+        assert_eq!(agent_tr.truncate, Truncate::Tail);
+        assert_eq!(agent_tr.max_bytes, 16_384);
+
+        let program_tr =
+            validate(&transcript, ExecPolicy::PROGRAM).expect("program transcript valid");
+        assert_eq!(program_tr.truncate, Truncate::Tail);
+        assert_eq!(program_tr.max_bytes, 4 << 20);
+
+        let cap_ok = parse(json!({"action": "start", "command": "true", "maxBytes": 4 << 20}));
+        assert!(validate(&cap_ok, ExecPolicy::AGENT).is_ok());
+        assert!(validate(&cap_ok, ExecPolicy::PROGRAM).is_ok());
+
+        let cap_over =
+            parse(json!({"action": "start", "command": "true", "maxBytes": (4 << 20) + 1}));
+        assert!(validate(&cap_over, ExecPolicy::AGENT).is_err());
+        assert!(validate(&cap_over, ExecPolicy::PROGRAM).is_err());
+    }
+
+    #[test]
+    fn wait_ms_bounds_and_defaults_follow_policy() {
+        let at_cap = parse(json!({"action": "start", "command": "true", "waitMs": 240_000}));
+        assert!(validate(&at_cap, ExecPolicy::AGENT).is_ok());
+        assert!(validate(&at_cap, ExecPolicy::PROGRAM).is_ok());
+
+        let over_cap = parse(json!({"action": "start", "command": "true", "waitMs": 240_001}));
+        let err = validate(&over_cap, ExecPolicy::AGENT)
+            .err()
+            .expect("agent must reject waitMs > 240_000");
+        assert!(err.contains("waitMs 240001 is out of range 0-240000"), "{err}");
+        assert!(validate(&over_cap, ExecPolicy::PROGRAM).is_ok());
+
+        assert_eq!(ExecPolicy::AGENT.resolve_wait_ms(None, false, false), Some(30_000));
+        assert_eq!(ExecPolicy::AGENT.resolve_wait_ms(None, false, true), Some(2_000));
+        assert_eq!(ExecPolicy::AGENT.resolve_wait_ms(None, true, true), Some(30_000));
+        assert_eq!(ExecPolicy::AGENT.resolve_wait_ms(Some(500), false, false), Some(500));
+
+        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(None, false, false), None);
+        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(None, false, true), Some(2_000));
+        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(None, true, false), Some(30_000));
+        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(None, true, true), Some(30_000));
+        assert_eq!(ExecPolicy::PROGRAM.resolve_wait_ms(Some(500), false, false), Some(500));
+    }
+
+    #[test]
+    fn head_tail_rejected_when_inline_markers_disabled() {
+        for req in [
+            json!({"action": "start", "command": "true", "truncate": "head_tail"}),
+            json!({"action": "poll", "taskId": "t1", "truncate": "head_tail"}),
+            json!({"action": "kill", "taskId": "t1", "truncate": "head_tail"}),
+            json!({"action": "transcript", "taskId": "t1", "truncate": "head_tail"}),
+        ] {
+            let parsed = parse(req);
+            assert!(validate(&parsed, ExecPolicy::AGENT).is_ok());
+            let err = validate(&parsed, ExecPolicy::PROGRAM)
+                .err()
+                .expect("program policy must reject head_tail");
+            assert!(err.contains("head") && err.contains("tail"), "{err}");
+        }
+
+        for mode in ["head", "tail"] {
+            for req in [
+                json!({"action": "start", "command": "true", "truncate": mode}),
+                json!({"action": "poll", "taskId": "t1", "truncate": mode}),
+                json!({"action": "kill", "taskId": "t1", "truncate": mode}),
+                json!({"action": "transcript", "taskId": "t1", "truncate": mode}),
+            ] {
+                assert!(validate(&parse(req), ExecPolicy::PROGRAM).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn list_max_bytes_and_truncate_rejected_when_inline_markers_disabled() {
+        for (field, req) in [
+            ("maxBytes", json!({"action": "list", "maxBytes": 1024})),
+            ("truncate", json!({"action": "list", "truncate": "head"})),
+            ("truncate", json!({"action": "list", "truncate": "tail"})),
+            ("truncate", json!({"action": "list", "truncate": "head_tail"})),
+        ] {
+            let parsed = parse(req);
+            assert!(validate(&parsed, ExecPolicy::AGENT).is_ok());
+            let err = validate(&parsed, ExecPolicy::PROGRAM)
+                .err()
+                .expect("program policy must reject list maxBytes/truncate");
+            assert!(err.contains(field) && err.contains("list"), "{err}");
         }
     }
 }

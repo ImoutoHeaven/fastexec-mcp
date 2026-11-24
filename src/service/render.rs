@@ -1437,6 +1437,7 @@ impl Service {
             raw: false,
             clean: true,
             keep_nul: false,
+            include_markers: true,
             encoding: encoding_rs::UTF_8,
             source: "transcript",
         };
@@ -1750,16 +1751,7 @@ impl Service {
 }
 
 pub(super) fn fit_screen_rows(rows: &[String], room: usize) -> (String, usize) {
-    let mut body = rows.join("\n");
-    let mut omitted = 0;
-    while body.len() > room && omitted + 1 < rows.len() {
-        omitted += 1;
-        body = format!(
-            "... [{omitted} top rows omitted] ...\n{}",
-            rows[omitted..].join("\n")
-        );
-    }
-    output::cut_to(&mut body, room.saturating_add(1));
+    let (body, omitted, _) = output::fit_screen_rows(rows, room, true);
     (body, omitted)
 }
 

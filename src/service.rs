@@ -14,8 +14,8 @@ use self::render::{
     result_payload_capacity, success, suppress, task_warnings, warning_text, wire_result_len,
 };
 use self::schema::{
-    Action, DEFAULT_KEY_DELAY_MS, ListScope, ListState, MAX_INPUT_BYTES, Request, View, flag,
-    normalize_request, validate, validate_cwd,
+    Action, DEFAULT_KEY_DELAY_MS, ExecPolicy, ListScope, ListState, MAX_INPUT_BYTES, Request, View,
+    flag, normalize_request, validate, validate_cwd,
 };
 use crate::lease::Lease;
 use crate::platform::process;
@@ -289,7 +289,14 @@ impl Service {
     > {
         let base_launch = call.launch();
         let (start, resolved_cwd) = codemode::control::validate(&request, base_launch)?;
-        let view = validate(&start, call.nested)?;
+        let view = validate(
+            &start,
+            if call.nested {
+                ExecPolicy::PROGRAM
+            } else {
+                ExecPolicy::AGENT
+            },
+        )?;
         let launch = match resolved_cwd {
             None => Arc::clone(base_launch),
             Some(dir) => Arc::new(base_launch.with_cwd(dir)),
@@ -406,7 +413,12 @@ impl Service {
         {
             return Err("A codemode task takes no input, eof, keys, resize, screen, raw, or encoding; poll it with waitMs and returnWhen.".into());
         }
-        let mut view = validate(&request, call.nested)?;
+        let policy = if call.nested {
+            ExecPolicy::PROGRAM
+        } else {
+            ExecPolicy::AGENT
+        };
+        let mut view = validate(&request, policy)?;
         let session = Arc::clone(call.session);
         match request.action {
             Action::List => {
@@ -463,12 +475,9 @@ impl Service {
                     script.record_started(task_reader.handle(&task.id));
                     view.owned_by_script = true;
                 }
-                let wait = match request.wait_ms {
-                    Some(ms) => Some(Duration::from_millis(ms)),
-                    None if request.return_when.is_some() => Some(Duration::from_millis(30_000)),
-                    None if call.nested => None,
-                    None => Some(Duration::from_millis(30_000)),
-                };
+                let wait = policy
+                    .resolve_wait_ms(request.wait_ms, request.return_when.is_some(), false)
+                    .map(Duration::from_millis);
                 self.wait_started(
                     (task, entry, task_reader),
                     startup_warning,
@@ -624,13 +633,9 @@ impl Service {
                 }
                 drop(gate);
                 let interacts = request.input.is_some() || request.keys.is_some() || axes.is_some();
-                let wait = match request.wait_ms {
-                    Some(ms) => Some(Duration::from_millis(ms)),
-                    None if when.is_some() => Some(Duration::from_millis(30_000)),
-                    None if interacts => Some(Duration::from_millis(2_000)),
-                    None if call.nested => None,
-                    None => Some(Duration::from_millis(30_000)),
-                };
+                let wait = policy
+                    .resolve_wait_ms(request.wait_ms, when.is_some(), interacts)
+                    .map(Duration::from_millis);
                 let encoding = view.encoding.unwrap_or(task.encoding);
                 let ended = wait::wait(
                     &task,

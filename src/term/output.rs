@@ -304,6 +304,8 @@ pub struct WindowSpec {
     pub raw: bool,
     pub clean: bool,
     pub keep_nul: bool,
+    /// When true, injects omission/cut markers; when false, emits only raw data bytes.
+    pub include_markers: bool,
     pub encoding: &'static Encoding,
     /// What the line numbers count, named in the omission marker: "log" or "transcript".
     pub source: &'static str,
@@ -327,6 +329,10 @@ pub struct Window {
 impl Window {
     pub fn is_empty(&self) -> bool {
         self.empty
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.omitted.is_some() || self.cut_lines > 0
     }
 }
 
@@ -401,6 +407,9 @@ pub struct WindowBuilder<'a> {
 impl<'a> WindowBuilder<'a> {
     /// `first_line` is the log line number at which the byte range starts.
     pub fn new(spec: WindowSpec, cleaner: &'a mut Cleaner, first_line: u64) -> Self {
+        if !spec.include_markers {
+            debug_assert_ne!(spec.truncate, Truncate::HeadTail);
+        }
         Self {
             spec,
             cleaner,
@@ -617,7 +626,9 @@ impl<'a> WindowBuilder<'a> {
                 return (String::new(), 0, Some((first_num, last_num)));
             }
             let mut text = self.head[0].prefix.clone();
-            cut_line_to_budget(&mut text, budget, self.head[0].dropped);
+            if self.spec.include_markers {
+                cut_line_to_budget(&mut text, budget, self.head[0].dropped);
+            }
             if text.is_empty() {
                 return (String::new(), 0, Some((first_num, last_num)));
             }
@@ -635,7 +646,9 @@ impl<'a> WindowBuilder<'a> {
             let first = &self.head[0];
             if first.dropped > 0 {
                 let mut text = first.prefix.clone();
-                cut_line_to_budget(&mut text, budget, first.dropped);
+                if self.spec.include_markers {
+                    cut_line_to_budget(&mut text, budget, first.dropped);
+                }
                 if text.is_empty() {
                     return (text, 0, Some((first_num, last_num)));
                 }
@@ -686,12 +699,16 @@ impl<'a> WindowBuilder<'a> {
             }
             let last = suffix_rev[0];
             let mut text = last.prefix.clone();
-            cut_line_to_budget(&mut text, budget, last.dropped);
+            if self.spec.include_markers {
+                cut_line_to_budget(&mut text, budget, last.dropped);
+            }
             if text.is_empty() {
                 return (text, 0, Some((first_num, last_num)));
             }
             return (text, 1, Some((first_num, last.first - 1)));
         }
+
+        debug_assert!(self.spec.include_markers);
 
         // Truncate::HeadTail multi-line overflow (Rule 5).
         let max_marker_len = format!(
@@ -918,6 +935,37 @@ pub fn cut_to(text: &mut String, budget: usize) -> bool {
 /// What a cut line ends with when the full byte-count note cannot fit.
 const MARK: &str = " … [cut]";
 
+/// Fits PTY screen rows into `room` bytes by dropping top rows first, then cutting the remaining
+/// bottom row if needed. Returns `(body, omitted_rows, line_cut)`.
+pub fn fit_screen_rows(rows: &[String], room: usize, include_markers: bool) -> (String, usize, bool) {
+    let mut body = rows.join("\n");
+    let mut omitted = 0;
+    while body.len() > room && omitted + 1 < rows.len() {
+        omitted += 1;
+        body = if include_markers {
+            format!(
+                "... [{omitted} top rows omitted] ...\n{}",
+                rows[omitted..].join("\n")
+            )
+        } else {
+            rows[omitted..].join("\n")
+        };
+    }
+    let line_cut = if include_markers {
+        cut_to(&mut body, room.saturating_add(1))
+    } else if body.len() > room {
+        let mut end = room;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        true
+    } else {
+        false
+    };
+    (body, omitted, line_cut)
+}
+
 /// Length of an incomplete UTF-8 sequence at the end of `tail` (the last 1..=3 bytes).
 pub fn incomplete_utf8_suffix(tail: &[u8]) -> usize {
     let suffix = &tail[tail.len().saturating_sub(3)..];
@@ -996,6 +1044,7 @@ mod tests {
             raw,
             clean: true,
             keep_nul: false,
+            include_markers: true,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -1016,6 +1065,7 @@ mod tests {
                 raw: false,
                 clean: true,
                 keep_nul: false,
+                include_markers: true,
                 encoding: encoding_rs::UTF_8,
                 source: "log",
             };
@@ -1132,6 +1182,7 @@ mod tests {
             raw,
             clean: true,
             keep_nul: false,
+            include_markers: true,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -1152,6 +1203,7 @@ mod tests {
             raw,
             clean: true,
             keep_nul: false,
+            include_markers: true,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -1189,6 +1241,7 @@ mod tests {
                     raw: false,
                     clean: true,
                     keep_nul,
+                    include_markers: true,
                     encoding: encoding_rs::UTF_8,
                     source: "log",
                 },
@@ -1237,6 +1290,7 @@ mod tests {
             raw: false,
             clean: true,
             keep_nul: false,
+            include_markers: true,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -1258,6 +1312,7 @@ mod tests {
             raw: false,
             clean: true,
             keep_nul: false,
+            include_markers: true,
             encoding: encoding_rs::UTF_8,
             source: "log",
         };
@@ -1677,6 +1732,7 @@ mod tests {
                     raw,
                     clean: true,
                     keep_nul: false,
+                    include_markers: true,
                     encoding,
                     source: "log",
                 },
@@ -1744,6 +1800,7 @@ mod tests {
                 raw: false,
                 clean: true,
                 keep_nul: false,
+                include_markers: true,
                 encoding: encoding_rs::UTF_8,
                 source: "log",
             },
@@ -1755,5 +1812,169 @@ mod tests {
         assert_eq!(small_out.cut_lines, 1);
         assert!(small_out.text.ends_with(MARK), "{:?}", small_out.text);
         assert!(small_out.text.len() <= 25);
+    }
+
+    fn program_window(
+        input: &[u8],
+        truncate: Truncate,
+        budget: usize,
+        keep_nul: bool,
+    ) -> Window {
+        let mut cleaner = Cleaner::default();
+        let spec = WindowSpec {
+            truncate,
+            budget,
+            raw: false,
+            clean: true,
+            keep_nul,
+            include_markers: false,
+            encoding: encoding_rs::UTF_8,
+            source: "log",
+        };
+        let mut builder = WindowBuilder::new(spec, &mut cleaner, 1);
+        builder.push(input);
+        builder.finish()
+    }
+
+    fn assert_no_markers(text: &str) {
+        assert!(!text.contains("lines omitted:"), "marker leaked: {text:?}");
+        assert!(!text.contains("line cut at"), "marker leaked: {text:?}");
+        assert!(!text.contains("top rows omitted"), "marker leaked: {text:?}");
+        assert!(!text.contains("[cut]"), "marker leaked: {text:?}");
+    }
+
+    #[test]
+    fn program_window_emits_raw_data_without_markers_across_edge_cases() {
+        for mode in [Truncate::Head, Truncate::Tail] {
+            let empty = program_window(b"", mode, 100, false);
+            assert!(empty.is_empty());
+            assert_eq!(empty.text, "");
+            assert_eq!(empty.omitted, None);
+            assert_eq!(empty.cut_lines, 0);
+            assert_eq!(empty.bad_lines, 0);
+            assert!(!empty.truncated());
+
+            let exact = program_window(b"aaa\nbbb\n", mode, 7, false);
+            assert_eq!(exact.text, "aaa\nbbb");
+            assert_eq!(exact.omitted, None);
+            assert_eq!(exact.cut_lines, 0);
+            assert!(!exact.truncated());
+
+            // Single-line overflow takes the raw UTF-8 prefix with zero cut marker.
+            let single = format!("{}\n", "X".repeat(200));
+            let out = program_window(single.as_bytes(), mode, 120, false);
+            assert_eq!(out.text, "X".repeat(120));
+            assert_eq!(out.cut_lines, 1);
+            assert_eq!(out.omitted, None);
+            assert!(out.truncated());
+            assert_no_markers(&out.text);
+
+            // Multi-byte UTF-8 boundary on single-line overflow (3-byte CJK + 4-byte emoji).
+            let utf8_line = format!("{}😀\n", "中".repeat(10));
+            let out = program_window(utf8_line.as_bytes(), mode, 32, false);
+            assert_eq!(out.text, "中".repeat(10));
+            assert_eq!(out.text.len(), 30);
+            assert_eq!(out.cut_lines, 1);
+            assert_eq!(out.omitted, None);
+            assert!(out.truncated());
+            assert_no_markers(&out.text);
+
+            // Budget too small for even the first multi-byte char omits the line cleanly.
+            let tiny = program_window("😀\n".as_bytes(), mode, 2, false);
+            assert_eq!(tiny.text, "");
+            assert_eq!(tiny.cut_lines, 0);
+            assert_eq!(tiny.omitted, Some((1, 1)));
+            assert!(tiny.truncated());
+        }
+
+        // Multi-line Head overflow: complete lines and overflowing first line.
+        let head_lines = b"line1\nline2\nline3\nline4\n";
+        let out = program_window(head_lines, Truncate::Head, 11, false);
+        assert_eq!(out.text, "line1\nline2");
+        assert_eq!(out.omitted, Some((3, 4)));
+        assert_eq!(out.cut_lines, 0);
+        assert!(out.truncated());
+        assert_no_markers(&out.text);
+
+        let head_over = format!("{}😀\nsecond\nthird\n", "a".repeat(20));
+        let out = program_window(head_over.as_bytes(), Truncate::Head, 22, false);
+        assert_eq!(out.text, "a".repeat(20));
+        assert_eq!(out.cut_lines, 1);
+        assert_eq!(out.omitted, Some((2, 3)));
+        assert!(out.truncated());
+        assert_no_markers(&out.text);
+
+        // Multi-line Tail overflow: complete lines and overflowing last line.
+        let out = program_window(head_lines, Truncate::Tail, 11, false);
+        assert_eq!(out.text, "line3\nline4");
+        assert_eq!(out.omitted, Some((1, 2)));
+        assert_eq!(out.cut_lines, 0);
+        assert!(out.truncated());
+        assert_no_markers(&out.text);
+
+        let tail_over = format!("first\nsecond\n{}😀\n", "b".repeat(20));
+        let out = program_window(tail_over.as_bytes(), Truncate::Tail, 22, false);
+        assert_eq!(out.text, "b".repeat(20));
+        assert_eq!(out.cut_lines, 1);
+        assert_eq!(out.omitted, Some((1, 2)));
+        assert!(out.truncated());
+        assert_no_markers(&out.text);
+
+        // Invalid UTF-8 counts bad_lines accurately alongside truncation.
+        let bad = [b"ok\n".as_slice(), &[0xff, b'x', b'\n'], b"tail\n"].concat();
+        let out = program_window(&bad, Truncate::Head, 8, false);
+        assert_eq!(out.bad_lines, 1);
+        assert_eq!(out.omitted, Some((3, 3)));
+        assert!(out.truncated());
+        assert_no_markers(&out.text);
+
+        // keep_nul: true preserves NUL bytes while cleaning ANSI and truncating cleanly.
+        let nul_input = b"\x1b[32ma\0b\x1b[0m\nc\0d\ne\0f\n";
+        let out = program_window(nul_input, Truncate::Head, 7, true);
+        assert_eq!(out.text, "a\0b\nc\0d");
+        assert_eq!(out.omitted, Some((3, 3)));
+        assert_eq!(out.cut_lines, 0);
+        assert!(out.truncated());
+        assert_no_markers(&out.text);
+    }
+
+    #[test]
+    fn fit_screen_rows_separates_agent_markers_from_raw_program_slicing() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(fit_screen_rows(&empty, 100, false), (String::new(), 0, false));
+        assert_eq!(fit_screen_rows(&empty, 100, true), (String::new(), 0, false));
+
+        let rows: Vec<String> = vec!["top-1".into(), "top-2".into(), "bottom".into()];
+        assert_eq!(
+            fit_screen_rows(&rows, 18, false),
+            ("top-1\ntop-2\nbottom".into(), 0, false)
+        );
+        assert_eq!(
+            fit_screen_rows(&rows, 12, false),
+            ("top-2\nbottom".into(), 1, false)
+        );
+        assert_eq!(fit_screen_rows(&rows, 6, false), ("bottom".into(), 2, false));
+
+        // Program mode drops top rows without markers and slices UTF-8 cleanly with zero [cut].
+        let utf8_rows: Vec<String> = vec!["top-1".into(), "top-2".into(), "中文😀tail".into()];
+        let (body, omitted, line_cut) = fit_screen_rows(&utf8_rows, 8, false);
+        assert_eq!(body, "中文");
+        assert_eq!(omitted, 2);
+        assert!(line_cut);
+        assert_no_markers(&body);
+
+        // Agent mode keeps the top-row omission marker and [cut] suffix.
+        let long_rows: Vec<String> = vec!["top-1".into(), "top-2".into(), "bottom-".repeat(30)];
+        let (body, omitted, line_cut) = fit_screen_rows(&long_rows, 100, true);
+        assert_eq!(omitted, 2);
+        assert!(line_cut);
+        assert!(body.starts_with("... [2 top rows omitted] ...\nbottom-"), "{body}");
+        assert!(body.ends_with(MARK), "{body}");
+        assert!(body.len() <= 100);
+
+        let (body, omitted, line_cut) = fit_screen_rows(&rows, 100, true);
+        assert_eq!(body, "top-1\ntop-2\nbottom");
+        assert_eq!(omitted, 0);
+        assert!(!line_cut);
     }
 }

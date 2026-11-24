@@ -1,12 +1,9 @@
-use super::WriteRequest;
 use super::edit::EditSource;
-use super::lock;
-#[cfg(test)]
-use super::path::with_path_workspace;
 use super::path::{
     append_path, display_path, ends_in_directory, native_path_bytes, read_target_link,
-    reserve_target_workspace, resolve, target_memory_error,
+    reserve_target_workspace, resolve, target_memory_error, with_path_workspace,
 };
+use super::{FileError, WriteRequest, lock};
 use crate::lease::{BytePool, Lease};
 use crate::session::LaunchContext;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
@@ -16,40 +13,89 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWriteData {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// Writes one file, creating its parent directories and keeping an existing file's permissions.
+pub async fn write_core(
+    request: WriteRequest,
+    launch: Arc<LaunchContext>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    input_owner: crate::lease::Owner,
+) -> crate::ipc::Owned<Result<FileWriteData, FileError>> {
+    let input = crate::ipc::Owned::new((request, permit), input_owner);
+    match tokio::task::spawn_blocking(move || {
+        input.flat_map(|(request, _permit)| write_blocking(&request, &launch))
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => crate::ipc::Owned::new(
+            Err(FileError::Io(format!(
+                "the file operation did not finish: {error}"
+            ))),
+            Default::default(),
+        ),
+    }
+}
+
+pub(crate) fn write_blocking(
+    request: &WriteRequest,
+    launch: &LaunchContext,
+) -> crate::ipc::Owned<Result<FileWriteData, FileError>> {
+    with_path_workspace(&request.path, launch, 0, |lease| {
+        write_text_reserved(request, launch, lease)
+    })
+    .unwrap_or_else(|message| {
+        crate::ipc::Owned::new(Err(FileError::Overload(message)), Default::default())
+    })
+}
+
 /// Writes one file, creating its parent directories and keeping an existing file's permissions.
 #[cfg(test)]
 pub(super) fn write_text(
     request: &WriteRequest,
     launch: &LaunchContext,
 ) -> Result<(String, String), String> {
-    with_path_workspace(&request.path, launch, 0, |lease| {
-        write_text_reserved(request, launch, lease)
-    })?
-    .run(|result| result)
+    write_blocking(request, launch)
+        .run(|result| result)
+        .map(|data| (format!("Successfully wrote to {}", data.path), data.path))
+        .map_err(FileError::into_message)
 }
 
 pub(super) fn write_text_reserved(
     request: &WriteRequest,
     launch: &LaunchContext,
     lease: &mut Lease,
-) -> Result<(String, String), String> {
-    let resolved = resolve(&request.path, launch)?;
+) -> Result<FileWriteData, FileError> {
+    let resolved = resolve(&request.path, launch).map_err(FileError::Validation)?;
     let shown_path = display_path(&resolved);
     let _guard = lock();
-    let target = write_target(&resolved, launch.memory())
-        .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
-    reserve_target_workspace(&target.value, lease, launch.memory())
-        .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
-    create_target_directories(&target.value, launch.memory())
-        .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
+    let map_io = |error: io::Error| {
+        let message = format!("Cannot write {shown_path}: {error}.");
+        match error.kind() {
+            io::ErrorKind::OutOfMemory => FileError::Overload(message),
+            io::ErrorKind::NotFound => FileError::NotFound(message),
+            _ => FileError::Io(message),
+        }
+    };
+    let target = write_target(&resolved, launch.memory()).map_err(&map_io)?;
+    reserve_target_workspace(&target.value, lease, launch.memory()).map_err(&map_io)?;
+    create_target_directories(&target.value, launch.memory()).map_err(&map_io)?;
     save_target(
         &target.value,
         request.content.as_bytes(),
         None,
         launch.memory(),
     )
-    .map_err(|error| format!("Cannot write {shown_path}: {error}."))?;
-    Ok((format!("Successfully wrote to {shown_path}"), shown_path))
+    .map_err(&map_io)?;
+    Ok(FileWriteData {
+        path: shown_path,
+        bytes: request.content.len() as u64,
+    })
 }
 
 /// Creates the final target's parent directories for an initial upload. Its real

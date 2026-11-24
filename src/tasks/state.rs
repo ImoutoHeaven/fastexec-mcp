@@ -1243,6 +1243,7 @@ impl Task {
             raw,
             clean,
             keep_nul,
+            include_markers: true,
             encoding,
             source: "log",
         };
@@ -1283,6 +1284,7 @@ impl Task {
             raw,
             clean,
             keep_nul,
+            include_markers: true,
             encoding,
             source: "log",
         };

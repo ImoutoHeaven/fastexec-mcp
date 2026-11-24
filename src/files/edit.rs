@@ -6,10 +6,11 @@ use super::read::TEXT_BLOCK;
 use super::write::save_target;
 #[cfg(windows)]
 use super::write::windows_file_identity;
-use super::{BlockingOutcome, EditRequest, lock};
+use super::{EditRequest, FileError, lock};
 use crate::lease::{BytePool, Lease};
 use crate::session::LaunchContext;
-use serde_json::{Value, json};
+use serde::Serialize;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::PathBuf;
@@ -17,8 +18,92 @@ use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::canonical_combining_class;
 
-/// An edit keeps the file it read separate from the path that can be changed meanwhile.
-type EditFailure = (String, Option<Value>);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EditMatch {
+    pub line: usize,
+    pub fuzzy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEditData {
+    pub path: String,
+    pub replacements: usize,
+    pub edits: Vec<EditMatch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditProblem {
+    Ambiguous,
+    NotFound,
+    Overlap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EditFailure {
+    pub index: usize,
+    pub problem: EditProblem,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<Vec<usize>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with: Option<Vec<usize>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditError {
+    pub error: FileError,
+    pub path: Option<String>,
+    pub failures: Option<Vec<EditFailure>>,
+}
+
+impl EditError {
+    pub fn message(&self) -> &str {
+        self.error.message()
+    }
+
+    pub fn into_message(self) -> String {
+        self.error.into_message()
+    }
+}
+
+impl fmt::Display for EditError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<FileError> for EditError {
+    fn from(error: FileError) -> Self {
+        Self {
+            error,
+            path: None,
+            failures: None,
+        }
+    }
+}
+
+/// Applies targeted replacements to one file, returning pure domain results without MCP or JSON wrappers.
+pub async fn edit_core(
+    request: EditRequest,
+    launch: Arc<LaunchContext>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    input_owner: crate::lease::Owner,
+) -> crate::ipc::Owned<Result<FileEditData, EditError>> {
+    let input = crate::ipc::Owned::new((request, permit), input_owner);
+    match tokio::task::spawn_blocking(move || {
+        input.flat_map(|(request, _permit)| edit_blocking(&request, &launch))
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => crate::ipc::Owned::new(
+            Err(FileError::Io(format!("the file operation did not finish: {error}")).into()),
+            Default::default(),
+        ),
+    }
+}
 
 fn edit_sum(parts: &[usize]) -> Option<usize> {
     parts
@@ -35,13 +120,11 @@ pub(super) fn edit_growth(items: usize, item_bytes: usize) -> Option<usize> {
         .checked_mul(4)
 }
 
-fn edit_memory_error(limit: usize) -> EditFailure {
-    (
-        format!(
-            "Server active memory budget ({limit} bytes) is full while editing the file; nothing was changed."
-        ),
-        None,
-    )
+fn edit_memory_error(limit: usize) -> EditError {
+    FileError::Overload(format!(
+        "Server active memory budget ({limit} bytes) is full while editing the file; nothing was changed."
+    ))
+    .into()
 }
 
 pub(super) struct EditWorkspace<'a> {
@@ -62,7 +145,7 @@ impl<'a> EditWorkspace<'a> {
         }
     }
 
-    fn retain(&mut self, bytes: Option<usize>) -> Result<(), EditFailure> {
+    fn retain(&mut self, bytes: Option<usize>) -> Result<(), EditError> {
         let retained = bytes
             .and_then(|bytes| self.retained.checked_add(bytes))
             .ok_or_else(|| edit_memory_error(self.limit))?;
@@ -76,7 +159,7 @@ impl<'a> EditWorkspace<'a> {
         Ok(())
     }
 
-    fn temporary(&mut self, bytes: Option<usize>) -> Result<(), EditFailure> {
+    fn temporary(&mut self, bytes: Option<usize>) -> Result<(), EditError> {
         let scratch = bytes
             .ok_or_else(|| edit_memory_error(self.limit))?
             .max(self.scratch);
@@ -91,7 +174,7 @@ impl<'a> EditWorkspace<'a> {
         Ok(())
     }
 
-    fn diagnostics(&mut self, edits: usize, path: &str, failed: bool) -> Result<(), EditFailure> {
+    fn diagnostics(&mut self, edits: usize, path: &str, failed: bool) -> Result<(), EditError> {
         // Each failure shows at most 20 line/entry numbers. This covers its
         // bullet, joined message, JSON copy and temporary number/label strings.
         let per_edit = if failed { 16 * 1024 } else { 512 };
@@ -208,7 +291,7 @@ fn prepare_edit_workspace(
     content: &str,
     request: &EditRequest,
     workspace: &mut EditWorkspace<'_>,
-) -> Result<EditNormalization, EditFailure> {
+) -> Result<EditNormalization, EditError> {
     let size =
         EditNormalization::count(content).ok_or_else(|| edit_memory_error(workspace.limit))?;
     let mut input_bytes = 0usize;
@@ -317,7 +400,7 @@ pub(super) fn read_edit_content(
     let memory = || {
         io::Error::new(
             io::ErrorKind::OutOfMemory,
-            edit_memory_error(pool.limit()).0,
+            edit_memory_error(pool.limit()).into_message(),
         )
     };
     let mut lease = pool.try_acquire(TEXT_BLOCK).ok_or_else(memory)?;
@@ -448,36 +531,57 @@ enum EntryProblem {
     NotFound { lines: Vec<usize>, more: usize },
 }
 
-pub(super) fn edit_owned_outcome(
+fn edit_retained_bytes(result: &Result<FileEditData, EditError>) -> Option<usize> {
+    match result {
+        Ok(data) => edit_sum(&[
+            data.path.capacity(),
+            data.edits
+                .capacity()
+                .checked_mul(std::mem::size_of::<EditMatch>())?,
+        ]),
+        Err(err) => {
+            let failures_bytes = err.failures.as_ref().map_or(Some(0), |failures| {
+                let items = failures
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<EditFailure>())?;
+                let vecs = failures.iter().try_fold(0usize, |sum, item| {
+                    let lines = item
+                        .lines
+                        .as_ref()
+                        .map_or(Some(0), |v| v.capacity().checked_mul(std::mem::size_of::<usize>()))?;
+                    let with = item
+                        .with
+                        .as_ref()
+                        .map_or(Some(0), |v| v.capacity().checked_mul(std::mem::size_of::<usize>()))?;
+                    edit_sum(&[sum, lines, with])
+                })?;
+                items.checked_add(vecs)
+            })?;
+            edit_sum(&[
+                err.message().len(),
+                err.path.as_ref().map_or(0, String::capacity),
+                failures_bytes,
+            ])
+        }
+    }
+}
+
+pub(crate) fn edit_blocking(
     request: &EditRequest,
     launch: &LaunchContext,
-) -> crate::ipc::Owned<BlockingOutcome> {
+) -> crate::ipc::Owned<Result<FileEditData, EditError>> {
     with_path_workspace(&request.path, launch, 0, |lease| {
         let path_bytes = lease.bytes();
         let result = edit_outcome_reserved(request, launch, lease);
-        // Every structured value here is a fresh JSON copy. Its encoded length
-        // bounds its retained string payload; the displayed String keeps capacity.
-        let retained = match &result {
-            Ok((text, value)) => crate::ipc::json_len(value)
-                .ok()
-                .and_then(|bytes| text.capacity().checked_add(bytes)),
-            Err((text, value)) => value
-                .as_ref()
-                .map_or(Some(0), |value| crate::ipc::json_len(value).ok())
-                .and_then(|bytes| text.capacity().checked_add(bytes)),
-        };
-        if let Some(retained) = retained {
+        if let Some(retained) = edit_retained_bytes(&result) {
             debug_assert!(retained <= lease.bytes());
             lease.shrink_to(path_bytes.max(retained));
         }
         result
     })
-    .unwrap_or_else(|message| crate::ipc::Owned::new(Err((message, None)), Default::default()))
-}
-
-#[cfg(test)]
-pub(super) fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> BlockingOutcome {
-    edit_owned_outcome(request, launch).run(|outcome| outcome)
+    .unwrap_or_else(|message| {
+        crate::ipc::Owned::new(Err(FileError::Overload(message).into()), Default::default())
+    })
 }
 
 /// Applies every edit to one file: exact matches first, and the fuzzy form when any edit needs it.
@@ -485,42 +589,53 @@ pub(super) fn edit_outcome_reserved(
     request: &EditRequest,
     launch: &LaunchContext,
     lease: &mut Lease,
-) -> BlockingOutcome {
+) -> Result<FileEditData, EditError> {
     if request.edits.is_empty() {
-        return Err((
+        return Err(FileError::Validation(
             "Edit tool input is invalid. edits must contain at least one replacement.".to_owned(),
-            None,
-        ));
+        )
+        .into());
     }
     for (index, edit) in request.edits.iter().enumerate() {
         if edit.old_text.is_empty() {
-            return Err((format!("edits[{index}].oldText must not be empty."), None));
+            return Err(
+                FileError::Validation(format!("edits[{index}].oldText must not be empty.")).into(),
+            );
         }
         if edit.start_line == Some(0) {
-            return Err((
-                format!("edits[{index}].startLine must be at least 1."),
-                None,
-            ));
+            return Err(FileError::Validation(format!(
+                "edits[{index}].startLine must be at least 1."
+            ))
+            .into());
         }
         if edit.end_line == Some(0) {
-            return Err((format!("edits[{index}].endLine must be at least 1."), None));
+            return Err(FileError::Validation(format!(
+                "edits[{index}].endLine must be at least 1."
+            ))
+            .into());
         }
         if let (Some(start), Some(end)) = (edit.start_line, edit.end_line)
             && start > end
         {
-            return Err((
-                format!("edits[{index}].startLine ({start}) must not exceed endLine ({end})."),
-                None,
-            ));
+            return Err(FileError::Validation(format!(
+                "edits[{index}].startLine ({start}) must not exceed endLine ({end})."
+            ))
+            .into());
         }
     }
-    let resolved = resolve(&request.path, launch).map_err(|msg| (msg, None))?;
+    let resolved = resolve(&request.path, launch).map_err(FileError::Validation)?;
     let shown_path = display_path(&resolved);
+    let map_io = |error: io::Error| -> EditError {
+        let message = format!("Could not edit file: {shown_path}. {error}.");
+        match error.kind() {
+            io::ErrorKind::NotFound => FileError::NotFound(message).into(),
+            io::ErrorKind::OutOfMemory => FileError::Overload(message).into(),
+            _ => FileError::Io(message).into(),
+        }
+    };
     let _guard = lock();
-    let source = EditSource::read(resolved, launch.memory())
-        .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
-    reserve_target_workspace(&source.target.value, lease, launch.memory())
-        .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
+    let source = EditSource::read(resolved, launch.memory()).map_err(&map_io)?;
+    reserve_target_workspace(&source.target.value, lease, launch.memory()).map_err(&map_io)?;
     let mut workspace = EditWorkspace::new(lease, launch.memory().limit());
     let (mut written, starts, fuzzy_flags) =
         apply_edits_budgeted(&source.content, request, &shown_path, &mut workspace)?;
@@ -531,49 +646,30 @@ pub(super) fn edit_outcome_reserved(
         return Err(edit_no_change(&shown_path));
     }
     workspace.diagnostics(request.edits.len(), &shown_path, false)?;
-    let mut text = format!(
-        "Successfully replaced {} block(s) in {shown_path}.",
-        request.edits.len(),
-    );
     let mut edits = Vec::with_capacity(request.edits.len());
-    for (index, (&at, &fuzzy)) in starts.iter().zip(&fuzzy_flags).enumerate() {
+    for (&at, &fuzzy) in starts.iter().zip(&fuzzy_flags) {
         let line = 1 + line_breaks(&source.content[..at]);
-        text.push_str(&format!("\nedits[{index}]: line {line}"));
-        if fuzzy {
-            text.push_str(" (fuzzy match)");
-        }
-        edits.push(json!({ "line": line, "fuzzy": fuzzy }));
+        edits.push(EditMatch { line, fuzzy });
     }
-    let structured = json!({
-        "ok": true,
-        "path": shown_path,
-        "replacements": request.edits.len(),
-        "edits": edits,
-    });
     source
         .save(written.as_bytes(), launch.memory())
-        .map_err(|error| (format!("Could not edit file: {shown_path}. {error}."), None))?;
-    Ok((text, structured))
+        .map_err(&map_io)?;
+    Ok(FileEditData {
+        path: shown_path,
+        replacements: request.edits.len(),
+        edits,
+    })
 }
 
-#[cfg(test)]
-pub(super) fn edit_text(request: &EditRequest, launch: &LaunchContext) -> Result<String, String> {
-    edit_outcome(request, launch)
-        .map(|(text, _)| text)
-        .map_err(|(msg, _)| msg)
-}
-
-fn edit_no_change(path: &str) -> (String, Option<Value>) {
+fn edit_no_change(path: &str) -> EditError {
     let error = format!(
         "Cannot edit {path}; nothing was changed: the replacement produced identical content."
     );
-    let structured = json!({
-        "ok": false,
-        "error": error,
-        "path": path,
-        "failures": [],
-    });
-    (error, Some(structured))
+    EditError {
+        error: FileError::Validation(error),
+        path: Some(path.to_owned()),
+        failures: Some(Vec::new()),
+    }
 }
 
 /// Matches in LF-normalized text, collects every entry failure (ambiguous, not_found, overlap),
@@ -584,7 +680,7 @@ pub(super) fn apply_edits_budgeted(
     request: &EditRequest,
     path: &str,
     workspace: &mut EditWorkspace<'_>,
-) -> Result<(String, Vec<usize>, Vec<bool>), EditFailure> {
+) -> Result<(String, Vec<usize>, Vec<bool>), EditError> {
     let size = prepare_edit_workspace(content, request, workspace)?;
     let total = request.edits.len();
     let normalized = LfText::new(content);
@@ -900,25 +996,26 @@ pub(super) fn apply_edits_budgeted(
                         bullets.push(format!(
                             "- edits[{index}]: oldText occurs {count} times, starting at lines {list}{extra}; add surrounding text to make it unique."
                         ));
-                        let mut item = json!({
-                            "index": index,
-                            "problem": "ambiguous",
-                            "lines": shown,
+                        failures.push(EditFailure {
+                            index,
+                            problem: EditProblem::Ambiguous,
+                            lines: Some(shown.to_vec()),
+                            with: None,
+                            more: (more > 0).then_some(more),
                         });
-                        if more > 0 {
-                            item["more"] = json!(more);
-                        }
-                        failures.push(item);
                     }
                     EntryProblem::NotFound { lines, more } => {
                         if lines.is_empty() {
                             bullets.push(format!(
                                 "- edits[{index}]: oldText was not found, even ignoring trailing whitespace, Unicode compatibility forms, curly quotes, dashes, and special spaces."
                             ));
-                            failures.push(json!({
-                                "index": index,
-                                "problem": "not_found",
-                            }));
+                            failures.push(EditFailure {
+                                index,
+                                problem: EditProblem::NotFound,
+                                lines: None,
+                                with: None,
+                                more: None,
+                            });
                         } else {
                             let shown = &lines[..lines.len().min(MAX_REPORTED_ITEMS)];
                             let list = shown
@@ -934,15 +1031,13 @@ pub(super) fn apply_edits_budgeted(
                             bullets.push(format!(
                                 "- edits[{index}]: oldText was not found in the requested line range (it occurs outside that range, starting at lines {list}{extra})."
                             ));
-                            let mut item = json!({
-                                "index": index,
-                                "problem": "not_found",
-                                "lines": shown,
+                            failures.push(EditFailure {
+                                index,
+                                problem: EditProblem::NotFound,
+                                lines: Some(shown.to_vec()),
+                                with: None,
+                                more: (*more > 0).then_some(*more),
                             });
-                            if *more > 0 {
-                                item["more"] = json!(more);
-                            }
-                            failures.push(item);
                         }
                     }
                 }
@@ -963,28 +1058,24 @@ pub(super) fn apply_edits_budgeted(
                 bullets.push(format!(
                     "- edits[{index}] overlaps {labels}{extra}; merge them into one edit or target disjoint regions."
                 ));
-                let mut item = json!({
-                    "index": index,
-                    "problem": "overlap",
-                    "with": shown,
+                failures.push(EditFailure {
+                    index,
+                    problem: EditProblem::Overlap,
+                    lines: None,
+                    with: Some(shown.to_vec()),
+                    more: (more > 0).then_some(more),
                 });
-                if more > 0 {
-                    item["more"] = json!(more);
-                }
-                failures.push(item);
             }
         }
         let error = format!(
             "Cannot edit {path}; nothing was changed:\n{}",
             bullets.join("\n")
         );
-        let structured = json!({
-            "ok": false,
-            "error": error,
-            "path": path,
-            "failures": failures,
+        return Err(EditError {
+            error: FileError::Validation(error),
+            path: Some(path.to_owned()),
+            failures: Some(failures),
         });
-        return Err((error, Some(structured)));
     }
 
     // Reverse application can grow before a later replacement shrinks the file.
@@ -1011,7 +1102,7 @@ pub(super) fn apply_edits(
     content: &str,
     request: &EditRequest,
     path: &str,
-) -> Result<(String, Vec<usize>, Vec<bool>), EditFailure> {
+) -> Result<(String, Vec<usize>, Vec<bool>), EditError> {
     let pool = crate::lease::process_pool();
     let mut lease = Lease::empty(pool);
     apply_edits_budgeted(

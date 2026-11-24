@@ -84,7 +84,7 @@ pub fn validate(
         None => None,
     };
     let start = request.as_exec()?;
-    service_schema::validate(&start, false)?;
+    service_schema::validate(&start, service_schema::ExecPolicy::AGENT)?;
     Ok((start, resolved_cwd))
 }
 

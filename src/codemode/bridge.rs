@@ -302,7 +302,7 @@ impl Host {
         }
         let queued_guard = if let ToolCall::Exec(request) = &request
             && request.action == Action::Start
-            && service_schema::validate(request, true).is_ok()
+            && service_schema::validate(request, service_schema::ExecPolicy::PROGRAM).is_ok()
         {
             if self.starts >= MAX_STARTS {
                 lock(&self.script.0.report).remove(id);

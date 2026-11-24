@@ -12,18 +12,62 @@ pub(crate) mod write;
 #[cfg(test)]
 mod tests;
 
-use self::edit::edit_owned_outcome;
-use self::path::with_path_workspace;
-use self::read::{ReadFailure, ReadLimits, read_cancellable};
-use self::write::write_text_reserved;
+use self::edit::{EditError, FileEditData};
+pub use self::edit::edit_core;
+use self::read::{FileReadData, MediaPayload, MediaReadMode, TextSlice, format_size};
+pub use self::read::{ReadPolicy, read_core};
+use self::write::FileWriteData;
+pub use self::write::write_core;
 use crate::lease::Lease;
+use crate::media;
 use crate::service::render::{self as service_render, OutputMode, Render};
 use crate::session::LaunchContext;
 use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileError {
+    Validation(String),
+    NotFound(String),
+    Limit(String),
+    Overload(String),
+    Cancelled(String),
+    Io(String),
+}
+
+impl FileError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Validation(msg)
+            | Self::NotFound(msg)
+            | Self::Limit(msg)
+            | Self::Overload(msg)
+            | Self::Cancelled(msg)
+            | Self::Io(msg) => msg,
+        }
+    }
+
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Validation(msg)
+            | Self::NotFound(msg)
+            | Self::Limit(msg)
+            | Self::Overload(msg)
+            | Self::Cancelled(msg)
+            | Self::Io(msg) => msg,
+        }
+    }
+}
+
+impl fmt::Display for FileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
 
 /// The one lock that serializes write and edit, so a read-modify-write cannot interleave with
 /// another one. It is held for the whole blocking operation, never across an await.
@@ -162,14 +206,15 @@ pub async fn read_tracked(
     cancel: Option<tokio_util::sync::CancellationToken>,
     input_owner: crate::lease::Owner,
 ) -> TrackedResult {
-    read_with_limits_and_permit(
-        crate::ipc::Owned::new(request, input_owner),
+    read_with_policy_and_permit(
+        request,
         launch,
         transfer,
         render,
-        ReadLimits::DIRECT,
+        ReadPolicy::AGENT,
         None,
         cancel,
+        input_owner,
     )
     .await
 }
@@ -186,58 +231,223 @@ pub(crate) async fn read_nested(
     cancel: tokio_util::sync::CancellationToken,
     input_owner: crate::lease::Owner,
 ) -> TrackedResult {
-    read_with_limits_and_permit(
-        crate::ipc::Owned::new(request, input_owner),
+    read_with_policy_and_permit(
+        request,
         launch,
         transfer,
         render,
-        ReadLimits::NESTED,
+        ReadPolicy::PROGRAM,
         Some(permit),
         Some(cancel),
+        input_owner,
     )
     .await
 }
 
-async fn read_with_limits_and_permit(
-    input: crate::ipc::Owned<ReadRequest>,
+#[allow(clippy::too_many_arguments)]
+async fn read_with_policy_and_permit(
+    request: ReadRequest,
     launch: Arc<LaunchContext>,
     transfer: bool,
     render: Render,
-    limits: ReadLimits,
+    policy: ReadPolicy,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     cancel: Option<tokio_util::sync::CancellationToken>,
+    input_owner: crate::lease::Owner,
 ) -> TrackedResult {
     let effective = render.effective();
-    match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        input.flat_map(|request| {
-            read_cancellable(&request, &launch, transfer, limits, cancel.as_ref())
-        })
-    })
-    .await
-    {
-        Ok(outcome) => {
-            let owner = outcome.owner.clone();
-            let mut tracked = outcome.run(|outcome| match outcome {
-                Ok(outcome) => outcome.into_tracked(effective),
-                Err(ReadFailure::Overload(message)) => TrackedResult {
-                    result: service_render::suppress(failed(message), effective),
-                    lease: None,
-                    overload: true,
-                    task_meta: None,
-                    payload_owner: Default::default(),
-                },
-                Err(ReadFailure::Error(message)) => {
-                    TrackedResult::plain(service_render::suppress(failed(message), effective))
-                }
-            });
-            tracked.payload_owner = owner;
-            tracked
-        }
+    let outcome =
+        read_core(request, launch, transfer, policy, permit, cancel, input_owner).await;
+    let owner = outcome.owner.clone();
+    let mut tracked = outcome.run(|read| match read {
+        Ok(data) => read_data_to_outcome(data, policy, owner.clone()).into_tracked(effective),
+        Err(FileError::Overload(message)) => TrackedResult {
+            result: service_render::suppress(failed(message), effective),
+            lease: None,
+            overload: true,
+            task_meta: None,
+            payload_owner: Default::default(),
+        },
         Err(error) => TrackedResult::plain(service_render::suppress(
-            failed(format!("the file operation did not finish: {error}")),
+            failed(error.into_message()),
             effective,
         )),
+    });
+    tracked.payload_owner = owner;
+    tracked
+}
+
+pub(super) fn read_data_to_outcome(
+    data: FileReadData,
+    policy: ReadPolicy,
+    owner: crate::lease::Owner,
+) -> Outcome {
+    match data {
+        FileReadData::Text(slice) => text_slice_to_outcome(slice, owner),
+        FileReadData::Media(MediaPayload::Inline {
+            kind,
+            path,
+            resolved_path,
+            mime_type,
+            bytes,
+            encoded_base64,
+            summary_line,
+            image_transform,
+            lease,
+        }) => {
+            let block = media::content_block(kind, &mime_type, encoded_base64, &resolved_path);
+            let mut map = serde_json::Map::new();
+            map.insert("ok".into(), json!(true));
+            map.insert("kind".into(), json!(kind.as_str()));
+            map.insert("path".into(), json!(path));
+            map.insert("mimeType".into(), json!(mime_type));
+            map.insert("bytes".into(), json!(bytes));
+            map.insert("attached".into(), json!(true));
+            if let Some(transform) = image_transform {
+                map.insert("originalBytes".into(), json!(transform.original_bytes));
+                map.insert("originalWidth".into(), json!(transform.original_width));
+                map.insert("originalHeight".into(), json!(transform.original_height));
+                map.insert("width".into(), json!(transform.width));
+                map.insert("height".into(), json!(transform.height));
+            }
+            Outcome {
+                owner,
+                notice: summary_line.clone(),
+                text: summary_line,
+                body: None,
+                attachment: Some(block),
+                lease: Some(lease),
+                structured: Value::Object(map),
+            }
+        }
+        FileReadData::Media(MediaPayload::Descriptor {
+            kind,
+            path,
+            mime_type,
+            bytes,
+            source_bytes,
+            attachable,
+            note,
+        }) => {
+            let descriptor_only = policy.media_mode == MediaReadMode::DescriptorOnly;
+            let flag_key = if descriptor_only {
+                "attachable"
+            } else {
+                "attached"
+            };
+            let mut map = serde_json::Map::new();
+            map.insert("ok".into(), json!(true));
+            map.insert("kind".into(), json!(kind.as_str()));
+            map.insert("path".into(), json!(path));
+            map.insert("mimeType".into(), json!(mime_type));
+            if let Some(size) = bytes {
+                map.insert("bytes".into(), json!(size));
+            }
+            map.insert(flag_key.into(), json!(attachable));
+            if let Some(size) = source_bytes {
+                map.insert("sourceBytes".into(), json!(size));
+            }
+            let summary = match note {
+                Some(note) => {
+                    map.insert("note".into(), json!(note.clone()));
+                    note
+                }
+                None => format!(
+                    "Read {} file [{}] ({} B)",
+                    kind.as_str(),
+                    mime_type,
+                    bytes.unwrap_or(0)
+                ),
+            };
+            Outcome {
+                owner,
+                notice: summary.clone(),
+                text: summary,
+                body: None,
+                attachment: None,
+                lease: None,
+                structured: Value::Object(map),
+            }
+        }
+    }
+}
+
+pub(super) fn text_slice_to_outcome(slice: TextSlice, owner: crate::lease::Owner) -> Outcome {
+    let mut notices = Vec::new();
+    if slice.line_too_long {
+        let shell_path = slice.path.replace('\'', "'\\''");
+        notices.push(format!(
+            "[Line {} is {}, exceeds {} limit. Use exec: sed -n '{}p' '{}' | head -c {}]",
+            slice.start_line,
+            format_size(slice.first_line_bytes),
+            format_size(slice.max_bytes),
+            slice.start_line,
+            shell_path,
+            slice.max_bytes
+        ));
+    } else if slice.budget_truncated {
+        let end_display = slice.start_line + slice.shown_lines - 1;
+        let next = end_display + 1;
+        if slice.stopped_on_bytes {
+            notices.push(format!(
+                "[Showing lines {}-{end_display} of {} ({} limit). Use offset={next} to continue.]",
+                slice.start_line,
+                slice.total_lines,
+                format_size(slice.max_bytes)
+            ));
+        } else {
+            notices.push(format!(
+                "[Showing lines {}-{end_display} of {}. Use offset={next} to continue.]",
+                slice.start_line, slice.total_lines
+            ));
+        }
+    } else if slice.truncated
+        && let Some(next) = slice.next_offset
+    {
+        let remaining = slice.total_lines - (next - 1);
+        notices.push(format!(
+            "[{remaining} more lines in file. Use offset={next} to continue.]"
+        ));
+    }
+    if slice.lossy {
+        notices.push("[Invalid UTF-8 was replaced with U+FFFD.]".to_owned());
+    }
+    let notice_block = notices.join("\n\n");
+    let text = if slice.line_too_long || slice.text.is_empty() {
+        notice_block.clone()
+    } else if notice_block.is_empty() {
+        slice.text.clone()
+    } else if slice.text.ends_with('\n') {
+        format!("{}\n{notice_block}", slice.text)
+    } else {
+        format!("{}\n\n{notice_block}", slice.text)
+    };
+    let notice = if notice_block.is_empty() {
+        format!("[read] {} · {} lines", slice.path, slice.shown_lines)
+    } else {
+        notice_block
+    };
+    let structured = json!({
+        "ok": true,
+        "kind": "text",
+        "path": slice.path,
+        "startLine": slice.start_line,
+        "endLine": slice.end_line,
+        "shownLines": slice.shown_lines,
+        "totalLines": slice.total_lines,
+        "truncated": slice.truncated,
+        "nextOffset": slice.next_offset,
+        "lineTooLong": slice.line_too_long,
+        "lossy": slice.lossy,
+    });
+    Outcome {
+        owner,
+        text,
+        notice,
+        body: Some(slice.text),
+        attachment: None,
+        lease: Some(slice.lease),
+        structured,
     }
 }
 
@@ -309,24 +519,22 @@ async fn write_with_permit(
     input_owner: crate::lease::Owner,
 ) -> TrackedResult {
     let effective = render.effective();
-    let bytes = request.content.len();
-    let input = crate::ipc::Owned::new((request, permit), input_owner);
-    let outcome = tokio::task::spawn_blocking(move || {
-        input.flat_map(|(request, _permit)| {
-            with_path_workspace(&request.path, &launch, 0, |lease| {
-                write_text_reserved(&request, &launch, lease)
-                    .map(|(text, path)| (text, json!({ "ok": true, "path": path, "bytes": bytes })))
-                    .map_err(|msg| (msg, None))
-            })
-            .unwrap_or_else(|message| {
-                crate::ipc::Owned::new(Err((message, None)), Default::default())
-            })
-        })
-    })
-    .await;
-    let mut tracked = finished_owned(outcome);
-    tracked.result = service_render::suppress(tracked.result, effective);
-    tracked
+    let outcome = write_core(request, launch, permit, input_owner).await;
+    let owner = outcome.owner.clone();
+    let (result, overload) = outcome.run(|res| match res {
+        Ok(FileWriteData { path, bytes }) => {
+            let text = format!("Successfully wrote to {path}");
+            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+            result.structured_content = Some(json!({ "ok": true, "path": path, "bytes": bytes }));
+            (result, false)
+        }
+        Err(FileError::Overload(message)) => (failed(message), true),
+        Err(err) => (failed(err.into_message()), false),
+    });
+    TrackedResult {
+        overload,
+        ..TrackedResult::owned(service_render::suppress(result, effective), owner)
+    }
 }
 
 /// Applies targeted replacements to one file.
@@ -357,31 +565,67 @@ async fn edit_with_permit(
     input_owner: crate::lease::Owner,
 ) -> TrackedResult {
     let effective = render.effective();
-    let input = crate::ipc::Owned::new((request, permit), input_owner);
-    let mut tracked = finished_owned(
-        tokio::task::spawn_blocking(move || {
-            input.flat_map(|(request, _permit)| edit_owned_outcome(&request, &launch))
-        })
-        .await,
-    );
-    tracked.result = service_render::suppress(tracked.result, effective);
-    tracked
-}
-
-pub(super) type BlockingOutcome = Result<(String, Value), (String, Option<Value>)>;
-
-fn finished_owned(
-    outcome: Result<crate::ipc::Owned<BlockingOutcome>, tokio::task::JoinError>,
-) -> TrackedResult {
-    match outcome {
-        Ok(outcome) => {
-            let owner = outcome.owner.clone();
-            let result = outcome.run(|outcome| finished(Ok(outcome)));
-            TrackedResult::owned(result, owner)
+    let outcome = edit_core(request, launch, permit, input_owner).await;
+    let owner = outcome.owner.clone();
+    let (result, overload) = outcome.run(|res| match res {
+        Ok(data) => {
+            let (text, structured) = edit_data_to_agent(data);
+            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+            result.structured_content = Some(structured);
+            (result, false)
         }
-        Err(error) => TrackedResult::plain(finished(Err(error))),
+        Err(EditError {
+            error: FileError::Overload(message),
+            ..
+        }) => (failed(message), true),
+        Err(err) => (edit_error_to_agent(err), false),
+    });
+    TrackedResult {
+        overload,
+        ..TrackedResult::owned(service_render::suppress(result, effective), owner)
     }
 }
+
+pub(super) fn edit_data_to_agent(data: FileEditData) -> (String, Value) {
+    let mut text = format!(
+        "Successfully replaced {} block(s) in {}.",
+        data.replacements, data.path
+    );
+    for (index, item) in data.edits.iter().enumerate() {
+        text.push_str(&format!("\nedits[{index}]: line {}", item.line));
+        if item.fuzzy {
+            text.push_str(" (fuzzy match)");
+        }
+    }
+    let structured = json!({
+        "ok": true,
+        "path": data.path,
+        "replacements": data.replacements,
+        "edits": data.edits,
+    });
+    (text, structured)
+}
+
+fn edit_error_to_agent(err: EditError) -> CallToolResult {
+    match err.failures {
+        Some(failures) => {
+            let message = err.error.into_message();
+            let structured = json!({
+                "ok": false,
+                "error": message,
+                "path": err.path.unwrap_or_default(),
+                "failures": failures,
+            });
+            let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
+            result.structured_content = Some(structured);
+            result
+        }
+        None => failed(err.error.into_message()),
+    }
+}
+
+#[cfg(test)]
+pub(super) type BlockingOutcome = Result<(String, Value), (String, Option<Value>)>;
 
 #[cfg(test)]
 pub(super) async fn write(
@@ -393,24 +637,6 @@ pub(super) async fn write(
     write_tracked(request, launch, render, input_owner)
         .await
         .result
-}
-
-/// A blocking operation's answer: its text and structured metadata, or its message as an error.
-pub(super) fn finished(outcome: Result<BlockingOutcome, tokio::task::JoinError>) -> CallToolResult {
-    match outcome {
-        Ok(Ok((text, structured))) => {
-            let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-            result.structured_content = Some(structured);
-            result
-        }
-        Ok(Err((message, Some(structured)))) => {
-            let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
-            result.structured_content = Some(structured);
-            result
-        }
-        Ok(Err((message, None))) => failed(message),
-        Err(error) => failed(format!("the file operation did not finish: {error}")),
-    }
 }
 
 pub(super) fn failed(message: String) -> CallToolResult {

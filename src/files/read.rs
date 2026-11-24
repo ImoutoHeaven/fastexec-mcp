@@ -1,12 +1,11 @@
 use super::path::{display_path, open_regular, resolve, with_path_workspace};
-use super::{Outcome, ReadRequest};
+use super::{FileError, ReadRequest};
 use crate::lease::{BytePool, Lease};
 use crate::media::{self, CompressFailure, DetectedMedia, MediaKind};
 use crate::session::LaunchContext;
-use serde_json::{Value, json};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(super) const MAX_LINES: u64 = 2000;
@@ -18,20 +17,37 @@ pub(super) const NESTED_MAX_BYTES: u64 = 4 << 20;
 pub(super) const SNIFF: usize = media::SNIFF;
 pub(super) const MEDIA_READ_CHUNK: usize = 64 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReadLimits {
-    max_lines: u64,
-    max_bytes: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaReadMode {
+    /// Agent path: read and compress/base64-encode for a ContentBlock.
+    InlineBlock,
+    /// Program path: sniff and validate only; return a descriptor without loading base64 into JS.
+    DescriptorOnly,
 }
 
-impl ReadLimits {
-    pub(crate) const DIRECT: Self = Self {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadPolicy {
+    pub max_lines: u64,
+    pub max_bytes: u64,
+    pub media_mode: MediaReadMode,
+    /// When true and both `offset` and `limit` are omitted, read the entire file as strict UTF-8
+    /// (erroring if > max_bytes or invalid UTF-8 instead of silently truncating or lossy-replacing).
+    pub strict_whole_file: bool,
+}
+
+impl ReadPolicy {
+    pub const AGENT: Self = Self {
         max_lines: MAX_LINES,
         max_bytes: MAX_BYTES,
+        media_mode: MediaReadMode::InlineBlock,
+        strict_whole_file: false,
     };
-    pub(crate) const NESTED: Self = Self {
+
+    pub const PROGRAM: Self = Self {
         max_lines: u64::MAX,
         max_bytes: NESTED_MAX_BYTES,
+        media_mode: MediaReadMode::DescriptorOnly,
+        strict_whole_file: true,
     };
 
     /// How much of one line is kept while it is read: a line that fits whole, and one byte more,
@@ -41,18 +57,91 @@ impl ReadLimits {
     }
 }
 
-pub(super) enum ReadFailure {
-    Error(String),
-    Overload(String),
+#[derive(Debug)]
+pub struct TextSlice {
+    pub path: String,
+    /// Raw file lines without line-number prefixes or notices.
+    pub text: String,
+    pub start_line: u64,
+    pub end_line: Option<u64>,
+    pub shown_lines: u64,
+    pub total_lines: u64,
+    pub truncated: bool,
+    pub next_offset: Option<u64>,
+    pub line_too_long: bool,
+    pub lossy: bool,
+    pub first_line_bytes: u64,
+    pub stopped_on_bytes: bool,
+    pub max_bytes: u64,
+    pub budget_truncated: bool,
+    pub lease: Lease,
 }
 
-impl From<String> for ReadFailure {
-    fn from(message: String) -> Self {
-        if message.starts_with("Server active memory budget (") {
-            Self::Overload(message)
-        } else {
-            Self::Error(message)
-        }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageTransform {
+    pub original_bytes: u64,
+    pub original_width: u32,
+    pub original_height: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug)]
+pub enum MediaPayload {
+    Inline {
+        kind: MediaKind,
+        path: String,
+        resolved_path: PathBuf,
+        mime_type: String,
+        bytes: u64,
+        encoded_base64: String,
+        summary_line: String,
+        image_transform: Option<ImageTransform>,
+        lease: Lease,
+    },
+    Descriptor {
+        kind: MediaKind,
+        path: String,
+        mime_type: String,
+        bytes: Option<u64>,
+        source_bytes: Option<u64>,
+        attachable: bool,
+        note: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+pub enum FileReadData {
+    Text(TextSlice),
+    Media(MediaPayload),
+}
+
+/// Reads one file according to `policy`, returning pure domain data without MCP or JSON wrappers.
+pub async fn read_core(
+    request: ReadRequest,
+    launch: Arc<LaunchContext>,
+    transfer: bool,
+    policy: ReadPolicy,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    input_owner: crate::lease::Owner,
+) -> crate::ipc::Owned<Result<FileReadData, FileError>> {
+    let input = crate::ipc::Owned::new(request, input_owner);
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        input.flat_map(|request| {
+            read_blocking(&request, &launch, transfer, policy, cancel.as_ref())
+        })
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => crate::ipc::Owned::new(
+            Err(FileError::Io(format!(
+                "the file operation did not finish: {error}"
+            ))),
+            Default::default(),
+        ),
     }
 }
 
@@ -67,19 +156,19 @@ pub(super) struct TextWorkspace {
 
 impl TextWorkspace {
     #[cfg(test)]
-    pub(super) fn new(pool: &Arc<BytePool>, path_bytes: usize) -> Result<Self, String> {
+    pub(super) fn new(pool: &Arc<BytePool>, path_bytes: usize) -> Result<Self, FileError> {
         Self::with_base(
             pool,
             TEXT_FIXED_WORKSPACE.saturating_add(path_bytes.saturating_mul(32)),
         )
     }
 
-    fn after_path(pool: &Arc<BytePool>) -> Result<Self, String> {
+    fn after_path(pool: &Arc<BytePool>) -> Result<Self, FileError> {
         // The path owner already accounts for the sniff buffer and path copies.
         Self::with_base(pool, TEXT_FIXED_WORKSPACE.saturating_sub(SNIFF))
     }
 
-    fn with_base(pool: &Arc<BytePool>, base: usize) -> Result<Self, String> {
+    fn with_base(pool: &Arc<BytePool>, base: usize) -> Result<Self, FileError> {
         // At most one 8 KiB block plus a three-byte UTF-8 carry is decoded.
         // The two Strings and two replacement-position vectors, including old
         // allocations during growth, fit (16 + 5 * sizeof(usize)) * (B + 3) + B.
@@ -93,53 +182,38 @@ impl TextWorkspace {
         Ok(workspace)
     }
 
-    fn reserve(&mut self, retained: usize) -> Result<(), String> {
+    fn reserve(&mut self, retained: usize) -> Result<(), FileError> {
         // Growing line and window buffers, render copies, and structured text
         // coexist. Charge before each growth; retain the largest admitted peak.
         let target = self.base.saturating_add(retained.saturating_mul(16));
         if target > self.lease.bytes() && !self.lease.try_resize(target) {
-            return Err(format!(
+            return Err(FileError::Overload(format!(
                 "Server active memory budget ({} bytes) is full while reading file text; retry once in-flight transfers complete.",
                 self.limit
-            ));
+            )));
         }
         Ok(())
     }
-}
-
-/// The text of one file, cut to the window and the limits a result may show.
-#[cfg(test)]
-pub(super) fn read_text(
-    request: &ReadRequest,
-    launch: &LaunchContext,
-    transfer: bool,
-    limits: ReadLimits,
-) -> Result<Outcome, String> {
-    read_cancellable(request, launch, transfer, limits, None)
-        .run(|read| read)
-        .map_err(|failure| match failure {
-            ReadFailure::Error(msg) | ReadFailure::Overload(msg) => msg,
-        })
 }
 
 pub(super) fn count_lines_streaming(
     file: &mut File,
     shown_path: &str,
     cancel: Option<&tokio_util::sync::CancellationToken>,
-) -> Result<u64, String> {
+) -> Result<u64, FileError> {
     file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
+        .map_err(|error| FileError::Io(format!("Cannot read {shown_path}: {error}.")))?;
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut newlines = 0_u64;
     let mut total_bytes = 0_u64;
     let mut last_byte = b'\n';
     loop {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            return Err("Cancelled while reading file.".into());
+            return Err(FileError::Cancelled("Cancelled while reading file.".into()));
         }
         let read = file
             .read(&mut buffer)
-            .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
+            .map_err(|error| FileError::Io(format!("Cannot read {shown_path}: {error}.")))?;
         if read == 0 {
             break;
         }
@@ -343,38 +417,8 @@ fn oversized_note(
     }
 }
 
-fn unattached_outcome(
-    kind: MediaKind,
-    shown_path: String,
-    mime: String,
-    source_bytes: Option<u64>,
-    note: String,
-    nested: bool,
-) -> Outcome {
-    let flag_key = if nested { "attachable" } else { "attached" };
-    let mut map = serde_json::Map::new();
-    map.insert("ok".into(), json!(true));
-    map.insert("kind".into(), json!(kind.as_str()));
-    map.insert("path".into(), json!(shown_path));
-    map.insert("mimeType".into(), json!(mime));
-    map.insert(flag_key.into(), json!(false));
-    if let Some(size) = source_bytes {
-        map.insert("sourceBytes".into(), json!(size));
-    }
-    map.insert("note".into(), json!(note.clone()));
-    Outcome {
-        owner: Default::default(),
-        notice: note.clone(),
-        text: note,
-        body: None,
-        attachment: None,
-        lease: None,
-        structured: Value::Object(map),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn read_media_outcome(
+fn read_media_core(
     file: &mut File,
     initial_len: u64,
     prefix: &[u8],
@@ -383,12 +427,12 @@ fn read_media_outcome(
     detected: DetectedMedia,
     launch: &LaunchContext,
     transfer: bool,
-    limits: ReadLimits,
+    policy: ReadPolicy,
     cancel: Option<&tokio_util::sync::CancellationToken>,
-) -> Result<Outcome, ReadFailure> {
-    let max_media_bytes = launch.max_media_bytes().map_err(ReadFailure::Error)?;
-    let compress = launch.image_compress().map_err(ReadFailure::Error)?;
-    if limits == ReadLimits::NESTED {
+) -> Result<MediaPayload, FileError> {
+    let max_media_bytes = launch.max_media_bytes().map_err(FileError::Validation)?;
+    let compress = launch.image_compress().map_err(FileError::Validation)?;
+    if policy.media_mode == MediaReadMode::DescriptorOnly {
         if initial_len > max_media_bytes {
             let exact = file
                 .metadata()
@@ -403,37 +447,24 @@ fn read_media_outcome(
                 max_media_bytes,
                 transfer,
             );
-            return Ok(unattached_outcome(
-                detected.kind,
-                shown_path,
-                detected.mime.to_owned(),
-                exact,
-                note,
-                true,
-            ));
+            return Ok(MediaPayload::Descriptor {
+                kind: detected.kind,
+                path: shown_path,
+                mime_type: detected.mime.to_owned(),
+                bytes: None,
+                source_bytes: exact,
+                attachable: false,
+                note: Some(note),
+            });
         }
-        let structured = json!({
-            "ok": true,
-            "kind": detected.kind.as_str(),
-            "path": shown_path,
-            "mimeType": detected.mime,
-            "bytes": initial_len,
-            "attachable": true,
-        });
-        let summary = format!(
-            "Read {} file [{}] ({} B)",
-            detected.kind.as_str(),
-            detected.mime,
-            initial_len
-        );
-        return Ok(Outcome {
-            owner: Default::default(),
-            notice: summary.clone(),
-            text: summary,
-            body: None,
-            attachment: None,
-            lease: None,
-            structured,
+        return Ok(MediaPayload::Descriptor {
+            kind: detected.kind,
+            path: shown_path,
+            mime_type: detected.mime.to_owned(),
+            bytes: Some(initial_len),
+            source_bytes: None,
+            attachable: true,
+            note: None,
         });
     }
 
@@ -459,25 +490,26 @@ fn read_media_outcome(
                 max_media_bytes,
                 transfer,
             );
-            return Ok(unattached_outcome(
-                detected.kind,
-                shown_path,
-                detected.mime.to_owned(),
-                exact,
-                note,
-                false,
-            ));
+            return Ok(MediaPayload::Descriptor {
+                kind: detected.kind,
+                path: shown_path,
+                mime_type: detected.mime.to_owned(),
+                bytes: None,
+                source_bytes: exact,
+                attachable: false,
+                note: Some(note),
+            });
         }
         Err(MediaReadError::Io(error)) => {
-            return Err(ReadFailure::Error(format!(
+            return Err(FileError::Io(format!(
                 "Cannot read {shown_path}: {error}."
             )));
         }
         Err(MediaReadError::Cancelled) => {
-            return Err(ReadFailure::Error("Cancelled while reading file.".into()));
+            return Err(FileError::Cancelled("Cancelled while reading file.".into()));
         }
         Err(MediaReadError::Overload) => {
-            return Err(ReadFailure::Overload(format!(
+            return Err(FileError::Overload(format!(
                 "Cannot read {shown_path}: server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
                 launch.memory().limit()
             )));
@@ -503,7 +535,7 @@ fn read_media_outcome(
                 if needed > lease.bytes() && !lease.try_resize(needed) {
                     drop(compressed);
                     drop(lease);
-                    return Err(ReadFailure::Overload(format!(
+                    return Err(FileError::Overload(format!(
                         "Cannot read {shown_path}: server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
                         launch.memory().limit()
                     )));
@@ -511,40 +543,34 @@ fn read_media_outcome(
                 let encoded = media::encode_base64(&compressed.bytes);
                 drop(compressed.bytes);
                 lease.shrink_to(outbound_peak);
-                let mut text = format!("Read image file [{}] ({sent_bytes} B)", compressed.mime);
+                let mut summary_line =
+                    format!("Read image file [{}] ({sent_bytes} B)", compressed.mime);
                 for hint in &compressed.hints {
-                    text.push('\n');
-                    text.push_str(hint);
+                    summary_line.push('\n');
+                    summary_line.push_str(hint);
                 }
-                let mut map = serde_json::Map::new();
-                map.insert("ok".into(), json!(true));
-                map.insert("kind".into(), json!("image"));
-                map.insert("path".into(), json!(shown_path));
-                map.insert("mimeType".into(), json!(compressed.mime.clone()));
-                map.insert("bytes".into(), json!(sent_bytes));
-                map.insert("attached".into(), json!(true));
-                if compressed.transformed {
-                    map.insert("originalBytes".into(), json!(compressed.original_bytes));
-                    map.insert("originalWidth".into(), json!(compressed.original_width));
-                    map.insert("originalHeight".into(), json!(compressed.original_height));
-                    map.insert("width".into(), json!(compressed.width));
-                    map.insert("height".into(), json!(compressed.height));
-                }
-                let block =
-                    media::content_block(MediaKind::Image, &compressed.mime, encoded, resolved);
-                return Ok(Outcome {
-                    owner: Default::default(),
-                    notice: text.clone(),
-                    text,
-                    body: None,
-                    attachment: Some(block),
-                    lease: Some(lease),
-                    structured: Value::Object(map),
+                let image_transform = compressed.transformed.then_some(ImageTransform {
+                    original_bytes: compressed.original_bytes,
+                    original_width: compressed.original_width,
+                    original_height: compressed.original_height,
+                    width: compressed.width,
+                    height: compressed.height,
+                });
+                return Ok(MediaPayload::Inline {
+                    kind: MediaKind::Image,
+                    path: shown_path,
+                    resolved_path: resolved.to_path_buf(),
+                    mime_type: compressed.mime,
+                    bytes: sent_bytes,
+                    encoded_base64: encoded,
+                    summary_line,
+                    image_transform,
+                    lease,
                 });
             }
             Err(CompressFailure::Overload) => {
                 drop(lease);
-                return Err(ReadFailure::Overload(format!(
+                return Err(FileError::Overload(format!(
                     "Cannot read {shown_path}: server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
                     launch.memory().limit()
                 )));
@@ -556,14 +582,15 @@ fn read_media_outcome(
                     "Cannot attach image file {shown_path} [{}] ({source_len} bytes): {reason}{hint}",
                     detected.mime
                 );
-                return Ok(unattached_outcome(
-                    MediaKind::Image,
-                    shown_path,
-                    detected.mime.to_owned(),
-                    Some(source_len),
-                    note,
-                    false,
-                ));
+                return Ok(MediaPayload::Descriptor {
+                    kind: MediaKind::Image,
+                    path: shown_path,
+                    mime_type: detected.mime.to_owned(),
+                    bytes: None,
+                    source_bytes: Some(source_len),
+                    attachable: false,
+                    note: Some(note),
+                });
             }
         }
     }
@@ -576,87 +603,77 @@ fn read_media_outcome(
         .saturating_mul(2)
         .saturating_add(frame_overhead);
     lease.shrink_to(outbound_peak);
-    let text = format!(
+    let summary_line = format!(
         "Read {} file [{}] ({sent_bytes} B)",
         detected.kind.as_str(),
         detected.mime
     );
-    let block = media::content_block(detected.kind, detected.mime, encoded, resolved);
-    let structured = json!({
-        "ok": true,
-        "kind": detected.kind.as_str(),
-        "path": shown_path,
-        "mimeType": detected.mime,
-        "bytes": sent_bytes,
-        "attached": true,
-    });
-    Ok(Outcome {
-        owner: Default::default(),
-        notice: text.clone(),
-        text,
-        body: None,
-        attachment: Some(block),
-        lease: Some(lease),
-        structured,
+    Ok(MediaPayload::Inline {
+        kind: detected.kind,
+        path: shown_path,
+        resolved_path: resolved.to_path_buf(),
+        mime_type: detected.mime.to_owned(),
+        bytes: sent_bytes,
+        encoded_base64: encoded,
+        summary_line,
+        image_transform: None,
+        lease,
     })
 }
 
-pub(super) fn read_cancellable(
+pub(crate) fn read_blocking(
     request: &ReadRequest,
     launch: &LaunchContext,
     transfer: bool,
-    limits: ReadLimits,
+    policy: ReadPolicy,
     cancel: Option<&tokio_util::sync::CancellationToken>,
-) -> crate::ipc::Owned<Result<Outcome, ReadFailure>> {
+) -> crate::ipc::Owned<Result<FileReadData, FileError>> {
     match with_path_workspace(&request.path, launch, SNIFF, |path_lease| {
-        read_cancellable_reserved(request, launch, transfer, limits, cancel, path_lease)
+        read_blocking_reserved(request, launch, transfer, policy, cancel, path_lease)
     }) {
-        Ok(mut read) => {
-            if let Ok(outcome) = &mut read.value {
-                outcome.owner = read.owner.clone();
-            }
-            read
-        }
+        Ok(read) => read,
         Err(message) => {
-            crate::ipc::Owned::new(Err(ReadFailure::Overload(message)), Default::default())
+            crate::ipc::Owned::new(Err(FileError::Overload(message)), Default::default())
         }
     }
 }
 
-fn read_cancellable_reserved(
+fn read_blocking_reserved(
     request: &ReadRequest,
     launch: &LaunchContext,
     transfer: bool,
-    limits: ReadLimits,
+    policy: ReadPolicy,
     cancel: Option<&tokio_util::sync::CancellationToken>,
     path_lease: &mut Lease,
-) -> Result<Outcome, ReadFailure> {
+) -> Result<FileReadData, FileError> {
     if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        return Err(ReadFailure::Error("Cancelled while reading file.".into()));
+        return Err(FileError::Cancelled("Cancelled while reading file.".into()));
     }
     if request.offset == Some(0) {
-        return Err(ReadFailure::Error(
+        return Err(FileError::Validation(
             "offset must be non-zero (1-indexed from start, or negative from end).".into(),
         ));
     }
     if request.limit == Some(0) {
-        return Err(ReadFailure::Error("limit must be at least 1.".into()));
+        return Err(FileError::Validation("limit must be at least 1.".into()));
     }
     let mut workspace;
-    let resolved = resolve(&request.path, launch).map_err(ReadFailure::Error)?;
+    let resolved = resolve(&request.path, launch).map_err(FileError::Validation)?;
     let shown_path = display_path(&resolved);
     let (mut file, metadata) = open_regular(&resolved).map_err(|error| {
-        if error.kind() == io::ErrorKind::IsADirectory {
-            ReadFailure::Error(format!(
+        if error.kind() == io::ErrorKind::NotFound {
+            FileError::NotFound(format!("Cannot read {shown_path}: {error}."))
+        } else if error.kind() == io::ErrorKind::IsADirectory {
+            FileError::Io(format!(
                 "Cannot read {shown_path}: {error}; list it with exec."
             ))
         } else {
-            ReadFailure::Error(format!("Cannot read {shown_path}: {error}."))
+            FileError::Io(format!("Cannot read {shown_path}: {error}."))
         }
     })?;
     let mut sniff = vec![0u8; SNIFF];
     let sniffed = read_upto(&mut file, &mut sniff)
-        .map_err(|error| ReadFailure::Error(format!("Cannot read {shown_path}: {error}.")))?;
+        .map_err(|error| FileError::Io(format!("Cannot read {shown_path}: {error}.")))?;
     if let Some(detected) = media::detect_path(&sniff[..sniffed], Some(&resolved)) {
         // Invalid media configuration may be echoed in a diagnostic. Reserve its
         // borrowed native text before the validator formats that error.
@@ -669,9 +686,12 @@ fn read_cancellable_reserved(
         .map(|value| value.as_encoded_bytes().len())
         .fold(0, usize::saturating_add);
         if !path_lease.try_grow(config_bytes.saturating_mul(16)) {
-            return Err(ReadFailure::Overload("Server active memory budget is full while preparing media configuration diagnostics.".into()));
+            return Err(FileError::Overload(
+                "Server active memory budget is full while preparing media configuration diagnostics."
+                    .into(),
+            ));
         }
-        return read_media_outcome(
+        return read_media_core(
             &mut file,
             metadata.len(),
             &sniff[..sniffed],
@@ -680,67 +700,70 @@ fn read_cancellable_reserved(
             detected,
             launch,
             transfer,
-            limits,
+            policy,
             cancel,
-        );
+        )
+        .map(FileReadData::Media);
     }
     if sniff[..sniffed].contains(&0) {
         let hint = action_hint(transfer);
-        return Err(ReadFailure::Error(format!(
+        return Err(FileError::Io(format!(
             "{shown_path} is a binary file ({} bytes).{hint}",
             metadata.len()
         )));
     }
     workspace = TextWorkspace::after_path(launch.memory())?;
-    if limits == ReadLimits::NESTED && request.offset.is_none() && request.limit.is_none() {
-        let mut outcome = read_whole_utf8(
+    if policy.strict_whole_file && request.offset.is_none() && request.limit.is_none() {
+        let slice = read_whole_utf8(
             &mut file,
             metadata.len(),
             &sniff[..sniffed],
             &shown_path,
-            limits.max_bytes,
+            policy.max_bytes,
             cancel,
-            &mut workspace,
-        )
-        .map_err(ReadFailure::from)?;
-        outcome.lease = Some(workspace.lease);
-        return Ok(outcome);
+            workspace,
+        )?;
+        return Ok(FileReadData::Text(slice));
     }
     let tail = if let Some(offset) = request.offset.filter(|off| *off < 0) {
         Some((
             offset.unsigned_abs(),
-            count_lines_streaming(&mut file, &shown_path, cancel).map_err(ReadFailure::Error)?,
+            count_lines_streaming(&mut file, &shown_path, cancel)?,
         ))
     } else {
         None
     };
     let mut scan = |start_line| {
         file.rewind()
-            .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
+            .map_err(|error| FileError::Io(format!("Cannot read {shown_path}: {error}.")))?;
         Window::scan(
             Source::new(BufReader::with_capacity(TEXT_BLOCK, &mut file), cancel),
             start_line,
             request.limit,
-            limits,
+            policy,
             &mut workspace,
         )
     };
     let (start_line, window) = if let Some((distance, total)) = tail {
-        scan_from_end(distance, total, &shown_path, scan).map_err(ReadFailure::from)?
+        scan_from_end(distance, total, &shown_path, scan)?
     } else {
         let start = request.offset.unwrap_or(1) as u64;
-        let window = scan(start).map_err(ReadFailure::from)?;
+        let window = scan(start)?;
         if start > 1 && start > window.total_lines {
-            return Err(ReadFailure::Error(format!(
+            return Err(FileError::Validation(format!(
                 "Offset {start} is beyond end of file ({} lines total)",
                 window.total_lines
             )));
         }
         (start, window)
     };
-    let mut outcome = window.render(start_line, request.limit, &shown_path, limits);
-    outcome.lease = Some(workspace.lease);
-    Ok(outcome)
+    Ok(FileReadData::Text(window.into_slice(
+        start_line,
+        request.limit,
+        shown_path,
+        policy,
+        workspace.lease,
+    )))
 }
 
 /// A successful tail slice must start at the offset implied by its own observed line count.
@@ -748,8 +771,8 @@ pub(super) fn scan_from_end(
     distance: u64,
     total: u64,
     path: &str,
-    mut scan: impl FnMut(u64) -> Result<Window, String>,
-) -> Result<(u64, Window), String> {
+    mut scan: impl FnMut(u64) -> Result<Window, FileError>,
+) -> Result<(u64, Window), FileError> {
     let from_end = |lines: u64| lines.saturating_sub(distance) + 1;
     let mut start = from_end(total);
     for _ in 0..2 {
@@ -760,9 +783,9 @@ pub(super) fn scan_from_end(
         }
         start = observed_start;
     }
-    Err(format!(
+    Err(FileError::Io(format!(
         "Cannot read {path}: the file changed while reading; retry."
-    ))
+    )))
 }
 
 pub(super) fn read_whole_utf8(
@@ -772,12 +795,12 @@ pub(super) fn read_whole_utf8(
     shown_path: &str,
     max_bytes: u64,
     cancel: Option<&tokio_util::sync::CancellationToken>,
-    workspace: &mut TextWorkspace,
-) -> Result<Outcome, String> {
+    mut workspace: TextWorkspace,
+) -> Result<TextSlice, FileError> {
     if initial_len > max_bytes {
-        return Err(format!(
+        return Err(FileError::Limit(format!(
             "Cannot read {shown_path} as a whole file: its size ({initial_len} bytes) exceeds the {max_bytes} byte (4 MiB) limit; pass offset and limit to read it in slices.",
-        ));
+        )));
     }
     let limit = max_bytes as usize;
     let capacity = (initial_len as usize).min(limit).max(prefix.len()) + 1;
@@ -787,12 +810,12 @@ pub(super) fn read_whole_utf8(
     let mut chunk = vec![0_u8; 64 * 1024];
     while raw.len() <= limit {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            return Err("Cancelled while reading file.".into());
+            return Err(FileError::Cancelled("Cancelled while reading file.".into()));
         }
         let want = (limit + 1 - raw.len()).min(chunk.len());
         let read = file
             .read(&mut chunk[..want])
-            .map_err(|error| format!("Cannot read {shown_path}: {error}."))?;
+            .map_err(|error| FileError::Io(format!("Cannot read {shown_path}: {error}.")))?;
         if read == 0 {
             break;
         }
@@ -803,40 +826,34 @@ pub(super) fn read_whole_utf8(
         let actual = file
             .metadata()
             .map_or(raw.len() as u64, |m| m.len().max(raw.len() as u64));
-        return Err(format!(
+        return Err(FileError::Limit(format!(
             "Cannot read {shown_path} as a whole file: its size ({actual} bytes) exceeds the {max_bytes} byte (4 MiB) limit; pass offset and limit to read it in slices.",
-        ));
+        )));
     }
     let body = String::from_utf8(raw).map_err(|_| {
-        format!(
+        FileError::Io(format!(
             "Cannot read {shown_path} as a whole file: it is not valid UTF-8; pass offset and limit to inspect it with U+FFFD replacements, or process it with exec."
-        )
+        ))
     })?;
     let total_lines =
         bytecount_lf(body.as_bytes()) + u64::from(!body.is_empty() && !body.ends_with('\n'));
-    let notice = format!("[read] {shown_path} · {total_lines} lines");
     let end_line = (total_lines > 0).then_some(total_lines);
-    let structured = json!({
-        "ok": true,
-        "kind": "text",
-        "path": shown_path,
-        "startLine": 1_u64,
-        "endLine": end_line,
-        "shownLines": total_lines,
-        "totalLines": total_lines,
-        "truncated": false,
-        "nextOffset": Value::Null,
-        "lineTooLong": false,
-        "lossy": false,
-    });
-    Ok(Outcome {
-        owner: Default::default(),
-        text: body.clone(),
-        notice,
-        body: Some(body),
-        attachment: None,
-        lease: None,
-        structured,
+    Ok(TextSlice {
+        path: shown_path.to_owned(),
+        text: body,
+        start_line: 1,
+        end_line,
+        shown_lines: total_lines,
+        total_lines,
+        truncated: false,
+        next_offset: None,
+        line_too_long: false,
+        lossy: false,
+        first_line_bytes: 0,
+        stopped_on_bytes: false,
+        max_bytes,
+        budget_truncated: false,
+        lease: workspace.lease,
     })
 }
 
@@ -888,7 +905,11 @@ impl<'a> Source<'a> {
 
     /// The next line with its `\n` terminator when present, keeping at most `keep` bytes of it;
     /// `None` after the last line (including right after a final `\n` at EOF).
-    fn kept(&mut self, keep: usize, workspace: &mut TextWorkspace) -> Result<Option<Line>, String> {
+    fn kept(
+        &mut self,
+        keep: usize,
+        workspace: &mut TextWorkspace,
+    ) -> Result<Option<Line>, FileError> {
         if self.done {
             return Ok(None);
         }
@@ -928,7 +949,7 @@ impl<'a> Source<'a> {
     }
 
     /// The next line's byte length (including its `\n` terminator); `None` after the last.
-    fn skipped(&mut self) -> Result<Option<u64>, String> {
+    fn skipped(&mut self) -> Result<Option<u64>, FileError> {
         if self.done {
             return Ok(None);
         }
@@ -952,12 +973,14 @@ impl<'a> Source<'a> {
                 .cancel
                 .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
             {
-                return Err("Cancelled while reading file.".into());
+                return Err(FileError::Cancelled("Cancelled while reading file.".into()));
             }
             let (end, read) = {
                 let available = match self.reader.fill_buf() {
                     Ok(available) => available,
-                    Err(error) => return Err(format!("Cannot read the file: {error}.")),
+                    Err(error) => {
+                        return Err(FileError::Io(format!("Cannot read the file: {error}.")));
+                    }
                 };
                 let read = available.len();
                 (available.iter().position(|byte| *byte == b'\n'), read)
@@ -981,17 +1004,19 @@ impl<'a> Source<'a> {
     }
 
     /// Reads one part of the file into `pending`, and answers whether the file ended.
-    fn fill(&mut self) -> Result<bool, String> {
+    fn fill(&mut self) -> Result<bool, FileError> {
         if self
             .cancel
             .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
         {
-            return Err("Cancelled while reading file.".into());
+            return Err(FileError::Cancelled("Cancelled while reading file.".into()));
         }
         let (data, read) = {
             let available = match self.reader.fill_buf() {
                 Ok(available) => available,
-                Err(error) => return Err(format!("Cannot read the file: {error}.")),
+                Err(error) => {
+                    return Err(FileError::Io(format!("Cannot read the file: {error}.")));
+                }
             };
             if available.is_empty() {
                 // The end: what the carry holds is the last, unfinished character.
@@ -1058,12 +1083,12 @@ impl Window {
         mut source: Source<'_>,
         start_line: u64,
         limit: Option<u64>,
-        limits: ReadLimits,
+        policy: ReadPolicy,
         workspace: &mut TextWorkspace,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, FileError> {
         let start = start_line.saturating_sub(1);
         let end = limit.map_or(u64::MAX, |limit| start.saturating_add(limit));
-        let keep = limits.keep();
+        let keep = policy.keep();
         let mut window = Self::default();
         let mut deciding = true;
         loop {
@@ -1072,7 +1097,7 @@ impl Window {
                 let Some(line) = source.kept(keep, workspace)? else {
                     break;
                 };
-                window.take_line(&line, &mut deciding, limits, workspace)?;
+                window.take_line(&line, &mut deciding, policy, workspace)?;
             } else {
                 let Some(length) = source.skipped()? else {
                     break;
@@ -1088,9 +1113,9 @@ impl Window {
         &mut self,
         line: &Line,
         deciding: &mut bool,
-        limits: ReadLimits,
+        policy: ReadPolicy,
         workspace: &mut TextWorkspace,
-    ) -> Result<(), String> {
+    ) -> Result<(), FileError> {
         self.total_lines += 1;
         self.window_lines += 1;
         self.window_bytes += line.length;
@@ -1100,7 +1125,7 @@ impl Window {
         // A line too large to show is still a line that was decoded, so its replacement
         // characters are known and reported.
         self.lossy |= line.lossy;
-        if self.window_bytes > limits.max_bytes {
+        if self.window_bytes > policy.max_bytes {
             self.stopped_on_bytes = true;
             *deciding = false;
             return Ok(());
@@ -1108,7 +1133,7 @@ impl Window {
         workspace.reserve(self.content.len().saturating_add(line.text.len()))?;
         self.content.push_str(&line.text);
         self.shown_lines += 1;
-        if self.shown_lines >= limits.max_lines {
+        if self.shown_lines >= policy.max_lines {
             *deciding = false;
         }
         Ok(())
@@ -1127,110 +1152,56 @@ impl Window {
         }
     }
 
-    /// The result text and structured metadata: the window, cut to the budget, with the notice
-    /// that says how to see more.
-    pub(super) fn render(
-        &self,
+    /// Builds the pure domain `TextSlice` without notices or JSON wrappers.
+    pub(super) fn into_slice(
+        self,
         start_line: u64,
         limit: Option<u64>,
-        shown_path: &str,
-        limits: ReadLimits,
-    ) -> Outcome {
+        shown_path: String,
+        policy: ReadPolicy,
+        lease: Lease,
+    ) -> TextSlice {
         let start = start_line.saturating_sub(1);
         let start_display = start + 1;
         let shown = self.shown_lines;
         let budget_truncated =
-            self.window_lines > limits.max_lines || self.window_bytes > limits.max_bytes;
-        let line_too_long = budget_truncated && self.first_line_bytes > limits.max_bytes;
-        let mut body = String::new();
-        let mut notices = Vec::new();
+            self.window_lines > policy.max_lines || self.window_bytes > policy.max_bytes;
+        let line_too_long = budget_truncated && self.first_line_bytes > policy.max_bytes;
         let mut truncated = budget_truncated;
         let mut next_offset = None;
-        let shown_lines;
-
-        if line_too_long {
-            shown_lines = 0;
-            let shell_path = shown_path.replace('\'', "'\\''");
-            notices.push(format!(
-                "[Line {start_display} is {}, exceeds {} limit. Use exec: sed -n '{start_display}p' '{shell_path}' | head -c {}]",
-                format_size(self.first_line_bytes),
-                format_size(limits.max_bytes),
-                limits.max_bytes
-            ));
+        let (text, shown_lines) = if line_too_long {
+            (String::new(), 0)
         } else if budget_truncated {
-            shown_lines = shown;
             let end_display = start_display + shown - 1;
-            let next = end_display + 1;
-            next_offset = Some(next);
-            body.push_str(&self.content);
-            if self.stopped_on_bytes {
-                notices.push(format!(
-                    "[Showing lines {start_display}-{end_display} of {} ({} limit). Use offset={next} to continue.]",
-                    self.total_lines,
-                    format_size(limits.max_bytes)
-                ));
-            } else {
-                notices.push(format!(
-                    "[Showing lines {start_display}-{end_display} of {}. Use offset={next} to continue.]",
-                    self.total_lines
-                ));
-            }
+            next_offset = Some(end_display + 1);
+            (self.content, shown)
         } else {
-            shown_lines = shown;
-            body.push_str(&self.content);
             if let Some(limit) = limit {
                 let selected_end = start.saturating_add(limit);
                 if selected_end < self.total_lines {
-                    let remaining = self.total_lines - selected_end;
-                    let next = selected_end + 1;
                     truncated = true;
-                    next_offset = Some(next);
-                    notices.push(format!(
-                        "[{remaining} more lines in file. Use offset={next} to continue.]"
-                    ));
+                    next_offset = Some(selected_end + 1);
                 }
             }
-        }
-        if self.lossy {
-            notices.push("[Invalid UTF-8 was replaced with U+FFFD.]".to_owned());
-        }
-        let notice_block = notices.join("\n\n");
-        let text = if line_too_long || body.is_empty() {
-            notice_block.clone()
-        } else if notice_block.is_empty() {
-            body.clone()
-        } else if body.ends_with('\n') {
-            format!("{body}\n{notice_block}")
-        } else {
-            format!("{body}\n\n{notice_block}")
-        };
-        let notice = if notice_block.is_empty() {
-            format!("[read] {shown_path} · {shown_lines} lines")
-        } else {
-            notice_block
+            (self.content, shown)
         };
         let end_line = (shown_lines > 0).then_some(start_display + shown_lines - 1);
-        let structured = json!({
-            "ok": true,
-            "kind": "text",
-            "path": shown_path,
-            "startLine": start_display,
-            "endLine": end_line,
-            "shownLines": shown_lines,
-            "totalLines": self.total_lines,
-            "truncated": truncated,
-            "nextOffset": next_offset,
-            "lineTooLong": line_too_long,
-            "lossy": self.lossy,
-        });
-        Outcome {
-            owner: Default::default(),
+        TextSlice {
+            path: shown_path,
             text,
-            notice,
-            body: Some(body),
-            attachment: None,
-            lease: None,
-            structured,
+            start_line: start_display,
+            end_line,
+            shown_lines,
+            total_lines: self.total_lines,
+            truncated,
+            next_offset,
+            line_too_long,
+            lossy: self.lossy,
+            first_line_bytes: self.first_line_bytes,
+            stopped_on_bytes: self.stopped_on_bytes,
+            max_bytes: policy.max_bytes,
+            budget_truncated,
+            lease,
         }
     }
 }
@@ -1254,7 +1225,7 @@ impl Line {
         lossy: bool,
         keep: usize,
         workspace: &mut TextWorkspace,
-    ) -> Result<(), String> {
+    ) -> Result<(), FileError> {
         if bytes.is_empty() {
             return Ok(());
         }
