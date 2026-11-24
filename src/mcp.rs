@@ -19,8 +19,8 @@ use crate::wait;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities,
-    ServerConfig, ToolAnnotations,
+    CallToolResult, ContentBlock, Implementation, InitializeRequestParams, InitializeResult,
+    ServerCapabilities, ServerConfig, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler};
@@ -64,7 +64,7 @@ pub(crate) enum Backend {
     Local {
         service: Arc<Service>,
         render: Render,
-        /// Created by the stdio client's first tool call.
+        /// Created by initialize, or the first tool call of a stdio client that skips it.
         session: Arc<OnceLock<Result<Arc<Session>, String>>>,
         /// What this server's tasks inherit: the environment captured at startup, so a later
         /// change to the server's own environment cannot reach them.
@@ -210,7 +210,9 @@ impl Server {
         else {
             return Err("this server has no tasks of its own".to_owned());
         };
-        if let Some(principals) = &self.principals {
+        if session.get().is_none()
+            && let Some(principals) = &self.principals
+        {
             let principal = context
                 .extensions
                 .get::<::http::request::Parts>()
@@ -227,7 +229,7 @@ impl Server {
     }
 }
 
-/// A session named for the client that first uses this server.
+/// A session named for the client that initializes or first uses this server.
 fn client_session(
     context: &RequestContext<RoleServer>,
     launch: &Arc<LaunchContext>,
@@ -241,7 +243,7 @@ fn client_session(
     ))
 }
 
-/// The client's name from request metadata.
+/// The client's name from request metadata or the legacy handshake.
 fn client_name(context: &RequestContext<RoleServer>) -> String {
     context
         .client_info()
@@ -314,9 +316,29 @@ fn hostname(launch: &LaunchContext) -> Option<String> {
 
 #[tool_handler(router = self.router)]
 impl ServerHandler for Server {
-    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
-        const VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
-        std::borrow::Cow::Borrowed(VERSIONS)
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, rmcp::ErrorData> {
+        let _response_workspace = reserve_response_content(
+            lease::process_pool(),
+            self.instructions.len().saturating_add(512),
+        )?;
+        let result = self
+            .negotiate_initialize(&request)?
+            .with_instructions(self.instructions.as_ref());
+        context.peer.set_peer_info(request);
+        if let Backend::Local {
+            session, launch, ..
+        } = &self.backend
+        {
+            session
+                .get_or_init(|| client_session(&context, launch))
+                .clone()
+                .map_err(|message| rmcp::ErrorData::internal_error(message, None))?;
+        }
+        Ok(result)
     }
 
     async fn discover(
@@ -344,6 +366,18 @@ impl ServerHandler for Server {
         request: rmcp::model::CustomRequest,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CustomResult, rmcp::ErrorData> {
+        // Version isolation: events/* is only available on MCP 2026-07-28+.
+        let supports_events = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        if !supports_events {
+            return Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                request.method,
+                None,
+            ));
+        }
+
         match request.method.as_str() {
             "events/list" => self.handle_events_list(request.params, context).await,
             "events/poll" => self.handle_events_poll(request.params, context).await,
@@ -365,17 +399,20 @@ impl ServerHandler for Server {
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         let bytes = self.router.map.values().fold(512usize, |bytes, route| {
             bytes.saturating_add(tool_metadata_copy_bytes(&route.attr))
         });
         let _response_workspace = reserve_response_content(lease::process_pool(), bytes)?;
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools: self.router.list_all(),
-            ttl_ms: Some(0),
-            cache_scope: Some(rmcp::model::CacheScope::Public),
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
             ..Default::default()
         })
     }
@@ -422,7 +459,9 @@ pub(crate) fn decode_mcp_header_value(raw: &str) -> Option<String> {
     Some(raw.to_owned())
 }
 
-/// Checks the HTTP `Mcp-Name` header for custom event methods the SDK does not validate.
+/// Validates the HTTP `Mcp-Name` header against `params.name` (supporting `=?base64?...?=`
+/// decoding). During Beta interop, a missing header is tolerated while any present header that
+/// fails decoding or mismatches `params.name` returns `ErrorData::header_mismatch` (HTTP 400 / -32020).
 fn validate_mcp_name_header(
     context: &RequestContext<RoleServer>,
     expected_name: &str,
@@ -430,10 +469,9 @@ fn validate_mcp_name_header(
     let Some(parts) = context.extensions.get::<::http::request::Parts>() else {
         return Ok(());
     };
-    let raw_header = parts
-        .headers
-        .get("mcp-name")
-        .ok_or_else(|| rmcp::ErrorData::header_mismatch("Mcp-Name header is required", None))?;
+    let Some(raw_header) = parts.headers.get("mcp-name") else {
+        return Ok(());
+    };
     let raw_str = raw_header.to_str().map_err(|_| {
         rmcp::ErrorData::header_mismatch("Mcp-Name header is not valid ASCII", None)
     })?;

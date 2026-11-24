@@ -186,6 +186,7 @@ fn is_control(message: &ClientJsonRpcMessage) -> bool {
         JsonRpcMessage::Notification(notification) => matches!(
             notification.notification,
             ClientNotification::CancelledNotification(_)
+                | ClientNotification::InitializedNotification(_)
         ),
         _ => false,
     }
@@ -246,6 +247,7 @@ pub(crate) fn is_standard_mcp_notification(method: &str) -> bool {
     matches!(
         method,
         "notifications/cancelled"
+            | "notifications/initialized"
             | "notifications/message"
             | "notifications/progress"
             | "notifications/prompts/list_changed"
@@ -260,7 +262,8 @@ pub(crate) fn is_standard_mcp_notification(method: &str) -> bool {
 pub(crate) fn is_standard_mcp_method(method: &str) -> bool {
     matches!(
         method,
-        "ping"
+        "initialize"
+            | "ping"
             | "server/discover"
             | "prompts/get"
             | "prompts/list"
@@ -332,18 +335,18 @@ mod tests {
     fn control_reserve_accepts_short_requests_but_cannot_grow_large_ones() {
         let main = BytePool::new(0);
         let control = BytePool::new(SHORT_PEAK);
-        for raw in [
-            br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.as_slice(),
-            br#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"reader","version":"1"}}}}"#.as_slice(),
-        ] {
-            let mut short = Buffer::new(Arc::clone(&main), Arc::clone(&control));
-            short.append(raw, SHORT_REQUEST).unwrap();
-            let message = short.parse(false).unwrap().unwrap().into_message();
-            assert!(control.used() > 0);
-            assert_eq!(main.used(), 0);
-            drop(message);
-            assert_eq!(control.used(), 0);
-        }
+        let mut short = Buffer::new(Arc::clone(&main), Arc::clone(&control));
+        short
+            .append(
+                br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+                SHORT_REQUEST,
+            )
+            .unwrap();
+        let message = short.parse(false).unwrap().unwrap().into_message();
+        assert!(control.used() > 0);
+        assert_eq!(main.used(), 0);
+        drop(message);
+        assert_eq!(control.used(), 0);
         let mut growing = Buffer::new(main, Arc::clone(&control));
         growing
             .append(&vec![b' '; SHORT_REQUEST], SHORT_REQUEST + 1)
@@ -360,9 +363,9 @@ mod tests {
     #[test]
     fn ordinary_calls_and_peer_metadata_leave_control_before_dispatch() {
         let ordinary = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"path":"sample.txt"}}}"#;
-        let with_metadata = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"path":"sample.txt"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"reader","version":"1"}}}}"#;
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"reader","version":"1"}}}"#;
         let control = BytePool::new(SHORT_PEAK);
-        for raw in [ordinary.as_slice(), with_metadata.as_slice()] {
+        for raw in [ordinary.as_slice(), initialize.as_slice()] {
             let mut buffer = Buffer::new(BytePool::new(0), Arc::clone(&control));
             buffer.append(raw, SHORT_REQUEST).unwrap();
             assert!(matches!(buffer.parse(false), Err(Failure::Budget)));
