@@ -15,22 +15,30 @@ import uuid
 
 
 class Client:
-    def __init__(self, binary, env, version):
+    def __init__(self, binary, env, version, *, inline=False):
         self.process = subprocess.Popen(
             [str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=None, text=True, encoding="utf-8", env=env,
         )
+        self.inline = inline
         self.messages = queue.Queue()
         self.next_id = 0
         threading.Thread(target=self.read, daemon=True).start()
         try:
-            initialized = self.request("initialize", {
-                "protocolVersion": "2025-06-18", "capabilities": {},
-                "clientInfo": {"name": "release-smoke", "version": "1"},
-            })
-            assert initialized["serverInfo"]["name"] == "fastexec", initialized
-            assert initialized["serverInfo"]["version"] == version, initialized
-            self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            if inline:
+                discovered = self.request("server/discover", {})
+                assert "2026-07-28" in discovered["supportedVersions"], discovered
+                server_info = discovered["_meta"]["io.modelcontextprotocol/serverInfo"]
+            else:
+                initialized = self.request("initialize", {
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": {"name": "release-smoke", "version": "1"},
+                })
+                server_info = initialized["serverInfo"]
+            assert server_info["name"] == "fastexec", server_info
+            assert server_info["version"] == version, server_info
+            if not inline:
+                self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         except BaseException:
             self.close()
             raise
@@ -50,6 +58,12 @@ class Client:
         self.process.stdin.flush()
 
     def request(self, method, params):
+        if self.inline:
+            params = {**params, "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "release-smoke", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }}
         self.next_id += 1
         self.send({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params})
         deadline = time.monotonic() + 30
@@ -126,6 +140,11 @@ def smoke(binary, version):
             finished(result, text, "PTY:ready")
             assert "40 100" in text, text
         print("PASS: initialize, tools/list, files, pipe exec, PTY input and resize", flush=True)
+
+        with contextlib.closing(Client(binary, env, version, inline=True)) as client:
+            tools = client.request("tools/list", {})["tools"]
+            assert {tool["name"] for tool in tools} == {"exec", "read", "write", "edit"}, tools
+        print("PASS: server/discover and inline tools/list", flush=True)
 
         def daemon(action):
             result = subprocess.run(

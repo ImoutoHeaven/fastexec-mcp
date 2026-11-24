@@ -122,6 +122,12 @@ jobs:
           reply="$(printf '%s\n%s\n' "$request" "$initialized" | env -u FASTEXEC_DAEMON "$extracted")"
           echo "$reply"
           grep -F "\"serverInfo\":{\"name\":\"fastexec\",\"version\":\"$VERSION\"}" <<< "$reply"
+          request='{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"smoke","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+          tool_request='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"smoke","version":"0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+          reply="$(printf '%s\n%s\n' "$request" "$tool_request" | env -u FASTEXEC_DAEMON "$extracted")"
+          echo "$reply"
+          grep -E '"supportedVersions":\[[^]]*"2026-07-28"[^]]*\]' <<< "$reply"
+          grep -F "\"io.modelcontextprotocol/serverInfo\":{\"name\":\"fastexec\",\"version\":\"$VERSION\"}" <<< "$reply"
 
       - name: smoke test Linux archive on Alpine
         if: startsWith(matrix.name, 'linux-')
