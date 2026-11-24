@@ -3446,7 +3446,7 @@ fn event_stream_resumes_after_endpoint_backpressure_and_ends_on_daemon_stop() {
 #[test]
 fn protocol_4_hello_is_rejected_by_protocol_5_daemon() {
     use std::io::Read;
-    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::UnixStream;
 
     let fixture = Fixture::new("proto4");
@@ -3462,16 +3462,21 @@ fn protocol_4_hello_is_rejected_by_protocol_5_daemon() {
     assert_eq!(code, 0, "{out}{err}");
 
     let ns_dir = fixture.runtime.join("ns").join(&namespace);
-    let socket = std::fs::read_dir(&ns_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            std::fs::symlink_metadata(path)
-                .map(|meta| meta.file_type().is_socket())
-                .unwrap_or(false)
-        })
-        .unwrap_or_else(|| panic!("no daemon socket in {}", ns_dir.display()));
+    let primary = ns_dir.join("sock");
+    let socket = if primary.as_os_str().len() <= 100 {
+        primary
+    } else {
+        let uid = std::fs::metadata(&ns_dir).unwrap().uid();
+        let fallback = PathBuf::from(format!("/tmp/fastexec-{uid}"));
+        #[cfg(target_os = "freebsd")]
+        {
+            fallback.join(&namespace).join("sock")
+        }
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            fallback.join(format!("{namespace}.sock"))
+        }
+    };
 
     for frame in [
         json!({
