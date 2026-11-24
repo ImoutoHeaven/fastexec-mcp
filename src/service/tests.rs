@@ -2220,3 +2220,73 @@ async fn list_warnings_follow_the_delivered_rows_for_direct_and_nested_calls() {
     assert!(warned_entry.is_reported());
     tasks.shutdown();
 }
+
+#[tokio::test]
+async fn combined_background_footer_fits_and_rejected_results_keep_events_unseen() {
+    let (service, tasks, session, _) = list_fixture().await;
+    let task = tasks.all().pop().unwrap();
+    let (other, _, _) = tasks
+        .start_script(
+            tasks::ScriptArgs {
+                code: "return undefined;".into(),
+                launch: Arc::clone(&session.launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "more".into(),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), other.done().wait_for(|done| *done))
+        .await
+        .unwrap()
+        .unwrap();
+    for index in 0..3 {
+        service
+            .event_bus
+            .publish_external(crate::events::ExternalEventInput {
+                event_type: None,
+                source: format!("{index}{}", "源".repeat(47)),
+                topic: Some("题".repeat(48)),
+                name: "名".repeat(48),
+                upstream_event_id: format!("footer-event-{index}"),
+                data: json!({}),
+                upstream_truncated: None,
+            })
+            .unwrap();
+    }
+    let call = script_call(&session, false);
+    let notice = service
+        .background(&call, &task, false, Action::Poll)
+        .unwrap();
+    let footer = &notice.value.as_ref().unwrap().0;
+    assert!(footer.contains(&other.id), "{footer}");
+    assert!(footer.contains("External events: 3 new"), "{footer}");
+    assert!(
+        footer.len() <= FOOTER_LIMIT,
+        "{} bytes: {footer}",
+        footer.len()
+    );
+    drop(notice);
+
+    let launch = Arc::new(session.launch.for_session().with_outbound_limit(1));
+    let mut refused_call = script_call(&session, false);
+    refused_call.launch = Some(&launch);
+    let request = json!({"action":"poll", "taskId":task.id, "waitMs":0});
+    let refused = service.call_json(request.clone(), refused_call).await;
+    assert_eq!(refused.is_error, Some(true));
+    let next = service
+        .call_json(request.clone(), script_call(&session, false))
+        .await;
+    let text = &next.content[0].as_text().unwrap().text;
+    assert!(text.contains("External events: 3 new"), "{text}");
+    let once = service
+        .call_json(request, script_call(&session, false))
+        .await;
+    let text = &once.content[0].as_text().unwrap().text;
+    assert!(!text.contains("External events:"), "{text}");
+    tasks.shutdown();
+}

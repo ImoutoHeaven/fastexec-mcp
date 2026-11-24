@@ -801,11 +801,13 @@ impl Service {
                 )
                 .map_err(|_| RenderSnapshot::overload(call, task))?
         };
+        let external_room =
+            FOOTER_LIMIT.saturating_sub(value.as_ref().map_or(0, |(line, _)| line.len() + 1));
         let external_cursor = if nested {
             None
         } else if let Some((ext_line, seq)) = self
             .event_bus
-            .peek_external_background_summary(&call.session.id)
+            .peek_external_background_summary(&call.session.id, external_room)
         {
             match &mut value {
                 Some((line, _)) => {

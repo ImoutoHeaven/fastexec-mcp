@@ -1165,10 +1165,14 @@ impl EventBus {
         })
     }
 
-    /// Peeks unseen `external.event` metadata for legacy `background()` notices without advancing
-    /// the session cursor. Returns `(sanitized_line, newest_seq)` when at least one unseen event
-    /// exists. Never includes untrusted `data`.
-    pub fn peek_external_background_summary(&self, session_id: &str) -> Option<(String, u64)> {
+    /// Peeks unseen `external.event` metadata without advancing the session cursor.
+    /// Returns a complete summary within `max_bytes`, or no notice if it cannot fit.
+    /// Never includes event `data`.
+    pub fn peek_external_background_summary(
+        &self,
+        session_id: &str,
+        max_bytes: usize,
+    ) -> Option<(String, u64)> {
         let state = lock(&self.state);
         let last_seen = state
             .session_cursors
@@ -1220,11 +1224,14 @@ impl EventBus {
         } else {
             String::new()
         };
-        let line = format!(
+        let mut line = format!(
             "External events: {total} new ({}{suffix})",
             parts.join(", ")
         );
-        Some((line, newest_seq))
+        if line.len() > max_bytes {
+            line = format!("External events: {total} new; use events/poll.");
+        }
+        (line.len() <= max_bytes).then_some((line, newest_seq))
     }
 
     /// Advances the session's `background()` external-event cursor after a notice is committed.
@@ -1261,7 +1268,7 @@ impl EventBus {
     /// Convenience wrapper that reads and immediately commits the session's external-event summary.
     #[cfg(test)]
     pub fn external_background_summary(&self, session_id: &str) -> Option<String> {
-        let (summary, seq) = self.peek_external_background_summary(session_id)?;
+        let (summary, seq) = self.peek_external_background_summary(session_id, 512)?;
         self.commit_external_background_cursor(session_id, seq);
         Some(summary)
     }
@@ -2134,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_background_summary_tracks_per_session_cursor_and_excludes_raw_data() {
+    fn background_summary_tracks_per_session_cursor_and_excludes_raw_data() {
         let (bus, _) = test_bus(32, 1 << 20, 8, 1 << 20);
         bus.publish_external(ExternalEventInput {
             event_type: None,
@@ -2178,6 +2185,29 @@ mod tests {
             format_rfc3339_ms(1_700_000_000_123),
             "2023-11-14T22:13:20.123Z"
         );
+    }
+
+    #[test]
+    fn background_summary_waits_for_space_without_consuming_events() {
+        let (bus, _) = test_bus(32, 1 << 20, 8, 1 << 20);
+        bus.publish_external(ext_input(
+            &"源".repeat(48),
+            "summary-budget",
+            &"名".repeat(48),
+            json!({}),
+        ))
+        .unwrap();
+
+        assert!(bus.peek_external_background_summary("s1", 1).is_none());
+        let (line, seq) = bus.peek_external_background_summary("s1", 64).unwrap();
+        assert_eq!(line, "External events: 1 new; use events/poll.");
+        assert!(line.len() <= 64);
+        assert_eq!(
+            bus.peek_external_background_summary("s1", 64),
+            Some((line, seq))
+        );
+        bus.commit_external_background_cursor("s1", seq);
+        assert!(bus.peek_external_background_summary("s1", 512).is_none());
     }
 
     #[test]
