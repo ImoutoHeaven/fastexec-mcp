@@ -351,6 +351,11 @@ async fn a_hello_is_answered_with_the_epoch_or_a_reject_naming_the_field() {
 // tests cover start, poll, and kill across sessions against the real binary on Linux; no
 // test-host override is added for it.
 #[cfg(windows)]
+fn output_of(text: &str) -> &str {
+    text.split_once("\n\n[").map_or("", |(body, _)| body)
+}
+
+#[cfg(windows)]
 #[tokio::test]
 async fn a_start_runs_in_the_hellos_environment_and_list_names_its_session_and_call() {
     let fixture = fixture();
@@ -371,9 +376,9 @@ async fn a_start_runs_in_the_hellos_environment_and_list_names_its_session_and_c
 
     // The variable exists only in this Hello, so only the Hello's launch context can supply
     // it: a task that sees it runs in what the handshake carried.
-    let started = start(&mut client, 1, "printf '%s' \"$FASTEXEC_IPC_PROBE\"").await;
-    assert_eq!(started["output"], json!("ipc-value"));
-    let task_id = started["taskId"].as_str().expect("a task ID").to_owned();
+    let (task_id, started_text) =
+        start(&mut client, 1, "printf '%s' \"$FASTEXEC_IPC_PROBE\"").await;
+    assert_eq!(output_of(&started_text), "ipc-value");
 
     // A second session whose first six characters match, starting its own call 1.
     let mut other = connect(daemon).await;
@@ -405,20 +410,19 @@ async fn a_second_session_reads_a_task_from_the_beginning() {
     let daemon = &fixture.daemon;
     let mut first = connect(daemon).await;
     first.welcome("aaa111", 1).await;
-    let started = start(&mut first, 1, "printf hi").await;
-    let task_id = started["taskId"].as_str().expect("a task ID").to_owned();
+    let (task_id, _) = start(&mut first, 1, "printf hi").await;
     // The start already read the output, so this session's next read sees nothing new.
-    assert_eq!(poll(&mut first, 2, &task_id).await["output"], json!(""));
+    assert_eq!(output_of(&poll(&mut first, 2, &task_id).await), "");
 
     let mut second = connect(daemon).await;
     second.welcome("bbb222", 1).await;
     assert_eq!(
-        poll(&mut second, 1, &task_id).await["output"],
-        json!("hi"),
+        output_of(&poll(&mut second, 1, &task_id).await),
+        "hi",
         "a session that never read this task starts at its beginning"
     );
     // And the first session's cursor is where it was.
-    assert_eq!(poll(&mut first, 3, &task_id).await["output"], json!(""));
+    assert_eq!(output_of(&poll(&mut first, 3, &task_id).await), "");
 }
 
 // shortcut: on Unix a task runs under the fastexec binary as its task host, which a unit-test
@@ -432,16 +436,15 @@ async fn a_reconnect_keeps_the_cursors_and_an_old_generation_is_refused() {
     let daemon = &fixture.daemon;
     let mut first = connect(daemon).await;
     first.welcome("sess11", 1).await;
-    let started = start(&mut first, 1, "printf hi").await;
-    let task_id = started["taskId"].as_str().expect("a task ID").to_owned();
+    let (task_id, _) = start(&mut first, 1, "printf hi").await;
     // The connection goes away without a Bye.
     drop(first);
 
     let mut second = connect(daemon).await;
     second.welcome("sess11", 2).await;
     assert_eq!(
-        poll(&mut second, 1, &task_id).await["output"],
-        json!(""),
+        output_of(&poll(&mut second, 1, &task_id).await),
+        "",
         "the session kept its cursors"
     );
 
@@ -458,7 +461,7 @@ async fn a_reconnect_keeps_the_cursors_and_an_old_generation_is_refused() {
         }
     }
     // And the connection that does hold the session still works.
-    assert_eq!(poll(&mut second, 2, &task_id).await["output"], json!(""));
+    assert_eq!(output_of(&poll(&mut second, 2, &task_id).await), "");
 }
 
 #[tokio::test]

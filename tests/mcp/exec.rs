@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+#[cfg(not(target_os = "macos"))]
 use std::process::Command;
 #[cfg(not(target_os = "macos"))]
 use std::process::Stdio;
