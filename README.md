@@ -9,8 +9,17 @@
 `exec`, or use `read`, `write`, and `edit` for files. Tasks run with the
 server account's permissions, without a sandbox.
 
-Clients must support MCP `2026-07-28`, including `server/discover` and
-per-request metadata. See the [protocol contract](docs/fastexec-design.md#mcp-protocol).
+## MCP compatibility
+
+Fastexec supports multiple MCP protocol versions. Both client interfaces are
+intentional product contracts and must retain regression coverage:
+
+- The `initialize` / `notifications/initialized` lifecycle, including HTTP sessions.
+- `server/discover` and requests with inline metadata.
+
+The clean implementation rule governs internal design: avoid migration
+layers, internal legacy/compatibility shims, and meaningless suppressions.
+Refactors must preserve these external MCP interfaces and their tests.
 
 ## Quick start
 

@@ -25,6 +25,14 @@ raises the patch version (`0.1.0` to `0.1.1`).
 Running the `release` workflow by hand (Actions, `release`, Run workflow) builds and smoke-tests the
 archives of a branch without releasing, as a rehearsal before tagging.
 
+## MCP compatibility gate
+
+Normal CI and release smoke must cover both supported MCP lifecycles:
+`initialize` / `notifications/initialized` sessions and
+`server/discover` with inline request metadata. Keep the established session
+smoke and the independent discovery/tool-list probe. Supported protocol
+versions remain a set; discovery checks must not restrict it to one revision.
+
 ## Failed release
 
 A job that failed on a flaky test passes with Re-run failed jobs on the same run. For a problem in
@@ -56,9 +64,8 @@ and no glibc compatibility package. Alpine uses these Linux archives.
 
 The FreeBSD archive is built natively and checked on FreeBSD 15.1 amd64. Its binary uses the
 FreeBSD base-system libraries; it does not require Rust at runtime. The FreeBSD and Alpine
-archive checks verify MCP `2026-07-28` discovery and tool listing, file write/edit/read,
-pipe exec, PTY input and resizing, and daemon tasks carried between sessions.
-Discovery must advertise only the supported protocol revision and the release version.
+archive checks cover MCP initialization and tool discovery, file write/edit/read, pipe exec,
+PTY input and resizing, and daemon tasks carried between sessions.
 
 Windows binaries link the C runtime statically (`.cargo/config.toml`) and embed the ConPTY
 of their architecture. macOS binaries are unsigned.

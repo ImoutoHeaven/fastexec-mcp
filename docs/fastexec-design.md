@@ -6,19 +6,18 @@ Authoritative runtime usage rules live in
 
 ## 0. Build and deployment
 
-### MCP protocol
+### MCP compatibility boundary
 
-Fastexec supports MCP `2026-07-28` over stdio and Streamable HTTP. Clients
-discover the server with `server/discover`. Discovery and ordinary requests carry
-`io.modelcontextprotocol/protocolVersion` and
-`io.modelcontextprotocol/clientCapabilities` in `params._meta`.
-Clients can also include `io.modelcontextprotocol/clientInfo` there to
-identify themselves. Discovery reports `supportedVersions: ["2026-07-28"]`
-and returns server identity in `_meta["io.modelcontextprotocol/serverInfo"]`.
+**Broad compatibility with MCP clients is an intentional product requirement.**
 
-HTTP requests also carry `MCP-Protocol-Version` and `Mcp-Method` headers.
-Named calls carry `Mcp-Name`, including `tools/call`, `events/poll`, and
-`events/stream`; its value matches the request's `name`.
+Fastexec supports multiple protocol revisions over stdio and Streamable HTTP.
+Keep both the `initialize` / `notifications/initialized` session lifecycle
+and the `server/discover` / inline-metadata lifecycle. Their protocol paths,
+client fixtures, and release smoke coverage are part of the supported interface.
+
+The clean implementation rule applies to internal design. Internal refactors
+must avoid migration layers, internal legacy/compatibility shims, and
+meaningless temporary suppressions while preserving these external interfaces.
 
 ### Platform notes
 
@@ -1067,7 +1066,7 @@ four times the input length remains for model strings, metadata and application
 parameter conversion. Official public Request/Notification Extensions carry the
 application owner to handlers and their workers. Recent cancellation IDs retain
 only their transferred ID allowance. Short inputs up to 64 KiB may use the control
-reserve for classification. Ordinary calls must move to
+reserve for classification. Ordinary calls and initialize metadata must move to
 the main pool before dispatch. Short list/kill, ping, discovery and cancellation
 or lifecycle control messages can remain in the reserve. A refused stdio admission
 sends a short overload error and closes that transport.
@@ -1081,7 +1080,7 @@ returns a fixed short receipt before dispatch. This allowance covers subsequent
 application copies and follows their real workers; it does not retroactively
 account for the SDK's earlier parsing or parameter conversion.
 
-Discovery, tool listings and the instructions tool reserve their
+Initialization, discovery, tool listings and the instructions tool reserve their
 application response-copy workspace before copying startup configuration, then
 release it at handler return. Tool listings count owned descriptions and metadata
 while sharing schema Arcs. Progress forwarding owns its input token and admits
@@ -1094,7 +1093,7 @@ do not provide complete ownership hooks for all of the following paths:
 - HTTP body collection, JSON parsing, header decoding and validation scratch.
   Fastexec retains its existing authentication, route and body-limit checks; the
   SDK keeps its original HTTP validation order and error behavior.
-- Independently cloned request parameters, peer information,
+- Independently cloned request parameters, initialization peer information,
   response models, handler cancellation and SDK queues after application handoff.
 - HTTP JSON/SSE encoding, response/replay caches, keepalive frames and returned
   body slices, including errors and progress notifications.
@@ -1108,7 +1107,7 @@ process pool therefore limits those tracked active payload buffers, not total
 process memory or every allocation made by the SDK.
 
 The HTTP integration case
-`slow_http_client_holds_active_memory_lease_until_response_completes_or_drops`
+`slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops`
 remains as an ignored upstream-dependent check. Its assertion requires the SDK's
 slow response body to retain a lease after the handler has returned its bare
 result. CI lists this case as ignored, not passed. Ordinary HTTP media delivery,
@@ -1158,7 +1157,7 @@ modes and exits with status `1` if the value is invalid.
 
 ### `FASTEXEC_INSTRUCTIONS_FILE`
 
-When unset, MCP `server/discover` returns the built-in server
+When unset, MCP `initialize` and `server/discover` return the built-in server
 instructions unchanged. When set, the path is resolved with `files::resolve`
 (relative to the launch working directory, with `~` expansion and Windows Git
 Bash drive paths) and opened non-blockingly as a regular file with
@@ -1175,7 +1174,7 @@ The default protocol composition appends it after a blank line (`\n\n`);
 Empty, non-UTF-8, unreadable, or invalid values exit with status `1`.
 
 Each serving process captures one immutable `Arc<str>` snapshot at startup;
-later edits or deletions do not change `server/discover`
+later edits or deletions do not change `initialize` or `server/discover`
 responses. Local stdio (`FASTEXEC_DAEMON=off`), daemon stdio endpoints
 (`FASTEXEC_DAEMON=on`), and HTTP daemons (`--http`) read it at startup.
 `daemon start --http` probes for an already-running daemon first and skips
@@ -1492,7 +1491,7 @@ omitted on final serialization unless noted as always-present below.
 
 ## 6. Daemon Mode (`FASTEXEC_DAEMON=on`)
 
-- **Endpoint and daemon**: The stdio process answers `server/discover` and
+- **Endpoint and daemon**: The stdio process answers `initialize` and
   `tools/list` itself and forwards every tool call to the namespace's daemon,
   holding no tasks of its own and killing none. The first call works to one `10` s
   deadline that covers connecting, starting a daemon, and its `Hello`; only an
@@ -1571,9 +1570,10 @@ omitted on final serialization unless noted as always-present below.
   separated by ASCII whitespace, serves the same toolset over Streamable HTTP.
   Each token is at least `16` visible ASCII characters; empty lists, invalid
   tokens, and duplicates are refused with token positions, never token values.
-  Requests use the authenticated token's principal session (`t1`, `t2`, etc.,
-  with owner labels `http-t1`, `http-t2`, etc.). Each principal session lasts
-  until the listener stops. The address is
+  Sessionless requests use the authenticated token's principal session (`t1`,
+  `t2`, etc., with owner labels `http-t1`, `http-t2`, etc.). The inline `_meta`
+  lifecycle chooses this path regardless of the named protocol version. Legacy
+  HTTP `initialize` creates a client-named session after negotiation. The address is
   loopback unless `FASTEXEC_HTTP_ALLOW_REMOTE=1`, which belongs behind a
   TLS-terminating proxy. Every `/mcp` request carries a configured bearer
   token, checked before a session is created or resumed, and
@@ -1584,7 +1584,11 @@ omitted on final serialization unless noted as always-present below.
   `FASTEXEC_HTTP_ALLOWED_ORIGINS`, where an entry without a port matches any
   port. This is request Origin validation, not CORS support: browser cross-origin
   preflights and CORS response headers are not provided. HTTP sessions run with
-  the daemon's own environment.
+  the daemon's own environment. The listener retains up to `256` legacy HTTP
+  sessions; at capacity it rejects new legacy initializations. Idle legacy
+  sessions expire after `60` minutes, and DELETE also releases the slot. The
+  cap is a count, not a memory or namespace-wide quota. Principal sessions
+  do not use this cap and last until the listener stops.
   The HTTP listener admits at most `128` concurrent connections and allows
   `10` seconds to receive request headers. Extra connections are closed without
   queueing; management through the local daemon socket has its own capacity.
@@ -1617,4 +1621,4 @@ omitted on final serialization unless noted as always-present below.
   before the bearer check and before the `4` MiB body cap that applies to
   `/mcp`. `/mcp` is the only other route: a path behind the bearer check that
   is not `/mcp` answers `404`, so a proxy that forwards its prefix unstripped
-  fails at `server/discover` instead of waiting until a later download.
+  fails at `initialize` instead of waiting until a later download.
