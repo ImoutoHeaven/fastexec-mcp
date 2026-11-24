@@ -115,17 +115,17 @@ pub struct Request {
     #[schemars(range(min = 5, max = 200))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) rows: Option<u16>,
-    /// list: "session" for tasks this session started or addressed (default when parentTaskId is omitted), or "all" for every task in this server (default when parentTaskId is set).
+    /// list: "session" for this session's tasks (default without parentTaskId), or "all" for every task (default with parentTaskId).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) scope: Option<ListScope>,
-    /// list: "active" for tasks whose root runs or that hold kept processes, or "finished" for the rest. Omit for both. Children whose parent is filtered out appear as top-level rows.
+    /// list: "active" for running or kept-process tasks, or "finished" for the rest; omit for both. Children whose parent is filtered out promote to top level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) state: Option<ListState>,
-    /// list: maximum top-level tasks (or child tasks with parentTaskId) to return, newest first, 1-500 (default 20). Folded codemode children do not count against this limit.
+    /// list: max top-level tasks (or children with parentTaskId), newest first, 1-500 (default 20). Folded codemode children do not count.
     #[schemars(range(min = 1, max = 500))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) limit: Option<u64>,
-    /// list: bare task ID or reader handle (<taskId>.<reader>) of a codemode task to list its child tasks flat instead of the default top-level view. Defaults scope to "all" when omitted.
+    /// list: codemode bare task ID or reader handle to list its children flat; defaults scope to "all".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) parent_task_id: Option<String>,
 }
