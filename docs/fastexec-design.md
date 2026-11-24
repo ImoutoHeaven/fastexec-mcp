@@ -1108,7 +1108,7 @@ process pool therefore limits those tracked active payload buffers, not total
 process memory or every allocation made by the SDK.
 
 The HTTP integration case
-`slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops`
+`slow_http_client_holds_active_memory_lease_until_response_completes_or_drops`
 remains as an ignored upstream-dependent check. Its assertion requires the SDK's
 slow response body to retain a lease after the handler has returned its bare
 result. CI lists this case as ignored, not passed. Ordinary HTTP media delivery,
