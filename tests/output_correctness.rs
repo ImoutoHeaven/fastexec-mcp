@@ -390,11 +390,13 @@ fn nested_raw_exec_preserves_line_terminators() {
     let result = server.codemode(json!({
         "code": r#"
             for (const sample of ["", "\n", "\r\n", "a\n", "a\r\n", "a\nb\n", "a\nb"]) {
+                // Generate CRLF at runtime; Git Bash normalizes CRLF in command source.
+                const escaped = sample.replace(/\r/g, "\\r").replace(/\n/g, "\\n");
                 const result = await tools.exec({
                     action: "start",
                     loginShell: false,
                     raw: true,
-                    command: "printf '%s' " + sh.quote(sample)
+                    command: "printf '%b' " + sh.quote(escaped)
                 });
                 if (result.output !== sample || result.truncated) {
                     throw new Error(JSON.stringify({ sample, result }));
