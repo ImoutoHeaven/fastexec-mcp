@@ -1424,7 +1424,7 @@ pub(crate) fn portable_schema(mut schema: serde_json::Value) -> serde_json::Valu
         .as_object_mut()
         .and_then(|root| {
             root.remove("$schema");
-            root.remove("$defs").or_else(|| root.remove("definitions"))
+            root.remove("$defs")
         })
         .and_then(|value| match value {
             serde_json::Value::Object(map) => Some(map),
@@ -1446,10 +1446,7 @@ fn rewrite_schema_node(
     loop {
         let mut progressed = false;
         if let Some(serde_json::Value::String(reference)) = obj.remove("$ref") {
-            let name = reference
-                .strip_prefix("#/$defs/")
-                .or_else(|| reference.strip_prefix("#/definitions/"))
-                .unwrap_or(&reference);
+            let name = reference.strip_prefix("#/$defs/").unwrap_or(&reference);
             if let Some(serde_json::Value::Object(mut target)) = defs.get(name).cloned() {
                 if obj.contains_key("description") {
                     target.remove("description");
