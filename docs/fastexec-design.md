@@ -9,7 +9,7 @@ Authoritative runtime usage rules live in
 ### MCP protocol
 
 Fastexec supports MCP `2026-07-28` over stdio and Streamable HTTP. Clients
-discover the server with `server/discover`. Every request carries
+discover the server with `server/discover`. Discovery and ordinary requests carry
 `io.modelcontextprotocol/protocolVersion` and
 `io.modelcontextprotocol/clientCapabilities` in `params._meta`.
 Clients can also include `io.modelcontextprotocol/clientInfo` there to
