@@ -352,7 +352,10 @@ async fn a_hello_is_answered_with_the_epoch_or_a_reject_naming_the_field() {
 // test-host override is added for it.
 #[cfg(windows)]
 fn output_of(text: &str) -> &str {
-    text.split_once("\n\n[").map_or("", |(body, _)| body)
+    match text.split_once("\n\n[").map_or("", |(body, _)| body) {
+        "(no new output)" => "",
+        body => body,
+    }
 }
 
 #[cfg(windows)]

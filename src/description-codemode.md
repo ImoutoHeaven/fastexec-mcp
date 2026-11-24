@@ -30,15 +30,12 @@ branching on tool results, or filtering bulky output before returning it to cont
   without loading base64 into JS. For text without offset or limit, whole-file mode reads up to
   4 MiB of strict UTF-8 or rejects with ToolError (LIMIT if larger, IO if non-UTF-8); offset or
   limit reads a 4 MiB slice.
-- sh`...` builds bash commands using raw template text (keeping backslashes), quotes scalar
-  interpolations with sh.quote(value), and expands arrays with sh.join(values); do not wrap
-  ${...} in quotes. Call sh.quote or sh.join directly when needed. For multiline interpreter
-  scripts (python3, awk, jq), pass command: "python3 -" with input: String.raw`...` instead of
-  nested quotes or heredocs.
-- text(value) appends strings verbatim and other values as JSON. console.log/info/warn/error/debug
-  join arguments with spaces. A non-undefined return value must be a string or JSON-serializable
-  and is appended last; exit() ends with 0. Output fits maxBytes (default 16384); logPath keeps
-  the rest.
+- sh`...` builds bash commands with raw template text (keeping backslashes), quotes scalars with
+  sh.quote(value), and expands arrays with sh.join(values); do not quote ${...}. For multiline
+  interpreter scripts (python3, awk, jq), pass command: "python3 -" with input: String.raw`...`.
+- text(value) appends strings verbatim and other values as JSON; console.log/info/warn/error/debug
+  join args with spaces. A non-undefined return value must be a string or JSON-serializable and
+  appends last; exit() ends with 0. Output fits maxBytes (default 16384); logPath keeps the rest.
 - attach(value) saves a file path, read media descriptor (attachable: false throws TypeError with
   note), opaque handle from nested poll/kill codemode.attachments, MCP image/audio/resource(blob)
   block, or base64 data URL as 1-based attachment #index. Outer MCP responses return text and media
