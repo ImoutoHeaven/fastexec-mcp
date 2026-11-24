@@ -1616,6 +1616,7 @@ const PRELUDE: &str = r#"(function (__write, __call, __attach, __exit) {
         enumerable: false,
         configurable: true,
     });
+    globalThis.ToolError = ToolError;
     globalThis.tools = tools;
     globalThis.sh = sh;
     globalThis.console = console;

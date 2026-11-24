@@ -794,10 +794,10 @@ async fn file_tools_resolve_errors_reject_bad_arguments_and_queue() {
         if ('ok' in edit || edit.replacements !== 1 || edit.edits[0].line !== 1) throw new Error('edit failed');
         let missingErr = null;
         try { await tools.read({path:'missing.txt'}); } catch (e) { missingErr = e; }
-        if (!missingErr || missingErr.name !== 'ToolError' || missingErr.tool !== 'read' || missingErr.code !== 'NOT_FOUND') throw new Error('missing file must reject with ToolError');
+        if (!(missingErr instanceof ToolError) || !(missingErr instanceof Error) || missingErr.name !== 'ToolError' || missingErr.tool !== 'read' || missingErr.code !== 'NOT_FOUND') throw new Error('missing file must reject with ToolError');
         let badExecErr = null;
         try { await tools.exec({action:'start',command:''}); } catch (e) { badExecErr = e; }
-        if (!badExecErr || badExecErr.name !== 'ToolError' || badExecErr.tool !== 'exec' || badExecErr.code !== 'VALIDATION') throw new Error('empty exec must reject with ToolError');
+        if (!(badExecErr instanceof ToolError) || !(badExecErr instanceof Error) || badExecErr.name !== 'ToolError' || badExecErr.tool !== 'exec' || badExecErr.code !== 'VALIDATION') throw new Error('empty exec must reject with ToolError');
         for (const args of [null, [], 'x', {path:'fixture.txt',surprise:true}]) {
             let rejected = false;
             try { await tools.read(args); } catch (e) { if (e instanceof TypeError) rejected = true; }
@@ -1662,7 +1662,7 @@ async fn sh_quote_image_notes_queue_cap_and_integrity_tool_errors() {
 
     // End-to-end JS ToolError on injected captureError and logError: non-empty message
     // built from diagnostics and full report (output, exitCode, diagnostic) in err.result,
-    // plus the 1025th pending call rejecting with RangeError.
+    // plus the 1025th pending call rejecting with ToolError(LIMIT).
     let seeded = fixture.start("text('partial-out'); throw new Error('boom');", None);
     complete(&seeded).await;
     seeded.inject_io_errors(Some("pty pipe lost"), Some("disk full"));
@@ -1694,7 +1694,7 @@ async fn sh_quote_image_notes_queue_cap_and_integrity_tool_errors() {
                 Array.from({{length: 1025}}, () => tools.read({{path: "ok.png"}}))
             );
             const limitErrors = settled.filter(
-                s => s.status === "rejected" && s.reason?.name === "ToolError" && s.reason.code === "LIMIT"
+                s => s.status === "rejected" && s.reason instanceof ToolError && s.reason instanceof Error && s.reason.code === "LIMIT"
             );
             if (limitErrors.length !== 1) {{
                 throw new Error("expected 1 ToolError(LIMIT) at 1025th pending call, got " + limitErrors.length);
