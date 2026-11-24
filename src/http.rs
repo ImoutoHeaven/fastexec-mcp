@@ -16,7 +16,7 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
-use rmcp::transport::streamable_http_server::session::local::SessionConfig;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
@@ -32,15 +32,11 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-mod sessions;
-use sessions::Sessions;
 /// The largest request body the daemon reads: a call carries its arguments, not a file.
 pub(crate) const LIMIT: usize = 4 << 20;
 /// HTTP has its own connection budget, so unauthenticated peers cannot consume the daemon
 /// socket's management capacity or exhaust the process's file descriptors.
 const MAX_CONNECTIONS: usize = 128;
-/// Legacy HTTP sessions survive individual connections and have a separate count cap.
-const MAX_HTTP_SESSIONS: usize = 256;
 /// The deadline for a complete HTTP request header.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-connection HTTP/2 stream cap.
@@ -232,7 +228,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         extra_instructions,
         instructions_tool,
     } = http;
-    // The factory makes a server for each legacy session or inline-lifecycle request.
+    // Each HTTP request gets a server that shares its principal session.
     let service = Arc::clone(&daemon.service());
     // Shared with the daemon so both HTTP sessions and stdio endpoints connected to it serve
     // capabilities through this `/t/` route.
@@ -268,7 +264,6 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         let table = Arc::clone(&table);
         let public_root = public_root.clone();
         move || {
-            let launch = Arc::new(launch.for_session());
             let backend = Backend::Local {
                 service: Arc::clone(&service),
                 render,
@@ -296,26 +291,16 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
     let mut config = StreamableHttpServerConfig::default();
-    // Legacy clients keep independent sessions; rmcp routes modern requests without one.
-    config.legacy_session_mode = true;
-    config.stateless_protocol_metadata_required = false;
+    config.legacy_session_mode = false;
+    config.stateless_protocol_metadata_required = true;
     // Stateless responses return JSON unless the handler emits notifications first.
     config.json_response = true;
     config.sse_keep_alive = Some(Duration::from_secs(15));
-    // Gemini rejects empty SSE priming events before reading the JSON-RPC answer.
-    config.sse_retry = None;
     config.cancellation_token = stopped.child_token();
     config.allowed_hosts = allowed_hosts(bound, remote_allowed());
     config.allowed_origins = allowed_origins(bound, &origins_from_env());
-    let mut session_config = SessionConfig::default();
-    session_config.channel_capacity = 16;
-    session_config.keep_alive = Some(Duration::from_secs(3600));
-    session_config.sse_retry = None;
-    session_config.completed_cache_ttl = Duration::from_secs(60);
-    session_config.init_timeout = Some(Duration::from_secs(60));
-    // This independent count cap bounds HTTP session bookkeeping.
-    let sessions = Sessions::new(session_config, MAX_HTTP_SESSIONS);
-    let inner = StreamableHttpService::new(factory, Arc::new(sessions), config);
+    let inner =
+        StreamableHttpService::new(factory, Arc::new(LocalSessionManager::default()), config);
     let layer = Bearer {
         digests: digests.into(),
         table,
@@ -516,7 +501,7 @@ struct Bearer<H = Server> {
     /// The files this listener publishes under `/t/`.
     table: Arc<Transfers>,
     stopped: CancellationToken,
-    inner: StreamableHttpService<H, Sessions>,
+    inner: StreamableHttpService<H, LocalSessionManager>,
 }
 
 impl<H> tower_service::Service<Request<Incoming>> for Bearer<H>
@@ -545,8 +530,7 @@ where
             let Some(principal) = authorized(request.headers(), &digests) else {
                 return Ok(refusal(version, StatusCode::UNAUTHORIZED, "Bearer"));
             };
-            // Two routes, and no other: a proxy that forwards its prefix without stripping it
-            // fails here, at `initialize`, rather than at a download an hour later.
+            // A proxy must strip its prefix before forwarding MCP requests.
             if request.uri().path() != "/mcp" {
                 return Ok(refusal(version, StatusCode::NOT_FOUND, ""));
             }

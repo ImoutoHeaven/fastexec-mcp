@@ -468,11 +468,17 @@ fn dechunk(body: &[u8]) -> Vec<u8> {
     }
 }
 
-/// One MCP session over HTTP: the session ID the daemon gave, and the next request ID.
+fn protocol_meta(client: &str) -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": client, "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    })
+}
+
 struct Client {
     addr: SocketAddr,
     token: String,
-    session: Option<String>,
     next_id: u64,
 }
 
@@ -481,17 +487,10 @@ impl Client {
         Client {
             addr,
             token,
-            session: None,
             next_id: 0,
         }
     }
 
-    /// Sends `body` as one POST to `/mcp` and returns the whole answer.
-    fn post(&mut self, body: &str) -> Response {
-        self.post_with(body, "")
-    }
-
-    /// Sends `body` as one POST to `/mcp` with headers of the test's own choosing.
     fn post_with(&mut self, body: &str, headers: &str) -> Response {
         let mut request = String::new();
         request.push_str("POST /mcp HTTP/1.1\r\n");
@@ -501,9 +500,6 @@ impl Client {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
         request.push_str("Connection: close\r\n");
         request.push_str(&format!("Authorization: Bearer {}\r\n", self.token));
-        if let Some(session) = &self.session {
-            request.push_str(&format!("Mcp-Session-Id: {session}\r\n"));
-        }
         request.push_str(headers);
         request.push_str("\r\n");
         request.push_str(body);
@@ -511,151 +507,94 @@ impl Client {
     }
 
     fn send(&mut self, message: Value) -> Response {
-        self.post(&message.to_string())
+        self.send_with(message, "")
     }
 
-    /// A 2026 request carries its own metadata and never uses a protocol session.
-    fn modern(&mut self, method: &str, params: Value) -> Value {
-        self.inline("2026-07-28", method, params)
-    }
-
-    /// Inline lifecycle metadata selects a principal session even with an older version.
-    fn inline(&mut self, version: &str, method: &str, mut params: Value) -> Value {
-        self.next_id += 1;
-        let id = self.next_id;
-        params["_meta"] = json!({
-            "io.modelcontextprotocol/protocolVersion": version,
-            "io.modelcontextprotocol/clientInfo": {"name": "http-modern-test", "version": "1"},
-            "io.modelcontextprotocol/clientCapabilities": {},
-        });
-        let mut headers = format!("MCP-Protocol-Version: {version}\r\nMcp-Method: {method}\r\n");
-        if let Some(name) = params["name"].as_str() {
+    fn send_with(&mut self, mut message: Value, extra_headers: &str) -> Response {
+        if message.get("params").is_none() {
+            message["params"] = json!({});
+        }
+        message["params"]["_meta"] = protocol_meta("http-test");
+        let method = message["method"].as_str().unwrap();
+        let mut headers = format!("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {method}\r\n");
+        if let Some(name) = message["params"]["name"].as_str() {
             headers.push_str(&format!("Mcp-Name: {name}\r\n"));
         }
-        let response = self.post_with(
-            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string(),
-            &headers,
-        );
+        headers.push_str(extra_headers);
+        self.post_with(&message.to_string(), &headers)
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = self.next_id;
+        let response =
+            self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
         assert_eq!(response.status, 200, "{}", response.body);
         assert!(response.header("mcp-session-id").is_none());
         let answer = response.answer(id);
         assert!(answer["result"].is_object(), "{answer}");
-        if version == "2026-07-28" {
-            assert_eq!(answer["result"]["resultType"], "complete", "{answer}");
-        }
+        assert_eq!(answer["result"]["resultType"], "complete", "{answer}");
         answer["result"].clone()
     }
 
-    /// A sessionless exec result, its structured content and its text.
-    fn modern_result(&mut self, arguments: Value) -> (Value, String) {
-        let result = self.modern(
-            "tools/call",
-            json!({"name": "exec", "arguments": arguments}),
+    fn discover(&mut self) -> Value {
+        let result = self.request("server/discover", json!({}));
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "fastexec",
+            "{result}"
         );
-        assert_ne!(result["isError"], true, "{result}");
-        let text = result["content"][0]["text"].as_str().unwrap().to_owned();
-        (result["structuredContent"].clone(), text)
-    }
-
-    /// The MCP handshake, which names the session every later request carries.
-    fn initialize(&mut self) -> Value {
-        self.initialize_version("2025-06-18")
-    }
-
-    fn initialize_version(&mut self, version: &str) -> Value {
-        self.next_id += 1;
-        let id = self.next_id;
-        let response = self.send(json!({
-            "jsonrpc": "2.0", "id": id, "method": "initialize",
-            "params": {
-                "protocolVersion": version,
-                "capabilities": {},
-                "clientInfo": {"name": "http-test", "version": "0"},
-            },
-        }));
-        assert_eq!(response.status, 200, "{:?}", response.body);
-        self.session = Some(
-            response
-                .header("mcp-session-id")
-                .unwrap_or_else(|| panic!("no session id in {:?}", response.headers))
-                .to_owned(),
-        );
-        let result = response.answer(id)["result"].clone();
-        assert!(
-            result["serverInfo"]["name"] == json!("fastexec"),
-            "{:?}",
-            response.body
-        );
-        let notified = self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
-        assert!(
-            notified.status == 200 || notified.status == 202,
-            "{}",
-            notified.body
+        assert_eq!(
+            result["supportedVersions"],
+            json!(["2026-07-28"]),
+            "{result}"
         );
         result
     }
 
-    /// The tools the server offers, by name.
     fn tools(&mut self) -> Vec<String> {
-        self.next_id += 1;
-        let id = self.next_id;
-        let response = self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}));
-        assert_eq!(response.status, 200, "{:?}", response.body);
-        response.answer(id)["result"]["tools"]
+        let result = self.request("tools/list", json!({}));
+        result["tools"]
             .as_array()
-            .unwrap_or_else(|| panic!("no tools in {:?}", response.body))
+            .unwrap_or_else(|| panic!("no tools in {result}"))
             .iter()
             .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
             .collect()
     }
 
-    /// One `tools/call` of any tool, and its own result.
     fn call_tool(&mut self, tool: &str, arguments: Value) -> Value {
         self.call_tool_with(tool, arguments, "")
     }
 
-    /// One `tools/call` with headers of the test's own choosing.
     fn call_tool_with(&mut self, tool: &str, arguments: Value, headers: &str) -> Value {
         self.next_id += 1;
         let id = self.next_id;
-        let body = json!({
-            "jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": {"name": tool, "arguments": arguments},
-        })
-        .to_string();
-        let response = self.post_with(&body, headers);
+        let response = self.send_with(
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            }),
+            headers,
+        );
         assert_eq!(response.status, 200, "{:?}", response.body);
         let answer = response.answer(id);
         assert!(answer["result"].is_object(), "protocol error: {answer}");
+        assert!(response.header("mcp-session-id").is_none());
+        assert_eq!(answer["result"]["resultType"], "complete", "{answer}");
         answer["result"].clone()
     }
 
-    /// One `tools/call`, and the tool's own result.
-    fn call(&mut self, arguments: Value) -> Value {
-        self.next_id += 1;
-        let id = self.next_id;
-        let response = self.send(json!({
-            "jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": {"name": "exec", "arguments": arguments},
-        }));
-        assert_eq!(response.status, 200, "{:?}", response.body);
-        response.answer(id)
-    }
-
-    /// The text a tool result carries, and its structured content.
     fn text(&mut self, arguments: Value) -> String {
         self.result(arguments).1
     }
 
-    /// The structured content a tool result carries, and its text.
     fn result(&mut self, arguments: Value) -> (Value, String) {
-        let answer = self.call(arguments);
-        assert_ne!(answer["result"]["isError"], json!(true), "{answer}");
-        let text = answer["result"]["content"][0]["text"]
+        let result = self.call_tool("exec", arguments);
+        assert_ne!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"]
             .as_str()
-            .unwrap_or_else(|| panic!("no text in {answer}"))
+            .unwrap_or_else(|| panic!("no text in {result}"))
             .to_owned();
-        (answer["result"]["structuredContent"].clone(), text)
+        (result["structuredContent"].clone(), text)
     }
 }
 
@@ -742,16 +681,9 @@ impl Stdio {
             next_id: 0,
             instructions: String::new(),
         };
-        let answer = stdio.request(
-            "initialize",
-            json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "stdio-test", "version": "0"},
-            }),
-        );
+        let answer = stdio.request("server/discover", json!({}));
         assert_eq!(
-            answer["result"]["serverInfo"]["name"],
+            answer["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
             json!("fastexec"),
             "{answer}"
         );
@@ -759,7 +691,6 @@ impl Stdio {
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        stdio.notify(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         stdio
     }
 
@@ -768,7 +699,8 @@ impl Stdio {
         self.stdin.flush().unwrap();
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Value {
+    fn request(&mut self, method: &str, mut params: Value) -> Value {
+        params["_meta"] = protocol_meta("stdio-test");
         self.next_id += 1;
         let id = self.next_id;
         self.notify(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -812,7 +744,7 @@ impl Drop for Stdio {
 fn modern_discovery_and_task_polls_work_without_a_handshake() {
     let fixture = Fixture::new("modern");
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    let discovery = client.modern("server/discover", json!({}));
+    let discovery = client.request("server/discover", json!({}));
     assert!(
         discovery["supportedVersions"]
             .as_array()
@@ -823,9 +755,9 @@ fn modern_discovery_and_task_polls_work_without_a_handshake() {
         discovery["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         "fastexec"
     );
-    let listed = client.modern("tools/list", json!({}));
+    let listed = client.request("tools/list", json!({}));
     assert_eq!(listed["tools"].as_array().unwrap().len(), 4);
-    let started = client.modern(
+    let started = client.request(
         "tools/call",
         json!({"name": "exec", "arguments": {
             "action": "start", "command": "printf MODERN_FIRST; read -r line; printf MODERN_SECOND",
@@ -840,7 +772,7 @@ fn modern_discovery_and_task_polls_work_without_a_handshake() {
             .contains("MODERN_FIRST")
     );
     let id = &started["structuredContent"]["taskId"];
-    let polled = client.modern(
+    let polled = client.request(
         "tools/call",
         json!({"name": "exec", "arguments": {
             "action": "poll", "taskId": id, "input": "go\n", "waitMs": 30000,
@@ -852,14 +784,13 @@ fn modern_discovery_and_task_polls_work_without_a_handshake() {
         !text.contains("MODERN_FIRST"),
         "a new HTTP request must keep its output cursor: {polled}"
     );
-    // A legacy client still has an independent cursor over the shared daemon's task.
-    let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
-    legacy.initialize();
-    let text = legacy.text(json!({"action": "poll", "taskId": id, "waitMs": 1000}));
+    let mut reconnect = Client::new(fixture.addr, fixture.tokens[0].clone());
+    let text = reconnect.text(json!({"action": "poll", "taskId": id, "waitMs": 0}));
     assert!(
-        text.contains("MODERN_FIRST") && text.contains("MODERN_SECOND"),
+        !text.contains("MODERN_FIRST") && !text.contains("MODERN_SECOND"),
         "{text}"
     );
+    assert!(!text.contains("new reader"), "{text}");
 }
 
 #[test]
@@ -871,7 +802,7 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     let mut b = Client::new(fixture.addr, fixture.tokens[0].clone());
     let mut other = Client::new(fixture.addr, fixture.tokens[1].clone());
 
-    let (started, text) = a.modern_result(json!({
+    let (started, text) = a.result(json!({
         "action": "start", "eof": false,
         "command": "printf 'A_FIRST\\n'; read -r line; printf 'A_SECOND\\n'; read -r line",
         "waitMs": 30000, "returnWhen": {"outputContains": ["A_FIRST"]},
@@ -884,7 +815,7 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     );
     assert!(!text.contains("new reader"), "{text}");
 
-    let (other_started, text) = other.modern_result(json!({
+    let (other_started, text) = other.result(json!({
         "action": "start", "eof": false, "command": "printf 'OTHER_FIRST\\n'; read -r line",
         "waitMs": 30000, "returnWhen": {"outputContains": ["OTHER_FIRST"]},
     }));
@@ -899,7 +830,7 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
         "another principal has counts only: {text}"
     );
 
-    let (b_started, text) = b.modern_result(json!({
+    let (b_started, text) = b.result(json!({
         "action": "start", "eof": false, "command": "printf 'B_FIRST\\n'; read -r line",
         "waitMs": 30000, "returnWhen": {"outputContains": ["B_FIRST"]},
     }));
@@ -920,7 +851,7 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     );
     assert!(!text.contains(other_id), "{text}");
 
-    let (attached, text) = b.modern_result(json!({
+    let (attached, text) = b.result(json!({
         "action": "poll", "taskId": a_id, "waitMs": 0,
     }));
     let b_handle = attached["taskId"].as_str().unwrap();
@@ -932,7 +863,7 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     );
     assert!(text.contains(b_handle), "{text}");
 
-    let (_, text) = a.modern_result(json!({
+    let (_, text) = a.result(json!({
         "action": "poll", "taskId": a_handle, "input": "go\n",
         "waitMs": 30000, "returnWhen": {"outputContains": ["A_SECOND"]},
     }));
@@ -942,7 +873,7 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     );
     assert!(!text.contains("new reader"), "{text}");
 
-    let (_, text) = b.modern_result(json!({
+    let (_, text) = b.result(json!({
         "action": "poll", "taskId": b_handle, "waitMs": 0,
     }));
     assert!(
@@ -951,11 +882,11 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     );
     assert!(!text.contains("new reader"), "{text}");
 
-    let (own_listed, _) = other.modern_result(json!({"action": "list"}));
+    let (own_listed, _) = other.result(json!({"action": "list"}));
     let own_tasks = own_listed["tasks"].as_array().unwrap();
     assert_eq!(own_tasks.len(), 1, "{own_listed}");
     assert_eq!(own_tasks[0]["taskId"], other_id, "{own_listed}");
-    let (listed, _) = other.modern_result(json!({"action": "list", "scope": "all"}));
+    let (listed, _) = other.result(json!({"action": "list", "scope": "all"}));
     let tasks = listed["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 3, "{listed}");
     for (id, owner) in [(a_id, "http-t1"), (b_id, "http-t1"), (other_id, "http-t2")] {
@@ -965,7 +896,7 @@ fn sessionless_tokens_scope_notices_and_handles_keep_independent_cursors() {
     }
     // Once shown in the session's first result, outside counts do not repeat on later polls.
     for _ in 0..2 {
-        let (_, text) = other.modern_result(json!({
+        let (_, text) = other.result(json!({
             "action": "poll", "taskId": other_handle, "waitMs": 0,
         }));
         assert!(!text.contains("running outside this session"), "{text}");
@@ -978,7 +909,7 @@ fn sessionless_exit_reporting_is_local_to_each_reader() {
     let fixture = Fixture::new("reader-exit");
     let mut a = Client::new(fixture.addr, fixture.tokens[0].clone());
     let mut b = Client::new(fixture.addr, fixture.tokens[0].clone());
-    let (started, text) = a.modern_result(json!({
+    let (started, text) = a.result(json!({
         "action": "start", "command": "sleep 60 & echo ROOT_EXIT",
         "keepTree": true, "loginShell": false, "waitMs": 30000,
     }));
@@ -988,13 +919,13 @@ fn sessionless_exit_reporting_is_local_to_each_reader() {
     let a_handle = started["taskId"].as_str().unwrap();
     let id = a_handle.split_once('.').unwrap().0;
 
-    let (waited, text) = a.modern_result(json!({
+    let (waited, text) = a.result(json!({
         "action": "poll", "taskId": a_handle, "waitMs": 150,
     }));
     assert_eq!(waited["keptRunning"], true, "{text}");
     assert_eq!(waited["waitEndedBy"]["condition"], "max_wait", "{text}");
 
-    let (attached, text) = b.modern_result(json!({
+    let (attached, text) = b.result(json!({
         "action": "poll", "taskId": id, "waitMs": 1000,
     }));
     assert_eq!(attached["keptRunning"], true, "{text}");
@@ -1005,7 +936,7 @@ fn sessionless_exit_reporting_is_local_to_each_reader() {
     );
     assert_ne!(attached["taskId"], started["taskId"]);
 
-    let (killed, text) = a.modern_result(json!({"action": "kill", "taskId": a_handle}));
+    let (killed, text) = a.result(json!({"action": "kill", "taskId": a_handle}));
     assert!(killed.get("keptRunning").is_none(), "{text}");
     assert_eq!(killed["taskId"], a_handle, "{text}");
 }
@@ -1026,13 +957,13 @@ fn invalid_http_requests_create_no_reader_and_change_no_task_state() {
         } else {
             arguments["eof"] = json!(false);
         }
-        let (started, _) = client.modern_result(arguments);
+        let (started, _) = client.result(arguments);
         let handle = started["taskId"].as_str().unwrap();
         let id = handle.split_once('.').unwrap().0;
         // The start reader is now the oldest of 16 idle readers. Any invalid call that allocates
         // a reader would evict it; its final poll below would replay READY and say new reader.
         for _ in 0..15 {
-            let (_, text) = client.modern_result(json!({
+            let (_, text) = client.result(json!({
                 "action": "poll", "taskId": id, "waitMs": 0,
             }));
             assert!(text.contains(" · new reader"), "{text}");
@@ -1061,14 +992,14 @@ fn invalid_http_requests_create_no_reader_and_change_no_task_state() {
             ]);
         }
         for arguments in invalid {
-            let result = client.modern(
+            let result = client.request(
                 "tools/call",
                 json!({"name": "exec", "arguments": arguments}),
             );
             assert_eq!(result["isError"], true, "pty={pty}: {result}");
         }
 
-        let (listed, _) = client.modern_result(json!({"action": "list"}));
+        let (listed, _) = client.result(json!({"action": "list"}));
         let task = listed["tasks"]
             .as_array()
             .unwrap()
@@ -1080,7 +1011,7 @@ fn invalid_http_requests_create_no_reader_and_change_no_task_state() {
             assert_eq!(task["cols"], 80, "{task}");
             assert_eq!(task["rows"], 24, "{task}");
         }
-        let (polled, text) = client.modern_result(json!({
+        let (polled, text) = client.result(json!({
             "action": "poll", "taskId": handle, "input": "SAFE\n",
             "waitMs": 30000, "returnWhen": {"outputContains": ["GOT_SAFE"]},
         }));
@@ -1092,123 +1023,8 @@ fn invalid_http_requests_create_no_reader_and_change_no_task_state() {
             "the reader was not evicted: pty={pty}: {text}"
         );
         assert!(!text.contains("new reader"), "pty={pty}: {text}");
-        client.modern_result(json!({"action": "kill", "taskId": handle}));
+        client.result(json!({"action": "kill", "taskId": handle}));
     }
-}
-
-#[test]
-fn inline_requests_with_an_older_version_use_the_principal_session() {
-    let fixture = Fixture::new("inline-old");
-    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    let started = client.inline("2025-06-18", "tools/call", json!({
-        "name": "exec", "arguments": {
-            "action": "start", "eof": false, "command": "printf 'OLD_FIRST\\n'; read -r line; printf 'OLD_SECOND\\n'",
-            "waitMs": 30000, "returnWhen": {"outputContains": ["OLD_FIRST"]},
-        },
-    }));
-    assert_ne!(started["isError"], true, "{started}");
-    let handle = started["structuredContent"]["taskId"].as_str().unwrap();
-    let polled = client.inline(
-        "2025-06-18",
-        "tools/call",
-        json!({
-            "name": "exec", "arguments": {
-                "action": "poll", "taskId": handle, "input": "go\n", "waitMs": 30000,
-            },
-        }),
-    );
-    let text = polled["content"][0]["text"].as_str().unwrap();
-    assert!(
-        text.contains("OLD_SECOND") && !text.contains("OLD_FIRST"),
-        "{polled}"
-    );
-    assert!(!text.contains("new reader"), "{polled}");
-    assert_eq!(polled["structuredContent"]["taskId"], handle);
-
-    let (listed, _) = client.modern_result(json!({"action": "list"}));
-    let task = &listed["tasks"][0];
-    assert_eq!(task["taskId"], handle.split_once('.').unwrap().0);
-    assert_eq!(task["owner"], "http-t1");
-}
-
-#[test]
-fn legacy_sse_responses_start_with_json_instead_of_empty_priming_events() {
-    let fixture = Fixture::new("sse-json");
-    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    let headers = "User-Agent: Google\r\nMCP-Protocol-Version: 2025-11-25\r\n";
-    for (method, params) in [
-        (
-            "initialize",
-            json!({
-                "protocolVersion": "2025-11-25",
-                "capabilities": {"roots": {"listChanged": true}, "sampling": {}},
-                "clientInfo": {"name": "mcp", "version": "0.1.0"},
-            }),
-        ),
-        ("tools/list", json!({})),
-        (
-            "tools/call",
-            json!({"name": "exec", "arguments": {"action": "list"}}),
-        ),
-    ] {
-        client.next_id += 1;
-        let id = client.next_id;
-        let response = client.post_with(
-            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string(),
-            headers,
-        );
-        assert_eq!(response.status, 200, "{method}: {}", response.body);
-        assert_eq!(response.header("content-type"), Some("text/event-stream"));
-        // Gemini rejects an empty priming event before it reads the JSON-RPC answer.
-        let data = response
-            .body
-            .lines()
-            .find_map(|line| line.strip_prefix("data:"))
-            .expect("an SSE data event");
-        let answer: Value = serde_json::from_str(data.trim())
-            .unwrap_or_else(|error| panic!("{method}: first SSE data must be JSON: {error}"));
-        assert_eq!(answer["id"], id);
-        assert!(answer["result"].is_object(), "{method}: {answer}");
-        match method {
-            "initialize" => {
-                assert_eq!(answer["result"]["protocolVersion"], "2025-11-25");
-                client.session = Some(response.header("mcp-session-id").unwrap().to_owned());
-                let notified = client.post_with(
-                    &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
-                    headers,
-                );
-                assert_eq!(notified.status, 202);
-            }
-            "tools/list" => assert!(!answer["result"]["tools"].as_array().unwrap().is_empty()),
-            "tools/call" => assert_ne!(answer["result"]["isError"], true),
-            _ => unreachable!(),
-        }
-    }
-}
-
-#[test]
-fn legacy_initialize_with_a_modern_version_keeps_its_client_session() {
-    let fixture = Fixture::new("legacy-new");
-    let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize_version("2026-07-28");
-    let (started, _) = client.result(json!({
-        "action": "start", "command": "true", "waitMs": 30000,
-    }));
-    let (listed, _) = client.result(json!({"action": "list"}));
-    let task = &listed["tasks"][0];
-    assert_eq!(
-        task["taskId"],
-        started["taskId"]
-            .as_str()
-            .unwrap()
-            .split_once('.')
-            .unwrap()
-            .0
-    );
-    assert!(
-        task["owner"].as_str().unwrap().starts_with("http-test-"),
-        "{task}"
-    );
 }
 
 #[test]
@@ -1218,19 +1034,19 @@ fn minimum_body_budget_keeps_outside_tenant_footer_whole_and_once_per_session() 
     fixture.start();
     let mut tenant = Client::new(fixture.addr, fixture.tokens[0].clone());
     let mut caller = Client::new(fixture.addr, fixture.tokens[1].clone());
-    let (started, _) = tenant.modern_result(json!({
+    let (started, _) = tenant.result(json!({
         "action": "start", "eof": false, "command": "read -r line", "waitMs": 0,
     }));
     // Footer lives outside the body maxBytes budget, so a 100-byte body still carries the
     // outside-task notice on the session's first call and does not repeat it on the second.
-    let (_, first_full) = caller.modern_result(json!({
+    let (_, first_full) = caller.result(json!({
         "action": "start", "command": "true", "waitMs": 30000, "maxBytes": 100,
     }));
     assert!(
         first_full.contains("1 task running outside this session; use list with scope \"all\"."),
         "{first_full}"
     );
-    let (_, second_call) = caller.modern_result(json!({
+    let (_, second_call) = caller.result(json!({
         "action": "start", "command": "true", "waitMs": 30000,
     }));
     assert!(
@@ -1248,7 +1064,7 @@ fn minimum_body_budget_keeps_outside_tenant_footer_whole_and_once_per_session() 
         ),
         "{first_full}"
     );
-    let (_, second_full) = caller.modern_result(json!({
+    let (_, second_full) = caller.result(json!({
         "action": "start", "command": "true", "waitMs": 30000,
     }));
     assert!(
@@ -1261,7 +1077,7 @@ fn minimum_body_budget_keeps_outside_tenant_footer_whole_and_once_per_session() 
 fn a_session_runs_a_task_over_http() {
     let fixture = Fixture::new("run");
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let mut tools = client.tools();
     tools.sort_unstable();
     assert_eq!(tools, ["edit", "exec", "read", "write"]);
@@ -1317,7 +1133,7 @@ fn a_session_runs_a_task_over_http() {
 fn a_stdio_endpoint_lists_the_task_an_http_session_started() {
     let fixture = Fixture::new("shared");
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let (structured, started) = client.result(json!({
         "action": "start", "command": "sleep 60", "waitMs": 0,
     }));
@@ -1335,19 +1151,16 @@ fn a_stdio_endpoint_lists_the_task_an_http_session_started() {
         .find(|task| task["taskId"] == json!(id.split_once('.').unwrap().0))
         .unwrap_or_else(|| panic!("the HTTP task is not listed: {text}"));
     assert!(
-        task["owner"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("http-test-"),
-        "the owner names the HTTP client: {task}"
+        task["owner"] == "http-t1",
+        "the owner names the HTTP principal: {task}"
     );
 }
 
 #[test]
 fn a_missing_or_wrong_token_is_refused_and_no_session_is_returned() {
     let fixture = Fixture::new("token");
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "x", "version": "0"},
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {
+        "_meta": protocol_meta("http-test"),
     }})
     .to_string();
     let missing = raw(fixture.addr, "", "", &body);
@@ -1382,10 +1195,10 @@ fn a_declared_body_over_the_cap_is_refused_before_it_is_read() {
     let response = exchange(fixture.addr, request.as_bytes());
     assert_eq!(response.status, 413, "{:?}", response.body);
     // A body that declares no length is capped as it arrives, and the request fails instead of
-    // being read to the end. The body is a valid `initialize` padded with whitespace past the cap,
+    // being read to the end. The body is a valid discovery request padded with whitespace past the cap,
     // so only the cap itself can make this request fail.
-    let mut body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "x", "version": "0"},
+    let mut body = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {
+        "_meta": protocol_meta("http-test"),
     }})
     .to_string();
     body.push_str(&" ".repeat((4 << 20) + 1 - body.len()));
@@ -1398,7 +1211,7 @@ fn a_declared_body_over_the_cap_is_refused_before_it_is_read() {
         .set_write_timeout(Some(Duration::from_secs(60)))
         .unwrap();
     let head = format!(
-        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAuthorization: Bearer {}\r\n\r\n",
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nAuthorization: Bearer {}\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\n\r\n",
         fixture.addr, fixture.tokens[0]
     );
     let _ = stream.write_all(head.as_bytes());
@@ -1445,14 +1258,14 @@ fn a_declared_body_over_the_cap_is_refused_before_it_is_read() {
 #[test]
 fn a_browser_origin_from_elsewhere_is_refused_and_none_is_accepted() {
     let fixture = Fixture::new("origin");
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "x", "version": "0"},
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {
+        "_meta": protocol_meta("http-test"),
     }})
     .to_string();
     let evil = raw(
         fixture.addr,
         &fixture.tokens[0],
-        "Origin: http://evil.example\r\n",
+        "Origin: http://evil.example\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\n",
         &body,
     );
     assert!(
@@ -1466,10 +1279,15 @@ fn a_browser_origin_from_elsewhere_is_refused_and_none_is_accepted() {
         "{:?}",
         evil.headers
     );
-    let plain = raw(fixture.addr, &fixture.tokens[0], "", &body);
+    let plain = raw(
+        fixture.addr,
+        &fixture.tokens[0],
+        "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\n",
+        &body,
+    );
     assert_eq!(plain.status, 200, "{:?}", plain.body);
     assert!(
-        plain.header("mcp-session-id").is_some(),
+        plain.header("mcp-session-id").is_none(),
         "{:?}",
         plain.headers
     );
@@ -1529,7 +1347,7 @@ fn file_tools_round_trip_over_http_and_name_transfer_for_a_binary() {
     {
         let plain = Fixture::new("files-plain");
         let mut client = Client::new(plain.addr, plain.tokens[0].clone());
-        client.initialize();
+        client.discover();
         let binary = client.call_tool("read", json!({"path": blob.display().to_string()}));
         assert_eq!(binary["isError"], json!(true), "{binary}");
         let text = binary["content"][0]["text"].as_str().unwrap_or_default();
@@ -1539,7 +1357,7 @@ fn file_tools_round_trip_over_http_and_name_transfer_for_a_binary() {
     let mut fixture = Fixture::bare("files").with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let path = dir.join("notes.txt");
     let written = client.call_tool(
         "write",
@@ -1631,7 +1449,7 @@ fn transfer_is_listed_over_http_and_names_the_scheme_the_client_saw() {
     let mut fixture = Fixture::bare("transfer-url").with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let tools = client.tools();
     assert!(tools.contains(&"transfer".to_owned()), "{tools:?}");
     let path = published(&fixture, "shot.bin");
@@ -1672,7 +1490,7 @@ fn a_named_root_wins_over_the_host_and_keeps_its_prefix() {
         .with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let path = published(&fixture, "rooted.bin");
     let url = publish(&mut client, &path);
     // The whole URL, not only its prefix: the root, then the id the listener checks itself.
@@ -1733,7 +1551,7 @@ fn a_second_start_with_another_root_keeps_the_root_the_daemon_has() {
         .with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     // A start that finds a running HTTP daemon keeps that daemon, and with it the root it minted
     // from when it started.
     fixture.public_url = Some("https://second.example/linux/".to_owned());
@@ -1748,21 +1566,15 @@ fn a_second_start_with_another_root_keeps_the_root_the_daemon_has() {
 fn a_path_that_is_not_mcp_is_not_found() {
     let fixture = Fixture::new("routes");
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "prefix", "version": "1"}
-        }
+        "method": "server/discover",
+        "params": {"_meta": protocol_meta("prefix")}
     })
     .to_string();
-    // `initialize` answers on the one route a session uses, and on nothing that only looks like it:
-    // a proxy that forwards its prefix unstripped fails here, at initialize, rather than later at a
-    // download.
+    // A proxy must strip its prefix before forwarding the discovery request.
     for (target, status) in [
         ("/mcp", 200),
         ("/mcp/", 404),
@@ -1770,7 +1582,13 @@ fn a_path_that_is_not_mcp_is_not_found() {
         ("/MCP", 404),
         ("/t/mcp", 404),
     ] {
-        let answer = post_to(fixture.addr, &fixture.tokens[0], target, "", &body);
+        let answer = post_to(
+            fixture.addr,
+            &fixture.tokens[0],
+            target,
+            "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\n",
+            &body,
+        );
         assert_eq!(answer.status, status, "{target}: {:?}", answer.body);
     }
     // A path nobody may use is refused as unauthenticated before it is reported missing.
@@ -1815,7 +1633,7 @@ fn an_upload_and_a_download_over_t_need_no_token() {
     let mut fixture = Fixture::bare("transfer-io").with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let file = published(&fixture, "up.bin");
     let target = target_of(&publish(&mut client, &file));
     let addr = fixture.addr;
@@ -1865,7 +1683,7 @@ fn ranges_offsets_and_unknown_ids_answer_as_specified() {
     let mut fixture = Fixture::bare("transfer-edges").with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let file = published(&fixture, "edges.bin");
     std::fs::write(&file, b"hello world").unwrap();
     let target = target_of(&publish(&mut client, &file));
@@ -1948,7 +1766,7 @@ fn an_interrupted_upload_leaves_a_prefix_that_resumes() {
     let mut fixture = Fixture::bare("transfer-resume").with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let file = published(&fixture, "resume.bin");
     let target = target_of(&publish(&mut client, &file));
     let addr = fixture.addr;
@@ -2003,7 +1821,7 @@ fn an_upload_larger_than_the_call_cap_arrives_whole() {
     let mut fixture = Fixture::bare("transfer-large").with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let file = published(&fixture, "large.bin");
     let target = target_of(&publish(&mut client, &file));
     let addr = fixture.addr;
@@ -2064,7 +1882,7 @@ fn a_refused_disk_write_is_not_acknowledged_as_success() {
     let mut fixture = Fixture::bare("transfer-sealed").with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let addr = fixture.addr;
     // The control: an unsealed memory file accepts the same upload and answers its size.
     let open = MemoryFile::new(false);
@@ -2181,7 +1999,7 @@ fn transfer_uploads_to_one_file_serialize_across_capabilities_and_aliases() {
     fixture.cwd = Some(fixture.runtime.clone());
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     // A previously missing file gets two IDs; opening it must not give each upload its own lock.
     let file = published(&fixture, "same.bin");
     let first = target_of(&publish(&mut client, &file));
@@ -2228,7 +2046,7 @@ fn transfer_uploads_to_different_files_do_not_wait_for_each_other() {
     let mut fixture = Fixture::bare("transfer-independent").with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let first_file = published(&fixture, "first.bin");
     let second_file = published(&fixture, "second.bin");
     let first = target_of(&publish(&mut client, &first_file));
@@ -2347,7 +2165,7 @@ fn http_unauthorized_incomplete_bodies_do_not_hold_a_connection() {
 fn http_a_long_tool_call_outlives_the_header_deadline() {
     let fixture = Fixture::new("http-long-tool-call");
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let result = client.call_tool(
         "exec",
         json!({
@@ -2381,7 +2199,7 @@ fn disconnected_uploads_waiting_for_the_same_file_release_their_descriptors() {
             .count()
     };
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let file = published(&fixture, "paused.bin");
     let target = target_of(&publish(&mut client, &file));
     let paused = begin_paused_upload(fixture.addr, &target);
@@ -2429,7 +2247,7 @@ fn malformed_or_truncated_upload_bodies_keep_the_prefix_but_are_not_successful()
     let mut fixture = Fixture::bare("transfer-invalid-body").with_transfer("true");
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
     let file = published(&fixture, "partial.bin");
     let target = target_of(&publish(&mut client, &file));
     for (framing, body) in [
@@ -2546,7 +2364,7 @@ fn yolo_overrides_all_http_tools_and_rejects_invalid_values() {
     {
         let fixture = Fixture::new("yolo-core-off");
         let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
-        let modern_listed = modern.modern("tools/list", json!({}));
+        let modern_listed = modern.request("tools/list", json!({}));
         let tools = modern_listed["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 4, "{modern_listed}");
         for (name, expected) in &core_defaults {
@@ -2559,20 +2377,13 @@ fn yolo_overrides_all_http_tools_and_rejects_invalid_values() {
         let mut fixture = Fixture::bare("yolo-off").with_transfer("true");
         fixture.start();
         let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
-        let modern_listed = modern.modern("tools/list", json!({}));
-        let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
-        legacy.initialize();
-        let legacy_listed =
-            legacy.send(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list"}));
-        let legacy_tools = legacy_listed.answer(99)["result"]["tools"].clone();
-
-        for tools_value in [&modern_listed["tools"], &legacy_tools] {
-            let tools = tools_value.as_array().unwrap();
-            assert_eq!(tools.len(), 5, "{tools_value}");
-            for (name, expected) in &with_transfer_defaults {
-                let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
-                assert_eq!(&tool["annotations"], expected, "default {name}: {tool}");
-            }
+        let modern_listed = modern.request("tools/list", json!({}));
+        let tools_value = &modern_listed["tools"];
+        let tools = tools_value.as_array().unwrap();
+        assert_eq!(tools.len(), 5, "{tools_value}");
+        for (name, expected) in &with_transfer_defaults {
+            let tool = tools.iter().find(|tool| tool["name"] == *name).unwrap();
+            assert_eq!(&tool["annotations"], expected, "default {name}: {tool}");
         }
     }
 
@@ -2593,30 +2404,23 @@ fn yolo_overrides_all_http_tools_and_rejects_invalid_values() {
         ];
         fixture.start();
         let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
-        let modern_listed = modern.modern("tools/list", json!({}));
-        let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
-        legacy.initialize();
-        let legacy_listed =
-            legacy.send(json!({"jsonrpc": "2.0", "id": 99, "method": "tools/list"}));
-        let legacy_tools = legacy_listed.answer(99)["result"]["tools"].clone();
-
-        for tools_value in [&modern_listed["tools"], &legacy_tools] {
-            let tools = tools_value.as_array().unwrap();
-            assert_eq!(tools.len(), all_titles.len(), "{tools_value}");
-            for (name, title) in all_titles {
-                let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
-                assert_eq!(
-                    tool["annotations"],
-                    json!({
-                        "title": title,
-                        "readOnlyHint": true,
-                        "destructiveHint": false,
-                        "idempotentHint": false,
-                        "openWorldHint": false,
-                    }),
-                    "yolo=true {name}: {tool}"
-                );
-            }
+        let modern_listed = modern.request("tools/list", json!({}));
+        let tools_value = &modern_listed["tools"];
+        let tools = tools_value.as_array().unwrap();
+        assert_eq!(tools.len(), all_titles.len(), "{tools_value}");
+        for (name, title) in all_titles {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(
+                tool["annotations"],
+                json!({
+                    "title": title,
+                    "readOnlyHint": true,
+                    "destructiveHint": false,
+                    "idempotentHint": false,
+                    "openWorldHint": false,
+                }),
+                "yolo=true {name}: {tool}"
+            );
         }
     }
 
@@ -2691,19 +2495,13 @@ fn stdio_transfer_endpoint_shares_the_http_daemons_transfer_route() {
     writeln!(
         stdin,
         "{}",
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"stdio-xfer","version":"0"}}})
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":protocol_meta("stdio-xfer")}})
     )
     .unwrap();
     writeln!(
         stdin,
         "{}",
-        json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"transfer","arguments":{"path":file.display().to_string()}}})
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"transfer","arguments":{"path":file.display().to_string()},"_meta":protocol_meta("stdio-xfer")}})
     )
     .unwrap();
     stdin.flush().unwrap();
@@ -2753,7 +2551,7 @@ fn codemode_http_runs_nested_tools_and_attaches_images() {
     fixture.cwd = Some(fixture.runtime.clone());
     fixture.start();
     let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
-    let listed = modern.modern("tools/list", json!({}));
+    let listed = modern.request("tools/list", json!({}));
     let tool = listed["tools"]
         .as_array()
         .unwrap()
@@ -2763,7 +2561,7 @@ fn codemode_http_runs_nested_tools_and_attaches_images() {
     assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
     assert_eq!(tool["annotations"]["destructiveHint"], false, "{tool}");
     let code = "const result = await tools.exec({action:'start',command:'printf http-codemode',loginShell:false}); text(result.output); attach(await tools.read({path:'shot.png'}));";
-    let result = modern.modern(
+    let result = modern.request(
         "tools/call",
         json!({"name":"codemode","arguments":{"code":code}}),
     );
@@ -2789,17 +2587,6 @@ fn codemode_http_runs_nested_tools_and_attaches_images() {
     );
     assert_eq!(
         result["structuredContent"]["codemode"]["attachmentsDelivered"][0]["index"], 1,
-        "{result}"
-    );
-    let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
-    legacy.initialize();
-    let result = legacy.call_tool("codemode", json!({"code":"return 'legacy-codemode'"}));
-    assert_eq!(result["structuredContent"]["exitCode"], 0, "{result}");
-    assert!(
-        result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("legacy-codemode"),
         "{result}"
     );
 }
@@ -2828,7 +2615,7 @@ fn transfer_reports_resolved_path_and_size_and_refuses_directories_and_non_missi
     fixture.cwd = Some(cwd_dir.clone());
     fixture.start();
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
 
     let existing = client.call_tool("transfer", json!({"path": "sub/existing.bin"}));
     assert_eq!(existing["isError"], false, "{existing}");
@@ -2940,9 +2727,9 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
     fixture.tokens = vec![random_token(), random_token()];
     fixture.start();
     let mut c1 = Client::new(fixture.addr, fixture.tokens[0].clone());
-    c1.initialize();
+    c1.discover();
     let mut c2 = Client::new(fixture.addr, fixture.tokens[1].clone());
-    c2.initialize();
+    c2.discover();
 
     c1.next_id += 1;
     let list_id = c1.next_id;
@@ -2969,19 +2756,13 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
         writeln!(
             stdin,
             "{}",
-            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}})
+            json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":protocol_meta("schema-test")}})
         )
         .unwrap();
         writeln!(
             stdin,
             "{}",
-            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-        )
-        .unwrap();
-        writeln!(
-            stdin,
-            "{}",
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":protocol_meta("schema-test")}})
         )
         .unwrap();
         stdin.flush().unwrap();
@@ -3049,10 +2830,8 @@ fn http_portable_schemas_1mib_input_and_singular_outside_token_footer() {
     .to_string()
     .len();
     let req_head = format!(
-        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {too_big_len}\r\nConnection: close\r\nAuthorization: Bearer {}\r\nMcp-Session-Id: {}\r\n\r\n",
-        fixture.addr,
-        c1.token,
-        c1.session.as_deref().unwrap()
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {too_big_len}\r\nConnection: close\r\nAuthorization: Bearer {}\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: exec\r\n\r\n",
+        fixture.addr, c1.token
     );
     let resp_413 = exchange(fixture.addr, req_head.as_bytes());
     assert_eq!(resp_413.status, 413, "{}", resp_413.body);
@@ -3147,30 +2926,25 @@ fn http_login_snapshots_are_session_scoped_and_strip_removed_variables() {
         );
     };
     let mut client = Client::new(addr, fixture.tokens[0].clone());
-    check(client.modern_result(request.clone()), "from_profile");
+    check(client.result(request.clone()), "from_profile");
 
     set_profile("other_token");
     let mut other = Client::new(addr, fixture.tokens[1].clone());
-    check(other.modern_result(request.clone()), "other_token");
-    check(client.modern_result(request.clone()), "from_profile");
+    check(other.result(request.clone()), "other_token");
+    check(client.result(request.clone()), "from_profile");
 
-    set_profile("legacy_one");
-    let mut legacy_one = Client::new(addr, fixture.tokens[0].clone());
-    legacy_one.initialize();
-    check(legacy_one.result(request.clone()), "legacy_one");
-    set_profile("legacy_two");
-    let mut legacy_two = Client::new(addr, fixture.tokens[0].clone());
-    legacy_two.initialize();
-    check(legacy_two.result(request.clone()), "legacy_two");
-    check(legacy_one.result(request.clone()), "legacy_one");
-    check(other.modern_result(request), "other_token");
+    set_profile("changed_after_probe");
+    let mut reconnect = Client::new(addr, fixture.tokens[0].clone());
+    reconnect.discover();
+    check(reconnect.result(request.clone()), "from_profile");
+    check(other.result(request), "other_token");
     assert_eq!(
         std::fs::read_to_string(home.join("profile-count"))
             .unwrap()
             .lines()
             .count(),
-        4,
-        "each principal and legacy session probes exactly once"
+        2,
+        "each principal probes exactly once"
     );
     let _ = fixture.run(&["daemon", "stop"]);
     let _ = spawned.wait();
@@ -3179,7 +2953,7 @@ fn http_login_snapshots_are_session_scoped_and_strip_removed_variables() {
 const BUILTIN_DAEMON_INSTRUCTIONS: &str = "Run bash tasks with exec and read, write, and edit files on this host.\nPrefer it over one-shot shell tools when a command may outlive a single call or needs input; tasks run in a shared background daemon, outlive this session, and are visible to every session using it.";
 
 #[test]
-fn http_instructions_file_matches_initialize_and_discover_and_stays_pinned() {
+fn http_instructions_file_discovery_stays_pinned() {
     let mut fixture = Fixture::bare("instructions-pin");
     let file = fixture.runtime.join("extra.txt");
     std::fs::write(&file, "    pinned line\r\nsecond line\r\n").unwrap();
@@ -3188,14 +2962,9 @@ fn http_instructions_file_matches_initialize_and_discover_and_stays_pinned() {
 
     let expected = format!("{BUILTIN_DAEMON_INSTRUCTIONS}\n\n    pinned line\nsecond line\n");
     let check = |fixture: &Fixture| {
-        let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
-        let init = legacy.initialize();
-        assert_eq!(init["instructions"].as_str(), Some(expected.as_str()));
-
-        let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
-        let discover = modern.modern("server/discover", json!({}));
+        let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
+        let discover = client.discover();
         assert_eq!(discover["instructions"].as_str(), Some(expected.as_str()));
-        assert_eq!(init["instructions"], discover["instructions"]);
     };
 
     check(&fixture);
@@ -3220,11 +2989,11 @@ fn shared_namespace_isolates_http_and_stdio_instructions_files() {
 
     let mut http = Client::new(fixture.addr, fixture.tokens[0].clone());
     assert_eq!(
-        http.initialize()["instructions"].as_str(),
+        http.discover()["instructions"].as_str(),
         Some(expected_a.as_str())
     );
     assert_eq!(
-        http.modern("server/discover", json!({}))["instructions"].as_str(),
+        http.request("server/discover", json!({}))["instructions"].as_str(),
         Some(expected_a.as_str())
     );
 
@@ -3240,7 +3009,7 @@ fn shared_namespace_isolates_http_and_stdio_instructions_files() {
 
     let mut http_after = Client::new(fixture.addr, fixture.tokens[0].clone());
     assert_eq!(
-        http_after.modern("server/discover", json!({}))["instructions"].as_str(),
+        http_after.request("server/discover", json!({}))["instructions"].as_str(),
         Some(expected_a.as_str())
     );
 }
@@ -3283,11 +3052,11 @@ fn idempotent_http_start_keeps_running_daemon_instructions() {
 
     let mut client = Client::new(original_addr, fixture.tokens[0].clone());
     assert_eq!(
-        client.initialize()["instructions"].as_str(),
+        client.discover()["instructions"].as_str(),
         Some(expected.as_str())
     );
     assert_eq!(
-        client.modern("server/discover", json!({}))["instructions"].as_str(),
+        client.request("server/discover", json!({}))["instructions"].as_str(),
         Some(expected.as_str())
     );
 }
@@ -3366,21 +3135,21 @@ fn http_instructions_tool_move_and_copy_pin_snapshot_and_reject_extra_args() {
         };
 
         let verify = |fixture: &Fixture, stage: &str| {
-            let mut legacy = Client::new(fixture.addr, fixture.tokens[0].clone());
-            let init = legacy.initialize();
+            let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
+            let discover = client.discover();
             assert_eq!(
-                init["instructions"].as_str(),
+                discover["instructions"].as_str(),
                 Some(expected_proto.as_str()),
-                "{mode} {stage} initialize"
+                "{mode} {stage} discovery"
             );
             if mode == "move" {
                 assert!(
-                    !init["instructions"].as_str().unwrap().contains(marker),
-                    "{mode} {stage} leaked file into initialize"
+                    !discover["instructions"].as_str().unwrap().contains(marker),
+                    "{mode} {stage} leaked file into discovery"
                 );
             }
 
-            let tool = http_list_tool(&mut legacy, "instructions")
+            let tool = http_list_tool(&mut client, "instructions")
                 .unwrap_or_else(|| panic!("{mode} {stage}: missing instructions tool"));
             assert_eq!(
                 tool["description"].as_str(),
@@ -3390,21 +3159,20 @@ fn http_instructions_tool_move_and_copy_pin_snapshot_and_reject_extra_args() {
             assert_eq!(tool["inputSchema"], expected_schema, "{mode} {stage}");
             assert_eq!(tool["annotations"], expected_annotations, "{mode} {stage}");
 
-            let empty_res = legacy.call_tool("instructions", json!({}));
+            let empty_res = client.call_tool("instructions", json!({}));
             assert_http_instructions_result(
                 &empty_res,
                 &expected_tool,
-                &format!("{mode} {stage} legacy {{}}"),
+                &format!("{mode} {stage} client {{}}"),
             );
 
-            // Also verify omitted and null arguments over legacy HTTP session.
             for (label, params) in [
                 ("omitted", json!({"name": "instructions"})),
                 ("null", json!({"name": "instructions", "arguments": null})),
             ] {
-                legacy.next_id += 1;
-                let id = legacy.next_id;
-                let resp = legacy.send(json!({
+                client.next_id += 1;
+                let id = client.next_id;
+                let resp = client.send(json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "method": "tools/call",
@@ -3419,9 +3187,9 @@ fn http_instructions_tool_move_and_copy_pin_snapshot_and_reject_extra_args() {
             }
 
             // Extra arguments must fail with JSON-RPC -32602.
-            legacy.next_id += 1;
-            let err_id = legacy.next_id;
-            let err_resp = legacy.send(json!({
+            client.next_id += 1;
+            let err_id = client.next_id;
+            let err_resp = client.send(json!({
                 "jsonrpc": "2.0",
                 "id": err_id,
                 "method": "tools/call",
@@ -3433,32 +3201,6 @@ fn http_instructions_tool_move_and_copy_pin_snapshot_and_reject_extra_args() {
                 json!(-32602),
                 "{mode} {stage} extra args: {}",
                 err_resp.body
-            );
-
-            // Sessionless modern server/discover + tools/call.
-            let mut modern = Client::new(fixture.addr, fixture.tokens[0].clone());
-            let discover = modern.modern("server/discover", json!({}));
-            assert_eq!(
-                discover["instructions"].as_str(),
-                Some(expected_proto.as_str()),
-                "{mode} {stage} server/discover"
-            );
-            let modern_list = modern.modern("tools/list", json!({}));
-            let modern_tool = modern_list["tools"]
-                .as_array()
-                .expect("modern tools/list array")
-                .iter()
-                .find(|tool| tool["name"] == "instructions")
-                .expect("modern instructions tool");
-            assert_eq!(modern_tool, &tool, "{mode} {stage} modern tool metadata");
-            let modern_call = modern.modern(
-                "tools/call",
-                json!({"name": "instructions", "arguments": {}}),
-            );
-            assert_http_instructions_result(
-                &modern_call,
-                &expected_tool,
-                &format!("{mode} {stage} modern call"),
             );
         };
 
@@ -3488,7 +3230,7 @@ fn shared_namespace_isolates_http_and_stdio_instructions_tool_modes() {
 
     let mut http = Client::new(fixture.addr, fixture.tokens[0].clone());
     assert_eq!(
-        http.initialize()["instructions"].as_str(),
+        http.discover()["instructions"].as_str(),
         Some(http_proto.as_str())
     );
     assert_eq!(
@@ -3554,10 +3296,10 @@ fn shared_namespace_isolates_http_and_stdio_instructions_tool_modes() {
     // HTTP daemon remains unaffected by stdio endpoints on the same namespace.
     let mut http_after = Client::new(fixture.addr, fixture.tokens[0].clone());
     assert_eq!(
-        http_after.modern("server/discover", json!({}))["instructions"].as_str(),
+        http_after.request("server/discover", json!({}))["instructions"].as_str(),
         Some(http_proto.as_str())
     );
-    let http_call_after = http_after.modern(
+    let http_call_after = http_after.request(
         "tools/call",
         json!({"name": "instructions", "arguments": {}}),
     );
@@ -3567,7 +3309,7 @@ fn shared_namespace_isolates_http_and_stdio_instructions_tool_modes() {
 #[cfg(debug_assertions)]
 #[test]
 #[ignore = "WONT FIX: official rmcp HTTP body ownership requires upstream hooks"]
-fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops() {
+fn slow_http_client_holds_active_memory_lease_until_response_completes_or_drops() {
     let mut fixture = Fixture::bare("slow-sse-lease");
     let workdir = fixture.runtime.join("work");
     std::fs::create_dir_all(&workdir).unwrap();
@@ -3583,14 +3325,14 @@ fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops()
     fixture.start();
 
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    let fits = client.modern(
+    let fits = client.request(
         "tools/call",
         json!({"name": "read", "arguments": {"path": "big.pdf"}}),
     );
     assert_eq!(fits["isError"], json!(false), "one response must fit");
     assert_eq!(fits["structuredContent"]["bytes"], json!(pdf.len()));
     drop(fits);
-    client.initialize();
+    client.discover();
 
     let body = serde_json::to_string(&json!({
         "jsonrpc": "2.0",
@@ -3598,7 +3340,8 @@ fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops()
         "method": "tools/call",
         "params": {
             "name": "read",
-            "arguments": {"path": "big.pdf"}
+            "arguments": {"path": "big.pdf"},
+            "_meta": protocol_meta("slow-reader")
         }
     }))
     .unwrap();
@@ -3607,17 +3350,16 @@ fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops()
         .unwrap();
     write!(
         slow,
-        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMcp-Session-Id: {}\r\nContent-Length: {}\r\n\r\n{}",
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: read\r\nContent-Length: {}\r\n\r\n{}",
         fixture.addr,
         fixture.tokens[0],
-        client.session.as_deref().expect("legacy session id"),
         body.len(),
         body
     )
     .unwrap();
     slow.flush().unwrap();
 
-    // Read past HTTP headers into the first 64 bytes of the SSE `data:` event, then stop reading.
+    // Read the JSON response prefix, then stop reading.
     let mut reader = std::io::BufReader::with_capacity(256, slow);
     let mut line = String::new();
     loop {
@@ -3631,20 +3373,22 @@ fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops()
     let mut peek = [0u8; 64];
     reader.read_exact(&mut peek).unwrap();
     assert!(
-        std::str::from_utf8(&peek).unwrap().contains("data:"),
-        "expected SSE data prefix, got {:?}",
+        std::str::from_utf8(&peek)
+            .unwrap()
+            .contains("\"jsonrpc\":\"2.0\""),
+        "expected JSON response prefix, got {:?}",
         String::from_utf8_lossy(&peek)
     );
 
     // A second read fails while the HTTP body owns the first result.
-    let second = client.modern(
+    let second = client.request(
         "tools/call",
         json!({"name": "read", "arguments": {"path": "big.pdf"}}),
     );
     assert_eq!(
         second["isError"],
         json!(true),
-        "expected overload while slow SSE is open: {second}"
+        "expected overload while slow HTTP is open: {second}"
     );
     assert!(
         second["content"][0]["text"]
@@ -3660,7 +3404,7 @@ fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops()
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut recovered = false;
     while Instant::now() < deadline {
-        let third = client.modern(
+        let third = client.request(
             "tools/call",
             json!({"name": "read", "arguments": {"path": "big.pdf"}}),
         );
@@ -3674,7 +3418,7 @@ fn slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops()
     }
     assert!(
         recovered,
-        "active memory lease was not reclaimed after slow SSE client closed"
+        "active memory lease was not reclaimed after slow HTTP client closed"
     );
 }
 
@@ -3686,11 +3430,11 @@ fn http_control_reserve_survives_output_admission_failure() {
     fixture.start();
 
     let mut client = Client::new(fixture.addr, fixture.tokens[0].clone());
-    client.initialize();
+    client.discover();
 
-    // Allow the initialize/request payloads, but not the text output workspace.
+    // Discovery and request payloads fit; the text output workspace does not.
     // `start` runs, then delivers its taskId receipt through the control reserve.
-    let started = client.modern(
+    let started = client.request(
         "tools/call",
         json!({
             "name": "exec",
@@ -3702,7 +3446,7 @@ fn http_control_reserve_survives_output_admission_failure() {
     assert!(overload_text.contains("taskId: "), "{overload_text}");
 
     // `list` still succeeds while ordinary output admission is unavailable.
-    let listed = client.modern(
+    let listed = client.request(
         "tools/call",
         json!({
             "name": "exec",
@@ -3716,7 +3460,7 @@ fn http_control_reserve_survives_output_admission_failure() {
     assert!(overload_text.contains(&bare_id), "{overload_text}");
 
     // `kill` also succeeds via the 8 MiB control reserve and stops the task.
-    let killed = client.modern(
+    let killed = client.request(
         "tools/call",
         json!({
             "name": "exec",
