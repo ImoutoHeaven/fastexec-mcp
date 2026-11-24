@@ -705,7 +705,6 @@ impl Task {
 
     /// Whether the task has any condition that `task_warnings` reports, without cloning
     /// diagnostics. Uses the same non-nested lock order as `snapshot_at_reserved`.
-    #[allow(dead_code)]
     pub fn has_warnings_unlocked(&self) -> bool {
         let end_output_open = lock(&self.end).as_ref().is_some_and(|end| end.output_open);
         let tree_done = *self.tree_done.borrow();

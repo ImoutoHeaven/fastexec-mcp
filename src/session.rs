@@ -444,12 +444,17 @@ impl Session {
 
 /// Splits an optional reader suffix before lookup or any task side effect.
 pub fn parse_handle(handle: &str) -> Result<(&str, Option<&str>), String> {
+    parse_handle_for(handle, "taskId")
+}
+
+/// Splits an optional reader suffix, naming `field` on malformed handles.
+pub fn parse_handle_for<'a>(handle: &'a str, field: &str) -> Result<(&'a str, Option<&'a str>), String> {
     let Some((id, key)) = handle.split_once('.') else {
         return Ok((handle, None));
     };
     if id.is_empty() || key.len() != 4 || !key.bytes().all(|byte| ALPHABET.contains(&byte)) {
         return Err(format!(
-            "Unknown taskId {handle:?}. Use a bare task ID or <taskId>.<reader>, with 4 Crockford base32 reader characters."
+            "Unknown {field} {handle:?}. Use a bare task ID or <taskId>.<reader>, with 4 Crockford base32 reader characters."
         ));
     }
     Ok((id, Some(key)))
@@ -543,6 +548,14 @@ impl TaskEntry {
             self.reported.store(true, Ordering::SeqCst);
         }
         if shown.tree_ended {
+            self.tree_end_reported.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Marks a folded finished child reported without building a full `Snapshot`.
+    pub fn mark_finished_reported(&self, tree_ended: bool) {
+        self.reported.store(true, Ordering::SeqCst);
+        if tree_ended {
             self.tree_end_reported.store(true, Ordering::SeqCst);
         }
     }

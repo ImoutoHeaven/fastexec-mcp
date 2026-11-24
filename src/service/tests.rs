@@ -1817,16 +1817,72 @@ async fn a_cancelled_token_wins_over_a_ready_result() {
 
 #[test]
 fn a_large_list_row_does_not_hide_the_opposite_end() {
+    let block = |lines: Vec<String>| ListBlock {
+        lines,
+        delivered_tasks: Vec::new(),
+        folded_finished: Vec::new(),
+        folded_count: 0,
+    };
     for (rows, want, omitted_at_start) in [
-        (vec!["x".repeat(200), "short".into()], 1, true),
-        (vec!["short".into(), "x".repeat(200)], 0, false),
+        (vec![block(vec!["x".repeat(200)]), block(vec!["short".into()])], 1, true),
+        (vec![block(vec!["short".into()]), block(vec!["x".repeat(200)])], 0, false),
     ] {
-        let (indexes, text) = fit_lines(&rows, Truncate::HeadTail, 100);
+        let (kept, text) = fit_lines(&rows, Truncate::HeadTail, 100);
+        let indexes: Vec<usize> = kept.into_iter().map(|(index, _)| index).collect();
         assert_eq!(indexes, [want]);
         assert_eq!(text.starts_with("... [1 task"), omitted_at_start);
         assert!(text.contains("short"));
         assert!(text.len() <= 100);
     }
+}
+
+#[test]
+fn fit_lines_keeps_parent_and_children_atomic_and_trims_single_block_bottom_up() {
+    let block = |lines: Vec<String>| ListBlock {
+        lines,
+        delivered_tasks: Vec::new(),
+        folded_finished: Vec::new(),
+        folded_count: 0,
+    };
+    let blocks = vec![
+        block(vec![
+            "p1 [running] 1.0s · owner · [codemode] a".into(),
+            "  └─ c1 [running] 0.5s · cmd1".into(),
+            "  └─ c2 [running] 0.4s · cmd2".into(),
+        ]),
+        block(vec![
+            "p2 [running] 1.0s · owner · [codemode] b".into(),
+            "  └─ c3 [running] 0.5s · cmd3".into(),
+        ]),
+        block(vec!["p3 [exited 0] 0.2s · owner · echo ok".into()]),
+    ];
+    let (kept, text) = fit_lines(&blocks, Truncate::HeadTail, 215);
+    assert!(text.len() <= 215, "{text}");
+    assert!(text.contains("... [1 tasks omitted; raise maxBytes to see them] ..."), "{text}");
+    // Never emits an indented child without its parent header right above it.
+    let mut saw_parent = false;
+    for line in text.lines() {
+        if line.starts_with("  └─") {
+            assert!(saw_parent, "orphaned child line in:\n{text}");
+        } else {
+            saw_parent = !line.starts_with("... [");
+        }
+    }
+    let indexes: Vec<usize> = kept.into_iter().map(|(index, _)| index).collect();
+    assert_eq!(indexes, [0, 2]);
+
+    // Single oversized block trims indented children from the bottom before cutting the parent.
+    let single = vec![block(vec![
+        "p1 [running] 1.0s · owner · [codemode] a".into(),
+        "  └─ c1 [running] 0.5s · cmd1".into(),
+        "  └─ c2 [running] 0.4s · cmd2".into(),
+    ])];
+    let (kept, text) = fit_lines(&single, Truncate::HeadTail, 80);
+    assert_eq!(kept, [(0, 0)]);
+    assert!(text.starts_with("p1 [running]"), "{text}");
+    assert!(text.contains("c1 [running]"), "{text}");
+    assert!(!text.contains("c2 [running]"), "{text}");
+    assert!(text.len() <= 80, "{text}");
 }
 
 #[test]

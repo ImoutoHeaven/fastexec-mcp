@@ -19,9 +19,9 @@ use self::schema::{
 };
 use crate::lease::Lease;
 use crate::platform::process;
-use crate::session::{ProbeWarning, ReadState, Reader, Session, parse_handle};
-use crate::tasks::state::Task;
-use crate::tasks::{self, ScriptArgs, StartArgs, Tasks};
+use crate::session::{ProbeWarning, ReadState, Reader, Session, parse_handle, parse_handle_for};
+use crate::tasks::state::{Snapshot, Task};
+use crate::tasks::{self, ChildSummary, ListQuery, ListedResult, ScriptArgs, StartArgs, Tasks};
 use crate::term::keys;
 use crate::term::output::{self, Truncate};
 use crate::wait;
@@ -414,8 +414,9 @@ impl Service {
                 let (listed, lease, owner) = self.list(
                     call,
                     &view,
-                    request.scope.unwrap_or_default(),
+                    request.scope,
                     request.state,
+                    request.parent_task_id.as_deref(),
                     request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
                 )?;
                 Ok((listed, lease, None, owner))
@@ -742,35 +743,39 @@ impl Service {
         }
     }
 
-    fn task<'a>(&self, handle: Option<&'a str>) -> Result<(Arc<Task>, Option<&'a str>), String> {
-        let (id, key) = parse_handle(handle.unwrap_or_default())?;
-        if let Some(task) = self.tasks.find(id) {
-            return Ok((task, key));
-        }
+    fn unknown_task_error(&self, field: &str, id: &str) -> String {
         // A well-formed ID whose epoch differs came from an earlier server or daemon.
         let epoch_differs = tasks::is_valid_task_id(id)
             && id
                 .split_once('-')
                 .is_some_and(|(epoch, _)| epoch != self.tasks.epoch());
-        Err(if self.daemon {
+        if self.daemon {
             if epoch_differs {
                 format!(
-                    "Unknown taskId {id:?}: it comes from an earlier fastexec daemon; tasks do not survive a daemon restart. Use action list to see this daemon's tasks."
+                    "Unknown {field} {id:?}: it comes from an earlier fastexec daemon; tasks do not survive a daemon restart. Use action list to see this daemon's tasks."
                 )
             } else {
                 format!(
-                    "Unknown taskId {id:?}. Finished tasks are kept for up to 24 h; use action list to see this daemon's tasks."
+                    "Unknown {field} {id:?}. Finished tasks are kept for up to 24 h; use action list to see this daemon's tasks."
                 )
             }
         } else if epoch_differs {
             format!(
-                "Unknown taskId {id:?}: it comes from an earlier fastexec server; tasks do not survive a restart. Use action list to see this server's tasks."
+                "Unknown {field} {id:?}: it comes from an earlier fastexec server; tasks do not survive a restart. Use action list to see this server's tasks."
             )
         } else {
             format!(
-                "Unknown taskId {id:?}. Tasks live as long as this server; use action list to see them."
+                "Unknown {field} {id:?}. Tasks live as long as this server; use action list to see them."
             )
-        })
+        }
+    }
+
+    fn task<'a>(&self, handle: Option<&'a str>) -> Result<(Arc<Task>, Option<&'a str>), String> {
+        let (id, key) = parse_handle(handle.unwrap_or_default())?;
+        if let Some(task) = self.tasks.find(id) {
+            return Ok((task, key));
+        }
+        Err(self.unknown_task_error("taskId", id))
     }
 
     fn background<'a>(
@@ -828,26 +833,39 @@ impl Service {
         &self,
         call: &Call<'_>,
         view: &View,
-        scope: ListScope,
+        scope: Option<ListScope>,
         state: Option<ListState>,
+        parent_task_id: Option<&str>,
         limit: usize,
     ) -> Result<(CallToolResult, Option<Lease>, crate::lease::Owner), ServiceError> {
         if call.cancel.is_cancelled() {
             return Err("Cancelled while listing tasks; retry list.".into());
         }
+        let parent_id = match parent_task_id {
+            Some(raw) => Some(parse_handle_for(raw, "parentTaskId")?.0),
+            None => None,
+        };
+        let all_scope = match scope {
+            Some(ListScope::All) => true,
+            Some(ListScope::Session) => false,
+            None => parent_id.is_some(),
+        };
         let session = call.session;
         // Declared before every candidate: all text drops before its workspace on error.
         let workspace = std::cell::RefCell::new(Lease::empty(call.launch().control_memory()));
         resize_metadata_workspace(&mut workspace.borrow_mut(), 8192, call, Action::List)
             .map_err(|message| ServiceError::Overload(message, None))?;
         let active_filter = state.map(|state| state == ListState::Active);
-        let (total_count, selected) = self
+        let ListedResult { total_count, items } = match self
             .tasks
             .listed(
                 session,
-                scope == ListScope::All,
-                active_filter,
-                limit,
+                ListQuery {
+                    all_scope,
+                    active_filter,
+                    parent_task_id: parent_id,
+                    limit,
+                },
                 &mut |bytes| {
                     let mut held = workspace.borrow_mut();
                     let target = held.bytes().saturating_add(metadata_workspace_bytes(bytes));
@@ -855,71 +873,137 @@ impl Service {
                 },
                 &mut |tree| metadata_members(tree, &mut workspace.borrow_mut(), call, Action::List),
             )
-            .map_err(|message| ServiceError::Overload(message, None))?;
-        let (listed, delivered) = {
-            let mut lines = Vec::with_capacity(selected.len());
-            let mut entries = Vec::with_capacity(selected.len());
-            let mut warnings = Vec::new();
-            for (task, snapshot) in &selected {
-                warnings.extend(
-                    task_warnings(snapshot)
-                        .into_iter()
-                        .map(|warning| format!("{}: {warning}", task.id)),
-                );
-                let command: String = task.command.chars().take(120).collect();
-                let code = snapshot
-                    .exit_code
-                    .map_or(String::new(), |code| format!(" {code}"));
-                // One read, so the line and the fields name the same size.
-                let size = task.pty.then(|| task.size());
-                let log_path = files::path::display_path(&task.log_path);
-                lines.push(format!(
-                    "{} [{}{code}] {:.1}s{}{} · {} · {}",
-                    task.id,
-                    snapshot.state,
-                    snapshot.elapsed.as_secs_f64(),
-                    match size {
-                        Some((cols, rows)) => format!(" pty {cols}x{rows}"),
-                        None => String::new(),
-                    },
-                    if snapshot.kept {
-                        format!(" · keeps {}", members(&snapshot.held))
-                    } else if snapshot.tree_ended {
-                        " · kept processes ended".to_string()
-                    } else {
-                        String::new()
-                    },
-                    match &task.started_by {
-                        Some((_, call)) => format!("{} call {call}", task.owner),
-                        None => task.owner.clone(),
-                    },
-                    command.replace('\n', " ")
+            .map_err(|message| ServiceError::Overload(message, None))?
+        {
+            Some(result) => result,
+            None => {
+                return Err(ServiceError::Plain(
+                    self.unknown_task_error("parentTaskId", parent_id.unwrap_or_default()),
                 ));
-                entries.push(json!({
-                "kind": if task.is_script() { "codemode" } else { "bash" },
-                "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
-                "captureError": snapshot.capture_error, "logError": snapshot.log_error,
-                "inputWarning": snapshot.input_warning, "inputError": snapshot.input_error,
-                "droppedBytes": snapshot.dropped, "logEvicted": snapshot.evicted,
-                "outputOpen": snapshot.output_open, "outputIncomplete": output_incomplete(snapshot),
-                "warnings": task_warnings(snapshot),
-                "cols": size.map(|(cols, _)| cols), "rows": size.map(|(_, rows)| rows),
-                "elapsedMs": snapshot.elapsed.as_millis() as u64, "command": command, "logPath": log_path,
-                "lifetimeExpired": snapshot.expired, "forcedEnd": snapshot.forced_end,
-                "keepTree": task.keep, "keptRunning": snapshot.kept,
-                "held": members_json(&snapshot.held),
-                "leftovers": members_json(&snapshot.leftovers), "killError": snapshot.kill_error,
-                "owner": task.owner,
-                "session": task.started_by.as_ref().map(|(session, _)| session),
-                "callId": task.started_by.as_ref().map(|(_, call)| *call),
-            }));
             }
-            let showing_note = (total_count > selected.len()).then(|| {
-                format!(
+        };
+        let mut blocks = Vec::with_capacity(items.len());
+        let (listed, delivered) = {
+            let mut entries = Vec::with_capacity(items.len());
+            let mut warnings = Vec::new();
+            for item in items {
+                let running = item.snapshot.state == "running";
+                warnings.extend(
+                    task_warnings(&item.snapshot)
+                        .into_iter()
+                        .map(|warning| format!("{}: {warning}", item.task.id)),
+                );
+                // One read, so the line and the fields name the same size.
+                let size = item.task.pty.then(|| item.task.size());
+                let summary_text = item
+                    .children
+                    .as_ref()
+                    .and_then(|summary| format_child_summary(summary, running));
+                let via_parent = if parent_id.is_none() {
+                    item.parent_task_id.as_deref()
+                } else {
+                    None
+                };
+                let mut block_lines = vec![format_list_row(
+                    &item.task,
+                    &item.snapshot,
+                    size,
+                    summary_text.as_deref(),
+                    via_parent,
+                )];
+                let mut delivered_tasks = Vec::new();
+                let mut folded_finished = Vec::new();
+                let mut folded_count = 0usize;
+                let children_json = if let Some(children) = item.children {
+                    let show_children = children.should_show(running);
+                    folded_count = children.done + children.failed;
+                    folded_finished = children.folded_finished;
+                    let mut active_entries = Vec::with_capacity(children.active_tasks.len());
+                    delivered_tasks.reserve(1 + children.active_tasks.len());
+                    let parent_task_id_str = item.task.id.clone();
+                    let mut child_rows = Vec::with_capacity(children.active_tasks.len());
+                    for (child, child_snapshot) in children.active_tasks {
+                        warnings.extend(
+                            task_warnings(&child_snapshot)
+                                .into_iter()
+                                .map(|warning| format!("{}: {warning}", child.id)),
+                        );
+                        let child_size = child.pty.then(|| child.size());
+                        block_lines.push(format_child_row(&child, &child_snapshot, child_size));
+                        active_entries.push(task_entry_json(
+                            &child,
+                            &child_snapshot,
+                            child_size,
+                            None,
+                            None,
+                        ));
+                        child_rows.push((child, child_snapshot));
+                    }
+                    if state != Some(ListState::Finished) && children.active > active_entries.len()
+                    {
+                        let more = children.active - active_entries.len();
+                        block_lines.push(format!(
+                            "  └─ ... {more} more active; list with parentTaskId=\"{parent_task_id_str}\" state=\"active\""
+                        ));
+                    }
+                    let json = show_children.then(|| {
+                        json!({
+                            "total": children.total,
+                            "done": children.done,
+                            "failed": children.failed,
+                            "warned": children.warned,
+                            "active": children.active,
+                            "queued": if running { children.queued } else { 0 },
+                            "cancelled": if !running { children.cancelled } else { 0 },
+                            "activeTasks": active_entries,
+                        })
+                    });
+                    delivered_tasks.push((item.task, item.snapshot));
+                    delivered_tasks.extend(child_rows);
+                    json
+                } else {
+                    delivered_tasks.push((item.task, item.snapshot));
+                    None
+                };
+                let (top_task, top_snapshot) = &delivered_tasks[0];
+                entries.push(task_entry_json(
+                    top_task,
+                    top_snapshot,
+                    size,
+                    item.parent_task_id.as_deref(),
+                    children_json,
+                ));
+                blocks.push(ListBlock {
+                    lines: block_lines,
+                    delivered_tasks,
+                    folded_finished,
+                    folded_count,
+                });
+            }
+            let (kept, text) = if blocks.is_empty() {
+                (Vec::new(), "No tasks.".to_string())
+            } else {
+                fit_lines(&blocks, view.truncate, view.max_bytes)
+            };
+            let folded_children: usize = kept
+                .iter()
+                .map(|&(index, _)| blocks[index].folded_count)
+                .sum();
+            let truncated = total_count > blocks.len();
+            let showing_note = match (truncated, folded_children > 0) {
+                (true, true) => Some(format!(
+                    "Showing {} of {total_count} top-level tasks ({folded_children} folded children; pass parentTaskId to inspect).",
+                    blocks.len()
+                )),
+                (false, true) => Some(format!(
+                    "{folded_children} folded codemode children hidden; pass parentTaskId to inspect."
+                )),
+                (true, false) => Some(format!(
                     "Showing {} of {total_count} tasks; raise limit to see more.",
-                    selected.len()
-                )
-            });
+                    blocks.len()
+                )),
+                (false, false) => None,
+            };
             let structured = json!({
                 "ok": true, "action": "list", "tasks": entries, "totalCount": total_count, "warnings": warnings,
             });
@@ -928,14 +1012,13 @@ impl Service {
                 suffix.push('\n');
                 suffix.push_str(&note);
             }
-            let (kept, text) = if lines.is_empty() {
-                (Vec::new(), "No tasks.".to_string())
-            } else {
-                fit_lines(&lines, view.truncate, view.max_bytes)
-            };
             // Direct calls deliver the text window; nested calls deliver every selected task.
             let delivered = if view.nested {
-                (0..selected.len()).collect()
+                blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, block)| (index, block.delivered_tasks.len()))
+                    .collect()
             } else {
                 kept
             };
@@ -974,14 +1057,21 @@ impl Service {
                 .map_err(|message| ServiceError::Overload(message, None))?;
         }
         // Only an admitted candidate commits the entries it actually displays.
-        for index in delivered {
-            let (task, snapshot) = &selected[index];
-            if let Some(entry) = session.existing(task) {
-                entry.mark_reported(snapshot);
-                entry.mark_keeps_reported(snapshot);
+        for (block_index, kept_tasks) in delivered {
+            let block = &blocks[block_index];
+            for (task, snapshot) in &block.delivered_tasks[..kept_tasks] {
+                if let Some(entry) = session.existing(task) {
+                    entry.mark_reported(snapshot);
+                    entry.mark_keeps_reported(snapshot);
+                }
+            }
+            for (child, tree_ended) in &block.folded_finished {
+                if let Some(entry) = session.existing(child) {
+                    entry.mark_finished_reported(*tree_ended);
+                }
             }
         }
-        drop(selected);
+        drop(blocks);
         let mut held = workspace.into_inner();
         held.shrink_to(retained);
         let owner = crate::lease::Owner::new(held.split_off(payload));
@@ -989,23 +1079,214 @@ impl Service {
     }
 }
 
-/// Joins the whole `lines` that fit `budget` bytes, picked from the ends `truncate` names, with
-/// one marker line where lines were left out. Returns the indexes of the lines shown and the
-/// text.
-fn fit_lines(lines: &[String], truncate: Truncate, budget: usize) -> (Vec<usize>, String) {
-    if lines.iter().map(|line| line.len() + 1).sum::<usize>() <= budget + 1 {
-        return ((0..lines.len()).collect(), lines.join("\n"));
+struct ListBlock {
+    lines: Vec<String>,
+    delivered_tasks: Vec<(Arc<Task>, Snapshot)>,
+    folded_finished: Vec<(Arc<Task>, bool)>,
+    folded_count: usize,
+}
+
+fn format_child_summary(summary: &ChildSummary, running: bool) -> Option<String> {
+    if !summary.should_show(running) {
+        return None;
+    }
+    if summary.total == 0 {
+        return Some(if running {
+            format!("{} queued", summary.queued)
+        } else {
+            format!("{} cancelled", summary.cancelled)
+        });
+    }
+    let mut parts = Vec::new();
+    if summary.done > 0 {
+        parts.push(format!("{} done", summary.done));
+    }
+    if summary.failed > 0 {
+        parts.push(format!("{} failed", summary.failed));
+    }
+    if summary.warned > 0 {
+        parts.push(format!("{} warned", summary.warned));
+    }
+    if summary.active > 0 {
+        parts.push(format!("{} active", summary.active));
+    }
+    if running && summary.queued > 0 {
+        parts.push(format!("{} queued", summary.queued));
+    }
+    if !running && summary.cancelled > 0 {
+        parts.push(format!("{} cancelled", summary.cancelled));
+    }
+    let noun = if summary.total == 1 { "task" } else { "tasks" };
+    Some(format!("{} {noun} ({})", summary.total, parts.join(", ")))
+}
+
+fn format_list_row(
+    task: &Task,
+    snapshot: &Snapshot,
+    size: Option<(u16, u16)>,
+    summary: Option<&str>,
+    via_parent: Option<&str>,
+) -> String {
+    let command: String = task.command.chars().take(120).collect();
+    let code = snapshot
+        .exit_code
+        .map_or(String::new(), |code| format!(" {code}"));
+    let owner = match &task.started_by {
+        Some((_, call)) => format!("{} call {call}", task.owner),
+        None => task.owner.clone(),
+    };
+    format!(
+        "{} [{}{code}] {:.1}s{}{}{} · {}{} · {}",
+        task.id,
+        snapshot.state,
+        snapshot.elapsed.as_secs_f64(),
+        match size {
+            Some((cols, rows)) => format!(" pty {cols}x{rows}"),
+            None => String::new(),
+        },
+        if snapshot.kept {
+            format!(" · keeps {}", members(&snapshot.held))
+        } else if snapshot.tree_ended {
+            " · kept processes ended".to_string()
+        } else {
+            String::new()
+        },
+        match summary {
+            Some(summary) => format!(" · {summary}"),
+            None => String::new(),
+        },
+        owner,
+        match via_parent {
+            Some(pid) => format!(" · via {pid}"),
+            None => String::new(),
+        },
+        command.replace('\n', " ")
+    )
+}
+
+fn format_child_row(task: &Task, snapshot: &Snapshot, size: Option<(u16, u16)>) -> String {
+    let command: String = task.command.chars().take(120).collect();
+    let code = snapshot
+        .exit_code
+        .map_or(String::new(), |code| format!(" {code}"));
+    format!(
+        "  └─ {} [{}{code}] {:.1}s{}{} · {}",
+        task.id,
+        snapshot.state,
+        snapshot.elapsed.as_secs_f64(),
+        match size {
+            Some((cols, rows)) => format!(" pty {cols}x{rows}"),
+            None => String::new(),
+        },
+        if snapshot.kept {
+            format!(" · keeps {}", members(&snapshot.held))
+        } else if snapshot.tree_ended {
+            " · kept processes ended".to_string()
+        } else {
+            String::new()
+        },
+        command.replace('\n', " ")
+    )
+}
+
+fn task_entry_json(
+    task: &Task,
+    snapshot: &Snapshot,
+    size: Option<(u16, u16)>,
+    parent_task_id: Option<&str>,
+    children: Option<Value>,
+) -> Value {
+    let command: String = task.command.chars().take(120).collect();
+    let log_path = files::path::display_path(&task.log_path);
+    let mut entry = json!({
+        "kind": if task.is_script() { "codemode" } else { "bash" },
+        "taskId": task.id, "state": snapshot.state, "exitCode": snapshot.exit_code, "pty": task.pty,
+        "captureError": snapshot.capture_error, "logError": snapshot.log_error,
+        "inputWarning": snapshot.input_warning, "inputError": snapshot.input_error,
+        "droppedBytes": snapshot.dropped, "logEvicted": snapshot.evicted,
+        "outputOpen": snapshot.output_open, "outputIncomplete": output_incomplete(snapshot),
+        "warnings": task_warnings(snapshot),
+        "cols": size.map(|(cols, _)| cols), "rows": size.map(|(_, rows)| rows),
+        "elapsedMs": snapshot.elapsed.as_millis() as u64, "command": command, "logPath": log_path,
+        "lifetimeExpired": snapshot.expired, "forcedEnd": snapshot.forced_end,
+        "keepTree": task.keep, "keptRunning": snapshot.kept,
+        "held": members_json(&snapshot.held),
+        "leftovers": members_json(&snapshot.leftovers), "killError": snapshot.kill_error,
+        "owner": task.owner,
+        "session": task.started_by.as_ref().map(|(session, _)| session),
+        "callId": task.started_by.as_ref().map(|(_, call)| *call),
+        "parentTaskId": parent_task_id,
+    });
+    if let Some(children) = children {
+        entry
+            .as_object_mut()
+            .expect("task entry is a JSON object")
+            .insert("children".into(), children);
+    }
+    entry
+}
+
+fn block_len(lines: &[String]) -> usize {
+    lines.iter().map(String::len).sum::<usize>() + lines.len().saturating_sub(1)
+}
+
+/// Fits a single block into `budget` bytes by trimming indented child lines from the bottom
+/// before falling back to cutting the parent line.
+fn fit_single_block(block: &ListBlock, budget: usize) -> (usize, String) {
+    let mut kept_lines = block.lines.len();
+    while kept_lines > 1 && block_len(&block.lines[..kept_lines]) > budget {
+        kept_lines -= 1;
+    }
+    let kept_tasks = kept_lines.min(block.delivered_tasks.len());
+    if kept_lines == 1 && block.lines[0].len() > budget {
+        let mut line = block.lines[0].clone();
+        output::cut_to(&mut line, budget + 1);
+        return (kept_tasks, line);
+    }
+    (kept_tasks, block.lines[..kept_lines].join("\n"))
+}
+
+/// Joins whole top-level `blocks` that fit `budget` bytes, picked from the ends `truncate` names,
+/// with one marker line counting omitted top-level blocks. Never splits a parent row from its
+/// indented children; if a single block exceeds `budget`, trims child lines from the bottom first.
+/// Returns `(block_index, kept_task_count)` pairs and the rendered text.
+fn fit_lines(
+    blocks: &[ListBlock],
+    truncate: Truncate,
+    budget: usize,
+) -> (Vec<(usize, usize)>, String) {
+    let total_bytes: usize = blocks
+        .iter()
+        .flat_map(|block| &block.lines)
+        .map(|line| line.len() + 1)
+        .sum();
+    if total_bytes <= budget + 1 {
+        let kept = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (index, block.delivered_tasks.len()))
+            .collect();
+        let text = blocks
+            .iter()
+            .flat_map(|block| block.lines.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return (kept, text);
+    }
+    if blocks.len() == 1 {
+        let (kept_tasks, text) = fit_single_block(&blocks[0], budget);
+        return (vec![(0, kept_tasks)], text);
     }
     let marker =
         |omitted: usize| format!("... [{omitted} tasks omitted; raise maxBytes to see them] ...");
-    let mut room = budget.saturating_sub(marker(lines.len()).len());
+    let mut room = budget.saturating_sub(marker(blocks.len()).len());
     let mut head = 0;
-    let mut tail = lines.len();
+    let mut tail = blocks.len();
     let mut want_head = truncate != Truncate::Tail;
     let mut want_tail = truncate != Truncate::Head;
     while head < tail && (want_head || want_tail) {
         if want_head {
-            let cost = lines[head].len() + 1;
+            let cost = block_len(&blocks[head].lines) + 1;
             if cost <= room {
                 head += 1;
                 room -= cost;
@@ -1014,7 +1295,7 @@ fn fit_lines(lines: &[String], truncate: Truncate, budget: usize) -> (Vec<usize>
             }
         }
         if want_tail && head < tail {
-            let cost = lines[tail - 1].len() + 1;
+            let cost = block_len(&blocks[tail - 1].lines) + 1;
             if cost <= room {
                 tail -= 1;
                 room -= cost;
@@ -1023,16 +1304,42 @@ fn fit_lines(lines: &[String], truncate: Truncate, budget: usize) -> (Vec<usize>
             }
         }
     }
+    if head == 0 && tail == blocks.len() {
+        let edge = if truncate == Truncate::Tail {
+            blocks.len() - 1
+        } else {
+            0
+        };
+        let note = marker(blocks.len() - 1);
+        let edge_budget = budget.saturating_sub(note.len() + 1);
+        if blocks[edge].lines.len() > 1 && blocks[edge].lines[0].len() <= edge_budget {
+            let (kept_tasks, trimmed) = fit_single_block(&blocks[edge], edge_budget);
+            let text = if truncate == Truncate::Tail {
+                format!("{note}\n{trimmed}")
+            } else {
+                format!("{trimmed}\n{note}")
+            };
+            return (vec![(edge, kept_tasks)], text);
+        }
+    }
     let mut note = marker(tail - head);
     output::cut_to(&mut note, budget + 1);
-    let text = lines[..head]
+    let text = blocks[..head]
         .iter()
-        .chain([&note])
-        .chain(&lines[tail..])
-        .map(String::as_str)
+        .flat_map(|block| block.lines.iter().map(String::as_str))
+        .chain([note.as_str()])
+        .chain(
+            blocks[tail..]
+                .iter()
+                .flat_map(|block| block.lines.iter().map(String::as_str)),
+        )
         .collect::<Vec<_>>()
         .join("\n");
-    ((0..head).chain(tail..lines.len()).collect(), text)
+    let kept = (0..head)
+        .chain(tail..blocks.len())
+        .map(|index| (index, blocks[index].delivered_tasks.len()))
+        .collect();
+    (kept, text)
 }
 
 /// Writes each key on its own after `input`, pausing `delay` after the program's stdin has

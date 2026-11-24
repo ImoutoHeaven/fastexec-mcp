@@ -292,7 +292,6 @@ impl Drop for InFlightGuard {
 }
 
 impl ScriptHandle {
-    #[allow(dead_code)]
     pub fn list_counts(&self) -> (usize, usize) {
         (
             self.0.queued_starts.load(Ordering::Relaxed),
