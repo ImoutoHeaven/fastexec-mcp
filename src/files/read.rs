@@ -170,8 +170,8 @@ impl TextWorkspace {
     }
 
     fn reserve(&mut self, retained: usize) -> Result<(), FileError> {
-        // Growing line and window buffers, render copies, and structured text
-        // coexist. Charge before each growth; retain the largest admitted peak.
+        // Growing source lines, output windows, and response copies coexist.
+        // Charge before each growth; retain the largest admitted peak.
         let target = self.base.saturating_add(retained.saturating_mul(16));
         if target > self.lease.bytes() && !self.lease.try_resize(target) {
             return Err(FileError::Overload(format!(

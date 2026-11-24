@@ -18,8 +18,11 @@ branching on tool results, or filtering bulky output before returning it to cont
   ran). Wrong argument shapes reject with TypeError. Use Promise.all or Promise.allSettled for
   concurrency.
 - Nested exec defaults to truncate "head" (transcript: "tail") and maxBytes 4194304 (4 MiB), keeps
-  NUL bytes in clean output (pass raw: true for exact bytes), and rejects truncate "head_tail" or
-  list maxBytes/truncate (VALIDATION). truncated, omittedLines, omittedRange, cutLines, and
+  NUL bytes in clean output, and rejects truncate "head_tail" or list maxBytes/truncate
+  (VALIDATION). raw: true preserves ANSI/control sequences and line endings; output is still
+  decoded using encoding (UTF-8 by default). Invalid sequences become replacement characters,
+  and encodingErrors counts affected lines. The task log holds captured bytes.
+  truncated, omittedLines, omittedRange, cutLines, and
   omittedRows report overflow (read logPath for the rest). Without waitMs, start and poll wait
   until exit; resize/input/keys waits 2000 ms, and returnWhen waits 30000 ms. Drive a PTY by
   awaiting start with pty: true and returnWhen, then poll with input and keys. Nested exec list

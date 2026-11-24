@@ -1040,7 +1040,7 @@ fn server_instructions_and_tool_descriptions_stay_within_their_word_budget() {
         "{instructions_on}"
     );
 
-    // v0.3.0 stdio totals, excluding the host line, whose paths may contain spaces.
+    // Include decoding guidance; exclude the host line, whose paths may contain spaces.
     let platform_words = if cfg!(windows) {
         59
     } else if cfg!(target_os = "macos") {
@@ -1049,8 +1049,8 @@ fn server_instructions_and_tool_descriptions_stay_within_their_word_budget() {
         0
     };
     for (server, instructions, baseline) in [
-        (&mut disabled, instructions_off, 2233),
-        (&mut enabled, instructions_on, 2987),
+        (&mut disabled, instructions_off, 2300),
+        (&mut enabled, instructions_on, 3100),
     ] {
         let listed = server.request("tools/list", json!({}));
         let mut words = instructions.split_whitespace().count();

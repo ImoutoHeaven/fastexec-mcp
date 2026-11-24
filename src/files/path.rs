@@ -34,7 +34,7 @@ pub(crate) fn with_path_workspace<T>(
     ))
 }
 
-/// Formats a path for tool output and `structuredContent`: forward slashes on Windows, stripping
+/// Formats a path for Agent text and Program data: forward slashes on Windows, stripping
 /// verbatim `\\?\` prefixes and turning `\\server\share` into `//server/share`.
 pub fn display_path(path: &Path) -> String {
     #[cfg(windows)]

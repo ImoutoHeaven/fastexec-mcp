@@ -1,8 +1,8 @@
 //! The text file tools: `read`, `write` and `edit`, and the path resolution they share.
 //!
-//! Every function here blocks: the callers run them on `spawn_blocking`, so one large file never
-//! holds a runtime thread. Read streams a file and keeps only the window it may show; write and
-//! edit hold the whole file, because they rewrite it.
+//! Async core entrypoints run file work on `spawn_blocking`; the Agent adapters format their
+//! domain results. Read streams a file and keeps only its output window; write and edit hold
+//! the whole file because they rewrite it.
 
 pub(crate) mod edit;
 pub(crate) mod path;

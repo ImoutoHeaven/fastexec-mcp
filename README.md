@@ -132,6 +132,11 @@ and diagnostics appear in explicit fields (`truncated`, `omittedRange`,
 `ToolError` carrying `code` (`VALIDATION`, `NOT_FOUND`, `OVERLOAD`, `LIMIT`,
 `CANCELLED`, `EDIT_FAILED`, or `IO`) and partial `result` data when available.
 
+Nested `exec` with `raw: true` preserves ANSI/control sequences and line endings.
+Its output is still decoded using `encoding` (UTF-8 by default), with invalid
+sequences replaced and affected lines counted in `encodingErrors`. The task log
+retains captured bytes under its storage limits.
+
 `attach` adds a media file, `read` descriptor, inline media block, or nested
 task attachment to the result. Poll or stop the script with `exec`. Stopping
 the script cancels pending tool calls and leaves Bash tasks it already started

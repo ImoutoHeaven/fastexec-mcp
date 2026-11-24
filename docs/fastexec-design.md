@@ -257,7 +257,7 @@ execution, naming `exec` actions in lowercase.
     needed), and returns unused tail bytes to the head. Nested `codemode` calls
     (`ExecPolicy::PROGRAM`) default to `"head"` (`"tail"` for `transcript`),
     preserve NUL bytes in clean output (`keep_nul: true`, so `find -print0` and
-    `rg -0` parse cleanly; pass `raw: true` for untransformed bytes), reject
+    `rg -0` parse cleanly), reject
     `truncate: "head_tail"` and `list` `truncate`/`maxBytes` with
     `ToolError` (`code: "VALIDATION"`), and omit all inline markers
     (`inline_markers: false`). When a single line or screen row exceeds the
@@ -266,6 +266,11 @@ execution, naming `exec` actions in lowercase.
     in the control channel. There is no fixed per-line length cap on either
     path. Omitted ranges on direct calls also appear in the status line, outside
     the body budget.
+  - `raw`: Skips terminal-output cleaning. Nested `raw: true` output preserves
+    ANSI/control sequences and line endings, while decoding bytes using `encoding`
+    (UTF-8 by default). Invalid sequences become replacement characters;
+    `encodingErrors` counts affected lines. The task log retains captured bytes
+    under its normal storage limits.
   - `encoding`: Any ASCII-compatible WHATWG label (such as `"utf-8"`, `"big5"`,
     `"gbk"`; UTF-16 is rejected). On `start`, sets the task default; on `poll`,
     overrides for that call.
