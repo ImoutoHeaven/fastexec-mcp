@@ -708,7 +708,7 @@ impl Service {
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
         ended: Option<WaitEnd>,
-        startup_warning: Option<ProbeWarning>,
+        mut startup_warning: Option<ProbeWarning>,
     ) -> Result<
         (
             CallToolResult,
@@ -803,7 +803,7 @@ impl Service {
         // Log metadata, such as an eviction during the read, is taken after it.
         metadata.refresh(&task, call, action)?;
         let snapshot = &metadata.value;
-        let delivered_warning = startup_warning.and_then(ProbeWarning::deliver);
+        let delivered_warning = startup_warning.as_mut().and_then(ProbeWarning::message);
         let mut extra_kill_warnings: Vec<String> = Vec::new();
         if view.max_bytes < requested_max_bytes {
             extra_kill_warnings.push(
@@ -881,11 +881,11 @@ impl Service {
                 .as_array_mut()
                 .unwrap()
                 .extend(extra_warns.iter().cloned().map(Value::String));
-            if let Some(warning) = &delivered_warning {
+            if let Some(warning) = delivered_warning {
                 structured["warnings"]
                     .as_array_mut()
                     .unwrap()
-                    .push(Value::String(warning.clone()));
+                    .push(Value::String(warning.to_owned()));
             }
             add_encoding_warning(&mut structured, window_ref);
             let warnings = warning_text(&structured["warnings"]);
@@ -953,6 +953,9 @@ impl Service {
             let mut lease = admit_outbound(call, action, &task, &suppressed, &mut None)?;
             let (suppressed, payload_owner) =
                 retain_text_result(suppressed, workspace, &mut lease, call, &task)?;
+            if let Some(warning) = startup_warning {
+                warning.commit();
+            }
             read.state.attachments_seen = final_seen;
             let state = read.commit();
             registrations.ids.clear();
@@ -1340,6 +1343,9 @@ impl Service {
         drop(window_val);
         let (suppressed, payload_owner) =
             retain_text_result(suppressed, workspace, &mut lease, call, &task)?;
+        if let Some(warning) = startup_warning {
+            warning.commit();
+        }
         let _permit = permit;
         read.state.attachments_seen = bundle.steps.last().map_or(initial_seen, PackStep::index);
         let state = read.commit();
@@ -1625,7 +1631,7 @@ impl Service {
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
         ended: WaitEnd,
-        startup_warning: Option<ProbeWarning>,
+        mut startup_warning: Option<ProbeWarning>,
         permit: Option<Arc<OwnedSemaphorePermit>>,
     ) -> Result<
         (
@@ -1665,11 +1671,11 @@ impl Service {
         .map_err(|error| format!("Internal failure while reading output: {error}."))?;
         let window = window.map_err(|error| format!("Cannot read the task log: {error}."))?;
         let mut structured = task_json(action, &task, snapshot, &task_reader);
-        if let Some(warning) = startup_warning.and_then(ProbeWarning::deliver) {
+        if let Some(warning) = startup_warning.as_mut().and_then(ProbeWarning::message) {
             structured["warnings"]
                 .as_array_mut()
                 .unwrap()
-                .push(Value::String(warning));
+                .push(Value::String(warning.to_owned()));
         }
         add_encoding_warning(&mut structured, &window);
         let warnings = warning_text(&structured["warnings"]);
@@ -1720,6 +1726,9 @@ impl Service {
         drop(screen.rows);
         let (suppressed, payload_owner) =
             retain_text_result(suppressed, screen._lease, &mut lease, call, &task)?;
+        if let Some(warning) = startup_warning {
+            warning.commit();
+        }
         let state = read.commit();
         task_reader.mark_delivered();
         report(

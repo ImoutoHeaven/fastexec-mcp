@@ -3038,3 +3038,44 @@ fn task_exit_events_count_kept_children_until_the_tree_ends() {
     assert_eq!(ended["keptProcesses"], 0);
     assert_eq!(ended["treeEnded"], true);
 }
+
+#[test]
+fn rejected_start_result_preserves_the_login_probe_warning() {
+    for screen in [false, true] {
+        let home = Scratch::new(if screen {
+            "login-warning-screen-refused"
+        } else {
+            "login-warning-window-refused"
+        });
+        std::fs::create_dir_all(&*home).unwrap();
+        std::fs::write(home.join(".bash_profile"), "exit 7\n").unwrap();
+        let mut server = Server::start_with(|cmd| {
+            cmd.env("HOME", &*home)
+                .env("USERPROFILE", &*home)
+                .env("FASTEXEC_OUTPUT_MODE", "both")
+                .env("FASTEXEC_TEST_OUTBOUND_LIMIT", "4096");
+        });
+        let mut request = json!({
+            "action":"start", "command":"printf '%06000d' 0", "maxBytes":8192
+        });
+        if screen {
+            request["pty"] = json!(true);
+            request["screen"] = json!(true);
+            request["cols"] = json!(120);
+            request["rows"] = json!(100);
+        }
+        let refused = server.request("tools/call", json!({"name":"exec","arguments":request}));
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert!(
+            refused["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("frame limit"),
+            "{refused}"
+        );
+        let (_, next) = server.ok(json!({"action":"start","command":"true"}));
+        assert!(next.contains("Login environment probe failed"), "{next}");
+        let (_, once) = server.ok(json!({"action":"start","command":"true"}));
+        assert!(!once.contains("Login environment probe failed"), "{once}");
+    }
+}

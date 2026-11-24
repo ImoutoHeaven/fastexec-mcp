@@ -64,10 +64,15 @@ pub struct ProbeWarning {
 }
 
 impl ProbeWarning {
-    pub fn deliver(mut self) -> Option<String> {
-        self.reserved
-            .take()
-            .or_else(|| lock(&self.unreported).take())
+    pub fn message(&mut self) -> Option<&str> {
+        if self.reserved.is_none() {
+            self.reserved = lock(&self.unreported).take();
+        }
+        self.reserved.as_deref()
+    }
+
+    pub fn commit(mut self) {
+        self.reserved.take();
     }
 }
 
