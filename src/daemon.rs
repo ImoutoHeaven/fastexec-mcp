@@ -1253,6 +1253,7 @@ async fn run_call(
         call_id: Some(id),
         nested: false,
         started: None,
+        queued_guard: None,
         render_slot: Some(&render_slot),
         http_response: false,
         rpc_id_bytes,

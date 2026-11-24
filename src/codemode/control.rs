@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -221,15 +221,54 @@ pub(super) struct Control {
     pub(super) in_flight: (Mutex<usize>, Condvar),
     pub(super) held_attachments: Mutex<HashMap<u64, crate::tasks::state::AttachmentLease>>,
     pub(super) next_attachment_handle: std::sync::atomic::AtomicU64,
+    pub(super) queued_starts: AtomicUsize,
+    pub(super) cancelled_starts: AtomicUsize,
 }
 
 #[derive(Clone)]
 pub struct ScriptHandle(pub(super) Arc<Control>);
 
+/// Counts an admitted `exec start` from validation until it enters `registry.tasks`,
+/// moving unspawned cancelled starts into `cancelled_starts` on drop.
+pub struct QueuedStartGuard {
+    control: Arc<Control>,
+    armed: bool,
+}
+
+impl QueuedStartGuard {
+    pub(super) fn new(script: &ScriptHandle) -> Self {
+        script.0.queued_starts.fetch_add(1, Ordering::Relaxed);
+        Self {
+            control: Arc::clone(&script.0),
+            armed: true,
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.control.queued_starts.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for QueuedStartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.control.queued_starts.fetch_sub(1, Ordering::Relaxed);
+            if self.control.cancel.is_cancelled() {
+                self.control.cancelled_starts.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct NestedCall<'a> {
     pub script: &'a ScriptHandle,
     pub pending_id: u64,
+    pub parent_task_id: &'a str,
 }
 
 pub(super) struct InFlightGuard(ScriptHandle);
@@ -253,6 +292,14 @@ impl Drop for InFlightGuard {
 }
 
 impl ScriptHandle {
+    #[allow(dead_code)]
+    pub fn list_counts(&self) -> (usize, usize) {
+        (
+            self.0.queued_starts.load(Ordering::Relaxed),
+            self.0.cancelled_starts.load(Ordering::Relaxed),
+        )
+    }
+
     pub(crate) fn reserve_result(&self, id: u64, bytes: usize) -> bool {
         lock(&self.0.report).result(id, bytes)
     }

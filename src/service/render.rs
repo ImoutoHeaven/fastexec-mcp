@@ -1821,6 +1821,12 @@ fn status_line(
                 task_handles(&report.running)
             ));
         }
+        if snapshot.state != "running" && report.running.len() > 3 {
+            line.push_str(&format!(
+                "; list active with exec list parentTaskId=\"{}\" state=\"active\"",
+                task.id
+            ));
+        }
     }
     line
 }
@@ -2125,6 +2131,7 @@ fn prune_task_diagnostics(value: &mut Value) {
         "rows",
         "session",
         "callId",
+        "parentTaskId",
     ] {
         if obj.get(key) == Some(&Value::Null) {
             obj.remove(key);
@@ -2183,6 +2190,25 @@ fn prune_task_diagnostics(value: &mut Value) {
             obj.remove("codemode");
         }
     }
+    if let Some(Value::Object(children)) = obj.get_mut("children") {
+        for key in ["done", "failed", "warned", "active", "queued", "cancelled"] {
+            if children.get(key).and_then(Value::as_u64) == Some(0) {
+                children.remove(key);
+            }
+        }
+        if children
+            .get("activeTasks")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            children.remove("activeTasks");
+        }
+        if let Some(Value::Array(active_tasks)) = children.get_mut("activeTasks") {
+            for entry in active_tasks {
+                prune_task_diagnostics(entry);
+            }
+        }
+    }
     if let Some(Value::Array(tasks)) = obj.get_mut("tasks") {
         for entry in tasks {
             prune_task_diagnostics(entry);
@@ -2231,4 +2257,78 @@ fn error_named(action: &str, message: &str) -> CallToolResult {
     let mut result = CallToolResult::error(vec![ContentBlock::text(message)]);
     result.structured_content = Some(json!({ "ok": false, "action": action, "error": message }));
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_task_diagnostics_strips_parent_and_children_defaults() {
+        let mut payload = json!({
+            "ok": true,
+            "action": "list",
+            "tasks": [
+                {
+                    "taskId": "p1-1",
+                    "parentTaskId": null,
+                    "children": {
+                        "total": 12,
+                        "done": 9,
+                        "failed": 0,
+                        "warned": 0,
+                        "active": 3,
+                        "queued": 0,
+                        "cancelled": 10,
+                        "activeTasks": [
+                            {
+                                "taskId": "p1-2",
+                                "parentTaskId": null,
+                                "droppedBytes": 0,
+                                "warnings": []
+                            }
+                        ]
+                    }
+                },
+                {
+                    "taskId": "p1-3",
+                    "parentTaskId": "p1-1",
+                    "children": {
+                        "total": 2,
+                        "done": 2,
+                        "failed": 0,
+                        "warned": 0,
+                        "active": 0,
+                        "queued": 0,
+                        "cancelled": 0,
+                        "activeTasks": []
+                    }
+                }
+            ]
+        });
+
+        prune_task_diagnostics(&mut payload);
+
+        let first = &payload["tasks"][0];
+        assert!(first.get("parentTaskId").is_none());
+        let first_children = &first["children"];
+        assert_eq!(first_children["total"], 12);
+        assert_eq!(first_children["done"], 9);
+        assert_eq!(first_children["active"], 3);
+        assert_eq!(first_children["cancelled"], 10);
+        for omitted in ["failed", "warned", "queued"] {
+            assert!(first_children.get(omitted).is_none(), "{omitted} kept");
+        }
+        let child_entry = &first_children["activeTasks"][0];
+        assert!(child_entry.get("parentTaskId").is_none());
+        assert!(child_entry.get("droppedBytes").is_none());
+        assert!(child_entry.get("warnings").is_none());
+
+        let second = &payload["tasks"][1];
+        assert_eq!(second["parentTaskId"], "p1-1");
+        let second_children = &second["children"];
+        assert_eq!(second_children["total"], 2);
+        assert_eq!(second_children["done"], 2);
+        assert!(second_children.get("activeTasks").is_none());
+    }
 }

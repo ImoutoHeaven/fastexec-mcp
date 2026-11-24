@@ -13,7 +13,7 @@ use crate::tasks::state::Task;
 use control::{Control, Report, ScriptHandle};
 use std::collections::HashMap;
 use std::io::PipeWriter;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +54,8 @@ pub fn prepare(runtime: Handle) -> Result<(ScriptHandle, ScriptWorker), String> 
         in_flight: (Mutex::new(0), Condvar::new()),
         held_attachments: Mutex::new(HashMap::new()),
         next_attachment_handle: std::sync::atomic::AtomicU64::new(0),
+        queued_starts: AtomicUsize::new(0),
+        cancelled_starts: AtomicUsize::new(0),
     }));
     let (sender, job) = mpsc::sync_channel(1);
     let control = script.clone();

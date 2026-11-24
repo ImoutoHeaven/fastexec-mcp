@@ -31,6 +31,7 @@ fn script_call(session: &Arc<Session>, nested: bool) -> Call<'_> {
         call_id: None,
         nested,
         started: None,
+        queued_guard: None,
         render_slot: None,
         http_response: false,
         rpc_id_bytes: 0,
@@ -384,6 +385,7 @@ async fn nested_precommit_exact_memory_quota_and_cancellation_keep_old_reservati
     call.started = Some(codemode::control::NestedCall {
         script: &script,
         pending_id: 7,
+        parent_task_id: "aaaaaaaa-0",
     });
     let mut held = pool.try_acquire(16);
     assert!(admit_nested_result(&call, Action::Poll, &result, &mut held).is_err());
@@ -431,6 +433,7 @@ async fn nested_precommit_list_quota_refusal_and_cancel_leave_reported_state_due
         call.started = Some(codemode::control::NestedCall {
             script: &script,
             pending_id: 1,
+            parent_task_id: "aaaaaaaa-0",
         });
         call
     };
@@ -512,6 +515,7 @@ async fn nested_precommit_reader_and_attachment_watermarks_survive_refusal_and_c
         call.started = Some(codemode::control::NestedCall {
             script: &script,
             pending_id: 1,
+            parent_task_id: "aaaaaaaa-0",
         });
         call
     };
@@ -1297,6 +1301,7 @@ async fn codemode_greedy_packing_eof_continuation_identical_dedup_and_single_ove
         call_id: None,
         nested: false,
         started: None,
+        queued_guard: None,
         render_slot: None,
         http_response: false,
         rpc_id_bytes: 0,

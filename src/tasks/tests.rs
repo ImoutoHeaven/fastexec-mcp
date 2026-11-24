@@ -369,6 +369,8 @@ mod tests {
             kill_after_ms: None,
             owner: "test-client".into(),
             started_by: None,
+            parent_task_id: None,
+            queued_guard: None,
             launch: launch(),
             input_owner: Default::default(),
         }
@@ -447,6 +449,7 @@ mod tests {
             http_response: false,
             rpc_id_bytes: 0,
             started: None,
+            queued_guard: None,
             render_slot: None,
             input_owner: Default::default(),
         };
@@ -761,6 +764,7 @@ mod tests {
             http_response: false,
             rpc_id_bytes: 0,
             started: None,
+            queued_guard: None,
             render_slot: None,
             input_owner: Default::default(),
         };
@@ -1746,6 +1750,7 @@ mod script_tests {
             owner: "pty-test".into(),
             session_id: None,
             started_by: None,
+            parent_task_id: None,
             started: Instant::now(),
             root: Root::Script(script),
             tree_done: watch::Sender::new(true),
@@ -2243,6 +2248,160 @@ mod script_tests {
             before - written_before
         );
         drop(out);
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn has_warnings_unlocked_matches_task_warnings_conditions() {
+        let (_runtime, tasks, _session) = fixture(Limits::OFF);
+        let task = finished_pty_task(&tasks, 80, 24);
+        // `finished_pty_task` initializes `output_open = true` with `out.closed = false`.
+        assert!(task.has_warnings_unlocked());
+        lock(&task.end).as_mut().unwrap().output_open = false;
+        assert!(!task.has_warnings_unlocked());
+
+        // capture_error
+        task.inject_io_errors(Some("read boom"), None);
+        assert!(task.has_warnings_unlocked());
+        task.inject_io_errors(None, None);
+        assert!(!task.has_warnings_unlocked());
+
+        // log_error
+        task.inject_io_errors(None, Some("disk full"));
+        assert!(task.has_warnings_unlocked());
+        task.inject_io_errors(None, None);
+        assert!(!task.has_warnings_unlocked());
+
+        // dropped bytes
+        lock(&task.out).dropped = 12;
+        assert!(task.has_warnings_unlocked());
+        lock(&task.out).dropped = 0;
+        assert!(!task.has_warnings_unlocked());
+
+        // evicted
+        lock(&task.out).evicted = true;
+        assert!(task.has_warnings_unlocked());
+        lock(&task.out).evicted = false;
+        assert!(!task.has_warnings_unlocked());
+
+        // output_open requires !out.closed
+        lock(&task.end).as_mut().unwrap().output_open = true;
+        lock(&task.out).closed = true;
+        assert!(!task.has_warnings_unlocked());
+        lock(&task.out).closed = false;
+        assert!(task.has_warnings_unlocked());
+        lock(&task.end).as_mut().unwrap().output_open = false;
+        assert!(!task.has_warnings_unlocked());
+
+        // kill_error only warns while !tree_done
+        *lock(&task.kill_error) = Some("kill failed".into());
+        assert!(!task.has_warnings_unlocked());
+        task.tree_done.send_replace(false);
+        assert!(task.has_warnings_unlocked());
+        task.tree_done.send_replace(true);
+        *lock(&task.kill_error) = None;
+        assert!(!task.has_warnings_unlocked());
+
+        // input_warning and input_error
+        *lock(&task.input_warning) = Some("canonical".into());
+        assert!(task.has_warnings_unlocked());
+        *lock(&task.input_warning) = None;
+        *lock(&task.input_error) = Some("write failed".into());
+        assert!(task.has_warnings_unlocked());
+        *lock(&task.input_error) = None;
+        assert!(!task.has_warnings_unlocked());
+
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn background_skips_running_children_of_running_codemode_parent() {
+        let (_runtime, tasks, session) = fixture(Limits::OFF);
+        let make_running = |parent_task_id: Option<String>| -> Arc<Task> {
+            let id = tasks.next_id();
+            let log_path = tasks.dir.join(format!("{id}.log"));
+            let _log = private_file(&log_path).unwrap();
+            let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
+            Arc::new(Task {
+                id,
+                command: "sleep 30".into(),
+                pty: false,
+                log_path,
+                encoding: encoding_rs::UTF_8,
+                keep: false,
+                owner: "test-client".into(),
+                session_id: Some(session.id.clone()),
+                started_by: None,
+                parent_task_id,
+                started: Instant::now(),
+                root: Root::Script(script),
+                tree_done: watch::Sender::new(false),
+                tree_ended_at: OnceLock::new(),
+                kill_error: Mutex::new(None),
+                kill_requested: AtomicBool::new(false),
+                expired: AtomicBool::new(false),
+                out: Mutex::default(),
+                end: Mutex::new(None),
+                done: watch::Sender::new(false),
+                activity: watch::Sender::new(()),
+                input: Mutex::new(None),
+                writer_done: WriterDone::new(true),
+                input_warning: Mutex::new(None),
+                input_error: Mutex::new(None),
+                queued: AtomicUsize::new(0),
+                input_gate: tokio::sync::Mutex::new(()),
+                terminal: None,
+                transcript_file: Mutex::new(None),
+                size: Mutex::new((0, 0)),
+                pty_control: Mutex::new(None),
+                size_error: Mutex::new(None),
+            })
+        };
+        let parent = make_running(None);
+        let child = make_running(Some(parent.id.clone()));
+        {
+            let mut registry = lock(&tasks.registry);
+            let _ = session.entry(&parent);
+            let _ = session.entry(&child);
+            registry.tasks.push(Arc::clone(&parent));
+            registry.tasks.push(Arc::clone(&child));
+        }
+
+        // Polling the running parent must not surface its own running child in background.
+        let (notice, claim) = tasks
+            .background(&session, &parent.id, 512, &mut |_| Ok(()), &mut |_| {
+                Ok(Some(Vec::new()))
+            })
+            .unwrap();
+        drop(claim);
+        assert!(
+            notice.is_none(),
+            "running child leaked into footer: {:?}",
+            notice.as_ref().map(|(line, _)| line)
+        );
+
+        // Once the parent is killed and finishes, the surviving running child surfaces.
+        *lock(&parent.end) = Some(Final {
+            exit_code: None,
+            killed: true,
+            expired: false,
+            forced_end: false,
+            elapsed: Duration::from_millis(50),
+            output_open: false,
+            leftovers: Vec::new(),
+            kept: false,
+        });
+        parent.tree_done.send_replace(true);
+        let (notice, _claim) = tasks
+            .background(&session, &parent.id, 512, &mut |_| Ok(()), &mut |_| {
+                Ok(Some(Vec::new()))
+            })
+            .unwrap();
+        let (line, shown) = notice.expect("surviving child should appear after parent ends");
+        assert!(line.contains(&child.id), "expected child id in {line}");
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].0.id, child.id);
+
         tasks.shutdown();
     }
 }

@@ -155,6 +155,8 @@ pub struct Task {
     pub session_id: Option<String>,
     /// The session ID and daemon call that started the task, when a daemon call started it.
     pub started_by: Option<(String, u64)>,
+    /// Parent codemode task ID for nested `exec start` children; `None` for top-level tasks.
+    pub parent_task_id: Option<String>,
     pub(super) started: Instant,
     pub(super) root: Root,
     /// Set once no process of the tree runs.
@@ -699,6 +701,26 @@ impl Task {
         snapshot.input_warning = input_warning;
         snapshot.input_error = input_error;
         Ok(())
+    }
+
+    /// Whether the task has any condition that `task_warnings` reports, without cloning
+    /// diagnostics. Uses the same non-nested lock order as `snapshot_at_reserved`.
+    #[allow(dead_code)]
+    pub fn has_warnings_unlocked(&self) -> bool {
+        let end_output_open = lock(&self.end).as_ref().is_some_and(|end| end.output_open);
+        let tree_done = *self.tree_done.borrow();
+        let out_warn = {
+            let out = lock(&self.out);
+            out.capture_error.is_some()
+                || out.log_error.is_some()
+                || out.dropped > 0
+                || out.evicted
+                || (end_output_open && !out.closed)
+        };
+        out_warn
+            || (!tree_done && lock(&self.kill_error).is_some())
+            || lock(&self.input_warning).is_some()
+            || lock(&self.input_error).is_some()
     }
 
     /// State used by script reports, without copying logs or process diagnostics.

@@ -161,7 +161,7 @@ execution, naming `exec` actions in lowercase.
 | `start` | `command`, `cwd`, `pty`, `loginShell`, `input`, `eof`, `killAfterMs`, `keepTree`, `cols`, `rows`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Rejects NUL bytes in `command` before execution, then spawns it in GNU bash (`loginShell: false` default with the session's login-environment snapshot; `loginShell: true` runs `bash -l -c`) and waits up to `waitMs` (default `30000`, range `0-240000` on direct calls; unbounded by default without `returnWhen` in nested `codemode` calls). Pipe mode defaults stdin to `/dev/null`, writes `input` (`<= 1` MiB UTF-8) and closes stdin unless `eof: false`, or keeps stdin open with `eof: false`; PTY mode rejects `input` and `eof: true` on `start` (`eof: false` is a no-op) and defaults size to `120x30`. |
 | `poll` | `taskId`, `cols`, `rows`, `input`, `keys`, `keyDelayMs`, `eof`, `waitMs`, `returnWhen`, `truncate`, `maxBytes`, `raw`, `encoding`, `screen` | Normalizes `keys: []` (and any accompanying `keyDelayMs`) to absent before validation, resizes the terminal (PTY only), writes `input` (`<= 16` KiB), presses `keys` (PTY only), applies `eof` (pipe only, idempotent when already closed), waits (`2000` ms with a resize, `input`, or `keys` and no `returnWhen`; `30000` ms on direct calls or with `returnWhen`; unbounded by default on nested `codemode` waits without `returnWhen` or input), and returns unseen output. |
 | `kill` | `taskId`, `truncate`, `maxBytes`, `waitMs` (ignored) | Terminates the task's process tree (waits up to `5` s) and returns unseen output through the reader gate without `waitEndedBy` (`head_tail` / `16384` B default on direct calls; `head` / `4194304` B default on nested calls). On a finished `keepTree` task, ends held processes while keeping the root exit result. |
-| `list` | `scope`, `state`, `limit`, `truncate`, `maxBytes` | Lists bare task IDs newest first filtered by `scope` (`"session"` default or `"all"`), `state` (`"active"` or `"finished"`; omitted lists both), and `limit` (`1-500`, default `20`), reporting `totalCount` before `limit`; creates no readers and marks only delivered entries. |
+| `list` | `scope`, `state`, `limit`, `parentTaskId`, `truncate`, `maxBytes` | Lists bare task IDs newest first filtered by `scope` (`"session"` default, or `"all"` by default when `parentTaskId` is set), `state` (`"active"` or `"finished"`; omitted lists both), and `limit` (`1-500`, default `20`), reporting `totalCount` before `limit`. Without `parentTaskId`, folds `codemode` children into their parent's summary (including `queued`/`cancelled` start counts) and indents up to `8` active children below it; with `parentTaskId`, lists that script's children flat. Creates no readers and marks only delivered entries and folded finished children of delivered parents. |
 | `transcript` | `taskId`, `truncate` (default `"tail"`), `maxBytes`, `waitMs` (ignored) | Reads a UTF-8 PTY task's terminal transcript from the first unseen final line, followed by pending lines. Does not wait or advance the `poll` cursor. |
 
 ### Key Parameter Rules
@@ -184,6 +184,33 @@ execution, naming `exec` actions in lowercase.
   cursors and decoding state commit only after complete rendering succeeds;
   failed or cancelled reads leave unseen output available for the next call.
   Retention and output limits apply to each reader.
+- **`list` grouping and `parentTaskId`**: Each bash task started from a
+  `codemode` script records `Task.parent_task_id` (immutable after creation;
+  `None` for direct bash starts and `codemode` scripts). Without `parentTaskId`,
+  `Tasks::listed` runs one pass over the scoped tasks (`registry.tasks` for
+  `scope: "all"`, `session.touched` for `scope: "session"`):
+  - Finished children of an eligible parent fold into the parent's inline
+    summary (`total`, `done`, `failed`, `warned`), paired with lock-free
+    `queued` (while running) or `cancelled` (after exit or `kill`) start
+    counts. Active children (`running` or `keptRunning`) render indented
+    (`  └─`) beneath the parent, capped at `8` per parent (matching
+    `START_PERMITS`) with an overflow hint pointing to `parentTaskId` when more
+    are active; under `state: "finished"`, `0` children are indented.
+  - When `state` is not `"finished"`, an eligible parent sorts at
+    `max(parent_pos, newest_active_child_pos)` so an older running `codemode`
+    with a fresh active child stays at the top of the list without post-`limit`
+    re-slicing. `totalCount` is the top-level item count before `limit`.
+  - A child whose parent is absent from the current view (evicted, outside
+    `scope: "session"`, finished/killed under `state: "active"`, or running
+    under `state: "finished"`) is promoted to a top-level row tagged `via <pid>`
+    when the child matches `state`.
+  - Passing `parentTaskId` (bare task ID or reader handle, normalized via
+    `parse_handle`) lists that script's children flat without folding. When
+    `scope` is omitted, drill-down searches all sessions; explicit
+    `scope: "session"` filters to the caller's session. Drill-down keeps
+    working after parent eviction while any child with that `parent_task_id`
+    remains in `registry.tasks`. A bash task ID returns `"No tasks."`; an
+    unknown ID with no remaining children errors naming `parentTaskId`.
 - **`waitMs` vs. `killAfterMs`**: `waitMs` (`0-240000`) bounds only the current
   call's wait. A call that hits `waitMs`, matches `returnWhen`, or is cancelled
   leaves the task running (use `list` to recover the `taskId` of a cancelled
@@ -328,8 +355,12 @@ the script sets `cwd`). A nested task's reader can be polled by the caller, and
 IPC children retain the outer call ID. Nested calls advance their reader state.
 Nested poll, kill, and transcript leave background notifications pending for
 tasks started outside the script; completion observed for a script's own tasks
-marks their session entries reported. A nested list marks every existing session
-entry delivered in its `tasks` array, regardless of which script started it.
+marks their session entries reported. Nested `tools.exec({ action: "list" })`
+uses the same grouping and `parentTaskId` contract as direct `exec list`,
+folding `codemode` children under their parent unless `parentTaskId` is passed,
+and marks every existing session entry delivered in its `tasks` array (plus
+folded finished children of delivered parents), regardless of which script
+started it.
 When a script
 ends, in-flight nested calls are cancelled and drained before publishing the
 final script report, so any `exec start` already inside process creation is
@@ -359,10 +390,24 @@ Kill, deadline, session end in local mode, or daemon stop interrupt bytecode
 and the job loop, cancel pending nested calls and wake an idle VM. The final
 state is published after capture drains. Any script ending cancels calls it
 did not await. Completed operations remain in effect; bash tasks it started
-remain independent tasks. `codemode.cancelledCalls` identifies calls cancelled
-on termination, and `codemode.startedTasks` lists all registered handles with
-states queried at each response. Status lines show up to three still-running
-handles and report when a kill has waited five seconds without completion.
+remain independent tasks. `Control` tracks unspawned `exec start` calls with
+two lock-free `AtomicUsize` counters (`queued_starts` and `cancelled_starts`)
+managed by `QueuedStartGuard`. `Host::call` constructs an armed guard on the VM
+thread right after admitting a validated `Action::Start` (incrementing
+`queued_starts`) and moves it through `Call` and `StartArgs` into
+`Tasks::start`, which disarms it under `lock(&self.registry)` right after
+pushing the new `Task`. If the guard drops while still armed (because script
+cancellation fired while waiting for `START_PERMITS`, or spawn failed), `Drop`
+decrements `queued_starts` and increments `cancelled_starts` when the script is
+cancelled. `ScriptHandle::list_counts()` reads both atomics without acquiring
+`Control.report`, keeping queued and cancelled counts disjoint from spawned
+`Task` entries with no spawn gap or double-counting. `codemode.cancelledCalls`
+identifies calls cancelled on termination, and `codemode.startedTasks` lists
+all registered handles with states queried at each response. Status lines show
+up to three still-running handles, append `; list active with exec list
+parentTaskId="<bare_id>" state="active"` on both `killed` and non-killed exits
+when more than three children are still running, and report when a kill has
+waited five seconds without completion.
 
 `attach(value)` accepts an opaque task attachment handle from nested `exec poll`
 or `kill`, a file path string or `{path}` media descriptor, an inline MCP
@@ -633,7 +678,12 @@ watermarks unchanged. A receipt for an operation that already ran includes its t
 handle and log path so the caller can retrieve output without repeating the action.
 
 Task lists reserve snapshot diagnostics, owner/session text, display paths and
-member names before copying them. Their rendering workspace covers 32 times the
+member names before copying them, covering every selected top-level task and
+attached indented active child (up to `8` per parent). Folded finished children
+are summarized from lightweight non-nested lock reads without cloning `Final`,
+`leftovers`, `held`, or command strings, keeping list memory O(`limit`). Held-process
+`members(tree)` queries for both top-level tasks and indented active children
+run after dropping `lock(&self.registry)`. Their rendering workspace covers 32 times the
 source capacity plus fixed row/member keys, including simultaneous snapshot, warning,
 JSON and growing text buffers. Short lists use the independent control pool;
 larger candidates can move to the main pool after acquiring its replacement charge.
@@ -663,11 +713,21 @@ report commit. Refusal or a dropped candidate leaves those notices and the outsi
 claim due; the same kill-only control fallback and task recovery errors apply.
 
 A list candidate checks the final frame limit and reserves its payload and
-application-owned wire before marking entries reported. HTTP reserves its payload
-until handler return; the SDK creates its own encoding afterward. Cancellation or refusal leaves those marks
-unchanged. Direct calls still mark only text rows that fit; nested calls mark every
-selected structured entry. The final result owns its payload, and daemon callers
-reserve only their IPC encoding while checking the eventual MCP envelope ceiling.
+application-owned wire before marking entries reported. `fit_lines` operates on
+atomic top-level display blocks (`ListBlock`, pairing a parent header with its
+indented active child lines) so `head_tail` and `tail` never separate `  └─`
+rows from their parent. If one block alone exceeds `maxBytes`, `fit_lines`
+trims indented child lines from the bottom and drops those omitted children
+from `delivered_tasks` before falling back to line cutting; omission markers
+count omitted top-level blocks. HTTP reserves its payload until handler return;
+the SDK creates its own encoding afterward. Cancellation or refusal leaves
+those marks unchanged. On commit, direct calls mark only surviving blocks
+(calling `mark_reported` and `mark_keeps_reported` on their delivered tasks and
+marking their `folded_finished` children reported in `session`, setting
+`tree_end_reported` when `tree_ended` is true), while nested calls mark every
+selected block. Unrendered blocks and trimmed children stay unreported. The
+final result owns its payload, and daemon callers reserve only their IPC
+encoding while checking the eventual MCP envelope ceiling.
 
 Text windows reserve their working peak before entering a blocking reader. Retained
 line prefixes release unused capacity after truncation and terminal padding removal;
@@ -1168,8 +1228,21 @@ omitted on final serialization unless noted as always-present below.
   `limit`), and `totalCount`; each entry always carries `taskId` as a bare task
   ID, `kind`, `state`, `exitCode`, `pty`, `elapsedMs`, `command` up to 120
   chars, `owner`, and `logPath`, omitting `cols`, `rows`, `session`, `callId`,
-  and task diagnostics when null/false/zero/empty. `warnings` covers selected
-  tasks only and is omitted when empty.
+  `parentTaskId`, and task diagnostics when null/false/zero/empty. Flat child
+  entries (in `parentTaskId` drill-down or as promoted orphans) set
+  `parentTaskId` to the bare parent ID. `codemode` entries include `children`
+  (`{ total, done, failed, warned, active, queued, cancelled, activeTasks }`)
+  only when `total > 0`, `running && queued > 0`, or `!running && cancelled > 0`;
+  `prune_task_diagnostics` strips zero-valued counters and empty `activeTasks`
+  and recurses into `children.activeTasks` (up to `8` active child entries,
+  without redundant `parentTaskId`). `warnings` covers rendered concrete rows
+  only (top-level items and indented active children) and is omitted when empty;
+  warnings on folded finished children appear as `children.warned` and in full
+  under `parentTaskId`. Behavior change: callers parsing `structuredContent.tasks`
+  directly without passing `parentTaskId` now receive `codemode` children folded
+  under `parent.children` (with active children in `parent.children.activeTasks`
+  and promoted orphans in top-level `tasks` with `parentTaskId`) instead of flat
+  top-level rows.
 - **Integrity and initial-input diagnostics**: On pipe `start`, an early child
   close (`BrokenPipe` or Windows pipe-closed codes `109`/`232`/`233`) sets
   `inputWarning: "stdin closed after N of M bytes"` with `ok: true`, whereas
@@ -1181,15 +1254,23 @@ omitted on final serialization unless noted as always-present below.
 - **Background footer**: Appended to `start`, `poll`, `kill`, `transcript`, and
   `codemode` results (up to `512` bytes, outside `maxBytes`) naming up to three
   other tasks this session has addressed, using bare task IDs. HTTP clients
-  sharing a token share this scope. Running tasks (or tasks holding processes)
+  sharing a token share this scope. While scanning `session.touched`,
+  `Tasks::background` collects running `codemode` task IDs before excluding the
+  current call's task (`exclude`), and skips running children
+  (`parent_task_id: Some(pid)`) whose parent `pid` is also running in `touched`
+  so an active batch does not flood the three-slot footer (including when
+  polling the parent itself). Once the parent exits or is killed, surviving
+  running or unreported finished children surface normally until reported by
+  `poll`, `kill`, or a delivered `list` (including via a delivered parent
+  summary). Running tasks (or tasks holding processes)
   outside this session appear **at most once per session** as `1 task running
   outside this session; use list with scope "all".` or `<n> tasks running
   outside this session; use list with scope "all".`; the session flag is
   consumed atomically when a delivered response shows that clause or when the
   session's first committed footer-bearing result finds no outside tasks (never
   on nested or cancelled calls). A footer marks only session tasks it names; `list`
-  marks existing session entries shown in direct text or delivered in a nested
-  `tasks` array.
+  marks existing session entries shown in direct text (plus folded finished
+  children of delivered parents) or delivered in a nested `tasks` array.
 
 ## 3. Logs, Terminal Emulator, and Transcript Spool
 

@@ -115,16 +115,19 @@ pub struct Request {
     #[schemars(range(min = 5, max = 200))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) rows: Option<u16>,
-    /// list: "session" for tasks this session started or addressed (default), or "all" for every task in this server.
+    /// list: "session" for tasks this session started or addressed (default when parentTaskId is omitted), or "all" for every task in this server (default when parentTaskId is set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) scope: Option<ListScope>,
-    /// list: "active" for tasks whose root runs or that hold kept processes, or "finished" for the rest. Omit for both.
+    /// list: "active" for tasks whose root runs or that hold kept processes, or "finished" for the rest. Omit for both. Children whose parent is filtered out appear as top-level rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) state: Option<ListState>,
-    /// list: maximum tasks to return, newest first, 1-500 (default 20).
+    /// list: maximum top-level tasks (or child tasks with parentTaskId) to return, newest first, 1-500 (default 20). Folded codemode children do not count against this limit.
     #[schemars(range(min = 1, max = 500))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) limit: Option<u64>,
+    /// list: bare task ID or reader handle (<taskId>.<reader>) of a codemode task to list its child tasks flat instead of the default top-level view. Defaults scope to "all" when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) parent_task_id: Option<String>,
 }
 
 /// Output options shared by start and poll.
@@ -178,6 +181,7 @@ pub(crate) fn validate(request: &Request, nested: bool) -> Result<View, String> 
         ("scope", request.scope.is_some()),
         ("state", request.state.is_some()),
         ("limit", request.limit.is_some()),
+        ("parentTaskId", request.parent_task_id.is_some()),
     ];
     const VIEW: [&str; 7] = [
         "waitMs",
@@ -217,7 +221,14 @@ pub(crate) fn validate(request: &Request, nested: bool) -> Result<View, String> 
         .chain(VIEW)
         .collect(),
         Action::Kill => vec!["taskId", "waitMs", "truncate", "maxBytes"],
-        Action::List => vec!["truncate", "maxBytes", "scope", "state", "limit"],
+        Action::List => vec![
+            "truncate",
+            "maxBytes",
+            "scope",
+            "state",
+            "limit",
+            "parentTaskId",
+        ],
         Action::Transcript => vec!["taskId", "waitMs", "truncate", "maxBytes"],
     };
     for (name, set) in present {
@@ -448,4 +459,34 @@ pub(crate) fn validate_cwd(
         ));
     }
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parent_task_id_allowed_only_on_list() {
+        let list: Request = serde_json::from_value(json!({
+            "action": "list",
+            "parentTaskId": "p1-1"
+        }))
+        .expect("list request deserializes");
+        assert_eq!(list.parent_task_id.as_deref(), Some("p1-1"));
+        assert!(validate(&list, false).is_ok());
+
+        for req in [
+            json!({"action": "start", "command": "true", "parentTaskId": "p1-1"}),
+            json!({"action": "poll", "taskId": "p1-1", "parentTaskId": "p1-1"}),
+            json!({"action": "kill", "taskId": "p1-1", "parentTaskId": "p1-1"}),
+            json!({"action": "transcript", "taskId": "p1-1", "parentTaskId": "p1-1"}),
+        ] {
+            let parsed: Request = serde_json::from_value(req).expect("request deserializes");
+            let err = validate(&parsed, false)
+                .err()
+                .expect("non-list action must reject parentTaskId");
+            assert!(err.contains("`parentTaskId` does not apply"), "{err}");
+        }
+    }
 }

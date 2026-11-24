@@ -233,6 +233,10 @@ pub struct StartArgs {
     /// The session ID and daemon call that started the task, shown by `list`; `None` for a
     /// stdio call, which has neither.
     pub started_by: Option<(String, u64)>,
+    /// Parent codemode task ID when started via nested `exec start`.
+    pub parent_task_id: Option<String>,
+    /// Releases the parent script's `queued_starts` counter once the task enters `registry.tasks`.
+    pub queued_guard: Option<codemode::control::QueuedStartGuard>,
     /// What the task inherits: its environment, and the bash found in it.
     pub launch: Arc<LaunchContext>,
     pub input_owner: crate::lease::Owner,
@@ -550,6 +554,7 @@ impl Tasks {
         session: &Session,
         key: String,
     ) -> Result<(Started, Option<ProbeWarning>), String> {
+        let mut queued_guard = args.queued_guard;
         let kill_after_ms = args.kill_after_ms;
         // Admission holds a place against the running limit, so the bash lookup, the file
         // creation, and the spawn below all run without the registry lock.
@@ -666,6 +671,7 @@ impl Tasks {
             owner: args.owner,
             session_id: Some(session.id.clone()),
             started_by: args.started_by,
+            parent_task_id: args.parent_task_id,
             started: Instant::now(),
             root: Root::Process(spawned.tree),
             tree_done: watch::Sender::new(false),
@@ -693,6 +699,9 @@ impl Tasks {
         let entry = session.entry(&task);
         let reader = entry.start_reader(key);
         registry.tasks.push(Arc::clone(&task));
+        if let Some(guard) = queued_guard.as_mut() {
+            guard.disarm();
+        }
         pending.release(&mut registry);
         let stopping = registry.stopping;
         drop(registry);
@@ -779,6 +788,7 @@ impl Tasks {
             owner: session.label.clone(),
             session_id: Some(session.id.clone()),
             started_by: args.call_id.map(|id| (session.id.clone(), id)),
+            parent_task_id: None,
             started: Instant::now(),
             root: Root::Script(script),
             tree_done: watch::Sender::new(false),
@@ -1220,9 +1230,24 @@ impl Tasks {
             Keeps,
             Running,
         }
+        // Collect running codemode parents before filtering `exclude` so polling a running
+        // script does not surface its own running children in the background footer.
+        let running_scripts: HashSet<String> = touched
+            .iter()
+            .filter(|(task, _)| task.is_script() && task.is_running())
+            .map(|(task, _)| task.id.clone())
+            .collect();
         let mut entries = Vec::new();
         for (task, entry) in touched.into_iter().filter(|(task, _)| task.id != exclude) {
             let mut snapshot = task.notice_snapshot();
+            if snapshot.state == "running"
+                && task
+                    .parent_task_id
+                    .as_deref()
+                    .is_some_and(|pid| running_scripts.contains(pid))
+            {
+                continue;
+            }
             let (rank, notice) = match snapshot.state {
                 "running" => (2, Notice::Running),
                 _ if !entry.is_reported() => {

@@ -1,6 +1,8 @@
 //! Asynchronous host bridge, 256 MiB pending-call budget, permits, and script output writer.
 
-use super::control::{CallInfo, InFlightGuard, NestedCall, Outcome, ScriptHandle, Wake, lock};
+use super::control::{
+    CallInfo, InFlightGuard, NestedCall, Outcome, QueuedStartGuard, ScriptHandle, Wake, lock,
+};
 use crate::files;
 use crate::lease::{BytePool, Lease};
 use crate::service::render::{OutputMode, Render};
@@ -100,6 +102,7 @@ pub(super) struct Host {
     pub(super) launch: Arc<LaunchContext>,
     pub(super) transfer: bool,
     pub(super) call_id: Option<u64>,
+    pub(super) parent_task_id: String,
     pub(super) runtime: Handle,
     pub(super) script: ScriptHandle,
     pub(super) start_permits: Arc<Semaphore>,
@@ -297,7 +300,7 @@ impl Host {
                 .unwrap()
                 .input_owner = input_owner.clone();
         }
-        if let ToolCall::Exec(request) = &request
+        let queued_guard = if let ToolCall::Exec(request) = &request
             && request.action == Action::Start
             && service_schema::validate(request, true).is_ok()
         {
@@ -306,7 +309,10 @@ impl Host {
                 return Err(crate::ipc::Owned::new(STARTS_ERROR.into(), input_owner));
             }
             self.starts += 1;
-        }
+            Some(QueuedStartGuard::new(&self.script))
+        } else {
+            None
+        };
         let permit_pool = match &request {
             ToolCall::Exec(req) => match req.action {
                 Action::Start => Some(Arc::clone(&self.start_permits)),
@@ -326,6 +332,7 @@ impl Host {
         let in_flight = InFlightGuard::enter(script.clone());
         let transfer = self.transfer;
         let call_id = self.call_id;
+        let parent_task_id = self.parent_task_id.clone();
         let cancel = script.0.cancel.child_token();
         let nested_render = Render {
             output_mode: OutputMode::Structured,
@@ -335,6 +342,7 @@ impl Host {
         let response_control = is_control.then(|| Arc::clone(launch.control_memory()));
         self.runtime.spawn(input_owner.clone().hold_future(async move {
             let _in_flight = in_flight;
+            let queued_guard = queued_guard;
             let permit = match permit_wait {
                 Some(wait) => Some(tokio::select! {
                     biased;
@@ -371,7 +379,12 @@ impl Host {
                                 progress: None,
                                 call_id,
                                 nested: true,
-                                started: Some(NestedCall { script: &script, pending_id: id }),
+                                started: Some(NestedCall {
+                                    script: &script,
+                                    pending_id: id,
+                                    parent_task_id: &parent_task_id,
+                                }),
+                                queued_guard,
                                 render_slot: None,
                                 http_response: false,
                                 rpc_id_bytes: 0,

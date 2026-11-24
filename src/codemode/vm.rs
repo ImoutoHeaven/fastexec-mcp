@@ -103,6 +103,7 @@ pub(super) fn run(
         launch,
         transfer,
         call_id,
+        parent_task_id: task.id.clone(),
         runtime,
         script: script.clone(),
         start_permits: Arc::new(Semaphore::new(START_PERMITS)),

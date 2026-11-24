@@ -53,6 +53,8 @@ pub struct Call<'a> {
     pub nested: bool,
     /// The nested script and pending bridge ID; also records starts before cancellation.
     pub started: Option<codemode::control::NestedCall<'a>>,
+    /// Tracks an admitted nested `exec start` until it enters `registry.tasks`.
+    pub queued_guard: Option<codemode::control::QueuedStartGuard>,
     pub(crate) render_slot: Option<&'a RenderSlot<'a>>,
     pub http_response: bool,
     /// Encoded outer JSON-RPC ID length, known before committing output cursors.
@@ -185,7 +187,7 @@ impl Service {
         self.tasks.prune_entries(call.session);
         call.render = call.render.effective();
         let action = request.action;
-        match self.handle(request, &call).await {
+        match self.handle(request, &mut call).await {
             Ok((result, lease, task_meta, payload_owner)) => files::TrackedResult {
                 result: suppress(result, call.render),
                 lease,
@@ -373,7 +375,7 @@ impl Service {
     async fn handle(
         &self,
         mut request: Request,
-        call: &Call<'_>,
+        call: &mut Call<'_>,
     ) -> Result<
         (
             CallToolResult,
@@ -438,6 +440,10 @@ impl Service {
                     kill_after_ms: request.kill_after_ms,
                     owner: session.label.clone(),
                     started_by: call.call_id.map(|id| (session.id.clone(), id)),
+                    parent_task_id: call
+                        .started
+                        .map(|nested| nested.parent_task_id.to_owned()),
+                    queued_guard: call.queued_guard.take(),
                     launch: Arc::clone(base_launch),
                     input_owner: call.input_owner.clone(),
                 };

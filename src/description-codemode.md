@@ -18,7 +18,8 @@ branching on tool results, or filtering bulky output before returning it to cont
   omittedRange report unseen overflow (read it from logPath). Without waitMs, start and poll have
   no deadline; resize, input, or keys waits 2000 ms, and returnWhen defaults waitMs to 30000 ms.
   Drive a PTY in one turn by awaiting start with pty: true and returnWhen, then poll with input
-  and keys.
+  and keys. Nested exec list follows the same grouping rules: codemode children fold under their
+  parent unless parentTaskId is passed.
 - tools.read({ path }) returns a media descriptor { kind, path, mimeType, bytes, attachable:
   true } (or { kind, path, mimeType, sourceBytes?, attachable: false, note }) for images, audio,
   PDF, and video without loading base64 into JS. For UTF-8 text without offset or limit it returns

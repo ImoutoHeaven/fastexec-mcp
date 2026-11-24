@@ -371,6 +371,7 @@ async fn text_buffer_bridge_control_classification_preserves_main_admission() {
         launch,
         transfer: false,
         call_id: None,
+        parent_task_id: "aaaaaaaa-0".into(),
         runtime: Handle::current(),
         script: script.clone(),
         start_permits: Arc::new(Semaphore::new(0)),
@@ -524,6 +525,7 @@ async fn start_history_limit_counts_admitted_calls_without_spawning_processes() 
         launch: Arc::clone(&fixture.session.launch),
         transfer: false,
         call_id: None,
+        parent_task_id: "aaaaaaaa-0".into(),
         runtime,
         script: script.clone(),
         start_permits: Arc::new(Semaphore::new(0)),
@@ -2178,4 +2180,69 @@ async fn sh_template_join_quote_contract_and_prototype_pollution_immunity() {
         .await;
     assert_eq!(st.exit_code, Some(0), "{out}");
     assert_eq!(out, "sh-contract-ok\n");
+}
+
+#[tokio::test]
+async fn queued_start_guard_tracks_queued_disarmed_and_cancelled_starts() {
+    let fixture = Fixture::new();
+    let runtime = Handle::current();
+    let (script, worker) = prepare(runtime.clone()).unwrap();
+    drop(worker);
+    let mut host = Host {
+        service: Arc::clone(&fixture.service),
+        session: Arc::clone(&fixture.session),
+        launch: Arc::clone(&fixture.session.launch),
+        transfer: false,
+        call_id: None,
+        parent_task_id: "aaaaaaaa-1".into(),
+        runtime: runtime.clone(),
+        script: script.clone(),
+        start_permits: Arc::new(Semaphore::new(0)),
+        io_permits: Arc::new(Semaphore::new(0)),
+        next: 1,
+        starts: 0,
+    };
+    let start_args = json!({"action":"start","command":"true"}).to_string();
+    host.call("exec", &start_args).unwrap();
+    host.call("exec", &start_args).unwrap();
+    host.call(
+        "exec",
+        &json!({"action":"start","command":"true","keys":[]}).to_string(),
+    )
+    .unwrap();
+    // Invalid start and non-start calls must not affect queued_starts.
+    host.call("exec", &json!({"action":"start","command":""}).to_string())
+        .unwrap();
+    host.call("read", &json!({"path":"missing"}).to_string())
+        .unwrap();
+    assert_eq!(host.starts, 3);
+    assert_eq!(script.list_counts(), (3, 0));
+
+    script.kill();
+    tokio::task::spawn_blocking(move || {
+        script.cancel_and_drain();
+        assert_eq!(script.list_counts(), (0, 3));
+    })
+    .await
+    .unwrap();
+    assert!(fixture.tasks.all().is_empty());
+
+    // Disarming a guard before drop leaves cancelled_starts at 0 even if the script is killed later.
+    let (disarm_script, disarm_worker) = prepare(runtime.clone()).unwrap();
+    drop(disarm_worker);
+    let mut guard = super::control::QueuedStartGuard::new(&disarm_script);
+    assert_eq!(disarm_script.list_counts(), (1, 0));
+    guard.disarm();
+    assert_eq!(disarm_script.list_counts(), (0, 0));
+    disarm_script.kill();
+    drop(guard);
+    assert_eq!(disarm_script.list_counts(), (0, 0));
+
+    // Dropping an armed guard without cancellation (e.g. spawn error) decrements queued_starts only.
+    let (err_script, err_worker) = prepare(runtime).unwrap();
+    drop(err_worker);
+    let err_guard = super::control::QueuedStartGuard::new(&err_script);
+    assert_eq!(err_script.list_counts(), (1, 0));
+    drop(err_guard);
+    assert_eq!(err_script.list_counts(), (0, 0));
 }
