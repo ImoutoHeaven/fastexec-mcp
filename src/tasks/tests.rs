@@ -347,7 +347,7 @@ mod tests {
         Session::new(label.into(), label.into(), launch())
     }
 
-    fn start(tasks: &Arc<Tasks>, args: StartArgs) -> Result<Arc<Task>, String> {
+    fn start(tasks: &Arc<Tasks>, args: StartArgs) -> Result<Arc<Task>, TaskError> {
         tasks
             .start(args, &session("test-client"), random_chars(4).unwrap())
             .map(|((task, _, _), _)| task)
@@ -519,8 +519,9 @@ mod tests {
         let Err(refused) = start(&tasks, start_args()) else {
             panic!("a third task was admitted under a limit of 2");
         };
-        assert!(refused.starts_with("TOO_MANY_TASKS"), "{refused}");
-        assert!(refused.contains('2'), "{refused}");
+        assert!(matches!(&refused, TaskError::Overload(_)), "{refused}");
+        assert!(refused.message().starts_with("TOO_MANY_TASKS"), "{refused}");
+        assert!(refused.message().contains('2'), "{refused}");
         // The limit is the configured one, not a constant.
         assert_eq!(
             tasks.all().iter().filter(|task| task.is_running()).count(),
@@ -542,14 +543,16 @@ mod tests {
                 Limits::OFF.max_running
             );
         };
-        assert!(refused.starts_with("TOO_MANY_TASKS"), "{refused}");
+        assert!(matches!(&refused, TaskError::Overload(_)), "{refused}");
+        assert!(refused.message().starts_with("TOO_MANY_TASKS"), "{refused}");
         lock(&tasks.registry).pending = 0;
         // A stopping server admits nothing.
         lock(&tasks.registry).stopping = true;
         let Err(refused) = start(&tasks, start_args()) else {
             panic!("a start was admitted while the server was stopping");
         };
-        assert!(refused.contains("shutting down"), "{refused}");
+        assert!(matches!(&refused, TaskError::Io(_)), "{refused}");
+        assert!(refused.message().contains("shutting down"), "{refused}");
         lock(&tasks.registry).stopping = false;
         // A start that fails after admission gives its place back, so the limit is not eaten.
         let failed = StartArgs {
@@ -1007,7 +1010,8 @@ mod tests {
         ) else {
             panic!("a task started with an invalid bash override");
         };
-        assert!(refused.contains("FASTEXEC_BASH"), "{refused}");
+        assert!(matches!(&refused, TaskError::Io(_)), "{refused}");
+        assert!(refused.message().contains("FASTEXEC_BASH"), "{refused}");
         // A context that finds bash still starts a task, and its start got its place back.
         let task = start(&tasks, start_args()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1101,14 +1105,12 @@ mod script_tests {
         });
         let (_, script) = tasks.admit(true).unwrap();
         assert!(
-            tasks
-                .admit(true)
-                .err()
-                .unwrap()
-                .contains("TOO_MANY_SCRIPTS")
+            matches!(tasks.admit(true), Err(TaskError::Overload(message)) if message.contains("TOO_MANY_SCRIPTS"))
         );
         let (_, process) = tasks.admit(false).unwrap();
-        assert!(tasks.admit(false).err().unwrap().contains("TOO_MANY_TASKS"));
+        assert!(
+            matches!(tasks.admit(false), Err(TaskError::Overload(message)) if message.contains("TOO_MANY_TASKS"))
+        );
         drop(script);
         let (_, next) = tasks.admit(true).unwrap();
         drop((next, process));
@@ -1516,7 +1518,9 @@ mod script_tests {
             assert!(snapshot.kill_error.unwrap().contains("unconfirmed"));
             assert_eq!(task.root_end(), Some((Some(0), true)));
             assert!(task.keeps_processes());
-            assert!(tasks.admit(false).err().unwrap().contains("TOO_MANY_TASKS"));
+            assert!(
+                matches!(tasks.admit(false), Err(TaskError::Overload(message)) if message.contains("TOO_MANY_TASKS"))
+            );
         }
         tasks.shutdown();
     }
@@ -1556,7 +1560,9 @@ mod script_tests {
         assert!(!pending.evicted());
 
         let (_, admitted) = tasks.admit(false).unwrap();
-        assert!(tasks.admit(false).err().unwrap().contains("TOO_MANY_TASKS"));
+        assert!(
+            matches!(tasks.admit(false), Err(TaskError::Overload(message)) if message.contains("TOO_MANY_TASKS"))
+        );
         drop(admitted);
 
         tasks.expire_finished(Instant::now());
@@ -1994,6 +2000,43 @@ mod script_tests {
     }
 
     #[test]
+    fn input_capacity_is_overload_and_uncertain_delivery_is_io() {
+        let (runtime, tasks, _session) = fixture(Limits::OFF);
+        let task = finished_pty_task(&tasks, 12, 3);
+        let (sender, receiver) = mpsc::channel();
+        *lock(&task.input) = Some(sender);
+        task.queued.store(INPUT_QUEUE_LIMIT, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let refused = runtime
+            .block_on(task.send(Some(b"x"), false, &cancel, Default::default()))
+            .unwrap_err();
+        assert!(matches!(&refused, TaskError::Overload(_)), "{refused}");
+        assert_eq!(task.queued.load(Ordering::SeqCst), INPUT_QUEUE_LIMIT);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(lock(&task.input_error).is_none());
+
+        task.queued.store(0, Ordering::SeqCst);
+        cancel.cancel();
+        let uncertain = runtime
+            .block_on(task.send(Some(b"x"), false, &cancel, Default::default()))
+            .unwrap_err();
+        assert!(matches!(&uncertain, TaskError::Io(_)), "{uncertain}");
+        assert!(uncertain.message().contains("INPUT_DELIVERY_UNCONFIRMED"));
+        assert_eq!(
+            lock(&task.input_error).as_deref(),
+            Some(uncertain.message())
+        );
+        let queued = receiver.try_recv().unwrap();
+        assert_eq!(queued.bytes, b"x");
+        task.queued.fetch_sub(queued.bytes.len(), Ordering::SeqCst);
+        drop(queued);
+        tasks.shutdown();
+    }
+
+    #[test]
     fn terminal_snapshots_hold_leases_and_refuse_before_changing_transcript() {
         let (_runtime, tasks, _session) = fixture(Limits::OFF);
         let task = finished_pty_task(&tasks, 12, 3);
@@ -2008,7 +2051,9 @@ mod script_tests {
 
         let memory = BytePool::new(screen_bytes);
         let occupied = memory.try_acquire(1).unwrap();
-        let refused = task.screen(&memory).err().unwrap();
+        let TaskError::Overload(refused) = task.screen(&memory).err().unwrap() else {
+            panic!("screen snapshot capacity must be Overload");
+        };
         assert!(refused.starts_with("Server active memory budget ("));
         assert!(refused.contains(&task.id));
         assert!(refused.contains(&crate::files::path::display_path(&task.log_path)));
@@ -2034,10 +2079,7 @@ mod script_tests {
         let file_before = std::fs::read(&path).unwrap();
         let quota_before = tasks.log_bytes.load(Ordering::SeqCst);
         assert!(
-            task.transcript(&tasks, &state, &memory)
-                .err()
-                .unwrap()
-                .contains("memory budget")
+            matches!(task.transcript(&tasks, &state, &memory), Err(TaskError::Overload(message)) if message.contains("memory budget"))
         );
         assert_eq!(memory.used(), 1);
         assert_eq!(state.shown, (0, 0));

@@ -2,7 +2,7 @@
 
 use crate::lease::{self, BytePool};
 use crate::tasks::state::{Snapshot, Task};
-use crate::tasks::{ALPHABET, pids, random_chars};
+use crate::tasks::{ALPHABET, TaskError, pids, random_chars};
 use crate::term::output::Cleaner;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -497,7 +497,7 @@ impl TaskEntry {
     }
 
     /// Resolve and touch atomically, so one live handle always uses one read gate.
-    pub fn reader(&self, key: Option<&str>) -> Result<Arc<Reader>, String> {
+    pub fn reader(&self, key: Option<&str>) -> Result<Arc<Reader>, TaskError> {
         let mut readers = lock(&self.readers);
         if let Some(key) = key
             && let Some(reader) = readers.by_key.get(key).cloned()
@@ -522,9 +522,9 @@ impl TaskEntry {
                 Arc::strong_count(reader) == 1 && Arc::strong_count(&reader.read) == 1
             });
             let Some(idle) = idle else {
-                return Err(
+                return Err(TaskError::Overload(
                     "All 16 readers for this task are busy; retry when a read finishes.".into(),
-                );
+                ));
             };
             let old = readers
                 .lru
@@ -716,7 +716,9 @@ mod tests {
         let busy: Vec<_> = (0..16)
             .map(|n| entry.reader(Some(&format!("{n:04}"))).unwrap())
             .collect();
-        assert!(entry.reader(None).err().unwrap().contains("16 readers"));
+        assert!(
+            matches!(entry.reader(None), Err(TaskError::Overload(message)) if message.contains("16 readers"))
+        );
         let same = entry.reader(Some(&busy[0].key)).unwrap();
         assert!(Arc::ptr_eq(&same, &busy[0]));
         drop((same, busy));

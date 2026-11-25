@@ -1139,7 +1139,7 @@ pub(crate) fn encode_service_error(
         ServiceError::NotFound(msg) => ("NOT_FOUND", msg, None),
         ServiceError::Cancelled(msg) => ("CANCELLED", msg, None),
         ServiceError::Overload(msg, meta) => ("OVERLOAD", msg, meta),
-        ServiceError::Plain(msg) => ("IO", msg, None),
+        ServiceError::Io(msg) => ("IO", msg, None),
     };
     let meta_dto = task_meta.as_ref().map(|m| TaskMetaDto {
         task_id: &m.bare_task_id,

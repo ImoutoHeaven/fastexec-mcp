@@ -29,11 +29,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_limits(Limits::OFF)
+    }
+
+    fn with_limits(limits: Limits) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "fastexec-script-test-{}",
             tasks::random_chars(12).unwrap()
         ));
-        let tasks = Tasks::new_in(Limits::OFF, dir.clone()).unwrap();
+        let tasks = Tasks::new_in(limits, dir.clone()).unwrap();
         let service = Arc::new(Service::new(Arc::clone(&tasks), false));
         let session = Session::new(
             "script-tests".into(),
@@ -190,7 +194,7 @@ async fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() 
             is_control: false,
         };
         let outcome = encode_service_error(
-            crate::service::ServiceError::Plain("hello λ\n".into()),
+            crate::service::ServiceError::Io("hello λ\n".into()),
             &ctx,
             &delivery,
         )
@@ -2402,6 +2406,33 @@ async fn queued_start_guard_tracks_queued_disarmed_and_cancelled_starts() {
     assert_eq!(err_script.list_counts(), (1, 0));
     drop(err_guard);
     assert_eq!(err_script.list_counts(), (0, 0));
+}
+
+#[tokio::test]
+async fn task_capacity_rejects_nested_start_with_overload() {
+    let fixture = Fixture::with_limits(Limits {
+        max_running: 1,
+        ..Limits::OFF
+    });
+    let (state, output) = fixture
+        .result(
+            r#"
+            try {
+                await tools.exec({ action: "start", command: "printf should-not-run", waitMs: 0 });
+            } catch (error) {
+                if (!(error instanceof ToolError) || error.code !== "OVERLOAD") {
+                    throw new Error("task capacity must be OVERLOAD: " + error.code);
+                }
+                if (error.result !== undefined) throw new Error("no task was started");
+                return "task-capacity-ok";
+            }
+            throw new Error("a task was admitted over the running limit");
+            "#,
+        )
+        .await;
+    assert_eq!(state.exit_code, Some(0), "{output}");
+    assert_eq!(output, "task-capacity-ok\n");
+    assert_eq!(fixture.tasks.all().len(), 1);
 }
 
 #[tokio::test]

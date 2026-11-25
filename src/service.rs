@@ -96,7 +96,7 @@ pub(crate) enum ServiceError {
     NotFound(String),
     Cancelled(String),
     Overload(String, Option<files::TaskMeta>),
-    Plain(String),
+    Io(String),
 }
 
 impl ServiceError {
@@ -106,20 +106,20 @@ impl ServiceError {
             | Self::NotFound(s)
             | Self::Cancelled(s)
             | Self::Overload(s, _)
-            | Self::Plain(s) => s,
+            | Self::Io(s) => s,
         }
     }
 }
 
 impl From<String> for ServiceError {
     fn from(message: String) -> Self {
-        Self::Plain(message)
+        Self::Io(message)
     }
 }
 
 impl From<&str> for ServiceError {
     fn from(message: &str) -> Self {
-        Self::Plain(message.to_owned())
+        Self::Io(message.to_owned())
     }
 }
 
@@ -131,17 +131,26 @@ impl std::ops::Deref for ServiceError {
     }
 }
 
-pub(crate) fn task_read_error(message: String, task: &Task) -> ServiceError {
-    if message.starts_with("Server active memory budget (") {
-        ServiceError::Overload(
+impl From<tasks::TaskError> for ServiceError {
+    fn from(error: tasks::TaskError) -> Self {
+        match error {
+            tasks::TaskError::Overload(message) => Self::Overload(message, None),
+            tasks::TaskError::Cancelled(message) => Self::Cancelled(message),
+            tasks::TaskError::Io(message) => Self::Io(message),
+        }
+    }
+}
+
+fn task_error(error: tasks::TaskError, task: &Task) -> ServiceError {
+    match error {
+        tasks::TaskError::Overload(message) => ServiceError::Overload(
             message,
             Some(files::TaskMeta {
                 bare_task_id: task.id.clone(),
                 log_path: files::path::display_path(&task.log_path),
             }),
-        )
-    } else {
-        ServiceError::Plain(message)
+        ),
+        error => error.into(),
     }
 }
 
@@ -466,7 +475,7 @@ impl Service {
         let (task, entry, reader) = started;
         let state = read_gate(&reader, &ctx.cancel).await?;
         let mark = wait::mark(&task, &reader, &state, when, ctx.launch().memory())
-            .map_err(|error| task_read_error(error, &task))?;
+            .map_err(|error| task_error(error, &task))?;
         let encoding = view.encoding.unwrap_or(task.encoding);
         let ended = wait::wait(
             &task,
@@ -478,7 +487,7 @@ impl Service {
             ctx.progress.as_ref(),
         )
         .await
-        .map_err(|error| task_read_error(error, &task))?;
+        .map_err(|error| task_error(error, &task))?;
         read_result(
             &ctx.cancel,
             self.prepare_window_or_screen(
@@ -646,7 +655,9 @@ impl Service {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(ServiceError::Validation)?;
                 let entry = session.entry(&task);
-                let task_reader = entry.reader(key).map_err(ServiceError::Validation)?;
+                let task_reader = entry
+                    .reader(key)
+                    .map_err(|error| task_error(error, &task))?;
                 let state = read_gate(&task_reader, &ctx.cancel).await?;
                 let sends = request.input.is_some()
                     || request.keys.is_some()
@@ -668,7 +679,7 @@ impl Service {
                 let encode = |task: &Task| -> Result<Vec<u8>, ServiceError> {
                     let mut data = input_bytes.to_vec();
                     if !names.is_empty() {
-                        let modes = task.modes().map_err(ServiceError::Plain)?;
+                        let modes = task.modes().map_err(ServiceError::Io)?;
                         for (name, key) in names.iter().zip(parsed.iter().copied()) {
                             data.extend(
                                 keys::encode(name, key, modes).map_err(ServiceError::Validation)?,
@@ -685,7 +696,7 @@ impl Service {
                 };
                 let mut data = encode(&task)?;
                 let mark = wait::mark(&task, &task_reader, &state, when, ctx.launch().memory())
-                    .map_err(|error| task_read_error(error, &task))?;
+                    .map_err(|error| task_error(error, &task))?;
                 if let Some((cols_axis, rows_axis)) = axes {
                     let (current_cols, current_rows) = task.size();
                     task.resize(
@@ -707,7 +718,8 @@ impl Service {
                         &ctx.cancel,
                         ctx.input_owner.clone(),
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| task_error(error, &task))?;
                 } else {
                     task.send(
                         input,
@@ -715,7 +727,8 @@ impl Service {
                         &ctx.cancel,
                         ctx.input_owner.clone(),
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| task_error(error, &task))?;
                     press(
                         &task,
                         input_bytes,
@@ -743,7 +756,7 @@ impl Service {
                     ctx.progress.as_ref(),
                 )
                 .await
-                .map_err(|error| task_read_error(error, &task))?;
+                .map_err(|error| task_error(error, &task))?;
                 read_result(
                     &ctx.cancel,
                     self.prepare_window_or_screen(
@@ -765,7 +778,9 @@ impl Service {
             Action::Kill => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
                 let entry = session.entry(&task);
-                let task_reader = entry.reader(key).map_err(ServiceError::Validation)?;
+                let task_reader = entry
+                    .reader(key)
+                    .map_err(|error| task_error(error, &task))?;
                 task.kill().map_err(|error| {
                     format!(
                         "Cannot terminate the process tree of {}: {error}. Poll to see its state, or retry kill.",
@@ -830,7 +845,9 @@ impl Service {
                     ));
                 }
                 let entry = session.entry(&task);
-                let task_reader = entry.reader(key).map_err(ServiceError::Validation)?;
+                let task_reader = entry
+                    .reader(key)
+                    .map_err(|error| task_error(error, &task))?;
                 let state = read_gate(&task_reader, &ctx.cancel).await?;
                 read_result(
                     &ctx.cancel,
@@ -992,7 +1009,7 @@ impl Service {
         let initial_metadata = PreparedSnapshot::new(&task, launch, action)?;
         let screen = task
             .screen(launch.memory())
-            .map_err(|error| task_read_error(error, &task))?;
+            .map_err(|error| task_error(error, &task))?;
         let (reader, until) = (Arc::clone(&task), screen.log_end);
         let staged = (screen, permit, StagedRead::new(state));
         let pending = tokio::task::spawn_blocking(move || {
@@ -1082,7 +1099,7 @@ impl Service {
         .await
         .map_err(|error| format!("Internal failure while reading: {error}."))?;
         let metadata = initial_metadata;
-        let transcript = pending.0.map_err(|error| task_read_error(error, &task))?;
+        let transcript = pending.0.map_err(|error| task_error(error, &task))?;
         let pending_lines = transcript.pending.matches('\n').count() as u64;
         let total = transcript.lines + pending_lines;
         let transcript_path = files::path::display_path(&transcript.path);
@@ -1336,11 +1353,14 @@ async fn task_render_permit(
             Action::Transcript => "Repeat transcript for the same task or read its log.",
             _ => "Poll the task or read its log. Do not replay the original operation.",
         };
-        ServiceError::Plain(format!(
-            "The task exists and may still be running. Its output was not read because the daemon is rendering other results.\ntaskId: {}\nlogPath: {}\n{recovery}",
-            reader.handle(&task.id),
-            files::path::display_path(&task.log_path),
-        ))
+        task_error(
+            tasks::TaskError::Overload(format!(
+                "The task exists and may still be running. Its output was not read because the daemon is rendering other results.\ntaskId: {}\nlogPath: {}\n{recovery}",
+                reader.handle(&task.id),
+                files::path::display_path(&task.log_path),
+            )),
+            task,
+        )
     })
 }
 
@@ -1368,10 +1388,11 @@ async fn press(
                 _ = tokio::time::sleep(delay) => {}
             }
         }
-        let bytes = task
+        let modes = task
             .modes()
-            .and_then(|modes| keys::encode(name, key, modes))
-            .map_err(|error| ServiceError::Plain(sent(error)))?;
+            .map_err(|error| ServiceError::Io(sent(error)))?;
+        let bytes = keys::encode(name, key, modes)
+            .map_err(|error| ServiceError::Validation(sent(error)))?;
         size += bytes.len();
         if size > MAX_INPUT_BYTES {
             return Err(ServiceError::Validation(sent(format!(
@@ -1380,7 +1401,18 @@ async fn press(
         }
         task.send(Some(&bytes), false, cancel, input_owner.clone())
             .await
-            .map_err(|error| ServiceError::Plain(sent(error)))?;
+            .map_err(|error| {
+                let error = match error {
+                    tasks::TaskError::Overload(message) => {
+                        tasks::TaskError::Overload(sent(message))
+                    }
+                    tasks::TaskError::Cancelled(message) => {
+                        tasks::TaskError::Cancelled(sent(message))
+                    }
+                    tasks::TaskError::Io(message) => tasks::TaskError::Io(sent(message)),
+                };
+                task_error(error, task)
+            })?;
     }
     Ok(())
 }

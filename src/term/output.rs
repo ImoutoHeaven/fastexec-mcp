@@ -130,15 +130,8 @@ pub struct Matcher {
 
 impl Matcher {
     /// Admits copies and the scan/decode peak before a caller sends input or resizes a task.
-    pub fn reserve(needles: &[String], memory: &Arc<BytePool>) -> Result<Lease, String> {
-        Self::workspace_bytes(needles)
-            .and_then(|bytes| memory.try_acquire(bytes))
-            .ok_or_else(|| {
-                format!(
-                    "Server active memory budget ({}) cannot fit output matching; this wait was not started.",
-                    memory.limit()
-                )
-            })
+    pub fn reserve(needles: &[String], memory: &Arc<BytePool>) -> Option<Lease> {
+        Self::workspace_bytes(needles).and_then(|bytes| memory.try_acquire(bytes))
     }
 
     fn workspace_bytes(needles: &[String]) -> Option<usize> {
@@ -304,7 +297,7 @@ pub struct WindowSpec {
     pub raw: bool,
     pub clean: bool,
     pub keep_nul: bool,
-    /// When true, injects omission/cut markers; when false, emits only raw data bytes.
+    /// When true, injects omission/cut markers; when false, emits decoded text without markers.
     pub include_markers: bool,
     pub encoding: &'static Encoding,
     /// What the line numbers count, named in the omission marker: "log" or "transcript".
@@ -1398,11 +1391,7 @@ mod tests {
             let memory = BytePool::new(limit);
             let lease = Matcher::reserve(&needles, &memory);
             if limit < needed {
-                assert!(
-                    lease
-                        .unwrap_err()
-                        .starts_with("Server active memory budget (")
-                );
+                assert!(lease.is_none());
                 assert_eq!(memory.used(), 0);
                 continue;
             }

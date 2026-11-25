@@ -58,6 +58,39 @@ impl Limits {
     };
 }
 
+#[derive(Debug)]
+pub enum TaskError {
+    Overload(String),
+    Cancelled(String),
+    Io(String),
+}
+
+impl TaskError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Overload(message) | Self::Cancelled(message) | Self::Io(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<String> for TaskError {
+    fn from(message: String) -> Self {
+        Self::Io(message)
+    }
+}
+
+impl From<&str> for TaskError {
+    fn from(message: &str) -> Self {
+        Self::Io(message.into())
+    }
+}
+
 pub(crate) const TASK_LOG_LIMIT: u64 = 64 << 20;
 pub(crate) const MAX_TASK_ATTACHMENTS: usize = 1024;
 const TOTAL_LOG_LIMIT: u64 = 4 << 30;
@@ -742,7 +775,7 @@ impl Tasks {
 
     /// Takes a place against [`Limits::max_running`] and the next task ID. The guard gives the
     /// place back on drop, so every failed start releases it.
-    fn admit(&self, script: bool) -> Result<(String, Pending<'_>), String> {
+    fn admit(&self, script: bool) -> Result<(String, Pending<'_>), TaskError> {
         let mut registry = lock(&self.registry);
         if registry.stopping {
             return Err("The server is shutting down; the task was not started.".into());
@@ -754,9 +787,9 @@ impl Tasks {
             .count();
         let limit = self.limits.max_running;
         if running + registry.pending >= limit {
-            return Err(format!(
+            return Err(TaskError::Overload(format!(
                 "TOO_MANY_TASKS: {limit} tasks are running or keep processes. Wait for one to finish or kill one, then retry."
-            ));
+            )));
         }
         if script {
             let running = registry
@@ -766,9 +799,9 @@ impl Tasks {
                 .count();
             let limit = self.limits.max_scripts;
             if running + registry.pending_scripts >= limit {
-                return Err(format!(
+                return Err(TaskError::Overload(format!(
                     "TOO_MANY_SCRIPTS: {limit} codemode tasks are running. Wait for one to finish or kill one, then retry."
-                ));
+                )));
             }
             registry.pending_scripts += 1;
         }
@@ -808,7 +841,7 @@ impl Tasks {
         args: StartArgs,
         session: &Session,
         key: String,
-    ) -> Result<(Started, Option<ProbeWarning>), String> {
+    ) -> Result<(Started, Option<ProbeWarning>), TaskError> {
         let mut queued_guard = args.queued_guard;
         let kill_after_ms = args.kill_after_ms;
         // Admission holds a place against the running limit, so the bash lookup, the file
@@ -849,7 +882,9 @@ impl Tasks {
             {
                 let _ = std::fs::remove_file(&log_path);
                 let _ = std::fs::remove_file(&script_path);
-                return Err(format!("Cannot write the command script: {error}."));
+                return Err(TaskError::Io(format!(
+                    "Cannot write the command script: {error}."
+                )));
             }
             Some(script_path.as_path())
         } else {
@@ -875,7 +910,7 @@ impl Tasks {
             Err(error) => {
                 let _ = std::fs::remove_file(&log_path);
                 let _ = std::fs::remove_file(&script_path);
-                return Err(format!("Cannot start the command: {error}."));
+                return Err(TaskError::Io(format!("Cannot start the command: {error}.")));
             }
         };
         if !need_input_worker {
@@ -1023,7 +1058,7 @@ impl Tasks {
         args: ScriptArgs,
         session: &Arc<Session>,
         key: String,
-    ) -> Result<Started, String> {
+    ) -> Result<Started, TaskError> {
         let (id, mut pending) = self.admit(true)?;
         let (script, worker) = codemode::prepare(self.handle.clone())?;
         let output = OutputWorkers::new()

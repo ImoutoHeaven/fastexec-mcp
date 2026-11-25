@@ -2,7 +2,8 @@
 
 use super::workers::{WriterDone, answer_program};
 use super::{
-    EVICTED_TRANSCRIPT, INPUT_QUEUE_LIMIT, INPUT_WRITE_LIMIT, TASK_LOG_LIMIT, Tasks, lock,
+    EVICTED_TRANSCRIPT, INPUT_QUEUE_LIMIT, INPUT_WRITE_LIMIT, TASK_LOG_LIMIT, TaskError, Tasks,
+    lock,
 };
 use crate::codemode;
 use crate::lease::{BytePool, Lease};
@@ -215,13 +216,13 @@ pub(super) struct Pty {
     pub(super) spool: Spool,
 }
 
-fn terminal_memory_error(memory: &BytePool, task: &Task) -> String {
-    format!(
+fn terminal_memory_error(memory: &BytePool, task: &Task) -> TaskError {
+    TaskError::Overload(format!(
         "Server active memory budget ({} bytes) cannot fit the terminal snapshot; the operation may have run (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId without input once in-flight transfers complete.",
         memory.limit(),
         task.id,
         crate::files::path::display_path(&task.log_path)
-    )
+    ))
 }
 
 /// A PTY task's transcript file: the final lines, those the terminal wrote out, then the
@@ -964,7 +965,7 @@ impl Task {
     }
 
     /// The rendered terminal of a PTY task.
-    pub fn screen(&self, memory: &Arc<BytePool>) -> Result<Screen, String> {
+    pub fn screen(&self, memory: &Arc<BytePool>) -> Result<Screen, TaskError> {
         self.check_size()?;
         let terminal = lock(
             self.terminal
@@ -1003,7 +1004,7 @@ impl Task {
         shared: &Tasks,
         state: &ReadState,
         memory: &Arc<BytePool>,
-    ) -> Result<Transcript, String> {
+    ) -> Result<Transcript, TaskError> {
         let terminal = self
             .terminal
             .as_ref()
@@ -1015,7 +1016,9 @@ impl Task {
         let Pty { live, spool } = &mut *pty;
         if lock(&self.transcript_file).is_none() {
             let reason = spool.stopped.as_deref().unwrap_or("it is gone");
-            return Err(format!("The transcript file is missing: {reason}."));
+            return Err(TaskError::Io(format!(
+                "The transcript file is missing: {reason}."
+            )));
         }
         // The result shows the pending lines only as the file holds them, those that fit the
         // per-task limit.
@@ -1068,7 +1071,7 @@ impl Task {
         eof: bool,
         cancel: &CancellationToken,
         input_owner: crate::lease::Owner,
-    ) -> Result<(), String> {
+    ) -> Result<(), TaskError> {
         let Some(done) = self.queue_input(input, eof, input_owner)? else {
             return Ok(());
         };
@@ -1081,7 +1084,7 @@ impl Task {
                 if let Err(error) = &result {
                     *lock(&self.input_error) = Some(error.clone());
                 }
-                return result;
+                return result.map_err(TaskError::Io);
             },
             _ = cancel.cancelled() => "the call was cancelled",
             _ = tokio::time::sleep(INPUT_WRITE_LIMIT) => "the input writer did not finish within 5 s",
@@ -1090,7 +1093,7 @@ impl Task {
             "INPUT_DELIVERY_UNCONFIRMED: {uncertain}; input may be partially delivered or still queued, and may take effect later. Do not blindly retry."
         );
         *lock(&self.input_error) = Some(error.clone());
-        Err(error)
+        Err(TaskError::Io(error))
     }
 
     fn queue_input(
@@ -1098,7 +1101,7 @@ impl Task {
         input: Option<&[u8]>,
         eof: bool,
         input_owner: crate::lease::Owner,
-    ) -> Result<Option<oneshot::Receiver<Result<(), String>>>, String> {
+    ) -> Result<Option<oneshot::Receiver<Result<(), String>>>, TaskError> {
         // A pipe write, including an explicit empty string, requires writable stdin.
         let data = input.filter(|bytes| !self.pty || !bytes.is_empty());
         if eof && self.pty {
@@ -1146,7 +1149,7 @@ impl Task {
             return Ok(None);
         }
         if !self.admit(bytes.len()) {
-            return Err("INPUT_BACKPRESSURE: 1 MiB of earlier input is still waiting for the program to read it. Poll for output, then retry.".into());
+            return Err(TaskError::Overload("INPUT_BACKPRESSURE: 1 MiB of earlier input is still waiting for the program to read it. Poll for output, then retry.".into()));
         }
         let (done, result) = oneshot::channel();
         if tx

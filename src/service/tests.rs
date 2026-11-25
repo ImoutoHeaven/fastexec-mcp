@@ -2759,3 +2759,175 @@ async fn program_bridge_admission_rollback_and_control_memory_fallback() {
     drop(worker);
     tasks.shutdown();
 }
+
+#[tokio::test]
+async fn capacity_refusals_mark_agent_results_as_overload() {
+    for script in [false, true] {
+        let tasks = Tasks::new(tasks::Limits {
+            max_running: if script { 1 } else { 0 },
+            max_scripts: 0,
+            ..tasks::Limits::OFF
+        })
+        .unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let session = Session::new(
+            "capacity".into(),
+            "capacity".into(),
+            Arc::new(LaunchContext::current().unwrap()),
+        );
+        let result = if script {
+            service
+                .codemode_agent(
+                    serde_json::from_value(json!({"code": "return undefined;"})).unwrap(),
+                    script_ctx(&session),
+                    AgentDelivery::default(),
+                    false,
+                )
+                .await
+        } else {
+            service
+                .exec_agent_json(
+                    json!({"action": "start", "command": "true"}),
+                    script_ctx(&session),
+                    AgentDelivery::default(),
+                )
+                .await
+        };
+        assert!(tasks.all().is_empty());
+        tasks.shutdown();
+        assert_eq!(result.result.is_error, Some(true));
+        assert!(result.overload, "{}", text_of(&result.result));
+        assert!(result.task_meta.is_none());
+    }
+}
+
+#[tokio::test]
+async fn cancelling_an_active_program_wait_preserves_cancelled_code() {
+    let (service, tasks, session) = script_fixture();
+    let (task, _, reader) = tasks
+        .start_script(
+            tasks::ScriptArgs {
+                code: "await sleep(60000);".into(),
+                launch: Arc::clone(&session.launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "r001".into(),
+        )
+        .unwrap();
+    let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+    script.test_pending_result(1, 0, 16 << 10);
+    let ctx = script_ctx(&session);
+    let cancel = ctx.cancel.clone();
+    let request = serde_json::from_value(json!({
+        "action": "poll", "taskId": reader.handle(&task.id)
+    }))
+    .unwrap();
+    let mut waiting = Box::pin(service.exec_program(
+        request,
+        ctx,
+        ProgramDelivery {
+            script: &script,
+            pending_id: 1,
+            is_control: false,
+        },
+    ));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    cancel.cancel();
+    let result = waiting.await;
+    let still_running = task.is_running();
+    drop(worker);
+    tasks.shutdown();
+    assert!(still_running, "cancelling a wait must not kill its task");
+    let codemode::control::Outcome::Value(payload) = result.outcome else {
+        panic!("expected a CANCELLED error envelope");
+    };
+    let parsed: Value = serde_json::from_str(&payload.value).unwrap();
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["code"], "CANCELLED");
+}
+
+#[tokio::test]
+async fn busy_renderer_preserves_overload_and_task_recovery_metadata() {
+    let (service, tasks, session, entry) = list_fixture().await;
+    let task = tasks.all().pop().unwrap();
+    let reader = entry.reader(Some("b005")).unwrap();
+    let pool = crate::lease::BytePool::new(0);
+    let launch = Arc::new(session.launch.for_session().with_memory(Arc::clone(&pool)));
+    let slots = Arc::new(Semaphore::new(0));
+    let slot = RenderSlot::new(&slots);
+    let mut ctx = script_ctx(&session);
+    ctx.launch = Some(&launch);
+    let refused = service
+        .exec_agent_json(
+            json!({"action": "poll", "taskId": reader.handle(&task.id), "waitMs": 0}),
+            ctx,
+            AgentDelivery {
+                render_slot: Some(&slot),
+                ..Default::default()
+            },
+        )
+        .await;
+    tasks.shutdown();
+    let text = text_of(&refused.result);
+    assert!(refused.overload, "{text}");
+    let meta = refused.task_meta.unwrap();
+    assert_eq!(meta.bare_task_id, task.id);
+    assert_eq!(meta.log_path, files::path::display_path(&task.log_path));
+    assert!(text.contains("daemon is rendering other results"), "{text}");
+    assert!(
+        text.contains("Do not resend input, keys, or resize."),
+        "{text}"
+    );
+    assert!(reader.is_fresh());
+    assert!(!entry.is_reported());
+    assert_eq!(pool.used(), 0);
+}
+
+#[tokio::test]
+async fn reader_capacity_is_overload_with_task_recovery_metadata() {
+    let (service, tasks, session, entry) = list_fixture().await;
+    let task = tasks.all().pop().unwrap();
+    let busy: Vec<_> = (0..16)
+        .map(|index| entry.reader(Some(&format!("{index:04}"))).unwrap())
+        .collect();
+    let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+    script.test_pending_result(1, 0, 16 << 10);
+    let refused = service
+        .exec_program(
+            serde_json::from_value(json!({"action": "poll", "taskId": task.id, "waitMs": 0}))
+                .unwrap(),
+            script_ctx(&session),
+            ProgramDelivery {
+                script: &script,
+                pending_id: 1,
+                is_control: false,
+            },
+        )
+        .await;
+    drop(worker);
+    tasks.shutdown();
+    let codemode::control::Outcome::Value(payload) = refused.outcome else {
+        panic!("expected an OVERLOAD error envelope");
+    };
+    let parsed: Value = serde_json::from_str(&payload.value).unwrap();
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["code"], "OVERLOAD");
+    assert_eq!(parsed["result"]["taskId"], task.id);
+    assert_eq!(
+        parsed["result"]["logPath"],
+        files::path::display_path(&task.log_path)
+    );
+    assert!(!entry.is_reported());
+    assert!(busy.iter().all(|reader| reader.is_fresh()));
+    assert!(Arc::ptr_eq(&busy[0], &entry.reader(Some("0000")).unwrap(),));
+}

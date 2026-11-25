@@ -4,6 +4,7 @@
 
 use crate::lease::{BytePool, Lease};
 use crate::session::{ReadState, Reader};
+use crate::tasks::TaskError;
 use crate::tasks::state::Task;
 use crate::term::output::{Cleaner, Matcher};
 use encoding_rs::Encoding;
@@ -137,19 +138,21 @@ pub fn mark(
     state: &ReadState,
     when: Option<&ReturnWhen>,
     memory: &Arc<BytePool>,
-) -> Result<Mark, String> {
+) -> Result<Mark, TaskError> {
     let matcher_lease = when
         .and_then(|when| when.output_contains.as_deref())
         .filter(|texts| !texts.is_empty())
-        .map(|texts| Matcher::reserve(texts, memory))
-        .transpose()
-        .map_err(|message| {
-            format!(
-                "{message} The task may have run (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId without input once in-flight transfers complete.",
-                reader.handle(&task.id),
-                crate::files::path::display_path(&task.log_path)
-            )
-        })?;
+        .map(|texts| {
+            Matcher::reserve(texts, memory).ok_or_else(|| {
+                TaskError::Overload(format!(
+                    "Server active memory budget ({}) cannot fit output matching; this wait was not started. The task may have run (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId without input once in-flight transfers complete.",
+                    memory.limit(),
+                    reader.handle(&task.id),
+                    crate::files::path::display_path(&task.log_path)
+                ))
+            })
+        })
+        .transpose()?;
     let (cursor, cleaner) = (state.cursor, state.cleaner.clone());
     let compares =
         when.is_some_and(|when| when.screen_appears.is_some() || when.screen_gone.is_some());
@@ -196,7 +199,7 @@ async fn finish(
     end: WaitEnd,
     deadline: Option<tokio::time::Instant>,
     cancel: &CancellationToken,
-) -> Result<WaitEnd, String> {
+) -> Result<WaitEnd, TaskError> {
     if matches!(end, WaitEnd::TreeEnded) {
         let drain_until = tokio::time::Instant::now() + crate::tasks::DRAIN_CAP;
         let until = deadline.map_or(drain_until, |d| d.min(drain_until));
@@ -204,7 +207,7 @@ async fn finish(
         while !task.output_closed() {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err(CANCELLED.into()),
+                _ = cancel.cancelled() => return Err(TaskError::Cancelled(CANCELLED.into())),
                 _ = tokio::time::sleep_until(until) => break,
                 _ = activity.changed() => {}
             }
@@ -294,7 +297,7 @@ pub async fn wait(
     encoding: &'static Encoding,
     cancel: &CancellationToken,
     progress: Option<&watch::Sender<Option<Progress>>>,
-) -> Result<WaitEnd, String> {
+) -> Result<WaitEnd, TaskError> {
     let started = Instant::now();
     let deadline = wait_duration.and_then(|d| tokio::time::Instant::now().checked_add(d));
     // Quiet that begins past the deadline does not hold, however late the last check runs.
@@ -366,7 +369,7 @@ pub async fn wait(
                     biased;
                     _ = cancel.cancelled() => {
                         scan.abort();
-                        return Err(CANCELLED.into());
+                        return Err(TaskError::Cancelled(CANCELLED.into()));
                     }
                     result = &mut scan => result,
                 }
@@ -389,7 +392,7 @@ pub async fn wait(
         }
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(CANCELLED.into()),
+            _ = cancel.cancelled() => return Err(TaskError::Cancelled(CANCELLED.into())),
             _ = done.changed() => {}
             _ = tree_done.changed() => {}
             _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => expired = true,
@@ -453,7 +456,10 @@ mod tests {
             let result = mark(&task, &reader, &state, Some(&when), &memory);
             assert_eq!(result.is_ok(), limit >= needed);
             assert_eq!(state.cursor, 0);
-            if let Err(message) = &result {
+            if let Err(error) = &result {
+                let TaskError::Overload(message) = error else {
+                    panic!("matcher capacity must be Overload: {error}");
+                };
                 assert!(message.starts_with("Server active memory budget ("));
                 assert!(message.contains(&reader.handle(&task.id)));
                 assert!(message.contains(&crate::files::path::display_path(&task.log_path)));
@@ -577,7 +583,7 @@ mod tests {
             cancel.cancel();
             for result in [scan.as_mut().poll(&mut cx), drain.as_mut().poll(&mut cx)] {
                 assert!(
-                    matches!(result, std::task::Poll::Ready(Err(message)) if message == CANCELLED)
+                    matches!(result, std::task::Poll::Ready(Err(TaskError::Cancelled(message))) if message == CANCELLED)
                 );
             }
             drop(release);
@@ -663,7 +669,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("Cancelled"), "{err}");
+        assert!(
+            matches!(&err, TaskError::Cancelled(message) if message == CANCELLED),
+            "{err}"
+        );
         let _ = task2.kill();
         tasks.shutdown();
     }
