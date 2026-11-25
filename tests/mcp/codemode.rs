@@ -885,19 +885,47 @@ fn nested_list_marks_tasks_started_by_an_outer_call() {
         "loginShell": false, "waitMs": 0,
     }));
     let handle = task_id_of(&started).to_owned();
+    let outer_bare = bare_id(&handle).to_owned();
     let listed = code_result(
         &mut server,
         json!({
             "code": format!(
-                "await tools.exec({{action:'poll', taskId:{}}}); const list = await tools.exec({{action:'list', state:'finished'}}); return list.tasks.find(task => task.taskId === {}).exitCode;",
-                json!(handle), json!(bare_id(&handle)),
+                r#"
+await tools.exec({{action:'poll', taskId:{handle}}});
+const own = await tools.exec({{action:'start', command:'exit 5', loginShell:false, waitMs:0}});
+const ownBare = own.taskId.split('.')[0];
+let outerExit = null;
+let ownExit = null;
+for (let i = 0; i < 40; i++) {{
+    const list = await tools.exec({{action:'list', state:'finished'}});
+    const outer = list.tasks.find(task => task.taskId === {outer});
+    const child = list.tasks.find(task => task.taskId === ownBare);
+    if (outer && child) {{
+        outerExit = outer.exitCode;
+        ownExit = child.exitCode;
+        break;
+    }}
+    await tools.exec({{action:'start', command:'sleep 0.05', loginShell:false}});
+}}
+return JSON.stringify({{ outerExit, ownExit, ownBare }});
+"#,
+                handle = json!(handle),
+                outer = json!(outer_bare),
             ),
         }),
     );
-    assert_eq!(body_of(code_text(&listed)), "4", "{listed}");
+    let text = code_text(&listed);
+    let parsed: Value = serde_json::from_str(body_of(text)).unwrap();
+    assert_eq!(parsed["outerExit"], 4, "{listed}");
+    assert_eq!(parsed["ownExit"], 5, "{listed}");
+    let own_bare = parsed["ownBare"].as_str().unwrap();
     assert!(
-        !code_text(&listed).contains("(Background:"),
-        "the delivered nested list already reported the finished outer task: {listed}",
+        text.contains("(Background:") && text.contains(&format!("{outer_bare} exited 4")),
+        "nested list must leave outer-session task due for the outer footer: {listed}",
+    );
+    assert!(
+        !text.contains(&format!("{own_bare} exited 5")),
+        "nested list must mark the script-owned finished child reported: {listed}",
     );
 }
 
@@ -2500,4 +2528,253 @@ fn program_tool_errors_file_shapes_and_outer_attached_summary() {
         text.contains(&format!("Attached: #1 (image/png, {} B)", png_bytes.len())),
         "expected Attached summary line on outer codemode result: {text}"
     );
+}
+
+#[test]
+fn codemode_keep_tree_dtos_cover_lifecycle_and_omit_defaults() {
+    let (dir, _) = scratch("keep-tree-dtos");
+    let root_release = dir.join("root-release");
+    let bg_release = dir.join("bg-release");
+    let mut server = codemode_server();
+    let code = format!(
+        r#"
+        const rootRelease = {root_release};
+        const bgRelease = {bg_release};
+        const assertNoTreeFlags = (label, dto) => {{
+            for (const key of ["keepTree", "keptRunning", "treeEnded", "treeUnconfirmed"]) {{
+                if (key in dto) {{
+                    throw new Error(label + " unexpectedly had " + key + ": " + JSON.stringify(dto));
+                }}
+            }}
+        }};
+
+        // Plain PTY task omits treeEnded and treeUnconfirmed across window, screen, transcript, list.
+        const plain = await tools.exec({{
+            action: "start",
+            pty: true,
+            loginShell: false,
+            command: "printf 'plain-ok\\n'",
+        }});
+        assertNoTreeFlags("plain start", plain);
+        const plainScreen = await tools.exec({{
+            action: "poll",
+            taskId: plain.taskId,
+            screen: true,
+            waitMs: 0,
+        }});
+        assertNoTreeFlags("plain screen", plainScreen);
+        const plainTranscript = await tools.exec({{
+            action: "transcript",
+            taskId: plain.taskId,
+        }});
+        assertNoTreeFlags("plain transcript", plainTranscript);
+        const plainBare = plain.taskId.split(".")[0];
+        const topList = await tools.exec({{ action: "list" }});
+        const selfId = topList.tasks[0].taskId;
+        const listChild = async (bareId) => {{
+            const listed = await tools.exec({{ action: "list", parentTaskId: selfId }});
+            const found = listed.tasks.find(t => t.taskId === bareId);
+            if (!found) throw new Error(bareId + " missing from list: " + JSON.stringify(listed));
+            return found;
+        }};
+        assertNoTreeFlags("plain list", await listChild(plainBare));
+
+        // keepTree: true PTY task through running -> held -> treeEnded.
+        const keep = await tools.exec({{
+            action: "start",
+            pty: true,
+            keepTree: true,
+            loginShell: false,
+            command: `(while [ ! -f '${{bgRelease}}' ]; do sleep 0.05; done) >/dev/null 2>&1 & printf 'bg-ready\\n'; while [ ! -f '${{rootRelease}}' ]; do sleep 0.05; done; exit 0`,
+            returnWhen: {{ outputContains: ["bg-ready"] }},
+            waitMs: 10000,
+        }});
+        const keepBare = keep.taskId.split(".")[0];
+        const assertRunningKeep = (label, dto) => {{
+            if (dto.state !== "running" || dto.keepTree !== true || "keptRunning" in dto || "treeEnded" in dto || "treeUnconfirmed" in dto) {{
+                throw new Error(label + " mismatch: " + JSON.stringify(dto));
+            }}
+        }};
+        assertRunningKeep("running window", keep);
+        assertRunningKeep("running screen", await tools.exec({{ action: "poll", taskId: keep.taskId, screen: true, waitMs: 0 }}));
+        assertRunningKeep("running transcript", await tools.exec({{ action: "transcript", taskId: keep.taskId }}));
+        assertRunningKeep("running list", await listChild(keepBare));
+
+        // Release root bash while descendant stays alive.
+        await tools.write({{ path: rootRelease, content: "go" }});
+        const heldWindow = await tools.exec({{ action: "poll", taskId: keep.taskId, waitMs: 10000 }});
+        const assertHeld = (label, dto) => {{
+            if (
+                dto.state !== "exited"
+                || dto.exitCode !== 0
+                || dto.keepTree !== true
+                || dto.keptRunning !== true
+                || !Array.isArray(dto.held)
+                || dto.held.length < 1
+                || "treeEnded" in dto
+                || "treeUnconfirmed" in dto
+            ) {{
+                throw new Error(label + " mismatch: " + JSON.stringify(dto));
+            }}
+        }};
+        assertHeld("held window", heldWindow);
+        assertHeld("held screen", await tools.exec({{ action: "poll", taskId: keep.taskId, screen: true, waitMs: 0 }}));
+        assertHeld("held transcript", await tools.exec({{ action: "transcript", taskId: keep.taskId }}));
+        assertHeld("held list", await listChild(keepBare));
+
+        // Release descendant and verify treeEnded: true across all DTOs.
+        await tools.write({{ path: bgRelease, content: "stop" }});
+        const endedWindow = await tools.exec({{ action: "poll", taskId: keep.taskId, waitMs: 10000 }});
+        const assertEnded = (label, dto) => {{
+            if (
+                dto.state !== "exited"
+                || dto.exitCode !== 0
+                || dto.keepTree !== true
+                || dto.treeEnded !== true
+                || "keptRunning" in dto
+                || "treeUnconfirmed" in dto
+                || "held" in dto
+            ) {{
+                throw new Error(label + " mismatch: " + JSON.stringify(dto));
+            }}
+        }};
+        assertEnded("ended window", endedWindow);
+        assertEnded("ended screen", await tools.exec({{ action: "poll", taskId: keep.taskId, screen: true, waitMs: 0 }}));
+        assertEnded("ended transcript", await tools.exec({{ action: "transcript", taskId: keep.taskId }}));
+        assertEnded("ended list", await listChild(keepBare));
+        return "lifecycle-ok";
+        "#,
+        root_release = json!(root_release.to_string_lossy()),
+        bg_release = json!(bg_release.to_string_lossy()),
+    );
+
+    let res = code_result(&mut server, json!({"code": code}));
+    let text = code_text(&res);
+    assert!(text.contains("[exited 0]"), "{res}");
+    assert_eq!(body_of(text), "lifecycle-ok", "{res}");
+}
+
+#[test]
+fn codemode_folded_keep_tree_child_reports_tree_ended_and_expands() {
+    let (dir, _) = scratch("keep-tree-folded");
+    let bg_release = dir.join("fold-bg-release");
+    let mut server = codemode_server();
+
+    let parent_code = format!(
+        r#"
+        const bgRelease = {bg_release};
+        await tools.exec({{ action: "start", loginShell: false, command: "exit 0" }});
+        const kept = await tools.exec({{
+            action: "start",
+            keepTree: true,
+            loginShell: false,
+            command: `(while [ ! -f '${{bgRelease}}' ]; do sleep 0.05; done) >/dev/null 2>&1 & exit 0`,
+            waitMs: 10000,
+        }});
+        if (!kept.keptRunning) {{
+            throw new Error("expected keptRunning before release: " + JSON.stringify(kept));
+        }}
+        await tools.write({{ path: bgRelease, content: "stop" }});
+        const ended = await tools.exec({{ action: "poll", taskId: kept.taskId, waitMs: 10000 }});
+        if (!ended.treeEnded) {{
+            throw new Error("expected treeEnded after release: " + JSON.stringify(ended));
+        }}
+        return kept.taskId.split(".")[0];
+        "#,
+        bg_release = json!(bg_release.to_string_lossy()),
+    );
+    let parent_res = code_result(&mut server, json!({"code": parent_code}));
+    let parent_text = code_text(&parent_res);
+    assert!(parent_text.contains("[exited 0]"), "{parent_res}");
+    let parent_bare = bare_id(task_id_of(parent_text)).to_owned();
+    let kept_child_bare = body_of(parent_text).to_owned();
+
+    let inspect_code = format!(
+        r#"
+        const parentBare = {parent_bare};
+        const keptChildBare = {kept_child_bare};
+        const list = await tools.exec({{ action: "list" }});
+        const parent = list.tasks.find(t => t.taskId === parentBare);
+        if (!parent || !parent.children) {{
+            throw new Error("parent or children missing: " + JSON.stringify(list));
+        }}
+        if (parent.children.total !== 2 || parent.children.done !== 2 || parent.children.treeEnded !== 1) {{
+            throw new Error("unexpected children summary: " + JSON.stringify(parent.children));
+        }}
+        const expanded = await tools.exec({{ action: "list", parentTaskId: parentBare }});
+        const kept = expanded.tasks.find(t => t.taskId === keptChildBare);
+        const plain = expanded.tasks.find(t => t.taskId !== keptChildBare);
+        if (!kept || kept.keepTree !== true || kept.treeEnded !== true || "keptRunning" in kept) {{
+            throw new Error("unexpected expanded kept child: " + JSON.stringify(kept));
+        }}
+        if (!plain || "keepTree" in plain || "treeEnded" in plain) {{
+            throw new Error("unexpected expanded plain child: " + JSON.stringify(plain));
+        }}
+        return "folded-ok";
+        "#,
+        parent_bare = json!(parent_bare),
+        kept_child_bare = json!(kept_child_bare),
+    );
+    let inspect_res = code_result(&mut server, json!({"code": inspect_code}));
+    let inspect_text = code_text(&inspect_res);
+    assert!(inspect_text.contains("[exited 0]"), "{inspect_res}");
+    assert_eq!(body_of(inspect_text), "folded-ok", "{inspect_res}");
+}
+
+#[test]
+fn codemode_nested_list_preserves_outer_notices_and_kept_child_alerts_after_exit() {
+    let mut server = codemode_server();
+    let outer = server.ok(json!({
+        "action": "start",
+        "command": "sleep 0.1; exit 6",
+        "loginShell": false,
+        "waitMs": 0,
+    }));
+    let outer_handle = task_id_of(&outer).to_owned();
+    let outer_bare = bare_id(&outer_handle).to_owned();
+
+    let script_code = format!(
+        r#"
+        await tools.exec({{ action: "poll", taskId: {outer_handle}, waitMs: 10000 }});
+        const child = await tools.exec({{
+            action: "start",
+            keepTree: true,
+            loginShell: false,
+            command: "sleep 30 >/dev/null 2>&1 & exit 0",
+            waitMs: 10000,
+        }});
+        if (!child.keptRunning) {{
+            throw new Error("expected keptRunning child: " + JSON.stringify(child));
+        }}
+        const childBare = child.taskId.split(".")[0];
+        const list = await tools.exec({{ action: "list" }});
+        if (!list.tasks.some(t => t.taskId === {outer_bare})) {{
+            throw new Error("outer task missing from nested list: " + JSON.stringify(list));
+        }}
+        return childBare;
+        "#,
+        outer_handle = json!(outer_handle),
+        outer_bare = json!(outer_bare),
+    );
+
+    let res = code_result(&mut server, json!({"code": script_code}));
+    let text = code_text(&res);
+    assert!(text.contains("[exited 0]"), "{res}");
+    let child_bare = body_of(text).to_owned();
+    assert!(
+        text.contains("(Background:") && text.contains(&format!("{outer_bare} exited 6")),
+        "nested list must not consume outer task's background notice: {res}"
+    );
+    let next = server.ok(json!({
+        "action": "start",
+        "command": "echo next-call",
+        "loginShell": false,
+    }));
+    let kept_noticed = (text.contains(&child_bare) && text.contains("keeps "))
+        || (next.contains("(Background:") && next.contains(&child_bare) && next.contains("keeps "));
+    assert!(
+        kept_noticed,
+        "script's active keepTree child must still trigger outer footer after script exit:\nscript={text}\nnext={next}"
+    );
+    server.ok(json!({ "action": "kill", "taskId": child_bare }));
 }

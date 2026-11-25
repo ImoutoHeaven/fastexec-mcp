@@ -2897,3 +2897,151 @@ fn rejected_start_result_preserves_the_login_probe_warning() {
         assert!(!once.contains("Login environment probe failed"), "{once}");
     }
 }
+
+#[test]
+fn keeptree_list_lifecycle_idempotence_narrow_cut_and_ordered_events() {
+    let mut server = Server::start_with(|command| {
+        command.env("FASTEXEC_DAEMON", "off");
+    });
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "keeptree-e2e", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let initial = server.request("events/poll", json!({"name": "task.exited", "_meta": meta}));
+    let mut cursor = initial["result"]["cursor"].clone();
+    assert!(cursor.is_string(), "{initial}");
+    let drain_events = |server: &mut Server, cursor: &mut Value, target_id: &str, min_count: usize| {
+        let mut collected = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while collected.len() < min_count && Instant::now() < deadline {
+            let response = server.request(
+                "events/poll",
+                json!({"name": "task.exited", "cursor": cursor, "_meta": meta}),
+            );
+            assert!(response.get("error").is_none(), "{response}");
+            *cursor = response["result"]["cursor"].clone();
+            for event in response["result"]["events"].as_array().unwrap() {
+                if event["data"]["taskId"].as_str() == Some(target_id) {
+                    collected.push(event["data"].clone());
+                }
+            }
+            if collected.len() < min_count {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        collected
+    };
+
+    // 1. keepTree running root shows `[running] · keepTree` in list; killing while running
+    // emits a single `task.exited` event with `treeEnded: false`.
+    let running_res = server.ok(json!({
+        "action": "start",
+        "command": "sleep 30",
+        "keepTree": true,
+        "waitMs": 0
+    }));
+    let running_handle = task_id_of(&running_res).to_owned();
+    let running_id = bare_id(&running_handle).to_owned();
+    let list_running = server.ok(json!({"action": "list", "limit": 5}));
+    assert!(
+        list_running.contains(&format!("{running_id} [running] · keepTree · ")),
+        "expected running keepTree marker:\n{list_running}"
+    );
+    server.ok(json!({"action": "kill", "taskId": running_handle}));
+    std::thread::sleep(Duration::from_millis(150));
+    let running_events = drain_events(&mut server, &mut cursor, &running_id, 1);
+    assert_eq!(running_events.len(), 1, "{running_events:?}");
+    assert_eq!(running_events[0]["treeEnded"], false, "{running_events:?}");
+
+    // 2. keepTree root exiting cleanly with no leftovers shows `[exited 0] · keepTree`.
+    let clean_res = server.ok(json!({
+        "action": "start",
+        "command": "echo clean",
+        "keepTree": true,
+        "waitMs": 10000
+    }));
+    let clean_id = bare_id(task_id_of(&clean_res)).to_owned();
+    let list_clean = server.ok(json!({"action": "list", "limit": 5}));
+    assert!(
+        list_clean.contains(&format!("{clean_id} [exited 0] · keepTree · ")),
+        "expected clean keepTree marker:\n{list_clean}"
+    );
+
+    let sleep = if cfg!(windows) { "sleep.exe" } else { "sleep" };
+
+    // 3. keepTree non-zero exit holding a child shows `[exited 3] · keeps {sleep} (`, then
+    // after child ends shows `[exited 3] · kept processes ended`, remains idempotent across
+    // repeated `exec: list` calls after footer acknowledgement, and emits ordered events.
+    let held_res = server.ok(json!({
+        "action": "start",
+        "command": "sleep 300 & exit 3",
+        "keepTree": true,
+        "waitMs": 10000
+    }));
+    let held_handle = task_id_of(&held_res).to_owned();
+    let held_id = bare_id(&held_handle).to_owned();
+    let list_held = server.ok(json!({"action": "list", "limit": 5}));
+    assert!(
+        list_held.contains(&format!("{held_id} [exited 3] · keeps {sleep} (")),
+        "expected non-zero kept marker:\n{list_held}"
+    );
+    server.ok(json!({"action": "kill", "taskId": held_handle}));
+    let held_events = drain_events(&mut server, &mut cursor, &held_id, 2);
+    assert_eq!(held_events.len(), 2, "{held_events:?}");
+    assert_eq!(held_events[0]["treeEnded"], false, "{held_events:?}");
+    assert!(held_events[0]["keptProcesses"].as_u64().unwrap() > 0, "{held_events:?}");
+    assert_eq!(held_events[1]["treeEnded"], true, "{held_events:?}");
+    assert_eq!(held_events[1]["keptProcesses"], 0, "{held_events:?}");
+
+    // Consume any footer notices, then verify repeated `exec: list` stays idempotent.
+    let _ = server.ok(json!({"action": "start", "command": "true"}));
+    let _ = server.ok(json!({"action": "start", "command": "true"}));
+    let list_ended_1 = server.ok(json!({"action": "list", "limit": 10}));
+    let list_ended_2 = server.ok(json!({"action": "list", "limit": 10}));
+    assert!(
+        list_ended_1.contains(&format!("{held_id} [exited 3] · kept processes ended · ")),
+        "expected kept processes ended:\n{list_ended_1}"
+    );
+    assert!(
+        list_ended_2.contains(&format!("{held_id} [exited 3] · kept processes ended · ")),
+        "repeated list must stay idempotent:\n{list_ended_2}"
+    );
+
+    // 4. 12 background processes with `limit: 1, maxBytes: 100` triggers Tier 4 brief cut
+    // (`keeps sleep +11` + ` … [cut]`) and conserves keeps acknowledgement in the footer.
+    let twelve_res = server.ok(json!({
+        "action": "start",
+        "command": "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 300 & done; echo twelve",
+        "keepTree": true,
+        "waitMs": 10000
+    }));
+    let twelve_handle = task_id_of(&twelve_res).to_owned();
+    let twelve_id = bare_id(&twelve_handle).to_owned();
+    let narrow = server.ok(json!({
+        "action": "list",
+        "limit": 1,
+        "maxBytes": 100
+    }));
+    let first_line = narrow.lines().next().unwrap_or("");
+    assert!(
+        first_line.len() <= 100,
+        "first line exceeded 100 bytes ({}): {first_line}",
+        first_line.len()
+    );
+    assert!(
+        first_line.contains(&format!("{twelve_id} [exited 0] · keeps {sleep} +11")),
+        "expected Tier 4 brief for 12 held processes:\n{narrow}"
+    );
+    assert!(
+        first_line.ends_with(" … [cut]"),
+        "expected inline cut marker:\n{narrow}"
+    );
+    // Tier 4 confirmed keeps, so the next direct start must not repeat `twelve_id keeps` in footer.
+    let after_narrow = server.ok(json!({"action": "start", "command": "true"}));
+    assert!(
+        !after_narrow.contains(&format!("{twelve_id} keeps ")),
+        "Tier 4 ack should suppress duplicate footer keeps notice:\n{after_narrow}"
+    );
+    server.ok(json!({"action": "kill", "taskId": twelve_handle}));
+}

@@ -632,7 +632,9 @@ async fn program_result_shrinks_workspace_before_waking_the_next_reader() {
 #[tokio::test]
 async fn nested_precommit_list_quota_refusal_and_cancel_leave_reported_state_due() {
     let (service, tasks, session, entry) = list_fixture().await;
+    let task = tasks.all().pop().unwrap();
     let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+    script.record_started(format!("{}.abcd", task.id));
     script.test_pending_result(1, 8, 64);
     let make_ctx = || {
         let mut ctx = script_ctx(&session);
@@ -1700,9 +1702,9 @@ async fn nested_task_reads_consume_reader_state_without_consuming_session_notice
 #[tokio::test]
 async fn nested_list_marks_only_delivered_session_tasks() {
     let (service, tasks, session) = script_fixture();
-    let mut entries = Vec::new();
-    for (idx, code) in ["return 7", "return 8"].into_iter().enumerate() {
-        let (task, entry, _) = tasks
+    let mut started = Vec::new();
+    for (idx, code) in ["return 7", "return 8", "return 9"].into_iter().enumerate() {
+        let (task, entry, reader) = tasks
             .start_script(
                 tasks::ScriptArgs {
                     code: code.into(),
@@ -1714,20 +1716,23 @@ async fn nested_list_marks_only_delivered_session_tasks() {
                     input_owner: Default::default(),
                 },
                 &session,
-                format!("l00{idx}"),
+                format!("r00{idx}"),
             )
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
             .await
             .unwrap()
             .unwrap();
-        entries.push(entry);
+        started.push((task, entry, reader));
     }
     let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+    // Script owns l000 (omitted by limit: 2) and l002 (delivered), but not l001 (outer task).
+    script.record_started(started[0].2.handle(&started[0].0.id));
+    script.record_started(started[2].2.handle(&started[2].0.id));
     script.test_pending_result(1, 0, 16 * 1024);
     let mut ctx = script_ctx(&session);
     ctx.on_started = Some(&script);
-    let req: Request = serde_json::from_value(json!({"action":"list","limit":1})).unwrap();
+    let req: Request = serde_json::from_value(json!({"action":"list","limit":2})).unwrap();
     let listed = service
         .exec_program(
             req,
@@ -1743,9 +1748,19 @@ async fn nested_list_marks_only_delivered_session_tasks() {
         panic!("expected Value");
     };
     let parsed: Value = serde_json::from_str(&payload.value).unwrap();
-    assert_eq!(parsed["value"]["tasks"].as_array().unwrap().len(), 1);
-    assert!(!entries[0].is_reported(), "an unselected task stays due");
-    assert!(entries[1].is_reported(), "the delivered task is reported");
+    assert_eq!(parsed["value"]["tasks"].as_array().unwrap().len(), 2);
+    assert!(
+        !started[0].1.is_reported(),
+        "an unselected script-owned task stays due"
+    );
+    assert!(
+        !started[1].1.is_reported(),
+        "an outer-session task stays due even when delivered in nested list"
+    );
+    assert!(
+        started[2].1.is_reported(),
+        "a delivered script-owned task is reported"
+    );
     drop(worker);
     tasks.shutdown();
 }
@@ -2440,7 +2455,10 @@ async fn list_warnings_follow_the_delivered_rows_for_direct_and_nested_calls() {
                     .any(|s| s.as_str().unwrap().contains("omitted-row-warning")))),
         "{data}"
     );
-    assert!(warned_entry.is_reported());
+    assert!(
+        !warned_entry.is_reported(),
+        "nested list must not mark an outer-session task reported"
+    );
     drop(worker);
     tasks.shutdown();
 }

@@ -14,7 +14,7 @@ use super::{
 use crate::lease::Lease;
 use crate::platform::process;
 use crate::session::{LaunchContext, ProbeWarning, Reader, Session, TaskEntry};
-use crate::tasks::state::{Snapshot, Task};
+use crate::tasks::state::{Snapshot, Task, clean_member_name};
 use crate::tasks::{self, ChildSummary};
 use crate::term::output::{self, Truncate, Window};
 use crate::wait::WaitEnd;
@@ -1143,13 +1143,14 @@ impl Service {
             } else {
                 None
             };
-            let mut block_lines = vec![format_list_row(
+            let top_row = TopRow::new(
                 &item.task,
                 &item.snapshot,
                 size,
                 summary_text.as_deref(),
                 via_parent,
-            )];
+            );
+            let mut block_lines = vec![top_row.full_line()];
             let mut delivered_tasks = Vec::new();
             let mut folded_finished = Vec::new();
             let mut folded_count = 0usize;
@@ -1179,6 +1180,7 @@ impl Service {
                 delivered_tasks.push((item.task, item.snapshot));
             }
             blocks.push(ListBlock {
+                top_row,
                 lines: block_lines,
                 delivered_tasks,
                 folded_finished,
@@ -1193,7 +1195,7 @@ impl Service {
         };
         let folded_children: usize = kept
             .iter()
-            .map(|&(index, _)| blocks[index].folded_count)
+            .map(|item| blocks[item.index].folded_count)
             .sum();
         let truncated = total_count > blocks.len();
         let showing_note = match (truncated, folded_children > 0) {
@@ -1212,7 +1214,7 @@ impl Service {
         };
         let warnings: Vec<String> = kept
             .iter()
-            .flat_map(|&(index, count)| &blocks[index].delivered_tasks[..count])
+            .flat_map(|item| &blocks[item.index].delivered_tasks[..item.kept_tasks])
             .flat_map(|(task, snapshot)| {
                 task_warnings(snapshot)
                     .into_iter()
@@ -1251,18 +1253,35 @@ impl Service {
                 "Cancelled while listing tasks; retry list.".into(),
             ));
         }
-        // Only an admitted candidate commits the entries it actually displays.
-        for (block_index, kept_tasks) in kept {
-            let block = &blocks[block_index];
-            for (task, snapshot) in &block.delivered_tasks[..kept_tasks] {
+        // Only an admitted candidate commits the fragments it actually displays.
+        for item in kept {
+            let block = &blocks[item.index];
+            for (row_index, (task, snapshot)) in block.delivered_tasks[..item.kept_tasks]
+                .iter()
+                .enumerate()
+            {
+                let ack = if row_index == 0 {
+                    item.top_ack
+                } else {
+                    full_ack(snapshot, false)
+                };
                 if let Some(entry) = session.existing(task) {
-                    entry.mark_reported(snapshot);
-                    entry.mark_keeps_reported(snapshot);
+                    if ack.root {
+                        entry.mark_root_reported(snapshot);
+                    }
+                    if ack.tree_ended {
+                        entry.mark_tree_end_reported();
+                    }
+                    if ack.keeps {
+                        entry.mark_keeps_reported(snapshot);
+                    }
                 }
             }
-            for (child, tree_ended) in &block.folded_finished {
-                if let Some(entry) = session.existing(child) {
-                    entry.mark_finished_reported(*tree_ended);
+            if item.top_ack.summary {
+                for (child, tree_ended) in &block.folded_finished {
+                    if let Some(entry) = session.existing(child) {
+                        entry.mark_finished_reported(*tree_ended);
+                    }
                 }
             }
         }
@@ -1270,6 +1289,37 @@ impl Service {
         workspace.shrink_to(retained);
         let owner = crate::lease::Owner::new(workspace.split_off(payload));
         Ok((listed, Some(workspace), None, owner))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_list_items_for_test(
+        &self,
+        items: Vec<crate::tasks::ListedTask>,
+        max_bytes: usize,
+        ctx: ExecContext<'_>,
+    ) -> String {
+        let prepared = PreparedList {
+            total_count: items.len(),
+            items,
+            parent_filter: None,
+            state_filter: None,
+            view: super::schema::View {
+                inline_markers: false,
+                keep_nul: false,
+                truncate: Truncate::HeadTail,
+                max_bytes,
+                raw: false,
+                encoding: None,
+                screen: false,
+                conditions: false,
+            },
+            workspace: Lease::empty(ctx.launch().memory()),
+            permit: None,
+        };
+        let (result, _lease, _meta, _owner) = self
+            .render_list_agent(prepared, &ctx, &AgentDelivery::default())
+            .expect("test list render");
+        result.content[0].as_text().unwrap().text.clone()
     }
 }
 
@@ -1309,11 +1359,169 @@ fn layout(
     format!("{body}\n\n{status}{footer}")
 }
 
+#[derive(Clone, Copy, Default)]
+struct RowAck {
+    root: bool,
+    tree_ended: bool,
+    keeps: bool,
+    summary: bool,
+}
+
+fn full_ack(snapshot: &Snapshot, has_summary: bool) -> RowAck {
+    RowAck {
+        root: true,
+        tree_ended: snapshot.tree_ended,
+        keeps: snapshot.kept && snapshot.held_known,
+        summary: has_summary,
+    }
+}
+
+struct KeptBlock {
+    index: usize,
+    kept_tasks: usize,
+    top_ack: RowAck,
+}
+
+struct TopRow {
+    head: String,
+    tree_full: Option<String>,
+    tree_brief: Option<String>,
+    tree_count: Option<String>,
+    elapsed_pty: String,
+    summary: Option<String>,
+    tail: String,
+}
+
+impl TopRow {
+    fn new(
+        task: &Task,
+        snapshot: &Snapshot,
+        size: Option<(u16, u16)>,
+        summary: Option<&str>,
+        via_parent: Option<&str>,
+    ) -> Self {
+        let code = snapshot
+            .exit_code
+            .map_or(String::new(), |code| format!(" {code}"));
+        let head = format!("{} [{}{code}]", task.id, snapshot.state);
+        let tree_full = tree_marker(task, snapshot);
+        let (tree_brief, tree_count) =
+            if snapshot.kept && snapshot.held_known && !snapshot.held.is_empty() {
+                let first = &snapshot.held[0];
+                let name = clean_member_name(&first.name)
+                    .unwrap_or_else(|| format!("pid {}", first.pid));
+                let suffix = if snapshot.kill_error.is_some() {
+                    " (kill failed)"
+                } else {
+                    ""
+                };
+                let brief = if snapshot.held.len() == 1 {
+                    format!(" · keeps {name}{suffix}")
+                } else {
+                    format!(" · keeps {name} +{}{suffix}", snapshot.held.len() - 1)
+                };
+                let count = if snapshot.held.len() == 1 {
+                    format!(" · keeps 1 process{suffix}")
+                } else {
+                    format!(" · keeps {} processes{suffix}", snapshot.held.len())
+                };
+                (Some(brief), Some(count))
+            } else {
+                (None, None)
+            };
+        let sep = if tree_full.is_some() { " · " } else { " " };
+        let pty = match size {
+            Some((cols, rows)) => format!(" pty {cols}x{rows}"),
+            None => String::new(),
+        };
+        let elapsed_pty = format!("{sep}{:.1}s{pty}", snapshot.elapsed.as_secs_f64());
+        let summary = summary.map(|summary| format!(" · {summary}"));
+        let owner = match &task.started_by {
+            Some((_, call)) => format!("{} call {call}", task.owner),
+            None => task.owner.clone(),
+        };
+        let via = match via_parent {
+            Some(pid) => format!(" · via {pid}"),
+            None => String::new(),
+        };
+        let tail = format!(" · {owner}{via} · {}", format_command(&task.command));
+        Self {
+            head,
+            tree_full,
+            tree_brief,
+            tree_count,
+            elapsed_pty,
+            summary,
+            tail,
+        }
+    }
+
+    fn full_line(&self) -> String {
+        self.line_with_tree(self.tree_full.as_deref().unwrap_or(""))
+    }
+
+    fn line_with_tree(&self, tree: &str) -> String {
+        format!(
+            "{}{tree}{}{}{}",
+            self.head,
+            self.elapsed_pty,
+            self.summary.as_deref().unwrap_or(""),
+            self.tail
+        )
+    }
+}
+
 struct ListBlock {
+    top_row: TopRow,
     lines: Vec<String>,
     delivered_tasks: Vec<(Arc<Task>, Snapshot)>,
     folded_finished: Vec<(Arc<Task>, bool)>,
     folded_count: usize,
+}
+
+impl ListBlock {
+    fn full_top_ack(&self) -> RowAck {
+        full_ack(&self.delivered_tasks[0].1, self.top_row.summary.is_some())
+    }
+}
+
+fn format_command(command: &str) -> String {
+    command
+        .chars()
+        .take(120)
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn tree_marker(task: &Task, snapshot: &Snapshot) -> Option<String> {
+    if snapshot.state == "running" {
+        return task.keep.then(|| " · keepTree".into());
+    }
+    if snapshot.kept {
+        let kill_failed = snapshot.kill_error.is_some();
+        let body = if !snapshot.held_known {
+            if kill_failed {
+                "processes (unconfirmed, kill failed)".into()
+            } else {
+                "processes (unconfirmed)".into()
+            }
+        } else if kill_failed {
+            format!("{} (kill failed)", members(&snapshot.held))
+        } else {
+            members(&snapshot.held)
+        };
+        return Some(format!(" · keeps {body}"));
+    }
+    if snapshot.tree_ended {
+        return Some(" · kept processes ended".into());
+    }
+    task.keep.then(|| " · keepTree".into())
 }
 
 fn format_child_summary(summary: &ChildSummary, running: bool) -> Option<String> {
@@ -1337,6 +1545,9 @@ fn format_child_summary(summary: &ChildSummary, running: bool) -> Option<String>
     if summary.warned > 0 {
         parts.push(format!("{} warned", summary.warned));
     }
+    if summary.tree_ended > 0 {
+        parts.push(format!("{} kept ended", summary.tree_ended));
+    }
     if summary.active > 0 {
         parts.push(format!("{} active", summary.active));
     }
@@ -1350,98 +1561,155 @@ fn format_child_summary(summary: &ChildSummary, running: bool) -> Option<String>
     Some(format!("{} {noun} ({})", summary.total, parts.join(", ")))
 }
 
-fn format_list_row(
-    task: &Task,
-    snapshot: &Snapshot,
-    size: Option<(u16, u16)>,
-    summary: Option<&str>,
-    via_parent: Option<&str>,
-) -> String {
-    let command: String = task.command.chars().take(120).collect();
+fn format_child_row(task: &Task, snapshot: &Snapshot, size: Option<(u16, u16)>) -> String {
     let code = snapshot
         .exit_code
         .map_or(String::new(), |code| format!(" {code}"));
-    let owner = match &task.started_by {
-        Some((_, call)) => format!("{} call {call}", task.owner),
-        None => task.owner.clone(),
+    let tree = tree_marker(task, snapshot);
+    let sep = if tree.is_some() { " · " } else { " " };
+    let pty = match size {
+        Some((cols, rows)) => format!(" pty {cols}x{rows}"),
+        None => String::new(),
     };
     format!(
-        "{} [{}{code}] {:.1}s{}{}{} · {}{} · {}",
+        "  └─ {} [{}{code}]{}{sep}{:.1}s{pty} · {}",
         task.id,
         snapshot.state,
+        tree.as_deref().unwrap_or(""),
         snapshot.elapsed.as_secs_f64(),
-        match size {
-            Some((cols, rows)) => format!(" pty {cols}x{rows}"),
-            None => String::new(),
-        },
-        if snapshot.kept {
-            format!(" · keeps {}", members(&snapshot.held))
-        } else if snapshot.tree_ended {
-            " · kept processes ended".to_string()
-        } else {
-            String::new()
-        },
-        match summary {
-            Some(summary) => format!(" · {summary}"),
-            None => String::new(),
-        },
-        owner,
-        match via_parent {
-            Some(pid) => format!(" · via {pid}"),
-            None => String::new(),
-        },
-        command.replace('\n', " ")
+        format_command(&task.command),
     )
 }
 
-fn format_child_row(task: &Task, snapshot: &Snapshot, size: Option<(u16, u16)>) -> String {
-    let command: String = task.command.chars().take(120).collect();
-    let code = snapshot
-        .exit_code
-        .map_or(String::new(), |code| format!(" {code}"));
-    format!(
-        "  └─ {} [{}{code}] {:.1}s{}{} · {}",
-        task.id,
-        snapshot.state,
-        snapshot.elapsed.as_secs_f64(),
-        match size {
-            Some((cols, rows)) => format!(" pty {cols}x{rows}"),
-            None => String::new(),
-        },
-        if snapshot.kept {
-            format!(" · keeps {}", members(&snapshot.held))
-        } else if snapshot.tree_ended {
-            " · kept processes ended".to_string()
-        } else {
-            String::new()
-        },
-        command.replace('\n', " ")
-    )
+fn cut_candidate(mut candidate_full: String, budget: usize) -> String {
+    const MARK: &str = " … [cut]";
+    if candidate_full.len() + MARK.len() <= budget {
+        candidate_full.push_str(MARK);
+    } else {
+        let mut end = budget - MARK.len();
+        while !candidate_full.is_char_boundary(end) {
+            end -= 1;
+        }
+        candidate_full.truncate(end);
+        candidate_full.push_str(MARK);
+    }
+    candidate_full
+}
+
+fn fit_row(row: &TopRow, snapshot: &Snapshot, budget: usize) -> (String, RowAck) {
+    const MARK_LEN: usize = " … [cut]".len();
+    let full_line = row.full_line();
+    let has_summary = row.summary.is_some();
+    if full_line.len() <= budget {
+        return (full_line, full_ack(snapshot, has_summary));
+    }
+    if budget >= 20 {
+        let head_len = row.head.len();
+        let tree_len = row.tree_full.as_deref().map_or(0, str::len);
+        let elapsed_len = row.elapsed_pty.len();
+        let summary_len = row.summary.as_deref().map_or(0, str::len);
+        let keeps_full = snapshot.kept && snapshot.held_known;
+
+        // Tier 1: head + tree_full + elapsed_pty + summary.
+        if head_len + tree_len + elapsed_len + summary_len + MARK_LEN <= budget {
+            return (
+                cut_candidate(full_line, budget),
+                full_ack(snapshot, has_summary),
+            );
+        }
+        // Tier 2: head + tree_full + elapsed_pty (drop summary ack).
+        if has_summary && head_len + tree_len + elapsed_len + MARK_LEN <= budget {
+            return (
+                cut_candidate(full_line, budget),
+                RowAck {
+                    root: true,
+                    tree_ended: snapshot.tree_ended,
+                    keeps: keeps_full,
+                    summary: false,
+                },
+            );
+        }
+        // Tier 3: head + tree_full.
+        if row.tree_full.is_some() && head_len + tree_len + MARK_LEN <= budget {
+            return (
+                cut_candidate(full_line, budget),
+                RowAck {
+                    root: true,
+                    tree_ended: snapshot.tree_ended,
+                    keeps: keeps_full,
+                    summary: false,
+                },
+            );
+        }
+        // Tier 4: head + tree_brief (same granularity as footer brief; confirms keeps).
+        if let Some(tree_brief) = &row.tree_brief
+            && head_len + tree_brief.len() + MARK_LEN <= budget
+        {
+            return (
+                cut_candidate(row.line_with_tree(tree_brief), budget),
+                RowAck {
+                    root: true,
+                    tree_ended: false,
+                    keeps: true,
+                    summary: false,
+                },
+            );
+        }
+        // Tier 5: head + tree_count (count only; keeps stays unconfirmed).
+        if let Some(tree_count) = &row.tree_count
+            && head_len + tree_count.len() + MARK_LEN <= budget
+        {
+            return (
+                cut_candidate(row.line_with_tree(tree_count), budget),
+                RowAck {
+                    root: true,
+                    tree_ended: false,
+                    keeps: false,
+                    summary: false,
+                },
+            );
+        }
+        // Tier 6: head only.
+        if head_len + MARK_LEN <= budget {
+            return (
+                cut_candidate(full_line, budget),
+                RowAck {
+                    root: true,
+                    tree_ended: false,
+                    keeps: false,
+                    summary: false,
+                },
+            );
+        }
+    }
+    // Tier 7: hard cut, confirm nothing.
+    let mut line = full_line;
+    output::cut_to(&mut line, budget + 1);
+    (line, RowAck::default())
 }
 
 fn block_len(lines: &[String]) -> usize {
     lines.iter().map(String::len).sum::<usize>() + lines.len().saturating_sub(1)
 }
 
-fn fit_single_block(block: &ListBlock, budget: usize) -> (usize, String) {
+fn fit_single_block(block: &ListBlock, budget: usize) -> (usize, RowAck, String) {
     let mut kept_lines = block.lines.len();
     while kept_lines > 1 && block_len(&block.lines[..kept_lines]) > budget {
         kept_lines -= 1;
     }
     let kept_tasks = kept_lines.min(block.delivered_tasks.len());
     if kept_lines == 1 && block.lines[0].len() > budget {
-        let mut line = block.lines[0].clone();
-        output::cut_to(&mut line, budget + 1);
-        return (kept_tasks, line);
+        let (line, ack) = fit_row(&block.top_row, &block.delivered_tasks[0].1, budget);
+        return (kept_tasks, ack, line);
     }
-    (kept_tasks, block.lines[..kept_lines].join("\n"))
+    (
+        kept_tasks,
+        block.full_top_ack(),
+        block.lines[..kept_lines].join("\n"),
+    )
 }
 
-fn fit_lines(
-    blocks: &[ListBlock],
-    truncate: Truncate,
-    budget: usize,
-) -> (Vec<(usize, usize)>, String) {
+fn fit_lines(blocks: &[ListBlock], truncate: Truncate, budget: usize) -> (Vec<KeptBlock>, String) {
     let total_bytes: usize = blocks
         .iter()
         .flat_map(|block| &block.lines)
@@ -1451,7 +1719,11 @@ fn fit_lines(
         let kept = blocks
             .iter()
             .enumerate()
-            .map(|(index, block)| (index, block.delivered_tasks.len()))
+            .map(|(index, block)| KeptBlock {
+                index,
+                kept_tasks: block.delivered_tasks.len(),
+                top_ack: block.full_top_ack(),
+            })
             .collect();
         let text = blocks
             .iter()
@@ -1461,8 +1733,15 @@ fn fit_lines(
         return (kept, text);
     }
     if blocks.len() == 1 {
-        let (kept_tasks, text) = fit_single_block(&blocks[0], budget);
-        return (vec![(0, kept_tasks)], text);
+        let (kept_tasks, top_ack, text) = fit_single_block(&blocks[0], budget);
+        return (
+            vec![KeptBlock {
+                index: 0,
+                kept_tasks,
+                top_ack,
+            }],
+            text,
+        );
     }
     let marker =
         |omitted: usize| format!("... [{omitted} tasks omitted; raise maxBytes to see them] ...");
@@ -1500,13 +1779,20 @@ fn fit_lines(
         let note = marker(blocks.len() - 1);
         let edge_budget = budget.saturating_sub(note.len() + 1);
         if blocks[edge].lines.len() > 1 && blocks[edge].lines[0].len() <= edge_budget {
-            let (kept_tasks, trimmed) = fit_single_block(&blocks[edge], edge_budget);
+            let (kept_tasks, top_ack, trimmed) = fit_single_block(&blocks[edge], edge_budget);
             let text = if truncate == Truncate::Tail {
                 format!("{note}\n{trimmed}")
             } else {
                 format!("{trimmed}\n{note}")
             };
-            return (vec![(edge, kept_tasks)], text);
+            return (
+                vec![KeptBlock {
+                    index: edge,
+                    kept_tasks,
+                    top_ack,
+                }],
+                text,
+            );
         }
     }
     let mut note = marker(tail - head);
@@ -1524,7 +1810,11 @@ fn fit_lines(
         .join("\n");
     let kept = (0..head)
         .chain(tail..blocks.len())
-        .map(|index| (index, blocks[index].delivered_tasks.len()))
+        .map(|index| KeptBlock {
+            index,
+            kept_tasks: blocks[index].delivered_tasks.len(),
+            top_ack: blocks[index].full_top_ack(),
+        })
         .collect();
     (kept, text)
 }
@@ -1560,7 +1850,7 @@ fn status_line(
         line.push_str(" · killed by killAfterMs");
     }
     if snapshot.kept {
-        let names = members(&snapshot.held);
+        let names = held_members_text(snapshot);
         line.push_str(&match &snapshot.kill_error {
             Some(error) => format!(" · could not end {names}: {error}; kill retries"),
             None => format!(" · keeps {names} running; kill ends them"),
@@ -1606,6 +1896,14 @@ fn status_line(
     line
 }
 
+fn held_members_text(snapshot: &Snapshot) -> String {
+    if !snapshot.held_known {
+        "processes (unconfirmed)".into()
+    } else {
+        members(&snapshot.held)
+    }
+}
+
 /// Names processes as `adb.exe (4120), sleep (77) and 3 more`.
 fn members(members: &[process::Member]) -> String {
     if members.is_empty() {
@@ -1614,7 +1912,10 @@ fn members(members: &[process::Member]) -> String {
     let mut text = members
         .iter()
         .take(3)
-        .map(|member| format!("{} ({})", member.name, member.pid))
+        .map(|member| match clean_member_name(&member.name) {
+            Some(clean) => format!("{clean} ({})", member.pid),
+            None => format!("pid {}", member.pid),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     if members.len() > 3 {

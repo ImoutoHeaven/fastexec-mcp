@@ -2449,10 +2449,49 @@ mod script_tests {
         end: Option<Final>,
         tree_done: bool,
     ) -> (Arc<Task>, Arc<TaskEntry>) {
+        let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
+        make_synthetic_task_with_root(
+            tasks,
+            session,
+            command,
+            parent_task_id,
+            end,
+            tree_done,
+            Root::Script(script),
+        )
+    }
+
+    fn make_synthetic_process_task(
+        tasks: &Tasks,
+        session: &Session,
+        command: &str,
+        parent_task_id: Option<String>,
+        end: Option<Final>,
+        tree_done: bool,
+    ) -> (Arc<Task>, Arc<TaskEntry>) {
+        make_synthetic_task_with_root(
+            tasks,
+            session,
+            command,
+            parent_task_id,
+            end,
+            tree_done,
+            Root::Process(process::Tree::synthetic_for_test()),
+        )
+    }
+
+    fn make_synthetic_task_with_root(
+        tasks: &Tasks,
+        session: &Session,
+        command: &str,
+        parent_task_id: Option<String>,
+        end: Option<Final>,
+        tree_done: bool,
+        root: Root,
+    ) -> (Arc<Task>, Arc<TaskEntry>) {
         let id = tasks.next_id();
         let log_path = tasks.dir.join(format!("{id}.log"));
         let _log = private_file(&log_path).unwrap();
-        let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
         let task = Arc::new(Task {
             id,
             command: command.into(),
@@ -2465,7 +2504,7 @@ mod script_tests {
             started_by: None,
             parent_task_id,
             started: Instant::now(),
-            root: Root::Script(script),
+            root,
             tree_done: watch::Sender::new(tree_done),
             tree_ended_at: OnceLock::new(),
             kill_error: Mutex::new(None),
@@ -2681,7 +2720,7 @@ mod script_tests {
             // Budget sized so parent + active_top fit while active_bottom is trimmed from the bottom.
             let trimmed = service
                 .exec_agent_json(
-                    serde_json::json!({ "action": "list", "maxBytes": 210 }),
+                    serde_json::json!({ "action": "list", "maxBytes": 230 }),
                     test_exec_context(&session),
                     crate::service::AgentDelivery::default(),
                 )
@@ -2796,6 +2835,666 @@ mod script_tests {
             assert!(session_b.existing(&parent).is_none());
             assert!(session_b.existing(&child_a).is_none());
         });
+
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn list_single_block_narrow_budget_tiers_and_ack_conservation() {
+        let (_runtime, tasks, session) = fixture(Limits::OFF);
+        let service = Arc::new(crate::service::Service::new(Arc::clone(&tasks), false));
+        let make_held_snapshot = |task: &Task, members: Option<Vec<process::Member>>| {
+            let mut snap = task.notice_snapshot();
+            crate::tasks::state::set_held(&mut snap, members);
+            snap
+        };
+
+        // 1. 12 processes + maxBytes: 100 -> Tier 4 (`keeps <min-pid-name> +11` + ` … [cut]`),
+        // records keeps_reported, and out-of-order members render identically.
+        let members_ordered: Vec<process::Member> = (101..=112)
+            .map(|pid| process::Member {
+                pid,
+                name: format!("worker-{pid}"),
+            })
+            .collect();
+        let mut members_shuffled = members_ordered.clone();
+        members_shuffled.reverse();
+        let expected_pids: Vec<u32> = (101..=112).collect();
+
+        let (task_a, entry_a) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 300 & # padding-for-narrow-budget-test",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let snap_a = make_held_snapshot(&task_a, Some(members_ordered.clone()));
+        let text_a = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&task_a),
+                snapshot: snap_a,
+                parent_task_id: None,
+                children: None,
+            }],
+            100,
+            test_exec_context(&session),
+        );
+        assert!(text_a.len() <= 100, "over budget ({}): {text_a}", text_a.len());
+        assert!(
+            text_a.contains(" · keeps worker-101 +11"),
+            "expected Tier 4 brief: {text_a}"
+        );
+        assert!(text_a.ends_with(" … [cut]"), "missing cut marker: {text_a}");
+        assert!(entry_a.is_reported());
+        assert!(entry_a.keeps_reported_eq(&expected_pids));
+
+        // Out-of-order input yields the exact same text when normalized via set_held.
+        let snap_shuffled = make_held_snapshot(&task_a, Some(members_shuffled));
+        let text_shuffled = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&task_a),
+                snapshot: snap_shuffled,
+                parent_task_id: None,
+                children: None,
+            }],
+            100,
+            test_exec_context(&session),
+        );
+        assert_eq!(text_a, text_shuffled);
+
+        // Boundary A: candidate_full.len() <= budget after replacing tree_full with tree_brief
+        // must still append ` … [cut]` and fit within budget.
+        let (task_short_cmd, entry_short_cmd) = make_synthetic_task(
+            &tasks,
+            &session,
+            "a",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let snap_short = make_held_snapshot(&task_short_cmd, Some(members_ordered.clone()));
+        let full_short = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&task_short_cmd),
+                snapshot: snap_short.clone(),
+                parent_task_id: None,
+                children: None,
+            }],
+            4096,
+            test_exec_context(&session),
+        );
+        // Pick budget smaller than `head + tree_full + 10` (so Tiers 1-3 fail) yet large enough
+        // that `candidate_full(tree_brief).len() + 10 <= budget`.
+        let budget_tier4_short = 90;
+        assert!(budget_tier4_short < full_short.len(), "{full_short}");
+        let text_boundary_a = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&task_short_cmd),
+                snapshot: snap_short,
+                parent_task_id: None,
+                children: None,
+            }],
+            budget_tier4_short,
+            test_exec_context(&session),
+        );
+        assert!(text_boundary_a.len() <= budget_tier4_short, "{text_boundary_a}");
+        assert!(
+            text_boundary_a.contains(" · keeps worker-101 +11"),
+            "{text_boundary_a}"
+        );
+        assert!(
+            text_boundary_a.ends_with(" … [cut]"),
+            "candidate_full <= budget must still carry cut marker: {text_boundary_a}"
+        );
+        assert!(entry_short_cmd.keeps_reported_eq(&expected_pids));
+
+        // Boundary B: core.len() == budget - 10 exact boundary keeps all of core intact.
+        let exact_core = format!("{} [exited 0] · keeps worker-101 +11", task_a.id);
+        let exact_budget = exact_core.len() + " … [cut]".len();
+        let text_boundary_b = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&task_a),
+                snapshot: make_held_snapshot(&task_a, Some(members_ordered)),
+                parent_task_id: None,
+                children: None,
+            }],
+            exact_budget,
+            test_exec_context(&session),
+        );
+        assert_eq!(text_boundary_b, format!("{exact_core} … [cut]"));
+
+        // 2. Long multibyte process name triggers Tier 5 (`keeps 12 processes` + ` … [cut]`)
+        // without consuming keeps_reported.
+        let mut mb_members: Vec<process::Member> = (201..=212)
+            .map(|pid| process::Member {
+                pid,
+                name: format!("p{pid}"),
+            })
+            .collect();
+        mb_members[0].name = "长进程名".repeat(8); // 96 UTF-8 bytes
+        let mb_pids: Vec<u32> = (201..=212).collect();
+        let (task_mb, entry_mb) = make_synthetic_task(
+            &tasks,
+            &session,
+            "keeps sleep (999) # command text containing keeps must not false-ack",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let text_mb = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&task_mb),
+                snapshot: make_held_snapshot(&task_mb, Some(mb_members)),
+                parent_task_id: None,
+                children: None,
+            }],
+            100,
+            test_exec_context(&session),
+        );
+        assert!(text_mb.len() <= 100, "{text_mb}");
+        assert!(
+            text_mb.contains(" · keeps 12 processes"),
+            "expected Tier 5 count marker: {text_mb}"
+        );
+        assert!(text_mb.ends_with(" … [cut]"), "{text_mb}");
+        assert!(entry_mb.is_reported());
+        assert!(
+            !entry_mb.keeps_reported_eq(&mb_pids),
+            "Tier 5 count-only cut must not consume keeps_reported"
+        );
+
+        // 3. !held_known and empty held set under narrow budget never produce `keeps 0 processes`,
+        // and command text containing "keeps " never triggers false keeps_reported.
+        let (task_unconf, entry_unconf) = make_synthetic_task(
+            &tasks,
+            &session,
+            "echo keeps fake-process (1) and more padding to force narrow cut 0123456789abcdef",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let text_unconf = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&task_unconf),
+                snapshot: make_held_snapshot(&task_unconf, None),
+                parent_task_id: None,
+                children: None,
+            }],
+            100,
+            test_exec_context(&session),
+        );
+        assert!(text_unconf.len() <= 100, "{text_unconf}");
+        assert!(!text_unconf.contains("keeps 0 processes"), "{text_unconf}");
+        assert!(
+            text_unconf.contains(" · keeps processes (unconfirmed)"),
+            "{text_unconf}"
+        );
+        assert!(text_unconf.ends_with(" … [cut]"), "{text_unconf}");
+        assert!(entry_unconf.is_reported());
+        assert!(
+            !entry_unconf.keeps_reported_eq(&[]),
+            "!held_known must not record keeps_reported even when command contains 'keeps '"
+        );
+
+        let (task_empty, _entry_empty) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 30 & # long command padding to force truncation in narrow budget 0123456789abcdef",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let text_empty = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&task_empty),
+                snapshot: make_held_snapshot(&task_empty, Some(Vec::new())),
+                parent_task_id: None,
+                children: None,
+            }],
+            50,
+            test_exec_context(&session),
+        );
+        assert!(text_empty.len() <= 50, "{text_empty}");
+        assert!(!text_empty.contains("keeps 0 processes"), "{text_empty}");
+
+        // 4. Codemode parent with long summary under narrow budget triggers Tier 2:
+        // confirms parent root while leaving folded children unreported.
+        let (cm_parent, cm_parent_entry) = make_synthetic_task(
+            &tasks,
+            &session,
+            "[codemode] long_orchestrator_padding_0123456789abcdef",
+            None,
+            Some(finished_final(false)),
+            true,
+        );
+        let (cm_child_plain, cm_child_plain_entry) = make_synthetic_task(
+            &tasks,
+            &session,
+            "echo done",
+            Some(cm_parent.id.clone()),
+            Some(finished_final(false)),
+            true,
+        );
+        let (cm_child_kept, cm_child_kept_entry) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 0.1 &",
+            Some(cm_parent.id.clone()),
+            Some(finished_final(true)),
+            true,
+        );
+        let parent_snap = cm_parent.notice_snapshot();
+        let summary = ChildSummary {
+            total: 4,
+            done: 2,
+            failed: 1,
+            warned: 1,
+            tree_ended: 1,
+            active: 0,
+            queued: 0,
+            cancelled: 1,
+            active_tasks: Vec::new(),
+            folded_finished: vec![
+                (Arc::clone(&cm_child_plain), false),
+                (Arc::clone(&cm_child_kept), true),
+            ],
+        };
+        // head + elapsed (~30 bytes) + 10 <= budget (48) < head + elapsed + summary (~95 bytes) + 10.
+        let text_cm = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&cm_parent),
+                snapshot: parent_snap,
+                parent_task_id: None,
+                children: Some(summary),
+            }],
+            48,
+            test_exec_context(&session),
+        );
+        let cm_first = text_cm.lines().next().unwrap_or("");
+        assert!(cm_first.len() <= 48, "{text_cm}");
+        assert!(cm_first.ends_with(" … [cut]"), "{text_cm}");
+        assert!(cm_parent_entry.is_reported());
+        assert!(
+            !cm_child_plain_entry.is_reported(),
+            "Tier 2 dropped summary so folded plain child must remain unreported"
+        );
+        assert!(
+            !cm_child_kept_entry.is_reported() && !cm_child_kept_entry.tree_end_reported(),
+            "Tier 2 dropped summary so folded kept child must remain unreported"
+        );
+
+        // 5. Control characters, newlines, and empty process names sanitize to single line + `pid <N>`.
+        let (task_ctrl, _entry_ctrl) = make_synthetic_task(
+            &tasks,
+            &session,
+            "echo ok\nline2\x07",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let ctrl_members = vec![
+            process::Member {
+                pid: 301,
+                name: "bad\n\t\x07name".into(),
+            },
+            process::Member {
+                pid: 302,
+                name: String::new(),
+            },
+            process::Member {
+                pid: 303,
+                name: " \r\n ".into(),
+            },
+        ];
+        let text_ctrl = service.render_list_items_for_test(
+            vec![ListedTask {
+                task: Arc::clone(&task_ctrl),
+                snapshot: make_held_snapshot(&task_ctrl, Some(ctrl_members)),
+                parent_task_id: None,
+                children: None,
+            }],
+            4096,
+            test_exec_context(&session),
+        );
+        assert_eq!(text_ctrl.lines().count(), 1, "must stay single line: {text_ctrl:?}");
+        assert!(
+            !text_ctrl.chars().any(char::is_control),
+            "control chars leaked: {text_ctrl:?}"
+        );
+        assert!(
+            text_ctrl.contains("keeps bad name (301), pid 302, pid 303"),
+            "{text_ctrl}"
+        );
+
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn list_folded_child_summary_shows_kept_ended_and_parent_drilldown() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let service = Arc::new(crate::service::Service::new(Arc::clone(&tasks), false));
+        let (parent, _) = make_synthetic_task(
+            &tasks,
+            &session,
+            "[codemode] parent()",
+            None,
+            Some(finished_final(false)),
+            true,
+        );
+        let (_plain, _) = make_synthetic_task(
+            &tasks,
+            &session,
+            "echo plain",
+            Some(parent.id.clone()),
+            Some(finished_final(false)),
+            true,
+        );
+        let (kept_ended, _) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 0.1 &",
+            Some(parent.id.clone()),
+            Some(finished_final(true)),
+            true,
+        );
+
+        runtime.block_on(async {
+            let list = service
+                .exec_agent_json(
+                    serde_json::json!({ "action": "list" }),
+                    test_exec_context(&session),
+                    crate::service::AgentDelivery::default(),
+                )
+                .await
+                .result;
+            let text = list.content[0].as_text().unwrap().text.as_str();
+            assert!(
+                text.contains("2 tasks (2 done, 1 kept ended)"),
+                "expected folded kept ended summary: {text}"
+            );
+
+            let drill = service
+                .exec_agent_json(
+                    serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
+                    test_exec_context(&session),
+                    crate::service::AgentDelivery::default(),
+                )
+                .await
+                .result;
+            let drill_text = drill.content[0].as_text().unwrap().text.as_str();
+            assert!(
+                drill_text.contains(&format!("{} [exited 0] · kept processes ended", kept_ended.id)),
+                "expected kept processes ended in drilldown: {drill_text}"
+            );
+        });
+
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn footer_races_overflow_counts_and_ordered_exited_events() {
+        let (_runtime, tasks, session) = fixture(Limits::OFF);
+        let bus = Arc::new(crate::events::EventBus::new().unwrap());
+        tasks.attach_event_bus(Arc::clone(&bus));
+
+        // 1. Batch root exit with kept processes counts overflow under `keeping processes`.
+        let mut batch_tasks = Vec::new();
+        for _ in 0..5 {
+            batch_tasks.push(make_synthetic_task(
+                &tasks,
+                &session,
+                "sleep 30 &",
+                None,
+                Some(finished_final(true)),
+                false,
+            ));
+        }
+        let (notice, claim) = tasks
+            .background(&session, "", 512, &mut |_| Ok(()), &mut |_| {
+                Ok(Some(vec![process::Member {
+                    pid: 555,
+                    name: "sleep".into(),
+                }]))
+            })
+            .unwrap();
+        drop(claim);
+        let (line, _) = notice.expect("expected batch keeping overflow footer");
+        assert!(
+            line.contains("2 more; 5 keeping processes; use list."),
+            "expected keeping processes overflow count: {line}"
+        );
+        assert!(
+            !line.contains("finished"),
+            "must not count kept roots as finished: {line}"
+        );
+        // Mark batch tasks finished so subsequent checks start clean.
+        for (task, entry) in &batch_tasks {
+            task.tree_done.send_replace(true);
+            entry.mark_finished_reported(true);
+        }
+
+        // 2. snapshot_held_reserved + tree_done transition never reports `kept` after tree ends.
+        let (race_snap_task, race_snap_entry) = make_synthetic_process_task(
+            &tasks,
+            &session,
+            "sleep 0.1 &",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let mut race_sampled = false;
+        let raced = race_snap_task
+            .snapshot_held_reserved(&mut |_| Ok(()), &mut |_| {
+                race_sampled = true;
+                race_snap_task.tree_done.send_replace(true);
+                Ok(None)
+            })
+            .unwrap();
+        assert!(race_sampled);
+        assert!(!raced.kept && raced.tree_ended && raced.held_known && raced.held.is_empty());
+        assert!(raced.kill_error.is_none());
+        race_snap_entry.mark_reported(&raced);
+
+        // 3. Prior Some([]) in keeps_reported must not suppress !held_known in Notice::Keeps,
+        // and held_brief formats unconfirmed states with and without kill_error.
+        let (unconf_task, unconf_entry) = make_synthetic_process_task(
+            &tasks,
+            &session,
+            "sleep 30 &",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let mut empty_known = unconf_task.notice_snapshot();
+        crate::tasks::state::set_held(&mut empty_known, Some(Vec::new()));
+        unconf_entry.mark_root_reported(&empty_known);
+        unconf_entry.mark_keeps_reported(&empty_known);
+        assert!(unconf_entry.keeps_reported_eq(&[]));
+        let mut unconfirmed = unconf_task.notice_snapshot();
+        crate::tasks::state::set_held(&mut unconfirmed, None);
+        assert!(!unconfirmed.held_known);
+        assert_eq!(held_brief(&unconfirmed), "processes (unconfirmed)");
+        unconfirmed.kill_error = Some("EPERM".into());
+        assert_eq!(
+            held_brief(&unconfirmed),
+            "processes (unconfirmed, kill failed)"
+        );
+        let (notice, claim) = tasks
+            .background(&session, "", 512, &mut |_| Ok(()), &mut |_| Ok(None))
+            .unwrap();
+        drop(claim);
+        let (line, _) = notice.expect("expected unconfirmed keeps footer");
+        assert!(
+            line.contains(&format!(
+                "{} keeps processes (unconfirmed)",
+                unconf_task.id
+            )),
+            "{line}"
+        );
+        unconf_task.tree_done.send_replace(true);
+        unconf_entry.mark_finished_reported(true);
+
+        // 4. Notice::Root and Notice::Keeps tree_done transitions during sampling emit
+        // `kept processes ended`, never `keeps`.
+        let (ended_root, ended_root_entry) = make_synthetic_process_task(
+            &tasks,
+            &session,
+            "sleep 0.1 &",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let (notice, claim) = tasks
+            .background(&session, "", 512, &mut |_| Ok(()), &mut |_| {
+                ended_root.tree_done.send_replace(true);
+                Ok(Some(Vec::new()))
+            })
+            .unwrap();
+        drop(claim);
+        let (line, shown) = notice.expect("expected ended root footer");
+        assert!(!line.contains("keeps"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "{} exited 0 and its kept processes ended",
+                ended_root.id
+            )),
+            "{line}"
+        );
+        ended_root_entry.mark_reported(&shown[0].1);
+
+        let (ended_keeps, ended_keeps_entry) = make_synthetic_process_task(
+            &tasks,
+            &session,
+            "sleep 0.1 &",
+            None,
+            Some(finished_final(true)),
+            false,
+        );
+        let root_snap = ended_keeps.notice_snapshot();
+        ended_keeps_entry.mark_root_reported(&root_snap);
+        let (notice, claim) = tasks
+            .background(&session, "", 512, &mut |_| Ok(()), &mut |_| {
+                ended_keeps.tree_done.send_replace(true);
+                Ok(Some(Vec::new()))
+            })
+            .unwrap();
+        drop(claim);
+        let (line, shown) = notice.expect("expected ended keeps footer");
+        assert!(!line.contains("keeps"), "{line}");
+        assert!(
+            line.contains(&format!("{} kept processes ended", ended_keeps.id)),
+            "{line}"
+        );
+        ended_keeps_entry.mark_reported(&shown[0].1);
+
+        // 5. EventBus ordering: killed-running emits treeEnded: false; kept-then-ended emits
+        // [treeEnded: false, treeEnded: true]; tree already ended at root publish emits single
+        // merged treeEnded: true.
+        let mut cursor = bus
+            .poll(
+                crate::events::PollRequest {
+                    name: "task.exited".into(),
+                    cursor: None,
+                    arguments: None,
+                    max_events: None,
+                    max_age_ms: None,
+                },
+                None,
+            )
+            .unwrap()
+            .value
+            .cursor;
+        let poll_all = |cursor: &mut String| {
+            let page = bus
+                .poll(
+                    crate::events::PollRequest {
+                        name: "task.exited".into(),
+                        cursor: Some(cursor.clone()),
+                        arguments: None,
+                        max_events: None,
+                        max_age_ms: None,
+                    },
+                    None,
+                )
+                .unwrap()
+                .value;
+            *cursor = page.cursor;
+            page.events
+                .into_iter()
+                .map(|event| event.data)
+                .collect::<Vec<_>>()
+        };
+
+        let (killed_running, _) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 30",
+            None,
+            Some(Final {
+                exit_code: None,
+                killed: true,
+                expired: false,
+                forced_end: false,
+                elapsed: Duration::from_millis(20),
+                output_open: false,
+                leftovers: Vec::new(),
+                kept: false,
+            }),
+            true,
+        );
+        tasks.emit_task_exited(&killed_running);
+        let events = poll_all(&mut cursor);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["taskId"], killed_running.id);
+        assert_eq!(events[0]["treeEnded"], false);
+
+        let (kept_then_ended, _) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 30 &",
+            None,
+            Some(Final {
+                exit_code: Some(0),
+                killed: false,
+                expired: false,
+                forced_end: false,
+                elapsed: Duration::from_millis(20),
+                output_open: false,
+                leftovers: vec![process::Member {
+                    pid: 900,
+                    name: "sleep".into(),
+                }],
+                kept: true,
+            }),
+            false,
+        );
+        tasks.emit_task_exited(&kept_then_ended);
+        kept_then_ended.tree_done.send_replace(true);
+        tasks.emit_task_exited(&kept_then_ended);
+        let events = poll_all(&mut cursor);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["taskId"], kept_then_ended.id);
+        assert_eq!(events[0]["treeEnded"], false);
+        assert_eq!(events[0]["keptProcesses"], 1);
+        assert_eq!(events[1]["taskId"], kept_then_ended.id);
+        assert_eq!(events[1]["treeEnded"], true);
+        assert_eq!(events[1]["keptProcesses"], 0);
+
+        let (merged_ended, _) = make_synthetic_task(
+            &tasks,
+            &session,
+            "sleep 0.01 &",
+            None,
+            Some(finished_final(true)),
+            true,
+        );
+        tasks.emit_task_exited(&merged_ended);
+        let events = poll_all(&mut cursor);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["taskId"], merged_ended.id);
+        assert_eq!(events[0]["treeEnded"], true);
+        assert_eq!(events[0]["keptProcesses"], 0);
 
         tasks.shutdown();
     }

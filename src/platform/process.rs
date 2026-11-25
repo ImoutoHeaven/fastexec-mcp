@@ -1418,6 +1418,41 @@ impl Tree {
             root: std::sync::Mutex::new(Some(root)),
         })
     }
+
+    /// A dummy process tree for unit tests that inject their own `members` callback.
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_test() -> Tree {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+            // SAFETY: null arguments request an unnamed empty job with default security.
+            let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            assert!(!raw.is_null(), "CreateJobObjectW failed");
+            // SAFETY: CreateJobObjectW returned a fresh handle owned here.
+            let job = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+            Tree {
+                job,
+                root: std::sync::Mutex::new(None),
+            }
+        }
+        #[cfg(unix)]
+        {
+            let (_, lifeline) = std::io::pipe().expect("synthetic test pipe");
+            Tree {
+                #[cfg(not(target_os = "macos"))]
+                host: 0,
+                _lifeline: lifeline,
+                state: std::sync::Mutex::new(TreeState::Complete),
+                #[cfg(target_os = "macos")]
+                control: {
+                    let (stream, _) =
+                        std::os::unix::net::UnixStream::pair().expect("synthetic test socket");
+                    crate::platform::tree_macos::Client::new(stream, 0)
+                },
+            }
+        }
+    }
 }
 
 /// Kills the tree whose host is `host` while it lives to adopt the orphans of each pass. An empty

@@ -182,6 +182,10 @@ struct ExecWindowDto<'a> {
     keep_tree: bool,
     #[serde(skip_serializing_if = "is_false")]
     kept_running: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    tree_ended: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    tree_unconfirmed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     held: Vec<MemberDto<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -251,6 +255,10 @@ struct ExecTranscriptDto<'a> {
     keep_tree: bool,
     #[serde(skip_serializing_if = "is_false")]
     kept_running: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    tree_ended: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    tree_unconfirmed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     held: Vec<MemberDto<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -292,6 +300,8 @@ struct ListChildrenDto<'a> {
     #[serde(skip_serializing_if = "is_zero_usize")]
     warned: usize,
     #[serde(skip_serializing_if = "is_zero_usize")]
+    tree_ended: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
     active: usize,
     #[serde(skip_serializing_if = "is_zero_usize")]
     queued: usize,
@@ -327,6 +337,10 @@ struct ListTaskDto<'a> {
     keep_tree: bool,
     #[serde(skip_serializing_if = "is_false")]
     kept_running: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    tree_ended: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    tree_unconfirmed: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     held: Vec<MemberDto<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -491,6 +505,8 @@ fn list_task_dto<'a>(
         parent_task_id,
         keep_tree: task.keep,
         kept_running: snapshot.kept,
+        tree_ended: snapshot.tree_ended,
+        tree_unconfirmed: snapshot.kept && !snapshot.held_known,
         held: members_dto(&snapshot.held),
         leftovers: members_dto(&snapshot.leftovers),
         lifetime_expired: snapshot.expired,
@@ -717,6 +733,8 @@ fn encode_window(
         new_reader: prepared.reader.is_fresh(),
         keep_tree: prepared.task.keep,
         kept_running: snapshot.kept,
+        tree_ended: snapshot.tree_ended,
+        tree_unconfirmed: snapshot.kept && !snapshot.held_known,
         held: members_dto(&snapshot.held),
         leftovers: members_dto(&snapshot.leftovers),
         lifetime_expired: snapshot.expired,
@@ -848,6 +866,8 @@ fn encode_transcript(
         encoding_errors: prepared.window.bad_lines,
         keep_tree: prepared.task.keep,
         kept_running: snapshot.kept,
+        tree_ended: snapshot.tree_ended,
+        tree_unconfirmed: snapshot.kept && !snapshot.held_known,
         held: members_dto(&snapshot.held),
         leftovers: members_dto(&snapshot.leftovers),
         lifetime_expired: snapshot.expired,
@@ -973,6 +993,8 @@ fn encode_screen(
         new_reader: prepared.reader.is_fresh(),
         keep_tree: prepared.task.keep,
         kept_running: snapshot.kept,
+        tree_ended: snapshot.tree_ended,
+        tree_unconfirmed: snapshot.kept && !snapshot.held_known,
         held: members_dto(&snapshot.held),
         leftovers: members_dto(&snapshot.leftovers),
         lifetime_expired: snapshot.expired,
@@ -1081,6 +1103,7 @@ fn encode_list(
                         done: c.done,
                         failed: c.failed,
                         warned: c.warned,
+                        tree_ended: c.tree_ended,
                         active: c.active,
                         queued: if running { c.queued } else { 0 },
                         cancelled: if !running { c.cancelled } else { 0 },
@@ -1120,7 +1143,7 @@ fn encode_list(
     match encoded {
         Ok((text, mut lease)) => {
             let permit = prepared.permit.take();
-            prepared.commit_all(ctx.session);
+            prepared.commit_program(ctx.session, ctx.on_started);
             lease.shrink_to(text.capacity());
             drop(permit);
             ProgramOutcome::value(text, lease)
@@ -1453,5 +1476,116 @@ mod tests {
             assert_eq!(memory.used(), 0);
             drop(worker);
         }
+    }
+
+    #[test]
+    fn tree_flags_serialize_sparsely_and_mark_unconfirmed() {
+        let mut children = ListChildrenDto {
+            total: 2,
+            done: 2,
+            failed: 0,
+            warned: 0,
+            tree_ended: 0,
+            active: 0,
+            queued: 0,
+            cancelled: 0,
+            active_tasks: Vec::new(),
+        };
+        let plain_children = serde_json::to_value(&children).unwrap();
+        assert!(plain_children.get("treeEnded").is_none());
+        children.tree_ended = 2;
+        let ended_children = serde_json::to_value(&children).unwrap();
+        assert_eq!(ended_children["treeEnded"], 2);
+
+        let window = ExecWindowDto {
+            action: "poll",
+            task_id: "t1.r1".into(),
+            kind: "bash",
+            state: "exited",
+            exit_code: Some(0),
+            pty: false,
+            elapsed_ms: 10,
+            output: "",
+            truncated: false,
+            log_path: "t1.log".into(),
+            wait_ended_by: None,
+            omitted_lines: 0,
+            omitted_range: None,
+            cut_lines: 0,
+            cols: None,
+            rows: None,
+            cursor: None,
+            omitted_rows: 0,
+            new_reader: false,
+            keep_tree: true,
+            kept_running: true,
+            tree_ended: false,
+            tree_unconfirmed: true,
+            held: Vec::new(),
+            leftovers: Vec::new(),
+            lifetime_expired: false,
+            forced_end: false,
+            output_open: false,
+            output_incomplete: false,
+            dropped_bytes: 0,
+            log_evicted: false,
+            encoding_errors: 0,
+            capture_error: None,
+            log_error: None,
+            input_warning: None,
+            input_error: None,
+            kill_error: None,
+            warnings: Vec::new(),
+            codemode: None,
+        };
+        let window_json = serde_json::to_value(&window).unwrap();
+        assert_eq!(window_json["keptRunning"], true);
+        assert_eq!(window_json["treeUnconfirmed"], true);
+        assert!(window_json.get("treeEnded").is_none());
+
+        let transcript = ExecTranscriptDto {
+            action: "transcript",
+            task_id: "t1.r1".into(),
+            kind: "bash",
+            state: "exited",
+            exit_code: Some(0),
+            pty: true,
+            elapsed_ms: 10,
+            output: "",
+            truncated: false,
+            log_path: "t1.log".into(),
+            transcript_path: "t1.transcript".into(),
+            transcript_lines: 0,
+            final_lines: 0,
+            first_line: 1,
+            omitted_lines: 0,
+            omitted_range: None,
+            cut_lines: 0,
+            new_reader: false,
+            transcript_incomplete: false,
+            transcript_error: None,
+            encoding_errors: 0,
+            keep_tree: true,
+            kept_running: false,
+            tree_ended: true,
+            tree_unconfirmed: false,
+            held: Vec::new(),
+            leftovers: Vec::new(),
+            lifetime_expired: false,
+            forced_end: false,
+            output_open: false,
+            output_incomplete: false,
+            dropped_bytes: 0,
+            log_evicted: false,
+            capture_error: None,
+            log_error: None,
+            input_warning: None,
+            input_error: None,
+            kill_error: None,
+            warnings: Vec::new(),
+        };
+        let transcript_json = serde_json::to_value(&transcript).unwrap();
+        assert_eq!(transcript_json["treeEnded"], true);
+        assert!(transcript_json.get("treeUnconfirmed").is_none());
     }
 }

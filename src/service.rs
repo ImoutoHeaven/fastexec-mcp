@@ -237,22 +237,33 @@ pub(crate) struct PreparedList {
 }
 
 impl PreparedList {
-    /// Marks every selected task, active child, and folded child reported in `session`.
-    pub(crate) fn commit_all(self, session: &Session) {
+    /// Marks only tasks started by the calling script (top-level, active children, and folded
+    /// finished children) reported in `session`, without modifying outer-session entries or
+    /// `keeps_reported`.
+    pub(crate) fn commit_program(
+        self,
+        session: &Session,
+        on_started: Option<&codemode::control::ScriptHandle>,
+    ) {
+        let owns = |task: &Task| on_started.is_some_and(|script| script.owns(&task.id));
         for item in &self.items {
-            if let Some(entry) = session.existing(&item.task) {
+            if owns(&item.task)
+                && let Some(entry) = session.existing(&item.task)
+            {
                 entry.mark_reported(&item.snapshot);
-                entry.mark_keeps_reported(&item.snapshot);
             }
             if let Some(children) = &item.children {
                 for (child, snapshot) in &children.active_tasks {
-                    if let Some(entry) = session.existing(child) {
+                    if owns(child)
+                        && let Some(entry) = session.existing(child)
+                    {
                         entry.mark_reported(snapshot);
-                        entry.mark_keeps_reported(snapshot);
                     }
                 }
                 for (child, tree_ended) in &children.folded_finished {
-                    if let Some(entry) = session.existing(child) {
+                    if owns(child)
+                        && let Some(entry) = session.existing(child)
+                    {
                         entry.mark_finished_reported(*tree_ended);
                     }
                 }
