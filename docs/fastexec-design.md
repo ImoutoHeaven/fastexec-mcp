@@ -350,10 +350,12 @@ quota, overload, cancellation, edit, and I/O failures reject with `ToolError`
 (`name: "ToolError"`, `tool`, `code`, `message`, `result`):
 
 - `"VALIDATION"`: argument or schema validation failures, including
-  `truncate: "head_tail"` and `list` `maxBytes`/`truncate` in Program mode.
+  `truncate: "head_tail"`, `list` `maxBytes`/`truncate` in Program mode, and
+  keys that the current keyboard mode cannot encode.
 - `"NOT_FOUND"`: unknown `taskId` / `parentTaskId` or missing file.
-- `"OVERLOAD"`: active byte-pool or bridge-input memory overload (`err.result`
-  carries `{ taskId, logPath }` when a task already ran).
+- `"OVERLOAD"`: task or reader capacity, input-queue backpressure, or active
+  byte-pool or bridge-input memory overload (`err.result` carries
+  `{ taskId, logPath }` when the failure belongs to an already-created task).
 - `"LIMIT"`: pending-call cap (`1024`), `256` MiB pending bridge budget, `4096`
   start cap, oversized result, or strict whole-file `read` size limit.
 - `"CANCELLED"`: cancelled call.
@@ -363,6 +365,12 @@ quota, overload, cancellation, edit, and I/O failures reject with `ToolError`
   `inputError`, `captureError`, or `logError`), where `err.result` preserves
   the full structured exec report (`output`, `exitCode`, `state`, `taskId`,
   `logPath`, error fields, `warnings`).
+
+Earlier input may already have been delivered when a poll hits input-queue
+backpressure or a keyboard-mode change. Delayed-key errors report how many keys
+were sent. Input queued before a cancellation or timeout remains an `"IO"`
+failure when delivery is unconfirmed. It can still take effect later, so do not
+replay it blindly.
 
 Non-zero command `exitCode`s resolve normally. Async rejections from `tools.*`
 and `sleep` carry the caller's script stack frame (`codemode.js:<line>:<col>`).
@@ -616,6 +624,14 @@ Nested `codemode` calls (`tools.exec`, `tools.read`, `tools.write`,
 encode typed DTOs directly in `src/codemode/encode.rs` so JavaScript callers
 receive raw data (`output` or `text`) and explicit control fields without
 Fastexec-injected prose.
+
+`src/service.rs` prepares domain results for both frontends. Shared snapshots,
+resource leases, task reports, and diagnostics live in `src/service/core.rs`;
+Agent text and MCP media packing live in `src/service/render.rs`. The Program
+encoder imports the shared core directly. An explicit `Consumer` selects startup
+cancellation and session-reporting rules independently of `ExecPolicy`; `View`
+contains output options. Task failures retain their overload, cancellation, or
+I/O kind from the source through the Service and Program encoder.
 
 ### `FASTEXEC_DAEMON`
 
