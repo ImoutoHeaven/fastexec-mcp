@@ -3612,4 +3612,53 @@ mod script_tests {
 
         tasks.shutdown();
     }
+
+    #[test]
+    fn retire_finished_evicts_logs_outside_registry_lock() {
+        let (runtime, tasks, session) = fixture(Limits {
+            max_finished: 1,
+            ..Limits::OFF
+        });
+        let (task1, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "retire1".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task1.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        assert!(task1.log_path.exists());
+
+        let unlinked_unlocked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&unlinked_unlocked);
+        let weak_tasks = Arc::downgrade(&tasks);
+        tasks.set_remove_hook(Some(Arc::new(move |path| {
+            if let Some(shared) = weak_tasks.upgrade() {
+                assert!(
+                    shared.registry.try_lock().is_ok(),
+                    "retire_finished must release registry lock before unlinking logs"
+                );
+                observed.store(true, Ordering::SeqCst);
+            }
+            std::fs::remove_file(path)
+        })));
+
+        std::thread::sleep(Duration::from_millis(5));
+        let (task2, _, _) = tasks
+            .start_script(script_args(&tasks), &session, "retire2".into())
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task2.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+
+        assert!(unlinked_unlocked.load(Ordering::SeqCst));
+        assert!(!task1.log_path.exists());
+        assert!(task2.log_path.exists());
+        tasks.set_remove_hook(None);
+        tasks.shutdown();
+    }
 }

@@ -198,7 +198,10 @@ pub enum Child {
         process: std::os::windows::io::OwnedHandle,
         /// Held until the tree ends; dropping it closes the terminal so output reaches EOF. The
         /// task's size control holds another reference while the tree runs.
-        #[allow(dead_code)] // held for the console's lifetime, never read here
+        #[expect(
+            dead_code,
+            reason = "held for the console's lifetime until the tree ends"
+        )]
         terminal: std::sync::Arc<crate::platform::conpty_spawn::Terminal>,
         /// Where the script records its exit status, so a root that never terminates can still
         /// end its task.
@@ -256,7 +259,10 @@ pub struct Child {
     /// The host writes the root bash's exit code here and holds it open until it exits.
     status: std::io::PipeReader,
     /// A PTY task's terminal, held until the tree ends.
-    #[allow(dead_code)] // held for the terminal's lifetime, never read here
+    #[expect(
+        dead_code,
+        reason = "held for the terminal's lifetime until the tree ends"
+    )]
     master: Option<std::fs::File>,
 }
 

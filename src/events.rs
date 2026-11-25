@@ -160,10 +160,10 @@ pub struct ExternalEventInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
     pub name: String,
-    pub upstream_event_id: String,
-    pub data: Value,
+    pub event_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_truncated: Option<bool>,
+    pub timestamp: Option<String>,
+    pub data: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -396,7 +396,7 @@ enum EventMeta {
         source: String,
         topic: Option<String>,
         upstream_name: String,
-        upstream_event_id: String,
+        event_id: String,
     },
 }
 
@@ -573,12 +573,10 @@ impl BusState {
         };
         self.ring_bytes = self.ring_bytes.saturating_sub(evicted.lease.bytes());
         if let EventMeta::External {
-            source,
-            upstream_event_id,
-            ..
+            source, event_id, ..
         } = &evicted.meta
         {
-            let key = (source.clone(), upstream_event_id.clone());
+            let key = (source.clone(), event_id.clone());
             if self.dedup.get(&key).copied() == Some(evicted.seq) {
                 self.dedup.remove(&key);
             }
@@ -751,11 +749,11 @@ impl EventBus {
                                 "source": { "type": "string" },
                                 "topic": { "type": "string" },
                                 "name": { "type": "string" },
-                                "upstreamEventId": { "type": "string" },
-                                "data": {},
-                                "upstreamTruncated": { "type": "boolean" }
+                                "eventId": { "type": "string" },
+                                "timestamp": { "type": "string" },
+                                "data": {}
                             },
-                            "required": ["source", "name", "upstreamEventId", "data"],
+                            "required": ["source", "name", "eventId", "data"],
                             "additionalProperties": false
                         }),
                     },
@@ -832,9 +830,16 @@ impl EventBus {
                 "external event requires non-empty `name`".to_owned(),
             ));
         }
-        if input.upstream_event_id.trim().is_empty() {
+        if input.event_id.trim().is_empty() {
             return Err(EventError::InvalidParams(
-                "external event requires non-empty `upstreamEventId`".to_owned(),
+                "external event requires non-empty `eventId`".to_owned(),
+            ));
+        }
+        if let Some(ts) = input.timestamp.as_deref()
+            && ts.trim().is_empty()
+        {
+            return Err(EventError::InvalidParams(
+                "external event `timestamp` must not be empty".to_owned(),
             ));
         }
 
@@ -844,14 +849,11 @@ impl EventBus {
             obj.insert("topic".to_owned(), Value::String(topic.clone()));
         }
         obj.insert("name".to_owned(), Value::String(input.name.clone()));
-        obj.insert(
-            "upstreamEventId".to_owned(),
-            Value::String(input.upstream_event_id.clone()),
-        );
-        obj.insert("data".to_owned(), input.data);
-        if let Some(truncated) = input.upstream_truncated {
-            obj.insert("upstreamTruncated".to_owned(), Value::Bool(truncated));
+        obj.insert("eventId".to_owned(), Value::String(input.event_id.clone()));
+        if let Some(timestamp) = input.timestamp {
+            obj.insert("timestamp".to_owned(), Value::String(timestamp));
         }
+        obj.insert("data".to_owned(), input.data);
         let payload = Value::Object(obj);
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| EventError::InvalidParams(format!("cannot serialize event: {e}")))?
@@ -862,12 +864,12 @@ impl EventBus {
             )));
         }
 
-        let dedup_key = (input.source.clone(), input.upstream_event_id.clone());
+        let dedup_key = (input.source.clone(), input.event_id.clone());
         let meta = EventMeta::External {
             source: input.source,
             topic: input.topic.filter(|t| !t.is_empty()),
             upstream_name: input.name,
-            upstream_event_id: input.upstream_event_id,
+            event_id: input.event_id,
         };
         let entry_bytes = estimate_entry_bytes(EVENT_EXTERNAL, payload_bytes, &meta);
         self.enqueue(
@@ -1402,13 +1404,13 @@ fn estimate_entry_bytes(name: &str, data_bytes: usize, meta: &EventMeta) -> usiz
             source,
             topic,
             upstream_name,
-            upstream_event_id,
+            event_id,
         } => {
             // Account for both stored metadata and the dedup index key copy.
             source.len().saturating_mul(2)
                 + topic.as_ref().map_or(0, String::len)
                 + upstream_name.len()
-                + upstream_event_id.len().saturating_mul(2)
+                + event_id.len().saturating_mul(2)
                 + DEDUP_FIXED_OVERHEAD
         }
     };
@@ -1490,9 +1492,9 @@ mod tests {
             source: source.to_owned(),
             topic: Some("pr".to_owned()),
             name: name.to_owned(),
-            upstream_event_id: id.to_owned(),
+            event_id: id.to_owned(),
+            timestamp: None,
             data,
-            upstream_truncated: None,
         }
     }
 
@@ -2062,7 +2064,7 @@ mod tests {
             let StreamItem::Event(event) = &item.value else {
                 panic!("expected replay event");
             };
-            assert_eq!(event.data["upstreamEventId"], id);
+            assert_eq!(event.data["eventId"], id);
         }
         assert_eq!(resumed.current_cursor().unwrap().value, "ep000001:3");
 
@@ -2148,9 +2150,9 @@ mod tests {
             source: "git\nhub".to_owned(),
             topic: Some("pr\r\x1b[31m".to_owned()),
             name: "merged".to_owned(),
-            upstream_event_id: "id-1".to_owned(),
+            event_id: "id-1".to_owned(),
+            timestamp: None,
             data: json!({"secret": "DO_NOT_LEAK_THIS_PAYLOAD"}),
-            upstream_truncated: None,
         })
         .unwrap();
         bus.publish_external(ExternalEventInput {
@@ -2158,9 +2160,9 @@ mod tests {
             source: "git\nhub".to_owned(),
             topic: Some("pr\r\x1b[31m".to_owned()),
             name: "merged".to_owned(),
-            upstream_event_id: "id-2".to_owned(),
+            event_id: "id-2".to_owned(),
+            timestamp: None,
             data: json!({"secret": "ANOTHER_SECRET"}),
-            upstream_truncated: None,
         })
         .unwrap();
 
@@ -2257,5 +2259,96 @@ mod tests {
         drop(g2);
         drop(_g3);
         assert_eq!(bus.active_streams(), 0);
+    }
+
+    #[test]
+    fn external_event_schema_and_payload_use_sep3415_fields() {
+        let (bus, _) = test_bus(16, 1 << 20, 8, 1 << 20);
+        let list = bus.list_event_types().unwrap();
+        let ext = list
+            .value
+            .events
+            .iter()
+            .find(|e| e.name == EVENT_EXTERNAL)
+            .unwrap();
+        let props = ext.payload_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("eventId"));
+        assert!(props.contains_key("timestamp"));
+        assert!(!props.contains_key("upstreamEventId"));
+        assert!(!props.contains_key("upstreamTruncated"));
+        assert_eq!(
+            ext.payload_schema["required"],
+            json!(["source", "name", "eventId", "data"])
+        );
+
+        let start = bus.current_cursor();
+        assert!(
+            bus.publish_external(ExternalEventInput {
+                event_type: None,
+                source: "gh".into(),
+                topic: None,
+                name: "push".into(),
+                event_id: "   ".into(),
+                timestamp: None,
+                data: json!({}),
+            })
+            .is_err()
+        );
+        assert!(
+            bus.publish_external(ExternalEventInput {
+                event_type: None,
+                source: "gh".into(),
+                topic: None,
+                name: "push".into(),
+                event_id: "ok-1".into(),
+                timestamp: Some("   ".into()),
+                data: json!({}),
+            })
+            .is_err()
+        );
+
+        let first = bus
+            .publish_external(ExternalEventInput {
+                event_type: Some(EVENT_EXTERNAL.into()),
+                source: "gh".into(),
+                topic: Some("main".into()),
+                name: "push".into(),
+                event_id: "sep-1".into(),
+                timestamp: Some("2026-11-25T12:34:56Z".into()),
+                data: json!({"sha": "abc"}),
+            })
+            .unwrap();
+        assert!(!first.deduplicated);
+
+        let dup = bus
+            .publish_external(ExternalEventInput {
+                event_type: None,
+                source: "gh".into(),
+                topic: None,
+                name: "push".into(),
+                event_id: "sep-1".into(),
+                timestamp: None,
+                data: json!({}),
+            })
+            .unwrap();
+        assert!(dup.deduplicated);
+        assert_eq!(dup.cursor, first.cursor);
+
+        let polled = bus
+            .poll(
+                PollRequest {
+                    name: EVENT_EXTERNAL.into(),
+                    cursor: Some(start),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(polled.value.events.len(), 1);
+        let payload = &polled.value.events[0].data;
+        assert_eq!(payload["eventId"], "sep-1");
+        assert_eq!(payload["timestamp"], "2026-11-25T12:34:56Z");
+        assert!(payload.get("upstreamEventId").is_none());
+        assert!(payload.get("upstreamTruncated").is_none());
     }
 }

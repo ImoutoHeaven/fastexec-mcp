@@ -1615,9 +1615,9 @@ async fn nested_task_reads_consume_reader_state_without_consuming_session_notice
             source: "src".into(),
             topic: None,
             name: "evt".into(),
-            upstream_event_id: "nested-cursor-test".into(),
+            event_id: "nested-cursor-test".into(),
+            timestamp: None,
             data: json!({}),
-            upstream_truncated: None,
         })
         .unwrap();
     let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
@@ -2494,9 +2494,9 @@ async fn combined_background_footer_fits_and_rejected_results_keep_events_unseen
                 source: format!("{index}{}", "源".repeat(47)),
                 topic: Some("题".repeat(48)),
                 name: "名".repeat(48),
-                upstream_event_id: format!("footer-event-{index}"),
+                event_id: format!("footer-event-{index}"),
+                timestamp: None,
                 data: json!({}),
-                upstream_truncated: None,
             })
             .unwrap();
     }

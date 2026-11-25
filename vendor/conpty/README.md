@@ -14,6 +14,6 @@ license in `LICENSE`. All four files carry Microsoft's Authenticode signature.
 | `arm64/conpty.dll` | `runtimes/win-arm64/native/conpty.dll` | `db3d173640b172bafd42d5b541b638a9aeec1c7d0e40dd636bf02822a32c912c` |
 | `arm64/OpenConsole.exe` | `build/native/runtimes/arm64/OpenConsole.exe` | `ed7622fd0d3bedc9ab9f122f5e58edf0def9e7999224f52dd395ba9f54edbe09` |
 
-`src/conpty.rs` embeds the files of the target architecture in Windows x64 and arm64 builds and
-loads this ConPTY in place of the system one. To update, replace all four files from a newer
-package, update the hashes here and `VERSION` in `src/conpty.rs`.
+`src/platform/conpty.rs` embeds the files of the target architecture in Windows x64 and arm64
+builds and loads this ConPTY in place of the system one. To update, replace all four files from a
+newer package, update the hashes here, and update `VERSION` in `src/platform/conpty.rs`.

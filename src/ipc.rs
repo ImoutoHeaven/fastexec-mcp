@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// What a Hello and a Welcome must agree on.
-pub const PROTOCOL: u32 = 5;
+pub const PROTOCOL: u32 = 6;
 
 /// The largest frame the daemon accepts. A Hello carries the endpoint's whole environment, which
 /// is the reason this is larger than a call.
@@ -1587,7 +1587,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_writes_reset_on_forward_progress_and_fail_on_stall() {
-        assert_eq!(PROTOCOL, 5);
+        assert_eq!(PROTOCOL, 6);
         assert_eq!(RESPONSE_LIMIT, 512 << 20);
 
         let payload = vec![b'x'; 256];

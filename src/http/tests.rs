@@ -18,6 +18,7 @@ async fn download_fixture(
         file: Some(file.take(content.len() as u64)),
         memory,
         _admitted: table.admit(&id).unwrap(),
+        _permit: None,
     };
     (directory, table, body)
 }
@@ -206,7 +207,8 @@ async fn downloads_size_the_same_open_handle_it_streams() {
         if partial {
             headers.insert(header::RANGE, "bytes=3-".parse().unwrap());
         }
-        let response = transfer_get(Version::HTTP_11, &headers, table.admit(&id).unwrap()).await;
+        let response =
+            transfer_get(Version::HTTP_11, &headers, table.admit(&id).unwrap(), None).await;
         std::fs::rename(&replacement, &path).unwrap();
         let (status, length, body) = if partial {
             assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 3-7/8");
@@ -710,6 +712,7 @@ async fn http2_h2c_concurrent_requests_and_refusal_omit_connection_close() {
     let layer = Bearer {
         digests: Arc::from([digest(token)]),
         table: Arc::new(Transfers::new()),
+        transfer_slots: Arc::new(Semaphore::new(MAX_TRANSFER_CONNECTIONS)),
         stopped: stopped.clone(),
         inner: poc_service(gate, bound),
     };
@@ -930,9 +933,9 @@ async fn three_client_suites_modern_events_modern_plain_and_legacy_2025() {
             source: "github".to_owned(),
             topic: Some("pr".to_owned()),
             name: "merged".to_owned(),
-            upstream_event_id: "u-1".to_owned(),
+            event_id: "u-1".to_owned(),
+            timestamp: None,
             data: serde_json::json!({ "secret": "TOP_SECRET_DATA" }),
-            upstream_truncated: None,
         })
         .unwrap();
     let b64_name = format!(
@@ -1217,4 +1220,159 @@ async fn three_client_suites_modern_events_modern_plain_and_legacy_2025() {
         .map(|d| serde_json::from_str(d).unwrap())
         .unwrap();
     assert_eq!(legacy_msg["error"]["code"], -32601);
+
+    // --- Suite 4: Strict Mcp-Name header checks ---
+    // 4a. Duplicate Mcp-Name header -> HTTP 400 + -32020.
+    let mut dup_hdr = Request::post("/mcp")
+        .header("host", "localhost")
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "events/poll")
+        .header("mcp-name", "external.event")
+        .header("mcp-name", "external.event")
+        .body(Full::new(modern_post_body(
+            30,
+            "events/poll",
+            serde_json::json!({ "name": "external.event" }),
+        )))
+        .unwrap();
+    dup_hdr.extensions_mut().insert(Principal(0));
+    let dup_res = http_svc.call(dup_hdr).await.unwrap();
+    assert_eq!(dup_res.status(), StatusCode::BAD_REQUEST);
+    let dup_body: serde_json::Value =
+        serde_json::from_slice(&dup_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(dup_body["error"]["code"], -32020);
+
+    // 4b. Bare Mcp-Name with surrounding space or HTAB -> HTTP 400 + -32020.
+    for raw_val in [" external.event", "external.event ", "external\tevent"] {
+        let mut ws_hdr = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/poll")
+            .header("mcp-name", raw_val)
+            .body(Full::new(modern_post_body(
+                31,
+                "events/poll",
+                serde_json::json!({ "name": "external.event" }),
+            )))
+            .unwrap();
+        ws_hdr.extensions_mut().insert(Principal(0));
+        let ws_res = http_svc.call(ws_hdr).await.unwrap();
+        assert_eq!(ws_res.status(), StatusCode::BAD_REQUEST, "val={raw_val:?}");
+        let ws_body: serde_json::Value =
+            serde_json::from_slice(&ws_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(ws_body["error"]["code"], -32020, "val={raw_val:?}");
+    }
+
+    // 4c. events/list with unexpected Mcp-Name header -> HTTP 400 + -32020.
+    let mut list_hdr = Request::post("/mcp")
+        .header("host", "localhost")
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "events/list")
+        .header("mcp-name", "external.event")
+        .body(Full::new(modern_post_body(
+            32,
+            "events/list",
+            serde_json::json!({}),
+        )))
+        .unwrap();
+    list_hdr.extensions_mut().insert(Principal(0));
+    let list_hdr_res = http_svc.call(list_hdr).await.unwrap();
+    assert_eq!(list_hdr_res.status(), StatusCode::BAD_REQUEST);
+    let list_hdr_body: serde_json::Value =
+        serde_json::from_slice(&list_hdr_res.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(list_hdr_body["error"]["code"], -32020);
+}
+
+#[tokio::test]
+async fn transfer_subquota_returns_503_while_preserving_mcp_control_plane() {
+    let dir = std::env::temp_dir().join(format!(
+        "fastexec-transfer-subquota-{}",
+        crate::tasks::random_chars(12).unwrap()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sample = dir.join("payload.bin");
+    std::fs::File::create(&sample)
+        .unwrap()
+        .set_len(64 << 20)
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let stopped = CancellationToken::new();
+    let token = "subquota-test-token";
+    let table = Arc::new(Transfers::new());
+    let id = table.create(sample.clone()).unwrap();
+    let inner = poc_service(Arc::new(tokio::sync::Notify::new()), bound);
+    let layer = Bearer {
+        digests: Arc::from([digest(token)]),
+        table: Arc::clone(&table),
+        transfer_slots: Arc::new(Semaphore::new(2)),
+        stopped: stopped.clone(),
+        inner,
+    };
+    let server_task = tokio::spawn(serve_connections(listener, layer, stopped.clone()));
+
+    let open_transfer = || async {
+        let mut s = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let req = format!("GET /t/{id} HTTP/1.1\r\nHost: {bound}\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut head = [0u8; 64];
+        let n = s.read(&mut head).await.unwrap();
+        (s, String::from_utf8_lossy(&head[..n]).into_owned())
+    };
+
+    // Hold both `/t/` sub-quota slots with unread streaming download bodies.
+    let (s1, h1) = open_transfer().await;
+    assert!(h1.starts_with("HTTP/1.1 200 OK"), "{h1}");
+    let (s2, h2) = open_transfer().await;
+    assert!(h2.starts_with("HTTP/1.1 200 OK"), "{h2}");
+
+    // 3rd `/t/` request gets 503 Service Unavailable with Connection: close and Content-Length: 0.
+    let mut s3 = tokio::net::TcpStream::connect(bound).await.unwrap();
+    let req3 = format!("GET /t/{id} HTTP/1.1\r\nHost: {bound}\r\n\r\n");
+    s3.write_all(req3.as_bytes()).await.unwrap();
+    let mut buf3 = Vec::new();
+    s3.read_to_end(&mut buf3).await.unwrap();
+    let text3 = String::from_utf8_lossy(&buf3);
+    assert!(
+        text3.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+        "{text3}"
+    );
+    assert!(
+        text3.to_ascii_lowercase().contains("connection: close\r\n"),
+        "{text3}"
+    );
+    assert!(
+        text3.to_ascii_lowercase().contains("content-length: 0\r\n"),
+        "{text3}"
+    );
+
+    // Meanwhile `/mcp` control plane still succeeds!
+    let mut mcp_stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+    let body = modern_post_body(1, "events/list", serde_json::json!({}));
+    let mcp_req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMcp-Protocol-Version: 2026-07-28\r\nMcp-Method: events/list\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    mcp_stream.write_all(mcp_req.as_bytes()).await.unwrap();
+    mcp_stream.write_all(&body).await.unwrap();
+    let mut mcp_out = Vec::new();
+    mcp_stream.read_to_end(&mut mcp_out).await.unwrap();
+    let mcp_text = String::from_utf8_lossy(&mcp_out);
+    assert!(mcp_text.starts_with("HTTP/1.1 200 OK\r\n"), "{mcp_text}");
+
+    drop(s1);
+    drop(s2);
+    stopped.cancel();
+    let _ = server_task.await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

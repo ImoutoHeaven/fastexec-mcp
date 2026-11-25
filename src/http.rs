@@ -38,6 +38,12 @@ pub(crate) const LIMIT: usize = 4 << 20;
 /// HTTP has its own connection budget, so unauthenticated peers cannot consume the daemon
 /// socket's management capacity or exhaust the process's file descriptors.
 const MAX_CONNECTIONS: usize = 128;
+/// Sub-quota for unauthenticated `/t/` file transfers on a shared HTTP listener, keeping 32
+/// connection slots available for `/mcp` control traffic.
+const MAX_TRANSFER_CONNECTIONS: usize = 96;
+const MAX_REJECT_WRITERS: usize = 32;
+const BUSY_503: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 /// Legacy HTTP sessions survive individual connections and have a separate count cap.
 const MAX_HTTP_SESSIONS: usize = 256;
 /// The deadline for a complete HTTP request header.
@@ -313,6 +319,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     let layer = Bearer {
         digests: digests.into(),
         table,
+        transfer_slots: Arc::new(Semaphore::new(MAX_TRANSFER_CONNECTIONS)),
         stopped: stopped.clone(),
         inner,
     };
@@ -341,11 +348,12 @@ where
     S::Future: Send + 'static,
 {
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let reject_slots = Arc::new(Semaphore::new(MAX_REJECT_WRITERS));
     loop {
         tokio::select! {
             _ = stopped.cancelled() => break,
             accepted = listener.accept() => {
-                let (stream, _peer) = match accepted {
+                let (mut stream, _peer) = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
                         eprintln!("fastexec: cannot accept an HTTP connection: {error}");
@@ -353,9 +361,28 @@ where
                         continue;
                     }
                 };
-                // Never queue a task waiting for a slot: that would move the unbounded
-                // allocation from sockets into futures. The accepted socket is dropped at once.
                 let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                    if let Ok(reject_permit) = Arc::clone(&reject_slots).try_acquire_owned() {
+                        tokio::spawn(async move {
+                            let _permit = reject_permit;
+                            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                                let _ = stream.write_all(BUSY_503).await;
+                                let _ = stream.shutdown().await;
+                                let _ = tokio::time::timeout(Duration::from_millis(50), async {
+                                    let mut sink = [0u8; 1024];
+                                    while let Ok(n) = stream.read(&mut sink).await {
+                                        if n == 0 {
+                                            break;
+                                        }
+                                    }
+                                })
+                                .await;
+                            })
+                            .await;
+                        });
+                    } else {
+                        let _ = stream.try_write(BUSY_503);
+                    }
                     continue;
                 };
                 let service = service.clone();
@@ -411,7 +438,7 @@ impl tower_service::Service<Request<Incoming>> for TransferOnly {
         let stopped = self.stopped.clone();
         Box::pin(async move {
             if request.uri().path().starts_with("/t/") {
-                return Ok(serve_transfer(request, table, stopped).await);
+                return Ok(serve_transfer(request, table, stopped, None).await);
             }
             Ok(refusal(request.version(), StatusCode::NOT_FOUND, ""))
         })
@@ -509,6 +536,8 @@ struct Bearer<H = Server> {
     digests: Arc<[[u8; 32]]>,
     /// The files this listener publishes under `/t/`.
     table: Arc<Transfers>,
+    /// Sub-quota keeping `/t/` transfers from starving `/mcp` connections.
+    transfer_slots: Arc<Semaphore>,
     stopped: CancellationToken,
     inner: StreamableHttpService<H, Sessions>,
 }
@@ -529,11 +558,19 @@ where
         let mut inner = self.inner.clone();
         let digests = Arc::clone(&self.digests);
         let table = Arc::clone(&self.table);
+        let transfer_slots = Arc::clone(&self.transfer_slots);
         let stopped = self.stopped.clone();
         Box::pin(async move {
             // A transfer is its own front door: no token, no body cap, and never a session.
             if request.uri().path().starts_with("/t/") {
-                return Ok(serve_transfer(request, table, stopped).await);
+                let Ok(permit) = transfer_slots.try_acquire_owned() else {
+                    return Ok(refusal(
+                        request.version(),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "",
+                    ));
+                };
+                return Ok(serve_transfer(request, table, stopped, Some(permit)).await);
             }
             let version = request.version();
             let Some(principal) = authorized(request.headers(), &digests) else {
@@ -574,7 +611,9 @@ where
 fn refusal(version: Version, status: StatusCode, challenge: &str) -> Reply {
     // The rejected request's body is deliberately unread. Closing prevents a peer from
     // keeping a connection occupied forever by declaring a body and never sending it.
-    let mut builder = Response::builder().status(status);
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_LENGTH, 0);
     if version < Version::HTTP_2 {
         builder = builder.header(header::CONNECTION, "close");
     }
@@ -632,6 +671,7 @@ async fn serve_transfer(
     request: Request<Incoming>,
     table: Arc<Transfers>,
     stopped: CancellationToken,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Reply {
     let version = request.version();
     let id = request
@@ -650,7 +690,7 @@ async fn serve_transfer(
         return transfer_empty(version, StatusCode::NOT_FOUND, &[]);
     };
     match *request.method() {
-        Method::GET => transfer_get(version, request.headers(), admitted).await,
+        Method::GET => transfer_get(version, request.headers(), admitted, permit).await,
         Method::HEAD => transfer_head(version, admitted).await,
         Method::PUT => transfer_put(request, admitted, stopped).await,
         _ => transfer_empty(
@@ -704,7 +744,12 @@ async fn presence(path: Arc<PathBuf>) -> Presence {
 }
 
 /// Downloads a file, or the one range of it that was asked for.
-async fn transfer_get(version: Version, headers: &HeaderMap, admitted: Admitted) -> Reply {
+async fn transfer_get(
+    version: Version,
+    headers: &HeaderMap,
+    admitted: Admitted,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Reply {
     let path = admitted.path();
     let (file, metadata) = match transfer_file(
         path,
@@ -765,6 +810,7 @@ async fn transfer_get(version: Version, headers: &HeaderMap, admitted: Admitted)
                 file: Some(file.take(length)),
                 memory: Arc::clone(crate::lease::process_pool()),
                 _admitted: admitted,
+                _permit: permit,
             }
             .boxed(),
         )
@@ -1068,6 +1114,7 @@ struct FileBody {
     file: Option<tokio::io::Take<tokio::fs::File>>,
     memory: Arc<crate::lease::BytePool>,
     _admitted: Admitted,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl hyper::body::Body for FileBody {

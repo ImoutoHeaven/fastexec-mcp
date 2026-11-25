@@ -1,23 +1,24 @@
-# fastexec Reference and Architecture
+# fastexec reference and architecture
 
 Authoritative runtime usage rules live in
-[`src/description.md`](../src/description.md) and request validation in
-[`src/service.rs`](../src/service.rs).
+[`src/description.md`](../src/description.md), service wiring in
+[`src/service.rs`](../src/service.rs), and request parameter validation in
+[`src/service/schema.rs`](../src/service/schema.rs).
 
 ## 0. Build and deployment
 
 ### MCP compatibility boundary
 
-**Broad compatibility with MCP clients is an intentional product requirement.**
+Broad compatibility with MCP clients is a core product contract. `fastexec`
+supports multiple protocol revisions over stdio and Streamable HTTP across both
+the `initialize` / `notifications/initialized` session lifecycle and the
+stateless `server/discover` / inline-metadata lifecycle, plus `2026-07-28` MCP
+Events (`events/list`, `events/poll`, `events/stream`; section 7). Their
+protocol paths, client fixtures, and release smoke coverage are part of the
+supported external interface.
 
-Fastexec supports multiple protocol revisions over stdio and Streamable HTTP.
-Keep both the `initialize` / `notifications/initialized` session lifecycle
-and the `server/discover` / inline-metadata lifecycle. Their protocol paths,
-client fixtures, and release smoke coverage are part of the supported interface.
-
-The clean implementation rule applies to internal design. Internal refactors
-must avoid migration layers, internal legacy/compatibility shims, and
-meaningless temporary suppressions while preserving these external interfaces.
+Internal refactors avoid migration layers, legacy compatibility shims, and
+unexplained lint suppressions while keeping these external MCP interfaces intact.
 
 ### Platform notes
 
@@ -95,8 +96,8 @@ loginctl enable-linger <user>
 
 `loginctl enable-linger` starts the unit without a login session.
 
-On Windows, [nssm](https://nssm.cc/usage) runs it under the user's own account
-instead of LocalSystem:
+On Windows, [nssm](https://nssm.cc/usage) runs the daemon under the user's own
+account so tasks use that user's profile and permissions:
 
 ```powershell
 nssm install fastexec "C:\path\to\fastexec.exe" "daemon run --http 127.0.0.1:8765"
@@ -148,10 +149,10 @@ Cloudflare reaches the daemon through a named tunnel; Quick Tunnels do not
 support server-sent events. Plan limits are in
 [Cloudflare's connection limits](https://developers.cloudflare.com/fundamentals/reference/connection-limits/).
 
-## 1. Tool Actions and Parameter Limits
+## 1. Tool actions and parameter limits
 
 Each tool accepts a single JSON object (`deny_unknown_fields`, `camelCase`),
-using a portable JSON Schema with no root combinators and flat scalar/enum
+using a portable JSON Schema without root combinators and with flat scalar or enum
 types. `null` values are treated as absent everywhere, and `false` booleans
 count as absent in inapplicable-parameter and `screen` combination checks while
 retaining their meaning where applicable (`eof: false`, `loginShell: false`).
@@ -160,14 +161,14 @@ execution, naming `exec` actions in lowercase.
 
 | Tool | Parameters | Summary |
 | --- | --- | --- |
-| `exec` | the action table below | Runs bash commands as tasks. |
+| `exec` | `action` plus action-specific fields | Runs bash commands as tasks. |
 | `codemode` | `code`, `cwd`, `waitMs`, `returnWhen`, `killAfterMs`, `truncate`, `maxBytes` | Runs async JavaScript as a task when `FASTEXEC_CODEMODE=true`. |
 | `read` | `path`, `offset`, `limit` | Reads a text file, or attaches an image, audio, PDF, or video file. |
 | `write` | `path`, `content` | Saves a complete replacement of a regular file. |
 | `edit` | `path`, `edits` | Applies exact text replacements to a UTF-8 file. |
 | `transfer` | `path` | Publishes one regular file at a `/t/<id>` URL when `FASTEXEC_TRANSFER=true`, returning the capability URL, path, and current byte size. |
 
-### `exec` Actions
+### `exec` actions
 
 | Action | Allowed Parameters | Summary |
 | --- | --- | --- |
@@ -177,125 +178,141 @@ execution, naming `exec` actions in lowercase.
 | `list` | `scope`, `state`, `limit`, `parentTaskId`, `truncate`, `maxBytes` | Lists bare task IDs newest first filtered by `scope` (`"session"` default, or `"all"` by default when `parentTaskId` is set), `state` (`"active"` or `"finished"`; omitted lists both), and `limit` (`1-500`, default `20`), reporting `totalCount` before `limit`. `truncate` and `maxBytes` apply to direct MCP calls only and fail validation in nested `codemode` calls. Tree markers follow `[<state>]` before elapsed time and command. Without `parentTaskId`, folds `codemode` children into their parent's summary (including `queued`/`cancelled` start counts and `kept ended` when kept child processes exited) and indents up to `8` active children below it; with `parentTaskId`, lists that script's children flat. Creates no readers; direct calls mark only delivered fragments (and folded finished children when the parent summary fits), while nested calls mark only tasks started by the current script. |
 | `transcript` | `taskId`, `truncate` (default `"tail"`), `maxBytes`, `waitMs` (ignored) | Reads a UTF-8 PTY task's terminal transcript from the first unseen final line, followed by pending lines. Does not wait or advance the `poll` cursor. |
 
-### Key Parameter Rules
+### Parameter rules
 
-- **`taskId` and readers**: Bare task IDs are `<8-char epoch>-<1..=13-char seq>`
-  in Crockford base32; in daemon mode a well-formed ID with a foreign epoch
-  reports that it came from an earlier daemon, whereas malformed IDs report
-  `Unknown taskId`. `start`, `poll`, `kill`, and `transcript` return
-  a reader handle, `<taskId>.<reader>` (four Crockford base32 characters), in
-  the status line (and as `taskId` in nested `codemode` results). Reusing a handle in the same session
-  preserves its cursor; passing a bare task ID creates a new reader from the
-  beginning of the retained log. An unknown valid reader key is recreated under
-  that key, including after eviction or a session ending. Each task entry holds
-  at most `16` readers, evicting the least recently used idle reader when
-  needed; an active reader, a waiter, or a cancelled call's still-running
-  blocking read cannot be evicted. If every reader is busy, attachment is
-  refused. A new attachment's first delivered output (including on `kill`),
-  transcript, or screen result says `new reader`; cancelled calls leave that
-  notice pending. Log and transcript range reads reject premature EOF. Reader
-  cursors and decoding state commit only after complete rendering succeeds;
-  failed or cancelled reads leave unseen output available for the next call.
-  Retention and output limits apply to each reader.
-- **`list` grouping and `parentTaskId`**: Each bash task started from a
-  `codemode` script records `Task.parent_task_id` (immutable after creation;
-  `None` for direct bash starts and `codemode` scripts). Without `parentTaskId`,
-  `Tasks::listed` runs one pass over the scoped tasks (`registry.tasks` for
-  `scope: "all"`, `session.touched` for `scope: "session"`):
-  - Every `list` row (top-level, indented active child, promoted orphan, and
-    `parentTaskId` flat row) keeps `[running]`, `[exited N]`, and `[killed]`
-    for the root process and places any tree marker immediately after
-    `[<state>]` before elapsed time, `pty`, summary, `owner`, `via`, and
-    `command`: ` · keepTree` while running or when `keepTree: true` finished
-    without entering a held state, ` · keeps <members>[ (kill failed)]` (PID
-    sorted), ` · keeps processes[ (kill failed)]` when held with no enumerated
-    non-root members, ` · keeps processes (unconfirmed[, kill failed])` when
-    members could not be confirmed, or ` · kept processes ended` once a held
-    tree ends.
-  - Finished children of an eligible parent fold into the parent's inline
-    summary (`total`, `done`, `failed`, `warned`, plus `tree_ended` rendered as
-    `<n> kept ended` when non-zero; `done + failed + active == total`), paired
-    with lock-free `queued` (while running) or `cancelled` (after exit or
-    `kill`) start counts. Active children (`running` or `keptRunning`) render
-    indented (`  └─`) beneath the parent, capped at `8` per parent (matching
-    `START_PERMITS`) with an overflow hint pointing to `parentTaskId` when more
-    are active; under `state: "finished"`, `0` children are indented.
-  - When `state` is not `"finished"`, an eligible parent sorts at
-    `max(parent_pos, newest_active_child_pos)` so an older running `codemode`
-    with a fresh active child stays at the top of the list without post-`limit`
-    re-slicing. `totalCount` is the top-level item count before `limit`.
-  - A child whose parent is absent from the current view (evicted, outside
-    `scope: "session"`, finished/killed under `state: "active"`, or running
-    under `state: "finished"`) is promoted to a top-level row tagged `via <pid>`
-    when the child matches `state`.
-  - Passing `parentTaskId` (bare task ID or reader handle, normalized via
-    `parse_handle`) lists that script's children flat without folding. Omit
-    `state: "active"` when inspecting `kept ended` children. When
-    `scope` is omitted, drill-down searches all sessions; explicit
-    `scope: "session"` filters to the caller's session. Drill-down keeps
-    working after parent eviction while any child with that `parent_task_id`
-    remains in `registry.tasks`. A bash task ID returns `"No tasks."`; an
-    unknown ID with no remaining children errors naming `parentTaskId`.
-- **`waitMs` vs. `killAfterMs`**: `waitMs` (`0-240000`) bounds only the current
-  call's wait. A call that hits `waitMs`, matches `returnWhen`, or is cancelled
-  leaves the task running (use `list` to recover the `taskId` of a cancelled
-  `start`). `killAfterMs` on `start` arms an independent timer that kills the
-  owned tree, including kept processes. Expiry while the root runs reports
-  `state: "killed"` and `lifetimeExpired: true`; after root exit, held processes
-  end and the root's original result stays.
-- **`returnWhen`**: Ends the wait early when any condition holds (`waitEndedBy`
-  reports `{ condition, text? }`):
-  - `outputContains`: `1-16` literal case-sensitive strings (`1-4096` bytes
-    each, no line breaks) matched against unseen output lines: cleaned for bash
-    (including text before a carriage return overwrites it), unchanged for codemode.
-  - `screenContains`, `screenAppears`, `screenGone` (UTF-8 PTY only): match
-    against the live screen at the task's size (`screenAppears` and `screenGone`
-    compare against the screen captured before the call's resize and `input`).
-  - `quietMs`: `10-60000` ms without output after `input` and `keys` finish.
-- **Window and encoding options**:
-  - `maxBytes`: `100-4194304` (`4` MiB; default `16384` on direct `exec` and
-    outer `codemode`, `4194304` on nested `tools.exec`). Bounds the output body
-    only; the status line, background footer (`<= 512` bytes), metadata,
-    errors, and correctness warnings stay outside that budget. Rejected on
-    nested `list` calls.
-  - `truncate`: Direct MCP calls (`ExecPolicy::AGENT`) default to `"head_tail"`
-    (`"tail"` for `transcript`), inject inline omission and cut markers
-    (`... [<k> lines omitted: log lines <a>-<b>] ...` and
-    `<prefix> … [line cut at <B>; <n> more bytes]`, plus
-    `... [<n> top rows omitted] ...` and ` … [cut]` for `screen: true`), and
-    drop NUL (`0x00`) bytes when cleaning (`keep_nul: false`). Multi-line
-    `head_tail` overflow reserves the inline marker and `B / 10` for the head,
-    fills the tail from the last line backward (cutting the last line if
-    needed), and returns unused tail bytes to the head. Nested `codemode` calls
-    (`ExecPolicy::PROGRAM`) default to `"head"` (`"tail"` for `transcript`),
-    preserve NUL bytes in clean output (`keep_nul: true`, so `find -print0` and
-    `rg -0` parse cleanly), reject
-    `truncate: "head_tail"` and `list` `truncate`/`maxBytes` with
-    `ToolError` (`code: "VALIDATION"`), and omit all inline markers
-    (`inline_markers: false`). When a single line or screen row exceeds the
-    budget in Program mode, it slices cleanly at a UTF-8 boundary and reports
-    `truncated`, `omittedLines`, `omittedRange`, `cutLines`, and `omittedRows`
-    in the control channel. There is no fixed per-line length cap on either
-    path. Omitted ranges on direct calls also appear in the status line, outside
-    the body budget.
-  - `raw`: Skips terminal-output cleaning. Nested `raw: true` output preserves
-    ANSI/control sequences and line endings, while decoding bytes using `encoding`
-    (UTF-8 by default). Invalid sequences become replacement characters;
-    `encodingErrors` counts affected lines. The task log retains captured bytes
-    under its normal storage limits.
-  - `encoding`: Any ASCII-compatible WHATWG label (such as `"utf-8"`, `"big5"`,
-    `"gbk"`; UTF-16 is rejected). On `start`, sets the task default; on `poll`,
-    overrides for that call.
-  - `screen`: Boolean (`false` default, UTF-8 PTY only). Returns the rendered
-    screen at the task's size and 1-based cursor `[row, col]`, marking the output
-    stream read up to that point. Cannot combine with `truncate`, `raw`, or
-    `encoding`.
-  - `cols`, `rows` (PTY only): the terminal's size. `start` takes them,
-    defaulting `120x30`; `poll` takes them too, because a resize is
-    terminal-side input: a poll applies the resize, then `input`, then `keys`,
-    then waits. Either axis may come alone and an omitted axis keeps its value;
-    bounds are `cols` `20-500` and `rows` `5-200`; an unchanged size is a no-op.
-    A pipe task refuses both.
+#### `taskId` and readers
+
+Bare task IDs are `<8-char epoch>-<1..=13-char seq>`
+in Crockford base32; in daemon mode a well-formed ID with a foreign epoch
+reports that it came from an earlier daemon, whereas malformed IDs report
+`Unknown taskId`. `start`, `poll`, `kill`, and `transcript` return
+a reader handle, `<taskId>.<reader>` (four Crockford base32 characters), in
+the status line (and as `taskId` in nested `codemode` results). Reusing a handle in the same session
+preserves its cursor; passing a bare task ID creates a new reader from the
+beginning of the retained log. An unknown valid reader key is recreated under
+that key, including after eviction or a session ending. Each task entry holds
+at most `16` readers, evicting the least recently used idle reader when
+needed; an active reader, a waiter, or a cancelled call's still-running
+blocking read cannot be evicted. If every reader is busy, attachment is
+refused. A new attachment's first delivered output (including on `kill`),
+transcript, or screen result says `new reader`; cancelled calls leave that
+notice pending. Log and transcript range reads reject premature EOF. Reader
+cursors and decoding state commit only after complete rendering succeeds;
+failed or cancelled reads leave unseen output available for the next call.
+Retention and output limits apply to each reader.
+
+#### `list` grouping and `parentTaskId`
+
+Each bash task started from a `codemode` script records `Task.parent_task_id`
+(immutable after creation; `None` for direct bash starts and `codemode`
+scripts). Without `parentTaskId`, `Tasks::listed` runs one pass over the scoped
+tasks (`registry.tasks` for `scope: "all"`, `session.touched` for
+`scope: "session"`):
+
+- Every `list` row (top-level, indented active child, promoted orphan, and
+  `parentTaskId` flat row) keeps `[running]`, `[exited N]`, and `[killed]`
+  for the root process and places any tree marker immediately after
+  `[<state>]` before elapsed time, `pty`, summary, `owner`, `via`, and
+  `command`: ` · keepTree` while running or when `keepTree: true` finished
+  without entering a held state, ` · keeps <members>[ (kill failed)]` (PID
+  sorted), ` · keeps processes[ (kill failed)]` when held with no enumerated
+  non-root members, ` · keeps processes (unconfirmed[, kill failed])` when
+  members could not be confirmed, or ` · kept processes ended` once a held
+  tree ends.
+- Finished children of an eligible parent fold into the parent's inline
+  summary (`total`, `done`, `failed`, `warned`, plus `tree_ended` rendered as
+  `<n> kept ended` when non-zero; `done + failed + active == total`), paired
+  with lock-free `queued` (while running) or `cancelled` (after exit or
+  `kill`) start counts. Active children (`running` or `keptRunning`) render
+  indented (`  └─`) beneath the parent, capped at `8` per parent (matching
+  `START_PERMITS`) with an overflow hint pointing to `parentTaskId` when more
+  are active; under `state: "finished"`, `0` children are indented.
+- When `state` is not `"finished"`, an eligible parent sorts at
+  `max(parent_pos, newest_active_child_pos)` so an older running `codemode`
+  with a fresh active child stays at the top of the list without post-`limit`
+  re-slicing. `totalCount` is the top-level item count before `limit`.
+- A child whose parent is absent from the current view (evicted, outside
+  `scope: "session"`, finished/killed under `state: "active"`, or running
+  under `state: "finished"`) is promoted to a top-level row tagged `via <pid>`
+  when the child matches `state`.
+- Passing `parentTaskId` (bare task ID or reader handle, normalized via
+  `parse_handle`) lists that script's children flat without folding. Omit
+  `state: "active"` when inspecting `kept ended` children. When
+  `scope` is omitted, drill-down searches all sessions; explicit
+  `scope: "session"` filters to the caller's session. Drill-down keeps
+  working after parent eviction while any child with that `parent_task_id`
+  remains in `registry.tasks`. A bash task ID returns `"No tasks."`; an
+  unknown ID with no remaining children errors naming `parentTaskId`.
+
+#### `waitMs` and `killAfterMs`
+
+`waitMs` (`0-240000`) bounds only the current call's wait. A call that hits
+`waitMs`, matches `returnWhen`, or is cancelled leaves the task running (use
+`list` to recover the `taskId` of a cancelled `start`). `killAfterMs` on
+`start` arms an independent timer that kills the owned tree, including kept
+processes. Expiry while the root runs reports `state: "killed"` and
+`lifetimeExpired: true`; after root exit, held processes end and the root's
+original result stays.
+
+#### `returnWhen`
+
+Ends the wait early when any condition holds (`waitEndedBy` reports
+`{ condition, text? }`):
+
+- `outputContains`: `1-16` literal case-sensitive strings (`1-4096` bytes each,
+  without line breaks) matched against unseen output lines: cleaned for bash
+  (including text before a carriage return overwrites it), unchanged for
+  codemode.
+- `screenContains`, `screenAppears`, `screenGone` (UTF-8 PTY only): match
+  against the live screen at the task's size (`screenAppears` and `screenGone`
+  compare against the screen captured before the call's resize and `input`).
+- `quietMs`: `10-60000` ms without output after `input` and `keys` finish.
+
+#### Window and encoding options
+
+- `maxBytes`: `100-4194304` (`4` MiB; default `16384` on direct `exec` and
+  outer `codemode`, `4194304` on nested `tools.exec`). Bounds the output body
+  only; the status line, background footer (`<= 512` bytes), metadata,
+  errors, and correctness warnings stay outside that budget. Rejected on
+  nested `list` calls.
+- `truncate`: Direct MCP calls (`ExecPolicy::AGENT`) default to `"head_tail"`
+  (`"tail"` for `transcript`), inject inline omission and cut markers
+  (`... [<k> lines omitted: log lines <a>-<b>] ...` and
+  `<prefix> … [line cut at <B>; <n> more bytes]`, plus
+  `... [<n> top rows omitted] ...` and ` … [cut]` for `screen: true`), and
+  drop NUL (`0x00`) bytes when cleaning (`keep_nul: false`). Multi-line
+  `head_tail` overflow reserves the inline marker and `B / 10` for the head,
+  fills the tail from the last line backward (cutting the last line if
+  needed), and returns unused tail bytes to the head. Nested `codemode` calls
+  (`ExecPolicy::PROGRAM`) default to `"head"` (`"tail"` for `transcript`),
+  preserve NUL bytes in clean output (`keep_nul: true`, so `find -print0` and
+  `rg -0` parse cleanly), reject
+  `truncate: "head_tail"` and `list` `truncate`/`maxBytes` with
+  `ToolError` (`code: "VALIDATION"`), and omit all inline markers
+  (`inline_markers: false`). When a single line or screen row exceeds the
+  budget in Program mode, it slices cleanly at a UTF-8 boundary and reports
+  `truncated`, `omittedLines`, `omittedRange`, `cutLines`, and `omittedRows`
+  in the control channel. Neither path enforces a fixed per-line length cap.
+  Omitted ranges on direct calls also appear in the status line, outside
+  the body budget.
+- `raw`: Skips terminal-output cleaning. Nested `raw: true` output preserves
+  ANSI/control sequences and line endings, while decoding bytes using `encoding`
+  (UTF-8 by default). Invalid sequences become replacement characters;
+  `encodingErrors` counts affected lines. The task log retains captured bytes
+  under its normal storage limits.
+- `encoding`: Any ASCII-compatible WHATWG label (such as `"utf-8"`, `"big5"`,
+  `"gbk"`; UTF-16 is rejected). On `start`, sets the task default; on `poll`,
+  overrides for that call.
+- `screen`: Boolean (`false` default, UTF-8 PTY only). Returns the rendered
+  screen at the task's size and 1-based cursor `[row, col]`, marking the output
+  stream read up to that point. Cannot combine with `truncate`, `raw`, or
+  `encoding`.
+- `cols`, `rows` (PTY only): the terminal's size. `start` takes them,
+  defaulting `120x30`; `poll` takes them too, because a resize is
+  terminal-side input: a poll applies the resize, then `input`, then `keys`,
+  then waits. Either axis may come alone and an omitted axis keeps its value;
+  bounds are `cols` `20-500` and `rows` `5-200`; an unchanged size is a no-op.
+  A pipe task refuses both.
 
 ### Codemode
 
@@ -505,12 +522,14 @@ attaching a fresh reader via the bare `taskId`
 re-reads retained output and attachments from index `1` for deduplication by
 `index`.
 
-### File Tools
+### File tools
 
-- **`read`**: Direct calls show up to `2000` lines and `50` KiB of a text file
-  (nested `codemode` calls without `offset` or `limit` return the whole UTF-8
-  file up to `4` MiB or reject with `ToolError` when larger or non-UTF-8, and
-  with `offset` or `limit` read up to `4` MiB with no line cap). `offset` is a
+#### `read`
+
+Direct calls show up to `2000` lines and `50` KiB of a text file
+(nested `codemode` calls without `offset` or `limit` return the whole UTF-8
+file up to `4` MiB or reject with `ToolError` when larger or non-UTF-8, and
+with `offset` or `limit` read up to `4` MiB without a line cap). `offset` is a
   non-zero integer (`1`-indexed from the start when positive, or counting from
   the end when negative with `-1` naming the last line; `0` is rejected). If the file
   changes the starting line of a negative offset during the scan, the reader
@@ -536,8 +555,11 @@ re-reads retained output and attachments from index `1` for deduplication by
   refused (binary files suggest `exec`, and also `transfer` when
   `FASTEXEC_TRANSFER=true` for that session). Slices report invalid UTF-8 with
   replacements and a note. A nested whole-file read requires valid UTF-8
-  throughout.
-- **`write`**: Saves `content`, creating missing parent directories of the final
+   throughout.
+
+#### `write`
+
+Saves `content`, creating missing parent directories of the final
   target, including a dangling symlink's resolved target. Relative, absolute,
   and chained symlinks are preserved; `edit` still requires an existing file.
   Content is staged in a private sibling file and synced before it replaces the
@@ -569,7 +591,10 @@ re-reads retained output and attachments from index `1` for deduplication by
   sufficiently privileged server to preserve it. Attribute
   lengths are checked again after reading so a concurrent growth cannot be
   saved as a truncated value.
-- **`edit`**: Each `edits[]` entry is `{oldText, newText, startLine?, endLine?}`,
+
+#### `edit`
+
+Each `edits[]` entry is `{oldText, newText, startLine?, endLine?}`,
   matched against the original file, not against the result of an earlier entry.
   When `startLine` and/or `endLine` (`1`-based inclusive LF line bounds;
   `startLine > endLine` is rejected) are given, only exact or fuzzy candidates
@@ -580,9 +605,9 @@ re-reads retained output and attachments from index `1` for deduplication by
   repeats kept), and not overlap any other matched span (`overlap`, checking
   every pair of overlapping spans and listing
   partner indices in `with`). `lines` and `with` cap at `20` items (`more`
-  counts any remainder), and a batch that matches uniquely without overlap but
-  leaves the file unchanged fails with `failures: []`. Instead of stopping at
-  the first bad entry, `edit` evaluates every entry and reports all failures
+  counts any remainder), and a batch that matches uniquely without overlap while
+  leaving the file unchanged fails with `failures: []`. `edit` evaluates every
+  entry in the batch and reports all failures together
   (as a text error on direct calls, or `ToolError` with `code: "EDIT_FAILED"`
   and `result: { path, failures }` in `codemode`), counting line numbers on
   real `\n` breaks so they match `read`. The file must be UTF-8; a byte-order mark
@@ -594,27 +619,34 @@ re-reads retained output and attachments from index `1` for deduplication by
   restrictions as `write`. Both `read` and `edit` validate the opened file as
   regular; an edit verifies the target's identity, contents, and path again
   before publishing.
-- **`transfer`**: Resolves `path` with the unified path rules, refuses
-  directories and non-regular files (hinting `tar` via `exec`) and non-missing
-  metadata errors, and returns plain text with the capability URL, path, and
-  byte size snapshot at mint time (or noting the file does not exist yet).
-- **Paths**: Every tool `cwd` and `path` resolves through one path helper:
-  expands `~` / `~/...`, resolves relative paths against the effective `cwd`
-  (a `codemode` call's `cwd` or the session's working directory), strips `.` and
-  repeated separators while leaving `..` to the OS kernel so symlinks resolve
-  as the filesystem sees them, accepts Windows `C:/...`, `C:\...`,
-  `//server/share/...`, and Git Bash `/c` or `/c/...`, refuses Windows
-  driveless rooted paths (`/tmp/...`, hinting `cygpath -m`) and drive-relative
-  paths (`C:foo`), and formats every reported path with forward slashes
-  (stripping `\\?\` verbatim prefixes and rendering UNC paths as
-  `//server/share/...`).
-- **Mutation**: `write` and `edit` serialize with each other inside one server
-  process. They do not coordinate with `exec`, with a `transfer` upload, or with
-  another process.
 
-## 2. Host Configuration and Response Format
+#### `transfer`
 
-### Progress Notifications and Timeouts
+Resolves `path` with the unified path rules, refuses
+directories and non-regular files (hinting `tar` via `exec`) and non-missing
+metadata errors, and returns plain text with the capability URL, path, and
+byte size snapshot at mint time (or noting the file does not exist yet).
+
+#### Path resolution and serialization
+
+Every tool `cwd` and `path` resolves through one path helper (`src/files/path.rs`):
+expands `~` / `~/...`, resolves relative paths against the effective `cwd`
+(a `codemode` call's `cwd` or the session's working directory), strips `.` and
+repeated separators while leaving `..` to the OS kernel so symlinks resolve
+as the filesystem sees them, accepts Windows `C:/...`, `C:\...`,
+`//server/share/...`, and Git Bash `/c` or `/c/...`, refuses Windows
+driveless rooted paths (`/tmp/...`, hinting `cygpath -m`) and drive-relative
+paths (`C:foo`), and formats every reported path with forward slashes
+(stripping `\\?\` verbatim prefixes and rendering UNC paths as
+`//server/share/...`).
+
+`write` and `edit` serialize with each other inside one server
+process. They do not coordinate with `exec`, with a `transfer` upload, or with
+another process.
+
+## 2. Host configuration and response format
+
+### Progress notifications and timeouts
 
 When a request carries a `progressToken`, the server emits progress every
 `20` seconds during waits. Clients that refresh their timeout on progress,
@@ -625,7 +657,7 @@ keep the MCP server connected for the task's lifetime: an idle disconnect ends
 its tasks. In `on` mode a disconnect ends nothing; the daemon keeps the tasks
 (section 6).
 
-### Direct MCP Responses vs. Codemode Programmatic Results
+### Direct MCP responses and Codemode programmatic results
 
 Direct MCP tool calls (`exec`, `codemode`, `read`, `write`, `edit`, and
 `transfer`) return `content` text and media blocks with `structuredContent`
@@ -678,7 +710,7 @@ of its advertised setting, within the same session and task permissions as exec.
 Invalid values fail stdio startup, daemon start, and daemon run with exit 1,
 without blocking `daemon status` or `daemon stop`.
 
-### `FASTEXEC_TRANSFER` and `FASTEXEC_TRANSFER_ADDR`
+### `FASTEXEC_TRANSFER`, `FASTEXEC_PUBLIC_URL`, and `FASTEXEC_TRANSFER_ADDR`
 
 `FASTEXEC_TRANSFER` defaults to `"false"` across local stdio, daemon endpoints,
 and Streamable HTTP, leaving `transfer` unregistered. `"true"` registers
@@ -686,13 +718,13 @@ and Streamable HTTP, leaving `transfer` unregistered. `"true"` registers
 values fail stdio startup, `daemon start`, and `daemon run` with exit `1`
 without blocking `daemon status` or `daemon stop`.
 
-- **Local stdio (`FASTEXEC_DAEMON=off`)**: When `FASTEXEC_TRANSFER=false`,
-  `FASTEXEC_PUBLIC_URL` and `FASTEXEC_TRANSFER_ADDR` are unread and no port is
+- Local stdio (`FASTEXEC_DAEMON=off`): when `FASTEXEC_TRANSFER=false`,
+  `FASTEXEC_PUBLIC_URL` and `FASTEXEC_TRANSFER_ADDR` stay unread and no port is
   bound. When `true`, startup validates both (refusing an unspecified
   `0.0.0.0` or `[::]` listener address when `FASTEXEC_PUBLIC_URL` is unset),
   binds a `/t/` listener on `FASTEXEC_TRANSFER_ADDR` (default `127.0.0.1:0`),
   and mints `{base}t/{id}` from `FASTEXEC_PUBLIC_URL` or `http://<bound>/`.
-- **Daemon stdio (`FASTEXEC_DAEMON=on`)**: Each endpoint advertises `transfer`
+- Daemon stdio (`FASTEXEC_DAEMON=on`): each endpoint advertises `transfer`
   from its own `FASTEXEC_TRANSFER` setting (validating `FASTEXEC_PUBLIC_URL` and
   `FASTEXEC_TRANSFER_ADDR` at startup when `true`) and forwards `"transfer"`
   over IPC. A non-HTTP daemon started with
@@ -706,14 +738,16 @@ without blocking `daemon status` or `daemon stop`.
   `FASTEXEC_PUBLIC_URL`, then `http://<http_addr>/` when `--http` is active,
   then `http://<transfer_listener_addr>/`; an unspecified `--http` or
   `FASTEXEC_TRANSFER_ADDR` address without `FASTEXEC_PUBLIC_URL` is refused.
-- **Streamable HTTP (`--http <addr>`)**: Uses the daemon's startup
+- Streamable HTTP (`--http <addr>`): uses the daemon's startup
   `FASTEXEC_TRANSFER` setting to decide whether HTTP sessions register
-  `transfer`. The `/t/` route stays mounted on the HTTP listener backed by the
-  daemon's shared `Transfers` table, returning `404` when no capability exists
-  and serving capabilities minted by `FASTEXEC_TRANSFER=true` stdio endpoints on
-  the same daemon. Non-loopback `FASTEXEC_TRANSFER_ADDR` values require
-  `FASTEXEC_HTTP_ALLOW_REMOTE=1`, and setting `FASTEXEC_TRANSFER_ADDR` alongside
-  `--http` fails startup with exit `1`.
+  `transfer`. Behind a reverse proxy, set `FASTEXEC_PUBLIC_URL` to the external
+  base URL (such as `https://example.com/mac/`) so minted capability URLs use
+  the proxy's public origin and path prefix. The `/t/` route stays mounted on
+  the HTTP listener backed by the daemon's shared `Transfers` table, returning
+  `404` when no capability exists and serving capabilities minted by
+  `FASTEXEC_TRANSFER=true` stdio endpoints on the same daemon. Non-loopback
+  `FASTEXEC_TRANSFER_ADDR` values require `FASTEXEC_HTTP_ALLOW_REMOTE=1`, and
+  setting `FASTEXEC_TRANSFER_ADDR` alongside `--http` fails startup with exit `1`.
 
 ### `FASTEXEC_IMAGE_COMPRESS` and `FASTEXEC_MAX_MEDIA_BYTES`
 
@@ -721,14 +755,14 @@ Both settings validate at MCP serving startup (and per endpoint session on a
 shared daemon, where HTTP uses the daemon's environment and each stdio endpoint
 sends its own values in `Hello`; `daemon status` and `daemon stop` ignore them).
 
-- **`FASTEXEC_IMAGE_COMPRESS`**: `"false"` (default) sends recognized images,
+- `FASTEXEC_IMAGE_COMPRESS`: `"false"` (default) sends recognized images,
   audio, PDF, and video verbatim. `"true"` decodes PNG, JPEG, GIF, WebP, and
   BMP (excluding APNG and JPEG-LS), scales dimensions over `2000` pixels down
   to at most `2000` on the long side, and searches PNG or JPEG quality until
   the encoded payload fits `4,718,592` base64 bytes (`3.5` MiB raw), while
   rejecting images past `32768` pixels per side or `64` megapixels and leaving
   APNG, JPEG-LS, TIFF, HEIC/HEIF, audio, PDF, and video verbatim.
-- **`FASTEXEC_MAX_MEDIA_BYTES`**: Maximum raw byte size per media file or
+- `FASTEXEC_MAX_MEDIA_BYTES`: maximum raw byte size per media file or
   `codemode` attachment (`104857600` default, accepted range `1048576` to
   `377487360`, or `1` MiB to `360` MiB so `4/3` base64 plus JSON framing fits a
   `512` MiB outbound frame). Live media reads and outbound frames share a
@@ -845,16 +879,17 @@ text before formatting. Missing paths, binary files, media results, write/edit
 results, and transfer inspection retain the owner through their returned result.
 Media and path failures do not require the text decoder allowance.
 
-The native path bounds below were checked against Rust 1.92 and 1.100 source.
-The package's `rust-version` is a minimum supported version, not a toolchain lock;
-CI selects stable Rust and used 1.100 during this review.
+The native path bounds match the Rust `1.92` and `1.100` standard-library
+implementations. `rust-version = "1.92"` sets the minimum supported Rust
+version; normal CI runs on stable Rust alongside a pinned Rust `1.92` job on
+Alpine.
 
 Native target resolution has a separate budget because a short symlink can name
 a much longer target. Unix `canonical_target` supplies `realpath` with a
 `PATH_MAX` caller buffer, including the terminating NUL; it finds the NUL inside
 that buffer and moves the same byte Vec into an OsString without a UTF-8 copy.
-The checked Rust 1.92 and 1.100 implementations pass a null output buffer to
-`realpath`. Our caller-buffer route returns the native
+Rust's standard library passes a null output buffer to `realpath`, whereas the
+caller-buffer route returns the native
 `ENAMETOOLONG` error when the resolved output cannot fit that platform limit.
 On Linux the caller buffer is 4096 bytes; macOS and FreeBSD use 1024. Native path
 bytes, including non-UTF-8 Unix names, are preserved; native filesystem naming
@@ -865,7 +900,7 @@ without creating that name. The Unicode canonical-path budget case runs on all
 platforms.
 
 Windows canonicalization reopens the current name with the same access mode and
-backup-semantics flag as the checked Rust 1.92 and 1.100 implementations. It queries
+backup-semantics flag as Rust's standard library. It queries
 `GetFinalPathNameByHandleW(VOLUME_NAME_DOS)` for its actual UTF-16 size. The query
 includes NUL and a successful read excludes it. Each caller buffer is admitted
 before allocation; if a later query needs more space, the old buffer is dropped
@@ -874,14 +909,14 @@ plus String growth while the wide buffer is still alive, preserving unpaired
 surrogates. No approximate Windows maximum path length is used as a memory bound.
 
 Unix final-link reads admit each caller-owned `readlink` buffer before use and
-grow from 256 bytes only when the result fills it. Windows retains the relative-link
-and junction semantics checked in Rust 1.92 and 1.100 `read_link`. Its native
+grow from 256 bytes only when the result fills it. Windows preserves the
+relative-link and junction semantics of Rust's `std::fs::read_link`. Its native
 reparse buffer is 16 KiB. Eight times that size covers the fixed reparse buffer,
 the substitute-name UTF-16 Vec, WTF-8 conversion growth and the short (at most
-260 UTF-16 units) prefix check. This is derived from `sys/fs/windows.rs`,
-`sys/args/windows.rs` and `sys/path/windows.rs` in both checked versions. Native Win32
-internal allocations remain outside this allowance. The original forty-link walk and directory requirements
-remain unchanged.
+260 UTF-16 units) prefix check, matching `library/std/src/sys/fs/windows.rs`,
+`sys/args/windows.rs`, and `sys/path/windows.rs` in the Rust standard library.
+Native Win32 internal allocations remain outside this allowance. The forty-link
+walk and directory checks still apply.
 
 Canonical and followed targets carry their actual PathBuf-capacity lease through
 the source object or blocking upload-preparation result. Link concatenation also
@@ -895,16 +930,15 @@ native arguments, lossy display expansion and error copies while these overlap.
 The 64-byte suffix allowance covers the generated staging name and child name;
 the larger multiplier includes geometric old/new capacities. All arithmetic is
 checked. A failed reservation happens before publication; target-derived error
-text keeps the outer owner. Save borrows the canonical target instead of cloning
-it. Edit verification still checks the current path and original file identities,
-rather than canonicalizing only the original handle.
+text keeps the outer owner. Save borrows the canonical target directly, and edit
+verification checks both the current path identity and the opened handle identity.
 
-**WONT FIX: opaque native-library scratch.** glibc `realpath` maintains its own
-dynamic rname/extra/link scratch even with a caller buffer; a supplied `PATH_MAX`
-buffer does not bound those internal allocations. libc and WinAPI internals
-remain outside the application byte pool. We neither copy their implementations
-nor claim a whole-process RSS bound. Caller-owned buffers, owned targets and the
-application's derived paths remain budgeted as described above.
+**WONT FIX: opaque native-library scratch.** glibc `realpath` allocates its own
+dynamic rname, extra, and link scratch buffers even with a caller buffer; a
+supplied `PATH_MAX` buffer does not bound those internal allocations. libc and
+WinAPI internals remain outside the application byte pool, which bounds
+caller-owned buffers, owned targets, and application-derived paths without
+claiming a whole-process RSS cap.
 
 Native implementation references: [Rust 1.92 Unix filesystem code](https://github.com/rust-lang/rust/blob/1.92.0/library/std/src/sys/fs/unix.rs), [Rust 1.92 Windows filesystem code](https://github.com/rust-lang/rust/blob/1.92.0/library/std/src/sys/fs/windows.rs), [Rust 1.100 Unix filesystem code](https://github.com/rust-lang/rust/blob/1.100.0/library/std/src/sys/fs/unix.rs), [Rust 1.100 Windows filesystem code](https://github.com/rust-lang/rust/blob/1.100.0/library/std/src/sys/fs/windows.rs), [Rust 1.100 path conversion](https://github.com/rust-lang/rust/blob/1.100.0/library/std/src/sys/args/windows.rs), [Rust 1.100 path normalization](https://github.com/rust-lang/rust/blob/1.100.0/library/std/src/sys/path/windows.rs), [glibc 2.39 canonicalize](https://github.com/bminor/glibc/blob/glibc-2.39/stdlib/canonicalize.c), and [Microsoft GetFinalPathNameByHandleW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew).
 
@@ -925,18 +959,20 @@ reservation covers the LF strings, CRLF and original-line indexes, normalized
 old/new strings, restored insertion text, per-edit records, current search needle,
 KMP tables and bounded occurrence lists. The cached fuzzy text has its own space.
 
-Unicode bounds come from the locked `unicode-normalization 0.1.26` implementation,
-not a fixed expansion assumption. `char::decompose_compatible` in
-`src/normalize.rs` emits fully decomposed characters from static tables or the
-Hangul calculation without building a string. The preflight counts those
-characters, line breaks, the longest combining sequence and the largest expansion
-of one input character. Composition cannot increase the decomposed character
-count, so four UTF-8 bytes per character bounds a non-ASCII NFKC result; ASCII
-retains its original byte length. The longest sequence plus one expansion bounds
-the decomposition and recomposition buffers in `src/decompose.rs` and
-`src/recompose.rs`. Their element sizes, geometric growth and stable-sort scratch
-are reserved before running the normalizer. The fuzzy-form allowance also covers
-its NFKC String, line-slice vector, joined String and character-mapped String.
+Unicode bounds come from the locked `unicode-normalization 0.1.26` crate,
+not a fixed expansion assumption. `char::decompose_compatible` in the
+`unicode-normalization` crate's `src/normalize.rs` emits fully decomposed
+characters from static tables or the Hangul calculation without building a
+string. The preflight counts those characters, line breaks, the longest
+combining sequence, and the largest expansion of one input character.
+Composition cannot increase the decomposed character count, so four UTF-8 bytes
+per character bounds a non-ASCII NFKC result; ASCII retains its original byte
+length. The longest sequence plus one expansion bounds the decomposition and
+recomposition buffers in `unicode-normalization`'s `src/decompose.rs` and
+`src/recompose.rs`. Their element sizes, geometric growth, and stable-sort
+scratch are reserved before running the normalizer. The fuzzy-form allowance
+also covers its NFKC String, line-slice vector, joined String, and
+character-mapped String.
 
 The heavier source map is admitted only before its first use. It includes the
 source-unit vector, the four-offset unit records, untrimmed and trimmed forms,
@@ -1013,7 +1049,7 @@ same allocation after its waiter is cancelled and the idle table entry is swept.
 The Admitted guard still controls active-request pins and idle timestamps; sharing
 the path does not extend that guard or the per-file upload lock.
 
-HTTP metadata checks and GET/PUT file opens additionally reserve
+HTTP metadata checks and GET/PUT file opens also reserve
 `native_path_bytes` from the shared process pool inside their actual blocking
 worker, before calling the filesystem. The same allowance covers Rust's terminated
 Unix path argument or Windows UTF-16/normalization buffers. The worker keeps that
@@ -1083,7 +1119,7 @@ owner with their comparison rows. Transcript reads carry both the snapshot owner
 and text-window workspace through each blocking worker; cancellation cannot free
 them while the worker still uses the snapshot. The final text owner is acquired
 before committing the reader cursor.
-Media packing moves Base64 blocks between candidates instead of cloning them.
+Media packing moves Base64 blocks between candidates without cloning them.
 Payload and wire owners are split only after their corresponding buffers are gone.
 
 Fastexec uses the official registry `rmcp = 3.9.0` with the checked-in lockfile.
@@ -1117,16 +1153,22 @@ before reading: raw bytes, decoded strings, escape scratch and the extra owned
 resource-content copy. After parsing, raw and scratch storage is dropped before
 the decoded payload owner is handed to its application consumer.
 
-The custom stdio input accumulator reserves old and replacement capacity together.
-Raw bytes, decoded JSON strings and escape scratch are admitted before parsing;
-four times the input length remains for model strings, metadata and application
-parameter conversion. Official public Request/Notification Extensions carry the
-application owner to handlers and their workers. Recent cancellation IDs retain
-only their transferred ID allowance. Short inputs up to 64 KiB may use the control
-reserve for classification. Ordinary calls and initialize metadata must move to
-the main pool before dispatch. Short list/kill, ping, discovery and cancellation
-or lifecycle control messages can remain in the reserve. A refused stdio admission
-sends a short overload error and closes that transport.
+The custom stdio input accumulator (`src/ingress.rs`, `src/cli/stdio.rs`)
+reserves old and replacement capacity together. Raw bytes, decoded JSON strings,
+and escape scratch are admitted before parsing; four times the input length
+remains for model strings, metadata, and application parameter conversion.
+Official public Request/Notification Extensions carry the application owner to
+handlers and their workers. Recent cancellation IDs retain only their
+transferred ID allowance. Short inputs up to `64` KiB may use the control
+reserve for classification. Ordinary calls and `initialize` metadata move to
+the main pool before dispatch, while short `list`/`kill`, `ping`, discovery,
+and cancellation or lifecycle control messages can remain in the reserve.
+Oversized lines (including partial chunks that cross the limit before `\n`),
+malformed JSON, or schema-invalid requests return correlated JSON-RPC errors
+(preserving the request `id` whenever parseable and discarding the remainder of
+an oversized line through its newline) without closing an established stdio
+session or killing active local tasks; notifications arriving before
+`initialize` are ignored without triggering `exit(1)`.
 
 At each public tool-handler entry, an existing application input owner is reused.
 When the official SDK supplied no owner, the handler counts the borrowed typed
@@ -1144,46 +1186,46 @@ while sharing schema Arcs. Progress forwarding owns its input token and admits
 its application message String before copying. Stdio admits its separate encoded
 frame when the official SDK calls the transport.
 
-**WONT FIX in this repository: official SDK internal ownership.** Public rmcp APIs
-do not provide complete ownership hooks for all of the following paths:
+**WONT FIX: official SDK internal ownership.** Public `rmcp` APIs do not expose
+ownership hooks for the following paths:
 
-- HTTP body collection, JSON parsing, header decoding and validation scratch.
-  Fastexec retains its existing authentication, route and body-limit checks; the
-  SDK keeps its original HTTP validation order and error behavior.
+- HTTP body collection, JSON parsing, header decoding, and validation scratch.
+  `fastexec` enforces authentication, route, and body-limit checks ahead of the
+  SDK while keeping `rmcp`'s HTTP validation order and error behavior.
 - Independently cloned request parameters, initialization peer information,
-  response models, handler cancellation and SDK queues after application handoff.
-- HTTP JSON/SSE encoding, response/replay caches, keepalive frames and returned
+  response models, handler cancellation, and SDK queues after application handoff.
+- HTTP JSON/SSE encoding, response/replay caches, keepalive frames, and returned
   body slices, including errors and progress notifications.
 
-The former whole-HTTP budget guarantee, response-owner propagation, prepaid
-correlated SSE fallback and SDK clone/replay accounting are withdrawn. Fixing
-those SDK lifetimes requires upstream support. Fastexec does not replace or copy
-SDK internals into application code, and these exclusions do not exempt the file,
-media, IPC, terminal or nested buffers that the application actually owns. The
-process pool therefore limits those tracked active payload buffers, not total
-process memory or every allocation made by the SDK.
+Whole-HTTP RSS accounting, post-handoff SSE frame tracking, and SDK internal
+clone or replay lifetimes sit outside the application byte pools because
+upstream `rmcp` owns those allocations. `fastexec` does not fork or duplicate
+SDK internals; the process pool bounds the file, media, IPC, terminal, event,
+and nested Codemode payload buffers owned by `fastexec`.
 
 The HTTP integration case
 `slow_sse_client_holds_active_memory_lease_until_response_completes_or_drops`
-remains as an ignored upstream-dependent check. Its assertion requires the SDK's
-slow response body to retain a lease after the handler has returned its bare
-result. CI lists this case as ignored, not passed. Ordinary HTTP media delivery,
-application admission, cancellation and control checks remain enabled.
+is marked `#[ignore]` as an upstream-dependent check because its assertion
+requires `rmcp`'s slow response body to hold a lease after handler return. CI
+reports this case as ignored while running ordinary HTTP media delivery,
+application admission, cancellation, and control checks.
 
 IPC request senders count JSON without a temporary encoding, reserve the measured
 frame capacity, and encode directly into that allocation. The frame owns its
-reservation while waiting for the writer and during partial writes. A Hello also
+reservation while waiting for the writer and during partial writes. A `Hello` also
 reserves its temporary environment and identity copies before constructing them.
 Daemon request readers reserve six times the declared body length: the raw body,
-a parsed Value, and four times the body length for borrowed-Value decoding and
+a parsed `Value`, and four times the body length for borrowed-`Value` decoding and
 subsequent argument copies. The earlier escape-decoding scratch fits within that
-peak. After parsing, the raw body and Value are dropped before retaining the
+peak. After parsing, the raw body and `Value` are dropped before retaining the
 four-times allowance. This covers payload strings and native OS-string units,
-not JSON object metadata, persistent launch environments, task state or VM heap.
-Short Hello, Cancel, Bye, Status, Stop and list/kill requests may use the control
-reserve; ordinary calls must move to the main pool before dispatch. A refused
-call returns a short correlated receipt without running the operation. Handshake
-and CLI response readers use the same budgeted endpoint parser.
+not JSON object metadata, persistent launch environments, task state, or VM heap.
+Short `Hello`, `HelloEmit`, `Cancel`, `EventsCancel`, `Bye`, `Status`, `Stop`,
+and `list`/`kill` requests may use the control reserve; ordinary tool calls,
+`EmitEvent`, and `EventsList`/`EventsPoll`/`EventsStream` move to the main pool
+before dispatch. A refused call returns a short correlated receipt without
+running the operation. Handshake and CLI response readers use the same budgeted
+endpoint parser.
 
 The IPC input owner travels with the dispatched future and the call's worker
 arguments. File workers retain it after their waiter is dropped; stdin queue items
@@ -1265,41 +1307,40 @@ calls; resolves normally in `codemode`). Operational failures set
 `isError: true` on direct MCP calls (with no `structuredContent`) and reject
 with `ToolError` in `codemode`.
 
-### Programmatic Result Fields (`codemode`)
+### Programmatic result fields (`codemode`)
 
 These fields describe typed objects returned by nested `tools.*` calls in
-`codemode` (direct MCP calls return text and media blocks with no
+`codemode` (direct MCP calls return text and media blocks without
 `structuredContent`). Default-valued flags, zero counters, empty arrays, and
 null diagnostics are omitted via `skip_serializing_if` unless noted as
-always-present below.
+always-present.
 
-- **Always present on `start`, `poll`, `kill`**: `action`, `kind` (`"bash"` or
+- `start`, `poll`, and `kill` always include `action`, `kind` (`"bash"` or
   `"codemode"`), `taskId` (reader handle), `state` (`"running"`, `"exited"`,
-  `"killed"`), `exitCode`, `pty`, `elapsedMs`, `output` (raw string with zero
+  `"killed"`), `exitCode`, `pty`, `elapsedMs`, `output` (raw string without
   inline markers or footers), `truncated`, and `logPath`. On direct MCP calls,
-  status lines omit ` · log <path>` when a finished task has no omitted or cut
-  output, no log-loss warning, and no open output or kept processes. Fields
-  omitted when false, zero, empty, or null: `waitEndedBy` (`start` and `poll`
-  only; `kill` omits it), `keepTree`, `keptRunning`, `treeEnded`,
-  `treeUnconfirmed`, `forcedEnd`,
-  `lifetimeExpired`, `logEvicted`, `logError`, `captureError`,
+  status lines omit ` · log <path>` when a finished task has neither omitted/cut
+  output nor log-loss warnings, open output, or kept processes. Fields omitted
+  when false, zero, empty, or null: `waitEndedBy` (`start` and `poll` only;
+  `kill` omits it), `keepTree`, `keptRunning`, `treeEnded`, `treeUnconfirmed`,
+  `forcedEnd`, `lifetimeExpired`, `logEvicted`, `logError`, `captureError`,
   `outputIncomplete`, `outputOpen`, `droppedBytes`, `inputWarning`,
   `inputError`, `warnings`, `leftovers` (`[{ pid, name }]`), `held` (`[{ pid,
   name }]`), `killError`, `encodingErrors`, `omittedLines`, `omittedRange`
   (`[first, last]`), `cutLines`, and `newReader`. With `screen: true`, `cols`,
   `rows`, and `cursor` (`[row, col]`) are present and `omittedRows` is included
   when non-zero.
-- **`transcript`**: Always includes `action`, `kind`, `taskId`, `state`,
+- `transcript` always includes `action`, `kind`, `taskId`, `state`,
   `exitCode`, `pty`, `elapsedMs`, `output`, `truncated`, `logPath`,
   `transcriptPath`, `transcriptLines`, `finalLines`, and `firstLine`, plus
   non-default window and task diagnostics when set.
-- **`codemode` report**: Included when any array is non-empty (nested
+- `codemode` report is included when any array is non-empty (nested
   `attachments` sealed handles, `cancelledCalls`, `startedTasks`).
-- **`read`**: Text reads return `{ kind: "text", path, text, startLine,
+- `read` text reads return `{ kind: "text", path, text, startLine,
   endLine, shownLines, totalLines, truncated, nextOffset?, lineTooLong?,
   lossy? }`. Media reads return `{ kind, path, mimeType, bytes, sourceBytes?,
   attachable, note? }` without base64.
-- **`list`**: Returns `{ action: "list", totalCount, tasks }` (built after
+- `list` returns `{ action: "list", totalCount, tasks }` (built after
   `limit`, rejecting `maxBytes` and `truncate`). Each entry carries `taskId` as
   a bare task ID, `kind`, `state`, `exitCode`, `pty`, `elapsedMs`, `command` up
   to 120 chars, `owner`, and `logPath`, omitting `cols`, `rows`, `session`,
@@ -1313,43 +1354,51 @@ always-present below.
   children appear in `children.activeTasks` (without redundant `parentTaskId`).
   Each task entry carries its own `warnings` array; nested `list` omits the
   redundant top-level formatted warning string list.
-- **Integrity and initial-input diagnostics**: On pipe `start`, an early child
-  close (`BrokenPipe` or Windows pipe-closed codes `109`/`232`/`233`) sets
-  `inputWarning: "stdin closed after N of M bytes"` as a non-fatal warning,
-  whereas other initial write failures, any `poll` write failure, or output
-  capture and log write failures (`task_io_ok == false`) return `isError: true`
-  on direct MCP calls and reject with `ToolError` (`code: "IO"`) in `codemode`
-  while preserving `exitCode`, captured `output`, error fields, and `warnings`
-  on `err.result`. Warnings stay whole regardless of `maxBytes`.
-- **Background footer (direct MCP calls only)**: Appended to direct `start`,
-  `poll`, `kill`, `transcript`, and `codemode` results (up to `512` bytes,
-  outside `maxBytes`) naming up to three other tasks this session has
-  addressed, using bare task IDs. Nested `codemode` calls never emit background
-  footers, never touch `external_background_cursor`, and never suppress outer
-  session task reporting when polling, killing, reading, or listing outer
-  tasks. HTTP clients sharing a
-  token share this scope. While scanning `session.touched`, `Tasks::background`
-  collects running `codemode` task IDs before excluding the current call's task
-  (`exclude`), and skips running children (`parent_task_id: Some(pid)`) whose
-  parent `pid` is also running in `touched` so an active batch does not flood
-  the three-slot footer (including when polling the parent itself). Once the
-  parent exits or is killed, surviving running or unreported finished children
-  surface normally until reported by `poll`, `kill`, or a delivered `list`
-  (including via a delivered parent summary). Running tasks (or tasks holding
-  processes) outside this session appear **at most once per session** as `1 task
-  running outside this session; use list with scope "all".` or `<n> tasks
-  running outside this session; use list with scope "all".`; the session flag
-  is consumed atomically when a delivered response shows that clause or when
-  the session's first committed footer-bearing result finds no outside tasks
-  (never on nested or cancelled calls). A footer marks only session tasks it
-  names; direct `list` marks only delivered fragments of shown session entries
-  (plus folded finished children when the parent summary fits), while nested
-  `list` marks only tasks started by the current script (without writing
-  `keeps_reported`).
 
-## 3. Logs, Terminal Emulator, and Transcript Spool
+#### Integrity and initial-input diagnostics
 
-- **Logs and retention**: File names use the bare task ID, without the reader
+On pipe `start`, an early child close (`BrokenPipe` or Windows pipe-closed codes
+`109`/`232`/`233`) sets `inputWarning: "stdin closed after N of M bytes"` as a
+non-fatal warning, whereas other initial write failures, any `poll` write
+failure, or output capture and log write failures (`task_io_ok == false`) return
+`isError: true` on direct MCP calls and reject with `ToolError` (`code: "IO"`)
+in `codemode` while preserving `exitCode`, captured `output`, error fields, and
+`warnings` on `err.result`. Warnings stay whole regardless of `maxBytes`.
+
+#### Background footer (direct MCP calls only)
+
+Appended to direct `start`, `poll`, `kill`, `transcript`, and `codemode` results
+(up to `512` bytes, outside `maxBytes`), naming up to three other tasks this
+session has addressed (using bare task IDs) plus any unseen `external.event`
+summary for this session (`External events: <n> new (...)`; section 7). Nested
+`codemode` calls never emit background footers, never advance the session's
+external-event background cursor, and never suppress outer session task
+reporting when polling, killing, reading, or listing outer tasks. HTTP clients
+sharing a token share this session scope. While scanning `session.touched`,
+`Tasks::background` collects running `codemode` task IDs before excluding the
+current call's task (`exclude`), and skips running children (`parent_task_id:
+Some(pid)`) whose parent `pid` is also running in `touched` so an active batch
+does not flood the three-slot footer (including when polling the parent itself).
+Once the parent exits or is killed, surviving running or unreported finished
+children surface normally until reported by `poll`, `kill`, or a delivered
+`list` (including via a delivered parent summary). Running tasks (or tasks
+holding processes) outside this session appear at most once per session as `1
+task running outside this session; use list with scope "all".` or `<n> tasks
+running outside this session; use list with scope "all".`; the session flag is
+consumed atomically when a delivered response shows that clause or when the
+session's first committed footer-bearing result finds no outside tasks (never on
+nested or cancelled calls). A footer marks only session tasks it names, and
+commits the session's `external.event` cursor only after the response is
+prepared for delivery; direct `list` marks only delivered fragments of shown
+session entries (plus folded finished children when the parent summary fits),
+while nested `list` marks only tasks started by the current script (without
+writing `keeps_reported`).
+
+## 3. Logs, terminal emulator, and transcript spool
+
+### Logs and retention
+
+File names use the bare task ID, without the reader
   suffix; readers share the same retained log and transcript files, and status
   lines omit ` · log <path>` when a finished task has neither omitted/cut output
   nor active processes or log warnings. In the default mode each task logs raw
@@ -1374,8 +1423,10 @@ always-present below.
   status. `on` mode logs under
   `<runtime root>/ns/<namespace>/logs/` (section 6). Each task log caps at `64`
   MiB, and all logs, transcripts, and stored attachments on a server cap at `4`
-  GiB total (evicting oldest finished task files first and refunding quota only
-  when file deletion succeeds or reports `NotFound`). After a partial write,
+  GiB total (evicting oldest finished task files first outside
+  `lock(&self.registry)` so filesystem unlink I/O never blocks task-registry
+  operations, and refunding quota only when file deletion succeeds or reports
+  `NotFound`). After a partial write,
   the new reservation is refunded only if truncation to the confirmed prefix
   succeeds. Otherwise the full reservation stays charged until file reclamation;
   the uncertain tail never advances readable bytes or transcript lines. Past a
@@ -1393,7 +1444,9 @@ always-present below.
   automatic stale-directory cleanup currently runs only on Linux. `on` mode
   empties the namespace's
   `logs/` directory at daemon start while holding its `daemon.lock`.
-- **Live PTY emulator and continuous transcript spool**: Each UTF-8 PTY task
+### Live PTY emulator and continuous transcript spool
+
+Each UTF-8 PTY task
   feeds output bytes into an `alacritty_terminal` (`0.26.0`) instance at the
   task's size (`src/term/terminal.rs`, `src/term/frames.rs`) that answers terminal queries
   (`ESC[6n`, `ESC[c`), tracks keyboard modes, serves `screen: true`, and
@@ -1406,7 +1459,9 @@ always-present below.
   `--- normal screen ---`) are written as final lines once settled. A
   `transcript` call returns unseen final lines followed by current pending
   lines; pending lines may change on the next call.
-- **Bounded terminal state**: A rendered cell retains at most `32` user combining
+### Bounded terminal state
+
+A rendered cell retains at most `32` user combining
   characters, and transcript row markers are replaced and retired once the
   grid no longer references them. OSC control strings are bounded at `8` KiB;
   an oversized string is discarded through its terminator without becoming
@@ -1418,9 +1473,11 @@ always-present below.
   drops the oldest saved mode while current-mode queries and restores continue
   to work.
 
-## 4. PTY Keys and Bundled ConPTY
+## 4. PTY keys and bundled ConPTY
 
-- **Key names and modes (`src/term/keys.rs`)**: `keys` uses case-insensitive tmux
+### Key names and modes (`src/term/keys.rs`)
+
+`keys` uses case-insensitive tmux
   `send-keys` names (`Enter`, `Tab`, `BTab`, `Escape`, `Space`, `BSpace`,
   arrows, `Home`, `End`, `PageUp`/`PageDown`, `Insert`, `Delete`, `F1` to `F12`,
   keypad keys, `[NUL]` to `[US]`, `0xHH`, or single characters) with `C-`, `M-`,
@@ -1429,7 +1486,9 @@ always-present below.
   DECKPAM keypad modes) or the kitty keyboard protocol when enabled. Initial
   validation rejects unknown or unencodable keys before input delivery; a later
   keyboard-mode change can fail a key after earlier input has been sent.
-- **Key pacing**: `keyDelayMs` (`0-2000`, default `150`; requested pauses per
+### Key pacing
+
+`keyDelayMs` (`0-2000`, default `150`; requested pauses per
   poll capped at `30000` ms) waits for stdin to accept prior bytes (up to `5` s).
   When input or another key precedes a key, the delay separates it from a paste.
   Zero sends input and keys together. Each write waits for the writer's completion
@@ -1442,7 +1501,9 @@ always-present below.
   always warns that its mode could not be verified: MSYS console readers may
   discard a leading byte after a resize, even for short keys ([#5](https://github.com/ImoutoHeaven/fastexec-mcp/issues/5)).
   Writer acknowledgement does not confirm delivery to the application.
-- **Bundled ConPTY (`src/platform/conpty.rs`)**: Windows x64 and arm64 builds embed Microsoft
+### Bundled ConPTY (`src/platform/conpty.rs`)
+
+Windows x64 and arm64 builds embed Microsoft
   ConPTY `1.24.260710001` (`conpty.dll` and `OpenConsole.exe`, MIT). Each process
   extracts into a newly reserved owner-only directory named
   `%TEMP%\fastexec-conpty-<version>-<arch>-<pid>-<random>` and pins the verified files
@@ -1453,9 +1514,11 @@ always-present below.
   fails, the already loaded system kernel supplies ConPTY; CWD and PATH are never searched
   for a replacement DLL. Transcript results warn that lines may be missing on that fallback.
 
-## 5. Bash Launch and Process-Tree Ownership
+## 5. Bash launch and process-tree ownership
 
-- **Launch (`src/platform/bash.rs`, `src/platform/process.rs`, `src/session.rs`)**: Runs
+### Launch (`src/platform/bash.rs`, `src/platform/process.rs`, `src/session.rs`)
+
+Runs
   `bash --noprofile --norc -c` (`loginShell: false`, default) on top of a
   once-per-session login-environment snapshot probed via `bash -l -c 'exec "$0" --fastexec-dump-env' <fastexec>`
   (`5` s deadline, `1` MiB cap, stripping `PWD`, `OLDPWD`, `SHLVL`, `_`,
@@ -1474,213 +1537,374 @@ always-present below.
   limit, a `5` second deadline, and cleanup of descendants on every outcome.
   Task workers and startup reapers are reserved before launching processes;
   allocation failures return errors without admitting an untracked running task.
-- **Tree ownership (`src/platform/process.rs`, `src/platform/host.rs`)**:
-  Unix entry points restore `SIGCHLD` to its default disposition with automatic
-  reaping disabled before spawning children. Each task host's PID stays reserved
-  until its owning server explicitly waits for it. Readiness follows the bash
-  spawn attempt; if the host dies before readiness, startup cleanup ends its
-  reserved process group before reaping the host. Unix PTY descriptors are
-  created with `O_CLOEXEC`, so an unrelated spawned command cannot retain them
-  across exec. Linux opens the matching slave with `TIOCGPTPEER`, so another
-  devpts mount cannot redirect a pathname lookup. FreeBSD and macOS use a
-  separate buffer per allocation, with `ptsname_r` and `TIOCPTYGNAME` respectively.
-  - **Windows**: Runs each task inside a Job Object with
-    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and breakaway disabled, because Git
-    Bash starts `&` children with breakaway whenever a Job allows it.
-  - **Linux**: A separate task host leads the session and adopts daemonized
-    descendants as a subreaper. Cleanup pins candidate processes with pidfds
-    before reading their authoritative ancestry, verifies membership again,
-    and signals the pinned processes. An empty scan alone cannot prove that
-    cleanup is complete: the host exits only after `waitpid` reports `ECHILD`,
-    and its pidfd confirms that exit before cleanup succeeds. This requires kernel
-    `5.3+`, readable `/proc`, and allowed `pidfd_open`/`pidfd_send_signal`
-    syscalls. The host checks pidfd availability before running bash; a failure
-    to read procfs during cleanup is reported as an error. A lifeline pipe
-    triggers cleanup if the server dies. A host
-    retains ownership and retries when a privileged descendant cannot be killed.
-  - **FreeBSD**: The task host acquires a kernel reaper with `PROC_REAP_ACQUIRE`
-    before starting bash. `PROC_REAP_GETPIDS` identifies descendants, including
-    nested reapers; `PROC_REAP_KILL` lets the kernel select signal targets
-    without a numeric PID-reuse race. Detached sessions and double forks stay
-    owned, without procfs. Partial kills and native permission errors keep the
-    host alive and are reported instead of counting as an empty tree. The
-    lifeline cleanup preserves reaper ownership while an unkillable descendant
-    remains. PTY allocation uses `posix_openpt` and `ptsname_r` with a separate
-    path buffer for each call; FreeBSD's `openpty` uses shared `ptsname` storage
-    and can open another task's slave during concurrent starts. Both descriptors
-    are created with `O_CLOEXEC`. The host retains a private PTY slave. After every
-    descendant is reaped, it disables terminal input controls and echo, resumes any stopped
-    output, and drains queued bytes before its session closes. Late input cannot
-    stop or discard the finished command's output. The root's exit status is
-    reported before this final drain,
-    so a kept background writer does not delay that result. An empty live host
-    completes the drain itself; an already dead host's reserved process group
-    is still cleaned up.
-  - **macOS**: The same task host owns membership, because nothing adopts an
-    orphan there: it scans the process table every 100 ms and tracks the
-    processes it started by pid and start time, so a descendant seen once stays
-    a member after it leaves the session, group, and parent chain. The host
-    stays alive while it holds a member, which is what a `keepTree` wait, a
-    deadline, and the server's end-of-tree wait read. The server keeps no
-    membership set: it asks the host for members and for a kill over a control
-    socket, so no signal ever names a group by a number the server read
-    elsewhere. Identity comes from libproc, or from the kernel's `KERN_PROC_PID`
-    row for another user's process, which libproc refuses. `SIGKILL` goes to
-    each member by identity, then to the host's own group. A member this user
-    may not signal fails the kill and keeps the host holding the tree, as on
-    Linux. A descendant that leaves the session and group and loses its
-    traceable parent before a scan sees it escapes, whichever order `setsid`
-    and the parent's exit happen in: the tree is best-effort tracking of
-    detached descendants, and fastexec is not a sandbox.
-  - **`keepTree: true`**: Keeps leftover processes running after root bash exits
-    until `kill`, `killAfterMs`, or the end of the tasks' owner: the server's
-    session in the default mode, the daemon's stop or exit in `on` mode. Once the root exit has been
-    reported, subsequent `poll` calls wait on the held tree
-    (`waitEndedBy.condition: "tree_ended"`), and a `start`/`poll` with
-    `returnWhen` waits past a root exit `0` for output from held processes.
-  - **A root that does not terminate (Windows)**: A ConPTY root records its
-    script's exit status as that script ends, in a file the task's directory
-    holds. A root that has not terminated five seconds after its script finished
-    is ended with that status, so the task publishes `exited` with `forcedEnd:
-    true` and ` · root forced after 5 s exit grace` in the result line; its tree
-    is then handled as on any root exit. The marker is installed only when the
-    shell has no `EXIT` trap yet, so a startup file (`BASH_ENV`, a profile) that
-    sets one keeps its cleanup; such a task, a command that sets its own trap,
-    and a command that `exec`s all keep the plain wait.
-  - **Limits**: Native permission failures appear in `killError`; unkillable
-    processes remain held. Processes launched outside the owned tree, such as
-    through a system service manager, are outside its cleanup scope.
+### Tree ownership (`src/platform/process.rs`, `src/platform/host.rs`)
 
-## 6. Daemon Mode (`FASTEXEC_DAEMON=on`)
+Unix entry points restore `SIGCHLD` to its default disposition with automatic
+reaping disabled before spawning children. Each task host's PID stays reserved
+until its owning server explicitly waits for it. Readiness follows the bash
+spawn attempt; if the host dies before readiness, startup cleanup ends its
+reserved process group before reaping the host. Unix PTY descriptors are
+created with `O_CLOEXEC`, so an unrelated spawned command cannot retain them
+across exec. Linux opens the matching slave with `TIOCGPTPEER`, so another
+devpts mount cannot redirect a pathname lookup. FreeBSD and macOS use a
+separate buffer per allocation, with `ptsname_r` and `TIOCPTYGNAME` respectively.
 
-- **Endpoint and daemon**: The stdio process answers `initialize` and
-  `tools/list` itself and forwards every tool call to the namespace's daemon,
-  holding no tasks of its own and killing none. The first call works to one `10` s
-  deadline that covers connecting, starting a daemon, and its `Hello`; only an
-  absent daemon is started, and one that is there but does not answer in time is
-  reported instead. A timeout in the writer queue leaves the connection usable
-  and identifies the frame that never went out. Interrupting a frame write
-  closes the connection. A call whose connection fails after sending began returns an
-  error naming the call, request ID, session, and daemon epoch: the action for
-  `exec`, and the tool for `codemode`, `read`, `write`, `edit`, and `transfer`.
-  Failed calls are not replayed.
-  `list` shows each task's owner and, for a call through this endpoint, the
-  session and call ID that started it; both are null for a task started in the
-  default mode or over HTTP.
-- **Identity**: The build ID is the SHA-256 of the running image. The namespace
-  is the first `16` hex characters of `SHA-256(build ID, scope)`, where the
-  scope is a non-empty `FASTEXEC_NAMESPACE`, else the canonical path of the
-  executable, so different builds never share a daemon.
-- **Runtime root**: `%LOCALAPPDATA%\fastexec` on Windows, created with an
-  owner-only DACL; `$XDG_RUNTIME_DIR/fastexec` or `<temp>/fastexec-<uid>` on
-  Unix, mode `0700` and checked. `ns/<namespace>/` holds `startup.lock`,
-  `daemon.lock`, `daemon.log`, `logs/`, and the socket; `bin/<build>[.exe]` is the
-  cached copy of the executable a daemon starts from. A daemon start sweeps the
-  payload of every namespace whose locks it can take.
-- **IPC**: A named pipe `\\.\pipe\fastexec-<user hash>-<namespace>` with an
-  owner-only DACL that rejects remote clients, or a Unix socket at
-  `ns/<namespace>/sock` when that path fits in `100` bytes, else at
-  `/tmp/fastexec-<uid>/<namespace>.sock`. Frames are length-prefixed JSON, and a
-  call names its tool (`exec`, `codemode`, `read`, `write`, `edit`, `transfer`).
-  The endpoint refuses a
-  call whose serialized arguments pass `3` MiB before writing it (sizing for up
-  to `1` MiB of JSON-escaped `start` `input`), a request frame
-  is at most `4` MiB (a `Hello` carries the endpoint's environment), a response
-  frame at most `512` MiB (protocol version `5`), one connection carries at most `32` concurrent calls,
-  and the daemon serves at most `128` connections.
-- **Sessions**: Each endpoint process holds one random session ID with its own
-  task entries and readers, and a reconnect keeps them. An endpoint session with
-  no live connection is dropped after `10` minutes, and the table holds at most
-  `256` endpoint sessions. The endpoint says `Bye` when its stdin closes, which
-  drops that session at once. Sessionless HTTP has one principal session per
-  configured token for the listener's entire lifetime; these sessions do not
-  expire. A session's entries retire with their tasks.
-- **Lifetimes**: The daemon does not exit idle by default. Starting it with
-  `--idle-exit on` enables exit after `10` minutes with no connections, an empty
-  task registry (finished tasks stay for up to `24` hours), and no live or
-  in-flight `/t/` transfers. `--idle-exit off` explicitly disables it. HTTP
-  daemons never exit idle, even with `--idle-exit on`.
-  `fastexec daemon stop` kills
-  every task and exits. A daemon crash ends its tasks, through the Windows Job
-  or the Linux task host, and a task ID from a dead daemon answers as coming
-  from an earlier daemon.
-- **Host confinement**: A host that keeps its children in a Job without
-  breakaway, such as a fastexec task, cannot start a detached daemon, and the
-  call fails naming `fastexec daemon start` from a terminal outside the host.
-  `fastexec daemon run` is the supervisor's own process and serves inside such a
-  host. A host that confines its children to a cgroup, such as a systemd scope or
-  a container, ends the daemon with it.
-- **CLI**: `fastexec` with no arguments serves MCP over stdio (exiting `1` after
-  cleanup if MCP initialization fails); `--version` (`-V`) and `--help` (`-h`)
-  print version or usage and exit `0`, and unknown or extra arguments print
-  usage to stderr and exit `2`. `fastexec daemon start [--http <addr>] [--idle-exit on|off]` starts the daemon detached
-  from the calling terminal and prints its epoch, PID, namespace, and HTTP
-  address. `fastexec daemon run [--http <addr>]` serves the same daemon in the
-  foreground, in the process a supervisor started: it takes the namespace lock
-  like any daemon and refuses a namespace that already has one, prints the same
-  line to stderr once both listeners are bound, keeps its logs on stderr, runs
-  with idle exit off, and refuses `--idle-exit`. `SIGTERM` and `SIGINT`, and on
-  Windows `Ctrl+C`, `Ctrl+Break`, console close and shutdown, stop it as
-  `daemon stop` does, with exit `0`. That cleanup is best effort where the
-  operating system ends the process first, by a close deadline it enforces or a
-  forced termination. `status` prints epoch, build, PID, sessions,
-  tasks, and the HTTP address or `off`; `stop` prints the stopped epoch. `status`
-  and `stop` never start a daemon, and `stop` without one exits `0`. Start flags
-  only apply to a new daemon; stop the existing one before changing its
-  idle-exit policy.
-- **HTTP**: `--http <addr>` with `FASTEXEC_HTTP_TOKEN`, one or more unique tokens
-  separated by ASCII whitespace, serves the same toolset over Streamable HTTP.
-  Each token is at least `16` visible ASCII characters; empty lists, invalid
-  tokens, and duplicates are refused with token positions, never token values.
-  Sessionless requests use the authenticated token's principal session (`t1`,
-  `t2`, etc., with owner labels `http-t1`, `http-t2`, etc.). The inline `_meta`
-  lifecycle chooses this path regardless of the named protocol version. Legacy
-  HTTP `initialize` creates a client-named session after negotiation. The address is
-  loopback unless `FASTEXEC_HTTP_ALLOW_REMOTE=1`, which belongs behind a
-  TLS-terminating proxy. Every `/mcp` request carries a configured bearer
-  token, checked before a session is created or resumed, and
-  `FASTEXEC_HTTP_TOKEN` is dropped from the
-  environment HTTP sessions launch tasks with; a `/mcp` body over `4` MiB is
-  refused; `Origin` is
-  limited to the bound address's own origin, the loopback names, and
-  `FASTEXEC_HTTP_ALLOWED_ORIGINS`, where an entry without a port matches any
-  port. This is request Origin validation, not CORS support: browser cross-origin
-  preflights and CORS response headers are not provided. HTTP sessions run with
-  the daemon's own environment. The listener retains up to `256` legacy HTTP
-  sessions; at capacity it rejects new legacy initializations. Idle legacy
-  sessions expire after `60` minutes, and DELETE also releases the slot. The
-  cap is a count, not a memory or namespace-wide quota. Principal sessions
-  do not use this cap and last until the listener stops.
-  The HTTP listener admits at most `128` concurrent connections and allows
-  `10` seconds to receive request headers. Extra connections are closed without
-  queueing; management through the local daemon socket has its own capacity.
-  This header deadline does not impose a total timeout on uploads, SSE, or
-  long tool calls. Invalid HTTP syntax and ordinary client disconnects do not
-  append one error-log entry per request. Streamed responses carry
-  `X-Accel-Buffering: no`, which tells a proxy not to buffer them.
-- **Transfer route**: `/t/<capability id>` serves one file without the bearer
-  token, which makes the URL usable by `curl`. It runs on `--http` (sharing the
-  daemon's table with any `FASTEXEC_TRANSFER=true` stdio endpoints) or on the
-  standalone `/t/` listener in local stdio and non-HTTP daemon modes when
-  `FASTEXEC_TRANSFER=true`, returning `404` on any non-`/t/` path there.
-  An id expires after `10` minutes unused, and an unknown or expired one answers
-  `404`. `GET` returns the file, honouring one `bytes=` range with `206` and
-  `416` and ignoring any other form, so the whole file comes back with `200`.
-  `HEAD` answers the current size. `PUT` writes the body at `?offset=` (default
-  `0`), truncating the file to that offset before reading the body, refusing an
-  offset past the end with `409`, and answering the new size on success. A
-  truncated or malformed body returns `400`. An upload that waits `30` seconds
-  for more body data returns `408`. This inactivity deadline applies while
-  waiting for the network, not to disk writes or the total upload time. In
-  either case, the accepted prefix is retained so `HEAD` and a later upload
-  can resume from its actual size. Uploads to the
-  same open file identity serialize even across distinct capability URLs,
-  symlinks, and hard links; uploads to different files remain independent. A
-  disconnected upload waiting for that lock releases its open file and waiter.
-  Any other method answers `405` with `Allow`.
-  Replies carry `Cache-Control: no-store`, `Content-Type:
-  application/octet-stream`, and `X-Accel-Buffering: no`. `/t/` is answered
-  before the bearer check and before the `4` MiB body cap that applies to
-  `/mcp`. `/mcp` is the only other route: a path behind the bearer check that
-  is not `/mcp` answers `404`, so a proxy that forwards its prefix unstripped
-  fails at `initialize` instead of waiting until a later download.
+- Windows: runs each task inside a Job Object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and breakaway disabled, because Git
+  Bash starts `&` children with breakaway whenever a Job allows it.
+- Linux: a separate task host leads the session and adopts daemonized
+  descendants as a subreaper. Cleanup pins candidate processes with pidfds
+  before reading their authoritative ancestry, verifies membership again,
+  and signals the pinned processes. An empty scan alone cannot prove that
+  cleanup is complete: the host exits only after `waitpid` reports `ECHILD`,
+  and its pidfd confirms that exit before cleanup succeeds. This requires kernel
+  `5.3+`, readable `/proc`, and allowed `pidfd_open`/`pidfd_send_signal`
+  syscalls. The host checks pidfd availability before running bash; a failure
+  to read procfs during cleanup is reported as an error. A lifeline pipe
+  triggers cleanup if the server dies. A host
+  retains ownership and retries when a privileged descendant cannot be killed.
+- FreeBSD: the task host acquires a kernel reaper with `PROC_REAP_ACQUIRE`
+  before starting bash. `PROC_REAP_GETPIDS` identifies descendants, including
+  nested reapers; `PROC_REAP_KILL` lets the kernel select signal targets
+  without a numeric PID-reuse race. Detached sessions and double forks stay
+  owned, without procfs. Partial kills and native permission errors keep the
+  host alive and report the remaining tree. The
+  lifeline cleanup preserves reaper ownership while an unkillable descendant
+  remains. PTY allocation uses `posix_openpt` and `ptsname_r` with a separate
+  path buffer for each call; FreeBSD's `openpty` uses shared `ptsname` storage
+  and can open another task's slave during concurrent starts. Both descriptors
+  are created with `O_CLOEXEC`. The host retains a private PTY slave. After every
+  descendant is reaped, it disables terminal input controls and echo, resumes any stopped
+  output, and drains queued bytes before its session closes. Late input cannot
+  stop or discard the finished command's output. The root's exit status is
+  reported before this final drain,
+  so a kept background writer does not delay that result. An empty live host
+  completes the drain itself; an already dead host's reserved process group
+  is still cleaned up.
+- macOS: the same task host owns membership, because nothing adopts an
+  orphan there: it scans the process table every 100 ms and tracks the
+  processes it started by pid and start time, so a descendant seen once stays
+  a member after it leaves the session, group, and parent chain. The host
+  stays alive while it holds a member, which is what a `keepTree` wait, a
+  deadline, and the server's end-of-tree wait read. The server keeps no
+  membership set: it asks the host for members and for a kill over a control
+  socket, so no signal ever names a group by a number the server read
+  elsewhere. Identity comes from libproc, or from the kernel's `KERN_PROC_PID`
+  row for another user's process, which libproc refuses. `SIGKILL` goes to
+  each member by identity, then to the host's own group. A member this user
+  may not signal fails the kill and keeps the host holding the tree, as on
+  Linux. A descendant that leaves the session and group and loses its
+  traceable parent before a scan sees it escapes, whichever order `setsid`
+  and the parent's exit happen in: the tree is best-effort tracking of
+  detached descendants, and fastexec is not a sandbox.
+- `keepTree: true`: keeps leftover processes running after root bash exits
+  until `kill`, `killAfterMs`, or the end of the tasks' owner: the server's
+  session in the default mode, the daemon's stop or exit in `on` mode. Once the root exit has been
+  reported, subsequent `poll` calls wait on the held tree
+  (`waitEndedBy.condition: "tree_ended"`), and a `start`/`poll` with
+  `returnWhen` waits past a root exit `0` for output from held processes.
+- Non-terminating Windows root: a ConPTY root records its
+  script's exit status as that script ends, in a file the task's directory
+  holds. A root that has not terminated five seconds after its script finished
+  is ended with that status, so the task publishes `exited` with `forcedEnd:
+  true` and ` · root forced after 5 s exit grace` in the result line; its tree
+  is then handled as on any root exit. The marker is installed only when the
+  shell has no `EXIT` trap yet, so a startup file (`BASH_ENV`, a profile) that
+  sets one keeps its cleanup; such a task, a command that sets its own trap,
+  and a command that `exec`s all keep the plain wait.
+- Cleanup limits: native permission failures appear in `killError`; unkillable
+  processes remain held. Processes launched outside the owned tree, such as
+  through a system service manager, are outside its cleanup scope.
+
+## 6. Daemon mode (`FASTEXEC_DAEMON=on`)
+
+### Endpoint and daemon
+
+The stdio process answers `initialize`, `server/discover`, and `tools/list`
+itself and forwards every tool call and MCP Events request to the namespace's
+daemon, holding no tasks of its own and killing none. The first call works to
+one `10` s deadline that covers connecting, starting a daemon, and its `Hello`;
+only an absent daemon is started, and one that is present yet unresponsive in
+time is reported as an error. A timeout in the writer queue leaves the
+connection usable and identifies the frame that never went out. Interrupting a
+frame write closes the connection. A call whose connection fails after sending
+began returns an error naming the call, request ID, session, and daemon epoch:
+the action for `exec`, and the tool for `codemode`, `read`, `write`, `edit`, and
+`transfer`. Failed calls are not replayed. `list` shows each task's owner and,
+for a call through this endpoint, the session and call ID that started it; both
+are null for a task started in the default mode or over HTTP.
+
+### Identity and runtime root
+
+The build ID is the SHA-256 of the running image. The namespace is the first
+`16` hex characters of `SHA-256(build ID, scope)`, where the scope is a
+non-empty `FASTEXEC_NAMESPACE`, else the canonical path of the executable, so
+different builds never share a daemon.
+
+The runtime root is `%LOCALAPPDATA%\fastexec` on Windows (created with an
+owner-only DACL) and `$XDG_RUNTIME_DIR/fastexec` or `<temp>/fastexec-<uid>` on
+Unix (mode `0700` and verified). `ns/<namespace>/` holds `startup.lock`,
+`daemon.lock`, `daemon.log`, `logs/`, and the socket; `bin/<build>[.exe]` holds
+the cached copy of the executable a daemon starts from. A daemon start sweeps
+the payload of every namespace whose locks it can acquire.
+
+### IPC (`src/ipc.rs`)
+
+Endpoints and `daemon emit` connect over a named pipe
+`\\.\pipe\fastexec-<user hash>-<namespace>` with an owner-only DACL that
+rejects remote clients, or a Unix socket at `ns/<namespace>/sock` when that path
+fits in `100` bytes, else at `/tmp/fastexec-<uid>/<namespace>.sock`. Frames are
+length-prefixed JSON speaking protocol version `6` (`ipc::PROTOCOL = 6`). Tool
+calls name their tool (`exec`, `codemode`, `read`, `write`, `edit`, `transfer`),
+while MCP Events and external ingestion use `EventsList`, `EventsPoll`,
+`EventsStream`, `EventsCancel`, `HelloEmit`, `EmitEvent`, `EventFrame`, and
+`EmitAck` (section 7). The endpoint refuses a tool call whose serialized
+arguments exceed `3` MiB before writing it (sizing for up to `1` MiB of
+JSON-escaped `start` `input`), a request frame is at most `4` MiB (a `Hello`
+carries the endpoint's environment), and a response frame is at most `512` MiB.
+One endpoint connection carries at most `32` concurrent tool calls and `16`
+active event streams (`MAX_EVENT_STREAMS_PER_CONN`), and the daemon admits at
+most `128` endpoint connections plus `128` concurrent `daemon emit` connections
+(`MAX_EMIT_CONNECTIONS`).
+
+### Sessions, lifetimes, and host confinement
+
+Each endpoint process holds one random session ID with its own task entries and
+readers, and a reconnect keeps them. An endpoint session with no live connection
+is dropped after `10` minutes, and the table holds at most `256` endpoint
+sessions. The endpoint sends `Bye` when its stdin closes, dropping that session
+immediately. Sessionless HTTP has one principal session per configured token for
+the listener's entire lifetime; these sessions do not expire. A session's
+entries retire with their tasks.
+
+The daemon does not exit idle by default. Starting it with `--idle-exit on`
+enables exit after `10` minutes with no connections, an empty task registry
+(finished tasks stay for up to `24` hours), and no live or in-flight `/t/`
+transfers. `--idle-exit off` explicitly disables it. HTTP daemons never exit
+idle, even with `--idle-exit on`. `fastexec daemon stop` kills every task and
+exits. A daemon crash ends its tasks through the Windows Job or the Unix task
+host, and a task ID from a dead daemon answers as coming from an earlier daemon.
+
+A host that keeps its children in a Job without breakaway, such as a `fastexec`
+task, cannot start a detached daemon, and the call fails naming
+`fastexec daemon start` from a terminal outside the host. `fastexec daemon run`
+is the supervisor's own process and serves inside such a host. A host that
+confines its children to a cgroup, such as a systemd scope or a container, ends
+the daemon with it.
+
+### CLI (`src/main.rs`, `src/cli/daemon.rs`)
+
+`fastexec` with no arguments serves MCP over stdio (exiting `1` after cleanup if
+MCP initialization fails); `--version` (`-V`) and `--help` (`-h`) print version
+or usage and exit `0`, and unknown or extra arguments print usage to stderr and
+exit `2`.
+
+- `fastexec daemon start [--http <addr>] [--idle-exit on|off]`: starts the
+  daemon detached from the calling terminal and prints its epoch, PID,
+  namespace, and HTTP address. Start flags apply only to a new daemon; stop an
+  existing daemon before changing its startup settings or idle-exit policy.
+- `fastexec daemon run [--http <addr>]`: serves the daemon in the foreground in
+  the supervisor's process, acquires the namespace lock (refusing a namespace
+  that already has a daemon), prints its readiness line to stderr once bound,
+  keeps logs on stderr, runs with idle exit off, and rejects `--idle-exit`.
+  `SIGTERM` and `SIGINT` on Unix, and `Ctrl+C`, `Ctrl+Break`, console close, and
+  shutdown on Windows, stop all tasks as `daemon stop` does and exit `0`.
+- `fastexec daemon status`: prints epoch, build, PID, sessions, tasks, and the
+  HTTP address or `off` without starting a daemon.
+- `fastexec daemon stop`: stops the running daemon and prints the stopped epoch
+  (exiting `0` without starting a daemon if none is running).
+- `fastexec daemon emit [--namespace <ns>] [--source <src>] [--topic <topic>] [--stream]`:
+  injects SEP-3415 `external.event` occurrences into an already-running daemon
+  from `stdin` (section 7).
+
+### Streamable HTTP (`src/http.rs`)
+
+`--http <addr>` with `FASTEXEC_HTTP_TOKEN` (one or more unique tokens separated
+by ASCII whitespace, each at least `16` visible ASCII characters) serves the
+same toolset and MCP Events over Streamable HTTP. Empty lists, invalid tokens,
+and duplicates fail startup naming token positions without exposing token
+values. Sessionless requests use the authenticated token's principal session
+(`t1`, `t2`, etc., with owner labels `http-t1`, `http-t2`, etc.); the inline
+`_meta` lifecycle selects this path regardless of the named protocol version.
+Stateful HTTP `initialize` creates a session after negotiation. The bind address
+must be loopback unless `FASTEXEC_HTTP_ALLOW_REMOTE=1`, which belongs behind a
+TLS-terminating reverse proxy. Every `/mcp` request requires a configured bearer
+token checked before session creation or resumption, and `FASTEXEC_HTTP_TOKEN`
+is stripped from the environment HTTP sessions launch tasks with. `/mcp` bodies
+over `4` MiB are refused. `Origin` is restricted to the bound address's origin,
+loopback names, and `FASTEXEC_HTTP_ALLOWED_ORIGINS` (where a host entry without
+a port matches any port); this is request `Origin` validation, without CORS
+preflight or response headers. HTTP sessions run with the daemon's environment.
+The listener retains up to `256` stateful HTTP sessions (expiring after `60`
+minutes idle or on `DELETE`); principal sessions sit outside this count and live
+until the listener stops.
+
+The HTTP listener admits at most `128` concurrent connections and enforces a
+`10` second header-read deadline without imposing a total timeout on uploads,
+SSE streams, or long tool calls. Within those `128` connections, `/t/` transfer
+requests are bounded by a dedicated sub-quota (returning `503 Service
+Unavailable` when transfer slots are full) so concurrent file transfers cannot
+starve `/mcp` control traffic. Extra connections past `128` close without
+queueing; local daemon socket management keeps its own capacity. Streamed
+responses include `X-Accel-Buffering: no`.
+
+### Transfer route (`src/transfer.rs`)
+
+`/t/<capability id>` serves one file without the bearer token so tools such as
+`curl` can download or upload directly. It runs on `--http` (sharing the
+daemon's table with any `FASTEXEC_TRANSFER=true` stdio endpoints; set
+`FASTEXEC_PUBLIC_URL` behind a reverse proxy so minted URLs carry the public
+origin and path prefix) or on the standalone `/t/` listener in local stdio and
+non-HTTP daemon modes when `FASTEXEC_TRANSFER=true`, returning `404` on any
+non-`/t/` path there. A capability ID expires after `10` minutes unused, and an
+unknown or expired ID returns `404`. `GET` returns the file, honoring one
+`bytes=` range with `206` and `416` and ignoring other forms so the full file
+returns with `200`. `HEAD` returns the current byte size. `PUT` writes the body
+at `?offset=` (default `0`), truncating the file to that offset before reading,
+refusing an offset past EOF with `409`, and returning the new size on success.
+Truncated or malformed bodies return `400`, and an upload that stalls `30`
+seconds waiting for network bytes returns `408` while keeping the written prefix
+so `HEAD` and a resumed `PUT` can continue from the confirmed size. Uploads to
+the same open file identity serialize across distinct capability URLs, symlinks,
+and hard links; disconnected waiters release their file handle and lock waiter.
+Any other HTTP method returns `405` with `Allow`. Replies set `Cache-Control:
+no-store`, `Content-Type: application/octet-stream`, and `X-Accel-Buffering:
+no`. `/t/` runs ahead of the bearer check and the `4` MiB `/mcp` body cap.
+Behind the bearer check, `/mcp` is the sole route and any other path returns
+`404`, so an unstripped proxy prefix fails immediately on the first `/mcp`
+request.
+
+## 7. MCP Events and daemon emit
+
+### Capability and protocol methods (`src/mcp.rs`, `src/events.rs`)
+
+On MCP protocol revision `2026-07-28`, `server/discover` and `initialize`
+advertise `io.modelcontextprotocol/events` with `{ "listChanged": false }`.
+`fastexec` implements `events/list`, `events/poll`, and `events/stream` in both
+local mode (`FASTEXEC_DAEMON=off`) and shared daemon mode (`FASTEXEC_DAEMON=on`,
+stdio and Streamable HTTP). Webhook methods `events/subscribe` and
+`events/unsubscribe` return JSON-RPC `-32601` (`Method not found`).
+
+HTTP header routing enforces strict `Mcp-Name` validation (`src/mcp.rs`):
+
+- `events/list` accepts `null` or `{}` params and rejects any request carrying
+  an `Mcp-Name` header with JSON-RPC `-32020`.
+- `events/poll` and `events/stream` require `params.name` and validate
+  `Mcp-Name` whenever the header is present: duplicate `Mcp-Name` headers are
+  rejected, a raw header value must consist solely of visible ASCII
+  (`0x21..=0x7E`), and an encoded word `=?base64?<utf8>?=` must decode to valid
+  UTF-8. Any malformed header or mismatch against `params.name` fails with
+  JSON-RPC `-32020`.
+
+### Event catalog and schemas (`src/events.rs`)
+
+`events/list` returns `{ resultType: "complete", events: [...] }` describing two
+event types, each supporting `delivery: ["push", "poll"]`:
+
+| Event `name` | `inputSchema` properties (`additionalProperties: false`) | `payloadSchema` properties (`additionalProperties: false`) | Summary |
+| --- | --- | --- | --- |
+| `task.exited` | `taskId?: string`, `scope?: "all" \| "session"` (`"all"` default; `"session"` requires an active session and rejects sessionless calls with `-32602`) | Required: `taskId: string`, `state: string`, `expired: boolean`, `keptProcesses: integer` (`>= 0`), `treeEnded: boolean`; optional: `exitCode: integer`, `logPath: string` | Published when a bash or `codemode` task exits, is killed, or expires via `killAfterMs`. |
+| `external.event` | `source?: string`, `topic?: string`, `name?: string` | Required: `source: string`, `name: string`, `eventId: string`, `data: any`; optional: `topic: string`, `timestamp: string` | Published by `fastexec daemon emit` using pure SEP-3415 `eventId` naming (no `upstreamEventId` or `upstreamTruncated`), deduplicated in the ring buffer by `(source, eventId)`. |
+
+### Ring buffer, polling, and streaming
+
+Each `Service` owns a bounded in-memory `EventBus` (`src/events.rs`) capped at
+`DEFAULT_MAX_EVENTS = 4096` records and `DEFAULT_MAX_BYTES = 8 MiB`
+(`8,388,608` bytes). Enqueuing a new event evicts the oldest records until both
+bounds hold and removes evicted `(source, eventId)` keys from the deduplication
+map.
+
+- `events/poll`: accepts `{ name, arguments?, cursor?, maxAgeMs?, maxEvents? }`,
+  caps returned items at `MAX_POLL_EVENTS = 64`, and returns `{ resultType:
+  "complete", events: [{ eventId, name, timestamp, data }], cursor, truncated,
+  hasMore, nextPollMs }`. Items in `events[]` omit per-item `cursor`;
+  `nextPollMs` is `2000` ms (`POLL_NEXT_ACTIVE_MS`) when `hasMore` is true and
+  `5000` ms (`POLL_NEXT_IDLE_MS`) when caught up, and `truncated: true` marks
+  evicted history before the caller's `cursor`.
+- `events/stream`: accepts `{ name, arguments?, cursor?, maxAgeMs?,
+  heartbeatMs? }`, clamping `heartbeatMs` to `5000..=30000` ms (default `30000`
+  ms). Every stream notification and the final `{ resultType: "complete" }`
+  result attach `_meta["io.modelcontextprotocol/subscriptionId"] = <request
+  id>`. The stream sends an initial `notifications/events/active` (`{ cursor,
+  truncated, heartbeatMs }`), followed by `notifications/events/event` (`{
+  eventId, name, timestamp, data, cursor }`), idle
+  `notifications/events/heartbeat` (`{ cursor }`), or
+  `notifications/events/terminated` when the stream ends due to lag, bus
+  shutdown, or per-stream memory backpressure.
+- Error codes: `InvalidParams` maps to `-32602`, `NotFound` to `-32023`,
+  `Forbidden` to `-32024`, and `ResourceExhausted` to `-32025` (carrying `{
+  limit, max }` in `error.data`).
+
+### Stream quotas and IPC backpressure isolation (`src/daemon/events.rs`, `src/endpoint.rs`)
+
+Active streams are bounded by `MAX_EVENT_STREAMS = 64` per server or daemon
+(`limit: "global_event_streams"`) and `MAX_EVENT_STREAMS_PER_CONN = 16` per
+daemon IPC connection (`limit: "connection_event_streams"`). Exceeding either
+cap rejects the subscription with JSON-RPC `-32025`.
+
+On daemon IPC connections, ordinary `EventWireFrame::Event` frames acquire
+memory exclusively from the `1 GiB` main byte pool (`daemon.memory`) and never
+consume permits from the `8 MiB` `daemon.reserved` control pool (`reserved` is
+restricted to short control, error, and termination frames). When the main pool
+cannot admit an outbound event frame for a stream, the daemon cancels only that
+stream and queues `EventWireFrame::Terminated` (`code: -32025`) using the
+control reserve without calling connection-level `closing.cancel()`, keeping
+sibling tool calls and other event streams on the shared IPC connection alive.
+
+On the endpoint side, receiving a stream overload or broadcast-lag termination
+delivers `notifications/events/terminated` (`-32025`) to that stream and exits
+cleanly without entering a zero-backoff reconnect loop. `events/list`,
+`events/poll`, and `events/stream` reconnect at most once when an idle IPC
+connection closed before the request frame was written.
+
+### `daemon emit` and IPC protocol 6 (`src/cli/daemon.rs`, `src/ipc.rs`, `src/daemon.rs`)
+
+`fastexec daemon emit [--namespace <ns>] [--source <src>] [--topic <topic>]
+[--stream]` injects external SEP-3415 events into an already-running daemon
+(exiting `1` without starting a daemon when none is running). Without
+`--stream`, it reads one JSON object from `stdin`; with `--stream`, it reads
+newline-delimited JSON (NDJSON) objects and writes one JSON acknowledgement per
+input line. Both each raw input payload and each serialized `external.event`
+payload cap at `MAX_EXTERNAL_EVENT_BYTES = 64 KiB` (`65,536` bytes).
+
+Each input JSON object follows strict SEP-3415 event naming:
+
+- Required fields: non-empty `eventId` (`string`), non-empty `name` (`string`),
+  and `data` (any JSON value), plus non-empty `source` (`string` in JSON or
+  supplied via `--source`).
+- Optional fields: `timestamp` (RFC 3339 string; defaults to daemon receive time
+  when omitted), `topic` (`string` in JSON or via `--topic`), and `eventType`
+  (must equal `"external.event"` if set, otherwise rejected with `-32024`).
+- Ignored transport wrappers: `cursor` and `_meta` are ignored so output from
+  `mcpcli events poll` or `mcpcli events stream` pipes directly into `daemon
+  emit --stream`.
+- Rejected legacy or unknown keys: `upstreamEventId`, `truncated`,
+  `upstreamTruncated`, and any other unknown top-level key fail validation.
+
+Over IPC (`ipc::PROTOCOL = 6`), `daemon emit` opens a lightweight connection
+using `ToDaemon::HelloEmit { protocol: 6, build }`, which sends no `cwd` or
+`env` snapshot and registers no daemon session entry. Each event travels in
+`ToDaemon::EmitEvent { event }` charged to the main byte pool (never routed
+through `control_pool`), and the daemon replies with `ToEndpoint::EmitAck { ok,
+eventId?, cursor?, deduplicated, error? }`. Concurrent emit connections cap at
+`MAX_EMIT_CONNECTIONS = 128`, tracked independently of the `128` endpoint
+connections.
+
+### Background footer `External events` summary (`src/events.rs`)
+
+The event bus tracks per-session background cursors in an LRU map capped at
+`MAX_SESSION_CURSORS = 4096` sessions. When building the background footer for a
+direct MCP tool call (`start`, `poll`, `kill`, `transcript`, or `codemode`),
+`peek_external_background_summary` inspects unseen `external.event` entries for
+that session and formats a single metadata-only line:
+
+`External events: <total> new (<source>[/<topic>]:<name>[ x<count>], ...)`
+
+Labels sanitize control characters, cap at `48` characters each, and group up to
+`3` distinct `<source>[/<topic>]:<name>` keys in arrival order (appending `,
++<m> more` when further groups exist, or falling back to `External events:
+<total> new; use events/poll.` when tight on the `512`-byte footer budget).
+Event `data` is never included in the footer. `commit_external_background_cursor`
+advances the session cursor only after the direct tool response is committed for
+delivery; cancelled calls and nested `codemode` calls leave the cursor
+untouched.

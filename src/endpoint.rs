@@ -143,8 +143,8 @@ impl EndpointEventStream {
         self.rx.recv().await
     }
 
-    pub fn is_lagged(&self) -> bool {
-        self.rx.is_closed() && !self.cancelled && !self.link.closed.is_cancelled()
+    pub(crate) fn link_closed(&self) -> bool {
+        self.link.closed.is_cancelled()
     }
 
     pub async fn cancel(&mut self) {
@@ -343,17 +343,10 @@ impl Endpoint {
         }
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let deadline = std::time::Instant::now() + runtime::START_WAIT;
-        let connecting = async {
-            match self.link(client_name, deadline).await {
-                Ok(link) => Ok(link),
-                // No call was written before a Welcome, so one reconnect replays nothing.
-                Err(_) => self.link(client_name, deadline).await,
-            }
-        };
         let link = tokio::select! {
             biased;
             _ = cancel.cancelled() => return plain_err("Cancelled before the call was sent.".into()),
-            linked = connecting => match linked {
+            linked = self.link_with_retry(client_name, deadline) => match linked {
                 Ok(link) => link,
                 Err(message) => {
                     return plain_err(format!("Cannot reach the fastexec daemon: {message}"));
@@ -515,6 +508,21 @@ impl Endpoint {
         Ok(link)
     }
 
+    /// Connects or reuses the current link, retrying once when a stale socket fails before a
+    /// `Welcome` (without retrying local memory-budget refusals).
+    async fn link_with_retry(
+        &self,
+        client_name: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Arc<Link>, SetupError> {
+        match self.link(client_name, deadline).await {
+            Ok(link) => Ok(link),
+            // No request was written before a Welcome, so one reconnect replays nothing.
+            Err(SetupError::MemoryBudget) => Err(SetupError::MemoryBudget),
+            Err(_) => self.link(client_name, deadline).await,
+        }
+    }
+
     fn event_setup_error(&self, error: SetupError) -> ipc::Owned<ipc::IpcEventError> {
         match error {
             SetupError::MemoryBudget => self.event_budget_error(
@@ -569,7 +577,7 @@ impl Endpoint {
         let link = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(self.event_link_error("events/list cancelled")),
-            linked = self.link(client_name, deadline) => {
+            linked = self.link_with_retry(client_name, deadline) => {
                 linked.map_err(|error| self.event_setup_error(error))?
             }
         };
@@ -613,6 +621,10 @@ impl Endpoint {
             Some((ipc::EventWireFrame::Error(err), lease)) => {
                 Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
             }
+            Some((ipc::EventWireFrame::Terminated(_), lease)) => {
+                drop(lease);
+                Err(self.event_budget_error("endpoint memory budget full during events/list"))
+            }
             None if link.closed.is_cancelled() => {
                 Err(self.event_link_error("daemon connection closed during events/list"))
             }
@@ -632,7 +644,7 @@ impl Endpoint {
         let link = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(self.event_link_error("events/poll cancelled")),
-            linked = self.link(client_name, deadline) => {
+            linked = self.link_with_retry(client_name, deadline) => {
                 linked.map_err(|error| self.event_setup_error(error))?
             }
         };
@@ -676,6 +688,10 @@ impl Endpoint {
             Some((ipc::EventWireFrame::Error(err), lease)) => {
                 Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
             }
+            Some((ipc::EventWireFrame::Terminated(_), lease)) => {
+                drop(lease);
+                Err(self.event_budget_error("endpoint memory budget full during events/poll"))
+            }
             None if link.closed.is_cancelled() => {
                 Err(self.event_link_error("daemon connection closed during events/poll"))
             }
@@ -699,7 +715,7 @@ impl Endpoint {
         let link = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(self.event_link_error("events/stream cancelled")),
-            linked = self.link(client_name, deadline) => {
+            linked = self.link_with_retry(client_name, deadline) => {
                 linked.map_err(|error| self.event_setup_error(error))?
             }
         };
@@ -758,6 +774,17 @@ impl Endpoint {
                 // Daemon rejected setup; no server-side stream exists to cancel.
                 reg.cancel_on_drop = false;
                 Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
+            }
+            Some((ipc::EventWireFrame::Terminated(err), lease)) => {
+                if err.message.starts_with("daemon ") {
+                    reg.cancel_on_drop = false;
+                    Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
+                } else {
+                    drop(lease);
+                    Err(self.event_budget_error(
+                        "endpoint memory budget full before events/stream activated",
+                    ))
+                }
             }
             None => {
                 if link.closed.is_cancelled() {
@@ -875,7 +902,7 @@ async fn read_loop(
                 let sender = lock(&link.event_pending).get(&id).cloned();
                 if let Some(tx) = sender {
                     if let Err(err) = tx.try_send((frame, lease)) {
-                        // A live link's closed receiver lets the consumer resume after draining its cursor.
+                        // Drop this stream's sender when its bounded buffer fills so the shared IPC link keeps moving.
                         lock(&link.event_pending).remove(&id);
                         let (frame, lease) = match err {
                             mpsc::error::TrySendError::Full(item)
@@ -903,9 +930,20 @@ async fn read_loop(
                 }
             }
             Some(ipc::LeasedEndpointFrame::OverloadEvent { id: Some(id) }) => {
-                // Closing only this entry lets active streams observe `is_lagged()` and resume
-                // from their cursor without tearing down the shared IPC connection.
-                lock(&link.event_pending).remove(&id);
+                if let Some(tx) = lock(&link.event_pending).remove(&id) {
+                    let frame = ipc::EventWireFrame::Terminated(ipc::IpcEventError {
+                        code: -32025,
+                        message: "endpoint active memory budget full during event stream".into(),
+                        data: None,
+                    });
+                    if let Ok(bytes) = ipc::json_len(&frame)
+                        && let Some(lease) = control_pool
+                            .try_acquire(bytes)
+                            .or_else(|| crate::lease::control_pool().try_acquire(bytes))
+                    {
+                        let _ = tx.try_send((frame, lease));
+                    }
+                }
             }
             // Nothing else belongs on this connection after the Welcome.
             _ => break,
@@ -1961,13 +1999,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_stream_recovery_sends_terminated_before_complete() {
+    async fn stream_overload_terminates_without_reconnecting_and_preserves_link() {
         use rmcp::ServiceExt as _;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-        let (identity, paths, mut listener, _target) = test_daemon("events-recovery-error");
+        let (identity, paths, mut listener, _target) = test_daemon("events-overload-term");
         let response = welcome(&identity);
-        let (flooded, flood) = oneshot::channel();
         let peer = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
             assert!(matches!(
@@ -1997,53 +2034,62 @@ mod tests {
             )
             .await
             .unwrap();
-            for index in 1..=350 {
-                ipc::write_frame(
-                    &mut conn,
-                    &ToEndpoint::EventFrame {
-                        id,
-                        frame: ipc::EventWireFrame::Event(crate::events::StreamEvent {
-                            event_id: format!("ev{index}"),
-                            name: crate::events::EVENT_EXTERNAL.into(),
-                            timestamp: "2026-11-22T00:00:00.000Z".into(),
-                            data: serde_json::json!({"index": index, "pad": "x".repeat(2048)}),
-                            cursor: format!("ep000001:{index}"),
-                        }),
-                    },
-                )
-                .await
-                .unwrap();
-            }
-            flooded.send(id).unwrap();
-            assert!(matches!(
-                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await.unwrap(),
-                Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == id
-            ));
-            let Some(ToDaemon::EventsStream { id: retry, request }) =
-                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
-                    .await
-                    .unwrap()
-            else {
-                panic!("expected recovery subscription");
-            };
-            assert_ne!(retry, id);
-            assert!(request.cursor.is_some());
+            // Send an event frame whose 5x parse peak exceeds the endpoint's 32 KiB main pool.
             ipc::write_frame(
                 &mut conn,
                 &ToEndpoint::EventFrame {
-                    id: retry,
-                    frame: ipc::EventWireFrame::Error(ipc::IpcEventError {
-                        code: -32025,
-                        message: "event stream quota is full".into(),
-                        data: Some(serde_json::json!({"limit": "active_event_streams", "max": 64})),
+                    id,
+                    frame: ipc::EventWireFrame::Event(crate::events::StreamEvent {
+                        event_id: "ev-oversized".into(),
+                        name: crate::events::EVENT_EXTERNAL.into(),
+                        timestamp: "2026-11-25T00:00:00.000Z".into(),
+                        data: serde_json::json!({"pad": "x".repeat(12 * 1024)}),
+                        cursor: "ep000001:1".into(),
                     }),
                 },
             )
             .await
             .unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await.unwrap(),
+                Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == id
+            ));
+            // Subsequent RPC on the same IPC connection succeeds without reconnecting.
+            let Some(ToDaemon::EventsList { id: list_id }) =
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected EventsList on the preserved IPC connection");
+            };
+            ipc::write_frame(
+                &mut conn,
+                &ToEndpoint::EventFrame {
+                    id: list_id,
+                    frame: ipc::EventWireFrame::ListResult(crate::events::EventsListResult {
+                        result_type: "complete".into(),
+                        events: Vec::new(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Bye)
+            ));
         });
 
-        let endpoint = Arc::new(Endpoint::for_test(identity, paths));
+        let pool = crate::lease::BytePool::new(32 * 1024);
+        let mut ep = Endpoint::for_test(identity, paths);
+        ep.launch = Arc::new(
+            LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(Arc::clone(&pool))
+                .with_control_memory(crate::lease::BytePool::new(64 * 1024)),
+        );
+        let endpoint = Arc::new(ep);
         let leases = Arc::new(crate::mcp::RequestLeases::default());
         let server = crate::mcp::Server::new(
             crate::mcp::Backend::Daemon(Arc::clone(&endpoint)),
@@ -2063,46 +2109,22 @@ mod tests {
         });
         let (read, mut input) = tokio::io::split(client);
         let mut lines = tokio::io::BufReader::new(read).lines();
-        let initialize = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18", "capabilities": {},
-                "clientInfo": {"name": "test", "version": "1"}
-            }
+        let meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
         });
-        input
-            .write_all(format!("{initialize}\n").as_bytes())
-            .await
-            .unwrap();
-        let init = timeout(Duration::from_secs(10), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(
-            serde_json::from_str::<serde_json::Value>(&init)
-                .unwrap()
-                .get("error")
-                .is_none()
-        );
         let request = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": "resume-request",
+            "id": "overload-stream",
             "method": "events/stream",
             "params": {
                 "name": "external.event",
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                }
+                "_meta": meta,
             }
         });
-        let initialized = serde_json::json!({
-            "jsonrpc": "2.0", "method": "notifications/initialized"
-        });
         input
-            .write_all(format!("{initialized}\n{request}\n").as_bytes())
+            .write_all(format!("{request}\n").as_bytes())
             .await
             .unwrap();
         let active = timeout(Duration::from_secs(10), lines.next_line())
@@ -2114,49 +2136,175 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&active).unwrap()["method"],
             "notifications/events/active"
         );
-        let id = timeout(Duration::from_secs(10), flood)
+
+        let term_line = timeout(Duration::from_secs(10), lines.next_line())
             .await
             .unwrap()
+            .unwrap()
             .unwrap();
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let link = endpoint.link.lock().await.clone().unwrap();
-                if !lock(&link.event_pending).contains_key(&id) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        let term_msg: serde_json::Value = serde_json::from_str(&term_line).unwrap();
+        assert_eq!(term_msg["method"], "notifications/events/terminated");
+        assert_eq!(term_msg["params"]["error"]["code"], -32025);
+        assert_eq!(
+            term_msg["params"]["error"]["message"],
+            "endpoint active memory budget full during event stream"
+        );
+        assert_eq!(
+            term_msg["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            "overload-stream"
+        );
 
-        let mut terminated = false;
-        loop {
-            let line = timeout(Duration::from_secs(10), lines.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert!(message.get("error").is_none(), "{message}");
-            if message["method"] == "notifications/events/terminated" {
-                assert!(!terminated, "{message}");
-                assert_eq!(message["params"]["error"]["code"], -32025);
-                assert_eq!(
-                    message["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
-                    "resume-request"
-                );
-                terminated = true;
-            } else if message["id"] == "resume-request" {
-                assert!(terminated, "{message}");
-                assert_eq!(message["result"]["resultType"], "complete");
-                break;
-            }
-        }
+        let complete_line = timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let complete_msg: serde_json::Value = serde_json::from_str(&complete_line).unwrap();
+        assert_eq!(complete_msg["id"], "overload-stream");
+        assert_eq!(complete_msg["result"]["resultType"], "complete");
+
+        let list_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "after-overload",
+            "method": "events/list",
+            "params": { "_meta": meta }
+        });
+        input
+            .write_all(format!("{list_req}\n").as_bytes())
+            .await
+            .unwrap();
+        let list_line = timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let list_msg: serde_json::Value = serde_json::from_str(&list_line).unwrap();
+        assert_eq!(list_msg["id"], "after-overload");
+        assert_eq!(list_msg["result"]["resultType"], "complete");
+
+        endpoint.bye().await;
         drop(input);
         drop(lines);
         finish(peer).await;
         finish(serving).await;
+    }
+
+    #[tokio::test]
+    async fn event_rpcs_retry_once_when_stale_connection_fails_before_welcome() {
+        for method in ["list", "poll", "stream"] {
+            let (identity, paths, mut listener, _target) =
+                test_daemon(&format!("evt-retry-{method}"));
+            let response = welcome(&identity);
+            let peer = tokio::spawn(async move {
+                let mut stale = listener.accept().await.unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut stale, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Hello { connection: 1, .. })
+                ));
+                drop(stale);
+
+                let mut fresh = listener.accept().await.unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut fresh, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Hello { connection: 2, .. })
+                ));
+                ipc::write_frame(&mut fresh, &response).await.unwrap();
+                let request = ipc::read_frame::<_, ToDaemon>(&mut fresh, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let (id, frame) = match request {
+                    ToDaemon::EventsList { id } => (
+                        id,
+                        ipc::EventWireFrame::ListResult(crate::events::EventsListResult {
+                            result_type: "complete".into(),
+                            events: Vec::new(),
+                        }),
+                    ),
+                    ToDaemon::EventsPoll { id, .. } => (
+                        id,
+                        ipc::EventWireFrame::PollResult(crate::events::PollResponse {
+                            result_type: "complete".into(),
+                            events: Vec::new(),
+                            cursor: "ep000001:0".into(),
+                            truncated: false,
+                            has_more: false,
+                            next_poll_ms: 2000,
+                        }),
+                    ),
+                    ToDaemon::EventsStream { id, .. } => (
+                        id,
+                        ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                            cursor: "ep000001:0".into(),
+                            truncated: false,
+                            heartbeat_ms: 30_000,
+                        }),
+                    ),
+                    other => panic!("unexpected frame: {other:?}"),
+                };
+                ipc::write_frame(&mut fresh, &ToEndpoint::EventFrame { id, frame })
+                    .await
+                    .unwrap();
+                loop {
+                    match ipc::read_frame::<_, ToDaemon>(&mut fresh, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                    {
+                        ToDaemon::EventsCancel { .. } => {}
+                        ToDaemon::Bye => break,
+                        other => panic!("unexpected trailing frame: {other:?}"),
+                    }
+                }
+            });
+
+            let endpoint = Endpoint::for_test(identity, paths);
+            match method {
+                "list" => {
+                    let res = endpoint
+                        .events_list("test", CancellationToken::new())
+                        .await
+                        .unwrap();
+                    assert_eq!(res.value.result_type, "complete");
+                }
+                "poll" => {
+                    let res = endpoint
+                        .events_poll(
+                            "test",
+                            crate::events::PollRequest {
+                                name: "external.event".into(),
+                                ..Default::default()
+                            },
+                            CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(res.value.result_type, "complete");
+                }
+                "stream" => {
+                    let (active, mut stream) = endpoint
+                        .events_stream(
+                            "test",
+                            crate::events::SubscribeRequest {
+                                name: "external.event".into(),
+                                ..Default::default()
+                            },
+                            CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(active.value.cursor, "ep000001:0");
+                    stream.cancel().await;
+                }
+                _ => unreachable!(),
+            }
+            endpoint.bye().await;
+            finish(peer).await;
+        }
     }
 
     #[tokio::test]

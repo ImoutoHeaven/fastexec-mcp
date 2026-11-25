@@ -201,8 +201,20 @@ struct Entry {
 }
 
 enum OutgoingPermit {
-    Main(#[allow(dead_code)] Lease),
-    Reserved(#[allow(dead_code)] OwnedSemaphorePermit),
+    Main(
+        #[expect(
+            dead_code,
+            reason = "held for Drop until the outgoing frame is written or dropped"
+        )]
+        Lease,
+    ),
+    Reserved(
+        #[expect(
+            dead_code,
+            reason = "held for Drop until the outgoing frame is written or dropped"
+        )]
+        OwnedSemaphorePermit,
+    ),
 }
 
 /// A frame on its way out, with the lease or control permit its bytes hold until written.
@@ -963,19 +975,20 @@ impl Daemon {
                         continue;
                     }
                     Ok(ipc::DaemonFrame::OverloadEvent { id: Some(id) }) => {
-                        events::queue_event_frame(
+                        let err = ipc::IpcEventError::memory_full(
+                            &self.memory,
+                            &self.control_memory,
+                            "Server active memory budget is full while reading the event request; the operation was not dispatched",
+                        );
+                        events::queue_event_control(
                             outgoing,
                             &self.memory,
                             &self.reserved,
                             &attached.token,
                             id,
-                            ipc::IpcEventError::memory_full(
-                                &self.memory,
-                                &self.control_memory,
-                                "Server active memory budget is full while reading the event request; the operation was not dispatched",
-                            )
-                            .map(ipc::EventWireFrame::Error),
+                            ipc::EventWireFrame::Error(err.value),
                         );
+                        drop(err.owner);
                         continue;
                     }
                     _ => return,
@@ -1046,14 +1059,26 @@ impl Daemon {
                 }
                 ToDaemon::EventsList { id } => match self.service.event_bus().list_event_types() {
                     Ok(result) => {
-                        events::queue_event_frame(
+                        if !events::queue_event_frame(
                             outgoing,
                             &self.memory,
-                            &self.reserved,
-                            &attached.token,
                             id,
                             result.map(ipc::EventWireFrame::ListResult),
-                        );
+                        ) {
+                            events::queue_event_control(
+                                outgoing,
+                                &self.memory,
+                                &self.reserved,
+                                &attached.token,
+                                id,
+                                ipc::EventWireFrame::Error(ipc::IpcEventError {
+                                    code: -32025,
+                                    message: "daemon active memory budget full during events/list"
+                                        .to_owned(),
+                                    data: None,
+                                }),
+                            );
+                        }
                     }
                     Err(error) => {
                         events::queue_event_control(
@@ -1073,14 +1098,27 @@ impl Daemon {
                         .poll(request, Some(&attached.session_id))
                     {
                         Ok(result) => {
-                            events::queue_event_frame(
+                            if !events::queue_event_frame(
                                 outgoing,
                                 &self.memory,
-                                &self.reserved,
-                                &attached.token,
                                 id,
                                 result.map(ipc::EventWireFrame::PollResult),
-                            );
+                            ) {
+                                events::queue_event_control(
+                                    outgoing,
+                                    &self.memory,
+                                    &self.reserved,
+                                    &attached.token,
+                                    id,
+                                    ipc::EventWireFrame::Error(ipc::IpcEventError {
+                                        code: -32025,
+                                        message:
+                                            "daemon active memory budget full during events/poll"
+                                                .to_owned(),
+                                        data: None,
+                                    }),
+                                );
+                            }
                         }
                         Err(error) => {
                             events::queue_event_control(

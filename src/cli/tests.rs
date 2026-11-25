@@ -469,9 +469,8 @@ mod stdio_transport_tests {
         assert!(flags.stream);
         assert!(daemon_flags("emit", &["--http".into(), "127.0.0.1:0".into()]).is_err());
 
-        // Accepts mcpcli eventId/truncated aliases and fills source/topic from CLI flags.
         let parsed = parse_emit_payload(
-            r#"{"eventId":"evt-42","name":"pr.merged","data":{"n":1},"truncated":true}"#,
+            r#"{"eventId":"evt-42","name":"pr.merged","timestamp":"2026-11-25T00:00:00Z","data":{"n":1},"cursor":"c-1","_meta":{"trace":"1"}}"#,
             Some("github"),
             Some("pr"),
         )
@@ -479,12 +478,27 @@ mod stdio_transport_tests {
         assert_eq!(parsed.source, "github");
         assert_eq!(parsed.topic.as_deref(), Some("pr"));
         assert_eq!(parsed.name, "pr.merged");
-        assert_eq!(parsed.upstream_event_id, "evt-42");
-        assert_eq!(parsed.upstream_truncated, Some(true));
+        assert_eq!(parsed.event_id, "evt-42");
+        assert_eq!(parsed.timestamp.as_deref(), Some("2026-11-25T00:00:00Z"));
+
+        for rejected in [
+            r#"{"upstreamEventId":"evt-42","name":"pr.merged","data":{"n":1}}"#,
+            r#"{"eventId":"evt-42","name":"pr.merged","data":{"n":1},"truncated":true}"#,
+            r#"{"eventId":"evt-42","name":"pr.merged","data":{"n":1},"upstreamTruncated":true}"#,
+            r#"{"eventId":"evt-42","name":"pr.merged","data":{"n":1},"extra":1}"#,
+            r#"{"eventId":"evt-42","name":"pr.merged"}"#,
+            r#"{"eventId":"evt-42","name":"pr.merged","timestamp":"","data":{}}"#,
+            r#"{"eventType":"task.exited","eventId":"evt-42","name":"pr.merged","data":{}}"#,
+        ] {
+            assert!(
+                parse_emit_payload(rejected, Some("github"), None).is_err(),
+                "unexpectedly accepted {rejected}"
+            );
+        }
 
         // Rejects oversized payloads (> 64 KiB).
         let huge = format!(
-            r#"{{"source":"s","name":"n","upstreamEventId":"1","data":"{}"}}"#,
+            r#"{{"source":"s","name":"n","eventId":"1","data":"{}"}}"#,
             "x".repeat(events::MAX_EXTERNAL_EVENT_BYTES)
         );
         assert!(parse_emit_payload(&huge, None, None).is_err());
@@ -505,7 +519,20 @@ mod stdio_transport_tests {
             decode_mcp_header_value(&encoded).as_deref(),
             Some("external.event")
         );
-        assert!(decode_mcp_header_value("=?base64?!!!invalid!!!?=").is_none());
+        for malformed in [
+            "",
+            " external.event",
+            "external.event ",
+            "external\tevent",
+            "external\x7fevent",
+            "=?base64?!!!invalid!!!?=",
+            "=?base64?unclosed",
+        ] {
+            assert!(
+                decode_mcp_header_value(malformed).is_none(),
+                "unexpectedly accepted {malformed:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -539,5 +566,151 @@ mod stdio_transport_tests {
             read_bounded_line(&mut reader, &mut buf, 16).await.unwrap(),
             BoundedLine::Eof
         );
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_drops_pre_init_and_custom_notifications_and_preserves_error_ids() {
+        use tokio::io::AsyncBufReadExt;
+
+        let leases = Arc::new(RequestLeases::default());
+        let (mut client_write, server_read) = tokio::io::duplex(64 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(64 * 1024);
+        let mut transport = StdioTransport::new(server_read, server_write, Arc::clone(&leases));
+        let mut out_lines = tokio::io::BufReader::new(client_read).lines();
+
+        // 1. Pre-init notifications (standard, custom, and malformed without id) are dropped,
+        // including after `server/discover` and `ping` before `initialize`.
+        client_write
+            .write_all(
+                concat!(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/custom\",\"params\":{\"x\":1}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":123}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/roots/list_changed\"}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/custom\"}\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let disc = transport.receive().await.expect("discover");
+        assert!(matches!(
+            disc,
+            rmcp::model::JsonRpcMessage::Request(ref r)
+                if matches!(r.request, rmcp::model::ClientRequest::DiscoverRequest(_))
+        ));
+        let ping = transport.receive().await.expect("ping");
+        assert!(matches!(
+            ping,
+            rmcp::model::JsonRpcMessage::Request(ref r)
+                if matches!(r.request, rmcp::model::ClientRequest::PingRequest(_))
+        ));
+
+        // 2. Malformed syntax -> -32700 (id: null); valid JSON object errors preserve string/integer id!
+        client_write
+            .write_all(
+                concat!(
+                    "{not valid json\n",
+                    "{\"jsonrpc\":\"1.0\",\"id\":\"bad-ver\",\"method\":\"ping\"}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":999}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":\"bad-params\",\"method\":\"tools/call\",\"params\":\"wrong\"}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":-7,\"method\":\"initialize\",\"params\":{\"bad\":1}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/custom\",\"params\":{\"ignored\":true}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let init = transport.receive().await.expect("initialize");
+        assert!(matches!(
+            init,
+            rmcp::model::JsonRpcMessage::Request(ref r)
+                if matches!(r.request, rmcp::model::ClientRequest::InitializeRequest(_))
+        ));
+        // CustomNotification after initialize is also dropped; standard InitializedNotification arrives.
+        let inited = transport.receive().await.expect("initialized notification");
+        assert!(matches!(
+            inited,
+            rmcp::model::JsonRpcMessage::Notification(ref n)
+                if matches!(n.notification, rmcp::model::ClientNotification::InitializedNotification(_))
+        ));
+
+        let mut errs = Vec::new();
+        for _ in 0..5 {
+            let line = out_lines.next_line().await.unwrap().unwrap();
+            errs.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+        }
+        assert_eq!(errs[0]["error"]["code"], -32700);
+        assert!(errs[0]["id"].is_null());
+        assert_eq!(errs[1]["error"]["code"], -32600);
+        assert_eq!(errs[1]["id"], "bad-ver");
+        assert_eq!(errs[2]["error"]["code"], -32600);
+        assert_eq!(errs[2]["id"], 42);
+        assert_eq!(errs[3]["error"]["code"], -32602);
+        assert_eq!(errs[3]["id"], "bad-params");
+        assert_eq!(errs[4]["error"]["code"], -32602);
+        assert_eq!(errs[4]["id"], -7);
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_survives_mid_line_overload_oversized_and_budget_errors() {
+        use tokio::io::AsyncBufReadExt;
+
+        let leases = Arc::new(RequestLeases::default());
+        let (mut client_write, server_read) = tokio::io::duplex(256 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(64 * 1024);
+        let mut transport = StdioTransport::new(server_read, server_write, Arc::clone(&leases));
+        transport.max_line_length = 40 * 1024;
+        let mut out_lines = tokio::io::BufReader::new(client_read).lines();
+
+        let tight_main = lease::BytePool::new(4096);
+        let tight_ctrl = lease::BytePool::new(4096);
+        transport.line_buf = crate::ingress::Buffer::new(tight_main, tight_ctrl);
+
+        let mid_overload = format!(
+            "{{\"jsonrpc\":\"2.0\",\"params\":{{\"nested\":{{\"id\":999}}}},\"id\":\"mid-1\",\"pad\":\"{}\"}}\n",
+            "x".repeat(20 * 1024)
+        );
+        // Follow immediately with an oversized (> 40 KiB max_line_length) request and a valid ping!
+        let oversized = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"tools/call\",\"params\":{{\"pad\":\"{}\"}}}}\n",
+            "y".repeat(45 * 1024)
+        );
+        client_write
+            .write_all(mid_overload.as_bytes())
+            .await
+            .unwrap();
+        client_write.write_all(oversized.as_bytes()).await.unwrap();
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+
+        let next = transport
+            .receive()
+            .await
+            .expect("session must survive overload and oversized lines");
+        match next {
+            rmcp::model::JsonRpcMessage::Request(req) => {
+                assert_eq!(req.id, rmcp::model::RequestId::Number(99));
+            }
+            other => panic!("expected ping request 99, got {other:?}"),
+        }
+
+        let err1: serde_json::Value =
+            serde_json::from_str(&out_lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(err1["id"], "mid-1");
+        assert_eq!(err1["error"]["code"], -32603);
+
+        let err2: serde_json::Value =
+            serde_json::from_str(&out_lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(err2["id"], 88);
+        assert_eq!(err2["error"]["code"], -32600);
     }
 }

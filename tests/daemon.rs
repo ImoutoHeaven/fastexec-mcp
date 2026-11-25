@@ -3286,7 +3286,8 @@ fn daemon_emit_single_and_stream_ndjson() {
     assert!(!forged_out.status.success());
     assert!(!forged_out.stderr.is_empty());
 
-    // 2. --stream mode handles \n and \r\n, deduplicates, and reports per-line errors.
+    // 2. --stream mode handles \n and \r\n, deduplicates, accepts SEP-3415 timestamp/cursor,
+    // and rejects unknown fields and oversized lines.
     let mut stream = fixture
         .command(&[
             "daemon",
@@ -3309,7 +3310,9 @@ fn daemon_emit_single_and_stream_ndjson() {
         stdin
             .write_all(
                 b"{\"eventId\":\"e1\",\"name\":\"merged\",\"data\":{\"n\":1}}\n\
-                  {\"eventId\":\"e3\",\"name\":\"opened\",\"data\":{\"n\":3}}\r\n\
+                  {\"eventId\":\"e3\",\"name\":\"opened\",\"timestamp\":\"2026-11-25T00:00:00Z\",\"cursor\":\"c1\",\"_meta\":{},\"data\":{\"n\":3}}\r\n\
+                  {\"upstreamEventId\":\"bad-id\",\"name\":\"opened\",\"data\":{}}\n\
+                  {\"eventId\":\"e-trunc\",\"name\":\"opened\",\"truncated\":true,\"data\":{}}\n\
                   not-json\n",
             )
             .unwrap();
@@ -3333,7 +3336,7 @@ fn daemon_emit_single_and_stream_ndjson() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(lines.len(), 5);
+    assert_eq!(lines.len(), 7);
     assert_eq!(lines[0]["ok"], true);
     assert_eq!(lines[0]["deduplicated"], true);
     assert_eq!(lines[1]["ok"], true);
@@ -3341,15 +3344,33 @@ fn daemon_emit_single_and_stream_ndjson() {
     assert!(lines[1]["eventId"].is_string());
     assert!(lines[1]["cursor"].is_string());
     assert_eq!(lines[2]["ok"], false);
-    assert!(lines[2]["error"].is_string());
+    assert!(
+        lines[2]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field `upstreamEventId`"),
+        "{}",
+        lines[2]
+    );
     assert_eq!(lines[3]["ok"], false);
-    assert_eq!(lines[3]["error"], "event payload exceeds 65536 byte limit");
-    assert_eq!(lines[4]["ok"], true);
-    assert_eq!(lines[4]["deduplicated"], false);
+    assert!(
+        lines[3]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field `truncated`"),
+        "{}",
+        lines[3]
+    );
+    assert_eq!(lines[4]["ok"], false);
+    assert!(lines[4]["error"].is_string());
+    assert_eq!(lines[5]["ok"], false);
+    assert_eq!(lines[5]["error"], "event payload exceeds 65536 byte limit");
+    assert_eq!(lines[6]["ok"], true);
+    assert_eq!(lines[6]["deduplicated"], false);
 }
 
 #[test]
-fn event_stream_resumes_after_endpoint_backpressure_and_ends_on_daemon_stop() {
+fn event_stream_terminates_cleanly_on_endpoint_backpressure_and_ends_on_daemon_stop() {
     const COUNT: usize = 350;
     let fixture = Fixture::new("events-backpressure");
     let (resume, pause) = channel();
@@ -3367,6 +3388,7 @@ fn event_stream_resumes_after_endpoint_backpressure_and_ends_on_daemon_stop() {
         message["method"] == "notifications/events/active" || message["id"] == subscription
     });
     assert_eq!(active["method"], "notifications/events/active", "{active}");
+    let mut last_cursor = active["params"]["cursor"].as_str().unwrap().to_owned();
     let mut emitter = fixture
         .command(&["daemon", "emit", "--stream", "--source", "burst"])
         .stdin(Stdio::piped())
@@ -3403,53 +3425,85 @@ fn event_stream_resumes_after_endpoint_backpressure_and_ends_on_daemon_stop() {
     resume.send(()).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut received = 0;
-    let mut resumptions = 0;
-    while received < COUNT {
+    let mut received = 0usize;
+    let mut terminated = false;
+    loop {
         let message = endpoint
             .lines
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .expect("stream did not resume");
+            .expect("stream did not finish after backpressure");
+        if message["id"] == subscription {
+            assert!(
+                terminated,
+                "stream completed without terminated notice: {message}"
+            );
+            assert_eq!(message["result"]["resultType"], "complete", "{message}");
+            break;
+        }
         assert_eq!(
             message["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], subscription,
             "{message}"
         );
         match message["method"].as_str() {
-            Some("notifications/events/active") => {
-                assert_eq!(message["params"]["truncated"], false, "{message}");
-                resumptions += 1;
-            }
             Some("notifications/events/event") => {
+                assert_eq!(message["params"]["data"]["eventId"], format!("e{received}"));
                 assert_eq!(
                     message["params"]["data"]["data"]["index"], received,
                     "{message}"
                 );
+                last_cursor = message["params"]["cursor"].as_str().unwrap().to_owned();
                 received += 1;
             }
+            Some("notifications/events/terminated") => {
+                assert!(!terminated, "duplicate terminated notice: {message}");
+                assert_eq!(message["params"]["error"]["code"], -32025, "{message}");
+                terminated = true;
+            }
             Some("notifications/events/heartbeat") => {}
-            _ => panic!("unexpected stream message: {message}"),
+            _ => panic!("unexpected stream message (must not loop active): {message}"),
         }
     }
-    assert!(resumptions > 0, "the test did not fill the endpoint queue");
+    assert!(received > 0 && received < COUNT, "received={received}");
+
     let listed = endpoint.request("events/list", json!({"_meta": meta}));
     assert!(listed.get("error").is_none(), "{listed}");
+
+    let polled = endpoint.request(
+        "events/poll",
+        json!({"name": "external.event", "cursor": last_cursor, "maxEvents": 500, "_meta": meta}),
+    );
+    assert!(polled.get("error").is_none(), "{polled}");
+
+    let subscription2 = endpoint.request_later(
+        "events/stream",
+        json!({"name": "external.event", "_meta": meta}),
+    );
+    let active2 = endpoint.next_matching("second stream did not activate", |message| {
+        message["method"] == "notifications/events/active"
+            && message["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == subscription2
+    });
+    assert_eq!(
+        active2["method"], "notifications/events/active",
+        "{active2}"
+    );
 
     let (code, out, err) = fixture.run(&["daemon", "stop"]);
     assert_eq!(code, 0, "{out}{err}");
     let ended = endpoint.next_matching("daemon stop did not terminate the stream", |message| {
         message["method"] == "notifications/events/terminated"
+            && message["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == subscription2
     });
     assert_eq!(ended["params"]["error"]["code"], -32000, "{ended}");
 }
 
 #[cfg(unix)]
 #[test]
-fn protocol_4_hello_is_rejected_by_protocol_5_daemon() {
+fn older_protocol_hello_is_rejected_by_current_daemon() {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::UnixStream;
 
-    let fixture = Fixture::new("proto4");
+    let fixture = Fixture::new("proto5");
     let (_, status_before, _) = fixture.run(&["daemon", "status"]);
     let namespace = status_before
         .trim_end()
@@ -3481,18 +3535,18 @@ fn protocol_4_hello_is_rejected_by_protocol_5_daemon() {
     for frame in [
         json!({
             "type": "hello",
-            "protocol": 4,
+            "protocol": 5,
             "namespace": namespace,
             "build": "test",
             "session": "0123456789abcdef0123456789",
             "connection": 1,
-            "client_name": "proto4-test",
+            "client_name": "proto5-test",
             "cwd": "/tmp",
             "env": []
         }),
         json!({
             "type": "hello_emit",
-            "protocol": 4,
+            "protocol": 5,
             "build": "test"
         }),
     ] {
@@ -3513,6 +3567,6 @@ fn protocol_4_hello_is_rejected_by_protocol_5_daemon() {
         stream.read_exact(&mut reply_buf).unwrap();
         let reply: Value = serde_json::from_slice(&reply_buf).unwrap();
         assert_eq!(reply["type"], json!("reject"), "{reply}");
-        assert_eq!(reply["message"], json!("protocol 4 is not 5"), "{reply}");
+        assert_eq!(reply["message"], json!("protocol 5 is not 6"), "{reply}");
     }
 }

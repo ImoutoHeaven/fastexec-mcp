@@ -1,7 +1,7 @@
 name: release
 
 # A pushed tag vX.Y.Z builds every platform, runs the CI suite on the tagged commit, and creates a
-# draft GitHub Release. A manual run builds and smoke-tests the archives without releasing.
+# draft GitHub Release. A manual run skips the CI job and builds and smoke-tests the archives.
 on:
   push:
     tags: ["v*"]
@@ -91,9 +91,11 @@ jobs:
         run: |
           name="fastexec-$VERSION-${{ matrix.name }}"
           mkdir -p "dist/$name"
-          mkdir -p "dist/$name/vendor/conpty"
           cp "$BIN" LICENSE NOTICE README.md "dist/$name/"
-          cp vendor/conpty/LICENSE "dist/$name/vendor/conpty/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            mkdir -p "dist/$name/vendor/conpty"
+            cp vendor/conpty/LICENSE "dist/$name/vendor/conpty/"
+          fi
           cd dist
           if [ "$RUNNER_OS" = Windows ]; then
             pwsh -NoProfile -NonInteractive -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
@@ -197,9 +199,8 @@ jobs:
             rustc --version
             cargo build --release --locked
             name="fastexec-$VERSION-freebsd-amd64"
-            mkdir -p "dist/$name/vendor/conpty"
+            mkdir -p "dist/$name"
             cp "$CARGO_TARGET_DIR/release/fastexec" LICENSE NOTICE README.md "dist/$name/"
-            cp vendor/conpty/LICENSE "dist/$name/vendor/conpty/"
             tar -czf "dist/$name.tar.gz" -C dist "$name"
             probe=$(mktemp -d)
             trap 'rm -rf "$probe"' EXIT

@@ -13,12 +13,15 @@ pub(crate) struct Buffer {
     in_control: bool,
     lease: Lease,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) const SNIFF_HEAD_LIMIT: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
     Limit,
-    Budget,
+    Budget { id: Option<rmcp::model::RequestId> },
     Syntax,
-    Data,
+    InvalidRequest { id: Option<rmcp::model::RequestId> },
+    InvalidParams { id: rmcp::model::RequestId },
 }
 pub(crate) struct Parsed {
     pub message: ClientJsonRpcMessage,
@@ -89,7 +92,7 @@ impl Buffer {
                     break;
                 }
             }
-            let capacity = admitted.ok_or(Failure::Budget)?;
+            let capacity = admitted.ok_or(Failure::Budget { id: None })?;
             let mut replacement = Vec::with_capacity(capacity);
             replacement.extend_from_slice(&self.bytes);
             self.bytes = replacement;
@@ -101,7 +104,10 @@ impl Buffer {
     pub fn parse(mut self, stdio: bool) -> Result<Option<Parsed>, Failure> {
         let len = self.bytes.len();
         if !self.resize(self.bytes.capacity().saturating_add(3 * len), len) {
-            return Err(Failure::Budget);
+            let id = stdio
+                .then(|| sniff_request_id(&self.bytes, len <= SNIFF_HEAD_LIMIT))
+                .flatten();
+            return Err(Failure::Budget { id });
         }
         let raw = if stdio {
             self.bytes
@@ -115,13 +121,7 @@ impl Buffer {
         }
         // Slice decoding can retain twice the longest escaped token as scratch,
         // alongside the decoded Value and original bytes.
-        let value: serde_json::Value =
-            serde_json::from_slice(raw).map_err(|error| match error.classify() {
-                serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-                    Failure::Syntax
-                }
-                _ => Failure::Data,
-            })?;
+        let value: serde_json::Value = serde_json::from_slice(raw).map_err(|_| Failure::Syntax)?;
         // Borrow the Value to avoid owned serde Content string copies. Retained
         // space covers SDK params, metadata, tool conversion and the request ID.
         let retained = 4 * len;
@@ -131,19 +131,25 @@ impl Buffer {
             .saturating_add(value_capacity(&value))
             .saturating_add(retained);
         if !self.resize(peak, len) {
-            return Err(Failure::Budget);
+            if stdio && value.as_object().is_some_and(|obj| !obj.contains_key("id")) {
+                return Ok(None);
+            }
+            let id = stdio.then(|| extract_value_request_id(&value)).flatten();
+            return Err(Failure::Budget { id });
         }
-        let parsed = ClientJsonRpcMessage::deserialize(&value);
-        if parsed.is_err()
-            && stdio
-            && let Some(method) = value.get("method").and_then(serde_json::Value::as_str)
-            && ((value.get("id").is_none() && !crate::ingress::is_standard_mcp_method(method))
-                || (method.starts_with("notifications/")
-                    && !crate::ingress::is_standard_mcp_notification(method)))
-        {
-            return Ok(None);
-        }
-        let message = parsed.map_err(|_| Failure::Data)?;
+        let message = match ClientJsonRpcMessage::deserialize(&value) {
+            Ok(rmcp::model::JsonRpcMessage::Request(req))
+                if matches!(
+                    &req.request,
+                    rmcp::model::ClientRequest::CustomRequest(custom)
+                        if is_typed_client_request(&custom.method)
+                ) =>
+            {
+                return Err(Failure::InvalidParams { id: req.id });
+            }
+            Ok(message) => message,
+            Err(_) => return classify_deserialize_failure(&value, stdio),
+        };
         drop(value);
         drop(std::mem::take(&mut self.bytes));
         self.lease.shrink_to(retained);
@@ -152,8 +158,16 @@ impl Buffer {
         // dispatch, so media pressure cannot consume the control reserve.
         if self.in_control && !is_control(&message) {
             let Some(lease) = self.pool.try_acquire(retained) else {
+                if stdio && matches!(message, rmcp::model::JsonRpcMessage::Notification(_)) {
+                    drop(message);
+                    return Ok(None);
+                }
+                let id = match &message {
+                    rmcp::model::JsonRpcMessage::Request(req) if stdio => Some(req.id.clone()),
+                    _ => None,
+                };
                 drop(message);
-                return Err(Failure::Budget);
+                return Err(Failure::Budget { id });
             };
             self.lease = lease;
             self.in_control = false;
@@ -163,6 +177,69 @@ impl Buffer {
             owner: Owner::new(std::sync::Mutex::new(self.lease)),
         }))
     }
+}
+
+fn is_typed_client_request(method: &str) -> bool {
+    matches!(
+        method,
+        "ping"
+            | "initialize"
+            | "server/discover"
+            | "completion/complete"
+            | "logging/setLevel"
+            | "prompts/get"
+            | "prompts/list"
+            | "resources/list"
+            | "resources/templates/list"
+            | "resources/read"
+            | "subscriptions/listen"
+            | "resources/subscribe"
+            | "resources/unsubscribe"
+            | "tools/call"
+            | "tools/list"
+            | "tasks/get"
+            | "tasks/update"
+            | "tasks/cancel"
+            | "skills/list"
+            | "skills/get"
+            | "resources/directory/read"
+    )
+}
+
+fn extract_value_request_id(value: &serde_json::Value) -> Option<rmcp::model::RequestId> {
+    match value.as_object()?.get("id")? {
+        serde_json::Value::String(s) => Some(rmcp::model::RequestId::String(Arc::from(s.as_str()))),
+        serde_json::Value::Number(n) => n.as_i64().map(rmcp::model::RequestId::Number),
+        _ => None,
+    }
+}
+
+fn classify_deserialize_failure(
+    value: &serde_json::Value,
+    stdio: bool,
+) -> Result<Option<Parsed>, Failure> {
+    let Some(obj) = value.as_object() else {
+        return Err(Failure::InvalidRequest { id: None });
+    };
+    if !obj.contains_key("id") {
+        if stdio {
+            return Ok(None);
+        }
+        return Err(Failure::InvalidRequest { id: None });
+    }
+    let id = extract_value_request_id(value);
+    if obj.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
+        && obj
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        && !obj.contains_key("result")
+        && !obj.contains_key("error")
+        && let Some(id) = id
+    {
+        return Err(Failure::InvalidParams { id });
+    }
+    Err(Failure::InvalidRequest { id })
 }
 fn is_control(message: &ClientJsonRpcMessage) -> bool {
     use rmcp::model::{ClientNotification, ClientRequest, JsonRpcMessage};
@@ -243,44 +320,121 @@ pub(crate) fn retain_id(owner: &Owner, id: &rmcp::model::RequestId) -> Owner {
 
 pub(crate) const UTF8_BOM: &[u8; 3] = b"\xEF\xBB\xBF";
 
-pub(crate) fn is_standard_mcp_notification(method: &str) -> bool {
-    matches!(
-        method,
-        "notifications/cancelled"
-            | "notifications/initialized"
-            | "notifications/message"
-            | "notifications/progress"
-            | "notifications/prompts/list_changed"
-            | "notifications/resources/list_changed"
-            | "notifications/resources/updated"
-            | "notifications/roots/list_changed"
-            | "notifications/subscriptions/acknowledged"
-            | "notifications/tools/list_changed"
-    )
+/// Scans at most [`SNIFF_HEAD_LIMIT`] bytes for a top-level JSON-RPC `"id"` field.
+pub(crate) fn sniff_request_id(raw: &[u8], complete: bool) -> Option<rmcp::model::RequestId> {
+    let truncated = !complete || raw.len() > SNIFF_HEAD_LIMIT;
+    let head = &raw[..raw.len().min(SNIFF_HEAD_LIMIT)];
+    let bytes = head.strip_prefix(UTF8_BOM).unwrap_or(head);
+    let mut i = skip_ws(bytes, 0);
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    loop {
+        i = skip_ws(bytes, i);
+        match bytes.get(i)? {
+            b'}' => return None,
+            b'"' => {}
+            _ => return None,
+        }
+        let key_end = scan_string_end(bytes, i)?;
+        let is_id = bytes[i..key_end] == *b"\"id\""
+            || serde_json::from_slice::<String>(&bytes[i..key_end])
+                .ok()
+                .as_deref()
+                == Some("id");
+        i = skip_ws(bytes, key_end);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_ws(bytes, i + 1);
+        if is_id {
+            return match bytes.get(i)? {
+                b'"' => {
+                    let val_end = scan_string_end(bytes, i)?;
+                    let s: String = serde_json::from_slice(&bytes[i..val_end]).ok()?;
+                    Some(rmcp::model::RequestId::String(Arc::from(s.as_str())))
+                }
+                b'-' | b'0'..=b'9' => {
+                    let start = i;
+                    while let Some(&b) = bytes.get(i) {
+                        if matches!(b, b'-' | b'+' | b'0'..=b'9' | b'.' | b'e' | b'E') {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if i == bytes.len() && truncated {
+                        return None;
+                    }
+                    let num: serde_json::Number = serde_json::from_slice(&bytes[start..i]).ok()?;
+                    num.as_i64().map(rmcp::model::RequestId::Number)
+                }
+                _ => None,
+            };
+        }
+        i = skip_value(bytes, i)?;
+        i = skip_ws(bytes, i);
+        if bytes.get(i) != Some(&b',') {
+            return None;
+        }
+        i += 1;
+    }
 }
 
-pub(crate) fn is_standard_mcp_method(method: &str) -> bool {
-    matches!(
-        method,
-        "initialize"
-            | "ping"
-            | "server/discover"
-            | "prompts/get"
-            | "prompts/list"
-            | "resources/list"
-            | "resources/read"
-            | "resources/subscribe"
-            | "resources/unsubscribe"
-            | "resources/templates/list"
-            | "subscriptions/listen"
-            | "tools/call"
-            | "tools/list"
-            | "completion/complete"
-            | "elicitation/create"
-            | "logging/setLevel"
-            | "roots/list"
-            | "sampling/createMessage"
-    ) || is_standard_mcp_notification(method)
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
+fn scan_string_end(bytes: &[u8], start_quote: usize) -> Option<usize> {
+    let mut i = start_quote + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            0x00..=0x1f => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_value(bytes: &[u8], mut i: usize) -> Option<usize> {
+    match bytes.get(i)? {
+        b'"' => scan_string_end(bytes, i),
+        b'{' | b'[' => {
+            let mut depth = 1usize;
+            i += 1;
+            while i < bytes.len() && depth > 0 {
+                match bytes[i] {
+                    b'"' => i = scan_string_end(bytes, i)?,
+                    b'{' | b'[' => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'}' | b']' => {
+                        depth -= 1;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            (depth == 0).then_some(i)
+        }
+        _ => {
+            let start = i;
+            while let Some(&b) = bytes.get(i) {
+                if b.is_ascii_whitespace() || matches!(b, b',' | b'}' | b']' | b'"' | b'{' | b'[') {
+                    break;
+                }
+                i += 1;
+            }
+            (i > start).then_some(i)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -316,7 +470,7 @@ mod tests {
         let refused = BytePool::new(peak - 1);
         assert!(matches!(
             buffered(raw, &refused).parse(true),
-            Err(Failure::Budget)
+            Err(Failure::Budget { .. })
         ));
         assert_eq!(refused.used(), 0);
         let pool = BytePool::new(peak);
@@ -353,7 +507,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             growing.append(b" ", SHORT_REQUEST + 1),
-            Err(Failure::Budget)
+            Err(Failure::Budget { id: None })
         );
         assert_eq!(growing.len(), SHORT_REQUEST);
         drop(growing);
@@ -368,7 +522,7 @@ mod tests {
         for raw in [ordinary.as_slice(), initialize.as_slice()] {
             let mut buffer = Buffer::new(BytePool::new(0), Arc::clone(&control));
             buffer.append(raw, SHORT_REQUEST).unwrap();
-            assert!(matches!(buffer.parse(false), Err(Failure::Budget)));
+            assert!(matches!(buffer.parse(false), Err(Failure::Budget { .. })));
             assert_eq!(control.used(), 0);
         }
         for action in ["list", "kill"] {
@@ -457,7 +611,7 @@ mod tests {
         assert_eq!(pool.used(), 0);
         assert!(matches!(
             buffered(b"[]", &pool).parse(false),
-            Err(Failure::Data)
+            Err(Failure::InvalidRequest { id: None })
         ));
         assert_eq!(pool.used(), 0);
     }

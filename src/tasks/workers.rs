@@ -335,9 +335,12 @@ fn wait_task(job: WaitWork) {
         leftovers,
         kept,
     });
-    shared.retire_finished(&mut registry);
+    let retired = shared.retire_finished(&mut registry);
     shared.emit_task_exited(&task);
     drop(registry);
+    for evicted in &retired {
+        shared.evict_log(evicted);
+    }
     task.done.send_replace(true);
 }
 
@@ -371,9 +374,13 @@ fn finish_tree(
     } else {
         task.hold_unconfirmed_tree();
     }
-    shared.retire_finished(&mut registry);
+    let retired = shared.retire_finished(&mut registry);
     if tree_ended && lock(&task.end).as_ref().is_some_and(|end| end.kept) {
         shared.emit_task_exited(task);
+    }
+    drop(registry);
+    for evicted in &retired {
+        shared.evict_log(evicted);
     }
 }
 

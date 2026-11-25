@@ -456,12 +456,34 @@ pub(crate) fn decode_mcp_header_value(raw: &str) -> Option<String> {
             .ok()?;
         return String::from_utf8(bytes).ok();
     }
+    if raw.is_empty()
+        || raw.starts_with(' ')
+        || raw.ends_with(' ')
+        || !raw.bytes().all(|b| (0x20..=0x7E).contains(&b))
+    {
+        return None;
+    }
     Some(raw.to_owned())
 }
 
+fn reject_unexpected_mcp_name_header(
+    context: &RequestContext<RoleServer>,
+) -> Result<(), rmcp::ErrorData> {
+    let Some(parts) = context.extensions.get::<::http::request::Parts>() else {
+        return Ok(());
+    };
+    if parts.headers.get_all("mcp-name").iter().next().is_some() {
+        return Err(rmcp::ErrorData::header_mismatch(
+            "events/list does not accept Mcp-Name header",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Validates the HTTP `Mcp-Name` header against `params.name` (supporting `=?base64?...?=`
-/// decoding). During Beta interop, a missing header is tolerated while any present header that
-/// fails decoding or mismatches `params.name` returns `ErrorData::header_mismatch` (HTTP 400 / -32020).
+/// decoding). Missing header is allowed; duplicate, malformed, or mismatched headers return
+/// `ErrorData::header_mismatch` (HTTP 400 / -32020).
 fn validate_mcp_name_header(
     context: &RequestContext<RoleServer>,
     expected_name: &str,
@@ -469,15 +491,21 @@ fn validate_mcp_name_header(
     let Some(parts) = context.extensions.get::<::http::request::Parts>() else {
         return Ok(());
     };
-    let Some(raw_header) = parts.headers.get("mcp-name") else {
+    let mut values = parts.headers.get_all("mcp-name").iter();
+    let Some(raw_header) = values.next() else {
         return Ok(());
     };
+    if values.next().is_some() {
+        return Err(rmcp::ErrorData::header_mismatch(
+            "duplicate Mcp-Name header is not allowed",
+            None,
+        ));
+    }
     let raw_str = raw_header.to_str().map_err(|_| {
         rmcp::ErrorData::header_mismatch("Mcp-Name header is not valid ASCII", None)
     })?;
-    let decoded = decode_mcp_header_value(raw_str).ok_or_else(|| {
-        rmcp::ErrorData::header_mismatch("Mcp-Name header has invalid base64 encoding", None)
-    })?;
+    let decoded = decode_mcp_header_value(raw_str)
+        .ok_or_else(|| rmcp::ErrorData::header_mismatch("Mcp-Name header is malformed", None))?;
     if decoded != expected_name {
         return Err(rmcp::ErrorData::header_mismatch(
             format!("Mcp-Name header ({decoded:?}) does not match params.name ({expected_name:?})"),
@@ -543,6 +571,7 @@ impl Server {
         params: Option<serde_json::Value>,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CustomResult, rmcp::ErrorData> {
+        reject_unexpected_mcp_name_header(&context)?;
         if let Some(value) = params
             && !value.is_object()
             && !value.is_null()
@@ -618,8 +647,7 @@ impl Server {
             Backend::Local { launch, .. } => (launch.memory(), launch.control_memory()),
             Backend::Daemon(endpoint) => (endpoint.memory(), endpoint.control_memory()),
         };
-        // The pending notification and a reconnect request may hold independent ID/input copies.
-        // Fixed metadata covers fastexec cursors and terminal error envelopes.
+        // Fixed metadata covers subscription ID copies, cursors, and terminal error envelopes.
         let metadata_bytes = ipc::json_len(&(&sub_req, &context.id))
             .unwrap_or(usize::MAX)
             .saturating_mul(3)
@@ -721,104 +749,102 @@ impl Server {
             }
             Backend::Daemon(endpoint) => {
                 let client = client_name(&context);
-                let mut request = sub_req;
-                let mut activated = false;
+                let (initial, mut stream) = endpoint
+                    .events_stream(&client, sub_req, context.ct.clone())
+                    .await
+                    .map_err(|error| error.run(ipc_event_error_to_rmcp))?;
+
+                if !send_event_notification(
+                    &context,
+                    "notifications/events/active",
+                    initial.map(serde_json::Value::from),
+                    &sub_id,
+                    &metadata,
+                )
+                .await
+                {
+                    stream.cancel().await;
+                    return Ok(stream_complete_result(&sub_id));
+                }
+
+                let mut terminated_sent = false;
                 loop {
-                    let (initial, mut stream) = match endpoint
-                        .events_stream(&client, request.clone(), context.ct.clone())
-                        .await
-                    {
-                        Ok(stream) => stream,
-                        Err(error) if !activated => return Err(error.run(ipc_event_error_to_rmcp)),
-                        Err(error) => {
-                            if !context.ct.is_cancelled() {
-                                send_event_notification(
-                                    &context,
-                                    "notifications/events/terminated",
-                                    error.map(event_error_payload),
-                                    &sub_id,
-                                    &metadata,
-                                )
-                                .await;
-                            }
+                    tokio::select! {
+                        biased;
+                        _ = context.ct.cancelled() => {
+                            stream.cancel().await;
                             return Ok(stream_complete_result(&sub_id));
                         }
-                    };
-
-                    request.cursor = Some(initial.value.cursor.clone());
-                    request.max_age_ms = None;
-                    if !send_event_notification(
-                        &context,
-                        "notifications/events/active",
-                        initial.map(serde_json::Value::from),
-                        &sub_id,
-                        &metadata,
-                    )
-                    .await
-                    {
-                        stream.cancel().await;
-                        return Ok(stream_complete_result(&sub_id));
-                    }
-
-                    activated = true;
-                    let mut terminated_sent = false;
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = context.ct.cancelled() => {
+                        frame = stream.next() => {
+                            let Some((frame, held)) = frame else {
+                                if !terminated_sent {
+                                    let error = if stream.link_closed() {
+                                        ipc::IpcEventError {
+                                            code: -32000,
+                                            message: "daemon connection closed".to_owned(),
+                                            data: None,
+                                        }
+                                    } else {
+                                        ipc::IpcEventError {
+                                            code: -32025,
+                                            message: "endpoint active memory budget full during event stream".to_owned(),
+                                            data: None,
+                                        }
+                                    };
+                                    send_event_notification(
+                                        &context,
+                                        "notifications/events/terminated",
+                                        terminated(error),
+                                        &sub_id,
+                                        &metadata,
+                                    )
+                                    .await;
+                                }
                                 stream.cancel().await;
                                 return Ok(stream_complete_result(&sub_id));
-                            }
-                            frame = stream.next() => {
-                                let Some((frame, held)) = frame else {
-                                    if !terminated_sent && stream.is_lagged() {
-                                        stream.cancel().await;
-                                        break;
-                                    }
-                                    if !terminated_sent {
-                                        send_event_notification(
-                                            &context,
-                                            "notifications/events/terminated",
-                                            terminated(ipc::IpcEventError {
-                                                code: -32000,
-                                                message: "daemon connection closed".to_owned(),
-                                                data: None,
-                                            }),
-                                            &sub_id,
-                                            &metadata,
-                                        ).await;
-                                    }
-                                    return Ok(stream_complete_result(&sub_id));
-                                };
-                                let owned = ipc::Owned::new(frame, lease::Owner::new(held));
-                                let (method, payload, cursor) = match owned.value {
-                                    ipc::EventWireFrame::Active(active) => {
-                                        let cursor = active.cursor.clone();
-                                        ("notifications/events/active", active.into(), Some(cursor))
-                                    }
-                                    ipc::EventWireFrame::Event(event) => {
-                                        let cursor = event.cursor.clone();
-                                        ("notifications/events/event", event.into(), Some(cursor))
-                                    }
-                                    ipc::EventWireFrame::Heartbeat { cursor } => {
-                                        let payload = events::value_object([("cursor", serde_json::Value::String(cursor.clone()))]);
-                                        ("notifications/events/heartbeat", payload, Some(cursor))
-                                    }
-                                    ipc::EventWireFrame::Error(error) => ("notifications/events/error", event_error_payload(error), None),
-                                    ipc::EventWireFrame::Terminated(error) => {
-                                        terminated_sent = true;
-                                        ("notifications/events/terminated", event_error_payload(error), None)
-                                    }
-                                    ipc::EventWireFrame::Complete => return Ok(stream_complete_result(&sub_id)),
-                                    ipc::EventWireFrame::ListResult(_) | ipc::EventWireFrame::PollResult(_) => continue,
-                                };
-                                if !send_event_notification(&context, method, ipc::Owned::new(payload, owned.owner), &sub_id, &metadata).await {
-                                    stream.cancel().await;
+                            };
+                            let owned = ipc::Owned::new(frame, lease::Owner::new(held));
+                            let (method, payload) = match owned.value {
+                                ipc::EventWireFrame::Active(active) => {
+                                    ("notifications/events/active", active.into())
+                                }
+                                ipc::EventWireFrame::Event(event) => {
+                                    ("notifications/events/event", event.into())
+                                }
+                                ipc::EventWireFrame::Heartbeat { cursor } => {
+                                    let payload = events::value_object([(
+                                        "cursor",
+                                        serde_json::Value::String(cursor),
+                                    )]);
+                                    ("notifications/events/heartbeat", payload)
+                                }
+                                ipc::EventWireFrame::Error(error) => {
+                                    ("notifications/events/error", event_error_payload(error))
+                                }
+                                ipc::EventWireFrame::Terminated(error) => {
+                                    terminated_sent = true;
+                                    (
+                                        "notifications/events/terminated",
+                                        event_error_payload(error),
+                                    )
+                                }
+                                ipc::EventWireFrame::Complete => {
                                     return Ok(stream_complete_result(&sub_id));
                                 }
-                                if let Some(cursor) = cursor {
-                                    request.cursor = Some(cursor);
-                                }
+                                ipc::EventWireFrame::ListResult(_)
+                                | ipc::EventWireFrame::PollResult(_) => continue,
+                            };
+                            if !send_event_notification(
+                                &context,
+                                method,
+                                ipc::Owned::new(payload, owned.owner),
+                                &sub_id,
+                                &metadata,
+                            )
+                            .await
+                            {
+                                stream.cancel().await;
+                                return Ok(stream_complete_result(&sub_id));
                             }
                         }
                     }

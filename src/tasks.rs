@@ -1179,9 +1179,12 @@ impl Tasks {
             leftovers: Vec::new(),
             kept: false,
         });
-        self.retire_finished(&mut registry);
+        let retired = self.retire_finished(&mut registry);
         self.emit_task_exited(task);
         drop(registry);
+        for evicted in &retired {
+            self.evict_log(evicted);
+        }
         task.done.send_replace(true);
     }
 
@@ -1312,10 +1315,9 @@ impl Tasks {
         }
     }
 
-    /// Keeps the [`Limits::max_finished`] most recently finished tasks and deletes the logs of
-    /// older ones. Runs at each completion under the registry guard that shows its end, so the
-    /// task that just finished always stays and no client sees the cap exceeded.
-    fn retire_finished(&self, registry: &mut Registry) {
+    /// Keeps the [`Limits::max_finished`] most recently finished tasks and returns older ones so
+    /// callers evict their logs after releasing the registry lock.
+    fn retire_finished(&self, registry: &mut Registry) -> Vec<Arc<Task>> {
         // Root exit alone cannot retire a task whose ender has not confirmed completion.
         let mut finished: Vec<(Instant, String)> = registry
             .tasks
@@ -1325,20 +1327,22 @@ impl Tasks {
             .collect();
         let keep = self.limits.max_finished;
         if finished.len() <= keep {
-            return;
+            return Vec::new();
         }
         finished.sort();
         let victims: Vec<String> = finished[..finished.len() - keep]
             .iter()
             .map(|(_, id)| id.clone())
             .collect();
+        let mut retired = Vec::with_capacity(victims.len());
         registry.tasks.retain(|task| {
             if !victims.contains(&task.id) {
                 return true;
             }
-            self.evict_log(task);
+            retired.push(Arc::clone(task));
             false
         });
+        retired
     }
 
     /// Removes every finished task that ended at least `finished_ttl` before `now`, deleting its

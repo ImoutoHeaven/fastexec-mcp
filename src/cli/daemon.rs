@@ -195,7 +195,7 @@ async fn cli(action: &str, flags: DaemonFlags) -> i32 {
 }
 
 /// Parses a single JSON object from stdin into an [`events::ExternalEventInput`], applying CLI
-/// `--source` / `--topic` defaults and accepting `eventId` / `truncated` aliases from `mcpcli`.
+/// `--source` and `--topic` defaults.
 pub(super) fn parse_emit_payload(
     raw: &str,
     default_source: Option<&str>,
@@ -214,6 +214,23 @@ pub(super) fn parse_emit_payload(
         .as_object()
         .ok_or_else(|| "event payload must be a JSON object".to_owned())?;
 
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "eventId"
+                | "name"
+                | "timestamp"
+                | "data"
+                | "source"
+                | "topic"
+                | "eventType"
+                | "cursor"
+                | "_meta"
+        ) {
+            return Err(format!("unknown field `{key}`"));
+        }
+    }
+
     let str_field = |key: &str| -> Result<Option<String>, String> {
         match obj.get(key) {
             None | Some(serde_json::Value::Null) => Ok(None),
@@ -221,43 +238,57 @@ pub(super) fn parse_emit_payload(
             Some(_) => Err(format!("field `{key}` must be a string")),
         }
     };
-    let bool_field = |key: &str| -> Result<Option<bool>, String> {
-        match obj.get(key) {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(serde_json::Value::Bool(b)) => Ok(Some(*b)),
-            Some(_) => Err(format!("field `{key}` must be a boolean")),
-        }
-    };
 
-    let event_type = str_field("eventType")?;
+    let event_type = match obj.get("eventType") {
+        None => None,
+        Some(serde_json::Value::String(s)) if s == events::EVENT_EXTERNAL => Some(s.clone()),
+        Some(serde_json::Value::String(s)) => {
+            return Err(format!(
+                "field `eventType` must be {:?}, got {s:?}",
+                events::EVENT_EXTERNAL
+            ));
+        }
+        Some(_) => return Err("field `eventType` must be a string".to_owned()),
+    };
+    let timestamp = match obj.get("timestamp") {
+        None => None,
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(_) => return Err("field `timestamp` must be a non-empty string".to_owned()),
+    };
     let source = str_field("source")?
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| default_source.map(str::to_owned))
+        .or_else(|| {
+            default_source
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        })
         .ok_or_else(|| "missing required `source` (provide in JSON or via --source)".to_owned())?;
     let topic = str_field("topic")?
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| default_topic.map(str::to_owned));
+        .or_else(|| {
+            default_topic
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        });
     let name = str_field("name")?
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "missing required `name`".to_owned())?;
-    let upstream_event_id = str_field("upstreamEventId")?
+    let event_id = str_field("eventId")?
         .filter(|s| !s.trim().is_empty())
-        .or(str_field("eventId")?.filter(|s| !s.trim().is_empty()))
-        .ok_or_else(|| "missing required `upstreamEventId` (or `eventId`)".to_owned())?;
-    let data = obj.get("data").cloned().unwrap_or(serde_json::Value::Null);
-    let upstream_truncated = match bool_field("upstreamTruncated")? {
-        Some(v) => Some(v),
-        None => bool_field("truncated")?,
-    };
+        .ok_or_else(|| "missing required `eventId`".to_owned())?;
+    let data = obj
+        .get("data")
+        .cloned()
+        .ok_or_else(|| "missing required `data`".to_owned())?;
 
     Ok(events::ExternalEventInput {
         event_type,
         source,
         topic,
         name,
-        upstream_event_id,
+        event_id,
+        timestamp,
         data,
-        upstream_truncated,
     })
 }
 

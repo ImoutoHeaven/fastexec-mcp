@@ -2266,12 +2266,14 @@ fn http_idle_connections_are_bounded_and_capacity_recovers() {
     let mut bytes = Vec::new();
     let ended = excess.read_to_end(&mut bytes);
     assert!(
-        matches!(ended, Ok(0))
-            || ended.is_err_and(|error| matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-            )),
-        "an excess unauthenticated connection was not closed: {:?}",
+        ended.is_ok(),
+        "reading 503 rejection failed: {ended:?} {:?}",
+        String::from_utf8_lossy(&bytes),
+    );
+    assert_eq!(
+        bytes,
+        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        "unexpected excess connection reply: {:?}",
         String::from_utf8_lossy(&bytes),
     );
     // HTTP pressure must not prevent the local management connection from working.

@@ -1789,3 +1789,145 @@ fn instructions_tool_rejects_invalid_env_values() {
         );
     }
 }
+
+#[test]
+fn stdio_survives_pre_init_notifications_errors_and_budget_overload_keeping_tasks_alive() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fastexec"));
+    crate::support::scrub_fastexec_env(&mut command);
+    let mut child = command
+        .env("FASTEXEC_DAEMON", "off")
+        .env("FASTEXEC_TEST_MEMORY_LIMIT", "131072")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+
+    let read_json = |stdout: &mut std::io::Lines<BufReader<std::process::ChildStdout>>| -> Value {
+        let line = stdout.next().expect("Unexpected EOF").unwrap();
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad json {e}: {line}"))
+    };
+
+    // 1. Pre-initialize notifications and malformed notification do not kill the stdio server.
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/roots/list_changed\"}}"
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/custom\",\"params\":{{\"x\":1}}}}"
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":\"bad\"}}"
+    )
+    .unwrap();
+
+    // 2. Syntax error returns -32700 (id: null) and invalid request/params preserve id.
+    writeln!(stdin, "{{broken json").unwrap();
+    let parse_err = read_json(&mut stdout);
+    assert_eq!(parse_err["error"]["code"], -32700, "{parse_err}");
+    assert!(parse_err["id"].is_null(), "{parse_err}");
+
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"bad-init\",\"method\":\"initialize\",\"params\":123}}"
+    )
+    .unwrap();
+    let invalid_params = read_json(&mut stdout);
+    assert_eq!(invalid_params["error"]["code"], -32602, "{invalid_params}");
+    assert_eq!(invalid_params["id"], "bad-init", "{invalid_params}");
+
+    // 3. Valid initialize succeeds.
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "stdio-survival", "version": "1"}
+            }
+        })
+    )
+    .unwrap();
+    let init_res = read_json(&mut stdout);
+    assert_eq!(init_res["id"], 1, "{init_res}");
+    assert!(init_res.get("result").is_some(), "{init_res}");
+
+    // 4. Start a background local task, then send an over-budget (> 128 KiB limit) request.
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "exec",
+                "arguments": {
+                    "action": "start",
+                    "command": "sleep 30",
+                    "waitMs": 50
+                }
+            }
+        })
+    )
+    .unwrap();
+    let start_res = read_json(&mut stdout);
+    assert_eq!(start_res["id"], 2, "{start_res}");
+
+    let huge_req = json!({
+        "jsonrpc": "2.0",
+        "id": "over-budget-req",
+        "method": "tools/call",
+        "params": {
+            "name": "write",
+            "arguments": {
+                "path": "ignored.txt",
+                "content": "z".repeat(80 * 1024)
+            }
+        }
+    });
+    writeln!(stdin, "{huge_req}").unwrap();
+    let budget_err = read_json(&mut stdout);
+    assert_eq!(budget_err["id"], "over-budget-req", "{budget_err}");
+    assert_eq!(budget_err["error"]["code"], -32603, "{budget_err}");
+
+    // 5. Session and local background task remain alive!
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "exec",
+                "arguments": {
+                    "action": "list",
+                    "state": "active"
+                }
+            }
+        })
+    )
+    .unwrap();
+    let list_res = read_json(&mut stdout);
+    assert_eq!(list_res["id"], 3, "{list_res}");
+    assert_eq!(list_res["result"]["isError"], false, "{list_res}");
+    let list_text = list_res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(list_text.contains("running"), "{list_text}");
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+}

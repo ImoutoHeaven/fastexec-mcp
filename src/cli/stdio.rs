@@ -22,8 +22,8 @@ const STDIO_MAX_LINE_BYTES: usize = 16 << 20;
 
 enum StdioLine {
     Line,
-    Oversized,
-    Overloaded,
+    Oversized(Option<rmcp::model::RequestId>),
+    Overloaded(Option<rmcp::model::RequestId>),
     End,
 }
 
@@ -31,8 +31,10 @@ enum StdioReadStep {
     Line,
     More,
     EndDiscard,
-    Oversized,
-    OversizedNeedsDiscard,
+    Oversized(Option<rmcp::model::RequestId>),
+    OversizedNeedsDiscard(Option<rmcp::model::RequestId>),
+    Overloaded(Option<rmcp::model::RequestId>),
+    OverloadedNeedsDiscard(Option<rmcp::model::RequestId>),
 }
 
 /// Custom MCP stdio transport that pairs request-ID leases with exact-capacity `Vec<u8>` writes so
@@ -40,10 +42,27 @@ enum StdioReadStep {
 pub(crate) struct StdioTransport<R, W> {
     read: tokio::io::BufReader<R>,
     pub(super) line_buf: ingress::Buffer,
-    max_line_length: usize,
+    pub(super) max_line_length: usize,
     discarding: bool,
+    ready: bool,
     write: Arc<tokio::sync::Mutex<Option<W>>>,
     leases: Arc<RequestLeases>,
+}
+
+fn sniff_prefix_id(
+    prefix: &[u8],
+    next: &[u8],
+    has_newline: bool,
+) -> Option<rmcp::model::RequestId> {
+    let cap = ingress::SNIFF_HEAD_LIMIT + 1;
+    let mut buf = [0u8; ingress::SNIFF_HEAD_LIMIT + 1];
+    let first = prefix.len().min(cap);
+    buf[..first].copy_from_slice(&prefix[..first]);
+    let second = next.len().min(cap - first);
+    buf[first..first + second].copy_from_slice(&next[..second]);
+    let complete =
+        has_newline && prefix.len().saturating_add(next.len()) <= ingress::SNIFF_HEAD_LIMIT;
+    ingress::sniff_request_id(&buf[..first + second], complete)
 }
 
 impl<R, W> StdioTransport<R, W>
@@ -56,6 +75,7 @@ where
             line_buf: ingress::Buffer::default(),
             max_line_length: STDIO_MAX_LINE_BYTES,
             discarding: false,
+            ready: false,
             write: Arc::new(tokio::sync::Mutex::new(Some(write))),
             leases,
         }
@@ -85,24 +105,32 @@ where
                             .unwrap_or(StdioReadStep::More),
                     )
                 } else if self.line_buf.len().saturating_add(take) > self.max_line_length {
+                    let id = sniff_prefix_id(&self.line_buf, &available[..take], newline.is_some());
                     self.reset_line_buf();
                     (
                         take,
                         if newline.is_some() {
-                            StdioReadStep::Oversized
+                            StdioReadStep::Oversized(id)
                         } else {
-                            StdioReadStep::OversizedNeedsDiscard
+                            StdioReadStep::OversizedNeedsDiscard(id)
+                        },
+                    )
+                } else if self
+                    .line_buf
+                    .append(&available[..take], self.max_line_length)
+                    .is_err()
+                {
+                    let id = sniff_prefix_id(&self.line_buf, &available[..take], newline.is_some());
+                    self.reset_line_buf();
+                    (
+                        take,
+                        if newline.is_some() {
+                            StdioReadStep::Overloaded(id)
+                        } else {
+                            StdioReadStep::OverloadedNeedsDiscard(id)
                         },
                     )
                 } else {
-                    if self
-                        .line_buf
-                        .append(&available[..take], self.max_line_length)
-                        .is_err()
-                    {
-                        self.reset_line_buf();
-                        return StdioLine::Overloaded;
-                    }
                     (
                         take,
                         if newline.is_some() {
@@ -118,10 +146,15 @@ where
                 StdioReadStep::Line => return StdioLine::Line,
                 StdioReadStep::More => {}
                 StdioReadStep::EndDiscard => self.discarding = false,
-                StdioReadStep::Oversized => return StdioLine::Oversized,
-                StdioReadStep::OversizedNeedsDiscard => {
+                StdioReadStep::Oversized(id) => return StdioLine::Oversized(id),
+                StdioReadStep::OversizedNeedsDiscard(id) => {
                     self.discarding = true;
-                    return StdioLine::Oversized;
+                    return StdioLine::Oversized(id);
+                }
+                StdioReadStep::Overloaded(id) => return StdioLine::Overloaded(id),
+                StdioReadStep::OverloadedNeedsDiscard(id) => {
+                    self.discarding = true;
+                    return StdioLine::Overloaded(id);
                 }
             }
         }
@@ -129,20 +162,25 @@ where
 }
 
 impl<R, W: tokio::io::AsyncWrite + Unpin> StdioTransport<R, W> {
-    async fn refuse_request_budget(&mut self) {
-        let Some(_lease) = lease::control_pool().try_acquire(1024) else {
-            return;
+    async fn send_local_error(
+        &mut self,
+        error: rmcp::model::ErrorData,
+        id: Option<rmcp::model::RequestId>,
+    ) -> bool {
+        let reply = rmcp::service::TxJsonRpcMessage::<RoleServer>::error(error, id);
+        let Ok(size) = ipc::json_len(&reply).map(|n| n.saturating_add(1)) else {
+            return true;
         };
-        let reply = rmcp::service::TxJsonRpcMessage::<RoleServer>::error(
-            rmcp::model::ErrorData::internal_error(
-                "Server active memory budget is full while reading the request.",
-                None,
-            ),
-            None,
-        );
-        if let Ok(bytes) = encode_stdio_frame(&reply, None) {
-            let _ = write_stdio_frame(&self.write, &bytes).await;
-        }
+        let Some(mut lease) = lease::control_pool()
+            .try_acquire(size)
+            .or_else(|| lease::process_pool().try_acquire(size))
+        else {
+            return true;
+        };
+        let Ok(bytes) = encode_stdio_frame(&reply, Some(&mut lease)) else {
+            return true;
+        };
+        write_stdio_frame(&self.write, &bytes).await.is_ok()
     }
 }
 
@@ -272,10 +310,35 @@ where
         loop {
             match self.read_line().await {
                 StdioLine::Line => {}
-                StdioLine::Oversized => continue,
-                StdioLine::Overloaded => {
-                    self.refuse_request_budget().await;
-                    return None;
+                StdioLine::Oversized(id) => {
+                    if !self
+                        .send_local_error(
+                            rmcp::model::ErrorData::invalid_request(
+                                "Request exceeds maximum stdio line size of 16 MiB.",
+                                None,
+                            ),
+                            id,
+                        )
+                        .await
+                    {
+                        return None;
+                    }
+                    continue;
+                }
+                StdioLine::Overloaded(id) => {
+                    if !self
+                        .send_local_error(
+                            rmcp::model::ErrorData::internal_error(
+                                "Server active memory budget is full while reading the request.",
+                                None,
+                            ),
+                            id,
+                        )
+                        .await
+                    {
+                        return None;
+                    }
+                    continue;
                 }
                 StdioLine::End => return None,
             }
@@ -285,9 +348,24 @@ where
                     let msg = parsed.into_message();
                     match &msg {
                         rmcp::model::JsonRpcMessage::Request(req) => {
+                            if !matches!(
+                                req.request,
+                                rmcp::model::ClientRequest::DiscoverRequest(_)
+                                    | rmcp::model::ClientRequest::PingRequest(_)
+                            ) {
+                                self.ready = true;
+                            }
                             self.leases.on_request(&req.id);
                         }
                         rmcp::model::JsonRpcMessage::Notification(noti) => {
+                            if !self.ready
+                                || matches!(
+                                    noti.notification,
+                                    rmcp::model::ClientNotification::CustomNotification(_)
+                                )
+                            {
+                                continue;
+                            }
                             if let rmcp::model::ClientNotification::CancelledNotification(cancel) =
                                 &noti.notification
                                 && let Some(id) = &cancel.params.request_id
@@ -303,25 +381,70 @@ where
                                 continue;
                             }
                         }
+                        _ if !self.ready => continue,
                         _ => {}
                     }
                     return Some(msg);
                 }
                 Ok(None) => continue,
-                Err(ingress::Failure::Budget) => {
-                    self.refuse_request_budget().await;
-                    return None;
-                }
-                Err(ingress::Failure::Syntax) => {}
-                Err(ingress::Failure::Data | ingress::Failure::Limit) => {
-                    let reply = rmcp::service::TxJsonRpcMessage::<RoleServer>::error(
-                        rmcp::model::ErrorData::invalid_request("Invalid request", None),
-                        None,
-                    );
-                    let Ok(bytes) = encode_stdio_frame(&reply, None) else {
+                Err(ingress::Failure::Budget { id }) => {
+                    if !self
+                        .send_local_error(
+                            rmcp::model::ErrorData::internal_error(
+                                "Server active memory budget is full while reading the request.",
+                                None,
+                            ),
+                            id,
+                        )
+                        .await
+                    {
                         return None;
-                    };
-                    if write_stdio_frame(&self.write, &bytes).await.is_err() {
+                    }
+                }
+                Err(ingress::Failure::Syntax) => {
+                    if !self
+                        .send_local_error(
+                            rmcp::model::ErrorData::parse_error("Parse error", None),
+                            None,
+                        )
+                        .await
+                    {
+                        return None;
+                    }
+                }
+                Err(ingress::Failure::Limit) => {
+                    if !self
+                        .send_local_error(
+                            rmcp::model::ErrorData::invalid_request(
+                                "Request exceeds maximum stdio line size of 16 MiB.",
+                                None,
+                            ),
+                            None,
+                        )
+                        .await
+                    {
+                        return None;
+                    }
+                }
+                Err(ingress::Failure::InvalidRequest { id }) => {
+                    if !self
+                        .send_local_error(
+                            rmcp::model::ErrorData::invalid_request("Invalid request", None),
+                            id,
+                        )
+                        .await
+                    {
+                        return None;
+                    }
+                }
+                Err(ingress::Failure::InvalidParams { id }) => {
+                    if !self
+                        .send_local_error(
+                            rmcp::model::ErrorData::invalid_params("Invalid params", None),
+                            Some(id),
+                        )
+                        .await
+                    {
                         return None;
                     }
                 }

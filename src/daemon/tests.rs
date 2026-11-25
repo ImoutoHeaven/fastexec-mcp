@@ -27,14 +27,22 @@ fn event_ipc_encoding_reserves_overlap_and_keeps_queued_bytes_charged() {
     .unwrap();
     for fits in [false, true] {
         let pool = BytePool::new(source_bytes + encoded_bytes - usize::from(!fits));
+        let reserved = Arc::new(Semaphore::new(65_536));
         let owner = crate::lease::Owner::new(pool.try_acquire(source_bytes).unwrap());
         let input = ipc::Owned::new(frame(), owner);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let closing = CancellationToken::new();
-        let queued =
-            events::queue_event_frame(&tx, &pool, &Arc::new(Semaphore::new(0)), &closing, 1, input);
+        let queued = events::queue_event_frame(&tx, &pool, 1, input);
         assert_eq!(queued, fits);
-        assert_eq!(closing.is_cancelled(), !fits);
+        assert!(
+            !closing.is_cancelled(),
+            "ordinary event backpressure must not cancel the shared connection"
+        );
+        assert_eq!(
+            reserved.available_permits(),
+            65_536,
+            "ordinary event frames must not consume the control reserve"
+        );
         assert_eq!(pool.used(), if fits { encoded_bytes } else { 0 });
         if fits {
             let queued = rx.try_recv().unwrap();
@@ -1822,9 +1830,9 @@ async fn hello_emit_bypasses_sessions_deduplicates_and_blocks_task_forgery() {
         source: "github".to_owned(),
         topic: Some("pr".to_owned()),
         name: "merged".to_owned(),
-        upstream_event_id: "id-1".to_owned(),
+        event_id: "id-1".to_owned(),
+        timestamp: Some("2026-11-25T12:00:00Z".to_owned()),
         data: serde_json::json!({ "pr": 42 }),
-        upstream_truncated: None,
     };
     emitter
         .send(&ToDaemon::EmitEvent { event: ev.clone() })
@@ -1839,7 +1847,7 @@ async fn hello_emit_bypasses_sessions_deduplicates_and_blocks_task_forgery() {
         other => panic!("expected first EmitAck ok, got {other:?}"),
     };
 
-    // Re-emitting the same (source, upstreamEventId) deduplicates.
+    // Re-emitting the same (source, eventId) deduplicates.
     emitter.send(&ToDaemon::EmitEvent { event: ev }).await;
     match emitter.next().await {
         Some(ToEndpoint::EmitAck {
@@ -1859,9 +1867,9 @@ async fn hello_emit_bypasses_sessions_deduplicates_and_blocks_task_forgery() {
                 source: "github".to_owned(),
                 topic: None,
                 name: "forged".to_owned(),
-                upstream_event_id: "id-2".to_owned(),
+                event_id: "id-2".to_owned(),
+                timestamp: None,
                 data: serde_json::json!({}),
-                upstream_truncated: None,
             },
         })
         .await;
@@ -2080,9 +2088,9 @@ async fn event_cancel_releases_full_quota_before_reusing_request_id() {
             source: "quota".to_owned(),
             topic: None,
             name: "ready".to_owned(),
-            upstream_event_id: round.to_string(),
+            event_id: round.to_string(),
+            timestamp: None,
             data: serde_json::json!({}),
-            upstream_truncated: None,
         })
         .unwrap();
         assert!(matches!(
@@ -2160,16 +2168,21 @@ async fn daemon_events_rpc_and_active_http_stream_prevent_idle_exit() {
             source: "ci".to_owned(),
             topic: None,
             name: "done".to_owned(),
-            upstream_event_id: "u-99".to_owned(),
+            event_id: "u-99".to_owned(),
+            timestamp: Some("2026-11-25T10:00:00Z".to_owned()),
             data: serde_json::json!({ "ok": true }),
-            upstream_truncated: None,
         })
         .unwrap();
     match client.next().await {
         Some(ToEndpoint::EventFrame {
             id: 11,
             frame: ipc::EventWireFrame::Event(ev),
-        }) => assert_eq!(ev.data["upstreamEventId"], "u-99"),
+        }) => {
+            assert_eq!(ev.data["eventId"], "u-99");
+            assert_eq!(ev.data["timestamp"], "2026-11-25T10:00:00Z");
+            assert!(ev.data.get("upstreamEventId").is_none());
+            assert!(ev.data.get("upstreamTruncated").is_none());
+        }
         other => panic!("expected Event frame, got {other:?}"),
     }
 
@@ -2196,4 +2209,90 @@ async fn daemon_events_rpc_and_active_http_stream_prevent_idle_exit() {
     drop(guard);
     assert!(!daemon.idle_expired(t0 + Duration::from_secs(10)));
     assert!(daemon.idle_expired(t0 + Duration::from_secs(10) + Duration::from_millis(250)));
+}
+
+#[tokio::test]
+async fn daemon_event_stream_overload_isolates_reserved_and_keeps_connection() {
+    let pool = BytePool::new(128 << 10);
+    let fixture = fixture_with_config(Config {
+        memory: Some(Arc::clone(&pool)),
+        ..Config::default()
+    });
+    let daemon = &fixture.daemon;
+    let mut client = connect(daemon).await;
+    client.welcome("streamoverload", 1).await;
+
+    client
+        .send(&ToDaemon::EventsStream {
+            id: 21,
+            request: crate::events::SubscribeRequest {
+                name: crate::events::EVENT_EXTERNAL.to_owned(),
+                ..Default::default()
+            },
+        })
+        .await;
+    assert!(matches!(
+        client.next().await,
+        Some(ToEndpoint::EventFrame {
+            id: 21,
+            frame: ipc::EventWireFrame::Active(_),
+        })
+    ));
+
+    // Publish an external event into EventBus (which uses its own pool), then exhaust daemon.memory
+    // so queue_event_frame cannot acquire main memory for the Event frame.
+    let full = pool.try_acquire(pool.limit() - pool.used()).unwrap();
+    daemon
+        .service()
+        .event_bus()
+        .publish_external(crate::events::ExternalEventInput {
+            event_type: None,
+            source: "ci".to_owned(),
+            topic: None,
+            name: "build".to_owned(),
+            event_id: "ev-mem-full".to_owned(),
+            timestamp: None,
+            data: serde_json::json!({"pad": "x".repeat(8192)}),
+        })
+        .unwrap();
+
+    match client.next().await {
+        Some(ToEndpoint::EventFrame {
+            id: 21,
+            frame: ipc::EventWireFrame::Terminated(err),
+        }) => {
+            assert_eq!(err.code, -32025);
+            assert_eq!(
+                err.message,
+                "daemon active memory budget full during event stream"
+            );
+            assert_eq!(err.data, None);
+        }
+        other => panic!("expected Terminated(-32025), got {other:?}"),
+    }
+    assert!(matches!(
+        client.next().await,
+        Some(ToEndpoint::EventFrame {
+            id: 21,
+            frame: ipc::EventWireFrame::Complete,
+        })
+    ));
+
+    drop(full);
+    // The shared IPC connection remains healthy for subsequent RPCs.
+    client.send(&ToDaemon::Status).await;
+    assert!(matches!(
+        client.next().await,
+        Some(ToEndpoint::Status { .. })
+    ));
+    client.send(&ToDaemon::EventsList { id: 22 }).await;
+    assert!(matches!(
+        client.next().await,
+        Some(ToEndpoint::EventFrame {
+            id: 22,
+            frame: ipc::EventWireFrame::ListResult(_),
+        })
+    ));
+    client.send(&ToDaemon::Bye).await;
+    assert_eq!(client.next().await, None);
 }
