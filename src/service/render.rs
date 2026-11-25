@@ -1256,9 +1256,8 @@ impl Service {
         // Only an admitted candidate commits the fragments it actually displays.
         for item in kept {
             let block = &blocks[item.index];
-            for (row_index, (task, snapshot)) in block.delivered_tasks[..item.kept_tasks]
-                .iter()
-                .enumerate()
+            for (row_index, (task, snapshot)) in
+                block.delivered_tasks[..item.kept_tasks].iter().enumerate()
             {
                 let ack = if row_index == 0 {
                     item.top_ack
@@ -1408,8 +1407,8 @@ impl TopRow {
         let (tree_brief, tree_count) =
             if snapshot.kept && snapshot.held_known && !snapshot.held.is_empty() {
                 let first = &snapshot.held[0];
-                let name = clean_member_name(&first.name)
-                    .unwrap_or_else(|| format!("pid {}", first.pid));
+                let name =
+                    clean_member_name(&first.name).unwrap_or_else(|| format!("pid {}", first.pid));
                 let suffix = if snapshot.kill_error.is_some() {
                     " (kill failed)"
                 } else {

@@ -2911,27 +2911,28 @@ fn keeptree_list_lifecycle_idempotence_narrow_cut_and_ordered_events() {
     let initial = server.request("events/poll", json!({"name": "task.exited", "_meta": meta}));
     let mut cursor = initial["result"]["cursor"].clone();
     assert!(cursor.is_string(), "{initial}");
-    let drain_events = |server: &mut Server, cursor: &mut Value, target_id: &str, min_count: usize| {
-        let mut collected = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while collected.len() < min_count && Instant::now() < deadline {
-            let response = server.request(
-                "events/poll",
-                json!({"name": "task.exited", "cursor": cursor, "_meta": meta}),
-            );
-            assert!(response.get("error").is_none(), "{response}");
-            *cursor = response["result"]["cursor"].clone();
-            for event in response["result"]["events"].as_array().unwrap() {
-                if event["data"]["taskId"].as_str() == Some(target_id) {
-                    collected.push(event["data"].clone());
+    let drain_events =
+        |server: &mut Server, cursor: &mut Value, target_id: &str, min_count: usize| {
+            let mut collected = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while collected.len() < min_count && Instant::now() < deadline {
+                let response = server.request(
+                    "events/poll",
+                    json!({"name": "task.exited", "cursor": cursor, "_meta": meta}),
+                );
+                assert!(response.get("error").is_none(), "{response}");
+                *cursor = response["result"]["cursor"].clone();
+                for event in response["result"]["events"].as_array().unwrap() {
+                    if event["data"]["taskId"].as_str() == Some(target_id) {
+                        collected.push(event["data"].clone());
+                    }
+                }
+                if collected.len() < min_count {
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             }
-            if collected.len() < min_count {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-        collected
-    };
+            collected
+        };
 
     // 1. keepTree running root shows `[running] · keepTree` in list; killing while running
     // emits a single `task.exited` event with `treeEnded: false`.
@@ -2990,7 +2991,10 @@ fn keeptree_list_lifecycle_idempotence_narrow_cut_and_ordered_events() {
     let held_events = drain_events(&mut server, &mut cursor, &held_id, 2);
     assert_eq!(held_events.len(), 2, "{held_events:?}");
     assert_eq!(held_events[0]["treeEnded"], false, "{held_events:?}");
-    assert!(held_events[0]["keptProcesses"].as_u64().unwrap() > 0, "{held_events:?}");
+    assert!(
+        held_events[0]["keptProcesses"].as_u64().unwrap() > 0,
+        "{held_events:?}"
+    );
     assert_eq!(held_events[1]["treeEnded"], true, "{held_events:?}");
     assert_eq!(held_events[1]["keptProcesses"], 0, "{held_events:?}");
 

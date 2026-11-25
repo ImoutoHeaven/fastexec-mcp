@@ -1554,7 +1554,7 @@ mod tests {
             output: "",
             truncated: false,
             log_path: "t1.log".into(),
-            transcript_path: "t1.transcript".into(),
+            transcript_path: "t1.transcript",
             transcript_lines: 0,
             final_lines: 0,
             first_line: 1,

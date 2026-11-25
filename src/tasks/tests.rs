@@ -2880,7 +2880,11 @@ mod script_tests {
             100,
             test_exec_context(&session),
         );
-        assert!(text_a.len() <= 100, "over budget ({}): {text_a}", text_a.len());
+        assert!(
+            text_a.len() <= 100,
+            "over budget ({}): {text_a}",
+            text_a.len()
+        );
         assert!(
             text_a.contains(" · keeps worker-101 +11"),
             "expected Tier 4 brief: {text_a}"
@@ -2938,7 +2942,10 @@ mod script_tests {
             budget_tier4_short,
             test_exec_context(&session),
         );
-        assert!(text_boundary_a.len() <= budget_tier4_short, "{text_boundary_a}");
+        assert!(
+            text_boundary_a.len() <= budget_tier4_short,
+            "{text_boundary_a}"
+        );
         assert!(
             text_boundary_a.contains(" · keeps worker-101 +11"),
             "{text_boundary_a}"
@@ -3157,7 +3164,11 @@ mod script_tests {
             4096,
             test_exec_context(&session),
         );
-        assert_eq!(text_ctrl.lines().count(), 1, "must stay single line: {text_ctrl:?}");
+        assert_eq!(
+            text_ctrl.lines().count(),
+            1,
+            "must stay single line: {text_ctrl:?}"
+        );
         assert!(
             !text_ctrl.chars().any(char::is_control),
             "control chars leaked: {text_ctrl:?}"
@@ -3224,7 +3235,10 @@ mod script_tests {
                 .result;
             let drill_text = drill.content[0].as_text().unwrap().text.as_str();
             assert!(
-                drill_text.contains(&format!("{} [exited 0] · kept processes ended", kept_ended.id)),
+                drill_text.contains(&format!(
+                    "{} [exited 0] · kept processes ended",
+                    kept_ended.id
+                )),
                 "expected kept processes ended in drilldown: {drill_text}"
             );
         });
@@ -3326,10 +3340,7 @@ mod script_tests {
         drop(claim);
         let (line, _) = notice.expect("expected unconfirmed keeps footer");
         assert!(
-            line.contains(&format!(
-                "{} keeps processes (unconfirmed)",
-                unconf_task.id
-            )),
+            line.contains(&format!("{} keeps processes (unconfirmed)", unconf_task.id)),
             "{line}"
         );
         unconf_task.tree_done.send_replace(true);

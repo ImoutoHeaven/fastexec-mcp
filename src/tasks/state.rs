@@ -833,7 +833,7 @@ impl Task {
             // Shown uses the ordinary commit interface, which only checks presence.
             kill_error: (!tree_done && lock(&self.kill_error).is_some()).then(String::new),
             held: Vec::new(),
-            held_known: !(held_past_exit && !tree_done),
+            held_known: !held_past_exit || tree_done,
             forced_end: false,
             lines: 0,
             dropped: 0,
@@ -894,7 +894,7 @@ impl Task {
             kept: held_past_exit && !tree_done,
             tree_ended: held_past_exit && tree_done,
             held: Vec::new(),
-            held_known: !(held_past_exit && !tree_done),
+            held_known: !held_past_exit || tree_done,
         })
     }
 
