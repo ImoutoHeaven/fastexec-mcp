@@ -4,7 +4,6 @@ use crate::lease::Lease;
 use base64::Engine;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, codecs::jpeg::JpegEncoder};
-use rmcp::model::{ContentBlock, ResourceContents};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -151,21 +150,6 @@ pub fn extension_for_mime(mime: &str) -> &'static str {
         "video/webm" => "webm",
         "video/avi" => "avi",
         _ => "bin",
-    }
-}
-
-pub fn content_block(
-    kind: MediaKind,
-    mime: &str,
-    encoded_base64: String,
-    path: &Path,
-) -> ContentBlock {
-    match kind {
-        MediaKind::Image => ContentBlock::image(encoded_base64, mime.to_owned()),
-        MediaKind::Audio => ContentBlock::audio(encoded_base64, mime.to_owned()),
-        MediaKind::Document | MediaKind::Video => ContentBlock::resource(
-            ResourceContents::blob(encoded_base64, file_uri(path)).with_mime_type(mime.to_owned()),
-        ),
     }
 }
 

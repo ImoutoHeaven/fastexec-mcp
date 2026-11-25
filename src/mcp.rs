@@ -9,6 +9,7 @@ use crate::http;
 use crate::ingress;
 use crate::ipc;
 use crate::lease;
+use crate::service::core::overload_task_message;
 use crate::service::render as service_render;
 use crate::service::schema::{Action, Request};
 use crate::service::{AgentDelivery, ExecContext, Service};
@@ -1244,7 +1245,7 @@ impl Server {
             let meta = tracked.task_meta.take();
             drop(tracked);
             let msg = match &meta {
-                Some(m) => service_render::overload_task_message(launch.memory().limit(), m),
+                Some(m) => overload_task_message(launch.memory().limit(), m),
                 None => format!(
                     "Server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
                     launch.memory().limit()

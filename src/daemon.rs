@@ -7,7 +7,8 @@ use crate::http::{self, Http};
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::lease::{self, BytePool, Lease};
 use crate::platform::runtime;
-use crate::service::render::{self as service_render, RenderSlot};
+use crate::service::core::{RenderSlot, overload_task_message};
+use crate::service::render as service_render;
 use crate::service::{AgentDelivery, ExecContext, Service};
 use crate::session::{LaunchContext, Session};
 use crate::tasks::{Limits, Tasks};
@@ -1398,7 +1399,7 @@ async fn run_call(
     // Active memory cannot fit the outbound frame without blocking; release the uncommitted result
     // and send a short overload receipt through the independent RESERVED control pool.
     let overload_text = match &task_meta {
-        Some(meta) => service_render::overload_task_message(daemon.memory.limit(), meta),
+        Some(meta) => overload_task_message(daemon.memory.limit(), meta),
         None => format!(
             "Server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
             daemon.memory.limit()

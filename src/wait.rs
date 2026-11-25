@@ -22,8 +22,6 @@ pub type Progress = (f64, String);
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_TEXTS: usize = 16;
 const QUIET_MS: std::ops::RangeInclusive<u64> = 10..=60_000;
-/// Characters of a matched text the status line quotes; structured content holds all of it.
-const NOTE_CHARS: usize = 60;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -116,29 +114,6 @@ impl WaitEnd {
             WaitEnd::ScreenGone(text) => ("screen_gone", Some(text)),
             WaitEnd::Quiet => ("quiet", None),
             WaitEnd::MaxWait => ("max_wait", None),
-        }
-    }
-
-    /// The status line note for a wait a condition ended, or that reached `waitMs` with
-    /// `returnWhen` conditions (`conditions`) none of which held.
-    pub fn note(&self, conditions: bool) -> String {
-        let quote = |text: &str| {
-            let mut short: String = text.chars().take(NOTE_CHARS).collect();
-            if short.len() < text.len() {
-                short.push('…');
-            }
-            format!("{short:?}")
-        };
-        match self {
-            WaitEnd::OutputContains(text, _) => format!(" · wait: output matched {}", quote(text)),
-            WaitEnd::ScreenContains(text) => format!(" · wait: screen matched {}", quote(text)),
-            WaitEnd::ScreenAppears(text) => {
-                format!(" · wait: screen text appeared {}", quote(text))
-            }
-            WaitEnd::ScreenGone(text) => format!(" · wait: screen text gone {}", quote(text)),
-            WaitEnd::Quiet => " · wait: output quiet".into(),
-            WaitEnd::MaxWait if conditions => " · wait: waitMs elapsed".into(),
-            WaitEnd::TaskEnded | WaitEnd::TreeEnded | WaitEnd::MaxWait => String::new(),
         }
     }
 }
@@ -513,7 +488,6 @@ mod tests {
         let ended = WaitEnd::OutputContains(text, lease);
         assert_eq!(memory.used(), retained);
         assert_eq!(ended.parts(), ("output_contains", Some("ready 世界")));
-        assert_eq!(ended.note(true), " · wait: output matched \"ready 世界\"");
         drop(ended);
         assert_eq!(memory.used(), 0);
     }

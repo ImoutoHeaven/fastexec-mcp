@@ -17,7 +17,7 @@ use self::read::format_size;
 pub use self::read::{FileReadData, MediaPayload, ReadPolicy, TextSlice, read_core};
 pub use self::write::{FileWriteData, write_core};
 use crate::lease::Lease;
-use crate::media;
+use crate::service::render::media_content_block;
 use crate::session::LaunchContext;
 use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
@@ -246,7 +246,7 @@ fn render_read_agent(data: FileReadData, owner: crate::lease::Owner) -> TrackedR
             lease,
             ..
         }) => {
-            let block = media::content_block(kind, &mime_type, encoded_base64, &resolved_path);
+            let block = media_content_block(kind, &mime_type, encoded_base64, &resolved_path);
             TrackedResult {
                 result: CallToolResult::success(vec![ContentBlock::text(summary_line), block]),
                 lease: Some(lease),

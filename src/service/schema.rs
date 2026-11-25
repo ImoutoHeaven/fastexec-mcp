@@ -187,7 +187,6 @@ pub struct Request {
 pub(crate) struct View {
     pub(super) inline_markers: bool,
     pub(super) keep_nul: bool,
-    pub(super) owned_by_script: bool,
     pub(super) truncate: Truncate,
     pub(crate) max_bytes: usize,
     pub(super) raw: bool,
@@ -482,7 +481,6 @@ pub(crate) fn validate(request: &Request, policy: ExecPolicy) -> Result<View, St
     Ok(View {
         inline_markers: policy.inline_markers,
         keep_nul: policy.keep_nul,
-        owned_by_script: false,
         truncate: request.truncate.unwrap_or(default_truncate),
         max_bytes: request
             .max_bytes

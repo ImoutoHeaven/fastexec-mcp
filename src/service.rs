@@ -1,16 +1,17 @@
 //! Core execution engine for `exec` and `codemode` tasks, split into shared preparation
 //! (`PreparedExec`) and sibling Agent (`render.rs`) and Program (`codemode/encode.rs`) frontends.
 
+pub(crate) mod core;
 pub(crate) mod render;
 pub(crate) mod schema;
 #[cfg(test)]
 mod tests;
 
-use self::render::{
-    RenderSlot, RenderSnapshot, ScriptReport, codemode_error, error_result, metadata_members,
-    metadata_workspace_bytes, overload_task_message, resize_metadata_workspace, schema_error,
-    script_report, text_workspace_bytes,
+use self::core::{
+    PreparedSnapshot, RenderSlot, ScriptReport, metadata_members, metadata_workspace_bytes,
+    overload_task_message, resize_metadata_workspace, script_report, text_workspace_bytes,
 };
+use self::render::{error_result, schema_error};
 use self::schema::{
     Action, DEFAULT_KEY_DELAY_MS, ExecPolicy, ListScope, ListState, MAX_INPUT_BYTES, Request, View,
     flag, normalize_request, validate, validate_cwd,
@@ -41,6 +42,12 @@ const KILL_WAIT: Duration = Duration::from_secs(5);
 const DEFAULT_LIST_LIMIT: u64 = 20;
 /// Screen reads only need stream decoding diagnostics and the updated cursor.
 const MIN_BODY_BUDGET: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Consumer {
+    Agent,
+    Program,
+}
 
 /// Shared core execution context for both Agent and Program calls.
 pub struct ExecContext<'a> {
@@ -147,7 +154,7 @@ pub(crate) enum PreparedExec {
 }
 
 pub(crate) struct PreparedWindow {
-    pub(crate) metadata: RenderSnapshot,
+    pub(crate) metadata: PreparedSnapshot,
     pub(crate) script: Option<ScriptReport>,
     pub(crate) unseen: Vec<AttachmentLease>,
     pub(crate) window: Window,
@@ -169,7 +176,7 @@ pub(crate) struct PreparedWindow {
 }
 
 pub(crate) struct PreparedTranscript {
-    pub(crate) metadata: RenderSnapshot,
+    pub(crate) metadata: PreparedSnapshot,
     pub(crate) window: Window,
     pub(crate) transcript_path: String,
     pub(crate) transcript_lines: u64,
@@ -190,7 +197,7 @@ pub(crate) struct PreparedTranscript {
 }
 
 pub(crate) struct PreparedScreen {
-    pub(crate) metadata: RenderSnapshot,
+    pub(crate) metadata: PreparedSnapshot,
     pub(crate) screen_rows: Vec<String>,
     pub(crate) cols: u16,
     pub(crate) rows_count: u16,
@@ -285,9 +292,14 @@ impl Service {
         delivery: AgentDelivery<'_>,
     ) -> files::TrackedResult {
         self.tasks.prune_entries(ctx.session);
-        let action = request.action;
         match self
-            .exec_core(request, ExecPolicy::AGENT, &mut ctx, delivery.render_slot)
+            .exec_core(
+                request,
+                ExecPolicy::AGENT,
+                Consumer::Agent,
+                &mut ctx,
+                delivery.render_slot,
+            )
             .await
         {
             Ok(prepared) => match self.render_agent(prepared, &ctx, &delivery).await {
@@ -299,22 +311,22 @@ impl Service {
                     payload_owner,
                 },
                 Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
-                    result: error_result(action, &message),
+                    result: error_result(&message),
                     lease: None,
                     overload: true,
                     task_meta,
                     payload_owner: Default::default(),
                 },
-                Err(err) => files::TrackedResult::plain(error_result(action, err.message())),
+                Err(err) => files::TrackedResult::plain(error_result(err.message())),
             },
             Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
-                result: error_result(action, &message),
+                result: error_result(&message),
                 lease: None,
                 overload: true,
                 task_meta,
                 payload_owner: Default::default(),
             },
-            Err(err) => files::TrackedResult::plain(error_result(action, err.message())),
+            Err(err) => files::TrackedResult::plain(error_result(err.message())),
         }
     }
 
@@ -353,22 +365,22 @@ impl Service {
                     payload_owner,
                 },
                 Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
-                    result: codemode_error(&message),
+                    result: error_result(&message),
                     lease: None,
                     overload: true,
                     task_meta,
                     payload_owner: Default::default(),
                 },
-                Err(err) => files::TrackedResult::plain(codemode_error(err.message())),
+                Err(err) => files::TrackedResult::plain(error_result(err.message())),
             },
             Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
-                result: codemode_error(&message),
+                result: error_result(&message),
                 lease: None,
                 overload: true,
                 task_meta,
                 payload_owner: Default::default(),
             },
-            Err(err) => files::TrackedResult::plain(codemode_error(err.message())),
+            Err(err) => files::TrackedResult::plain(error_result(err.message())),
         }
     }
 
@@ -381,7 +393,13 @@ impl Service {
     ) -> codemode::encode::ProgramOutcome {
         self.tasks.prune_entries(ctx.session);
         match self
-            .exec_core(request, ExecPolicy::PROGRAM, &mut ctx, None)
+            .exec_core(
+                request,
+                ExecPolicy::PROGRAM,
+                Consumer::Program,
+                &mut ctx,
+                None,
+            )
             .await
         {
             Ok(prepared) => codemode::encode::encode_exec_program(prepared, &ctx, &delivery),
@@ -428,7 +446,7 @@ impl Service {
             view,
             ctx,
             render_slot,
-            true,
+            Consumer::Agent,
         )
         .await
     }
@@ -443,7 +461,7 @@ impl Service {
         view: View,
         ctx: &ExecContext<'_>,
         render_slot: Option<&RenderSlot<'_>>,
-        is_agent: bool,
+        consumer: Consumer,
     ) -> Result<PreparedExec, ServiceError> {
         let (task, entry, reader) = started;
         let state = read_gate(&reader, &ctx.cancel).await?;
@@ -474,7 +492,7 @@ impl Service {
                 view,
                 Some(ended),
                 startup_warning,
-                is_agent,
+                consumer,
             ),
         )
         .await
@@ -484,10 +502,10 @@ impl Service {
         &self,
         mut request: Request,
         policy: ExecPolicy,
+        consumer: Consumer,
         ctx: &mut ExecContext<'_>,
         render_slot: Option<&RenderSlot<'_>>,
     ) -> Result<PreparedExec, ServiceError> {
-        let is_agent = policy.inline_markers;
         normalize_request(&mut request);
         if request.action == Action::Poll
             && let Ok((task, _)) = self.task(request.task_id.as_deref())
@@ -512,7 +530,7 @@ impl Service {
                     .into(),
             ));
         }
-        let mut view = validate(&request, policy).map_err(ServiceError::Validation)?;
+        let view = validate(&request, policy).map_err(ServiceError::Validation)?;
         let session = Arc::clone(ctx.session);
         match request.action {
             Action::List => {
@@ -558,7 +576,7 @@ impl Service {
                 let starting = Arc::clone(&session);
                 let key = tasks::random_chars(4)
                     .map_err(|error| format!("Cannot name the reader: {error}"))?;
-                if !is_agent && ctx.cancel.is_cancelled() {
+                if consumer == Consumer::Program && ctx.cancel.is_cancelled() {
                     return Err(ServiceError::Cancelled(
                         "Cancelled before the command was started.".into(),
                     ));
@@ -569,7 +587,6 @@ impl Service {
                         .map_err(|error| format!("Internal failure while starting: {error}."))??;
                 if let Some(script) = ctx.on_started {
                     script.record_started(task_reader.handle(&task.id));
-                    view.owned_by_script = true;
                 }
                 let wait = policy
                     .resolve_wait_ms(request.wait_ms, request.return_when.is_some(), false)
@@ -582,13 +599,12 @@ impl Service {
                     view,
                     ctx,
                     render_slot,
-                    is_agent,
+                    consumer,
                 )
                 .await
             }
             Action::Poll => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
-                view.owned_by_script = ctx.on_started.is_some_and(|script| script.owns(&task.id));
                 let when = request.return_when.as_ref();
                 let watches_screen = when.and_then(|when| when.screen_condition());
                 let needs_pty = [
@@ -741,14 +757,13 @@ impl Service {
                         view,
                         Some(ended),
                         None,
-                        is_agent,
+                        consumer,
                     ),
                 )
                 .await
             }
             Action::Kill => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
-                view.owned_by_script = ctx.on_started.is_some_and(|script| script.owns(&task.id));
                 let entry = session.entry(&task);
                 let task_reader = entry.reader(key).map_err(ServiceError::Validation)?;
                 task.kill().map_err(|error| {
@@ -789,14 +804,13 @@ impl Service {
                         view,
                         None,
                         None,
-                        is_agent,
+                        consumer,
                     ),
                 )
                 .await
             }
             Action::Transcript => {
                 let (task, key) = self.task(request.task_id.as_deref())?;
-                view.owned_by_script = ctx.on_started.is_some_and(|script| script.owns(&task.id));
                 if task.is_script() {
                     return Err(ServiceError::Validation(
                         "A codemode task has no terminal or transcript; poll returns its output."
@@ -828,7 +842,7 @@ impl Service {
                         task_reader,
                         state,
                         view,
-                        is_agent,
+                        consumer,
                     ),
                 )
                 .await
@@ -849,9 +863,10 @@ impl Service {
         view: View,
         ended: Option<WaitEnd>,
         startup_warning: Option<ProbeWarning>,
-        is_agent: bool,
+        consumer: Consumer,
     ) -> Result<PreparedExec, ServiceError> {
-        let mark_session_entry = is_agent || view.owned_by_script;
+        let mark_session_entry = consumer == Consumer::Agent
+            || ctx.on_started.is_some_and(|script| script.owns(&task.id));
         let permit =
             task_render_permit(render_slot, &ctx.cancel, action, &task, &task_reader).await?;
         if view.screen {
@@ -895,7 +910,7 @@ impl Service {
                 ServiceError::Overload(overload_task_message(pool.limit(), &meta), Some(meta))
             })?;
         let encoding = view.encoding.unwrap_or(task.encoding);
-        let initial_metadata = RenderSnapshot::new(&task, launch, action)?;
+        let initial_metadata = PreparedSnapshot::new(&task, launch, action)?;
         let clean = !task.is_script();
         let keep_nul = view.keep_nul;
         let include_markers = view.inline_markers;
@@ -974,7 +989,7 @@ impl Service {
         mark_session_entry: bool,
     ) -> Result<PreparedExec, ServiceError> {
         let launch = ctx.launch();
-        let initial_metadata = RenderSnapshot::new(&task, launch, action)?;
+        let initial_metadata = PreparedSnapshot::new(&task, launch, action)?;
         let screen = task
             .screen(launch.memory())
             .map_err(|error| task_read_error(error, &task))?;
@@ -1033,9 +1048,10 @@ impl Service {
         task_reader: Arc<Reader>,
         state: tokio::sync::OwnedMutexGuard<ReadState>,
         view: View,
-        is_agent: bool,
+        consumer: Consumer,
     ) -> Result<PreparedExec, ServiceError> {
-        let mark_session_entry = is_agent || view.owned_by_script;
+        let mark_session_entry = consumer == Consumer::Agent
+            || ctx.on_started.is_some_and(|script| script.owns(&task.id));
         let launch = ctx.launch();
         let permit = task_render_permit(
             render_slot,
@@ -1045,7 +1061,7 @@ impl Service {
             &task_reader,
         )
         .await?;
-        let initial_metadata = RenderSnapshot::new(&task, launch, Action::Transcript)?;
+        let initial_metadata = PreparedSnapshot::new(&task, launch, Action::Transcript)?;
         let (reader, tasks) = (Arc::clone(&task), Arc::clone(&self.tasks));
         let memory = Arc::clone(launch.memory());
         let workspace = memory

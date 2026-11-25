@@ -106,8 +106,12 @@ fn read_data_to_view(data: FileReadData) -> ReadView {
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded_base64)
                     .map(|b| b.len() as u64)
                     .unwrap_or(0);
-            let block =
-                crate::media::content_block(kind, &mime_type, encoded_base64, &resolved_path);
+            let block = crate::service::render::media_content_block(
+                kind,
+                &mime_type,
+                encoded_base64,
+                &resolved_path,
+            );
             let structured = json!({
                 "kind": kind.as_str(),
                 "mimeType": mime_type,

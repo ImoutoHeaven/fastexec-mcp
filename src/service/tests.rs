@@ -1,3 +1,4 @@
+use super::core::*;
 use super::render::*;
 use super::schema::*;
 use super::*;
@@ -104,6 +105,110 @@ async fn list_fixture() -> (Arc<Service>, Arc<Tasks>, Arc<Session>, Arc<TaskEntr
 }
 
 #[tokio::test]
+async fn consumer_cancellation_is_independent_of_output_policy() {
+    for (consumer, policy) in [
+        (Consumer::Program, ExecPolicy::AGENT),
+        (Consumer::Agent, ExecPolicy::PROGRAM),
+    ] {
+        let (service, tasks, session) = script_fixture();
+        let missing_bash =
+            std::env::temp_dir().join(format!("fastexec-missing-bash-{}", tasks.epoch()));
+        assert!(!missing_bash.exists());
+        let launch = Arc::new(LaunchContext::new(
+            std::env::temp_dir(),
+            vec![("FASTEXEC_BASH".into(), missing_bash.into_os_string())],
+        ));
+        let mut ctx = script_ctx(&session);
+        ctx.launch = Some(&launch);
+        ctx.cancel.cancel();
+        let request = serde_json::from_value(json!({
+            "action": "start", "command": "printf started", "waitMs": 0, "maxBytes": 100
+        }))
+        .unwrap();
+        let error = service
+            .exec_core(request, policy, consumer, &mut ctx, None)
+            .await
+            .err()
+            .expect("a cancelled or invalid start must fail");
+        if consumer == Consumer::Program {
+            assert!(matches!(error, ServiceError::Cancelled(_)), "{error:?}");
+        } else {
+            assert!(
+                error.message().starts_with("Invalid FASTEXEC_BASH"),
+                "Agent start must reach launch validation: {error:?}"
+            );
+        }
+        assert!(tasks.all().is_empty());
+        tasks.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn consumer_reporting_is_independent_of_output_policy() {
+    for (consumer, policy) in [
+        (Consumer::Program, ExecPolicy::AGENT),
+        (Consumer::Agent, ExecPolicy::PROGRAM),
+    ] {
+        for owned in [false, true] {
+            let (service, tasks, session, entry) = list_fixture().await;
+            let task = tasks.all().pop().unwrap();
+            let reader = entry.reader(Some("abcd")).unwrap();
+            let (script, worker) = codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+            if owned {
+                script.record_started(reader.handle(&task.id));
+            }
+            let mut ctx = script_ctx(&session);
+            ctx.on_started = Some(&script);
+            let request = serde_json::from_value(json!({
+                "action": "poll",
+                "taskId": reader.handle(&task.id),
+                "waitMs": 0,
+                "maxBytes": 100
+            }))
+            .unwrap();
+            let PreparedExec::Window(prepared) = service
+                .exec_core(request, policy, consumer, &mut ctx, None)
+                .await
+                .unwrap()
+            else {
+                panic!("expected a window");
+            };
+            assert_eq!(
+                prepared.mark_session_entry,
+                consumer == Consumer::Agent || owned,
+                "{consumer:?}, owned: {owned}"
+            );
+            drop(prepared);
+            assert!(!entry.is_reported(), "preparation cannot commit a report");
+            drop(worker);
+            tasks.shutdown();
+        }
+    }
+}
+
+#[test]
+fn wait_note_formats_agent_status_without_changing_match_ownership() {
+    let text = "ready 世界".to_owned();
+    let memory = crate::lease::BytePool::new(128);
+    let lease = memory.try_acquire(text.capacity()).unwrap();
+    let ended = WaitEnd::OutputContains(text, lease);
+    let retained = memory.used();
+    assert_eq!(
+        wait_note(&ended, true),
+        r#" · wait: output matched "ready 世界""#
+    );
+    assert_eq!(ended.parts(), ("output_contains", Some("ready 世界")));
+    assert_eq!(memory.used(), retained);
+    assert_eq!(
+        wait_note(&WaitEnd::MaxWait, true),
+        " · wait: waitMs elapsed"
+    );
+    assert_eq!(wait_note(&WaitEnd::MaxWait, false), "");
+    drop(ended);
+    assert_eq!(memory.used(), 0);
+}
+
+#[tokio::test]
 async fn background_metadata_keeps_owner_and_claim_until_commit_and_only_kill_uses_control() {
     let (service, tasks, session, noticed_entry) = list_fixture().await;
     let noticed = tasks.all().pop().unwrap();
@@ -179,7 +284,7 @@ async fn background_metadata_keeps_owner_and_claim_until_commit_and_only_kill_us
 async fn response_snapshot_owns_its_workspace_and_uses_control_only_for_kill() {
     let (_service, tasks, session, _entry) = list_fixture().await;
     let task = tasks.all().pop().unwrap();
-    let probe = RenderSnapshot::new(&task, &session.launch, Action::Poll).unwrap();
+    let probe = PreparedSnapshot::new(&task, &session.launch, Action::Poll).unwrap();
     let required = probe.workspace.bytes();
     assert!(required > 0);
     drop(probe);
@@ -193,7 +298,7 @@ async fn response_snapshot_owns_its_workspace_and_uses_control_only_for_kill() {
                 .with_memory(Arc::clone(&memory))
                 .with_control_memory(Arc::clone(&control)),
         );
-        let snapshot = RenderSnapshot::new(&task, &launch, Action::Poll);
+        let snapshot = PreparedSnapshot::new(&task, &launch, Action::Poll);
         assert_eq!(snapshot.is_ok(), limit >= required);
         assert_eq!(control.used(), 0);
         if limit >= required {
@@ -212,7 +317,7 @@ async fn response_snapshot_owns_its_workspace_and_uses_control_only_for_kill() {
             .with_control_memory(Arc::clone(&control)),
     );
     for action in [Action::Start, Action::Poll, Action::Transcript] {
-        let error = RenderSnapshot::new(&task, &launch, action).err().unwrap();
+        let error = PreparedSnapshot::new(&task, &launch, action).err().unwrap();
         assert!(
             matches!(&error, ServiceError::Overload(_, Some(meta)) if meta.bare_task_id == task.id)
         );
@@ -223,7 +328,7 @@ async fn response_snapshot_owns_its_workspace_and_uses_control_only_for_kill() {
         );
         assert_eq!((memory.used(), control.used()), (0, 0));
     }
-    let snapshot = RenderSnapshot::new(&task, &launch, Action::Kill).unwrap();
+    let snapshot = PreparedSnapshot::new(&task, &launch, Action::Kill).unwrap();
     assert_eq!(snapshot.value.state, "exited");
     assert_eq!(control.used(), required);
     drop(snapshot);
@@ -358,7 +463,7 @@ async fn preparation_errors_release_workspace_before_waking_the_next_reader() {
             .unwrap()
             .unwrap();
         let reader = entry.reader(Some("next")).unwrap();
-        let metadata = RenderSnapshot::new(&task, &session.launch, Action::Poll).unwrap();
+        let metadata = PreparedSnapshot::new(&task, &session.launch, Action::Poll).unwrap();
         let required = text_workspace_bytes(100) + metadata.workspace.bytes();
         drop(metadata);
         if failure == "report" {
@@ -409,7 +514,7 @@ async fn preparation_errors_release_workspace_before_waking_the_next_reader() {
                     Arc::clone(&reader),
                     gate,
                     view,
-                    false,
+                    Consumer::Program,
                 )
                 .await
         } else {
@@ -425,7 +530,7 @@ async fn preparation_errors_release_workspace_before_waking_the_next_reader() {
                     view,
                     None,
                     None,
-                    false,
+                    Consumer::Program,
                 )
                 .await
         };
@@ -468,7 +573,13 @@ async fn program_result_shrinks_workspace_before_waking_the_next_reader() {
     }))
     .unwrap();
     let PreparedExec::Window(mut prepared) = service
-        .exec_core(request, ExecPolicy::PROGRAM, &mut ctx, None)
+        .exec_core(
+            request,
+            ExecPolicy::PROGRAM,
+            Consumer::Program,
+            &mut ctx,
+            None,
+        )
         .await
         .unwrap()
     else {
@@ -1178,7 +1289,7 @@ async fn cancellation_keeps_attachment_worker_memory_and_reader_pinned() {
     };
     let metadata_charge = {
         let before = pool.used();
-        let mut metadata = RenderSnapshot::new(&task, &session.launch, Action::Poll).unwrap();
+        let mut metadata = PreparedSnapshot::new(&task, &session.launch, Action::Poll).unwrap();
         metadata
             .refresh(&task, &session.launch, Action::Poll)
             .unwrap();
@@ -2438,7 +2549,7 @@ async fn program_transcript_dto_emits_raw_output_and_all_fields() {
     let window = builder.finish();
     assert!(!window.text.contains("omitted"), "{}", window.text);
 
-    let metadata = RenderSnapshot::new(&task, &session.launch, Action::Transcript).unwrap();
+    let metadata = PreparedSnapshot::new(&task, &session.launch, Action::Transcript).unwrap();
     let prepared = PreparedExec::Transcript(Box::new(PreparedTranscript {
         workspace: crate::lease::Lease::empty(session.launch.memory()),
         permit: None,
@@ -2455,7 +2566,6 @@ async fn program_transcript_dto_emits_raw_output_and_all_fields() {
         entry: Arc::clone(&entry),
         reader: Arc::clone(&reader),
         view: View {
-            owned_by_script: true,
             truncate: Truncate::Tail,
             max_bytes: 16,
             raw: false,
