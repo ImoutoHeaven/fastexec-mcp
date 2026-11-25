@@ -7,7 +7,7 @@ mod workers;
 
 use self::state::{
     AttachmentMeta, AttachmentSlot, AttachmentSlotState, Final, Input, Pty, Root, Snapshot, Spool,
-    Task,
+    Task, clean_member_name, copy_snapshot_text, mark_tree_ended, set_held,
 };
 use self::workers::{
     CaptureWork, InputWork, OutputWorkers, ReadWork, WaitWork, Workers, WriterDone, drain,
@@ -253,6 +253,7 @@ pub struct ChildSummary {
     pub done: usize,
     pub failed: usize,
     pub warned: usize,
+    pub tree_ended: usize,
     pub active: usize,
     pub queued: usize,
     pub cancelled: usize,
@@ -667,6 +668,9 @@ impl Tasks {
                                     if task.has_warnings_unlocked() {
                                         fold.summary.warned += 1;
                                     }
+                                    if tree_ended {
+                                        fold.summary.tree_ended += 1;
+                                    }
                                     fold.summary
                                         .folded_finished
                                         .push((Arc::clone(task), tree_ended));
@@ -752,21 +756,25 @@ impl Tasks {
                 ListedResult { total_count, items }
             }
         };
-        for item in &mut result.items {
-            if item.snapshot.kept {
-                item.snapshot.held = match &item.task.root {
-                    Root::Process(tree) => members(tree)?.unwrap_or_default(),
-                    Root::Script(_) => Vec::new(),
-                };
+        let mut populate_held = |task: &Task, snapshot: &mut Snapshot| -> Result<(), String> {
+            if !snapshot.kept {
+                return Ok(());
             }
+            let listed = match &task.root {
+                Root::Process(tree) => members(tree)?,
+                Root::Script(_) => Some(Vec::new()),
+            };
+            set_held(snapshot, listed);
+            if !snapshot.held_known && snapshot.kill_error.is_none() && !*task.tree_done.borrow() {
+                snapshot.kill_error = copy_snapshot_text(&lock(&task.kill_error), reserve)?;
+            }
+            Ok(())
+        };
+        for item in &mut result.items {
+            populate_held(&item.task, &mut item.snapshot)?;
             if let Some(children) = &mut item.children {
                 for (child, snapshot) in &mut children.active_tasks {
-                    if snapshot.kept {
-                        snapshot.held = match &child.root {
-                            Root::Process(tree) => members(tree)?.unwrap_or_default(),
-                            Root::Script(_) => Vec::new(),
-                        };
-                    }
+                    populate_held(child, snapshot)?;
                 }
             }
         }
@@ -1172,9 +1180,9 @@ impl Tasks {
             kept: false,
         });
         self.retire_finished(&mut registry);
+        self.emit_task_exited(task);
         drop(registry);
         task.done.send_replace(true);
-        self.emit_task_exited(task);
     }
 
     /// Saves an attachment with a monotonic 1-based task-local index under the 4 GiB and 1024-entry caps.
@@ -1547,18 +1555,34 @@ impl Tasks {
                 }
                 _ if snapshot.tree_ended && !entry.tree_end_reported() => (1, Notice::TreeEnded),
                 _ if snapshot.kept => {
-                    snapshot.held = match &task.root {
-                        Root::Process(tree) => members(tree)?.unwrap_or_default(),
-                        Root::Script(_) => Vec::new(),
+                    let listed = match &task.root {
+                        Root::Process(tree) => members(tree)?,
+                        Root::Script(_) => Some(Vec::new()),
                     };
-                    // The current PID vector fits the admitted member workspace; the
-                    // previous reported vector may be longer and is only borrowed.
-                    if snapshot.kill_error.is_none()
-                        && entry.keeps_reported_eq(&pids(&snapshot.held))
-                    {
-                        continue;
+                    set_held(&mut snapshot, listed);
+                    if *task.tree_done.borrow() {
+                        if entry.tree_end_reported() {
+                            continue;
+                        }
+                        mark_tree_ended(&mut snapshot);
+                        (1, Notice::TreeEnded)
+                    } else {
+                        if !snapshot.held_known
+                            && snapshot.kill_error.is_none()
+                            && lock(&task.kill_error).is_some()
+                        {
+                            snapshot.kill_error = Some(String::new());
+                        }
+                        // The current PID vector fits the admitted member workspace; the
+                        // previous reported vector may be longer and is only borrowed.
+                        if snapshot.held_known
+                            && snapshot.kill_error.is_none()
+                            && entry.keeps_reported_eq(&pids(&snapshot.held))
+                        {
+                            continue;
+                        }
+                        (2, Notice::Keeps)
                     }
-                    (2, Notice::Keeps)
                 }
                 _ => continue,
             };
@@ -1568,20 +1592,46 @@ impl Tasks {
             return Ok((None, claim));
         }
         entries.sort_by_key(|(rank, ..)| *rank);
+        for (index, (_, notice, task, snapshot)) in entries.iter_mut().enumerate() {
+            if *notice != Notice::Root || !snapshot.kept {
+                continue;
+            }
+            if *task.tree_done.borrow() {
+                mark_tree_ended(snapshot);
+                continue;
+            }
+            if index < 3 {
+                let listed = match &task.root {
+                    Root::Process(tree) => members(tree)?,
+                    Root::Script(_) => Some(Vec::new()),
+                };
+                set_held(snapshot, listed);
+                if *task.tree_done.borrow() {
+                    mark_tree_ended(snapshot);
+                } else if !snapshot.held_known
+                    && snapshot.kill_error.is_none()
+                    && lock(&task.kill_error).is_some()
+                {
+                    snapshot.kill_error = Some(String::new());
+                }
+            }
+        }
         // Counts/labels are fixed-size metadata. Only three handles enter formatting;
         // process names were admitted while querying the relevant held trees.
         reserve(256)?;
         for (_, _, task, _) in entries.iter().take(3) {
             reserve(task.id.capacity().saturating_add(128))?;
         }
-        let count = |rank: u8| entries.iter().filter(|entry| entry.0 == rank).count();
-        let failed = count(0);
+        let failed = entries.iter().filter(|entry| entry.0 == 0).count();
         let running = entries
             .iter()
             .filter(|entry| entry.1 == Notice::Running)
             .count();
-        let keeping = count(2) - running;
-        let finished = entries.len() - count(2);
+        let keeping = entries
+            .iter()
+            .filter(|entry| entry.1 == Notice::Keeps || (entry.1 == Notice::Root && entry.3.kept))
+            .count();
+        let finished = entries.len() - running - keeping;
         let mut counts = Vec::new();
         for (number, label) in [
             (running, "running"),
@@ -1609,7 +1659,7 @@ impl Tasks {
                         (Notice::Running, _) => {
                             format!("{id} running {}", short(snapshot.elapsed))
                         }
-                        (Notice::Keeps, _) => format!("{id} keeps {}", brief(&snapshot.held)),
+                        (Notice::Keeps, _) => format!("{id} keeps {}", held_brief(snapshot)),
                         (Notice::TreeEnded, _) => format!("{id} kept processes ended"),
                         (_, code) => {
                             let root = match code {
@@ -1619,12 +1669,13 @@ impl Tasks {
                                 _ if snapshot.expired => "killed by killAfterMs".into(),
                                 _ => "killed".into(),
                             };
-                            let tree = if snapshot.tree_ended {
-                                " and its kept processes ended"
+                            if snapshot.kept {
+                                format!("{id} {root}, keeps {}", held_brief(snapshot))
+                            } else if snapshot.tree_ended {
+                                format!("{id} {root} and its kept processes ended")
                             } else {
-                                ""
-                            };
-                            format!("{id} {root}{tree}")
+                                format!("{id} {root}")
+                            }
                         }
                     }
                 })
@@ -1701,19 +1752,37 @@ pub type BackgroundNotice<'a> = (
     crate::session::OutsideClaim<'a>,
 );
 
-/// The sorted PIDs of `held`.
+/// The sorted, deduplicated PIDs of `held`.
 pub(crate) fn pids(held: &[Member]) -> Vec<u32> {
     let mut pids: Vec<u32> = held.iter().map(|member| member.pid).collect();
     pids.sort_unstable();
+    pids.dedup();
     pids
 }
 
 /// The first held process and how many more: `adb.exe +2`.
 fn brief(held: &[Member]) -> String {
+    let label = |member: &Member| {
+        clean_member_name(&member.name).unwrap_or_else(|| format!("pid {}", member.pid))
+    };
     match held {
         [] => "processes".into(),
-        [one] => one.name.clone(),
-        [first, rest @ ..] => format!("{} +{}", first.name, rest.len()),
+        [one] => label(one),
+        [first, rest @ ..] => format!("{} +{}", label(first), rest.len()),
+    }
+}
+
+fn held_brief(snapshot: &Snapshot) -> String {
+    if !snapshot.held_known {
+        if snapshot.kill_error.is_some() {
+            "processes (unconfirmed, kill failed)".into()
+        } else {
+            "processes (unconfirmed)".into()
+        }
+    } else if snapshot.kill_error.is_some() {
+        format!("{} (kill failed)", brief(&snapshot.held))
+    } else {
+        brief(&snapshot.held)
     }
 }
 

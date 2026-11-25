@@ -8,7 +8,8 @@ branching on tool results, or filtering bulky output before returning it to cont
   APIs, callback timers, file system, or network.
 - tools.exec/read/write/edit(args) take those tools' arguments and resolve directly to typed
   objects: exec { action, taskId, kind, state, exitCode, pty, elapsedMs, output, truncated,
-  logPath, ... }, text read { kind: "text", path, text, startLine, endLine, shownLines, totalLines,
+  logPath, ... } (plus treeEnded and treeUnconfirmed when kept processes ended or are
+  unconfirmed), text read { kind: "text", path, text, startLine, endLine, shownLines, totalLines,
   truncated, nextOffset?, ... }, write { path, bytes }, edit { path, replacements, edits }.
   output and text are raw (no status lines, footers, line prefixes, or inline omission/cut
   markers); truncation and diagnostics live in explicit fields. Non-zero exitCode resolves. Failed
@@ -26,8 +27,10 @@ branching on tool results, or filtering bulky output before returning it to cont
   omittedRows report overflow (read logPath for the rest). Without waitMs, start and poll wait
   until exit; resize/input/keys waits 2000 ms, and returnWhen waits 30000 ms. Drive a PTY by
   awaiting start with pty: true and returnWhen, then poll with input and keys. Nested exec list
-  returns { action: "list", totalCount, tasks }, folding codemode children under their parent
-  unless parentTaskId is passed.
+  returns { action: "list", totalCount, tasks } (entries carry treeEnded and treeUnconfirmed when
+  set; folded parents report children.treeEnded), folding codemode children under their parent
+  unless parentTaskId is passed. Nested list marks only tasks started by the current script and
+  leaves outer session notices pending.
 - tools.read({ path }) returns a media descriptor { kind, path, mimeType, bytes, attachable:
   true } (or { ..., sourceBytes?, attachable: false, note }) for images, audio, PDF, and video
   without loading base64 into JS. For text without offset or limit, whole-file mode reads up to

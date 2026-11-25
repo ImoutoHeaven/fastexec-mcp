@@ -336,9 +336,9 @@ fn wait_task(job: WaitWork) {
         kept,
     });
     shared.retire_finished(&mut registry);
+    shared.emit_task_exited(&task);
     drop(registry);
     task.done.send_replace(true);
-    shared.emit_task_exited(&task);
 }
 
 fn finish_tree(
@@ -365,16 +365,13 @@ fn finish_tree(
             let _ = std::fs::remove_file(status);
         }
     }
-    let emit_kept_ended = {
-        let mut registry = lock(&shared.registry);
-        if tree_ended {
-            let _ = task.tree_ended_at.set(Instant::now());
-            task.tree_done.send_replace(true);
-        }
-        shared.retire_finished(&mut registry);
-        tree_ended && task.keep && lock(&task.end).is_some()
-    };
-    if emit_kept_ended {
+    let mut registry = lock(&shared.registry);
+    if tree_ended {
+        let _ = task.tree_ended_at.set(Instant::now());
+        task.tree_done.send_replace(true);
+    }
+    shared.retire_finished(&mut registry);
+    if tree_ended && lock(&task.end).as_ref().is_some_and(|end| end.kept) {
         shared.emit_task_exited(task);
     }
 }

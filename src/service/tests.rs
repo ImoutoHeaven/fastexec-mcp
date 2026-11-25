@@ -1848,6 +1848,7 @@ async fn critical_warnings_survive_small_budgets() {
         kept: false,
         tree_ended: true,
         held: Vec::new(),
+        held_known: true,
         kill_error: None,
     };
     assert!(output_incomplete(&snapshot));
@@ -2062,6 +2063,7 @@ async fn cancellation_during_blocking_render_keeps_reader_fresh_and_gate_pinned(
                 kept: false,
                 tree_ended: true,
                 held: Vec::new(),
+                held_known: true,
                 kill_error: None,
             };
             rendering.mark_reported(&snapshot);

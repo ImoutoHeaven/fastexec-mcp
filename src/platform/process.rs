@@ -1357,45 +1357,55 @@ impl Tree {
     }
 
     pub(crate) fn members_with_budget(&self, budget: &mut MemberBudget<'_>) -> Option<Vec<Member>> {
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::Threading::GetProcessId;
-            let held = lock(&self.root);
-            let Some(process) = held.as_ref() else {
-                return Some(Vec::new());
-            };
-            let handle = process.as_raw_handle();
-            // SAFETY: the held handle keeps this root's PID reserved during the query.
-            let pid = unsafe { GetProcessId(handle) };
-            windows::job_members_with_budget(self.job.as_raw_handle(), Some((pid, handle)), budget)
+        let mut result = {
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::System::Threading::GetProcessId;
+                let held = lock(&self.root);
+                let Some(process) = held.as_ref() else {
+                    return Some(Vec::new());
+                };
+                let handle = process.as_raw_handle();
+                // SAFETY: the held handle keeps this root's PID reserved during the query.
+                let pid = unsafe { GetProcessId(handle) };
+                windows::job_members_with_budget(
+                    self.job.as_raw_handle(),
+                    Some((pid, handle)),
+                    budget,
+                )
+            }
+            #[cfg(unix)]
+            {
+                let state = lock(&self.state);
+                match *state {
+                    TreeState::Complete => return Some(Vec::new()),
+                    TreeState::Unconfirmed => return None,
+                    TreeState::Active => {}
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    self.control.members_with_budget(budget)
+                }
+                #[cfg(target_os = "freebsd")]
+                {
+                    crate::platform::tree_freebsd::members(self.host, budget).ok()
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    crate::platform::tree_linux::members(self.host, budget).ok()
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+                {
+                    let _ = budget;
+                    Some(unix_members(self.host))
+                }
+            }
+        };
+        if let Some(list) = result.as_mut() {
+            crate::tasks::state::normalize_members(list);
         }
-        #[cfg(unix)]
-        {
-            let state = lock(&self.state);
-            match *state {
-                TreeState::Complete => return Some(Vec::new()),
-                TreeState::Unconfirmed => return None,
-                TreeState::Active => {}
-            }
-            #[cfg(target_os = "macos")]
-            {
-                self.control.members_with_budget(budget)
-            }
-            #[cfg(target_os = "freebsd")]
-            {
-                crate::platform::tree_freebsd::members(self.host, budget).ok()
-            }
-            #[cfg(target_os = "linux")]
-            {
-                crate::platform::tree_linux::members(self.host, budget).ok()
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
-            {
-                let _ = budget;
-                Some(unix_members(self.host))
-            }
-        }
+        result
     }
 
     #[cfg(windows)]

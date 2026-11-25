@@ -551,12 +551,20 @@ impl TaskEntry {
         lock(&self.keeps_reported).as_deref() == Some(current)
     }
 
-    pub fn mark_reported(&self, shown: &Snapshot) {
+    pub fn mark_root_reported(&self, shown: &Snapshot) {
         if shown.state != "running" {
             self.reported.store(true, Ordering::SeqCst);
         }
+    }
+
+    pub fn mark_tree_end_reported(&self) {
+        self.tree_end_reported.store(true, Ordering::SeqCst);
+    }
+
+    pub fn mark_reported(&self, shown: &Snapshot) {
+        self.mark_root_reported(shown);
         if shown.tree_ended {
-            self.tree_end_reported.store(true, Ordering::SeqCst);
+            self.mark_tree_end_reported();
         }
     }
 
@@ -564,13 +572,13 @@ impl TaskEntry {
     pub fn mark_finished_reported(&self, tree_ended: bool) {
         self.reported.store(true, Ordering::SeqCst);
         if tree_ended {
-            self.tree_end_reported.store(true, Ordering::SeqCst);
+            self.mark_tree_end_reported();
         }
     }
 
     /// A task's own status line may be cut before its held processes.
     pub fn mark_keeps_reported(&self, shown: &Snapshot) {
-        if shown.kept && shown.kill_error.is_none() {
+        if shown.kept && shown.held_known && shown.kill_error.is_none() {
             *lock(&self.keeps_reported) = Some(pids(&shown.held));
         }
     }

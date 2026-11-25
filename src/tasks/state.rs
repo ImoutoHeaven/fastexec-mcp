@@ -359,11 +359,13 @@ pub struct Snapshot {
     pub tree_ended: bool,
     /// The processes the task holds, when [`Task::snapshot_held_reserved`] took the snapshot.
     pub held: Vec<Member>,
+    /// Whether [`Self::held`] reflects a confirmed member listing.
+    pub held_known: bool,
     /// Why the last kill of the processes it holds failed.
     pub kill_error: Option<String>,
 }
 
-fn copy_snapshot_text(
+pub(super) fn copy_snapshot_text(
     value: &Option<String>,
     reserve: &mut impl FnMut(usize) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
@@ -371,6 +373,54 @@ fn copy_snapshot_text(
         reserve(text.capacity().saturating_add(128))?;
     }
     Ok(value.clone())
+}
+
+pub(crate) fn normalize_members(list: &mut Vec<Member>) {
+    list.sort_by_key(|m| m.pid);
+    list.dedup_by_key(|m| m.pid);
+}
+
+pub(crate) fn set_held(snapshot: &mut Snapshot, members: Option<Vec<Member>>) {
+    match members {
+        Some(mut list) => {
+            normalize_members(&mut list);
+            snapshot.held_known = true;
+            snapshot.held = list;
+        }
+        None => {
+            snapshot.held_known = false;
+            snapshot.held.clear();
+        }
+    }
+}
+
+pub(crate) fn mark_tree_ended(snapshot: &mut Snapshot) {
+    snapshot.kept = false;
+    snapshot.tree_ended = true;
+    snapshot.kill_error = None;
+    snapshot.held.clear();
+    snapshot.held_known = true;
+}
+
+pub(crate) fn clean_member_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut parts = cleaned.split_whitespace();
+    let first = parts.next()?;
+    let mut out = String::from(first);
+    for part in parts {
+        out.push(' ');
+        out.push_str(part);
+    }
+    Some(out)
 }
 
 impl Spool {
@@ -686,10 +736,17 @@ impl Task {
         let tree_done = *self.tree_done.borrow();
         let mut snapshot = self.snapshot_at_reserved(end, tree_done, reserve)?;
         if snapshot.kept {
-            snapshot.held = match &self.root {
-                Root::Process(tree) => members(tree)?.unwrap_or_default(),
-                Root::Script(_) => Vec::new(),
+            let listed = match &self.root {
+                Root::Process(tree) => members(tree)?,
+                Root::Script(_) => Some(Vec::new()),
             };
+            set_held(&mut snapshot, listed);
+            if *self.tree_done.borrow() {
+                mark_tree_ended(&mut snapshot);
+                snapshot.output_open &= !lock(&self.out).closed;
+            } else if !snapshot.held_known && snapshot.kill_error.is_none() {
+                snapshot.kill_error = copy_snapshot_text(&lock(&self.kill_error), reserve)?;
+            }
         }
         Ok(snapshot)
     }
@@ -776,6 +833,7 @@ impl Task {
             // Shown uses the ordinary commit interface, which only checks presence.
             kill_error: (!tree_done && lock(&self.kill_error).is_some()).then(String::new),
             held: Vec::new(),
+            held_known: !(held_past_exit && !tree_done),
             forced_end: false,
             lines: 0,
             dropped: 0,
@@ -836,6 +894,7 @@ impl Task {
             kept: held_past_exit && !tree_done,
             tree_ended: held_past_exit && tree_done,
             held: Vec::new(),
+            held_known: !(held_past_exit && !tree_done),
         })
     }
 
