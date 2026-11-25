@@ -350,7 +350,6 @@ fn finish_tree(
 ) {
     let tree_ended = child.wait_tree(task.root.process());
     if !tree_ended {
-        task.hold_unconfirmed_tree();
         drop(child);
     } else {
         *lock(&task.input) = None;
@@ -369,6 +368,8 @@ fn finish_tree(
     if tree_ended {
         let _ = task.tree_ended_at.set(Instant::now());
         task.tree_done.send_replace(true);
+    } else {
+        task.hold_unconfirmed_tree();
     }
     shared.retire_finished(&mut registry);
     if tree_ended && lock(&task.end).as_ref().is_some_and(|end| end.kept) {

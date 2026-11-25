@@ -1475,6 +1475,109 @@ mod script_tests {
         tasks.shutdown();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn host_loss_publication_waits_for_list_classification_and_snapshot() {
+        let (_runtime, tasks, session) = fixture(Limits::OFF);
+        let (task, _) = make_synthetic_process_task(
+            &tasks,
+            &session,
+            "host lost after root exit",
+            None,
+            Some(finished_final(false)),
+            false,
+        );
+        let (newer, _) = make_synthetic_process_task(
+            &tasks,
+            &session,
+            "newer finished task",
+            None,
+            Some(finished_final(false)),
+            true,
+        );
+        let (child, mut drop_signal) = process::Child::failed_host_for_test();
+        let (dropped, drop_seen) = mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            let _ = dropped.send(drop_signal.read(&mut [0]));
+        });
+        let workers = Workers::new(false).unwrap();
+        let (confirmed, completion) = mpsc::channel();
+        let mut work = Some(EndWork {
+            shared: Arc::clone(&tasks),
+            task: Arc::clone(&task),
+            child,
+            script: tasks.dir.join("unconfirmed-script.sh"),
+            exit_status: None,
+            confirmed: Some(confirmed),
+        });
+        let listed = tasks
+            .listed(
+                &session,
+                ListQuery {
+                    all_scope: true,
+                    active_filter: Some(false),
+                    parent_task_id: None,
+                    limit: 20,
+                },
+                &mut |_| {
+                    if let Some(work) = work.take() {
+                        // Both rows are classified; the newer row's snapshot precedes the lost host's.
+                        workers.ender.send(work).unwrap();
+                        assert_eq!(
+                            drop_seen
+                                .recv_timeout(Duration::from_secs(5))
+                                .unwrap()
+                                .unwrap(),
+                            0,
+                        );
+                    }
+                    Ok(())
+                },
+                &mut |tree| Ok(tree.members()),
+            )
+            .unwrap()
+            .unwrap();
+        drop(workers);
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        observer.join().unwrap();
+
+        assert!(work.is_none());
+        assert_eq!(listed.total_count, 2);
+        assert_eq!(listed.items[0].task.id, newer.id);
+        assert_eq!(listed.items[1].task.id, task.id);
+        assert!(
+            !listed.items[1].snapshot.kept,
+            "host loss changed a row after it was classified as finished"
+        );
+        assert!(listed.items[1].snapshot.kill_error.is_none());
+
+        let active = tasks
+            .listed(
+                &session,
+                ListQuery {
+                    all_scope: true,
+                    active_filter: Some(true),
+                    parent_task_id: None,
+                    limit: 20,
+                },
+                &mut |_| Ok(()),
+                &mut |tree| Ok(tree.members()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.total_count, 1);
+        assert_eq!(active.items[0].task.id, task.id);
+        let snapshot = &active.items[0].snapshot;
+        assert!(snapshot.kept && !snapshot.tree_ended && !snapshot.held_known);
+        assert!(
+            snapshot
+                .kill_error
+                .as_deref()
+                .is_some_and(|error| error.contains("unconfirmed"))
+        );
+        tasks.shutdown();
+    }
+
     #[test]
     fn host_loss_holds_the_task_before_or_after_the_root_result() {
         let (runtime, tasks, session) = fixture(Limits {

@@ -262,6 +262,27 @@ pub struct Child {
 
 #[cfg(unix)]
 impl Child {
+    #[cfg(test)]
+    pub(crate) fn failed_host_for_test() -> (Self, std::io::PipeReader) {
+        let host = Command::new("/bin/sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .unwrap();
+        let (status, status_writer) = std::io::pipe().unwrap();
+        drop(status_writer);
+        let (dropped, signal) = std::io::pipe().unwrap();
+        let signal: std::os::fd::OwnedFd = signal.into();
+        (
+            Self {
+                host,
+                status,
+                // EOF tells the test when finish_tree has dropped the child.
+                master: Some(signal.into()),
+            },
+            dropped,
+        )
+    }
+
     /// Blocks until the root bash exits and returns its bash-convention exit code. A root that
     /// never terminates is not this platform's failure mode, so the end is never forced.
     pub fn wait(&mut self, tree: &Tree) -> (i32, bool) {
