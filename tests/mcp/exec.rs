@@ -3012,8 +3012,8 @@ fn keeptree_list_lifecycle_idempotence_narrow_cut_and_ordered_events() {
         "repeated list must stay idempotent:\n{list_ended_2}"
     );
 
-    // 4. 12 background processes with `limit: 1, maxBytes: 100` triggers Tier 4 brief cut
-    // (`keeps sleep +11` + ` … [cut]`) and conserves keeps acknowledgement in the footer.
+    // 4. 12 background processes with `limit: 1, maxBytes: 100` triggers Tier 3 (short PIDs) or
+    // Tier 4 (long PIDs) with ` … [cut]`, and confirms keeps acknowledgement in the footer.
     let twelve_res = server.ok(json!({
         "action": "start",
         "command": "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 300 & done; echo twelve",
@@ -3034,8 +3034,10 @@ fn keeptree_list_lifecycle_idempotence_narrow_cut_and_ordered_events() {
         first_line.len()
     );
     assert!(
-        first_line.contains(&format!("{twelve_id} [exited 0] · keeps {sleep} +11")),
-        "expected Tier 4 brief for 12 held processes:\n{narrow}"
+        first_line.contains(&format!("{twelve_id} [exited 0] · keeps {sleep} +11"))
+            || (first_line.contains(&format!("{twelve_id} [exited 0] · keeps {sleep} ("))
+                && first_line.contains(" and 9 more")),
+        "expected Tier 3 or Tier 4 cut for 12 held processes:\n{narrow}"
     );
     assert!(
         first_line.ends_with(" … [cut]"),

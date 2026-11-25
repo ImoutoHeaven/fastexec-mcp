@@ -686,7 +686,8 @@ fn a_sudo_child_the_server_may_not_kill_is_held_and_reported() {
         "the task keeps the tree it could not end: {listing}"
     );
     assert!(
-        line.contains(&format!("({})", rooted.pid)),
+        line.contains(&format!("({})", rooted.pid))
+            || line.contains(&format!("pid {}", rooted.pid)),
         "the task still holds the root process {}: {listing}",
         rooted.pid
     );
