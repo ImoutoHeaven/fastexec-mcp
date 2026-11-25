@@ -6,6 +6,60 @@ use serde_json::{Value, json};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+// A failed startup assertion needs native stacks before Server teardown removes its hosts.
+#[cfg(target_os = "macos")]
+fn sample_stalled_start(server: &Server, case: &str) {
+    let server_pid = server.child.id();
+    let mut pids = vec![server_pid];
+    match Command::new("/usr/bin/pgrep")
+        .args(["-P", &server_pid.to_string()])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Ok(pid) = line.trim().parse::<u32>()
+                    && pid > 0
+                    && !pids.contains(&pid)
+                {
+                    pids.push(pid);
+                }
+            }
+        }
+        result => eprintln!("START_DIAG child lookup server={server_pid}: {result:?}"),
+    }
+    let selected = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    match Command::new("/bin/ps")
+        .args(["-p", &selected, "-o", "pid=,ppid=,state=,comm="])
+        .output()
+    {
+        Ok(output) => {
+            eprintln!(
+                "START_DIAG process state server={server_pid}: {}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            if let Err(error) = std::fs::write(
+                format!("ci-macos-{case}-{server_pid}-ps.log"),
+                output.stdout,
+            ) {
+                eprintln!("START_DIAG cannot save process state: {error}");
+            }
+        }
+        Err(error) => eprintln!("START_DIAG process state failed: {error}"),
+    }
+    for pid in pids {
+        let path = format!("ci-macos-{case}-{server_pid}-{pid}.log");
+        let result = Command::new("/usr/bin/sample")
+            .args([&pid.to_string(), "1", "1", "-file", &path])
+            .stdin(Stdio::null())
+            .status();
+        eprintln!("START_DIAG sample pid={pid} path={path}: {result:?}");
+    }
+}
+
 fn image_count(result: &Value) -> usize {
     result["content"]
         .as_array()
@@ -1529,8 +1583,13 @@ fn codemode_kill_shows_orphans_cancelled_starts_and_clears_background() {
         if listed.contains("8 tasks (8 active, 2 queued)") {
             break;
         }
+        let before_deadline = Instant::now() < deadline;
+        #[cfg(target_os = "macos")]
+        if !before_deadline {
+            sample_stalled_start(&server, "kill");
+        }
         assert!(
-            Instant::now() < deadline,
+            before_deadline,
             "timed out waiting for 8 active + 2 queued: {listed}"
         );
         std::thread::sleep(Duration::from_millis(25));
@@ -1626,8 +1685,13 @@ fn codemode_list_reports_live_queued_starts_accurately() {
         if text.contains("8 tasks (8 active, 4 queued)") {
             break text;
         }
+        let before_deadline = Instant::now() < deadline;
+        #[cfg(target_os = "macos")]
+        if !before_deadline {
+            sample_stalled_start(&server, "list");
+        }
         assert!(
-            Instant::now() < deadline,
+            before_deadline,
             "timed out waiting for 8 active + 4 queued: {text}"
         );
         std::thread::sleep(Duration::from_millis(25));
