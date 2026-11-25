@@ -1785,16 +1785,19 @@ local mode (`FASTEXEC_DAEMON=off`) and shared daemon mode (`FASTEXEC_DAEMON=on`,
 stdio and Streamable HTTP). Webhook methods `events/subscribe` and
 `events/unsubscribe` return JSON-RPC `-32601` (`Method not found`).
 
-HTTP header routing enforces strict `Mcp-Name` validation (`src/mcp.rs`):
+HTTP header routing enforces strict `Mcp-Name` validation (`src/mcp.rs`), using
+the same MCP header value encoding as `Mcp-Param-*`:
 
 - `events/list` accepts `null` or `{}` params and rejects any request carrying
   an `Mcp-Name` header with JSON-RPC `-32020`.
 - `events/poll` and `events/stream` require `params.name` and validate
   `Mcp-Name` whenever the header is present: duplicate `Mcp-Name` headers are
-  rejected, a raw header value must consist solely of visible ASCII
-  (`0x21..=0x7E`), and an encoded word `=?base64?<utf8>?=` must decode to valid
-  UTF-8. Any malformed header or mismatch against `params.name` fails with
-  JSON-RPC `-32020`.
+  rejected; non-empty printable ASCII (`0x20..=0x7E`) values without leading or
+  trailing space (`' '`) or horizontal tab (`'\t'`) and not starting with
+  `=?base64?` pass verbatim, while all other values use standard `=`-padded
+  Base64 wrapped as `=?base64?<standard-base64>?=` decoding to valid UTF-8. Any
+  malformed header or mismatch against `params.name` fails with JSON-RPC
+  `-32020`.
 
 ### Event catalog and schemas (`src/events.rs`)
 
