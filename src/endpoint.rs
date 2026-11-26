@@ -85,6 +85,8 @@ struct Link {
     writer: Mutex<Option<Writer>>,
     pending: std::sync::Mutex<HashMap<u64, Pending>>,
     event_pending: std::sync::Mutex<HashMap<u64, PendingEvent>>,
+    #[cfg(test)]
+    overflow_hook: std::sync::Mutex<Option<Arc<tests::OverflowHook>>>,
     /// Cancelled when the link ends: every call on it is lost, and the reader stops.
     closed: CancellationToken,
     memory: Arc<crate::lease::BytePool>,
@@ -101,17 +103,15 @@ struct PendingEvent {
 struct EventRegistration {
     link: Arc<Link>,
     id: u64,
-    overflowed: Option<Arc<AtomicBool>>,
     active: bool,
     cancel_on_drop: bool,
 }
 
 impl EventRegistration {
-    fn new(link: Arc<Link>, id: u64, overflowed: Option<Arc<AtomicBool>>) -> Self {
+    fn new(link: Arc<Link>, id: u64) -> Self {
         Self {
             link,
             id,
-            overflowed,
             active: true,
             cancel_on_drop: false,
         }
@@ -131,12 +131,8 @@ impl Drop for EventRegistration {
         if !self.active {
             return;
         }
-        lock(&self.link.event_pending).remove(&self.id);
-        let already_overflowed = self
-            .overflowed
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire));
-        if self.cancel_on_drop && !already_overflowed && !self.link.closed.is_cancelled() {
+        let removed = lock(&self.link.event_pending).remove(&self.id).is_some();
+        if self.cancel_on_drop && removed && !self.link.closed.is_cancelled() {
             tokio::spawn(Arc::clone(&self.link).cancel_event(self.id));
         }
     }
@@ -148,7 +144,6 @@ pub struct EndpointEventStream {
     id: u64,
     rx: mpsc::Receiver<(ipc::EventWireFrame, crate::lease::Lease)>,
     overflowed: Arc<AtomicBool>,
-    cancelled: bool,
 }
 
 impl EndpointEventStream {
@@ -165,12 +160,8 @@ impl EndpointEventStream {
     }
 
     pub async fn cancel(&mut self) {
-        if self.cancelled {
-            return;
-        }
-        self.cancelled = true;
-        lock(&self.link.event_pending).remove(&self.id);
-        if !self.overflowed() {
+        let removed = lock(&self.link.event_pending).remove(&self.id).is_some();
+        if removed {
             Arc::clone(&self.link).cancel_event(self.id).await;
         }
     }
@@ -178,8 +169,8 @@ impl EndpointEventStream {
 
 impl Drop for EndpointEventStream {
     fn drop(&mut self) {
-        lock(&self.link.event_pending).remove(&self.id);
-        if !self.cancelled && !self.overflowed() && !self.link.closed.is_cancelled() {
+        let removed = lock(&self.link.event_pending).remove(&self.id).is_some();
+        if removed && !self.link.closed.is_cancelled() {
             tokio::spawn(Arc::clone(&self.link).cancel_event(self.id));
         }
     }
@@ -516,6 +507,8 @@ impl Endpoint {
             writer: Mutex::new(Some(writer)),
             pending: std::sync::Mutex::new(HashMap::new()),
             event_pending: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            overflow_hook: std::sync::Mutex::new(None),
             closed: CancellationToken::new(),
             memory: Arc::clone(self.launch.memory()),
             control_memory: Arc::clone(self.launch.control_memory()),
@@ -616,7 +609,7 @@ impl Endpoint {
                 overflowed: None,
             },
         );
-        let _reg = EventRegistration::new(Arc::clone(&link), id, None);
+        let _reg = EventRegistration::new(Arc::clone(&link), id);
         let mut attempted = false;
         let frame = ToDaemon::EventsList { id };
         let sent = tokio::select! {
@@ -694,7 +687,7 @@ impl Endpoint {
                 overflowed: None,
             },
         );
-        let _reg = EventRegistration::new(Arc::clone(&link), id, None);
+        let _reg = EventRegistration::new(Arc::clone(&link), id);
         let mut attempted = false;
         let frame = ToDaemon::EventsPoll { id, request };
         let sent = tokio::select! {
@@ -777,7 +770,7 @@ impl Endpoint {
                 overflowed: Some(Arc::clone(&overflowed)),
             },
         );
-        let mut reg = EventRegistration::new(Arc::clone(&link), id, Some(Arc::clone(&overflowed)));
+        let mut reg = EventRegistration::new(Arc::clone(&link), id);
         let mut attempted = false;
         let frame = ToDaemon::EventsStream { id, request };
         let sent = tokio::select! {
@@ -822,7 +815,6 @@ impl Endpoint {
                         id,
                         rx,
                         overflowed,
-                        cancelled: false,
                     },
                 ))
             }
@@ -964,14 +956,21 @@ async fn read_loop(
                 let pending = lock(&link.event_pending).get(&id).cloned();
                 if let Some(entry) = pending {
                     if let Err(err) = entry.tx.try_send((frame, lease)) {
-                        // Drop this stream's sender when its bounded buffer fills so the shared IPC link keeps moving.
-                        let removed = lock(&link.event_pending).remove(&id).is_some();
+                        #[cfg(test)]
+                        let hook = lock(&link.overflow_hook).take();
+                        #[cfg(test)]
+                        if let Some(hook) = &hook {
+                            hook.arrived.notify_one();
+                            hook.resume.notified().await;
+                        }
+                        // The caller that removes the route owns cancellation.
+                        let removed = lock(&link.event_pending).remove(&id);
                         let (frame, lease) = match err {
                             mpsc::error::TrySendError::Full(item) => {
-                                if let Some(overflowed) = &entry.overflowed {
-                                    overflowed.store(true, Ordering::Release);
-                                }
-                                if removed {
+                                if let Some(removed) = removed {
+                                    if let Some(overflowed) = &removed.overflowed {
+                                        overflowed.store(true, Ordering::Release);
+                                    }
                                     tokio::spawn(Arc::clone(&link).cancel_event(id));
                                 }
                                 item
@@ -981,6 +980,10 @@ async fn read_loop(
                         drop(entry);
                         drop(frame);
                         drop(lease);
+                        #[cfg(test)]
+                        if let Some(hook) = hook {
+                            hook.done.notify_one();
+                        }
                     }
                 } else {
                     drop(frame);
@@ -1002,6 +1005,9 @@ async fn read_loop(
             }
             Some(ipc::LeasedEndpointFrame::OverloadEvent { id: Some(id) }) => {
                 if let Some(entry) = lock(&link.event_pending).remove(&id) {
+                    if entry.overflowed.is_some() {
+                        tokio::spawn(Arc::clone(&link).cancel_event(id));
+                    }
                     let frame = ipc::EventWireFrame::Terminated(ipc::IpcEventError {
                         code: -32025,
                         message: "endpoint active memory budget full during event stream".into(),
@@ -1717,10 +1723,8 @@ mod tests {
                 "budget" => stream.as_mut().unwrap().cancel().await,
                 "drop_stream" => drop(stream.take()),
                 "drop_registration" => {
-                    let mut stream = stream.take().unwrap();
-                    stream.cancelled = true;
-                    let mut registration =
-                        EventRegistration::new(Arc::clone(&link), stream.id, None);
+                    let stream = stream.take().unwrap();
+                    let mut registration = EventRegistration::new(Arc::clone(&link), stream.id);
                     registration.arm_cancel();
                     drop(registration);
                     drop(stream);
@@ -3290,6 +3294,7 @@ mod tests {
         let (identity, paths, mut listener, _target) = test_daemon("isolated-handshake");
         let response = welcome(&identity);
         let (ready_for_oversized_tx, ready_for_oversized_rx) = oneshot::channel();
+        let (cancel_notices_tx, mut cancel_notices_rx) = mpsc::channel(2);
         let peer = tokio::spawn(async move {
             let mut ready_for_oversized_rx = Some(ready_for_oversized_rx);
             // Attempt 1: `hello_owned` succeeds, but encoding `Hello` runs out of isolated pools.
@@ -3375,6 +3380,7 @@ mod tests {
                         .unwrap(),
                     Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == id
                 ));
+                cancel_notices_tx.send(()).await.unwrap();
             }
             assert!(matches!(
                 ipc::read_frame::<_, ToDaemon>(&mut third, ipc::REQUEST_LIMIT)
@@ -3456,6 +3462,10 @@ mod tests {
             .try_acquire(control_pool.limit() - control_pool.used())
             .unwrap();
         ready_for_oversized_tx.send(()).unwrap();
+        timeout(Duration::from_secs(5), cancel_notices_rx.recv())
+            .await
+            .unwrap()
+            .expect("OOM cancels upstream before the consumer reads");
         let next1 = timeout(Duration::from_secs(5), stream1.next())
             .await
             .unwrap();
@@ -3482,6 +3492,10 @@ mod tests {
             .await
             .unwrap();
         drop(active2);
+        timeout(Duration::from_secs(5), cancel_notices_rx.recv())
+            .await
+            .unwrap()
+            .expect("OOM cancels upstream before the consumer reads");
         let (term_frame, term_lease) = timeout(Duration::from_secs(5), stream2.next())
             .await
             .unwrap()
@@ -3501,6 +3515,119 @@ mod tests {
 
         endpoint.bye().await;
         finish(peer).await;
+    }
+
+    #[derive(Default)]
+    pub(super) struct OverflowHook {
+        pub(super) arrived: tokio::sync::Notify,
+        pub(super) resume: tokio::sync::Notify,
+        pub(super) done: tokio::sync::Notify,
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_stream_owns_the_route_before_a_stale_full_send_finishes() {
+        for explicit in [true, false] {
+            let (identity, paths, mut listener, _target) = test_daemon(if explicit {
+                "overflow-cancel"
+            } else {
+                "overflow-drop"
+            });
+            let response = welcome(&identity);
+            let (start_tx, start_rx) = oneshot::channel();
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let mut conn = listener.accept().await.unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Hello { .. })
+                ));
+                ipc::write_frame(&mut conn, &response).await.unwrap();
+                let Some(ToDaemon::EventsStream { id, .. }) =
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap()
+                else {
+                    panic!("expected subscription")
+                };
+                ipc::write_frame(
+                    &mut conn,
+                    &ToEndpoint::EventFrame {
+                        id,
+                        frame: ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                            cursor: "ep000001:0".into(),
+                            truncated: false,
+                            heartbeat_ms: 30_000,
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+                start_rx.await.unwrap();
+                for _ in 0..=EVENT_STREAM_CHANNEL_CAPACITY {
+                    ipc::write_frame(
+                        &mut conn,
+                        &ToEndpoint::EventFrame {
+                            id,
+                            frame: ipc::EventWireFrame::Heartbeat {
+                                cursor: "ep000001:0".into(),
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT).await.unwrap(),
+                    Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == id
+                ));
+                cancel_tx.send(()).unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::Bye)
+                ));
+            });
+            let endpoint = Endpoint::for_test(identity, paths);
+            let (active, mut stream) = endpoint
+                .events_stream(
+                    "test",
+                    crate::events::SubscribeRequest {
+                        name: crate::events::EVENT_EXTERNAL.into(),
+                        ..Default::default()
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            drop(active);
+            let link = Arc::clone(&stream.link);
+            let overflowed = Arc::clone(&stream.overflowed);
+            let hook = Arc::new(OverflowHook::default());
+            *lock(&link.overflow_hook) = Some(Arc::clone(&hook));
+            start_tx.send(()).unwrap();
+            timeout(Duration::from_secs(5), hook.arrived.notified())
+                .await
+                .unwrap();
+            if explicit {
+                stream.cancel().await;
+            }
+            drop(stream);
+            timeout(Duration::from_secs(5), cancel_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            hook.resume.notify_one();
+            timeout(Duration::from_secs(5), hook.done.notified())
+                .await
+                .unwrap();
+            assert!(!overflowed.load(Ordering::Acquire));
+            assert!(!link.closed.is_cancelled());
+            endpoint.bye().await;
+            finish(peer).await;
+        }
     }
 
     #[tokio::test]
