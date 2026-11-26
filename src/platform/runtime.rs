@@ -598,17 +598,13 @@ pub(crate) fn create_private_windows_check(dir: &Path) -> io::Result<()> {
 }
 
 /// Checks that what is at `dir` is a real directory this user owns with mode 0700.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn create_private_unix_check(dir: &Path) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        private_macos::check(dir)
-    }
     #[cfg(target_os = "freebsd")]
     {
         crate::platform::freebsd_fs::check_private_directory(dir)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+    #[cfg(not(target_os = "freebsd"))]
     {
         crate::platform::private_unix::check_metadata(dir, &std::fs::symlink_metadata(dir)?)
     }
