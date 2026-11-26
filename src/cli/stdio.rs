@@ -6,10 +6,9 @@ use crate::config::{
 };
 use crate::endpoint;
 use crate::env::LaunchContext;
-use crate::http;
-use crate::ingress;
+use crate::http_wire;
 use crate::lease;
-use crate::mcp::{Backend, RequestLeases, Server};
+use crate::mcp::{Backend, RequestLeases, Server, ingress};
 use crate::service::Service;
 use crate::tasks::{Limits, Tasks};
 use crate::transfer::{self, TransferEndpoint};
@@ -68,10 +67,27 @@ impl<R, W> StdioTransport<R, W>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    #[cfg(test)]
     pub(crate) fn new(read: R, write: W, leases: Arc<RequestLeases>) -> Self {
+        Self::with_pools(
+            read,
+            write,
+            leases,
+            Arc::clone(lease::process_pool()),
+            Arc::clone(lease::control_pool()),
+        )
+    }
+
+    pub(crate) fn with_pools(
+        read: R,
+        write: W,
+        leases: Arc<RequestLeases>,
+        pool: Arc<lease::BytePool>,
+        control: Arc<lease::BytePool>,
+    ) -> Self {
         Self {
             read: tokio::io::BufReader::new(read),
-            line_buf: ingress::Buffer::default(),
+            line_buf: ingress::Buffer::new(pool, control),
             max_line_length: STDIO_MAX_LINE_BYTES,
             discarding: false,
             ready: false,
@@ -81,7 +97,7 @@ where
     }
 
     fn reset_line_buf(&mut self) {
-        self.line_buf = ingress::Buffer::default();
+        self.line_buf.clear();
     }
 
     async fn read_line(&mut self) -> StdioLine {
@@ -119,16 +135,23 @@ where
                     .append(&available[..take], self.max_line_length)
                     .is_err()
                 {
-                    let id = sniff_prefix_id(&self.line_buf, &available[..take], newline.is_some());
-                    self.reset_line_buf();
-                    (
-                        take,
+                    let step = if newline.is_some()
+                        && ingress::is_complete_json_notification(
+                            &self.line_buf,
+                            &available[..take],
+                        ) {
+                        StdioReadStep::More
+                    } else {
+                        let id =
+                            sniff_prefix_id(&self.line_buf, &available[..take], newline.is_some());
                         if newline.is_some() {
                             StdioReadStep::Overloaded(id)
                         } else {
                             StdioReadStep::OverloadedNeedsDiscard(id)
-                        },
-                    )
+                        }
+                    };
+                    self.reset_line_buf();
+                    (take, step)
                 } else {
                     (
                         take,
@@ -170,9 +193,11 @@ impl<R, W: tokio::io::AsyncWrite + Unpin> StdioTransport<R, W> {
         let Ok(size) = lease::json_len(&reply).map(|n| n.saturating_add(1)) else {
             return true;
         };
-        let Some(mut lease) = lease::control_pool()
+        let Some(mut lease) = self
+            .line_buf
+            .control()
             .try_acquire(size)
-            .or_else(|| lease::process_pool().try_acquire(size))
+            .or_else(|| self.line_buf.pool().try_acquire(size))
         else {
             return true;
         };
@@ -236,6 +261,8 @@ struct StdioSendPayload {
     staging: Option<lease::Lease>,
     outbound: Option<lease::Lease>,
     payload_owner: lease::Owner,
+    pool: Arc<lease::BytePool>,
+    control: Arc<lease::BytePool>,
 }
 
 struct StdioFrame {
@@ -247,9 +274,9 @@ impl StdioSendPayload {
     fn encode(mut self) -> std::io::Result<StdioFrame> {
         if self.outbound.is_none() {
             let size = lease::json_len(&self.item)?.saturating_add(1);
-            self.outbound = lease::process_pool().try_acquire(size).or_else(|| {
+            self.outbound = self.pool.try_acquire(size).or_else(|| {
                 (size <= 64 * 1024)
-                    .then(|| lease::control_pool().try_acquire(size))
+                    .then(|| self.control.try_acquire(size))
                     .flatten()
             });
             if self.outbound.is_none() {
@@ -298,6 +325,8 @@ where
             staging: staging_lease,
             outbound: outbound_lease,
             payload_owner,
+            pool: Arc::clone(self.line_buf.pool()),
+            control: Arc::clone(self.line_buf.control()),
         };
         async move {
             let frame = payload.encode()?;
@@ -341,7 +370,7 @@ where
                 }
                 StdioLine::End => return None,
             }
-            let parsed = std::mem::take(&mut self.line_buf).parse(true);
+            let parsed = self.line_buf.take().parse(true);
             match parsed {
                 Ok(Some(parsed)) => {
                     let msg = parsed.into_message();
@@ -560,9 +589,10 @@ pub(crate) async fn serve() {
                 };
                 let table = Arc::new(transfer::Transfers::new());
                 let stop = CancellationToken::new();
-                tokio::spawn(http::serve_transfers(
+                tokio::spawn(http_wire::serve_transfers(
                     listener,
                     Arc::clone(&table),
+                    Arc::clone(launch.memory()),
                     stop.clone(),
                 ));
                 let base: Arc<str> =
@@ -601,7 +631,13 @@ pub(crate) async fn serve() {
         inner: tokio::io::stdin(),
         eof: Arc::clone(&eof),
     };
-    let transport = StdioTransport::new(stdin, tokio::io::stdout(), stdio_leases);
+    let transport = StdioTransport::with_pools(
+        stdin,
+        tokio::io::stdout(),
+        stdio_leases,
+        Arc::clone(launch.memory()),
+        Arc::clone(launch.control_memory()),
+    );
     // Signals are watched from the start, so an exit during initialization still cleans up.
     let signal = shutdown_signal();
     tokio::pin!(signal);

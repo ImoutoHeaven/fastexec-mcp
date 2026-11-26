@@ -1,6 +1,5 @@
 //! Owned MCP request buffers and non-blocking admission before parsing.
-use crate::lease::Owner;
-use crate::lease::{self, BytePool, Lease};
+use crate::lease::{BytePool, Lease, Owner};
 use rmcp::model::ClientJsonRpcMessage;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -27,14 +26,6 @@ pub(crate) struct Parsed {
     pub message: ClientJsonRpcMessage,
     pub owner: Owner,
 }
-impl Default for Buffer {
-    fn default() -> Self {
-        Self::new(
-            Arc::clone(lease::process_pool()),
-            Arc::clone(lease::control_pool()),
-        )
-    }
-}
 impl std::ops::Deref for Buffer {
     type Target = Vec<u8>;
     fn deref(&self) -> &Self::Target {
@@ -51,6 +42,21 @@ impl Buffer {
             in_control: false,
             lease,
         }
+    }
+    pub(crate) fn clear(&mut self) {
+        self.bytes = Vec::new();
+        self.in_control = false;
+        self.lease = Lease::empty(&self.pool);
+    }
+    pub(crate) fn take(&mut self) -> Self {
+        let replacement = Self::new(Arc::clone(&self.pool), Arc::clone(&self.control));
+        std::mem::replace(self, replacement)
+    }
+    pub(crate) fn pool(&self) -> &Arc<BytePool> {
+        &self.pool
+    }
+    pub(crate) fn control(&self) -> &Arc<BytePool> {
+        &self.control
     }
     fn resize(&mut self, target: usize, input_len: usize) -> bool {
         let short = input_len <= SHORT_REQUEST && target <= SHORT_PEAK;
@@ -102,23 +108,31 @@ impl Buffer {
         Ok(())
     }
     pub fn parse(mut self, stdio: bool) -> Result<Option<Parsed>, Failure> {
+        if stdio
+            && self
+                .bytes
+                .strip_prefix(UTF8_BOM)
+                .unwrap_or(&self.bytes)
+                .iter()
+                .all(u8::is_ascii_whitespace)
+        {
+            return Ok(None);
+        }
         let len = self.bytes.len();
         if !self.resize(self.bytes.capacity().saturating_add(3 * len), len) {
+            if stdio && is_complete_json_notification(&self.bytes, &[]) {
+                return Ok(None);
+            }
             let id = stdio
                 .then(|| sniff_request_id(&self.bytes, len <= SNIFF_HEAD_LIMIT))
                 .flatten();
             return Err(Failure::Budget { id });
         }
         let raw = if stdio {
-            self.bytes
-                .strip_prefix(crate::ingress::UTF8_BOM)
-                .unwrap_or(&self.bytes)
+            self.bytes.strip_prefix(UTF8_BOM).unwrap_or(&self.bytes)
         } else {
             &self.bytes
         };
-        if stdio && raw.iter().all(u8::is_ascii_whitespace) {
-            return Ok(None);
-        }
         // Slice decoding can retain twice the longest escaped token as scratch,
         // alongside the decoded Value and original bytes.
         let value: serde_json::Value = serde_json::from_slice(raw).map_err(|_| Failure::Syntax)?;
@@ -437,14 +451,383 @@ fn skip_value(bytes: &[u8], mut i: usize) -> Option<usize> {
     }
 }
 
+/// Checks without heap allocation whether `prefix` + `suffix` is a complete, syntactically valid
+/// top-level JSON object `{ ... }` (allowing a leading UTF-8 BOM and RFC 8259 whitespace) with no
+/// top-level `"id"` key.
+pub(crate) fn is_complete_json_notification(prefix: &[u8], suffix: &[u8]) -> bool {
+    const MAX_DEPTH: usize = 127;
+    enum State {
+        ObjectFirstOrClose,
+        ObjectKey,
+        ArrayFirstOrClose,
+        Value,
+        AfterValue,
+    }
+
+    let chain = ByteChain {
+        first: prefix,
+        second: suffix,
+    };
+    let mut i = if chain.starts_with_at(0, UTF8_BOM) {
+        3
+    } else {
+        0
+    };
+    i = chain.skip_rfc_ws(i);
+    if chain.get(i) != Some(b'{') {
+        return false;
+    }
+    i += 1;
+    let mut stack: u128 = 1;
+    let mut depth: usize = 1;
+    let mut state = State::ObjectFirstOrClose;
+
+    while depth > 0 {
+        match state {
+            State::ObjectFirstOrClose => {
+                i = chain.skip_rfc_ws(i);
+                if chain.get(i) == Some(b'}') {
+                    i += 1;
+                    depth -= 1;
+                    state = State::AfterValue;
+                } else {
+                    state = State::ObjectKey;
+                }
+            }
+            State::ObjectKey => {
+                i = chain.skip_rfc_ws(i);
+                let Some((after_key, is_id)) = chain.scan_json_string(i) else {
+                    return false;
+                };
+                if depth == 1 && is_id {
+                    return false;
+                }
+                i = chain.skip_rfc_ws(after_key);
+                if chain.get(i) != Some(b':') {
+                    return false;
+                }
+                i += 1;
+                state = State::Value;
+            }
+            State::ArrayFirstOrClose => {
+                i = chain.skip_rfc_ws(i);
+                if chain.get(i) == Some(b']') {
+                    i += 1;
+                    depth -= 1;
+                    state = State::AfterValue;
+                } else {
+                    state = State::Value;
+                }
+            }
+            State::Value => {
+                i = chain.skip_rfc_ws(i);
+                match chain.get(i) {
+                    Some(b'{') => {
+                        if depth >= MAX_DEPTH {
+                            return false;
+                        }
+                        stack |= 1u128 << depth;
+                        depth += 1;
+                        i += 1;
+                        state = State::ObjectFirstOrClose;
+                    }
+                    Some(b'[') => {
+                        if depth >= MAX_DEPTH {
+                            return false;
+                        }
+                        stack &= !(1u128 << depth);
+                        depth += 1;
+                        i += 1;
+                        state = State::ArrayFirstOrClose;
+                    }
+                    Some(b'"') => {
+                        let Some((next_i, _)) = chain.scan_json_string(i) else {
+                            return false;
+                        };
+                        i = next_i;
+                        state = State::AfterValue;
+                    }
+                    Some(b'-' | b'0'..=b'9') => {
+                        let Some(next_i) = chain.scan_json_number(i) else {
+                            return false;
+                        };
+                        i = next_i;
+                        state = State::AfterValue;
+                    }
+                    Some(b't') if chain.starts_with_at(i, b"true") => {
+                        i += 4;
+                        state = State::AfterValue;
+                    }
+                    Some(b'f') if chain.starts_with_at(i, b"false") => {
+                        i += 5;
+                        state = State::AfterValue;
+                    }
+                    Some(b'n') if chain.starts_with_at(i, b"null") => {
+                        i += 4;
+                        state = State::AfterValue;
+                    }
+                    _ => return false,
+                }
+            }
+            State::AfterValue => {
+                i = chain.skip_rfc_ws(i);
+                let in_object = ((stack >> (depth - 1)) & 1) == 1;
+                match (in_object, chain.get(i)) {
+                    (true, Some(b',')) => {
+                        i += 1;
+                        state = State::ObjectKey;
+                    }
+                    (true, Some(b'}')) => {
+                        i += 1;
+                        depth -= 1;
+                    }
+                    (false, Some(b',')) => {
+                        i += 1;
+                        state = State::Value;
+                    }
+                    (false, Some(b']')) => {
+                        i += 1;
+                        depth -= 1;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+    chain.skip_rfc_ws(i) == chain.len()
+}
+
+struct ByteChain<'a> {
+    first: &'a [u8],
+    second: &'a [u8],
+}
+
+impl<'a> ByteChain<'a> {
+    fn len(&self) -> usize {
+        self.first.len() + self.second.len()
+    }
+
+    fn get(&self, idx: usize) -> Option<u8> {
+        if idx < self.first.len() {
+            Some(self.first[idx])
+        } else {
+            self.second.get(idx - self.first.len()).copied()
+        }
+    }
+
+    fn skip_rfc_ws(&self, mut i: usize) -> usize {
+        while matches!(self.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            i += 1;
+        }
+        i
+    }
+
+    fn starts_with_at(&self, idx: usize, pat: &[u8]) -> bool {
+        pat.iter()
+            .enumerate()
+            .all(|(off, &expected)| self.get(idx + off) == Some(expected))
+    }
+
+    fn scan_hex4(&self, idx: usize) -> Option<u16> {
+        let mut val = 0u16;
+        for off in 0..4 {
+            let digit = match self.get(idx + off)? {
+                b @ b'0'..=b'9' => b - b'0',
+                b @ b'a'..=b'f' => b - b'a' + 10,
+                b @ b'A'..=b'F' => b - b'A' + 10,
+                _ => return None,
+            };
+            val = (val << 4) | u16::from(digit);
+        }
+        Some(val)
+    }
+
+    fn scan_utf8_non_ascii(&self, idx: usize) -> Option<usize> {
+        let is_cont = |b: u8| (0x80..=0xBF).contains(&b);
+        match self.get(idx)? {
+            0xC2..=0xDF => is_cont(self.get(idx + 1)?).then_some(idx + 2),
+            0xE0 => {
+                let b1 = self.get(idx + 1)?;
+                ((0xA0..=0xBF).contains(&b1) && is_cont(self.get(idx + 2)?)).then_some(idx + 3)
+            }
+            0xE1..=0xEC | 0xEE..=0xEF => {
+                (is_cont(self.get(idx + 1)?) && is_cont(self.get(idx + 2)?)).then_some(idx + 3)
+            }
+            0xED => {
+                let b1 = self.get(idx + 1)?;
+                ((0x80..=0x9F).contains(&b1) && is_cont(self.get(idx + 2)?)).then_some(idx + 3)
+            }
+            0xF0 => {
+                let b1 = self.get(idx + 1)?;
+                ((0x90..=0xBF).contains(&b1)
+                    && is_cont(self.get(idx + 2)?)
+                    && is_cont(self.get(idx + 3)?))
+                .then_some(idx + 4)
+            }
+            0xF1..=0xF3 => (is_cont(self.get(idx + 1)?)
+                && is_cont(self.get(idx + 2)?)
+                && is_cont(self.get(idx + 3)?))
+            .then_some(idx + 4),
+            0xF4 => {
+                let b1 = self.get(idx + 1)?;
+                ((0x80..=0x8F).contains(&b1)
+                    && is_cont(self.get(idx + 2)?)
+                    && is_cont(self.get(idx + 3)?))
+                .then_some(idx + 4)
+            }
+            _ => None,
+        }
+    }
+
+    fn scan_json_string(&self, quote_idx: usize) -> Option<(usize, bool)> {
+        if self.get(quote_idx) != Some(b'"') {
+            return None;
+        }
+        let mut i = quote_idx + 1;
+        let mut head = [0u8; 2];
+        let mut decoded_len = 0usize;
+        let mut push_byte = |b: u8| {
+            if decoded_len < 2 {
+                head[decoded_len] = b;
+            }
+            decoded_len = decoded_len.saturating_add(1);
+        };
+        while let Some(b) = self.get(i) {
+            match b {
+                b'"' => return Some((i + 1, decoded_len == 2 && head == *b"id")),
+                0x00..=0x1f => return None,
+                b'\\' => {
+                    let esc = self.get(i + 1)?;
+                    match esc {
+                        b'"' | b'\\' | b'/' => {
+                            push_byte(esc);
+                            i += 2;
+                        }
+                        b'b' => {
+                            push_byte(0x08);
+                            i += 2;
+                        }
+                        b'f' => {
+                            push_byte(0x0c);
+                            i += 2;
+                        }
+                        b'n' => {
+                            push_byte(b'\n');
+                            i += 2;
+                        }
+                        b'r' => {
+                            push_byte(b'\r');
+                            i += 2;
+                        }
+                        b't' => {
+                            push_byte(b'\t');
+                            i += 2;
+                        }
+                        b'u' => {
+                            let u1 = self.scan_hex4(i + 2)?;
+                            let (ch, next_i) = match u1 {
+                                0xD800..=0xDBFF => {
+                                    if !self.starts_with_at(i + 6, b"\\u") {
+                                        return None;
+                                    }
+                                    let u2 = self.scan_hex4(i + 8)?;
+                                    if !(0xDC00..=0xDFFF).contains(&u2) {
+                                        return None;
+                                    }
+                                    let code = 0x10000
+                                        + ((u32::from(u1 - 0xD800) << 10) | u32::from(u2 - 0xDC00));
+                                    (char::from_u32(code)?, i + 12)
+                                }
+                                0xDC00..=0xDFFF => return None,
+                                _ => (char::from_u32(u32::from(u1))?, i + 6),
+                            };
+                            let mut utf8 = [0u8; 4];
+                            for &ub in ch.encode_utf8(&mut utf8).as_bytes() {
+                                push_byte(ub);
+                            }
+                            i = next_i;
+                        }
+                        _ => return None,
+                    }
+                }
+                0x20..=0x7f => {
+                    push_byte(b);
+                    i += 1;
+                }
+                _ => {
+                    let next_i = self.scan_utf8_non_ascii(i)?;
+                    for idx in i..next_i {
+                        push_byte(self.get(idx)?);
+                    }
+                    i = next_i;
+                }
+            }
+        }
+        None
+    }
+
+    fn scan_json_number(&self, start: usize) -> Option<usize> {
+        let mut i = start;
+        if self.get(i) == Some(b'-') {
+            i += 1;
+        }
+        match self.get(i)? {
+            b'0' => i += 1,
+            b'1'..=b'9' => {
+                i += 1;
+                while matches!(self.get(i), Some(b'0'..=b'9')) {
+                    i += 1;
+                }
+            }
+            _ => return None,
+        }
+        if self.get(i) == Some(b'.') {
+            i += 1;
+            if !matches!(self.get(i), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(self.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
+        }
+        if matches!(self.get(i), Some(b'e' | b'E')) {
+            i += 1;
+            if matches!(self.get(i), Some(b'+' | b'-')) {
+                i += 1;
+            }
+            if !matches!(self.get(i), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(self.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
+        }
+        let in_range = if i <= self.first.len() {
+            serde_json::from_slice::<serde_json::Number>(&self.first[start..i]).is_ok()
+        } else if start >= self.first.len() {
+            let s = start - self.first.len();
+            let e = i - self.first.len();
+            serde_json::from_slice::<serde_json::Number>(&self.second[s..e]).is_ok()
+        } else {
+            use std::io::Read as _;
+            let left = &self.first[start..];
+            let right = &self.second[..i - self.first.len()];
+            serde_json::from_reader::<_, serde_json::Number>(left.chain(right)).is_ok()
+        };
+        in_range.then_some(i)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rmcp::model::{GetExtensions, JsonRpcMessage};
 
+    const LIMIT: usize = 4 << 20;
+
     fn buffered(raw: &[u8], pool: &Arc<BytePool>) -> Buffer {
         let mut buffer = Buffer::new(Arc::clone(pool), BytePool::new(0));
-        buffer.append(raw, crate::http::LIMIT).unwrap();
+        buffer.append(raw, LIMIT).unwrap();
         buffer
     }
 
@@ -614,5 +997,102 @@ mod tests {
             Err(Failure::InvalidRequest { id: None })
         ));
         assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn clear_and_take_preserve_isolated_pools_and_release_charges() {
+        let pool = BytePool::new(128);
+        let control = BytePool::new(64);
+        let mut buf = Buffer::new(Arc::clone(&pool), Arc::clone(&control));
+        assert!(Arc::ptr_eq(buf.pool(), &pool));
+        assert!(Arc::ptr_eq(buf.control(), &control));
+
+        buf.append(&[b'x'; 80], LIMIT).unwrap();
+        assert_eq!(pool.used(), buf.capacity());
+        buf.clear();
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), 0);
+        assert_eq!(pool.used(), 0);
+        assert!(Arc::ptr_eq(buf.pool(), &pool));
+        assert!(Arc::ptr_eq(buf.control(), &control));
+        assert_eq!(
+            buf.append(&[b'x'; 200], LIMIT),
+            Err(Failure::Budget { id: None })
+        );
+
+        buf.append(&[b'y'; 80], LIMIT).unwrap();
+        let taken = buf.take();
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), 0);
+        assert!(Arc::ptr_eq(buf.pool(), &pool));
+        assert!(Arc::ptr_eq(buf.control(), &control));
+        assert_eq!(taken.len(), 80);
+        drop(taken);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn stdio_early_parse_budget_drops_only_syntactically_valid_notifications() {
+        let noti = br#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{"nested":{"id":9},"s":"a\nb\uD83D\uDE00"}}"#;
+        let tight = BytePool::new(noti.len());
+        assert!(buffered(noti, &tight).parse(true).unwrap().is_none());
+        assert_eq!(tight.used(), 0);
+        assert_eq!(
+            buffered(noti, &tight).parse(false).err(),
+            Some(Failure::Budget { id: None })
+        );
+
+        for (split_noti, expected) in [
+            (
+                &b"\xef\xbb\xbf { \"method\" : \"x\", \"arr\" : [true, false, null, -0.5e+2] }\r\n"
+                    [..],
+                true,
+            ),
+            (&br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#[..], false),
+            (
+                &br#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#[..],
+                false,
+            ),
+            (
+                &br#"{"jsonrpc":"2.0","i\u0064":"esc","method":"ping"}"#[..],
+                false,
+            ),
+            (&br#"{"jsonrpc":"2.0","method":"x",}"#[..], false),
+            (&br#"{"jsonrpc":"2.0","method":"x"} trailing"#[..], false),
+            (&br#"{"jsonrpc":"2.0","params":[1,2}}"#[..], false),
+            (&br#"{"jsonrpc":"2.0","n":01}"#[..], false),
+            (&br#"{"jsonrpc":"2.0","n":1e999}"#[..], false),
+            (&br#"{"jsonrpc":"2.0","s":"\uD800"}"#[..], false),
+            (&b"{\"jsonrpc\":\"2.0\",\"s\":\"\xff\"}"[..], false),
+            (&b"[{\"jsonrpc\":\"2.0\"}]"[..], false),
+        ] {
+            for split in 0..=split_noti.len() {
+                let (a, b) = split_noti.split_at(split);
+                assert_eq!(
+                    is_complete_json_notification(a, b),
+                    expected,
+                    "split={split} input={split_noti:?}"
+                );
+            }
+        }
+
+        // Exact depth boundary matches serde_json::Value recursion limit (127 containers ok, 128 rejected).
+        for depth in [127usize, 128] {
+            let mut nested = String::from(r#"{"v":"#);
+            for _ in 1..depth {
+                nested.push('[');
+            }
+            nested.push('0');
+            for _ in 1..depth {
+                nested.push(']');
+            }
+            nested.push('}');
+            let serde_ok = serde_json::from_slice::<serde_json::Value>(nested.as_bytes()).is_ok();
+            assert_eq!(serde_ok, depth == 127);
+            assert_eq!(
+                is_complete_json_notification(nested.as_bytes(), &[]),
+                serde_ok
+            );
+        }
     }
 }

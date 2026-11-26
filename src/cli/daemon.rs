@@ -45,6 +45,7 @@ pub(crate) fn daemon_main(args: &[std::ffi::OsString]) -> i32 {
             flags.http,
             flags.idle_exit.unwrap_or_default(),
             false,
+            spawn_http,
         ),
         "run" => cli_run(flags),
         _ => match tokio::runtime::Runtime::new() {
@@ -164,7 +165,33 @@ fn cli_run(flags: DaemonFlags) -> i32 {
     if let Err(error) = runtime::paths(&identity.namespace) {
         return fail(&format!("cannot use the runtime directory: {error}"));
     }
-    daemon::serve_process(identity.namespace, identity.build, flags.http, false, true)
+    daemon::serve_process(
+        identity.namespace,
+        identity.build,
+        flags.http,
+        false,
+        true,
+        spawn_http,
+    )
+}
+
+pub(super) fn spawn_http(
+    launch: daemon::HttpLaunch,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(crate::http::serve(crate::http::HttpServeArgs {
+        listener: launch.listener,
+        digests: launch.digests,
+        tools: launch.tools,
+        launch: launch.launch,
+        public_root: launch.public_root,
+        extra_instructions: launch.extra_instructions,
+        instructions_tool: launch.instructions_tool,
+        service: launch.service,
+        transfers: launch.transfers,
+        memory: launch.memory,
+        control_memory: launch.control_memory,
+        stopped: launch.stopped,
+    }))
 }
 
 /// The CLI: one exchange with the namespace's daemon, and what it prints.
@@ -291,7 +318,7 @@ pub(super) fn parse_emit_payload(
     })
 }
 
-async fn connect_emit_daemon(
+pub(super) async fn connect_emit_daemon(
     identity: &runtime::Identity,
     paths: &runtime::Paths,
     deadline: std::time::Instant,
@@ -320,9 +347,33 @@ async fn connect_emit_daemon(
         .await
         .map_err(|e| format!("cannot read Welcome: {e}"))?;
         match frame {
-            ipc::LeasedEndpointFrame::Frame(ToEndpoint::Welcome { protocol, .. }, _)
-                if protocol == ipc::PROTOCOL =>
-            {
+            ipc::LeasedEndpointFrame::Frame(
+                ToEndpoint::Welcome {
+                    protocol,
+                    namespace,
+                    build,
+                    ..
+                },
+                _,
+            ) => {
+                if protocol != ipc::PROTOCOL {
+                    return Err(format!(
+                        "the daemon speaks protocol {protocol}, not {}",
+                        ipc::PROTOCOL
+                    ));
+                }
+                if namespace != identity.namespace {
+                    return Err(format!(
+                        "the daemon serves namespace {namespace}, not {}",
+                        identity.namespace
+                    ));
+                }
+                if build != identity.build {
+                    return Err(format!(
+                        "the daemon runs build {build}, not {}",
+                        identity.build
+                    ));
+                }
                 Ok(())
             }
             ipc::LeasedEndpointFrame::Frame(ToEndpoint::Reject { message }, _) => Err(message),

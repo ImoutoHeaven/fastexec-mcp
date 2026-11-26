@@ -100,11 +100,7 @@ pub(super) fn write_text_reserved(
 
 /// Creates the final target's parent directories for an initial upload. Its real
 /// blocking worker owns the resolved target even when the HTTP waiter is dropped.
-pub(crate) fn create_target_parents(path: &Path) -> io::Result<crate::lease::Owned<PathBuf>> {
-    create_target_parents_in(path, crate::lease::process_pool())
-}
-
-pub(super) fn create_target_parents_in(
+pub(crate) fn create_target_parents_in(
     path: &Path,
     pool: &Arc<BytePool>,
 ) -> io::Result<crate::lease::Owned<PathBuf>> {

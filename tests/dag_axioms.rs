@@ -4,16 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Target 23-module strict lower-triangular allowlist `D(u)` from Spec §3 (`rank(v) < rank(u)`).
-///
-/// Checkpoint 2 mapping notes:
-/// - `#4 env` and `#15 render` are active at their final target ranks (`src/session.rs` is split
-///   into `#4 src/env.rs` and `#12 src/tasks/session.rs`, so `session` is no longer a valid
-///   top-level module).
-/// - `#18 http_wire` stays at its target rank so Checkpoint 3 extraction activates without
-///   reordering.
-/// - `ingress` is listed separately in [`CP2_TRANSITIONAL_MODULES`] until Checkpoint 3 folds
-///   `src/ingress.rs` into `#21 src/mcp/ingress.rs`.
+/// Final 23-module strict lower-triangular allowlist `D(u)` from Spec §3 (`rank(v) < rank(u)`).
+/// Every cross-top-module dependency in non-test `src/` code must appear in this table, and the
+/// set of top-level modules declared in `src/main.rs` must match these 23 entries one-to-one.
 const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
     // S0 primitives (#1..#3, 3x3 diagonal block)
     ("id", &[]),
@@ -139,27 +132,6 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Top-level modules still present in CP2 that fold into another module in Checkpoint 3.
-/// `src/ingress.rs` folds into `src/mcp/ingress.rs` in Checkpoint 3.
-const CP2_TRANSITIONAL_MODULES: &[&str] = &["ingress"];
-
-/// Exact set of cross-top-module directed edges `(from, to)` still present after Checkpoint 2
-/// that lie outside [`TARGET_DAG_ALLOWLIST`] and are scheduled for removal in Checkpoint 3.
-const CP2_TRANSITIONAL_EDGES: &[(&str, &str)] = &[
-    ("ingress", "lease"),
-    ("daemon", "files"),
-    ("daemon", "http"),
-    ("mcp", "ingress"),
-    ("mcp", "http"),
-    ("http", "files"),
-    ("http", "daemon"),
-    ("cli", "ingress"),
-];
-
-/// Remaining top-level 2-cycles scheduled for removal in Checkpoint 3 (15 -> 9 -> 2 -> 0).
-/// Every pair is ordered lexicographically (`a < b`).
-const CP2_TRANSITIONAL_2CYCLES: &[(&str, &str)] = &[("daemon", "http"), ("http", "mcp")];
-
 /// Cross-layer one-way edges eliminated in Checkpoint 1.
 const CP1_FORBIDDEN_EDGES: &[(&str, &str)] = &[
     ("platform", "ipc"),
@@ -172,11 +144,29 @@ const CP1_FORBIDDEN_EDGES: &[(&str, &str)] = &[
 
 /// Multi-file top-level modules whose entire submodule graph (including parent `<top>.rs` and
 /// child `<top>/<sub>.rs` files) must have zero strongly connected cycles.
-const ACYCLIC_SUBMODULE_TREES: &[&str] = &["term", "service", "render", "http", "cli"];
+const ACYCLIC_SUBMODULE_TREES: &[&str] = &[
+    "term",
+    "service",
+    "render",
+    "http_wire",
+    "mcp",
+    "http",
+    "cli",
+];
 
 /// Multi-file top-level modules whose sibling child submodules (`<top>/<sub>.rs`) must have zero
 /// strongly connected cycles among siblings.
-const ACYCLIC_SIBLING_SUBMODULES: &[&str] = &["term", "http", "cli", "tasks", "service", "daemon"];
+const ACYCLIC_SIBLING_SUBMODULES: &[&str] = &[
+    "term",
+    "tasks",
+    "service",
+    "render",
+    "http_wire",
+    "daemon",
+    "mcp",
+    "http",
+    "cli",
+];
 
 /// Allowed sibling submodules inside `src/tasks/` and their exact permitted sibling directed edges
 /// `(from_sub, to_sub)` (Spec §4.2.2, §7.2.5).
@@ -188,11 +178,9 @@ const TASKS_ALLOWED_SIBLING_EDGES: &[(&str, &str)] = &[
 ];
 
 const RQUICKJS_ALLOWED: &[&str] = &["codemode"];
-const HYPER_ALLOWED: &[&str] = &["http", "http_wire"];
-const RMCP_ALLOWED_CP2: &[&str] = &[
-    "render", "ipc", "endpoint", "daemon", "mcp", "http", "cli",     // target shell/wire set
-    "ingress", // CP3 transitional module (`mcp/ingress`)
-];
+const ALACRITTY_ALLOWED: &[&str] = &["term"];
+const HYPER_ALLOWED: &[&str] = &["http_wire", "http"];
+const RMCP_ALLOWED: &[&str] = &["render", "ipc", "endpoint", "daemon", "mcp", "http", "cli"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok {
@@ -1186,8 +1174,16 @@ struct AllowSuppression {
     lints: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeclaredMod {
+    name: String,
+    line: usize,
+    is_inline: bool,
+}
+
 #[derive(Default, Debug)]
 struct ScanReport {
+    main_declared_mods: Vec<DeclaredMod>,
     top_modules: BTreeSet<String>,
     file_submodules: BTreeMap<String, BTreeSet<String>>,
     edges: Vec<EdgeRef>,
@@ -1451,8 +1447,10 @@ fn check_crate_token(tok: &Token, current_top: &str, file_label: &str, report: &
     if let Some(ident) = tok.ident_name() {
         let forbidden = match ident {
             "rquickjs" => !RQUICKJS_ALLOWED.contains(&current_top),
-            "hyper" | "hyper_util" => !HYPER_ALLOWED.contains(&current_top),
-            "rmcp" => !RMCP_ALLOWED_CP2.contains(&current_top),
+            "alacritty_terminal" => !ALACRITTY_ALLOWED.contains(&current_top),
+            "hyper" | "hyper_util" | "http_body_util" | "tower_service" | "axum" | "rustls"
+            | "tokio_rustls" => !HYPER_ALLOWED.contains(&current_top),
+            "rmcp" => !RMCP_ALLOWED.contains(&current_top),
             _ => false,
         };
         if forbidden {
@@ -2009,6 +2007,50 @@ fn analyze_virtual_files(files: &[(&str, Vec<String>, &str)]) -> ScanReport {
     report
 }
 
+fn extract_top_level_mods(tokens: &[Token]) -> Vec<DeclaredMod> {
+    let mut out = Vec::new();
+    let (mut paren, mut bracket, mut brace) = (0usize, 0usize, 0usize);
+    let mut i = 0;
+    while i < tokens.len() {
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && tokens[i].is_kw("mod")
+            && let Some(name) = tokens.get(i + 1).and_then(Token::ident_name)
+        {
+            if tokens.get(i + 2).is_some_and(|t| t.is_punct(';')) {
+                out.push(DeclaredMod {
+                    name: name.to_owned(),
+                    line: tokens[i].line,
+                    is_inline: false,
+                });
+                i += 3;
+                continue;
+            }
+            if tokens.get(i + 2).is_some_and(|t| t.is_punct('{')) {
+                out.push(DeclaredMod {
+                    name: name.to_owned(),
+                    line: tokens[i].line,
+                    is_inline: true,
+                });
+                i = skip_balanced_delim(tokens, i + 2);
+                continue;
+            }
+        }
+        match tokens[i].kind {
+            Tok::Punct('(') => paren += 1,
+            Tok::Punct(')') => paren = paren.saturating_sub(1),
+            Tok::Punct('[') => bracket += 1,
+            Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+            Tok::Punct('{') => brace += 1,
+            Tok::Punct('}') => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
 fn scan_repo_src() -> ScanReport {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let src_dir = root.join("src");
@@ -2044,13 +2086,13 @@ fn scan_repo_src() -> ScanReport {
         .map(|(label, mod_path, content)| (label.as_str(), mod_path.clone(), content.as_str()))
         .collect();
     let mut report = analyze_virtual_files(&refs);
-    if let Some(main_content) = main_src {
-        let filtered = strip_pure_test_code(&lex(&main_content));
-        scan_tokens_allow_suppressions("src/main.rs", &filtered, &mut report.allow_suppressions);
-        report
-            .allow_suppressions
-            .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
-    }
+    let main_content = main_src.expect("src/main.rs must exist");
+    let filtered = strip_pure_test_code(&lex(&main_content));
+    report.main_declared_mods = extract_top_level_mods(&filtered);
+    scan_tokens_allow_suppressions("src/main.rs", &filtered, &mut report.allow_suppressions);
+    report
+        .allow_suppressions
+        .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
     report
 }
 
@@ -2228,17 +2270,59 @@ fn submodule_directed_edges(report: &ScanReport, top: &str, include_root: bool) 
 }
 
 // ---------------------------------------------------------------------------
-// Architecture Gate Tests (Checkpoint 2: tightened D(u), submodule & rmcp gates)
+// Architecture Gate Tests (Final state: zero cycles, zero transitional edges)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn target_dag_allowlist_is_strictly_lower_triangular() {
+    const EXPECTED_RANK_ORDER: &[&str] = &[
+        "id",
+        "lease",
+        "transport",
+        "env",
+        "media",
+        "term",
+        "platform",
+        "files",
+        "transfer",
+        "config",
+        "events",
+        "tasks",
+        "wait",
+        "service",
+        "render",
+        "codemode",
+        "ipc",
+        "http_wire",
+        "endpoint",
+        "daemon",
+        "mcp",
+        "http",
+        "cli",
+    ];
+    const DIAGONAL_BLOCKS: &[&[&str]] = &[
+        &["id", "lease", "transport"],
+        &["media", "term", "platform"],
+        &["transfer", "config"],
+        &["render", "codemode", "ipc"],
+        &["http_wire", "endpoint"],
+        &["daemon", "mcp"],
+    ];
+
+    let actual_order: Vec<&str> = TARGET_DAG_ALLOWLIST.iter().map(|&(m, _)| m).collect();
+    assert_eq!(
+        actual_order, EXPECTED_RANK_ORDER,
+        "TARGET_DAG_ALLOWLIST must match the 23 Spec §3 modules in exact #1..#23 rank order"
+    );
+
     let mut ranks: HashMap<&str, usize> = HashMap::new();
-    for (idx, &(module, _)) in TARGET_DAG_ALLOWLIST.iter().enumerate() {
+    let mut deps_by_mod: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    for (idx, &(module, deps)) in TARGET_DAG_ALLOWLIST.iter().enumerate() {
         assert!(
             ranks.insert(module, idx).is_none(),
             "duplicate module `{module}` in TARGET_DAG_ALLOWLIST"
         );
+        deps_by_mod.insert(module, deps.iter().copied().collect());
     }
     for &(u, deps) in TARGET_DAG_ALLOWLIST {
         let rank_u = ranks[u];
@@ -2254,14 +2338,92 @@ fn target_dag_allowlist_is_strictly_lower_triangular() {
             );
         }
     }
+    for &block in DIAGONAL_BLOCKS {
+        for &u in block {
+            for &v in block {
+                if u != v {
+                    assert!(
+                        !deps_by_mod[u].contains(v),
+                        "diagonal orthogonal block {block:?} contains lateral edge `{u}` -> `{v}`"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn top_level_module_bijection_violations(
+    main_mods: &[DeclaredMod],
+    src_tops: &BTreeSet<String>,
+) -> Vec<String> {
+    let expected: BTreeSet<&str> = TARGET_DAG_ALLOWLIST.iter().map(|&(m, _)| m).collect();
+    let mut violations = Vec::new();
+    let mut seen_in_main: BTreeMap<&str, usize> = BTreeMap::new();
+
+    for decl in main_mods {
+        if decl.is_inline {
+            violations.push(format!(
+                "  - src/main.rs:{} declares inline top-level module `mod {} {{ ... }}` (must be file module)",
+                decl.line, decl.name
+            ));
+        }
+        if let Some(&first_line) = seen_in_main.get(decl.name.as_str()) {
+            violations.push(format!(
+                "  - src/main.rs:{} duplicates `mod {};` (first declared at line {first_line})",
+                decl.line, decl.name
+            ));
+        } else {
+            seen_in_main.insert(decl.name.as_str(), decl.line);
+        }
+        if !expected.contains(decl.name.as_str()) {
+            violations.push(format!(
+                "  - src/main.rs:{} declares non-target top-level module `mod {};`",
+                decl.line, decl.name
+            ));
+        }
+    }
+
+    for &exp in &expected {
+        if !seen_in_main.contains_key(exp) {
+            violations.push(format!(
+                "  - src/main.rs is missing target top-level module `mod {exp};`"
+            ));
+        }
+    }
+
+    for discovered in src_tops {
+        if !expected.contains(discovered.as_str()) {
+            violations.push(format!(
+                "  - src/ contains non-target top-level module `src/{discovered}`"
+            ));
+        }
+    }
+
+    for &exp in &expected {
+        if !src_tops.contains(exp) {
+            violations.push(format!(
+                "  - src/ is missing target top-level module `{exp}`"
+            ));
+        }
+    }
+
+    violations
+}
+
+#[test]
+fn main_rs_declares_exact_target_top_level_modules() {
+    let report = scan_repo_src();
+    let violations =
+        top_level_module_bijection_violations(&report.main_declared_mods, &report.top_modules);
+    assert!(
+        violations.is_empty(),
+        "top-level module declarations do not match the 23 target modules in TARGET_DAG_ALLOWLIST:\n{}",
+        violations.join("\n")
+    );
 }
 
 fn unauthorized_cross_module_edges(report: &ScanReport) -> Vec<String> {
-    let mut allowed_modules: BTreeSet<&str> =
-        TARGET_DAG_ALLOWLIST.iter().map(|&(m, _)| m).collect();
-    for &m in CP2_TRANSITIONAL_MODULES {
-        allowed_modules.insert(m);
-    }
+    let allowed_modules: BTreeSet<&str> = TARGET_DAG_ALLOWLIST.iter().map(|&(m, _)| m).collect();
     let mut violations = Vec::new();
     for discovered in &report.top_modules {
         if !allowed_modules.contains(discovered.as_str()) {
@@ -2276,15 +2438,6 @@ fn unauthorized_cross_module_edges(report: &ScanReport) -> Vec<String> {
         for &v in deps {
             allowed_edges.insert((u, v));
         }
-    }
-    for &edge in CP2_TRANSITIONAL_EDGES {
-        assert!(
-            !allowed_edges.contains(&edge),
-            "CP2_TRANSITIONAL_EDGES redundantly lists `{}` -> `{}` which is already in TARGET_DAG_ALLOWLIST",
-            edge.0,
-            edge.1
-        );
-        allowed_edges.insert(edge);
     }
 
     let directed = top_level_directed_edges(report);
@@ -2301,40 +2454,78 @@ fn unauthorized_cross_module_edges(report: &ScanReport) -> Vec<String> {
 }
 
 #[test]
-fn cp2_every_cross_module_edge_belongs_to_target_dag_or_transitional_budget() {
+fn every_cross_module_edge_belongs_to_target_dag_allowlist() {
     let report = scan_repo_src();
     let unauthorized = unauthorized_cross_module_edges(&report);
     assert!(
         unauthorized.is_empty(),
-        "found {} unauthorized cross-top-module edge(s) outside D(u) ∪ CP2_TRANSITIONAL_EDGES:\n{}",
+        "found {} unauthorized cross-top-module edge(s) outside TARGET_DAG_ALLOWLIST:\n{}",
         unauthorized.len(),
         unauthorized.join("\n")
     );
 }
 
 #[test]
-fn cp2_top_level_two_cycles_stay_within_transitional_budget() {
+fn top_level_two_cycles_are_zero() {
     let report = scan_repo_src();
     let directed = top_level_directed_edges(&report);
     let actual_cycles = compute_two_cycles(&directed);
-    let allowed: BTreeSet<(String, String)> = CP2_TRANSITIONAL_2CYCLES
-        .iter()
-        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
-        .collect();
-
-    let forbidden: Vec<(String, String)> = actual_cycles.difference(&allowed).cloned().collect();
-    if !forbidden.is_empty() {
-        let mut msg = format!(
-            "found {} top-level 2-cycle(s) outside CP2_TRANSITIONAL_2CYCLES:\n",
-            forbidden.len()
-        );
-        for (a, b) in &forbidden {
+    if !actual_cycles.is_empty() {
+        let mut msg = format!("found {} top-level 2-cycle(s):\n", actual_cycles.len());
+        for (a, b) in &actual_cycles {
             let ab = &directed[&(a.clone(), b.clone())];
             let ba = &directed[&(b.clone(), a.clone())];
             msg.push_str(&format!(
                 "  - {a} <-> {b}:\n      {a} -> {b}: {}\n      {b} -> {a}: {}\n",
                 ab.join(", "),
                 ba.join(", ")
+            ));
+        }
+        panic!("{msg}");
+    }
+}
+
+fn top_level_cyclic_sccs(
+    report: &ScanReport,
+    directed: &BTreeMap<(String, String), Vec<String>>,
+) -> Vec<Vec<String>> {
+    let mut nodes: BTreeSet<String> = TARGET_DAG_ALLOWLIST
+        .iter()
+        .map(|&(m, _)| m.to_owned())
+        .collect();
+    nodes.extend(report.top_modules.iter().cloned());
+    let mut adj: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (u, v) in directed.keys() {
+        nodes.insert(u.clone());
+        nodes.insert(v.clone());
+        adj.entry(u.clone()).or_default().insert(v.clone());
+    }
+    tarjan_cyclic_sccs(&nodes, &adj)
+}
+
+#[test]
+fn top_level_module_graph_is_strictly_acyclic() {
+    let report = scan_repo_src();
+    let directed = top_level_directed_edges(&report);
+    let sccs = top_level_cyclic_sccs(&report, &directed);
+    if !sccs.is_empty() {
+        let mut msg = format!(
+            "found {} cyclic strongly connected component(s) in top-level module graph:\n",
+            sccs.len()
+        );
+        for scc in &sccs {
+            let mut details = Vec::new();
+            for u in scc {
+                for v in scc {
+                    if let Some(sites) = directed.get(&(u.clone(), v.clone())) {
+                        details.push(format!("      {u} -> {v}: {}", sites.join(", ")));
+                    }
+                }
+            }
+            msg.push_str(&format!(
+                "  - SCC {{{}}}:\n{}\n",
+                scc.join(", "),
+                details.join("\n")
             ));
         }
         panic!("{msg}");
@@ -2365,30 +2556,24 @@ fn cp1_forbidden_cross_layer_edges_are_zero() {
 
 #[test]
 fn submodule_graphs_have_zero_strongly_connected_cycles() {
-    let report = scan_repo_src();
-    let mut failures = Vec::new();
+    const COHESIVE_INTERNAL_HELPERS: &[&str] = &["files", "platform", "codemode"];
+    const AGGREGATE_ROOT_CORES: &[&str] = &["tasks", "daemon"];
 
-    for &top in ACYCLIC_SUBMODULE_TREES {
-        let graph = submodule_directed_edges(&report, top, true);
-        for scc in tarjan_cyclic_sccs(&graph.nodes, &graph.adj) {
-            let mut details = Vec::new();
-            for u in &scc {
-                for v in &scc {
-                    if let Some(sites) = graph.witnesses.get(&(u.clone(), v.clone())) {
-                        details.push(format!("      {u} -> {v}: {}", sites.join(", ")));
-                    }
-                }
+    let report = scan_repo_src();
+    let mut tree_targets: BTreeSet<&str> = ACYCLIC_SUBMODULE_TREES.iter().copied().collect();
+    let mut sibling_targets: BTreeSet<&str> = ACYCLIC_SIBLING_SUBMODULES.iter().copied().collect();
+    for discovered in report.file_submodules.keys().map(String::as_str) {
+        if !COHESIVE_INTERNAL_HELPERS.contains(&discovered) {
+            sibling_targets.insert(discovered);
+            if !AGGREGATE_ROOT_CORES.contains(&discovered) {
+                tree_targets.insert(discovered);
             }
-            failures.push(format!(
-                "  - `{top}` submodule-tree SCC {{{}}}:\n{}",
-                scc.join(", "),
-                details.join("\n")
-            ));
         }
     }
 
-    for &top in ACYCLIC_SIBLING_SUBMODULES {
-        let graph = submodule_directed_edges(&report, top, false);
+    let mut failures = Vec::new();
+    let mut check = |top: &str, include_root: bool, kind: &str| {
+        let graph = submodule_directed_edges(&report, top, include_root);
         for scc in tarjan_cyclic_sccs(&graph.nodes, &graph.adj) {
             let mut details = Vec::new();
             for u in &scc {
@@ -2399,11 +2584,18 @@ fn submodule_graphs_have_zero_strongly_connected_cycles() {
                 }
             }
             failures.push(format!(
-                "  - `{top}` sibling-submodule SCC {{{}}}:\n{}",
+                "  - `{top}` {kind} SCC {{{}}}:\n{}",
                 scc.join(", "),
                 details.join("\n")
             ));
         }
+    };
+
+    for top in tree_targets {
+        check(top, true, "submodule-tree");
+    }
+    for top in sibling_targets {
+        check(top, false, "sibling-submodule");
     }
 
     assert!(
@@ -3228,7 +3420,7 @@ fn tasks_submodule_contract_accepts_target_dag_and_rejects_script_session_and_st
 }
 
 #[test]
-fn cp2_rmcp_isolation_rejects_files_transfer_and_service_while_allowing_render() {
+fn third_party_crate_isolation_enforces_final_rmcp_hyper_and_rquickjs_boundaries() {
     let report = analyze_virtual_files(&[
         (
             "src/files.rs",
@@ -3243,20 +3435,214 @@ fn cp2_rmcp_isolation_rejects_files_transfer_and_service_while_allowing_render()
         (
             "src/service.rs",
             vec!["service".into()],
-            "pub fn bad() -> rmcp::model::CallToolResult { todo!() }",
+            "pub fn bad() -> (rmcp::model::CallToolResult, rquickjs::Error) { todo!() }",
+        ),
+        (
+            "src/ingress.rs",
+            vec!["ingress".into()],
+            "pub fn bad() -> rmcp::model::RequestId { todo!() }",
+        ),
+        (
+            "src/http_wire.rs",
+            vec!["http_wire".into()],
+            "pub fn wire(_: hyper::Version, _: hyper_util::rt::TokioExecutor, _: http_body_util::Full<bytes::Bytes>, _: &dyn tower_service::Service<()>) -> rmcp::ErrorData { todo!() }",
+        ),
+        (
+            "src/http.rs",
+            vec!["http".into()],
+            "pub fn srv(_: http_body_util::Limited<()>, _: &dyn tower_service::Service<()>) -> rmcp::ErrorData { todo!() }",
+        ),
+        (
+            "src/term/terminal.rs",
+            vec!["term".into(), "terminal".into()],
+            "pub fn vt(_: alacritty_terminal::index::Line) {}",
+        ),
+        (
+            "src/daemon.rs",
+            vec!["daemon".into()],
+            "pub fn bad(_: http_body_util::Full<bytes::Bytes>, _: &dyn tower_service::Service<()>) {}",
+        ),
+        (
+            "src/cli/stdio.rs",
+            vec!["cli".into(), "stdio".into()],
+            "pub fn bad(_: http_body_util::Empty<bytes::Bytes>, _: &dyn tower_service::Service<()>) {}",
+        ),
+        (
+            "src/tasks.rs",
+            vec!["tasks".into()],
+            "pub fn bad(_: alacritty_terminal::index::Column) {}",
+        ),
+        (
+            "src/wait.rs",
+            vec!["wait".into()],
+            "pub fn bad(_: alacritty_terminal::grid::Scroll) {}",
+        ),
+        (
+            "src/mcp/ingress.rs",
+            vec!["mcp".into(), "ingress".into()],
+            "pub fn ok() -> rmcp::model::RequestId { todo!() }",
         ),
         (
             "src/render.rs",
             vec!["render".into()],
             "pub fn ok() -> rmcp::model::CallToolResult { todo!() }",
         ),
+        (
+            "src/codemode.rs",
+            vec!["codemode".into()],
+            "pub fn ok(_: rquickjs::Runtime) {}",
+        ),
     ]);
-    let leaked_tops: Vec<&str> = report
+    let leaks: Vec<(&str, &str)> = report
         .crate_leaks
         .iter()
-        .map(|l| l.from_top.as_str())
+        .map(|l| (l.from_top.as_str(), l.crate_name.as_str()))
         .collect();
-    assert_eq!(leaked_tops, vec!["files", "transfer", "service"]);
+    assert_eq!(
+        leaks,
+        vec![
+            ("files", "rmcp"),
+            ("transfer", "rmcp"),
+            ("service", "rmcp"),
+            ("service", "rquickjs"),
+            ("ingress", "rmcp"),
+            ("http_wire", "rmcp"),
+            ("daemon", "http_body_util"),
+            ("daemon", "tower_service"),
+            ("cli", "http_body_util"),
+            ("cli", "tower_service"),
+            ("tasks", "alacritty_terminal"),
+            ("wait", "alacritty_terminal"),
+        ]
+    );
+}
+
+#[test]
+fn top_level_module_bijection_gate_rejects_missing_extra_duplicate_and_inline_modules() {
+    let mut full_main = String::new();
+    let mut full_tops = BTreeSet::new();
+    for &(name, _) in TARGET_DAG_ALLOWLIST {
+        full_main.push_str(&format!("mod {name};\n"));
+        full_tops.insert(name.to_owned());
+    }
+    full_main.push_str("#[cfg(test)]\nmod tests;\nfn main() { mod inner_fn_local {} }\n");
+    let clean_decls = extract_top_level_mods(&strip_pure_test_code(&lex(&full_main)));
+    assert!(
+        top_level_module_bijection_violations(&clean_decls, &full_tops).is_empty(),
+        "exact 23-module bijection unexpectedly failed"
+    );
+
+    let mut bad_main = full_main
+        .replace("mod http_wire;\n", "")
+        .replace("mod wait;\n", "mod wait {}\n");
+    bad_main.push_str("mod id;\nmod session;\nmod ingress;\n");
+    let mut bad_tops = full_tops;
+    bad_tops.remove("http_wire");
+    bad_tops.insert("ingress".to_owned());
+
+    let bad_decls = extract_top_level_mods(&strip_pure_test_code(&lex(&bad_main)));
+    let violations = top_level_module_bijection_violations(&bad_decls, &bad_tops);
+    assert_eq!(violations.len(), 7, "got: {violations:?}");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("declares inline top-level module `mod wait { ... }`"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("duplicates `mod id;`"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("declares non-target top-level module `mod session;`"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("declares non-target top-level module `mod ingress;`"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("src/main.rs is missing target top-level module `mod http_wire;`"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("src/ contains non-target top-level module `src/ingress`"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("src/ is missing target top-level module `http_wire`"))
+    );
+}
+
+#[test]
+fn top_level_tarjan_scc_and_mcp_ingress_submodule_tree_detect_cycles() {
+    let three_cycle = analyze_virtual_files(&[
+        (
+            "src/id.rs",
+            vec!["id".into()],
+            "pub fn a() { let _ = crate::lease::b(); }",
+        ),
+        (
+            "src/lease.rs",
+            vec!["lease".into()],
+            "pub fn b() { let _ = crate::transport::c(); }",
+        ),
+        (
+            "src/transport.rs",
+            vec!["transport".into()],
+            "pub fn c() { let _ = crate::id::a(); }",
+        ),
+    ]);
+    let directed = top_level_directed_edges(&three_cycle);
+    assert!(compute_two_cycles(&directed).is_empty());
+    let sccs = top_level_cyclic_sccs(&three_cycle, &directed);
+    assert_eq!(
+        sccs,
+        vec![vec![
+            "id".to_owned(),
+            "lease".to_owned(),
+            "transport".to_owned(),
+        ]]
+    );
+
+    let clean_mcp = analyze_virtual_files(&[
+        (
+            "src/mcp.rs",
+            vec!["mcp".into()],
+            "pub(crate) mod ingress; pub struct Server; pub fn run() { let _ = ingress::Buffer; }",
+        ),
+        (
+            "src/mcp/ingress.rs",
+            vec!["mcp".into(), "ingress".into()],
+            "pub struct Buffer; pub fn ok() { let _ = crate::lease::BytePool::new(1); }",
+        ),
+    ]);
+    let clean_mcp_graph = submodule_directed_edges(&clean_mcp, "mcp", true);
+    assert!(tarjan_cyclic_sccs(&clean_mcp_graph.nodes, &clean_mcp_graph.adj).is_empty());
+
+    let cyclic_mcp = analyze_virtual_files(&[
+        (
+            "src/mcp.rs",
+            vec!["mcp".into()],
+            "pub(crate) mod ingress; pub struct Server; pub fn run() { let _ = ingress::Buffer; }",
+        ),
+        (
+            "src/mcp/ingress.rs",
+            vec!["mcp".into(), "ingress".into()],
+            "pub struct Buffer; pub fn bad() { let _ = super::Server; }",
+        ),
+    ]);
+    let cyclic_mcp_graph = submodule_directed_edges(&cyclic_mcp, "mcp", true);
+    assert_eq!(
+        tarjan_cyclic_sccs(&cyclic_mcp_graph.nodes, &cyclic_mcp_graph.adj),
+        vec![vec!["mcp".to_owned(), "mcp::ingress".to_owned()]]
+    );
 }
 
 #[test]

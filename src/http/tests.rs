@@ -1,285 +1,9 @@
 use super::*;
-
-async fn download_fixture(
-    content: &[u8],
-    memory: Arc<crate::lease::BytePool>,
-) -> (PathBuf, Arc<Transfers>, FileBody) {
-    let directory = std::env::temp_dir().join(format!(
-        "fastexec-download-budget-{}",
-        crate::id::random_chars(12).unwrap()
-    ));
-    std::fs::create_dir(&directory).unwrap();
-    let path = directory.join("ordinary.txt");
-    std::fs::write(&path, content).unwrap();
-    let table = Arc::new(Transfers::new());
-    let id = table.create(path.clone()).unwrap();
-    let file = tokio::fs::File::open(&path).await.unwrap();
-    let body = FileBody {
-        file: Some(file.take(content.len() as u64)),
-        memory,
-        _admitted: table.admit(&id).unwrap(),
-        _permit: None,
-    };
-    (directory, table, body)
-}
-
-#[tokio::test]
-async fn download_chunk_admission_ends_a_refused_body() {
-    const CONTENT: &[u8] = b"ordinary";
-    for cap in [CONTENT.len() - 1, CONTENT.len(), CONTENT.len() + 1] {
-        let memory = crate::lease::BytePool::new(cap);
-        let (directory, _table, mut body) = download_fixture(CONTENT, Arc::clone(&memory)).await;
-        let frame = body.frame().await.unwrap();
-        if cap < CONTENT.len() {
-            assert_eq!(frame.unwrap_err().kind(), std::io::ErrorKind::OutOfMemory);
-            assert!(hyper::body::Body::is_end_stream(&body));
-            assert!(body.frame().await.is_none());
-        } else {
-            let bytes = frame.unwrap().into_data().unwrap();
-            assert_eq!(&bytes[..], CONTENT);
-            assert_eq!(memory.used(), CONTENT.len());
-            drop(bytes);
-        }
-        drop(body);
-        assert_eq!(memory.used(), 0);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-}
-
-#[tokio::test]
-async fn download_frame_slices_keep_their_lease_after_body_drop() {
-    const CONTENT: &[u8] = b"ordinary";
-    let memory = crate::lease::BytePool::new(CONTENT.len());
-    let (directory, table, mut body) = download_fixture(CONTENT, Arc::clone(&memory)).await;
-    let bytes = body.frame().await.unwrap().unwrap().into_data().unwrap();
-    let retained = bytes.slice(1..);
-    assert_eq!(memory.used(), CONTENT.len());
-    drop(bytes);
-    drop(body);
-    assert!(table.is_idle(std::time::Instant::now() + transfer::IDLE));
-    assert_eq!(memory.used(), CONTENT.len());
-    assert_eq!(&retained[..], &CONTENT[1..]);
-    drop(retained);
-    assert_eq!(memory.used(), 0);
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[tokio::test]
-async fn native_file_worker_admits_before_io_and_releases_success_and_error() {
-    let directory = std::env::temp_dir().join(format!(
-        "fastexec-native-transfer-{}",
-        crate::id::random_chars(12).unwrap()
-    ));
-    std::fs::create_dir(&directory).unwrap();
-    let path = Arc::new(directory.join("ordinary.txt"));
-    let required = crate::files::path::native_path_bytes(&path).unwrap();
-    for cap in [required - 1, required, required + 1] {
-        let pool = crate::lease::BytePool::new(cap);
-        let operation_pool = Arc::clone(&pool);
-        let result = transfer_file(Arc::clone(&path), Arc::clone(&pool), move |path| {
-            assert_eq!(operation_pool.used(), required);
-            std::fs::File::create(path)
-        })
-        .await;
-        if cap < required {
-            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::OutOfMemory);
-            assert!(!path.exists(), "refusal must precede the native file call");
-        } else {
-            drop(result.unwrap());
-            assert!(path.exists());
-            std::fs::remove_file(path.as_path()).unwrap();
-        }
-        assert_eq!(pool.used(), 0);
-    }
-    let pool = crate::lease::BytePool::new(required);
-    let operation_pool = Arc::clone(&pool);
-    let error = transfer_file(path, Arc::clone(&pool), move |path| {
-        assert_eq!(operation_pool.used(), required);
-        std::fs::metadata(path)
-    })
-    .await
-    .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-    assert_eq!(pool.used(), 0);
-    std::fs::remove_dir(directory).unwrap();
-}
-
-#[tokio::test]
-async fn native_file_worker_keeps_its_lease_after_waiter_cancellation() {
-    let path = Arc::new(std::env::temp_dir());
-    let required = crate::files::path::native_path_bytes(&path).unwrap();
-    let pool = crate::lease::BytePool::new(required);
-    let worker_pool = Arc::clone(&pool);
-    let operation_pool = Arc::clone(&pool);
-    let (ready, observed) = tokio::sync::oneshot::channel();
-    let (release, blocked) = std::sync::mpsc::channel();
-    let waiter = tokio::spawn(async move {
-        transfer_file(path, worker_pool, move |path| {
-            assert_eq!(operation_pool.used(), required);
-            ready.send(()).unwrap();
-            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
-            assert_eq!(operation_pool.used(), required);
-            std::fs::metadata(path)
-        })
-        .await
-    });
-    observed.await.unwrap();
-    waiter.abort();
-    assert!(waiter.await.unwrap_err().is_cancelled());
-    assert_eq!(pool.used(), required);
-    release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while pool.used() != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-}
-
-#[test]
-fn metadata_worker_keeps_the_shared_path_after_its_waiter_is_dropped() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .max_blocking_threads(1)
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let table = Arc::new(Transfers::new());
-        let id = table
-            .create(PathBuf::from(format!(
-                "future-transfer-{}",
-                crate::id::random_chars(12).unwrap()
-            )))
-            .unwrap();
-        let admitted = table.admit(&id).unwrap();
-        let shared = admitted.path();
-        let weak = Arc::downgrade(&shared);
-        let (ready, observed) = tokio::sync::oneshot::channel();
-        let (release, blocked) = std::sync::mpsc::channel();
-        let blocker = tokio::task::spawn_blocking(move || {
-            ready.send(()).unwrap();
-            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
-        });
-        observed.await.unwrap();
-        let mut pending = Box::pin(presence(shared));
-        std::future::poll_fn(|cx| {
-            assert!(pending.as_mut().poll(cx).is_pending());
-            Poll::Ready(())
-        })
-        .await;
-        drop(pending);
-        drop(admitted);
-        assert!(table.is_idle(std::time::Instant::now() + transfer::IDLE));
-        assert!(
-            weak.upgrade().is_some(),
-            "the queued worker still owns the path"
-        );
-        release.send(()).unwrap();
-        blocker.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while weak.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-    });
-}
-
-// Windows may refuse replacing a destination with an open handle.
-#[cfg(unix)]
-#[tokio::test]
-async fn downloads_size_the_same_open_handle_it_streams() {
-    let directory = std::env::temp_dir().join(format!(
-        "fastexec-transfer-replace-{}",
-        crate::id::random_chars(12).unwrap()
-    ));
-    std::fs::create_dir(&directory).unwrap();
-    let path = directory.join("file.txt");
-    let replacement = directory.join("replacement.txt");
-    let table = Arc::new(Transfers::new());
-    let id = table.create(path.clone()).unwrap();
-    for partial in [false, true] {
-        std::fs::write(&path, b"original").unwrap();
-        std::fs::write(&replacement, b"new").unwrap();
-        let mut headers = HeaderMap::new();
-        if partial {
-            headers.insert(header::RANGE, "bytes=3-".parse().unwrap());
-        }
-        let response =
-            transfer_get(Version::HTTP_11, &headers, table.admit(&id).unwrap(), None).await;
-        std::fs::rename(&replacement, &path).unwrap();
-        let (status, length, body) = if partial {
-            assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 3-7/8");
-            (StatusCode::PARTIAL_CONTENT, "5", &b"ginal"[..])
-        } else {
-            (StatusCode::OK, "8", &b"original"[..])
-        };
-        assert_eq!(response.status(), status);
-        assert_eq!(response.headers()[header::CONTENT_LENGTH], length);
-        assert_eq!(
-            response.into_body().collect().await.unwrap().to_bytes(),
-            body
-        );
-    }
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[tokio::test(start_paused = true)]
-async fn idle_upload_flushes_accepted_prefix_and_releases_turn() {
-    use hyper::body::Frame;
-    struct Stalled(Option<Bytes>);
-    impl hyper::body::Body for Stalled {
-        type Data = Bytes;
-        type Error = Infallible;
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-            match self.0.take() {
-                Some(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
-                None => Poll::Pending,
-            }
-        }
-    }
-
-    let directory = std::env::temp_dir().join(format!(
-        "fastexec-transfer-idle-{}",
-        crate::id::random_chars(12).unwrap()
-    ));
-    let path = directory.join("file.txt");
-    let table = Arc::new(Transfers::new());
-    let id = table.create(path.clone()).unwrap();
-    let admitted = table.admit(&id).unwrap();
-    let target = prepare_upload(&admitted, 0).await.unwrap();
-    let input = Stalled(Some(Bytes::from_static(b"accepted")));
-    let response = write_upload(
-        Version::HTTP_11,
-        admitted,
-        target,
-        0,
-        input,
-        CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-    assert_eq!(std::fs::read(&path).unwrap(), b"accepted");
-    let admitted = table.admit(&id).unwrap();
-    let resume = prepare_upload(&admitted, 8).await.unwrap();
-    let response = write_upload(
-        Version::HTTP_11,
-        admitted,
-        resume,
-        8,
-        Full::new(Bytes::from_static(b"!")),
-        CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(std::fs::read(&path).unwrap(), b"accepted!");
-    std::fs::remove_dir_all(directory).unwrap();
-}
+use bytes::Bytes;
+use http::{Method, Version};
+use http_body_util::Full;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn headers(value: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -587,11 +311,17 @@ async fn http2_h2c_concurrent_requests_and_refusal_omit_connection_close() {
     let layer = Bearer {
         digests: Arc::from([digest(token)]),
         table: Arc::new(Transfers::new()),
+        memory: BytePool::new(1 << 20),
         transfer_slots: Arc::new(Semaphore::new(MAX_TRANSFER_CONNECTIONS)),
         stopped: stopped.clone(),
         inner: poc_service(gate, bound),
     };
-    let server_task = tokio::spawn(serve_connections(listener, layer, stopped.clone(), None));
+    let server_task = tokio::spawn(http_wire::serve_connections(
+        listener,
+        layer,
+        stopped.clone(),
+        None,
+    ));
 
     let stream = tokio::net::TcpStream::connect(bound).await.unwrap();
     let (mut sender, conn) =
@@ -663,14 +393,14 @@ async fn http2_h2c_concurrent_requests_and_refusal_omit_connection_close() {
 
     // HTTP/1.1 still sets `Connection: close`.
     assert_eq!(
-        refusal(Version::HTTP_11, StatusCode::UNAUTHORIZED, "Bearer")
+        http_wire::refusal(Version::HTTP_11, StatusCode::UNAUTHORIZED, "Bearer")
             .headers()
             .get(header::CONNECTION)
             .and_then(|v| v.to_str().ok()),
         Some("close")
     );
     assert_eq!(
-        transfer_empty(Version::HTTP_11, StatusCode::NOT_FOUND, &[])
+        http_wire::transfer_empty(Version::HTTP_11, StatusCode::NOT_FOUND, &[])
             .headers()
             .get(header::CONNECTION)
             .and_then(|v| v.to_str().ok()),
@@ -1190,11 +920,17 @@ async fn transfer_subquota_returns_503_while_preserving_mcp_control_plane() {
     let layer = Bearer {
         digests: Arc::from([digest(token)]),
         table: Arc::clone(&table),
+        memory: BytePool::new(1 << 20),
         transfer_slots: Arc::new(Semaphore::new(2)),
         stopped: stopped.clone(),
         inner,
     };
-    let server_task = tokio::spawn(serve_connections(listener, layer, stopped.clone(), None));
+    let server_task = tokio::spawn(http_wire::serve_connections(
+        listener,
+        layer,
+        stopped.clone(),
+        None,
+    ));
 
     let open_transfer = || async {
         let mut s = tokio::net::TcpStream::connect(bound).await.unwrap();
@@ -1280,17 +1016,24 @@ impl TestHttpSender {
         }
     }
 
-    async fn send(&mut self, request: Request<Full<Bytes>>) -> Response<Incoming> {
+    async fn try_send(
+        &mut self,
+        request: Request<Full<Bytes>>,
+    ) -> Result<Response<Incoming>, hyper::Error> {
         match self {
             Self::Http1(sender) => {
-                sender.ready().await.unwrap();
-                sender.send_request(request).await.unwrap()
+                sender.ready().await?;
+                sender.send_request(request).await
             }
             Self::Http2(sender) => {
-                sender.ready().await.unwrap();
-                sender.send_request(request).await.unwrap()
+                sender.ready().await?;
+                sender.send_request(request).await
             }
         }
+    }
+
+    async fn send(&mut self, request: Request<Full<Bytes>>) -> Response<Incoming> {
+        self.try_send(request).await.unwrap()
     }
 }
 
@@ -1315,11 +1058,12 @@ async fn transfer_connection_quota_survives_completed_requests_on_http1_and_http
         let layer = Bearer {
             digests: Arc::from([digest(token)]),
             table,
+            memory: BytePool::new(1 << 20),
             transfer_slots: Arc::new(Semaphore::new(2)),
             stopped: stopped.clone(),
             inner: poc_service(Arc::new(tokio::sync::Notify::new()), bound),
         };
-        let server_task = tokio::spawn(serve_connections(
+        let server_task = tokio::spawn(http_wire::serve_connections(
             listener,
             layer,
             stopped.clone(),
@@ -1408,5 +1152,496 @@ async fn transfer_connection_quota_survives_completed_requests_on_http1_and_http
         .await
         .unwrap();
     }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn g12_transfer_routes_stay_isolated_to_injected_byte_pool() {
+    const EXACT_NAME: &str = "http::tests::g12_transfer_routes_stay_isolated_to_injected_byte_pool";
+    if !std::env::args().any(|arg| arg == "--exact") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", EXACT_NAME, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(verify_g12_transfer_pool_isolation());
+}
+
+async fn verify_g12_transfer_pool_isolation() {
+    assert_eq!(crate::lease::process_pool().used(), 0);
+    let download_payload = vec![b'x'; 8192];
+
+    for shared_bearer in [true, false] {
+        let dir = std::env::temp_dir().join(format!(
+            "fastexec-g12-transfer-{}",
+            crate::id::random_chars(12).unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let nested_upload = dir
+            .join("nested")
+            .join("deeper")
+            .join("leaf")
+            .join("uploaded.bin");
+        let existing_download = dir.join("existing.bin");
+        std::fs::write(&existing_download, &download_payload).unwrap();
+
+        let table = Arc::new(Transfers::new());
+        let upload_id = table.create(nested_upload.clone()).unwrap();
+        let download_id = table.create(existing_download.clone()).unwrap();
+
+        let pool = BytePool::new(64 * 1024);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let stopped = CancellationToken::new();
+
+        let server_task = if shared_bearer {
+            let layer = Bearer {
+                digests: Arc::from([digest("g12-token")]),
+                table: Arc::clone(&table),
+                memory: Arc::clone(&pool),
+                transfer_slots: Arc::new(Semaphore::new(8)),
+                stopped: stopped.clone(),
+                inner: poc_service(Arc::new(tokio::sync::Notify::new()), bound),
+            };
+            tokio::spawn(http_wire::serve_connections(
+                listener,
+                layer,
+                stopped.clone(),
+                None,
+            ))
+        } else {
+            tokio::spawn(http_wire::serve_transfers(
+                listener,
+                Arc::clone(&table),
+                Arc::clone(&pool),
+                stopped.clone(),
+            ))
+        };
+
+        let make_req = |method: Method, path: String, body: Bytes, version: Version| {
+            Request::builder()
+                .method(method)
+                .uri(format!("http://{bound}{path}"))
+                .version(version)
+                .header(header::HOST, bound.to_string())
+                .body(Full::new(body))
+                .unwrap()
+        };
+
+        // (a1) Fully saturated isolated pool: HEAD, PUT (missing + existing), and GET fail with
+        // zero writes on disk and zero fallback to global `process_pool()`.
+        let full_hold = pool.try_acquire(pool.limit()).unwrap();
+        let (mut h2_client, h2_conn) = TestHttpSender::connect(bound, true).await;
+
+        let head_refused = h2_client
+            .send(make_req(
+                Method::HEAD,
+                format!("/t/{upload_id}"),
+                Bytes::new(),
+                Version::HTTP_2,
+            ))
+            .await;
+        assert_eq!(head_refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        let put_missing_refused = h2_client
+            .send(make_req(
+                Method::PUT,
+                format!("/t/{upload_id}?offset=0"),
+                Bytes::from_static(b"blocked"),
+                Version::HTTP_2,
+            ))
+            .await;
+        assert_eq!(
+            put_missing_refused.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(!dir.join("nested").exists());
+        assert!(!nested_upload.exists());
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        let put_existing_refused = h2_client
+            .send(make_req(
+                Method::PUT,
+                format!("/t/{download_id}?offset=0"),
+                Bytes::from_static(b"corrupt"),
+                Version::HTTP_2,
+            ))
+            .await;
+        assert_eq!(
+            put_existing_refused.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            std::fs::read(&existing_download).unwrap(),
+            download_payload,
+            "refused upload must leave the existing file untouched"
+        );
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        let get_refused = h2_client
+            .send(make_req(
+                Method::GET,
+                format!("/t/{download_id}"),
+                Bytes::new(),
+                Version::HTTP_2,
+            ))
+            .await;
+        assert_eq!(get_refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        drop(full_hold);
+        assert_eq!(pool.used(), 0);
+
+        // (a2) Tight pool where `presence` succeeds (`upload_native` bytes fit), then
+        // `create_target_parents_in` exceeds remaining capacity before touching disk.
+        let upload_native = crate::files::path::native_path_bytes(&nested_upload).unwrap();
+        let tight_parent_hold = pool.try_acquire(pool.limit() - upload_native).unwrap();
+        let put_parent_refused = h2_client
+            .send(make_req(
+                Method::PUT,
+                format!("/t/{upload_id}?offset=0"),
+                Bytes::from_static(b"partial"),
+                Version::HTTP_2,
+            ))
+            .await;
+        assert_eq!(
+            put_parent_refused.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            !dir.join("nested").exists(),
+            "parent creation must abort before mkdir when isolated pool lacks target workspace"
+        );
+        assert!(!nested_upload.exists());
+        assert_eq!(crate::lease::process_pool().used(), 0);
+        drop(tight_parent_hold);
+        assert_eq!(pool.used(), 0);
+
+        // (a3) Tight pool where `open_regular` fits (`download_native` bytes), then `FileBody`
+        // chunk copy (`8192` bytes) exceeds remaining capacity and aborts the stream.
+        let download_native = crate::files::path::native_path_bytes(&existing_download).unwrap();
+        assert!(download_native < download_payload.len());
+        let tight_chunk_hold = pool.try_acquire(pool.limit() - download_native).unwrap();
+        let direct_tight = http_wire::serve_transfer(
+            Request::get(format!("/t/{download_id}"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            Arc::clone(&table),
+            Arc::clone(&pool),
+            stopped.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(direct_tight.status(), StatusCode::OK);
+        assert_eq!(
+            direct_tight
+                .into_body()
+                .frame()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::OutOfMemory
+        );
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        let chunk_failed = match h2_client
+            .try_send(make_req(
+                Method::GET,
+                format!("/t/{download_id}"),
+                Bytes::new(),
+                Version::HTTP_2,
+            ))
+            .await
+        {
+            Err(_) => true,
+            Ok(res) => res.into_body().collect().await.is_err(),
+        };
+        assert!(
+            chunk_failed,
+            "streaming download body must fail when chunk lease exceeds isolated pool"
+        );
+        assert_eq!(crate::lease::process_pool().used(), 0);
+        drop(tight_chunk_hold);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // (c) Ample isolated pool capacity: multi-level parent creation + upload + resume + HEAD
+        // + GET succeed with zero global pool usage and `pool.used() == 0` once settled.
+        let (mut h1_client, h1_conn) = TestHttpSender::connect(bound, false).await;
+
+        let init_put = h1_client
+            .send(make_req(
+                Method::PUT,
+                format!("/t/{upload_id}?offset=0"),
+                Bytes::new(),
+                Version::HTTP_11,
+            ))
+            .await;
+        assert_eq!(init_put.status(), StatusCode::OK);
+        assert_eq!(
+            init_put.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"0")
+        );
+        assert!(nested_upload.is_file());
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        let part1 = h1_client
+            .send(make_req(
+                Method::PUT,
+                format!("/t/{upload_id}?offset=0"),
+                Bytes::from_static(b"hello "),
+                Version::HTTP_11,
+            ))
+            .await;
+        assert_eq!(part1.status(), StatusCode::OK);
+        assert_eq!(
+            part1.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"6")
+        );
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        let part2 = h1_client
+            .send(make_req(
+                Method::PUT,
+                format!("/t/{upload_id}?offset=6"),
+                Bytes::from_static(b"isolated pool"),
+                Version::HTTP_11,
+            ))
+            .await;
+        assert_eq!(part2.status(), StatusCode::OK);
+        assert_eq!(
+            part2.into_body().collect().await.unwrap().to_bytes(),
+            Bytes::from_static(b"19")
+        );
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        let head_ok = h1_client
+            .send(make_req(
+                Method::HEAD,
+                format!("/t/{upload_id}"),
+                Bytes::new(),
+                Version::HTTP_11,
+            ))
+            .await;
+        assert_eq!(head_ok.status(), StatusCode::OK);
+        assert_eq!(head_ok.headers()[header::CONTENT_LENGTH], "19");
+        head_ok.into_body().collect().await.unwrap();
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        let get_uploaded = h1_client
+            .send(make_req(
+                Method::GET,
+                format!("/t/{upload_id}"),
+                Bytes::new(),
+                Version::HTTP_11,
+            ))
+            .await;
+        assert_eq!(get_uploaded.status(), StatusCode::OK);
+        assert_eq!(
+            &get_uploaded.into_body().collect().await.unwrap().to_bytes()[..],
+            b"hello isolated pool"
+        );
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        let get_existing = h1_client
+            .send(make_req(
+                Method::GET,
+                format!("/t/{download_id}"),
+                Bytes::new(),
+                Version::HTTP_11,
+            ))
+            .await;
+        assert_eq!(get_existing.status(), StatusCode::OK);
+        assert_eq!(
+            &get_existing.into_body().collect().await.unwrap().to_bytes()[..],
+            &download_payload[..]
+        );
+        assert_eq!(crate::lease::process_pool().used(), 0);
+
+        // Direct in-flight check: while holding a streamed download frame, `pool.used()` reflects
+        // the live chunk lease and `process_pool().used()` remains strictly zero.
+        let direct_res = http_wire::serve_transfer(
+            Request::get(format!("/t/{download_id}"))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            Arc::clone(&table),
+            Arc::clone(&pool),
+            stopped.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(direct_res.status(), StatusCode::OK);
+        let mut direct_body = direct_res.into_body();
+        let held_chunk = direct_body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(&held_chunk[..], &download_payload[..]);
+        assert!(pool.used() >= download_payload.len());
+        assert_eq!(crate::lease::process_pool().used(), 0);
+        drop(held_chunk);
+        drop(direct_body);
+
+        drop((h1_client, h2_client));
+        stopped.cancel();
+        server_task.await.unwrap();
+        let _ = h1_conn.await;
+        let _ = h2_conn.await;
+
+        assert_eq!(pool.used(), 0);
+        assert_eq!(crate::lease::process_pool().used(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn http2_authority_mints_transfer_url_without_host_header_and_blocks_userinfo() {
+    let dir = std::env::temp_dir().join(format!(
+        "fastexec-h2-transfer-authority-{}",
+        crate::id::random_chars(12).unwrap()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sample = dir.join("payload.txt");
+    std::fs::write(&sample, b"http2-authority-ok").unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let stopped = CancellationToken::new();
+    let token = "0123456789abcdef";
+    let tasks = crate::tasks::Tasks::new(crate::tasks::Limits::OFF).unwrap();
+    let service = Arc::new(crate::service::Service::new(tasks, true));
+    let launch = Arc::new(LaunchContext::new(dir.clone(), Vec::new()));
+    let table = Arc::new(Transfers::new());
+    let server_task = tokio::spawn(serve(HttpServeArgs {
+        listener,
+        digests: vec![digest(token)],
+        tools: Tools {
+            codemode: false,
+            transfer: true,
+            yolo: false,
+        },
+        launch,
+        public_root: None,
+        extra_instructions: None,
+        instructions_tool: InstructionsToolMode::Off,
+        service,
+        transfers: Arc::clone(&table),
+        memory: BytePool::new(1 << 20),
+        control_memory: BytePool::new(256 * 1024),
+        stopped: stopped.clone(),
+    }));
+
+    let (mut h2_client, h2_conn) = TestHttpSender::connect(bound, true).await;
+    let body = modern_post_body(
+        1,
+        "tools/call",
+        serde_json::json!({
+            "name": "transfer",
+            "arguments": { "path": sample.to_string_lossy() }
+        }),
+    );
+
+    // RFC 9113 HTTP/2 request with `:authority` and `:scheme`, carrying no `Host` header.
+    let ok_req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://{bound}/mcp"))
+        .version(Version::HTTP_2)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "transfer")
+        .body(Full::new(body.clone()))
+        .unwrap();
+    let ok_res = h2_client.send(ok_req).await;
+    assert_eq!(ok_res.status(), StatusCode::OK);
+    let ok_json: serde_json::Value =
+        serde_json::from_slice(&ok_res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_ne!(
+        ok_json["result"]["isError"],
+        serde_json::json!(true),
+        "{ok_json}"
+    );
+    let text = ok_json["result"]["content"][0]["text"].as_str().unwrap();
+    let url = text
+        .split_whitespace()
+        .find(|part| part.starts_with(&format!("http://{bound}/t/")))
+        .expect("minted transfer URL");
+
+    let dl_req = Request::builder()
+        .method(Method::GET)
+        .uri(url)
+        .version(Version::HTTP_2)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let dl_res = h2_client.send(dl_req).await;
+    assert_eq!(dl_res.status(), StatusCode::OK);
+    assert_eq!(
+        &dl_res.into_body().collect().await.unwrap().to_bytes()[..],
+        b"http2-authority-ok"
+    );
+
+    // Userinfo in `:authority` must never produce a credential-bearing URL.
+    let evil_uri = http::Uri::builder()
+        .scheme("http")
+        .authority(format!("evil@{bound}"))
+        .path_and_query("/mcp")
+        .build()
+        .unwrap();
+    let evil_req = Request::builder()
+        .method(Method::POST)
+        .uri(evil_uri)
+        .version(Version::HTTP_2)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "transfer")
+        .body(Full::new(body))
+        .unwrap();
+    let evil_res = h2_client.send(evil_req).await;
+    if evil_res.status() == StatusCode::OK {
+        let evil_json: serde_json::Value =
+            serde_json::from_slice(&evil_res.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            evil_json["result"]["isError"],
+            serde_json::json!(true),
+            "{evil_json}"
+        );
+        let err_text = evil_json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!err_text.contains("evil"), "{err_text}");
+    } else {
+        assert!(evil_res.status().is_client_error());
+    }
+
+    drop(h2_client);
+    stopped.cancel();
+    server_task.await.unwrap();
+    let _ = h2_conn.await;
     std::fs::remove_dir_all(dir).unwrap();
 }

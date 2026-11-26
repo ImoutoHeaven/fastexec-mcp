@@ -1393,7 +1393,7 @@ async fn sweep_drops_a_session_detached_past_the_ttl_and_keeps_an_attached_one()
 /// Runs `daemon` on `endpoint`, so the test talks to it over the transport as a client does.
 fn run_on(daemon: &Arc<Daemon>, endpoint: &Endpoint) -> tokio::task::JoinHandle<()> {
     let listener = Listener::bind(endpoint.name()).unwrap();
-    tokio::spawn(Arc::clone(daemon).run(listener, None))
+    tokio::spawn(Arc::clone(daemon).run(listener))
 }
 
 #[tokio::test]
@@ -2295,4 +2295,137 @@ async fn daemon_event_stream_overload_isolates_reserved_and_keeps_connection() {
     ));
     client.send(&ToDaemon::Bye).await;
     assert_eq!(client.next().await, None);
+}
+
+#[tokio::test]
+async fn g15_http_launch_handoff_bidirectional_stop_and_panic_propagation() {
+    static CAPTURED: Mutex<Option<oneshot::Sender<(std::net::SocketAddr, CancellationToken)>>> =
+        Mutex::new(None);
+
+    fn recording_spawner(launch: HttpLaunch) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let addr = launch.listener.local_addr().unwrap();
+        let stopped = launch.stopped;
+        if let Some(tx) = lock(&CAPTURED).take() {
+            let _ = tx.send((addr, stopped.clone()));
+        }
+        Box::pin(async move {
+            let _listener = launch.listener;
+            stopped.cancelled().await;
+        })
+    }
+
+    fn panicking_spawner(_launch: HttpLaunch) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            panic!("simulated HTTP server task failure");
+        })
+    }
+
+    let _serial = one_at_a_time();
+
+    // 1. Ephemeral HTTP port handoff, Status reporting, and daemon -> HTTP graceful shutdown.
+    {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tcp.local_addr().unwrap();
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let daemon = Daemon::with_config(
+            Arc::clone(&tasks),
+            "fastexec".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+            Some(bound.to_string()),
+            None,
+            Config::default(),
+        );
+        let (tx, rx) = oneshot::channel();
+        *lock(&CAPTURED) = Some(tx);
+
+        let http_task = daemon.attach_http(
+            PendingHttp {
+                listener: tcp,
+                digests: vec![[0xabu8; 32]],
+                tools: crate::config::Tools::default(),
+                launch: Arc::new(LaunchContext::current().unwrap()),
+                public_root: None,
+                extra_instructions: None,
+                instructions_tool: crate::config::InstructionsToolMode::Off,
+            },
+            recording_spawner,
+        );
+        let endpoint = Endpoint::new("g15-handoff");
+        let running = run_on(&daemon, &endpoint);
+
+        let (seen_addr, http_stopped) = timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("spawner invoked")
+            .unwrap();
+        assert_eq!(seen_addr, bound);
+        assert!(!http_stopped.is_cancelled());
+
+        let mut client = connect_over(&endpoint).await;
+        client.welcome("g15stat", 1).await;
+        client.send(&ToDaemon::Status).await;
+        match client.next().await {
+            Some(ToEndpoint::Status { http, .. }) => {
+                assert_eq!(http.as_deref(), Some(bound.to_string().as_str()));
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        client.send(&ToDaemon::Stop).await;
+        assert_eq!(client.next().await, None);
+        timeout(Duration::from_secs(5), running)
+            .await
+            .expect("daemon run stopped")
+            .unwrap();
+        timeout(Duration::from_secs(5), http_task)
+            .await
+            .expect("http task stopped")
+            .unwrap();
+        assert!(http_stopped.is_cancelled());
+        tasks.shutdown();
+    }
+
+    // 2. Abnormal panic inside `spawn_http` triggers `StopOnDrop` and stops `Daemon::run`.
+    {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tcp.local_addr().unwrap();
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let daemon = Daemon::with_config(
+            Arc::clone(&tasks),
+            "fastexec".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+            Some(bound.to_string()),
+            None,
+            Config::default(),
+        );
+        let endpoint = Endpoint::new("g15-panic");
+        let running = run_on(&daemon, &endpoint);
+        let mut client = connect_over(&endpoint).await;
+        client.welcome("g15pan", 1).await;
+
+        let http_task = daemon.attach_http(
+            PendingHttp {
+                listener: tcp,
+                digests: vec![[0xcd; 32]],
+                tools: crate::config::Tools::default(),
+                launch: Arc::new(LaunchContext::current().unwrap()),
+                public_root: None,
+                extra_instructions: None,
+                instructions_tool: crate::config::InstructionsToolMode::Off,
+            },
+            panicking_spawner,
+        );
+
+        let err = timeout(Duration::from_secs(5), http_task)
+            .await
+            .expect("panicking http task finished")
+            .expect_err("expected JoinError from panic");
+        assert!(err.is_panic());
+
+        timeout(Duration::from_secs(5), running)
+            .await
+            .expect("daemon stopped when http task panicked")
+            .unwrap();
+        assert_eq!(client.next().await, None);
+        tasks.shutdown();
+    }
 }

@@ -4,7 +4,6 @@
 mod events;
 
 use crate::env::LaunchContext;
-use crate::http::{self, Http};
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::lease::{self, BytePool, Lease};
 use crate::platform::runtime;
@@ -20,6 +19,8 @@ use crate::transport::Listener;
 use rmcp::model::{CallToolResult, ContentBlock};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
@@ -56,6 +57,41 @@ pub const RESERVED: usize = lease::CONTROL_LIMIT;
 /// Normal renders can coexist, but neither they nor one management action consume the slots
 /// reserved for the other management action. This bounds render concurrency, not daemon RSS.
 const RENDER_SLOTS: usize = 2;
+
+/// Streamable HTTP launch contract passed to the top-level CLI spawner.
+pub struct HttpLaunch {
+    pub listener: tokio::net::TcpListener,
+    pub digests: Vec<[u8; 32]>,
+    pub tools: crate::config::Tools,
+    pub launch: Arc<LaunchContext>,
+    pub public_root: Option<Arc<str>>,
+    pub extra_instructions: Option<String>,
+    pub instructions_tool: crate::config::InstructionsToolMode,
+    pub service: Arc<Service>,
+    pub transfers: Arc<Transfers>,
+    pub memory: Arc<BytePool>,
+    pub control_memory: Arc<BytePool>,
+    pub stopped: CancellationToken,
+}
+
+/// Pre-bound HTTP front-door configuration collected before daemon state exists.
+pub(crate) struct PendingHttp {
+    pub listener: tokio::net::TcpListener,
+    pub digests: Vec<[u8; 32]>,
+    pub tools: crate::config::Tools,
+    pub launch: Arc<LaunchContext>,
+    pub public_root: Option<Arc<str>>,
+    pub extra_instructions: Option<String>,
+    pub instructions_tool: crate::config::InstructionsToolMode,
+}
+
+struct StopOnDrop(Arc<Daemon>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
 
 /// What a daemon is run with.
 #[derive(Clone, Debug)]
@@ -310,15 +346,43 @@ impl Daemon {
         Arc::clone(&self.transfers)
     }
 
+    /// Spawns the Streamable HTTP task and propagates unexpected exits back to daemon shutdown.
+    pub(crate) fn attach_http(
+        self: &Arc<Self>,
+        http: PendingHttp,
+        spawn_http: fn(HttpLaunch) -> Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let guard = StopOnDrop(Arc::clone(self));
+        let fut = spawn_http(HttpLaunch {
+            listener: http.listener,
+            digests: http.digests,
+            tools: http.tools,
+            launch: http.launch,
+            public_root: http.public_root,
+            extra_instructions: http.extra_instructions,
+            instructions_tool: http.instructions_tool,
+            service: self.service(),
+            transfers: self.transfers(),
+            memory: Arc::clone(self.memory()),
+            control_memory: Arc::clone(self.control_memory()),
+            stopped: self.stopped.clone(),
+        });
+        tokio::spawn(async move {
+            let _guard = guard;
+            fut.await;
+        })
+    }
+
     fn attach_transfer_listener(
         &self,
         listener: tokio::net::TcpListener,
         bound: std::net::SocketAddr,
     ) {
         let _ = self.transfer_listener.set(bound);
-        tokio::spawn(http::serve_transfers(
+        tokio::spawn(crate::http_wire::serve_transfers(
             listener,
             Arc::clone(&self.transfers),
+            Arc::clone(&self.memory),
             self.stopped.clone(),
         ));
     }
@@ -352,9 +416,10 @@ impl Daemon {
                 let bound = listener
                     .local_addr()
                     .map_err(|error| format!("cannot read transfer listener address: {error}"))?;
-                tokio::spawn(http::serve_transfers(
+                tokio::spawn(crate::http_wire::serve_transfers(
                     listener,
                     Arc::clone(&self.transfers),
+                    Arc::clone(&self.memory),
                     self.stopped.clone(),
                 ));
                 Ok::<std::net::SocketAddr, String>(bound)
@@ -504,15 +569,7 @@ impl Daemon {
 
     /// Runs until the daemon stops or exits on its own: accepts connections, and on every tick
     /// drops what has expired and checks whether the daemon is still needed.
-    pub async fn run(self: Arc<Self>, mut listener: Listener, http: Option<Http>) {
-        // The HTTP front door runs beside the pipe or socket, and stops with the daemon.
-        if let Some(http) = http {
-            let daemon = Arc::clone(&self);
-            let stopped = self.stopped.clone();
-            tokio::spawn(async move {
-                http::serve(http, daemon, stopped).await;
-            });
-        }
+    pub async fn run(self: Arc<Self>, mut listener: Listener) {
         let mut tick = interval(self.config.tick);
         // A tick that came due while the loop was busy runs once, not once per missed period.
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1699,6 +1756,7 @@ pub fn serve_process(
     http: Option<String>,
     idle_exit: bool,
     foreground: bool,
+    spawn_http: fn(HttpLaunch) -> Pin<Box<dyn Future<Output = ()> + Send>>,
 ) -> i32 {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -1707,7 +1765,9 @@ pub fn serve_process(
             return 1;
         }
     };
-    runtime.block_on(serve_daemon(namespace, build, http, idle_exit, foreground))
+    runtime.block_on(serve_daemon(
+        namespace, build, http, idle_exit, foreground, spawn_http,
+    ))
 }
 
 async fn serve_daemon(
@@ -1716,6 +1776,7 @@ async fn serve_daemon(
     http: Option<String>,
     idle_exit: bool,
     foreground: bool,
+    spawn_http: fn(HttpLaunch) -> Pin<Box<dyn Future<Output = ()> + Send>>,
 ) -> i32 {
     let actual = match runtime::build_id() {
         Ok(actual) => actual,
@@ -1839,7 +1900,7 @@ async fn serve_daemon(
                 .map_or_else(|_| addr.to_string(), |addr| addr.to_string());
             (
                 Some(bound),
-                Some(Http {
+                Some(PendingHttp {
                     listener,
                     digests,
                     tools,
@@ -1956,7 +2017,8 @@ async fn serve_daemon(
     if let Some((transfer_tcp, bound)) = startup_transfer {
         daemon.attach_transfer_listener(transfer_tcp, bound);
     }
-    let mut run = std::pin::pin!(Arc::clone(&daemon).run(listener, http));
+    let http_task = http.map(|pending| daemon.attach_http(pending, spawn_http));
+    let mut run = std::pin::pin!(Arc::clone(&daemon).run(listener));
     let mut shutdown = std::pin::pin!(shutdown);
     if foreground {
         // Both listeners are bound and the handlers are in place, so this line is what a
@@ -1987,6 +2049,12 @@ async fn serve_daemon(
         }
     } else {
         run.await;
+    }
+    if let Some(http_task) = http_task
+        && let Err(error) = http_task.await
+    {
+        eprintln!("fastexec: HTTP server task failed: {error}");
+        std::process::exit(1);
     }
     // Exit here, with the namespace's lock still held: returning would drop it before the
     // process ends, and another daemon could take the namespace while this one is still alive.

@@ -1,8 +1,8 @@
 //! Unit tests for CLI daemon flags, deadlines, event budgets, and stdio transport.
 
 use super::daemon::{
-    BoundedLine, DaemonFlags, NO_ANSWER, blocking_within, daemon_flags, parse_emit_payload,
-    read_bounded_line, within,
+    BoundedLine, DaemonFlags, NO_ANSWER, blocking_within, connect_emit_daemon, daemon_flags,
+    parse_emit_payload, read_bounded_line, within,
 };
 use super::stdio::{StdioTransport, encode_stdio_frame};
 use crate::config::{InstructionsToolMode, Tools};
@@ -665,27 +665,76 @@ mod stdio_transport_tests {
         let leases = Arc::new(RequestLeases::default());
         let (mut client_write, server_read) = tokio::io::duplex(256 * 1024);
         let (server_write, client_read) = tokio::io::duplex(64 * 1024);
-        let mut transport = StdioTransport::new(server_read, server_write, Arc::clone(&leases));
+        let tight_main = lease::BytePool::new(4096);
+        let tight_ctrl = lease::BytePool::new(4096);
+        let mut transport = StdioTransport::with_pools(
+            server_read,
+            server_write,
+            Arc::clone(&leases),
+            Arc::clone(&tight_main),
+            Arc::clone(&tight_ctrl),
+        );
         transport.max_line_length = 40 * 1024;
         let mut out_lines = tokio::io::BufReader::new(client_read).lines();
 
-        let tight_main = lease::BytePool::new(4096);
-        let tight_ctrl = lease::BytePool::new(4096);
-        transport.line_buf = crate::ingress::Buffer::new(tight_main, tight_ctrl);
-
-        let mid_overload = format!(
+        let mid_overload_1 = format!(
             "{{\"jsonrpc\":\"2.0\",\"params\":{{\"nested\":{{\"id\":999}}}},\"id\":\"mid-1\",\"pad\":\"{}\"}}\n",
             "x".repeat(20 * 1024)
         );
-        // Follow immediately with an oversized (> 40 KiB max_line_length) request and a valid ping!
-        let oversized = format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"tools/call\",\"params\":{{\"pad\":\"{}\"}}}}\n",
-            "y".repeat(45 * 1024)
+        // Second over-budget request after `reset_line_buf()` must still hit `tight_main`/`tight_ctrl`.
+        let mid_overload_2 = format!(
+            "{{\"jsonrpc\":\"2.0\",\"params\":{{\"nested\":{{\"id\":999}}}},\"id\":\"mid-2\",\"pad\":\"{}\"}}\n",
+            "x".repeat(20 * 1024)
+        );
+        // Fits `append` (< 4096) then fails `self.line_buf.take().parse(true)` (`4 * len` > 4096).
+        let parse_overload = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"parse-3\",\"method\":\"ping\",\"pad\":\"{}\"}}\n",
+            "z".repeat(1400)
+        );
+        // Over-budget line after `take()` must also stay bound to `tight_main`/`tight_ctrl`.
+        let mid_overload_4 = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"mid-4\",\"method\":\"ping\",\"pad\":\"{}\"}}\n",
+            "x".repeat(20 * 1024)
         );
         client_write
-            .write_all(mid_overload.as_bytes())
+            .write_all(mid_overload_1.as_bytes())
             .await
             .unwrap();
+        client_write
+            .write_all(mid_overload_2.as_bytes())
+            .await
+            .unwrap();
+        client_write
+            .write_all(parse_overload.as_bytes())
+            .await
+            .unwrap();
+        client_write
+            .write_all(mid_overload_4.as_bytes())
+            .await
+            .unwrap();
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+
+        let ping_98 = transport
+            .receive()
+            .await
+            .expect("session must survive consecutive mid-line and parse budget errors");
+        match ping_98 {
+            rmcp::model::JsonRpcMessage::Request(req) => {
+                assert_eq!(req.id, rmcp::model::RequestId::Number(98));
+            }
+            other => panic!("expected ping request 98, got {other:?}"),
+        }
+
+        // Lower `max_line_length` below BufReader's 8 KiB chunk so an oversized line trips `-32600`
+        // before `append` checks the 4 KiB pool.
+        transport.max_line_length = 6 * 1024;
+        let oversized = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":88,\"method\":\"tools/call\",\"params\":{{\"pad\":\"{}\"}}}}\n",
+            "y".repeat(10 * 1024)
+        );
         client_write.write_all(oversized.as_bytes()).await.unwrap();
         client_write
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"ping\"}\n")
@@ -695,22 +744,578 @@ mod stdio_transport_tests {
         let next = transport
             .receive()
             .await
-            .expect("session must survive overload and oversized lines");
-        match next {
+            .expect("session must survive oversized lines");
+        assert!(
+            tight_main.used() > 0,
+            "accepted ping must charge tight_main"
+        );
+        assert_eq!(tight_ctrl.used(), 0);
+        match &next {
             rmcp::model::JsonRpcMessage::Request(req) => {
                 assert_eq!(req.id, rmcp::model::RequestId::Number(99));
             }
             other => panic!("expected ping request 99, got {other:?}"),
         }
+        drop(next);
+        assert_eq!(tight_main.used(), 0);
+        assert_eq!(tight_ctrl.used(), 0);
 
-        let err1: serde_json::Value =
-            serde_json::from_str(&out_lines.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(err1["id"], "mid-1");
-        assert_eq!(err1["error"]["code"], -32603);
+        for expected_id in [
+            serde_json::json!("mid-1"),
+            serde_json::json!("mid-2"),
+            serde_json::json!("parse-3"),
+            serde_json::json!("mid-4"),
+        ] {
+            let err: serde_json::Value =
+                serde_json::from_str(&out_lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(err["id"], expected_id);
+            assert_eq!(err["error"]["code"], -32603);
+        }
 
-        let err2: serde_json::Value =
+        let err_oversized: serde_json::Value =
             serde_json::from_str(&out_lines.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(err2["id"], 88);
-        assert_eq!(err2["error"]["code"], -32600);
+        assert_eq!(err_oversized["id"], 88);
+        assert_eq!(err_oversized["error"]["code"], -32600);
+
+        // Outbound unleased `send` also honors the instance's isolated pools rather than global pools.
+        let mut zero_transport = StdioTransport::with_pools(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            Arc::new(RequestLeases::default()),
+            lease::BytePool::new(0),
+            lease::BytePool::new(0),
+        );
+        let progress = rmcp::model::ServerJsonRpcMessage::notification(
+            rmcp::model::ServerNotification::ProgressNotification(
+                rmcp::model::ProgressNotification::new(
+                    rmcp::model::ProgressNotificationParam::new(
+                        rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(1)),
+                        1.0,
+                    ),
+                ),
+            ),
+        );
+        let send_err = zero_transport.send(progress).await.unwrap_err();
+        assert_eq!(send_err.kind(), std::io::ErrorKind::OutOfMemory);
+    }
+
+    #[tokio::test]
+    async fn stdio_early_budget_exhaustion_silently_drops_complete_notifications() {
+        use tokio::io::AsyncBufReadExt;
+
+        let leases = Arc::new(RequestLeases::default());
+        let (mut client_write, server_read) = tokio::io::duplex(256 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(64 * 1024);
+        let tight_main = lease::BytePool::new(4096);
+        let tight_ctrl = lease::BytePool::new(512);
+        let mut transport = StdioTransport::with_pools(
+            server_read,
+            server_write,
+            Arc::clone(&leases),
+            Arc::clone(&tight_main),
+            Arc::clone(&tight_ctrl),
+        );
+        transport.max_line_length = 32 * 1024;
+        let mut out_lines = tokio::io::BufReader::new(client_read).lines();
+
+        // 1. Complete single-line notifications failing `append` (~6 KiB > 4096) or `parse` `3 * len`
+        // (~2 KiB > 4096 / 4) must produce zero stdout error frames.
+        let append_stage_noti = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/custom\",\"params\":{{\"id\":\"nested\",\"pad\":\"{}\"}}}}\n",
+            "n".repeat(6000)
+        );
+        let parse_stage_noti = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{{\"pad\":\"{}\"}}}}\n",
+            "m".repeat(2000)
+        );
+        // 2. Invalid JSON syntax, escaped `"id"` key, `"id": null`, truncated mid-line (> 8 KiB
+        // BufReader chunk), and oversized (> 32 KiB max_line_length) notifications MUST still emit errors.
+        let bad_syntax = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/custom\",\"pad\":\"{}\",}}\n",
+            "b".repeat(6000)
+        );
+        let escaped_id_req = format!(
+            "{{\"jsonrpc\":\"2.0\",\"i\\u0064\":\"esc-1\",\"method\":\"ping\",\"pad\":\"{}\"}}\n",
+            "e".repeat(6000)
+        );
+        let null_id_req = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\",\"pad\":\"{}\"}}\n",
+            "q".repeat(2000)
+        );
+        let truncated_mid_line_noti = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/custom\",\"pad\":\"{}\"}}\n",
+            "t".repeat(16 * 1024)
+        );
+        let oversized_noti = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/custom\",\"pad\":\"{}\"}}\n",
+            "o".repeat(36 * 1024)
+        );
+
+        for line in [
+            append_stage_noti.as_str(),
+            parse_stage_noti.as_str(),
+            bad_syntax.as_str(),
+            escaped_id_req.as_str(),
+            null_id_req.as_str(),
+            truncated_mid_line_noti.as_str(),
+            "{\"jsonrpc\":\"2.0\",\"id\":76,\"method\":\"ping\"}\n",
+        ] {
+            client_write.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        let ping_76 = transport.receive().await.expect("ping 76");
+        match ping_76 {
+            rmcp::model::JsonRpcMessage::Request(req) => {
+                assert_eq!(req.id, rmcp::model::RequestId::Number(76));
+            }
+            other => panic!("expected ping 76, got {other:?}"),
+        }
+
+        // Lower `max_line_length` below BufReader's 8 KiB chunk so `oversized_noti` hits `-32600`.
+        transport.max_line_length = 7 * 1024;
+        client_write
+            .write_all(oversized_noti.as_bytes())
+            .await
+            .unwrap();
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+
+        let ping = transport.receive().await.expect("ping 77");
+        match ping {
+            rmcp::model::JsonRpcMessage::Request(req) => {
+                assert_eq!(req.id, rmcp::model::RequestId::Number(77));
+            }
+            other => panic!("expected ping 77, got {other:?}"),
+        }
+        assert_eq!(tight_main.used(), 0);
+        drop(transport);
+
+        // Multi-chunk complete notification (10 KiB across 8 KiB BufReader split, failing second append).
+        let (mut multi_write, multi_read) = tokio::io::duplex(64 * 1024);
+        let (multi_srv_write, multi_cli_read) = tokio::io::duplex(16 * 1024);
+        let multi_main = lease::BytePool::new(9000);
+        let multi_ctrl = lease::BytePool::new(512);
+        let mut multi_transport = StdioTransport::with_pools(
+            multi_read,
+            multi_srv_write,
+            Arc::new(RequestLeases::default()),
+            Arc::clone(&multi_main),
+            Arc::clone(&multi_ctrl),
+        );
+        let multi_chunk_noti = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/custom\",\"pad\":\"{}\"}}\n",
+            "k".repeat(9800)
+        );
+        multi_write
+            .write_all(multi_chunk_noti.as_bytes())
+            .await
+            .unwrap();
+        drop(multi_write);
+        assert!(multi_transport.receive().await.is_none());
+        assert_eq!(multi_main.used(), 0);
+        drop(multi_transport);
+        let mut multi_out = Vec::new();
+        tokio::io::BufReader::new(multi_cli_read)
+            .read_to_end(&mut multi_out)
+            .await
+            .unwrap();
+        assert!(
+            multi_out.is_empty(),
+            "multi-chunk complete notification must not write error frame: {:?}",
+            String::from_utf8_lossy(&multi_out)
+        );
+
+        let mut errs = Vec::new();
+        while let Some(line) = out_lines.next_line().await.unwrap() {
+            errs.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+        }
+        assert_eq!(errs.len(), 5, "unexpected error frames: {errs:?}");
+        assert!(errs[0]["id"].is_null());
+        assert_eq!(errs[0]["error"]["code"], -32603);
+        assert_eq!(errs[1]["id"], "esc-1");
+        assert_eq!(errs[1]["error"]["code"], -32603);
+        assert!(errs[2]["id"].is_null());
+        assert_eq!(errs[2]["error"]["code"], -32603);
+        assert!(errs[3]["id"].is_null());
+        assert_eq!(errs[3]["error"]["code"], -32603);
+        assert!(errs[4]["id"].is_null());
+        assert_eq!(errs[4]["error"]["code"], -32600);
+    }
+}
+
+#[cfg(test)]
+mod g15_http_daemon_wiring_tests {
+    use super::*;
+    use crate::daemon::{self, Daemon, PendingHttp};
+    use crate::ipc::{self, OsText, ToDaemon, ToEndpoint};
+    use crate::transport::{self, Endpoint, Listener};
+    use bytes::Bytes;
+    use http::{Request, StatusCode, header};
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::rt::TokioIo;
+    use sha2::{Digest, Sha256};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fastexec-{label}-{}",
+            crate::id::random_chars(12).unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn ipc_hello(
+        client: &mut transport::Client,
+        session: &str,
+        cwd: &std::path::Path,
+        extra_env: Vec<(&str, &str)>,
+    ) {
+        let mut launch = LaunchContext::new(
+            cwd.to_path_buf(),
+            extra_env
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        );
+        launch = launch.for_session();
+        let (wire_cwd, mut wire_env) = ipc::launch_to_wire(&launch);
+        wire_env.push((OsText::Text("G15_TAG".into()), OsText::Text("1".into())));
+        let hello = ToDaemon::Hello {
+            protocol: ipc::PROTOCOL,
+            namespace: "fastexec".to_owned(),
+            build: env!("CARGO_PKG_VERSION").to_owned(),
+            session: session.to_owned(),
+            connection: 1,
+            client_name: "g15-cli".to_owned(),
+            cwd: wire_cwd,
+            env: wire_env,
+        };
+        ipc::write_frame_idle(client, &hello, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let welcome = ipc::read_frame::<_, ToEndpoint>(client, lease::FRAME_LIMIT)
+            .await
+            .unwrap();
+        assert!(matches!(welcome, Some(ToEndpoint::Welcome { .. })));
+    }
+
+    #[tokio::test]
+    async fn g15_cli_spawn_http_wires_daemon_port_status_mcp_requests_and_graceful_shutdown() {
+        let root = temp_dir("g15-http-full");
+        let logs = root.join("logs");
+        crate::platform::runtime::create_private(&logs).unwrap();
+        let tasks = Tasks::new_in(Limits::OFF, logs).unwrap();
+
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = tcp.local_addr().unwrap();
+        let token = "g15-bearer-secret";
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+
+        let daemon = Daemon::with_config(
+            Arc::clone(&tasks),
+            "fastexec".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+            Some(bound.to_string()),
+            None,
+            daemon::Config::default(),
+        );
+        let launch = Arc::new(LaunchContext::new(root.clone(), Vec::new()));
+        let http_task = daemon.attach_http(
+            PendingHttp {
+                listener: tcp,
+                digests: vec![digest],
+                tools: Tools {
+                    codemode: false,
+                    transfer: true,
+                    yolo: false,
+                },
+                launch,
+                public_root: None,
+                extra_instructions: None,
+                instructions_tool: InstructionsToolMode::Off,
+            },
+            crate::cli::daemon::spawn_http,
+        );
+
+        let ipc_ep = Endpoint::new("g15-cli-http");
+        let ipc_listener = Listener::bind(ipc_ep.name()).unwrap();
+        let run_task = tokio::spawn(Arc::clone(&daemon).run(ipc_listener));
+
+        // 1. IPC Status reports exact bound HTTP address.
+        let mut ipc_client = transport::connect(ipc_ep.name()).await.unwrap();
+        ipc_hello(&mut ipc_client, "g15sess1", &root, Vec::new()).await;
+        ipc::write_frame_idle(&mut ipc_client, &ToDaemon::Status, Duration::from_secs(5))
+            .await
+            .unwrap();
+        match ipc::read_frame::<_, ToEndpoint>(&mut ipc_client, lease::FRAME_LIMIT)
+            .await
+            .unwrap()
+        {
+            Some(ToEndpoint::Status { http, .. }) => {
+                assert_eq!(http.as_deref(), Some(bound.to_string().as_str()));
+            }
+            other => panic!("expected Status frame, got {other:?}"),
+        }
+
+        // 2. HTTP /mcp rejects unauthenticated calls and serves authenticated MCP ping.
+        {
+            let stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .unwrap();
+            let conn_task = tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let unauth = Request::post("/mcp")
+                .header(header::HOST, bound.to_string())
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let unauth_res = sender.send_request(unauth).await.unwrap();
+            assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
+            drop(sender);
+            let _ = conn_task.await;
+        }
+        {
+            let stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .unwrap();
+            let conn_task = tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let body = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientInfo": {"name": "g15", "version": "1"},
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .unwrap();
+            let req = Request::post("/mcp")
+                .header(header::HOST, "localhost")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "server/discover")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap();
+            let res = sender.send_request(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let payload: serde_json::Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(payload["id"], 1);
+            assert_eq!(
+                payload["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/events"],
+                serde_json::json!({ "listChanged": false })
+            );
+            drop(sender);
+            let _ = conn_task.await;
+        }
+
+        // 3. IPC Stop cleanly shuts down both Daemon::run and http::serve.
+        ipc::write_frame_idle(&mut ipc_client, &ToDaemon::Stop, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            ipc::read_frame::<_, ToEndpoint>(&mut ipc_client, lease::FRAME_LIMIT)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("daemon run exited")
+            .unwrap();
+        timeout(Duration::from_secs(5), http_task)
+            .await
+            .expect("http::serve exited")
+            .unwrap();
+        assert!(tokio::net::TcpStream::connect(bound).await.is_err());
+
+        tasks.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn g15_ipc_only_daemon_lazily_serves_transfers_and_stops_cleanly() {
+        let root = temp_dir("g15-lazy-xfer");
+        let logs = root.join("logs");
+        crate::platform::runtime::create_private(&logs).unwrap();
+        std::fs::write(root.join("payload.txt"), b"lazy-transfer-ok").unwrap();
+        let tasks = Tasks::new_in(Limits::OFF, logs).unwrap();
+
+        let daemon = Daemon::with_config(
+            Arc::clone(&tasks),
+            "fastexec".to_owned(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+            None,
+            None,
+            daemon::Config::default(),
+        );
+        let ipc_ep = Endpoint::new("g15-lazy-ipc");
+        let ipc_listener = Listener::bind(ipc_ep.name()).unwrap();
+        let run_task = tokio::spawn(Arc::clone(&daemon).run(ipc_listener));
+
+        let mut ipc_client = transport::connect(ipc_ep.name()).await.unwrap();
+        ipc_hello(
+            &mut ipc_client,
+            "g15xfer1",
+            &root,
+            vec![("FASTEXEC_TRANSFER", "true")],
+        )
+        .await;
+
+        let mint_call = ToDaemon::Call {
+            id: 7,
+            tool: "transfer".to_owned(),
+            request_id: "7".to_owned(),
+            arguments: serde_json::json!({ "path": "payload.txt" }),
+        };
+        ipc::write_frame_idle(&mut ipc_client, &mint_call, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let url = match ipc::read_frame::<_, ToEndpoint>(&mut ipc_client, lease::FRAME_LIMIT)
+            .await
+            .unwrap()
+        {
+            Some(ToEndpoint::Result { id: 7, result }) => {
+                assert_eq!(result.is_error, Some(false));
+                let text = result.content[0].as_text().unwrap().text.clone();
+                text.split_whitespace()
+                    .find(|tok| tok.starts_with("http://127.0.0.1:"))
+                    .expect("transfer URL")
+                    .to_owned()
+            }
+            other => panic!("expected transfer Result, got {other:?}"),
+        };
+
+        let uri: http::Uri = url.parse().unwrap();
+        let addr: std::net::SocketAddr = uri.authority().unwrap().as_str().parse().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let get_req = Request::get(uri.path())
+            .header(header::HOST, addr.to_string())
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let get_res = sender.send_request(get_req).await.unwrap();
+        assert_eq!(get_res.status(), StatusCode::OK);
+        let downloaded = get_res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&downloaded[..], b"lazy-transfer-ok");
+        drop(sender);
+        let _ = conn_task.await;
+
+        daemon.stop();
+        timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("ipc-only daemon stopped")
+            .unwrap();
+        tasks.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn daemon_emit_handshake_verifies_welcome_protocol_namespace_and_build() {
+        let root = temp_dir("emit-welcome-check");
+        let ep = Endpoint::new("emit-fake-daemon");
+        let mut listener = Listener::bind(ep.name()).unwrap();
+        let paths = crate::platform::runtime::Paths {
+            root: root.clone(),
+            ns: root.join("ns"),
+            endpoint: ep.name().to_owned(),
+        };
+        let identity = crate::platform::runtime::Identity {
+            namespace: "expected-ns".to_owned(),
+            build: "expected-build".to_owned(),
+        };
+
+        let server = tokio::spawn(async move {
+            let welcomes = [
+                ToEndpoint::Welcome {
+                    protocol: ipc::PROTOCOL + 1,
+                    namespace: "expected-ns".to_owned(),
+                    build: "expected-build".to_owned(),
+                    epoch: "ep-1".to_owned(),
+                },
+                ToEndpoint::Welcome {
+                    protocol: ipc::PROTOCOL,
+                    namespace: "rogue-ns".to_owned(),
+                    build: "expected-build".to_owned(),
+                    epoch: "ep-1".to_owned(),
+                },
+                ToEndpoint::Welcome {
+                    protocol: ipc::PROTOCOL,
+                    namespace: "expected-ns".to_owned(),
+                    build: "rogue-build".to_owned(),
+                    epoch: "ep-1".to_owned(),
+                },
+                ToEndpoint::Welcome {
+                    protocol: ipc::PROTOCOL,
+                    namespace: "expected-ns".to_owned(),
+                    build: "expected-build".to_owned(),
+                    epoch: "ep-1".to_owned(),
+                },
+            ];
+            for welcome in welcomes {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = ipc::read_frame::<_, ToDaemon>(&mut stream, lease::FRAME_LIMIT)
+                    .await
+                    .unwrap();
+                assert!(matches!(hello, Some(ToDaemon::HelloEmit { .. })));
+                ipc::write_frame_idle(&mut stream, &welcome, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let Err(proto_err) = connect_emit_daemon(&identity, &paths, deadline).await else {
+            panic!("mismatched protocol must fail");
+        };
+        assert!(
+            proto_err.contains("speaks protocol"),
+            "unexpected error: {proto_err}"
+        );
+
+        let Err(ns_err) = connect_emit_daemon(&identity, &paths, deadline).await else {
+            panic!("mismatched namespace must fail");
+        };
+        assert_eq!(
+            ns_err,
+            "the daemon serves namespace rogue-ns, not expected-ns"
+        );
+
+        let Err(build_err) = connect_emit_daemon(&identity, &paths, deadline).await else {
+            panic!("mismatched build must fail");
+        };
+        assert_eq!(
+            build_err,
+            "the daemon runs build rogue-build, not expected-build"
+        );
+
+        let _accepted = connect_emit_daemon(&identity, &paths, deadline)
+            .await
+            .expect("matching Welcome must succeed");
+
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("fake emit daemon finished")
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

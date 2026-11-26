@@ -1,14 +1,14 @@
 //! MCP server handler, tool routing, schema rewriting, and progress/event forwarding.
 
+pub(crate) mod ingress;
+
 use crate::codemode;
 use crate::config::{InstructionsToolMode, Tools, compose_instructions};
 use crate::endpoint;
 use crate::env::LaunchContext;
 use crate::events;
 use crate::files;
-use crate::http;
 use crate::id;
-use crate::ingress;
 use crate::ipc;
 use crate::lease;
 use crate::render;
@@ -47,6 +47,10 @@ impl schemars::JsonSchema for CodemodeArguments {
     }
 }
 
+/// The token position authenticated before rmcp receives a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Principal(pub usize);
+
 #[derive(Clone)]
 pub(crate) struct Server {
     pub(crate) backend: Backend,
@@ -62,13 +66,24 @@ pub(crate) struct Server {
     pub(crate) stdio_leases: Option<Arc<RequestLeases>>,
 }
 
+pub(crate) struct RegisteredSession {
+    session: Arc<Session>,
+    event_bus: Arc<events::EventBus>,
+}
+
+impl Drop for RegisteredSession {
+    fn drop(&mut self) {
+        self.event_bus.remove_session(&self.session.id);
+    }
+}
+
 /// Where this server's calls run: in this process, or on the namespace's daemon.
 #[derive(Clone)]
 pub(crate) enum Backend {
     Local {
         service: Arc<Service>,
         /// Created by initialize, or the first tool call of a stdio client that skips it.
-        session: Arc<OnceLock<Result<Arc<Session>, String>>>,
+        session: Arc<OnceLock<Result<RegisteredSession, String>>>,
         /// What this server's tasks inherit: the environment captured at startup, so a later
         /// change to the server's own environment cannot reach them.
         launch: Arc<LaunchContext>,
@@ -84,19 +99,6 @@ impl Backend {
         match self {
             Self::Local { daemon, .. } => *daemon,
             Self::Daemon(_) => true,
-        }
-    }
-}
-
-impl Drop for Backend {
-    fn drop(&mut self) {
-        if let Self::Local {
-            service, session, ..
-        } = self
-            && Arc::strong_count(session) == 1
-            && let Some(Ok(sess)) = session.get()
-        {
-            service.event_bus().remove_session(&sess.id);
         }
     }
 }
@@ -205,10 +207,20 @@ impl Server {
         router
     }
 
+    fn pools(&self) -> (&Arc<lease::BytePool>, &Arc<lease::BytePool>) {
+        match &self.backend {
+            Backend::Local { launch, .. } => (launch.memory(), launch.control_memory()),
+            Backend::Daemon(endpoint) => (endpoint.memory(), endpoint.control_memory()),
+        }
+    }
+
     /// The principal session for sessionless HTTP, or this server's client-named session.
     fn session(&self, context: &RequestContext<RoleServer>) -> Result<Arc<Session>, String> {
         let Backend::Local {
-            session, launch, ..
+            service,
+            session,
+            launch,
+            ..
         } = &self.backend
         else {
             return Err("this server has no tasks of its own".to_owned());
@@ -219,7 +231,7 @@ impl Server {
             let principal = context
                 .extensions
                 .get::<::http::request::Parts>()
-                .and_then(|parts| parts.extensions.get::<http::Principal>())
+                .and_then(|parts| parts.extensions.get::<Principal>())
                 .ok_or_else(|| "Internal error: HTTP request has no principal.".to_owned())?;
             return principals
                 .get(principal.0)
@@ -228,28 +240,35 @@ impl Server {
         }
         let isolate_launch = self.principals.is_some();
         session
-            .get_or_init(|| client_session(context, launch, isolate_launch))
-            .clone()
+            .get_or_init(|| client_session(context, service, launch, isolate_launch))
+            .as_ref()
+            .map(|registered| Arc::clone(&registered.session))
+            .map_err(Clone::clone)
     }
 }
 
 /// A session named for the client that initializes or first uses this server.
 fn client_session(
     context: &RequestContext<RoleServer>,
+    service: &Service,
     launch: &Arc<LaunchContext>,
     isolate_launch: bool,
-) -> Result<Arc<Session>, String> {
+) -> Result<RegisteredSession, String> {
     let short = id::random_chars(6).map_err(|error| format!("Cannot name the session: {error}"))?;
     let launch = if isolate_launch {
         Arc::new(launch.for_session())
     } else {
         Arc::clone(launch)
     };
-    Ok(Session::new(
+    let session = Session::new(
         short.clone(),
         format!("{}-{short}", client_name(context)),
         launch,
-    ))
+    );
+    Ok(RegisteredSession {
+        session,
+        event_bus: Arc::clone(service.event_bus()),
+    })
 }
 
 /// The client's name from request metadata or the legacy handshake.
@@ -330,23 +349,24 @@ impl ServerHandler for Server {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, rmcp::ErrorData> {
-        let _response_workspace = reserve_response_content(
-            lease::process_pool(),
-            self.instructions.len().saturating_add(512),
-        )?;
+        let _response_workspace =
+            reserve_response_content(self.pools().0, self.instructions.len().saturating_add(512))?;
         let result = self
             .negotiate_initialize(&request)?
             .with_instructions(self.instructions.as_ref());
         context.peer.set_peer_info(request);
         if let Backend::Local {
-            session, launch, ..
+            service,
+            session,
+            launch,
+            ..
         } = &self.backend
         {
             let isolate_launch = self.principals.is_some();
             session
-                .get_or_init(|| client_session(&context, launch, isolate_launch))
-                .clone()
-                .map_err(|message| rmcp::ErrorData::internal_error(message, None))?;
+                .get_or_init(|| client_session(&context, service, launch, isolate_launch))
+                .as_ref()
+                .map_err(|message| rmcp::ErrorData::internal_error(message.clone(), None))?;
         }
         Ok(result)
     }
@@ -355,8 +375,10 @@ impl ServerHandler for Server {
         &self,
         _context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::DiscoverResult, rmcp::ErrorData> {
-        let _response_workspace = reserve_response_content(
-            lease::process_pool(),
+        let (pool, control) = self.pools();
+        let _response_workspace = reserve_control_response_content(
+            pool,
+            control,
             self.instructions.len().saturating_add(512),
         )?;
         let mut info = self.get_info();
@@ -414,7 +436,8 @@ impl ServerHandler for Server {
         let bytes = self.router.map.values().fold(512usize, |bytes, route| {
             bytes.saturating_add(tool_metadata_copy_bytes(&route.attr))
         });
-        let _response_workspace = reserve_response_content(lease::process_pool(), bytes)?;
+        let (pool, control) = self.pools();
+        let _response_workspace = reserve_control_response_content(pool, control, bytes)?;
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
@@ -434,14 +457,14 @@ impl ServerHandler for Server {
     }
 }
 
-fn event_error_to_rmcp(err: events::EventError) -> rmcp::ErrorData {
+fn event_error_to_rmcp(err: events::EventError, control: &Arc<lease::BytePool>) -> rmcp::ErrorData {
     let message_bytes = match &err {
         events::EventError::InvalidParams(message)
         | events::EventError::NotFound { message, .. }
         | events::EventError::Forbidden(message)
         | events::EventError::ResourceExhausted { message, .. } => message.len(),
     };
-    let Some(held) = lease::control_pool().try_acquire(message_bytes.saturating_add(256)) else {
+    let Some(held) = control.try_acquire(message_bytes.saturating_add(256)) else {
         return rmcp::ErrorData::new(
             rmcp::model::ErrorCode(-32025),
             "Server active memory budget is full while preparing the event error",
@@ -595,7 +618,7 @@ impl Server {
             Backend::Local { service, .. } => service
                 .event_bus()
                 .list_event_types()
-                .map_err(event_error_to_rmcp)?,
+                .map_err(|err| event_error_to_rmcp(err, self.pools().1))?,
             Backend::Daemon(endpoint) => endpoint
                 .events_list(&client_name(&context), context.ct.clone())
                 .await
@@ -627,7 +650,7 @@ impl Server {
                 service
                     .event_bus()
                     .poll(poll_req, caller_session.as_deref())
-                    .map_err(event_error_to_rmcp)?
+                    .map_err(|err| event_error_to_rmcp(err, self.pools().1))?
             }
             Backend::Daemon(endpoint) => endpoint
                 .events_poll(&client_name(&context), poll_req, context.ct.clone())
@@ -653,10 +676,7 @@ impl Server {
         let sub_req: events::SubscribeRequest = serde_json::from_value(raw)
             .map_err(|e| rmcp::ErrorData::invalid_params(format!("invalid params: {e}"), None))?;
         validate_mcp_name_header(&context, &sub_req.name)?;
-        let (pool, control) = match &self.backend {
-            Backend::Local { launch, .. } => (launch.memory(), launch.control_memory()),
-            Backend::Daemon(endpoint) => (endpoint.memory(), endpoint.control_memory()),
-        };
+        let (pool, control) = self.pools();
         // Fixed metadata covers subscription ID copies, cursors, and terminal error envelopes.
         let metadata_bytes = lease::json_len(&(&sub_req, &context.id))
             .unwrap_or(usize::MAX)
@@ -681,15 +701,15 @@ impl Server {
                 let _guard = service
                     .event_bus()
                     .try_acquire_stream()
-                    .map_err(event_error_to_rmcp)?;
+                    .map_err(|err| event_error_to_rmcp(err, control))?;
                 let caller_session = self.session(&context).ok().map(|s| s.id.clone());
                 let mut sub = service
                     .event_bus()
                     .subscribe(sub_req, caller_session.as_deref())
-                    .map_err(event_error_to_rmcp)?;
+                    .map_err(|err| event_error_to_rmcp(err, control))?;
                 let initial = sub
                     .initial_active()
-                    .map_err(event_error_to_rmcp)?
+                    .map_err(|err| event_error_to_rmcp(err, control))?
                     .map(serde_json::Value::from);
                 if !send_event_notification(
                     &context,
@@ -900,10 +920,7 @@ impl Server {
         parameters: &T,
         is_control: bool,
     ) -> Result<(), CallToolResult> {
-        let (pool, control) = match &self.backend {
-            Backend::Local { launch, .. } => (launch.memory(), launch.control_memory()),
-            Backend::Daemon(endpoint) => (endpoint.memory(), endpoint.control_memory()),
-        };
+        let (pool, control) = self.pools();
         let owner = application_input_owner(
             &(parameters, &context.id),
             context.extensions.get::<lease::Owner>(),
@@ -938,7 +955,7 @@ impl Server {
         }
         match &self.backend {
             Backend::Daemon(endpoint) => {
-                let (progress, _forwarder) = progress(&context);
+                let (progress, _forwarder) = self.progress(&context);
                 // The daemon validates the call again; this is only how it travels.
                 let arguments = match serde_json::to_value(&request) {
                     Ok(arguments) => arguments,
@@ -967,7 +984,7 @@ impl Server {
                 daemon: _,
             } => match self.session(&context) {
                 Ok(session) => {
-                    let (progress, _forwarder) = progress(&context);
+                    let (progress, _forwarder) = self.progress(&context);
                     let ctx = ExecContext {
                         session: &session,
                         launch: None,
@@ -1034,7 +1051,7 @@ impl Server {
                         return CallToolResult::error(vec![ContentBlock::text(message)]);
                     }
                 };
-                let (progress, _forwarder) = progress(&context);
+                let (progress, _forwarder) = self.progress(&context);
                 let mut ctx = ExecContext {
                     session: &session,
                     launch: None,
@@ -1204,7 +1221,7 @@ impl Server {
                                 .ok_or_else(|| {
                                     "Cannot make a transfer URL outside an HTTP request.".to_owned()
                                 })
-                                .and_then(|parts| inferred_base(&parts.headers)),
+                                .and_then(inferred_base),
                         };
                         match base {
                             Ok(base) => {
@@ -1249,8 +1266,7 @@ impl Server {
         }
         match &self.tool_instructions {
             Some(text) => {
-                let _response_workspace =
-                    reserve_response_content(lease::process_pool(), text.len())?;
+                let _response_workspace = reserve_response_content(self.pools().0, text.len())?;
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     text.as_ref(),
                 )]))
@@ -1267,135 +1283,59 @@ impl Server {
     pub(crate) fn deliver_local(
         &self,
         context: &RequestContext<RoleServer>,
-        mut tracked: TrackedResult,
+        tracked: TrackedResult,
         launch: &LaunchContext,
         is_control: bool,
     ) -> CallToolResult {
         // Official rmcp owns HTTP response models and encodings after this
         // handoff. Its internal copies and queues are outside the app budget.
-        if http_context(context) || self.stdio_leases.is_none() {
+        if http_context(context) {
             return tracked.result;
         }
-        let use_control = is_control || tracked.result.is_error == Some(true);
-        let b64_bytes =
-            render::unleased_result_payload_capacity(&tracked.result, &tracked.payload_owner);
-        let exact_json = lease::json_len(&tracked.result).unwrap_or(usize::MAX);
-        let id_bytes = lease::json_len(&context.id).unwrap_or(usize::MAX);
-        let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
-        let encoded_peak = outbound_bytes;
-        let admitted = b64_bytes.checked_add(encoded_peak).and_then(|peak| {
-            admit_delivery(
-                &mut tracked.lease,
-                launch.memory(),
-                launch.control_memory(),
-                peak,
-                use_control,
-            )
-        });
-        let Some(mut held) = admitted else {
-            let meta = tracked.task_meta.take();
-            drop(tracked);
-            let msg = match &meta {
-                Some(m) => overload_task_message(launch.memory().limit(), m),
-                None => format!(
-                    "Server active memory budget ({} bytes) is full; retry once in-flight transfers complete.",
-                    launch.memory().limit()
-                ),
-            };
-            let err = CallToolResult::error(vec![ContentBlock::text(msg)]);
-            let err_outbound = lease::json_len(&err)
-                .unwrap_or(usize::MAX)
-                .saturating_add(id_bytes)
-                .saturating_add(256);
-            let err_peak = render::result_payload_capacity(&err).saturating_add(err_outbound);
-            if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
-                .then(|| launch.control_memory().try_acquire(err_peak))
-                .flatten()
-                && let Some(stdio) = &self.stdio_leases
-            {
-                let outbound = err_lease.split_off(err_outbound);
-                return stdio.deliver(
-                    context.id.clone(),
-                    &context.ct,
-                    err,
-                    err_lease,
-                    outbound,
-                    Default::default(),
-                );
-            }
-            return err;
+        let Some(stdio) = self.stdio_leases.as_deref() else {
+            return tracked.result;
         };
-        if let Some(stdio) = &self.stdio_leases {
-            let outbound = held.split_off(outbound_bytes.min(held.bytes()));
-            return stdio.deliver(
-                context.id.clone(),
-                &context.ct,
-                tracked.result,
-                held,
-                outbound,
-                tracked.payload_owner,
-            );
-        }
-        tracked.result
+        let limit = launch.memory().limit();
+        deliver_tracked(
+            launch.memory(),
+            launch.control_memory(),
+            stdio,
+            context,
+            tracked,
+            is_control,
+            |meta| match meta {
+                Some(m) => overload_task_message(limit, m),
+                None => format!(
+                    "Server active memory budget ({limit} bytes) is full; retry once in-flight transfers complete.",
+                ),
+            },
+        )
     }
 
     fn deliver_daemon(
         &self,
         context: &RequestContext<RoleServer>,
-        mut tracked: TrackedResult,
+        tracked: TrackedResult,
         endpoint: &endpoint::Endpoint,
         is_control: bool,
     ) -> CallToolResult {
-        let Some(stdio) = &self.stdio_leases else {
-            drop(tracked.lease.take());
+        let Some(stdio) = self.stdio_leases.as_deref() else {
             return tracked.result;
         };
         let pool = endpoint.memory();
-        let control_pool = endpoint.control_memory();
-        let use_control = is_control || tracked.result.is_error == Some(true);
-        let b64_bytes =
-            render::unleased_result_payload_capacity(&tracked.result, &tracked.payload_owner);
-        let exact_json = lease::json_len(&tracked.result).unwrap_or(usize::MAX);
-        let id_bytes = lease::json_len(&context.id).unwrap_or(usize::MAX);
-        let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
-        let admitted = b64_bytes.checked_add(outbound_bytes).and_then(|peak| {
-            admit_delivery(&mut tracked.lease, pool, control_pool, peak, use_control)
-        });
-        let Some(mut held) = admitted else {
-            drop(tracked);
-            let err = CallToolResult::error(vec![ContentBlock::text(format!(
-                "Endpoint active memory budget ({} bytes) is full while writing stdio response; use action list or poll once in-flight transfers complete.",
-                pool.limit()
-            ))]);
-            let err_outbound = lease::json_len(&err)
-                .unwrap_or(usize::MAX)
-                .saturating_add(id_bytes)
-                .saturating_add(256);
-            let err_peak = render::result_payload_capacity(&err).saturating_add(err_outbound);
-            if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
-                .then(|| control_pool.try_acquire(err_peak))
-                .flatten()
-            {
-                let outbound = err_lease.split_off(err_outbound);
-                return stdio.deliver(
-                    context.id.clone(),
-                    &context.ct,
-                    err,
-                    err_lease,
-                    outbound,
-                    Default::default(),
-                );
-            }
-            return err;
-        };
-        let outbound = held.split_off(outbound_bytes.min(held.bytes()));
-        stdio.deliver(
-            context.id.clone(),
-            &context.ct,
-            tracked.result,
-            held,
-            outbound,
-            tracked.payload_owner,
+        let limit = pool.limit();
+        deliver_tracked(
+            pool,
+            endpoint.control_memory(),
+            stdio,
+            context,
+            tracked,
+            is_control,
+            |_| {
+                format!(
+                    "Endpoint active memory budget ({limit} bytes) is full while writing stdio response; use action list or poll once in-flight transfers complete.",
+                )
+            },
         )
     }
 
@@ -1414,7 +1354,7 @@ impl Server {
                 ))]);
             }
         };
-        let (progress, _forwarder) = progress(context);
+        let (progress, _forwarder) = self.progress(context);
         let tracked = endpoint
             .call_tracked(
                 tool,
@@ -1583,31 +1523,117 @@ fn rewrite_schema_node(
     serde_json::Value::Object(obj)
 }
 
-/// The base inferred from a request: its Host, over the scheme the client saw.
-fn inferred_base(headers: &::http::HeaderMap) -> Result<String, String> {
-    let host = headers
-        .get(::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| "Cannot make a transfer URL: the request names no Host.".to_owned())?;
-    let authority: ::http::uri::Authority = host
-        .parse()
-        .map_err(|_| format!("Cannot make a transfer URL: {host} is not a host."))?;
-    let scheme = forwarded_scheme(headers);
+/// The base inferred from a request: its Host or HTTP/2 `:authority`, over the scheme the client saw.
+fn inferred_base(parts: &::http::request::Parts) -> Result<String, String> {
+    let mut hosts = parts.headers.get_all(::http::header::HOST).iter();
+    let authority =
+        match hosts.next() {
+            Some(raw) => {
+                if hosts.next().is_some() {
+                    return Err(
+                        "Cannot make a transfer URL: the request carries multiple Host headers."
+                            .to_owned(),
+                    );
+                }
+                let host = raw.to_str().map_err(|_| {
+                    "Cannot make a transfer URL: Host header is not valid ASCII.".to_owned()
+                })?;
+                if host.contains('@') {
+                    return Err(
+                        "Cannot make a transfer URL: the request host carries userinfo.".to_owned(),
+                    );
+                }
+                host.parse::<::http::uri::Authority>()
+                    .map_err(|_| format!("Cannot make a transfer URL: {host} is not a host."))?
+            }
+            None => parts.uri.authority().cloned().ok_or_else(|| {
+                "Cannot make a transfer URL: the request names no Host.".to_owned()
+            })?,
+        };
+    if authority.as_str().contains('@') {
+        return Err("Cannot make a transfer URL: the request host carries userinfo.".to_owned());
+    }
+    if authority.host().is_empty() {
+        return Err("Cannot make a transfer URL: the request names no Host.".to_owned());
+    }
+    let scheme = forwarded_scheme(&parts.headers)
+        .or_else(|| parts.uri.scheme_str().and_then(known_scheme))
+        .unwrap_or("http");
     Ok(format!("{scheme}://{authority}/"))
 }
 
-/// The scheme the client saw: the first `X-Forwarded-Proto` token when it names one of the two.
-fn forwarded_scheme(headers: &::http::HeaderMap) -> &'static str {
-    let token = headers
+/// The scheme the client saw: the first `X-Forwarded-Proto` token when it names `http` or `https`.
+fn forwarded_scheme(headers: &::http::HeaderMap) -> Option<&'static str> {
+    headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
-        .map(str::trim);
-    match token {
-        Some(token) if token.eq_ignore_ascii_case("https") => "https",
-        Some(token) if token.eq_ignore_ascii_case("http") => "http",
-        _ => "http",
+        .map(str::trim)
+        .and_then(known_scheme)
+}
+
+fn known_scheme(token: &str) -> Option<&'static str> {
+    if token.eq_ignore_ascii_case("https") {
+        Some("https")
+    } else if token.eq_ignore_ascii_case("http") {
+        Some("http")
+    } else {
+        None
     }
+}
+
+fn deliver_tracked(
+    pool: &Arc<lease::BytePool>,
+    control_pool: &Arc<lease::BytePool>,
+    stdio: &RequestLeases,
+    context: &RequestContext<RoleServer>,
+    mut tracked: TrackedResult,
+    is_control: bool,
+    overload_message: impl FnOnce(Option<&crate::service::TaskMeta>) -> String,
+) -> CallToolResult {
+    let use_control = is_control || tracked.result.is_error == Some(true);
+    let b64_bytes =
+        render::unleased_result_payload_capacity(&tracked.result, &tracked.payload_owner);
+    let exact_json = lease::json_len(&tracked.result).unwrap_or(usize::MAX);
+    let id_bytes = lease::json_len(&context.id).unwrap_or(usize::MAX);
+    let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
+    let admitted = b64_bytes
+        .checked_add(outbound_bytes)
+        .and_then(|peak| admit_delivery(&mut tracked.lease, pool, control_pool, peak, use_control));
+    let Some(mut held) = admitted else {
+        let meta = tracked.task_meta.take();
+        drop(tracked);
+        let err = CallToolResult::error(vec![ContentBlock::text(overload_message(meta.as_ref()))]);
+        let err_outbound = lease::json_len(&err)
+            .unwrap_or(usize::MAX)
+            .saturating_add(id_bytes)
+            .saturating_add(256);
+        let err_peak = render::result_payload_capacity(&err).saturating_add(err_outbound);
+        if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
+            .then(|| control_pool.try_acquire(err_peak))
+            .flatten()
+        {
+            let outbound = err_lease.split_off(err_outbound);
+            return stdio.deliver(
+                context.id.clone(),
+                &context.ct,
+                err,
+                err_lease,
+                outbound,
+                Default::default(),
+            );
+        }
+        return err;
+    };
+    let outbound = held.split_off(outbound_bytes.min(held.bytes()));
+    stdio.deliver(
+        context.id.clone(),
+        &context.ct,
+        tracked.result,
+        held,
+        outbound,
+        tracked.payload_owner,
+    )
 }
 
 // A failed growth keeps the old lease until the caller drops the owned result.
@@ -1660,6 +1686,25 @@ fn reserve_response_content(
     })
 }
 
+fn reserve_control_response_content(
+    pool: &Arc<lease::BytePool>,
+    control: &Arc<lease::BytePool>,
+    bytes: usize,
+) -> Result<lease::Lease, rmcp::ErrorData> {
+    pool.try_acquire(bytes)
+        .or_else(|| {
+            (bytes <= lease::CONTROL_LIMIT)
+                .then(|| control.try_acquire(bytes))
+                .flatten()
+        })
+        .ok_or_else(|| {
+            rmcp::ErrorData::internal_error(
+                "Server active memory budget is full while preparing the response",
+                None,
+            )
+        })
+}
+
 // SDK parsing happened before this boundary. Reserve only the subsequent
 // application copies of parameters/IDs and pass this owner into actual workers.
 fn application_input_owner<T: serde::Serialize>(
@@ -1698,7 +1743,7 @@ fn http_context(context: &RequestContext<RoleServer>) -> bool {
     context
         .extensions
         .get::<::http::request::Parts>()
-        .is_some_and(|parts| parts.extensions.get::<http::Principal>().is_some())
+        .is_some_and(|parts| parts.extensions.get::<Principal>().is_some())
 }
 
 /// Aborts the progress forwarder however the call returns, including through `?`.
@@ -1717,18 +1762,17 @@ fn progress_notification(
     seconds: f64,
     message: &str,
     input_owner: &crate::lease::Owner,
-    _http_response: bool,
+    pool: &Arc<lease::BytePool>,
+    control: &Arc<lease::BytePool>,
 ) -> Option<rmcp::model::ServerNotification> {
     use rmcp::model::GetExtensions;
     // This owns the application's message allocation. SDK encodings are outside
     // the boundary; stdio acquires its own exact frame owner in Transport::send.
-    let held = lease::process_pool()
-        .try_acquire(message.len())
-        .or_else(|| {
-            (message.len() <= 64 * 1024)
-                .then(|| lease::control_pool().try_acquire(message.len()))
-                .flatten()
-        })?;
+    let held = pool.try_acquire(message.len()).or_else(|| {
+        (message.len() <= 64 * 1024)
+            .then(|| control.try_acquire(message.len()))
+            .flatten()
+    })?;
     let mut notification = rmcp::model::ServerNotification::ProgressNotification(
         rmcp::model::ProgressNotification::new(
             rmcp::model::ProgressNotificationParam::new(token.clone(), seconds)
@@ -1746,7 +1790,7 @@ async fn forward_progress(
     token: rmcp::model::ProgressToken,
     mut latest: watch::Receiver<Option<wait::Progress>>,
     owner: crate::lease::Owner,
-    http_response: bool,
+    (pool, control): (Arc<lease::BytePool>, Arc<lease::BytePool>),
 ) {
     while latest.changed().await.is_ok() {
         let notification = {
@@ -1754,7 +1798,7 @@ async fn forward_progress(
             let Some((seconds, message)) = latest.as_ref() else {
                 continue;
             };
-            progress_notification(&token, *seconds, message, &owner, http_response)
+            progress_notification(&token, *seconds, message, &owner, &pool, &control)
         };
         let Some(notification) = notification else {
             continue;
@@ -1765,32 +1809,31 @@ async fn forward_progress(
     }
 }
 
-/// The sink the call replaces with its latest progress message, when the client asked for
-/// progress; the forwarder sends them.
-fn progress(
-    context: &RequestContext<RoleServer>,
-) -> (
-    Option<watch::Sender<Option<wait::Progress>>>,
-    Option<Forwarder>,
-) {
-    let Some(token) = context.meta.get_progress_token() else {
-        return (None, None);
-    };
-    let owner = context
-        .extensions
-        .get::<crate::lease::Owner>()
-        .cloned()
-        .unwrap_or_default();
-    let (sender, latest) = watch::channel(None);
-    let future = forward_progress(
-        context.peer.clone(),
-        token,
-        latest,
-        owner.clone(),
-        http_context(context),
-    );
-    let forwarder = Forwarder(tokio::spawn(owner.hold_future(future)));
-    (Some(sender), Some(forwarder))
+impl Server {
+    /// The sink the call replaces with its latest progress message, when the client asked for
+    /// progress; the forwarder sends them.
+    fn progress(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> (
+        Option<watch::Sender<Option<wait::Progress>>>,
+        Option<Forwarder>,
+    ) {
+        let Some(token) = context.meta.get_progress_token() else {
+            return (None, None);
+        };
+        let owner = context
+            .extensions
+            .get::<crate::lease::Owner>()
+            .cloned()
+            .unwrap_or_default();
+        let (pool, control) = self.pools();
+        let pools = (Arc::clone(pool), Arc::clone(control));
+        let (sender, latest) = watch::channel(None);
+        let future = forward_progress(context.peer.clone(), token, latest, owner.clone(), pools);
+        let forwarder = Forwarder(tokio::spawn(owner.hold_future(future)));
+        (Some(sender), Some(forwarder))
+    }
 }
 
 /// Prepaid application payload, staging and wire bytes for each stdio response ID.
@@ -2597,7 +2640,7 @@ mod event_notification_tests {
             peer0.peer().clone(),
         );
         let (mut parts, ()) = ::http::Request::new(()).into_parts();
-        parts.extensions.insert(http::Principal(0));
+        parts.extensions.insert(Principal(0));
         stateless_ctx.extensions.insert(parts);
         let resolved = stateless_server.session(&stateless_ctx).unwrap();
         assert!(Arc::ptr_eq(&resolved, &principal_session));
@@ -2687,5 +2730,461 @@ mod event_notification_tests {
             .unwrap();
         assert!(Arc::ptr_eq(&stdio_sess.launch, &shared_launch));
         peers.close().await.unwrap();
+    }
+
+    #[test]
+    fn instance_pools_never_touch_globals_and_control_plane_falls_back_to_control_memory() {
+        const EXACT_NAME: &str = "mcp::event_notification_tests::instance_pools_never_touch_globals_and_control_plane_falls_back_to_control_memory";
+        if !std::env::args().any(|arg| arg == "--exact") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", EXACT_NAME, "--nocapture"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(verify_instance_pool_isolation());
+    }
+
+    async fn verify_instance_pool_isolation() {
+        assert_eq!(lease::process_pool().used(), 0);
+        assert_eq!(lease::control_pool().used(), 0);
+
+        let init_params: InitializeRequestParams = serde_json::from_value(serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "pool-isolation", "version": "1.0" }
+        }))
+        .unwrap();
+
+        let make_server = |main_limit: usize, control_limit: usize| {
+            let pool = lease::BytePool::new(main_limit);
+            let control = lease::BytePool::new(control_limit);
+            let launch = Arc::new(
+                LaunchContext::new(std::env::temp_dir(), Vec::new())
+                    .with_memory(Arc::clone(&pool))
+                    .with_control_memory(Arc::clone(&control)),
+            );
+            let tasks = Tasks::new(Limits::OFF).unwrap();
+            let server = Server::new(
+                Backend::Local {
+                    service: Arc::new(Service::new(tasks, false)),
+                    session: Arc::new(OnceLock::new()),
+                    launch: Arc::clone(&launch),
+                    daemon: false,
+                },
+                &launch,
+                None,
+                Tools::default(),
+                Some("extra directive"),
+                InstructionsToolMode::Copy,
+            );
+            (server, pool, control)
+        };
+
+        // 1. Both isolated pools saturated (0 bytes): all 6 paths refuse/drop without touching globals.
+        {
+            let (server, pool, control) = make_server(0, 0);
+            let (outgoing, mut queued) = mpsc::channel(4);
+            let mut peer =
+                rmcp::service::serve_directly(TestServer, PausedTransport(outgoing), None);
+            let ctx = |id: &str| {
+                RequestContext::new(
+                    rmcp::model::RequestId::String(id.into()),
+                    peer.peer().clone(),
+                )
+            };
+
+            let init_err = server
+                .initialize(init_params.clone(), ctx("init-full"))
+                .await
+                .unwrap_err();
+            assert!(
+                init_err
+                    .message
+                    .contains("Server active memory budget is full")
+            );
+            let instr_err = server
+                .instructions(Parameters(serde_json::Map::new()), ctx("instr-full"))
+                .await
+                .unwrap_err();
+            assert!(
+                instr_err
+                    .message
+                    .contains("Server active memory budget is full")
+            );
+            let disc_err = server.discover(ctx("disc-full")).await.unwrap_err();
+            assert!(
+                disc_err
+                    .message
+                    .contains("Server active memory budget is full")
+            );
+            let list_err = server.list_tools(None, ctx("list-full")).await.unwrap_err();
+            assert!(
+                list_err
+                    .message
+                    .contains("Server active memory budget is full")
+            );
+            let ev_err = server
+                .handle_events_poll(
+                    Some(serde_json::json!({"name": "no.such.event"})),
+                    ctx("poll-full"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(ev_err.code.0, -32025);
+            assert!(
+                ev_err.message.contains(
+                    "Server active memory budget is full while preparing the event error"
+                )
+            );
+
+            let mut prog_ctx = ctx("prog-full");
+            prog_ctx.meta.set_progress_token(rmcp::model::ProgressToken(
+                rmcp::model::NumberOrString::Number(1),
+            ));
+            let (sender, forwarder) = server.progress(&prog_ctx);
+            sender
+                .as_ref()
+                .unwrap()
+                .send(Some((1.0, "dropped-progress".to_owned())))
+                .unwrap();
+            tokio::task::yield_now().await;
+            drop(sender);
+            drop(forwarder);
+            assert!(queued.try_recv().is_err());
+
+            assert_eq!(pool.used(), 0);
+            assert_eq!(control.used(), 0);
+            assert_eq!(lease::process_pool().used(), 0);
+            assert_eq!(lease::control_pool().used(), 0);
+            peer.close().await.unwrap();
+        }
+
+        // 2. Main pool saturated (0 bytes), control pool ample: initialize and instructions stay
+        // refused, while discover, list_tools, event_error_to_rmcp, and progress fall back to control.
+        {
+            let (server, pool, control) = make_server(0, 64 * 1024);
+            let (outgoing, mut queued) = mpsc::channel(4);
+            let mut peer =
+                rmcp::service::serve_directly(TestServer, PausedTransport(outgoing), None);
+            let ctx = |id: &str| {
+                RequestContext::new(
+                    rmcp::model::RequestId::String(id.into()),
+                    peer.peer().clone(),
+                )
+            };
+
+            assert!(
+                server
+                    .initialize(init_params.clone(), ctx("init-ctrl"))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                server
+                    .instructions(Parameters(serde_json::Map::new()), ctx("instr-ctrl"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(control.used(), 0);
+
+            let discovered = server.discover(ctx("disc-ctrl")).await.unwrap();
+            assert!(!discovered.supported_versions.is_empty());
+            let listed = server.list_tools(None, ctx("list-ctrl")).await.unwrap();
+            assert!(!listed.tools.is_empty());
+            let ev_err = server
+                .handle_events_poll(
+                    Some(serde_json::json!({"name": "no.such.event"})),
+                    ctx("poll-ctrl"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(ev_err.code.0, -32023);
+
+            let mut prog_ctx = ctx("prog-ctrl");
+            prog_ctx.meta.set_progress_token(rmcp::model::ProgressToken(
+                rmcp::model::NumberOrString::Number(2),
+            ));
+            let (sender, _forwarder) = server.progress(&prog_ctx);
+            let msg = "control-progress-payload";
+            sender
+                .as_ref()
+                .unwrap()
+                .send(Some((2.0, msg.to_owned())))
+                .unwrap();
+            let pending = tokio::time::timeout(std::time::Duration::from_secs(5), queued.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pool.used(), 0);
+            assert_eq!(control.used(), msg.len());
+            assert_eq!(lease::process_pool().used(), 0);
+            assert_eq!(lease::control_pool().used(), 0);
+            drop(pending.message);
+            assert_eq!(control.used(), 0);
+            pending.complete.send(()).unwrap();
+            peer.close().await.unwrap();
+        }
+
+        // 3. Main pool ample, control pool zero: initialize and instructions succeed on instance main pool.
+        {
+            let (server, pool, control) = make_server(64 * 1024, 0);
+            let (outgoing, _queued) = mpsc::channel(1);
+            let mut peer =
+                rmcp::service::serve_directly(TestServer, PausedTransport(outgoing), None);
+            let ctx = |id: &str| {
+                RequestContext::new(
+                    rmcp::model::RequestId::String(id.into()),
+                    peer.peer().clone(),
+                )
+            };
+
+            server
+                .initialize(init_params, ctx("init-main"))
+                .await
+                .unwrap();
+            let instr = server
+                .instructions(Parameters(serde_json::Map::new()), ctx("instr-main"))
+                .await
+                .unwrap();
+            assert_eq!(instr.is_error, Some(false));
+            assert_eq!(pool.used(), 0);
+            assert_eq!(control.used(), 0);
+            assert_eq!(lease::process_pool().used(), 0);
+            assert_eq!(lease::control_pool().used(), 0);
+            peer.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn inferred_base_and_transfer_support_http2_authority_and_reject_userinfo_or_duplicate_hosts()
+     {
+        let dir = std::env::temp_dir().join(format!(
+            "fastexec-mcp-transfer-{}",
+            id::random_chars(10).unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sample = dir.join("item.txt");
+        std::fs::write(&sample, b"hello").unwrap();
+
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(tasks, true));
+        let launch = Arc::new(LaunchContext::new(dir.clone(), Vec::new()));
+        let table = Arc::new(transfer::Transfers::new());
+        let server = Server::new(
+            Backend::Local {
+                service,
+                session: Arc::new(OnceLock::new()),
+                launch: Arc::clone(&launch),
+                daemon: true,
+            },
+            &launch,
+            Some(TransferEndpoint::Http {
+                table: Arc::clone(&table),
+                public_root: None,
+            }),
+            Tools {
+                codemode: false,
+                transfer: true,
+                yolo: false,
+            },
+            None,
+            InstructionsToolMode::Off,
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        let mut peer = rmcp::service::serve_directly(TestServer, PausedTransport(tx), None);
+
+        let call_transfer = |parts: ::http::request::Parts| {
+            let mut ctx =
+                RequestContext::new(rmcp::model::RequestId::Number(1), peer.peer().clone());
+            ctx.extensions.insert(parts);
+            let path = sample.to_string_lossy().into_owned();
+            server.transfer(Parameters(transfer::Request { path }), ctx)
+        };
+
+        // HTTP/2 request without Host header uses :authority and :scheme.
+        let (h2_https_parts, ()) = ::http::Request::builder()
+            .uri("https://127.0.0.1:8787/mcp")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            inferred_base(&h2_https_parts).unwrap(),
+            "https://127.0.0.1:8787/"
+        );
+        let ok_res = call_transfer(h2_https_parts).await;
+        assert_eq!(ok_res.is_error, Some(false));
+        let ok_text = &ok_res.content[0].as_text().unwrap().text;
+        assert!(
+            ok_text.starts_with("https://127.0.0.1:8787/t/"),
+            "{ok_text}"
+        );
+
+        // X-Forwarded-Proto overrides :scheme in both directions.
+        let (xfp_https, ()) = ::http::Request::builder()
+            .uri("http://[::1]:8787/mcp")
+            .header("x-forwarded-proto", "https, http")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(inferred_base(&xfp_https).unwrap(), "https://[::1]:8787/");
+        let (xfp_http, ()) = ::http::Request::builder()
+            .uri("https://localhost:8787/mcp")
+            .header("x-forwarded-proto", "http")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(inferred_base(&xfp_http).unwrap(), "http://localhost:8787/");
+
+        // Missing both Host and :authority fails with the canonical message.
+        let (no_host, ()) = ::http::Request::builder()
+            .uri("/mcp")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            inferred_base(&no_host).unwrap_err(),
+            "Cannot make a transfer URL: the request names no Host."
+        );
+
+        // Empty host (`:8787`) is rejected.
+        let (empty_host, ()) = ::http::Request::builder()
+            .uri("/mcp")
+            .header(::http::header::HOST, ":8787")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert!(inferred_base(&empty_host).is_err());
+
+        // Userinfo in Host or HTTP/2 :authority is rejected without echoing credentials.
+        let (evil_header, ()) = ::http::Request::builder()
+            .uri("/mcp")
+            .header(::http::header::HOST, "evil@127.0.0.1:8787")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let err = inferred_base(&evil_header).unwrap_err();
+        assert!(!err.contains("evil"), "{err}");
+        let bad_res = call_transfer(evil_header).await;
+        assert_eq!(bad_res.is_error, Some(true));
+
+        let evil_uri = ::http::Uri::builder()
+            .scheme("http")
+            .authority("evil@127.0.0.1:8787")
+            .path_and_query("/mcp")
+            .build()
+            .unwrap();
+        let (evil_h2, ()) = ::http::Request::builder()
+            .uri(evil_uri)
+            .body(())
+            .unwrap()
+            .into_parts();
+        let err = inferred_base(&evil_h2).unwrap_err();
+        assert!(!err.contains("evil"), "{err}");
+        let bad_h2_res = call_transfer(evil_h2).await;
+        assert_eq!(bad_h2_res.is_error, Some(true));
+
+        // Duplicate Host headers are rejected even when identical.
+        for second in ["127.0.0.1:8787", "localhost:8787"] {
+            let (mut dup_parts, ()) = ::http::Request::builder()
+                .uri("http://127.0.0.1:8787/mcp")
+                .body(())
+                .unwrap()
+                .into_parts();
+            dup_parts
+                .headers
+                .append(::http::header::HOST, "127.0.0.1:8787".parse().unwrap());
+            dup_parts
+                .headers
+                .append(::http::header::HOST, second.parse().unwrap());
+            assert!(inferred_base(&dup_parts).is_err());
+            let dup_res = call_transfer(dup_parts).await;
+            assert_eq!(dup_res.is_error, Some(true));
+        }
+
+        peer.close().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_backend_local_drops_always_remove_event_bus_session_cursor() {
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(tasks, false));
+        let bus = Arc::clone(service.event_bus());
+        bus.publish_external(events::ExternalEventInput {
+            event_type: None,
+            source: "ci".to_owned(),
+            topic: None,
+            name: "done".to_owned(),
+            event_id: "ev-1".to_owned(),
+            timestamp: None,
+            data: serde_json::json!({}),
+        })
+        .unwrap();
+
+        let launch = Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new()));
+        let (tx, _rx) = mpsc::channel(1);
+        let mut peer = rmcp::service::serve_directly(TestServer, PausedTransport(tx), None);
+
+        for round in 0..128 {
+            let backend = Backend::Local {
+                service: Arc::clone(&service),
+                session: Arc::new(OnceLock::new()),
+                launch: Arc::clone(&launch),
+                daemon: false,
+            };
+            let server = Server::new(
+                backend.clone(),
+                &launch,
+                None,
+                Tools::default(),
+                None,
+                InstructionsToolMode::Off,
+            );
+            let sess = server
+                .session(&RequestContext::new(
+                    rmcp::model::RequestId::Number(round),
+                    peer.peer().clone(),
+                ))
+                .unwrap();
+            let sess_id = sess.id.clone();
+            drop(sess);
+            drop(server);
+
+            assert!(bus.external_background_summary(&sess_id).is_some());
+            assert!(bus.external_background_summary(&sess_id).is_none());
+
+            let clones: Vec<Backend> = (0..8).map(|_| backend.clone()).collect();
+            drop(backend);
+            let barrier = std::sync::Barrier::new(clones.len());
+            std::thread::scope(|scope| {
+                for clone in clones {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        drop(clone);
+                    });
+                }
+            });
+
+            assert!(
+                bus.external_background_summary(&sess_id).is_some(),
+                "round {round}: session cursor for {sess_id} was not removed on concurrent drop"
+            );
+            bus.remove_session(&sess_id);
+        }
+
+        peer.close().await.unwrap();
     }
 }
