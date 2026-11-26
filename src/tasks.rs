@@ -1434,14 +1434,18 @@ impl Tasks {
 
     /// Kills every tree, kept processes included, and removes the log directory.
     pub fn shutdown(&self) {
-        let mut registry = lock(&self.registry);
-        // Admission closes first: no start is admitted from here on, and one already admitted
-        // still inserts its task and then ends its tree.
-        registry.stopping = true;
-        for task in registry.tasks.iter() {
-            if task.is_running() {
-                task.kill_requested.store(true, Ordering::SeqCst);
+        let tasks = {
+            let mut registry = lock(&self.registry);
+            // An already admitted start still publishes, then ends its tree.
+            registry.stopping = true;
+            for task in &registry.tasks {
+                if task.is_running() {
+                    task.kill_requested.store(true, Ordering::SeqCst);
+                }
             }
+            registry.tasks.clone()
+        };
+        for task in tasks {
             let _ = task.root.kill();
         }
         let _ = std::fs::remove_dir_all(&self.dir);
