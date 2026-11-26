@@ -1,10 +1,10 @@
 use super::bridge::{
-    BRIDGE_ERROR, BRIDGE_LIMIT, DIAGNOSTIC_RESERVE, DIAGNOSTIC_WORKSPACE, Host, MAX_STARTS,
-    SLEEP_CHUNK_MS, STARTS_ERROR, SyncCallError, queue_permit, sleep, split_sleep,
+    DIAGNOSTIC_RESERVE, DIAGNOSTIC_WORKSPACE, Host, MAX_STARTS, SLEEP_CHUNK_MS, STARTS_ERROR,
+    SyncCallError, queue_permit, sleep, split_sleep,
 };
 use super::control::{
-    BridgeHandle, InFlightGuard, MAX_CODE, Outcome, ProgramDelivery, Report, Request, SettledCall,
-    lock, validate,
+    BRIDGE_ERROR, BRIDGE_LIMIT, BridgeHandle, InFlightGuard, MAX_CODE, Outcome, ProgramDelivery,
+    Report, Request, SettledCall, lock, validate,
 };
 use super::encode::{encode_exec_program, encode_service_error};
 use super::vm::{STALLED, describe, pending_text};
@@ -22,6 +22,7 @@ use rquickjs::{Context, Function, Runtime, Value};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 
 struct Fixture {
@@ -2624,6 +2625,7 @@ async fn program_tool_error_codes_partial_results_and_edit_matches() {
 
 mod exec_program_tests {
     use super::*;
+    use crate::codemode::bridge::exec_program;
     use crate::files;
     use crate::render::types::{AgentDelivery, TrackedResult};
     use crate::service::core::PreparedSnapshot;

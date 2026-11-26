@@ -1,14 +1,16 @@
 //! QuickJS runtime setup, event loop, and JavaScript prelude.
 
-use super::Work;
 use super::bridge::{
     BRIDGE_MEMORY_RESULT_ERROR, BRIDGE_RESULT_ERROR, DIAGNOSTIC_RESERVE, DIAGNOSTIC_WORKSPACE,
     Host, IO_PERMITS, Output, START_PERMITS, SyncCallError,
 };
 use super::control::{BridgeHandle, Outcome, SettledCall, lock};
+use crate::env::LaunchContext;
 use crate::files;
 use crate::media::{self, CompressFailure, MediaKind};
+use crate::service::Service;
 use crate::tasks::script::CallInfo;
+use crate::tasks::session::Session;
 use crate::tasks::state::Task;
 use crate::tasks::{ScriptIo, Tasks};
 use base64::Engine;
@@ -20,7 +22,21 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
+use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
+
+pub(crate) struct Work {
+    pub(super) service: Arc<Service>,
+    pub(super) session: Arc<Session>,
+    pub(super) launch: Arc<LaunchContext>,
+    pub(super) transfer: bool,
+    pub(super) call_id: Option<u64>,
+    pub(super) code: String,
+    pub(super) runtime: Handle,
+    pub(super) input_owner: crate::lease::Owner,
+    #[cfg(test)]
+    pub(super) vm_memory_limit: Option<usize>,
+}
 
 // QuickJS mixes column origins on its first physical line; user code starts on the next one.
 const SCRIPT_PREFIX: &str = "(async () => {\n";

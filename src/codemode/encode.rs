@@ -1,8 +1,7 @@
 //! Programmatic encoder for nested `codemode` tool calls: typed `Serialize` DTOs, attachment
 //! handle registration with rollback, and single-peak bridge memory admission.
 
-use super::bridge::BRIDGE_LIMIT;
-use super::control::{Outcome, ProgramDelivery};
+use super::control::{BRIDGE_LIMIT, Outcome, ProgramDelivery};
 use crate::env::{LaunchContext, ProbeWarning};
 use crate::files::edit::{EditError, EditFailure, EditMatch, FileEditData};
 use crate::files::read::{FileReadData, MediaPayload};

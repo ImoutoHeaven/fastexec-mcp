@@ -7,18 +7,18 @@ pub(crate) mod encode;
 mod tests;
 mod vm;
 
-use self::control::{BridgeHandle, ProgramDelivery, Request};
+use self::control::{BridgeHandle, Request};
+use self::vm::Work;
 use crate::env::LaunchContext;
 use crate::id;
 use crate::service::core::RenderSlot;
 use crate::service::schema::{self as service_schema, ExecPolicy};
-use crate::service::{Consumer, ExecContext, PreparedExec, Service, ServiceError};
+use crate::service::{ExecContext, PreparedExec, Service, ServiceError};
 use crate::tasks::script::ScriptControl;
 use crate::tasks::session::Session;
 use crate::tasks::{ScriptIo, ScriptPublishArgs, Started, TaskError, Tasks};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
-use tokio::runtime::Handle;
 
 pub(crate) struct ScriptSpawnArgs {
     pub code: String,
@@ -28,19 +28,6 @@ pub(crate) struct ScriptSpawnArgs {
     pub call_id: Option<u64>,
     pub service: Arc<Service>,
     pub input_owner: crate::lease::Owner,
-}
-
-pub(super) struct Work {
-    pub(super) service: Arc<Service>,
-    pub(super) session: Arc<Session>,
-    pub(super) launch: Arc<LaunchContext>,
-    pub(super) transfer: bool,
-    pub(super) call_id: Option<u64>,
-    pub(super) code: String,
-    pub(super) runtime: Handle,
-    pub(super) input_owner: crate::lease::Owner,
-    #[cfg(test)]
-    pub(super) vm_memory_limit: Option<usize>,
 }
 
 pub(super) type VmJob = (ScriptIo, (Work, BridgeHandle));
@@ -162,26 +149,4 @@ pub(crate) async fn prepare_script(
             render_slot,
         )
         .await
-}
-
-pub(crate) async fn exec_program(
-    service: &Service,
-    request: service_schema::Request,
-    mut ctx: ExecContext<'_>,
-    delivery: ProgramDelivery<'_>,
-) -> encode::ProgramOutcome {
-    service.tasks().prune_entries(ctx.session);
-    match service
-        .exec_core(
-            request,
-            ExecPolicy::PROGRAM,
-            Consumer::Program,
-            &mut ctx,
-            None,
-        )
-        .await
-    {
-        Ok(prepared) => encode::encode_exec_program(prepared, &ctx, &delivery),
-        Err(err) => encode::encode_service_error(err, &ctx, &delivery),
-    }
 }

@@ -1,6 +1,5 @@
 //! Script request validation, bridge handles, and pending-call accounting.
 
-use super::bridge::{BRIDGE_ERROR, BRIDGE_LIMIT};
 use crate::env::LaunchContext;
 use crate::lease::{BytePool, Lease};
 use crate::service::schema as service_schema;
@@ -14,6 +13,10 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+
+pub(crate) const BRIDGE_LIMIT: usize = 256 * 1024 * 1024;
+pub(super) const BRIDGE_ERROR: &str =
+    "Script tool-call bridge exceeds 256 MiB of pending arguments and results.";
 
 pub(super) const MAX_CODE: usize = 256 * 1024;
 const PENDING_CALLS: usize = 1024;

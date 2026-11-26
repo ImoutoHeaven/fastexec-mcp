@@ -4,8 +4,8 @@ use super::control::{BridgeHandle, InFlightGuard, Outcome, ProgramDelivery, Sett
 use super::encode::{self, ProgramOutcome};
 use crate::env::LaunchContext;
 use crate::files;
-use crate::service::schema::{self as service_schema, Action};
-use crate::service::{ExecContext, Service};
+use crate::service::schema::{self as service_schema, Action, ExecPolicy};
+use crate::service::{Consumer, ExecContext, Service};
 use crate::tasks::TASK_LOG_LIMIT;
 use crate::tasks::script::{CallInfo, QueuedStartGuard};
 use crate::tasks::session::Session;
@@ -15,9 +15,6 @@ use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 
 pub(super) const SLEEP_CHUNK_MS: u64 = 1_u64 << 40;
-pub(crate) const BRIDGE_LIMIT: usize = 256 * 1024 * 1024;
-pub(super) const BRIDGE_ERROR: &str =
-    "Script tool-call bridge exceeds 256 MiB of pending arguments and results.";
 pub(super) const DIAGNOSTIC_RESERVE: u64 = 4096;
 // One bounded description and pending-call text coexist until diagnostics finish writing.
 pub(super) const DIAGNOSTIC_WORKSPACE: usize = 3 * DIAGNOSTIC_RESERVE as usize;
@@ -398,7 +395,7 @@ impl Host {
                     }
                     ToolCall::Exec(request) => {
                         let _permit = permit;
-                        super::exec_program(
+                        exec_program(
                             &service,
                             *request,
                             ExecContext {
@@ -494,6 +491,28 @@ impl Host {
                 }
             }));
         Ok(id)
+    }
+}
+
+pub(crate) async fn exec_program(
+    service: &Service,
+    request: service_schema::Request,
+    mut ctx: ExecContext<'_>,
+    delivery: ProgramDelivery<'_>,
+) -> encode::ProgramOutcome {
+    service.tasks().prune_entries(ctx.session);
+    match service
+        .exec_core(
+            request,
+            ExecPolicy::PROGRAM,
+            Consumer::Program,
+            &mut ctx,
+            None,
+        )
+        .await
+    {
+        Ok(prepared) => encode::encode_exec_program(prepared, &ctx, &delivery),
+        Err(err) => encode::encode_service_error(err, &ctx, &delivery),
     }
 }
 
