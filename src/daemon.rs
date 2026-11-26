@@ -2,10 +2,14 @@
 //! calls it runs over local byte streams and Streamable HTTP.
 
 mod events;
+mod wire;
+
+use self::events::{ActiveEventStream, EventStreamRegistration, EventStreams};
+use self::wire::{Outgoing, OutgoingPermit};
 
 use crate::env::LaunchContext;
 use crate::ipc::{self, ToDaemon, ToEndpoint};
-use crate::lease::{self, BytePool, Lease};
+use crate::lease::{self, BytePool};
 use crate::platform::runtime;
 use crate::render;
 use crate::render::files::{self as render_files, mint_transfer, transfer_error};
@@ -24,7 +28,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -239,32 +243,6 @@ struct Entry {
     detached_at: Option<Instant>,
 }
 
-enum OutgoingPermit {
-    Main(
-        #[expect(
-            dead_code,
-            reason = "held for Drop until the outgoing frame is written or dropped"
-        )]
-        Lease,
-    ),
-    Reserved(
-        #[expect(
-            dead_code,
-            reason = "held for Drop until the outgoing frame is written or dropped"
-        )]
-        OwnedSemaphorePermit,
-    ),
-}
-
-/// A frame on its way out, with the lease or control permit its bytes hold until written.
-struct Outgoing {
-    bytes: Vec<u8>,
-    _permit: Option<OutgoingPermit>,
-    /// Signalled once the frame is written. A progress forwarder waits on it, so at most one
-    /// progress frame per call is queued and the latest wins.
-    written: Option<oneshot::Sender<()>>,
-}
-
 /// A connection's hold on its session. Dropping it closes the connection, so no way out of
 /// serving one — including a panic or the task being aborted — leaves a session attached to
 /// nothing.
@@ -288,6 +266,88 @@ struct Attached {
 }
 
 impl Daemon {
+    fn start_event_stream(
+        self: &Arc<Self>,
+        event_streams: &EventStreams,
+        session_id: &str,
+        closing: &CancellationToken,
+        outgoing: &mpsc::UnboundedSender<Outgoing>,
+        id: u64,
+        request: crate::lease::Owned<crate::events::SubscribeRequest>,
+    ) {
+        let stream_token = {
+            let mut streams = lock(event_streams);
+            if streams.contains_key(&id) {
+                Err(ipc::IpcEventError {
+                    code: -32602,
+                    message: format!("event stream {id} is already active"),
+                    data: None,
+                })
+            } else if streams.len() >= MAX_EVENT_STREAMS_PER_CONN {
+                Err(ipc::IpcEventError {
+                    code: -32025,
+                    message: format!(
+                        "active event streams on connection reached limit ({MAX_EVENT_STREAMS_PER_CONN})"
+                    ),
+                    data: Some(serde_json::json!({
+                        "limit": "connection_event_streams",
+                        "max": MAX_EVENT_STREAMS_PER_CONN
+                    })),
+                })
+            } else {
+                match self.service.event_bus().try_acquire_stream() {
+                    Err(err) => Err(err.into()),
+                    Ok(guard) => match self
+                        .service
+                        .event_bus()
+                        .subscribe(request.value, Some(session_id))
+                    {
+                        Ok(sub) => {
+                            let token = Arc::new(closing.child_token());
+                            streams.insert(
+                                id,
+                                ActiveEventStream {
+                                    token: Arc::clone(&token),
+                                    _guard: guard,
+                                },
+                            );
+                            let registration = EventStreamRegistration {
+                                streams: Arc::clone(event_streams),
+                                id,
+                                token,
+                            };
+                            Ok((registration, sub))
+                        }
+                        Err(err) => Err(err.into()),
+                    },
+                }
+            }
+        };
+        match stream_token {
+            Ok((registration, sub)) => {
+                tokio::spawn(request.owner.hold_future(events::run_event_stream(
+                    Arc::clone(&self.memory),
+                    Arc::clone(&self.reserved),
+                    self.stopped.clone(),
+                    registration,
+                    sub,
+                    outgoing.clone(),
+                    closing.clone(),
+                )));
+            }
+            Err(err) => {
+                events::queue_event_control(
+                    outgoing,
+                    &self.memory,
+                    &self.reserved,
+                    closing,
+                    id,
+                    ipc::EventWireFrame::Error(err),
+                );
+            }
+        }
+    }
+
     pub fn with_config(
         tasks: Arc<Tasks>,
         namespace: String,
@@ -1183,8 +1243,7 @@ impl Daemon {
                     }
                 }
                 ToDaemon::EventsStream { id, request } => {
-                    events::start_stream(
-                        self,
+                    self.start_event_stream(
                         event_streams,
                         &attached.session_id,
                         &attached.token,
