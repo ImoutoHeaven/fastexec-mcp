@@ -12,11 +12,11 @@ use super::{
     PreparedWindow, Service, ServiceError, StagedRead,
 };
 use crate::lease::Lease;
-use crate::platform::process;
+use crate::platform::process::{self, clean_member_name};
 use crate::session::{LaunchContext, ProbeWarning, Reader, Session, TaskEntry};
-use crate::tasks::state::{Snapshot, Task, clean_member_name};
+use crate::tasks::state::{Snapshot, Task};
 use crate::tasks::{self, ChildSummary};
-use crate::term::output::{self, Truncate, Window};
+use crate::term::output::{self, Truncate, Window, WindowSpec};
 use crate::wait::WaitEnd;
 use crate::{files, media};
 use rmcp::model::{CallToolResult, ContentBlock, ResourceContents};
@@ -520,7 +520,7 @@ impl Service {
 
         let mut active_max_bytes = view.max_bytes;
         let effective_cap = if action == Action::Kill {
-            (crate::daemon::RESERVED - 4).min(outbound_limit)
+            (crate::lease::CONTROL_LIMIT - 4).min(outbound_limit)
         } else {
             outbound_limit
         };
@@ -540,26 +540,20 @@ impl Service {
             let state_guard = read.into_guard();
             let reader_narrow = Arc::clone(&task);
             let narrow_budget = view.max_bytes.min(64 * 1024);
-            let clean = !task.is_script();
-            let encoding = view.encoding.unwrap_or(task.encoding);
-            let truncate = view.truncate;
-            let raw = view.raw;
-            let keep_nul = view.keep_nul;
-            let include_markers = view.inline_markers;
+            let spec = WindowSpec {
+                truncate: view.truncate,
+                budget: narrow_budget,
+                raw: view.raw,
+                clean: !task.is_script(),
+                keep_nul: view.keep_nul,
+                include_markers: view.inline_markers,
+                encoding: view.encoding.unwrap_or(task.encoding),
+                source: "log",
+            };
             let narrow_win;
             (narrow_win, workspace, permit, read) = tokio::task::spawn_blocking(move || {
                 let mut staged = StagedRead::new(state_guard);
-                let win = reader_narrow.read_window_with_markers(
-                    &mut staged.state,
-                    truncate,
-                    narrow_budget,
-                    raw,
-                    clean,
-                    keep_nul,
-                    include_markers,
-                    encoding,
-                    None,
-                );
+                let win = reader_narrow.read_window_with_markers(&mut staged.state, spec, None);
                 (win, workspace, permit, staged)
             })
             .await
@@ -1924,7 +1918,7 @@ fn members(members: &[process::Member]) -> String {
 }
 
 fn rpc_result_len(delivery: &AgentDelivery<'_>, result: &CallToolResult) -> Result<usize, String> {
-    crate::ipc::json_len(result)
+    crate::lease::json_len(result)
         .map(|n| n.saturating_add(delivery.rpc_id_bytes).saturating_add(256))
         .map_err(|err| format!("Cannot measure result JSON: {err}."))
 }

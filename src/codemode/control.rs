@@ -1,9 +1,10 @@
 //! Script request validation, lifecycle handles, and pending-call accounting.
 
 use super::bridge::{BRIDGE_ERROR, BRIDGE_LIMIT};
+use crate::id::parse_handle;
 use crate::lease::{BytePool, Lease};
 use crate::service::schema as service_schema;
-use crate::session::{LaunchContext, parse_handle};
+use crate::session::LaunchContext;
 use crate::tasks::state::AttachmentLease;
 use crate::term::output::Truncate;
 use schemars::JsonSchema;
@@ -202,7 +203,7 @@ impl Report {
 }
 
 pub(crate) enum Outcome {
-    Value(crate::ipc::Owned<String>),
+    Value(crate::lease::Owned<String>),
     Error(&'static str),
     Cancelled(&'static str),
     Limit,
@@ -494,7 +495,7 @@ impl ScriptHandle {
         drop(idle.wait_while(active, |&mut active| active > 0));
     }
 
-    pub(super) fn finish(&self) -> crate::ipc::Owned<Vec<CallInfo>> {
+    pub(super) fn finish(&self) -> crate::lease::Owned<Vec<CallInfo>> {
         let dropped = std::mem::take(&mut *lock(&self.0.held_attachments));
         drop(dropped);
         let mut report = lock(&self.0.report);
@@ -511,6 +512,6 @@ impl ScriptHandle {
         report.pending.clear();
         report.bridge_bytes = 0;
         self.0.cancel.cancel();
-        crate::ipc::Owned::new(report.cancelled.clone(), crate::lease::Owner::new(owners))
+        crate::lease::Owned::new(report.cancelled.clone(), crate::lease::Owner::new(owners))
     }
 }

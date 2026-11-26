@@ -84,7 +84,7 @@ mod bundled {
             let mut pins = Vec::new();
             for (name, bytes) in FILES {
                 let path = dir.join(name);
-                let nonce = crate::tasks::random_chars(12).map_err(|error| error.to_string())?;
+                let nonce = crate::id::random_chars(12).map_err(|error| error.to_string())?;
                 let temp = dir.join(format!("{name}.{nonce}.tmp"));
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
@@ -134,19 +134,20 @@ mod bundled {
                         nonce.len() == 12
                             && nonce
                                 .bytes()
-                                .all(|byte| crate::tasks::ALPHABET.contains(&byte))
+                                .all(|byte| crate::id::ALPHABET.contains(&byte))
                     })
                     .and_then(|(pid, _)| pid.parse::<u32>().ok());
                 if old_pid.is_some_and(|pid| {
                     pid != std::process::id() && !crate::platform::process::is_alive(pid)
-                }) && crate::platform::runtime::create_private(&entry.path()).is_ok()
+                }) && crate::platform::runtime::create_private_windows_check(&entry.path())
+                    .is_ok()
                 {
                     let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
         }
         for _ in 0..8 {
-            let nonce = crate::tasks::random_chars(12).map_err(|error| error.to_string())?;
+            let nonce = crate::id::random_chars(12).map_err(|error| error.to_string())?;
             let dir = temp.join(format!("{prefix}{}-{nonce}", std::process::id()));
             match crate::platform::runtime::create_private_new(&dir) {
                 Ok(()) => return Ok(dir),

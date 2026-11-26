@@ -55,9 +55,6 @@ const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// An upload may continue indefinitely while it delivers data, but not hold a file idle.
 const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The value that names the address clients reach, when a proxy stands in front of the listener.
-pub const PUBLIC_URL: &str = "FASTEXEC_PUBLIC_URL";
-
 /// The daemon's HTTP front door: one listener and the token digests that admit requests.
 pub struct Http {
     pub listener: TcpListener,
@@ -68,154 +65,13 @@ pub struct Http {
     /// What the sessions this listener serves inherit: captured before the daemon leaves the
     /// directory it was started in.
     pub launch: Arc<LaunchContext>,
-    /// The base a `transfer` URL is minted from: the parsed [`PUBLIC_URL`], read once at start.
+    /// The base a `transfer` URL is minted from: the parsed [`crate::config::PUBLIC_URL`], read once at start.
     /// Its absence means each request's own Host and `X-Forwarded-Proto` name the address.
     pub public_root: Option<Arc<str>>,
     /// Normalized extra instructions loaded once at daemon startup.
     pub extra_instructions: Option<String>,
     /// Whether HTTP sessions also expose server instructions as an MCP tool.
     pub instructions_tool: InstructionsToolMode,
-}
-
-/// The root this process was started with: `None` when the variable is unset, the normalized root
-/// when it is valid, and the reason it cannot be used otherwise. Called once when an HTTP daemon
-/// starts, so nothing rereads the environment while a URL is minted.
-pub fn public_root() -> Result<Option<String>, String> {
-    root_of(std::env::var_os(PUBLIC_URL).as_deref())
-}
-
-/// [`public_root`] over a value that is already in hand, so the unset, the valid, the empty and
-/// the non-UTF-8 cases are all one function.
-pub(crate) fn root_of(value: Option<&std::ffi::OsStr>) -> Result<Option<String>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let Some(text) = value.to_str() else {
-        return Err(format!("{PUBLIC_URL} is not UTF-8"));
-    };
-    valid_root(text).map(Some)
-}
-
-/// A public root, validated and normalized: a scheme, a host, an optional port, and a path prefix
-/// that ends in one `/`. Every rejection names the variable and the reason.
-///
-/// The value crosses trust boundaries, so it is a small wrapper over [`http::Uri`] rather than a
-/// URL normalizer: what it states is kept byte for byte, and only the scheme case and the one
-/// trailing `/` are settled here.
-pub fn valid_root(text: &str) -> Result<String, String> {
-    // The value itself stays out of the message: a mistyped value can carry userinfo, and a
-    // refusal is written to a terminal and to a daemon log.
-    let refuse = |why: &str| Err(format!("{PUBLIC_URL} {why}"));
-    if text
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control())
-    {
-        return refuse("contains whitespace or a control character");
-    }
-    if text.contains('?') || text.contains('#') {
-        return refuse("carries a query or a fragment");
-    }
-    let Ok(uri) = text.parse::<::http::Uri>() else {
-        return refuse(unparsed_form(text));
-    };
-    let Some(scheme) = uri.scheme_str() else {
-        return refuse("must start with http:// or https://");
-    };
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return refuse("must start with http:// or https://");
-    }
-    let scheme = scheme.to_ascii_lowercase();
-    let Some(authority) = uri.authority() else {
-        return refuse("names no host");
-    };
-    // The raw authority is what a port is judged on: `Authority::port()` answers `None` for a port
-    // it refuses, which would read as "no port at all".
-    let raw = authority.as_str();
-    if raw.contains('@') {
-        return refuse("carries userinfo");
-    }
-    if authority.host().is_empty() {
-        return refuse("names no host");
-    }
-    let port = match authority_port(raw) {
-        Ok(port) => port,
-        Err(why) => return refuse(why),
-    };
-    if let Some(port) = port {
-        if port.is_empty() {
-            return refuse("has an empty port");
-        }
-        if !port.bytes().all(|byte| byte.is_ascii_digit()) {
-            return refuse("has a port that is not a decimal number");
-        }
-        match port.parse::<u32>() {
-            Ok(number) if (1..=65535).contains(&number) => {}
-            _ => return refuse("has a port outside 1-65535"),
-        }
-    }
-    let path = uri.path();
-    // The one trailing `/` a value may state is not an interior segment; anything else empty, and
-    // any literal dot segment, is refused rather than normalized away.
-    let mut segments: Vec<&str> = path.split('/').skip(1).collect();
-    if segments.last().is_some_and(|last| last.is_empty()) {
-        segments.pop();
-    }
-    for segment in segments {
-        if segment.is_empty() {
-            return refuse("has an empty path segment");
-        }
-        if segment == "." || segment == ".." {
-            return refuse("has a dot path segment");
-        }
-    }
-    let trailing = if path.ends_with('/') { "" } else { "/" };
-    Ok(format!("{scheme}://{raw}{path}{trailing}"))
-}
-
-/// Why a value that `http::Uri` refused is not a URL: a port that is not decimal digits is the
-/// common mistake worth naming.
-fn unparsed_form(text: &str) -> &'static str {
-    let Some((_, rest)) = text.split_once("://") else {
-        return "must start with http:// or https://";
-    };
-    let authority = rest.split('/').next().unwrap_or_default();
-    if authority.is_empty() {
-        return "names no host";
-    }
-    match authority_port(authority) {
-        Err(why) => why,
-        Ok(Some(port)) if !port.bytes().all(|byte| byte.is_ascii_digit()) => {
-            "has a port that is not a decimal number"
-        }
-        _ => "is not a URL",
-    }
-}
-
-/// The port a raw authority states, or why the part after its host is not one.
-///
-/// `http::Uri` reads a bracketed authority loosely: `[]` parses with a host of `[]`, and anything
-/// behind the closing `]` is dropped from `host()` and answers `None` from `port()`. The raw text is
-/// therefore read here; brackets must contain an IPv6 address, optionally followed by a port.
-fn authority_port(authority: &str) -> Result<Option<&str>, &'static str> {
-    let Some(rest) = authority.strip_prefix('[') else {
-        let mut parts = authority.rsplitn(2, ':');
-        let last = parts.next().unwrap_or_default();
-        return Ok(parts.next().map(|_| last));
-    };
-    let Some((host, after)) = rest.split_once(']') else {
-        return Err("has an unclosed bracketed host");
-    };
-    if host.is_empty() {
-        return Err("names no host");
-    }
-    if host.parse::<std::net::Ipv6Addr>().is_err() {
-        return Err("has a bracketed host that is not an IPv6 address");
-    }
-    match after.strip_prefix(':') {
-        Some(port) => Ok(Some(port)),
-        None if after.is_empty() => Ok(None),
-        None => Err("has text after a bracketed host"),
-    }
 }
 
 /// What a reply carries: rmcp's own response type, so a refusal and a served call have one shape.
@@ -269,7 +125,6 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         let table = Arc::clone(&table);
         let public_root = public_root.clone();
         move || {
-            let launch = Arc::new(launch.for_session());
             let backend = Backend::Local {
                 service: Arc::clone(&service),
                 session: Arc::new(OnceLock::new()),
@@ -305,7 +160,7 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
     // Gemini rejects empty SSE priming events before reading the JSON-RPC answer.
     config.sse_retry = None;
     config.cancellation_token = stopped.child_token();
-    config.allowed_hosts = allowed_hosts(bound, remote_allowed());
+    config.allowed_hosts = allowed_hosts(bound, crate::config::remote_allowed());
     config.allowed_origins = allowed_origins(bound, &origins_from_env());
     let mut session_config = SessionConfig::default();
     session_config.channel_capacity = 16;
@@ -542,12 +397,6 @@ fn origins_from_env() -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Whether a bind outside loopback was allowed: the daemon then trusts a TLS-terminating proxy in
-/// front of it for both the host and the origin.
-pub fn remote_allowed() -> bool {
-    std::env::var("FASTEXEC_HTTP_ALLOW_REMOTE").is_ok_and(|value| value == "1")
 }
 
 /// An invalid request, an idle peer or a disconnected client is not a server failure. Actual

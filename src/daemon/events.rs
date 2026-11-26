@@ -39,7 +39,7 @@ pub(super) fn start_stream(
     closing: &CancellationToken,
     outgoing: &mpsc::UnboundedSender<Outgoing>,
     id: u64,
-    request: ipc::Owned<crate::events::SubscribeRequest>,
+    request: crate::lease::Owned<crate::events::SubscribeRequest>,
 ) {
     let stream_token = {
         let mut streams = lock(event_streams);
@@ -126,9 +126,9 @@ pub(super) fn queue_event_frame(
     outgoing: &mpsc::UnboundedSender<Outgoing>,
     memory: &Arc<BytePool>,
     id: u64,
-    frame: ipc::Owned<ipc::EventWireFrame>,
+    frame: crate::lease::Owned<ipc::EventWireFrame>,
 ) -> bool {
-    let ipc::Owned {
+    let crate::lease::Owned {
         value: frame,
         owner,
     } = frame;

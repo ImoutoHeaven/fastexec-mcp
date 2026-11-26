@@ -1,8 +1,9 @@
 //! Session-scoped task notices and independent, bounded reader cursors.
 
+use crate::id::random_chars;
 use crate::lease::{self, BytePool};
 use crate::tasks::state::{Snapshot, Task};
-use crate::tasks::{ALPHABET, TaskError, pids, random_chars};
+use crate::tasks::{TaskError, pids};
 use crate::term::output::Cleaner;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -107,6 +108,13 @@ impl LaunchCache {
 
 const SHELL_MANAGED_VARS: [&str; 6] = ["PWD", "OLDPWD", "SHLVL", "_", "SHELLOPTS", "BASHOPTS"];
 
+/// The native unit of an OS string: UTF-16 on Windows, a byte on Unix.
+#[cfg(windows)]
+pub(crate) type Unit = u16;
+/// The native unit of an OS string: UTF-16 on Windows, a byte on Unix.
+#[cfg(unix)]
+pub(crate) type Unit = u8;
+
 /// What a session's tasks inherit: the directory they start in and their whole environment.
 /// A task's environment comes from here, never from the server's own globals, so one server can
 /// serve sessions with different environments.
@@ -130,9 +138,9 @@ fn default_outbound_limit() -> usize {
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|limit| {
-            cfg!(debug_assertions) && (1024..=crate::ipc::RESPONSE_LIMIT).contains(limit)
+            cfg!(debug_assertions) && (1024..=crate::lease::FRAME_LIMIT).contains(limit)
         })
-        .unwrap_or(crate::ipc::RESPONSE_LIMIT)
+        .unwrap_or(crate::lease::FRAME_LIMIT)
 }
 
 impl LaunchContext {
@@ -447,27 +455,6 @@ impl Session {
     }
 }
 
-/// Splits an optional reader suffix before lookup or any task side effect.
-pub fn parse_handle(handle: &str) -> Result<(&str, Option<&str>), String> {
-    parse_handle_for(handle, "taskId")
-}
-
-/// Splits an optional reader suffix, naming `field` on malformed handles.
-pub fn parse_handle_for<'a>(
-    handle: &'a str,
-    field: &str,
-) -> Result<(&'a str, Option<&'a str>), String> {
-    let Some((id, key)) = handle.split_once('.') else {
-        return Ok((handle, None));
-    };
-    if id.is_empty() || key.len() != 4 || !key.bytes().all(|byte| ALPHABET.contains(&byte)) {
-        return Err(format!(
-            "Unknown {field} {handle:?}. Use a bare task ID or <taskId>.<reader>, with 4 Crockford base32 reader characters."
-        ));
-    }
-    Ok((id, Some(key)))
-}
-
 const MAX_READERS: usize = 16;
 
 #[derive(Default)]
@@ -665,22 +652,6 @@ mod tests {
     }
 
     #[test]
-    fn handles_are_bare_ids_or_exact_reader_suffixes() {
-        assert_eq!(parse_handle("task-1").unwrap(), ("task-1", None));
-        assert_eq!(
-            parse_handle("task-1.abcd").unwrap(),
-            ("task-1", Some("abcd"))
-        );
-        for invalid in [
-            "a.b.abcd", ".abcd", "a.abc", "a.abcde", "a.ABCD", "a.ilou", "a.abç",
-        ] {
-            let message = parse_handle(invalid).unwrap_err();
-            assert!(message.contains("Unknown taskId"), "{message}");
-            assert!(message.contains("<taskId>.<reader>"), "{message}");
-        }
-    }
-
-    #[test]
     fn readers_attach_recreate_and_touch_the_idle_lru() {
         let entry = TaskEntry::default();
         let initial = entry.start_reader("0000".into());
@@ -713,7 +684,12 @@ mod tests {
         let attached = entry.reader(None).unwrap();
         assert!(attached.is_fresh());
         assert_eq!(attached.key.len(), 4);
-        assert!(attached.key.bytes().all(|byte| ALPHABET.contains(&byte)));
+        assert!(
+            attached
+                .key
+                .bytes()
+                .all(|byte| crate::id::ALPHABET.contains(&byte))
+        );
         assert_ne!(attached.key, recreated.key);
         assert_eq!(lock(&entry.readers).by_key.len(), MAX_READERS);
     }

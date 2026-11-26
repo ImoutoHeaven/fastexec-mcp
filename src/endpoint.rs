@@ -244,7 +244,7 @@ impl Endpoint {
     /// Creates the endpoint and starts identifying this build at once: the hash reads the whole
     /// image, so one task owns it from start to finish and callers only wait on the result.
     pub fn new(launch: Arc<LaunchContext>) -> std::io::Result<Self> {
-        let session = crate::tasks::random_chars(26)?;
+        let session = crate::id::random_chars(26)?;
         let identity: Arc<OnceCell<Identity>> = Arc::new(OnceCell::new());
         let (announce, ready) = watch::channel(false);
         let stored = Arc::clone(&identity);
@@ -331,7 +331,7 @@ impl Endpoint {
             .to_owned();
         // A call this large is refused here: sending it would only make the daemon refuse it,
         // and the caller would have waited for a connection to hear that.
-        match ipc::json_len(&arguments) {
+        match crate::lease::json_len(&arguments) {
             Ok(length) if length > ipc::CALL_LIMIT => {
                 return plain_err(format!(
                     "The call is {} bytes; calls are limited to 3 MiB.",
@@ -523,7 +523,7 @@ impl Endpoint {
         }
     }
 
-    fn event_setup_error(&self, error: SetupError) -> ipc::Owned<ipc::IpcEventError> {
+    fn event_setup_error(&self, error: SetupError) -> crate::lease::Owned<ipc::IpcEventError> {
         match error {
             SetupError::MemoryBudget => self.event_budget_error(
                 "endpoint memory budget full while connecting to fastexec daemon",
@@ -535,7 +535,7 @@ impl Endpoint {
     fn event_link_error(
         &self,
         message: impl Into<std::borrow::Cow<'static, str>>,
-    ) -> ipc::Owned<ipc::IpcEventError> {
+    ) -> crate::lease::Owned<ipc::IpcEventError> {
         let message = message.into();
         let bytes = message.len().saturating_add(256);
         if let Some(lease) = self
@@ -543,7 +543,7 @@ impl Endpoint {
             .try_acquire(bytes)
             .or_else(|| self.control_memory().try_acquire(bytes))
         {
-            ipc::Owned::new(
+            crate::lease::Owned::new(
                 ipc::IpcEventError {
                     code: -32603,
                     message: message.into_owned(),
@@ -552,7 +552,7 @@ impl Endpoint {
                 crate::lease::Owner::new(lease),
             )
         } else {
-            ipc::Owned::new(
+            crate::lease::Owned::new(
                 ipc::IpcEventError {
                     code: -32025,
                     message: String::new(),
@@ -563,7 +563,7 @@ impl Endpoint {
         }
     }
 
-    fn event_budget_error(&self, message: &'static str) -> ipc::Owned<ipc::IpcEventError> {
+    fn event_budget_error(&self, message: &'static str) -> crate::lease::Owned<ipc::IpcEventError> {
         ipc::IpcEventError::memory_full(self.memory(), self.control_memory(), message)
     }
 
@@ -572,7 +572,10 @@ impl Endpoint {
         &self,
         client_name: &str,
         cancel: CancellationToken,
-    ) -> Result<ipc::Owned<crate::events::EventsListResult>, ipc::Owned<ipc::IpcEventError>> {
+    ) -> Result<
+        crate::lease::Owned<crate::events::EventsListResult>,
+        crate::lease::Owned<ipc::IpcEventError>,
+    > {
         let deadline = std::time::Instant::now() + runtime::START_WAIT;
         let link = tokio::select! {
             biased;
@@ -615,12 +618,14 @@ impl Endpoint {
             frame = rx.recv() => frame,
         };
         match frame {
-            Some((ipc::EventWireFrame::ListResult(res), lease)) => {
-                Ok(ipc::Owned::new(res, crate::lease::Owner::new(lease)))
-            }
-            Some((ipc::EventWireFrame::Error(err), lease)) => {
-                Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
-            }
+            Some((ipc::EventWireFrame::ListResult(res), lease)) => Ok(crate::lease::Owned::new(
+                res,
+                crate::lease::Owner::new(lease),
+            )),
+            Some((ipc::EventWireFrame::Error(err), lease)) => Err(crate::lease::Owned::new(
+                err,
+                crate::lease::Owner::new(lease),
+            )),
             Some((ipc::EventWireFrame::Terminated(_), lease)) => {
                 drop(lease);
                 Err(self.event_budget_error("endpoint memory budget full during events/list"))
@@ -639,7 +644,10 @@ impl Endpoint {
         client_name: &str,
         request: crate::events::PollRequest,
         cancel: CancellationToken,
-    ) -> Result<ipc::Owned<crate::events::PollResponse>, ipc::Owned<ipc::IpcEventError>> {
+    ) -> Result<
+        crate::lease::Owned<crate::events::PollResponse>,
+        crate::lease::Owned<ipc::IpcEventError>,
+    > {
         let deadline = std::time::Instant::now() + runtime::START_WAIT;
         let link = tokio::select! {
             biased;
@@ -682,12 +690,14 @@ impl Endpoint {
             frame = rx.recv() => frame,
         };
         match frame {
-            Some((ipc::EventWireFrame::PollResult(res), lease)) => {
-                Ok(ipc::Owned::new(res, crate::lease::Owner::new(lease)))
-            }
-            Some((ipc::EventWireFrame::Error(err), lease)) => {
-                Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
-            }
+            Some((ipc::EventWireFrame::PollResult(res), lease)) => Ok(crate::lease::Owned::new(
+                res,
+                crate::lease::Owner::new(lease),
+            )),
+            Some((ipc::EventWireFrame::Error(err), lease)) => Err(crate::lease::Owned::new(
+                err,
+                crate::lease::Owner::new(lease),
+            )),
             Some((ipc::EventWireFrame::Terminated(_), lease)) => {
                 drop(lease);
                 Err(self.event_budget_error("endpoint memory budget full during events/poll"))
@@ -708,8 +718,11 @@ impl Endpoint {
         request: crate::events::SubscribeRequest,
         cancel: CancellationToken,
     ) -> Result<
-        (ipc::Owned<crate::events::ActiveNotice>, EndpointEventStream),
-        ipc::Owned<ipc::IpcEventError>,
+        (
+            crate::lease::Owned<crate::events::ActiveNotice>,
+            EndpointEventStream,
+        ),
+        crate::lease::Owned<ipc::IpcEventError>,
     > {
         let deadline = std::time::Instant::now() + runtime::START_WAIT;
         let link = tokio::select! {
@@ -761,7 +774,7 @@ impl Endpoint {
             Some((ipc::EventWireFrame::Active(active), lease)) => {
                 reg.disarm();
                 Ok((
-                    ipc::Owned::new(active, crate::lease::Owner::new(lease)),
+                    crate::lease::Owned::new(active, crate::lease::Owner::new(lease)),
                     EndpointEventStream {
                         link,
                         id,
@@ -773,12 +786,18 @@ impl Endpoint {
             Some((ipc::EventWireFrame::Error(err), lease)) => {
                 // Daemon rejected setup; no server-side stream exists to cancel.
                 reg.cancel_on_drop = false;
-                Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
+                Err(crate::lease::Owned::new(
+                    err,
+                    crate::lease::Owner::new(lease),
+                ))
             }
             Some((ipc::EventWireFrame::Terminated(err), lease)) => {
                 if err.message.starts_with("daemon ") {
                     reg.cancel_on_drop = false;
-                    Err(ipc::Owned::new(err, crate::lease::Owner::new(lease)))
+                    Err(crate::lease::Owned::new(
+                        err,
+                        crate::lease::Owner::new(lease),
+                    ))
                 } else {
                     drop(lease);
                     Err(self.event_budget_error(
@@ -866,7 +885,7 @@ async fn read_loop(
             _ = link.closed.cancelled() => None,
             frame = ipc::read_endpoint_frame_leased(
                 &mut reader,
-                ipc::RESPONSE_LIMIT,
+                crate::lease::FRAME_LIMIT,
                 &pool,
                 &control_pool,
                 |id| lock(&link.pending).get(&id).is_some_and(|entry| entry.control),
@@ -936,7 +955,7 @@ async fn read_loop(
                         message: "endpoint active memory budget full during event stream".into(),
                         data: None,
                     });
-                    if let Ok(bytes) = ipc::json_len(&frame)
+                    if let Ok(bytes) = crate::lease::json_len(&frame)
                         && let Some(lease) = control_pool
                             .try_acquire(bytes)
                             .or_else(|| crate::lease::control_pool().try_acquire(bytes))
@@ -975,9 +994,8 @@ pub(crate) fn hello_owned(
     session: &str,
     connection: u64,
     client_name: &str,
-) -> Result<ipc::Owned<ToDaemon>, SetupError> {
-    let copied = launch
-        .wire_capacity()
+) -> Result<crate::lease::Owned<ToDaemon>, SetupError> {
+    let copied = ipc::launch_wire_capacity(launch)
         .saturating_add(identity.namespace.len())
         .saturating_add(identity.build.len())
         .saturating_add(session.len())
@@ -991,8 +1009,8 @@ pub(crate) fn hello_owned(
                 .flatten()
         })
         .ok_or(SetupError::MemoryBudget)?;
-    let (cwd, env) = launch.to_wire();
-    Ok(ipc::Owned::new(
+    let (cwd, env) = ipc::launch_to_wire(launch);
+    Ok(crate::lease::Owned::new(
         ToDaemon::Hello {
             protocol: ipc::PROTOCOL,
             namespace: identity.namespace.clone(),
@@ -1010,7 +1028,7 @@ pub(crate) fn hello_owned(
 /// Sends the Hello and returns the Welcome's epoch, or the reason the daemon refused it.
 pub(crate) async fn handshake(
     client: &mut transport::Client,
-    hello: ipc::Owned<ToDaemon>,
+    hello: crate::lease::Owned<ToDaemon>,
     identity: &runtime::Identity,
 ) -> Result<String, SetupError> {
     {
@@ -1033,7 +1051,7 @@ pub(crate) async fn handshake(
     }
     match ipc::read_endpoint_frame_leased(
         client,
-        ipc::RESPONSE_LIMIT,
+        crate::lease::FRAME_LIMIT,
         crate::lease::process_pool(),
         crate::lease::control_pool(),
         |_| false,
@@ -1209,8 +1227,11 @@ mod tests {
             std::env::temp_dir(),
             vec![("SAMPLE".into(), "hello λ".into())],
         );
-        let copied =
-            launch.wire_capacity() + identity.namespace.len() + identity.build.len() + 1 + 4;
+        let copied = ipc::launch_wire_capacity(&launch)
+            + identity.namespace.len()
+            + identity.build.len()
+            + 1
+            + 4;
         for (limit, fits) in [(copied - 1, false), (copied, true)] {
             let pool = crate::lease::BytePool::new(limit);
             let launch = launch
@@ -1282,7 +1303,7 @@ mod tests {
                 Duration::from_secs(30),
                 handshake(
                     &mut client,
-                    ipc::Owned::new(hello(&identity), Default::default()),
+                    crate::lease::Owned::new(hello(&identity), Default::default()),
                     &identity,
                 ),
             )
@@ -1324,7 +1345,10 @@ mod tests {
             .expect("the peer did not panic");
     }
 
-    async fn failed_event_rpc(endpoint: &Endpoint, method: &str) -> ipc::Owned<ipc::IpcEventError> {
+    async fn failed_event_rpc(
+        endpoint: &Endpoint,
+        method: &str,
+    ) -> crate::lease::Owned<ipc::IpcEventError> {
         let cancel = CancellationToken::new();
         match method {
             "list" => endpoint.events_list("test", cancel).await.err(),

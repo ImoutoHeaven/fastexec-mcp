@@ -209,9 +209,9 @@ impl Host {
         &mut self,
         tool: &str,
         arguments: &str,
-    ) -> Result<u64, crate::ipc::Owned<SyncCallError>> {
+    ) -> Result<u64, crate::lease::Owned<SyncCallError>> {
         if self.script.interrupted() || self.script.0.cancel.is_cancelled() {
-            return Err(crate::ipc::Owned::new(
+            return Err(crate::lease::Owned::new(
                 SyncCallError::Type("The script is ending; no new tool calls can start.".into()),
                 Default::default(),
             ));
@@ -221,13 +221,13 @@ impl Host {
         let bytes = arguments.len().saturating_add(tool.len()).saturating_mul(4);
         let (lease, control) = if let Some(lease) = self.launch.memory().try_acquire(bytes) {
             (lease, false)
-        } else if arguments.len().saturating_add(tool.len()) <= crate::ipc::SHORT_INPUT {
+        } else if arguments.len().saturating_add(tool.len()) <= crate::lease::SHORT_INPUT {
             (
                 self.launch
                     .control_memory()
                     .try_acquire(bytes)
                     .ok_or_else(|| {
-                        crate::ipc::Owned::new(
+                        crate::lease::Owned::new(
                             SyncCallError::Overload(bridge_input_error()),
                             Default::default(),
                         )
@@ -235,7 +235,7 @@ impl Host {
                 true,
             )
         } else {
-            return Err(crate::ipc::Owned::new(
+            return Err(crate::lease::Owned::new(
                 SyncCallError::Overload(bridge_input_error()),
                 Default::default(),
             ));
@@ -255,7 +255,7 @@ impl Host {
                 input_owner.clone(),
             )
             .map_err(|error| {
-                crate::ipc::Owned::new(SyncCallError::Limit(error), input_owner.clone())
+                crate::lease::Owned::new(SyncCallError::Limit(error), input_owner.clone())
             })?;
         let parsed = (|| {
             if tool == "sleep" {
@@ -291,7 +291,7 @@ impl Host {
             Ok(request) => request,
             Err(error) => {
                 lock(&self.script.0.report).remove(id);
-                return Err(crate::ipc::Owned::new(
+                return Err(crate::lease::Owned::new(
                     SyncCallError::Type(error),
                     input_owner,
                 ));
@@ -303,7 +303,7 @@ impl Host {
         if control && !is_control {
             let Some(lease) = self.launch.memory().try_acquire(bytes) else {
                 lock(&self.script.0.report).remove(id);
-                return Err(crate::ipc::Owned::new(
+                return Err(crate::lease::Owned::new(
                     SyncCallError::Overload(bridge_input_error()),
                     input_owner,
                 ));
@@ -321,7 +321,7 @@ impl Host {
         {
             if self.starts >= MAX_STARTS {
                 lock(&self.script.0.report).remove(id);
-                return Err(crate::ipc::Owned::new(
+                return Err(crate::lease::Owned::new(
                     SyncCallError::Limit(STARTS_ERROR.into()),
                     input_owner,
                 ));
@@ -382,7 +382,7 @@ impl Host {
                         let _ = lock(&script.0.report).result(id, 0);
                         let _ = script.0.wake.send(Wake::Settled {
                             id,
-                            outcome: Outcome::Value(crate::ipc::Owned::new(
+                            outcome: Outcome::Value(crate::lease::Owned::new(
                                 String::new(),
                                 Default::default(),
                             )),

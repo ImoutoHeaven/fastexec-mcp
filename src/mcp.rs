@@ -6,6 +6,7 @@ use crate::endpoint;
 use crate::events;
 use crate::files;
 use crate::http;
+use crate::id;
 use crate::ingress;
 use crate::ipc;
 use crate::lease;
@@ -14,7 +15,6 @@ use crate::service::render as service_render;
 use crate::service::schema::{Action, Request};
 use crate::service::{AgentDelivery, ExecContext, Service};
 use crate::session::{LaunchContext, Session};
-use crate::tasks;
 use crate::transfer::{self, TransferEndpoint, publish_transfer, transfer_error};
 use crate::wait;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -223,8 +223,9 @@ impl Server {
                 .cloned()
                 .ok_or_else(|| "Internal error: HTTP principal is out of range.".to_owned());
         }
+        let isolate_launch = self.principals.is_some();
         session
-            .get_or_init(|| client_session(context, launch))
+            .get_or_init(|| client_session(context, launch, isolate_launch))
             .clone()
     }
 }
@@ -233,13 +234,18 @@ impl Server {
 fn client_session(
     context: &RequestContext<RoleServer>,
     launch: &Arc<LaunchContext>,
+    isolate_launch: bool,
 ) -> Result<Arc<Session>, String> {
-    let short =
-        tasks::random_chars(6).map_err(|error| format!("Cannot name the session: {error}"))?;
+    let short = id::random_chars(6).map_err(|error| format!("Cannot name the session: {error}"))?;
+    let launch = if isolate_launch {
+        Arc::new(launch.for_session())
+    } else {
+        Arc::clone(launch)
+    };
     Ok(Session::new(
         short.clone(),
         format!("{}-{short}", client_name(context)),
-        Arc::clone(launch),
+        launch,
     ))
 }
 
@@ -333,8 +339,9 @@ impl ServerHandler for Server {
             session, launch, ..
         } = &self.backend
         {
+            let isolate_launch = self.principals.is_some();
             session
-                .get_or_init(|| client_session(&context, launch))
+                .get_or_init(|| client_session(&context, launch, isolate_launch))
                 .clone()
                 .map_err(|message| rmcp::ErrorData::internal_error(message, None))?;
         }
@@ -438,7 +445,7 @@ fn event_error_to_rmcp(err: events::EventError) -> rmcp::ErrorData {
             None,
         );
     };
-    ipc::Owned::new(err, lease::Owner::new(held))
+    lease::Owned::new(err, lease::Owner::new(held))
         .map(ipc::IpcEventError::from)
         .run(ipc_event_error_to_rmcp)
 }
@@ -532,13 +539,13 @@ pub(crate) fn event_error_payload(error: ipc::IpcEventError) -> serde_json::Valu
 async fn send_event_notification(
     context: &RequestContext<RoleServer>,
     method: &str,
-    params: ipc::Owned<serde_json::Value>,
+    params: lease::Owned<serde_json::Value>,
     subscription_id: &rmcp::model::RequestId,
     metadata: &lease::Owner,
 ) -> bool {
     use rmcp::model::GetExtensions;
 
-    let ipc::Owned { value, owner } = params;
+    let lease::Owned { value, owner } = params;
     let mut notification = build_event_notification(method, value, subscription_id);
     // The peer may keep this notification queued after the request is cancelled.
     notification
@@ -648,7 +655,7 @@ impl Server {
             Backend::Daemon(endpoint) => (endpoint.memory(), endpoint.control_memory()),
         };
         // Fixed metadata covers subscription ID copies, cursors, and terminal error envelopes.
-        let metadata_bytes = ipc::json_len(&(&sub_req, &context.id))
+        let metadata_bytes = lease::json_len(&(&sub_req, &context.id))
             .unwrap_or(usize::MAX)
             .saturating_mul(3)
             .saturating_add(2048);
@@ -665,7 +672,7 @@ impl Server {
                 })?,
         );
         let sub_id = context.id.clone();
-        let terminated = |error| ipc::Owned::new(event_error_payload(error), metadata.clone());
+        let terminated = |error| lease::Owned::new(event_error_payload(error), metadata.clone());
         match &self.backend {
             Backend::Local { service, .. } => {
                 let _guard = service
@@ -705,12 +712,12 @@ impl Server {
                         }
                         item = sub.next() => {
                             match item {
-                                Ok(Some(ipc::Owned { value, owner })) => {
+                                Ok(Some(lease::Owned { value, owner })) => {
                                     let (method, payload) = match value {
                                         events::StreamItem::Active(active) => ("notifications/events/active", active.into()),
                                         events::StreamItem::Event(event) => ("notifications/events/event", event.into()),
                                     };
-                                    if !send_event_notification(&context, method, ipc::Owned::new(payload, owner), &sub_id, &metadata).await {
+                                    if !send_event_notification(&context, method, lease::Owned::new(payload, owner), &sub_id, &metadata).await {
                                         return Ok(stream_complete_result(&sub_id));
                                     }
                                     sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat);
@@ -803,7 +810,7 @@ impl Server {
                                 stream.cancel().await;
                                 return Ok(stream_complete_result(&sub_id));
                             };
-                            let owned = ipc::Owned::new(frame, lease::Owner::new(held));
+                            let owned = lease::Owned::new(frame, lease::Owner::new(held));
                             let (method, payload) = match owned.value {
                                 ipc::EventWireFrame::Active(active) => {
                                     ("notifications/events/active", active.into())
@@ -837,7 +844,7 @@ impl Server {
                             if !send_event_notification(
                                 &context,
                                 method,
-                                ipc::Owned::new(payload, owned.owner),
+                                lease::Owned::new(payload, owned.owner),
                                 &sub_id,
                                 &metadata,
                             )
@@ -964,7 +971,7 @@ impl Server {
                     let delivery = AgentDelivery {
                         render_slot: None,
                         http_response: http_context(&context),
-                        rpc_id_bytes: ipc::json_len(&context.id).unwrap_or(usize::MAX),
+                        rpc_id_bytes: lease::json_len(&context.id).unwrap_or(usize::MAX),
                     };
                     let tracked = service.exec_agent(request, ctx, delivery).await;
                     self.deliver_local(&context, tracked, launch, is_control)
@@ -1031,7 +1038,7 @@ impl Server {
                 let delivery = AgentDelivery {
                     render_slot: None,
                     http_response: http_context(&context),
-                    rpc_id_bytes: ipc::json_len(&context.id).unwrap_or(usize::MAX),
+                    rpc_id_bytes: lease::json_len(&context.id).unwrap_or(usize::MAX),
                 };
                 let tracked = service
                     .codemode_agent(request, ctx, delivery, self.tools.transfer)
@@ -1254,8 +1261,8 @@ impl Server {
             &tracked.result,
             &tracked.payload_owner,
         );
-        let exact_json = ipc::json_len(&tracked.result).unwrap_or(usize::MAX);
-        let id_bytes = ipc::json_len(&context.id).unwrap_or(usize::MAX);
+        let exact_json = lease::json_len(&tracked.result).unwrap_or(usize::MAX);
+        let id_bytes = lease::json_len(&context.id).unwrap_or(usize::MAX);
         let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
         let encoded_peak = outbound_bytes;
         let admitted = b64_bytes.checked_add(encoded_peak).and_then(|peak| {
@@ -1278,7 +1285,7 @@ impl Server {
                 ),
             };
             let err = CallToolResult::error(vec![ContentBlock::text(msg)]);
-            let err_outbound = ipc::json_len(&err)
+            let err_outbound = lease::json_len(&err)
                 .unwrap_or(usize::MAX)
                 .saturating_add(id_bytes)
                 .saturating_add(256);
@@ -1333,8 +1340,8 @@ impl Server {
             &tracked.result,
             &tracked.payload_owner,
         );
-        let exact_json = ipc::json_len(&tracked.result).unwrap_or(usize::MAX);
-        let id_bytes = ipc::json_len(&context.id).unwrap_or(usize::MAX);
+        let exact_json = lease::json_len(&tracked.result).unwrap_or(usize::MAX);
+        let id_bytes = lease::json_len(&context.id).unwrap_or(usize::MAX);
         let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
         let admitted = b64_bytes.checked_add(outbound_bytes).and_then(|peak| {
             admit_delivery(&mut tracked.lease, pool, control_pool, peak, use_control)
@@ -1345,7 +1352,7 @@ impl Server {
                 "Endpoint active memory budget ({} bytes) is full while writing stdio response; use action list or poll once in-flight transfers complete.",
                 pool.limit()
             ))]);
-            let err_outbound = ipc::json_len(&err)
+            let err_outbound = lease::json_len(&err)
                 .unwrap_or(usize::MAX)
                 .saturating_add(id_bytes)
                 .saturating_add(256);
@@ -1622,9 +1629,9 @@ fn tool_metadata_copy_bytes(tool: &rmcp::model::Tool) -> usize {
     owned(&tool.name)
         .saturating_add(tool.title.as_ref().map_or(0, String::len))
         .saturating_add(tool.description.as_ref().map_or(0, owned))
-        .saturating_add(ipc::json_len(&tool.annotations).unwrap_or(usize::MAX))
-        .saturating_add(ipc::json_len(&tool.icons).unwrap_or(usize::MAX))
-        .saturating_add(ipc::json_len(&tool.meta).unwrap_or(usize::MAX))
+        .saturating_add(lease::json_len(&tool.annotations).unwrap_or(usize::MAX))
+        .saturating_add(lease::json_len(&tool.icons).unwrap_or(usize::MAX))
+        .saturating_add(lease::json_len(&tool.meta).unwrap_or(usize::MAX))
 }
 
 fn reserve_response_content(
@@ -1652,12 +1659,12 @@ fn application_input_owner<T: serde::Serialize>(
         return Ok(owner.clone());
     }
     const REFUSED: &str = "Server active memory budget is full while preparing tool arguments; the operation was not dispatched.";
-    let length = ipc::json_len(parameters_and_id).map_err(|_| REFUSED)?;
+    let length = lease::json_len(parameters_and_id).map_err(|_| REFUSED)?;
     let bytes = length.checked_mul(4).ok_or(REFUSED)?;
     let held = pool
         .try_acquire(bytes)
         .or_else(|| {
-            (is_control && length <= ipc::SHORT_INPUT)
+            (is_control && length <= lease::SHORT_INPUT)
                 .then(|| control.try_acquire(bytes))
                 .flatten()
         })
@@ -2294,7 +2301,7 @@ mod metadata_budget_tests {
         let args = serde_json::json!({"action":"sleep","path":"sample.txt"});
         let id = rmcp::model::RequestId::String("ordinary-id".into());
         let borrowed = (&args, &id);
-        let needed = 4 * ipc::json_len(&borrowed).unwrap();
+        let needed = 4 * lease::json_len(&borrowed).unwrap();
         for (limit, fits) in [(needed - 1, false), (needed, true)] {
             let pool = lease::BytePool::new(limit);
             let control = lease::BytePool::new(needed);
@@ -2453,9 +2460,9 @@ mod event_notification_tests {
         let payload_pool = lease::BytePool::new(64);
         let metadata_pool = lease::BytePool::new(64);
         let payload = serde_json::json!({"cursor": "current"});
-        let payload_bytes = ipc::json_len(&payload).unwrap();
-        let metadata_bytes = ipc::json_len(&context.id).unwrap();
-        let params = ipc::Owned::new(
+        let payload_bytes = lease::json_len(&payload).unwrap();
+        let metadata_bytes = lease::json_len(&context.id).unwrap();
+        let params = lease::Owned::new(
             payload,
             lease::Owner::new(payload_pool.try_acquire(payload_bytes).unwrap()),
         );
@@ -2506,7 +2513,7 @@ mod event_notification_tests {
                 send_event_notification(
                     &context,
                     "notifications/events/active",
-                    ipc::Owned::new(serde_json::json!({}), lease::Owner::default()),
+                    lease::Owned::new(serde_json::json!({}), lease::Owner::default()),
                     &context.id,
                     &lease::Owner::default(),
                 ),
@@ -2536,5 +2543,135 @@ mod event_notification_tests {
         pending.complete.send(()).unwrap();
         after_cancel.await.unwrap().unwrap();
         peer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_stateless_requests_share_launch_while_stateful_sessions_isolate_caches() {
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(tasks, true));
+        let shared_launch = Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new()));
+        let principal_session = Session::new(
+            "t1".into(),
+            "http-t1".into(),
+            Arc::new(shared_launch.for_session()),
+        );
+        let principals: Arc<[Arc<Session>]> = Arc::from([Arc::clone(&principal_session)]);
+        let make_http_server = || {
+            let mut server = Server::new(
+                Backend::Local {
+                    service: Arc::clone(&service),
+                    session: Arc::new(OnceLock::new()),
+                    launch: Arc::clone(&shared_launch),
+                    daemon: true,
+                },
+                &shared_launch,
+                None,
+                Tools::default(),
+                None,
+                InstructionsToolMode::Off,
+            );
+            server.principals = Some(Arc::clone(&principals));
+            server
+        };
+
+        // Stateless HTTP call uses the pre-built principal session without initializing OnceLock.
+        let stateless_server = make_http_server();
+        let (tx0, _rx0) = mpsc::channel(1);
+        let mut peer0 = rmcp::service::serve_directly(TestServer, PausedTransport(tx0), None);
+        let mut stateless_ctx = RequestContext::new(
+            rmcp::model::RequestId::String("stateless".into()),
+            peer0.peer().clone(),
+        );
+        let (mut parts, ()) = ::http::Request::new(()).into_parts();
+        parts.extensions.insert(http::Principal(0));
+        stateless_ctx.extensions.insert(parts);
+        let resolved = stateless_server.session(&stateless_ctx).unwrap();
+        assert!(Arc::ptr_eq(&resolved, &principal_session));
+        if let Backend::Local {
+            session, launch, ..
+        } = &stateless_server.backend
+        {
+            assert!(session.get().is_none());
+            assert!(Arc::ptr_eq(launch, &shared_launch));
+        }
+        peer0.close().await.unwrap();
+
+        // Stateful HTTP initialize isolates each session's LaunchContext from shared_launch and peers.
+        let init_params: InitializeRequestParams = serde_json::from_value(serde_json::json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "http-stateful", "version": "1.0" }
+        }))
+        .unwrap();
+        let stateful_a = make_http_server();
+        let (txa, _rxa) = mpsc::channel(1);
+        let mut peera = rmcp::service::serve_directly(TestServer, PausedTransport(txa), None);
+        stateful_a
+            .initialize(
+                init_params.clone(),
+                RequestContext::new(
+                    rmcp::model::RequestId::String("init-a".into()),
+                    peera.peer().clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let sess_a = stateful_a
+            .session(&RequestContext::new(
+                rmcp::model::RequestId::String("call-a".into()),
+                peera.peer().clone(),
+            ))
+            .unwrap();
+        peera.close().await.unwrap();
+
+        let stateful_b = make_http_server();
+        let (txb, _rxb) = mpsc::channel(1);
+        let mut peerb = rmcp::service::serve_directly(TestServer, PausedTransport(txb), None);
+        stateful_b
+            .initialize(
+                init_params,
+                RequestContext::new(
+                    rmcp::model::RequestId::String("init-b".into()),
+                    peerb.peer().clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let sess_b = stateful_b
+            .session(&RequestContext::new(
+                rmcp::model::RequestId::String("call-b".into()),
+                peerb.peer().clone(),
+            ))
+            .unwrap();
+        peerb.close().await.unwrap();
+
+        assert!(!Arc::ptr_eq(&sess_a.launch, &shared_launch));
+        assert!(!Arc::ptr_eq(&sess_b.launch, &shared_launch));
+        assert!(!Arc::ptr_eq(&sess_a.launch, &sess_b.launch));
+
+        // Stdio server (principals: None) shares its single LaunchContext directly.
+        let stdio_server = Server::new(
+            Backend::Local {
+                service: Arc::clone(&service),
+                session: Arc::new(OnceLock::new()),
+                launch: Arc::clone(&shared_launch),
+                daemon: false,
+            },
+            &shared_launch,
+            None,
+            Tools::default(),
+            None,
+            InstructionsToolMode::Off,
+        );
+        let (txs, _rxs) = mpsc::channel(1);
+        let mut peers = rmcp::service::serve_directly(TestServer, PausedTransport(txs), None);
+        let stdio_sess = stdio_server
+            .session(&RequestContext::new(
+                rmcp::model::RequestId::String("stdio".into()),
+                peers.peer().clone(),
+            ))
+            .unwrap();
+        assert!(Arc::ptr_eq(&stdio_sess.launch, &shared_launch));
+        peers.close().await.unwrap();
     }
 }

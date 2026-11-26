@@ -34,7 +34,7 @@ pub(crate) struct ProgramOutcome {
 impl ProgramOutcome {
     pub(crate) fn value(text: String, lease: Lease) -> Self {
         Self {
-            outcome: Outcome::Value(crate::ipc::Owned::new(text, Owner::new(lease))),
+            outcome: Outcome::Value(crate::lease::Owned::new(text, Owner::new(lease))),
             pre_reserved: true,
         }
     }
@@ -541,7 +541,7 @@ fn admit_bridge_result<T: Serialize>(
     cancel: Option<&CancellationToken>,
     task_meta: Option<(String, String)>,
 ) -> Result<(String, Lease), ProgramOutcome> {
-    let Ok(wire_len) = crate::ipc::json_len(envelope) else {
+    let Ok(wire_len) = crate::lease::json_len(envelope) else {
         return Err(ProgramOutcome::error(
             "Cannot measure the nested tool result.",
             false,

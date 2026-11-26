@@ -51,10 +51,67 @@ impl<F: std::future::Future> std::future::Future for OwnedFuture<F> {
     }
 }
 
+/// The payload is destroyed before its last process-local byte owner.
+#[derive(Debug)]
+pub(crate) struct Owned<T> {
+    pub value: T,
+    pub owner: Owner,
+}
+
+impl<T> Owned<T> {
+    pub fn new(value: T, owner: Owner) -> Self {
+        Self { value, owner }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Owned<U> {
+        let Self { value, owner } = self;
+        Owned::new(f(value), owner)
+    }
+
+    /// A derived value may reserve additional buffers while keeping its input owner.
+    pub fn flat_map<U>(self, f: impl FnOnce(T) -> Owned<U>) -> Owned<U> {
+        let Self { value, owner } = self;
+        let result = f(value);
+        Owned::new(result.value, Owner::new((owner, result.owner)))
+    }
+
+    /// Capturing this whole wrapper also covers a blocking job that has not started.
+    pub fn run<U>(self, f: impl FnOnce(T) -> U) -> U {
+        let Self { value, owner } = self;
+        let result = f(value);
+        drop(owner);
+        result
+    }
+}
+
+/// Counts the serialized JSON bytes of `message` without allocating a buffer.
+pub fn json_len<T: serde::Serialize + ?Sized>(message: &T) -> std::io::Result<usize> {
+    struct ByteCounter(usize);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0 += buffer.len();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, message)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(counter.0)
+}
+
 /// Default per-process active byte budget: 1 GiB.
 pub const DEFAULT_LIMIT: usize = 1 << 30;
 /// Independent control-plane byte budget for `list`, short `kill`, progress, and error receipts.
 pub const CONTROL_LIMIT: usize = 8 << 20;
+/// Maximum serialized outbound frame body: 512 MiB.
+pub const FRAME_LIMIT: usize = 512 << 20;
+pub(crate) const SHORT_INPUT: usize = 64 * 1024;
 
 /// Tracks active bytes across in-flight reads, encodings, and queued outbound frames.
 #[derive(Debug)]
@@ -75,9 +132,12 @@ impl BytePool {
         self.limit
     }
 
-    #[cfg(test)]
     pub fn used(&self) -> usize {
         self.used.load(Ordering::SeqCst)
+    }
+
+    pub fn available(&self) -> usize {
+        self.limit.saturating_sub(self.used())
     }
 
     /// Reserves `bytes` without waiting, returning `None` immediately when full.
@@ -342,5 +402,68 @@ mod tests {
         assert_eq!(pool.used(), 70);
         drop(lease);
         assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn owned_drops_value_before_owner_and_json_len_matches_wire() {
+        struct DropOrderCheck {
+            pool: Arc<BytePool>,
+            expected_used: usize,
+        }
+        impl Drop for DropOrderCheck {
+            fn drop(&mut self) {
+                assert_eq!(
+                    self.pool.used(),
+                    self.expected_used,
+                    "value must drop before owner releases its lease"
+                );
+            }
+        }
+
+        assert_eq!(FRAME_LIMIT, 512 << 20);
+        assert_eq!(SHORT_INPUT, 64 * 1024);
+
+        let pool = BytePool::new(128);
+        let owned = Owned::new(
+            DropOrderCheck {
+                pool: Arc::clone(&pool),
+                expected_used: 32,
+            },
+            Owner::new(pool.try_acquire(32).unwrap()),
+        );
+        drop(owned);
+        assert_eq!(pool.used(), 0);
+
+        let chained = Owned::new(
+            DropOrderCheck {
+                pool: Arc::clone(&pool),
+                expected_used: 48,
+            },
+            Owner::new(pool.try_acquire(32).unwrap()),
+        )
+        .flat_map(|first| {
+            let derived = Owner::new(pool.try_acquire(16).unwrap());
+            drop(first);
+            Owned::new(
+                DropOrderCheck {
+                    pool: Arc::clone(&pool),
+                    expected_used: 48,
+                },
+                derived,
+            )
+        });
+        let out = chained.map(|inner| inner).run(|inner| {
+            drop(inner);
+            assert_eq!(pool.used(), 48);
+            7usize
+        });
+        assert_eq!(out, 7);
+        assert_eq!(pool.used(), 0);
+
+        let sample = serde_json::json!({"hello": ["world", 42, true]});
+        assert_eq!(
+            json_len(&sample).unwrap(),
+            serde_json::to_vec(&sample).unwrap().len()
+        );
     }
 }

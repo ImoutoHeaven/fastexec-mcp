@@ -1,7 +1,6 @@
 //! FreeBSD native ACLs and extended attributes, including private staging on ACL-inheriting volumes.
 
-use crate::ipc::Owned;
-use crate::lease::{BytePool, Owner};
+use crate::lease::{BytePool, Owned, Owner};
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -232,7 +231,7 @@ fn publish_private_directory(dir: &Path) -> io::Result<()> {
     for _ in 0..16 {
         let temporary = parent.join(format!(
             ".fastexec-private-{}",
-            crate::tasks::random_chars(16)?
+            crate::id::random_chars(16)?
         ));
         match create_private_directory(&temporary) {
             Ok(()) => {}
@@ -589,7 +588,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "fastexec-private-concurrent-{}-{}",
             std::process::id(),
-            crate::tasks::random_chars(16).unwrap()
+            crate::id::random_chars(16).unwrap()
         ));
         create_private_directory(&root).unwrap();
         let mut failures = Vec::new();
@@ -632,7 +631,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "fastexec-private-publish-{}-{}",
             std::process::id(),
-            crate::tasks::random_chars(16).unwrap()
+            crate::id::random_chars(16).unwrap()
         ));
         create_private_directory(&root).unwrap();
         let directory = root.join("winner");

@@ -8,7 +8,6 @@ use super::stdio::{StdioTransport, encode_stdio_frame};
 use crate::config::{InstructionsToolMode, Tools};
 use crate::events;
 use crate::files;
-use crate::ipc;
 use crate::lease;
 use crate::mcp::{Backend, RequestLeases, Server, decode_mcp_header_value};
 use crate::service::Service;
@@ -359,7 +358,8 @@ mod stdio_transport_tests {
             let result = CallToolResult::success(vec![ContentBlock::text("already admitted")]);
             let id = rmcp::model::RequestId::Number(7);
             let payload_bytes = service_render::result_payload_capacity(&result);
-            let wire_bytes = ipc::json_len(&result).unwrap() + ipc::json_len(&id).unwrap() + 256;
+            let wire_bytes =
+                lease::json_len(&result).unwrap() + lease::json_len(&id).unwrap() + 256;
             let pool = lease::BytePool::new(payload_bytes + wire_bytes);
             let launch = Arc::new(
                 LaunchContext::new(std::env::current_dir().unwrap(), Vec::new())
@@ -433,7 +433,7 @@ mod stdio_transport_tests {
     #[test]
     fn stdio_encoding_keeps_exact_capacity_charged() {
         let item = serde_json::json!({"text": "x".repeat(65_535)});
-        let expected = ipc::json_len(&item).unwrap() + 1;
+        let expected = lease::json_len(&item).unwrap() + 1;
         let pool = lease::BytePool::new(expected);
         let mut lease = lease::Lease::empty(&pool);
         let bytes = encode_stdio_frame(&item, Some(&mut lease)).unwrap();

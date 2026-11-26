@@ -113,8 +113,8 @@ pub async fn read_core(
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     cancel: Option<tokio_util::sync::CancellationToken>,
     input_owner: crate::lease::Owner,
-) -> crate::ipc::Owned<Result<FileReadData, FileError>> {
-    let input = crate::ipc::Owned::new(request, input_owner);
+) -> crate::lease::Owned<Result<FileReadData, FileError>> {
+    let input = crate::lease::Owned::new(request, input_owner);
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         input
@@ -123,7 +123,7 @@ pub async fn read_core(
     .await
     {
         Ok(outcome) => outcome,
-        Err(error) => crate::ipc::Owned::new(
+        Err(error) => crate::lease::Owned::new(
             Err(FileError::Io(format!(
                 "the file operation did not finish: {error}"
             ))),
@@ -599,13 +599,13 @@ pub(crate) fn read_blocking(
     transfer: bool,
     policy: ReadPolicy,
     cancel: Option<&tokio_util::sync::CancellationToken>,
-) -> crate::ipc::Owned<Result<FileReadData, FileError>> {
+) -> crate::lease::Owned<Result<FileReadData, FileError>> {
     match with_path_workspace(&request.path, launch, SNIFF, |path_lease| {
         read_blocking_reserved(request, launch, transfer, policy, cancel, path_lease)
     }) {
         Ok(read) => read,
         Err(message) => {
-            crate::ipc::Owned::new(Err(FileError::Overload(message)), Default::default())
+            crate::lease::Owned::new(Err(FileError::Overload(message)), Default::default())
         }
     }
 }

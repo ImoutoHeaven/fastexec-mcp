@@ -662,7 +662,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "fastexec-module-test-{}-{}",
             std::process::id(),
-            crate::tasks::random_chars(12).unwrap()
+            crate::id::random_chars(12).unwrap()
         ));
         std::fs::create_dir(&dir).unwrap();
         let source = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())

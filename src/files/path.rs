@@ -21,14 +21,14 @@ pub(crate) fn with_path_workspace<T>(
     launch: &LaunchContext,
     extra: usize,
     operation: impl FnOnce(&mut Lease) -> T,
-) -> Result<crate::ipc::Owned<T>, String> {
+) -> Result<crate::lease::Owned<T>, String> {
     let mut lease = launch.memory().try_acquire(path_workspace_bytes(path, launch, extra))
         .ok_or_else(|| format!(
             "Server active memory budget ({} bytes) is full while preparing the file path; the file operation was not dispatched.",
             launch.memory().limit()
         ))?;
     let value = operation(&mut lease);
-    Ok(crate::ipc::Owned::new(
+    Ok(crate::lease::Owned::new(
         value,
         crate::lease::Owner::new(lease),
     ))
@@ -405,7 +405,7 @@ pub(crate) fn reserve_target_workspace(
 pub(super) fn native_path_input(
     path: &Path,
     pool: &Arc<BytePool>,
-) -> io::Result<crate::ipc::Owned<std::ffi::CString>> {
+) -> io::Result<crate::lease::Owned<std::ffi::CString>> {
     use std::os::unix::ffi::OsStrExt;
     let bytes = native_path_bytes(path).ok_or_else(|| target_memory_error(pool))?;
     let lease = pool
@@ -413,7 +413,7 @@ pub(super) fn native_path_input(
         .ok_or_else(|| target_memory_error(pool))?;
     let value = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    Ok(crate::ipc::Owned::new(
+    Ok(crate::lease::Owned::new(
         value,
         crate::lease::Owner::new(lease),
     ))
@@ -425,7 +425,7 @@ pub(super) fn native_path_input(
 pub(super) fn canonical_target(
     path: &Path,
     pool: &Arc<BytePool>,
-) -> io::Result<crate::ipc::Owned<PathBuf>> {
+) -> io::Result<crate::lease::Owned<PathBuf>> {
     use std::os::unix::ffi::OsStringExt;
     let input = native_path_input(path, pool)?;
     // POSIX realpath's caller buffer includes its terminating NUL.
@@ -448,7 +448,7 @@ pub(super) fn canonical_target(
     } = buffer;
     data.truncate(end);
     let value = PathBuf::from(std::ffi::OsString::from_vec(data));
-    Ok(crate::ipc::Owned::new(
+    Ok(crate::lease::Owned::new(
         value,
         crate::lease::Owner::new(lease),
     ))
@@ -458,7 +458,7 @@ pub(super) fn canonical_target(
 pub(super) fn canonical_target(
     path: &Path,
     pool: &Arc<BytePool>,
-) -> io::Result<crate::ipc::Owned<PathBuf>> {
+) -> io::Result<crate::lease::Owned<PathBuf>> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -521,7 +521,7 @@ pub(super) fn canonical_target(
         ));
         drop(buffer);
         lease.shrink_to(value.capacity());
-        return Ok(crate::ipc::Owned::new(
+        return Ok(crate::lease::Owned::new(
             value,
             crate::lease::Owner::new(lease),
         ));
@@ -532,7 +532,7 @@ pub(super) fn canonical_target(
 pub(super) fn read_target_link(
     path: &Path,
     pool: &Arc<BytePool>,
-) -> io::Result<crate::ipc::Owned<PathBuf>> {
+) -> io::Result<crate::lease::Owned<PathBuf>> {
     use std::os::unix::ffi::OsStringExt;
     let input = native_path_input(path, pool)?;
     let mut capacity = 256usize;
@@ -563,7 +563,7 @@ pub(super) fn read_target_link(
         } = buffer;
         data.truncate(count as usize);
         let value = PathBuf::from(std::ffi::OsString::from_vec(data));
-        return Ok(crate::ipc::Owned::new(
+        return Ok(crate::lease::Owned::new(
             value,
             crate::lease::Owner::new(lease),
         ));
@@ -574,7 +574,7 @@ pub(super) fn read_target_link(
 pub(super) fn read_target_link(
     path: &Path,
     pool: &Arc<BytePool>,
-) -> io::Result<crate::ipc::Owned<PathBuf>> {
+) -> io::Result<crate::lease::Owned<PathBuf>> {
     use windows_sys::Win32::Storage::FileSystem::MAXIMUM_REPARSE_DATA_BUFFER_SIZE;
     // Rust 1.92 uses one fixed reparse buffer, a UTF-16 substitute-name Vec, and a
     // WTF-8 String. Eight reparse buffers cover those allocations and growth plus
@@ -587,7 +587,7 @@ pub(super) fn read_target_link(
         .ok_or_else(|| target_memory_error(pool))?;
     let value = std::fs::read_link(path)?;
     lease.shrink_to(value.capacity());
-    Ok(crate::ipc::Owned::new(
+    Ok(crate::lease::Owned::new(
         value,
         crate::lease::Owner::new(lease),
     ))

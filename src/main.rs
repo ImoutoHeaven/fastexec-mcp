@@ -8,6 +8,7 @@ mod endpoint;
 mod events;
 mod files;
 mod http;
+mod id;
 mod ingress;
 mod ipc;
 mod lease;

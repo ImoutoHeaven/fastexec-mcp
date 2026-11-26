@@ -325,8 +325,8 @@ impl Daemon {
         launch: &LaunchContext,
         has_public_root: bool,
     ) -> Result<std::net::SocketAddr, String> {
-        let allow_remote = http::remote_allowed()
-            || launch.var("FASTEXEC_HTTP_ALLOW_REMOTE") == Some(std::ffi::OsStr::new("1"));
+        let allow_remote = crate::config::remote_allowed()
+            || launch.var(crate::config::HTTP_ALLOW_REMOTE) == Some(std::ffi::OsStr::new("1"));
         let requested = crate::config::transfer_addr_of(
             launch.var(crate::config::TRANSFER_ADDR),
             allow_remote,
@@ -374,7 +374,7 @@ impl Daemon {
         launch: &Arc<LaunchContext>,
         input_owner: crate::lease::Owner,
     ) -> crate::files::TrackedResult {
-        let session_root = match http::root_of(launch.var(http::PUBLIC_URL)) {
+        let session_root = match crate::config::root_of(launch.var(crate::config::PUBLIC_URL)) {
             Ok(root) => root,
             Err(message) => {
                 return crate::files::TrackedResult::plain(crate::transfer::transfer_error(
@@ -408,11 +408,11 @@ impl Daemon {
         )
         .await
         {
-            ipc::Owned {
+            lease::Owned {
                 value: Ok(target),
                 owner,
-            } => ipc::Owned::new(target, owner),
-            ipc::Owned {
+            } => lease::Owned::new(target, owner),
+            lease::Owned {
                 value: Err(message),
                 owner,
             } => {
@@ -765,7 +765,7 @@ impl Daemon {
             )
             .await;
         }
-        let launch = match LaunchContext::from_wire(&cwd, &env) {
+        let launch = match ipc::launch_from_wire(&cwd, &env) {
             Ok(launch) => launch,
             Err(message) => {
                 return reject(
@@ -994,7 +994,7 @@ impl Daemon {
                     _ => return,
                 },
             };
-            let ipc::Owned {
+            let lease::Owned {
                 value: message,
                 owner,
             } = message;
@@ -1007,7 +1007,7 @@ impl Daemon {
                 } => {
                     // The endpoint preserves string IDs here; numeric IDs are
                     // conservatively charged for their surrounding quotes too.
-                    let rpc_id_bytes = ipc::json_len(&request_id).unwrap_or(usize::MAX);
+                    let rpc_id_bytes = lease::json_len(&request_id).unwrap_or(usize::MAX);
                     let token = {
                         let mut calls = lock(in_flight);
                         if calls.contains_key(&id) || calls.len() >= MAX_IN_FLIGHT {
@@ -1140,7 +1140,7 @@ impl Daemon {
                         &attached.token,
                         outgoing,
                         id,
-                        ipc::Owned::new(request, owner),
+                        lease::Owned::new(request, owner),
                     );
                 }
                 ToDaemon::EventsCancel { id } => {
@@ -1342,7 +1342,7 @@ async fn run_call(
         lock(&in_flight).remove(&id);
         return;
     };
-    if length > ipc::RESPONSE_LIMIT + 4 {
+    if length > lease::FRAME_LIMIT + 4 {
         let text = match &task_meta {
             Some(m) => format!(
                 "The result was {length} bytes, over the 512 MiB frame limit; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId with a smaller maxBytes or read logPath.",
@@ -1757,7 +1757,7 @@ async fn serve_daemon(
     // Parsed only when `--http` or daemon-level `FASTEXEC_TRANSFER=true` uses it; a plain
     // daemon with `transfer` off leaves `FASTEXEC_PUBLIC_URL` unread.
     let public_root = if http.is_some() || tools.transfer {
-        match http::public_root() {
+        match crate::config::public_root() {
             Ok(root) => root.map(Arc::from),
             Err(message) => {
                 eprintln!("fastexec: {message}");

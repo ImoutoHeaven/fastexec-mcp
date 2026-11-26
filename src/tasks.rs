@@ -7,14 +7,15 @@ mod workers;
 
 use self::state::{
     AttachmentMeta, AttachmentSlot, AttachmentSlotState, Final, Input, Pty, Root, Snapshot, Spool,
-    Task, clean_member_name, copy_snapshot_text, mark_tree_ended, set_held,
+    Task, copy_snapshot_text, mark_tree_ended, set_held,
 };
 use self::workers::{
     CaptureWork, InputWork, OutputWorkers, ReadWork, WaitWork, Workers, WriterDone, drain,
 };
 use crate::codemode;
+use crate::id::{base32, random_chars};
 use crate::media::MediaKind;
-use crate::platform::process::{self, Launch, Member, Tree};
+use crate::platform::process::{self, Launch, Member, Tree, clean_member_name};
 use crate::session::{LaunchContext, ProbeWarning, Reader, Session, TaskEntry};
 use crate::term::terminal::Live;
 use encoding_rs::Encoding;
@@ -191,53 +192,14 @@ impl Drop for Pending<'_> {
     }
 }
 
-/// Crockford's base32 alphabet in lowercase.
-pub(crate) const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
-
-/// `value` in Crockford's base32, most significant digit first, no padding beyond `digits`.
-fn base32(mut value: u128, digits: usize) -> String {
-    let digits = digits.max(1);
-    let mut out = Vec::with_capacity(digits);
-    loop {
-        out.push(ALPHABET[(value & 31) as usize] as char);
-        value >>= 5;
-        if value == 0 && out.len() >= digits {
-            break;
-        }
-    }
-    out.iter().rev().collect()
-}
-
 /// An epoch and a counter value as a task ID.
 fn task_id(epoch: &str, number: u64) -> String {
     format!("{epoch}-{}", base32(number as u128, 1))
 }
 
-/// `digits` characters (at most 26) from 128 random bits, for the epoch and session names.
-pub fn random_chars(digits: usize) -> std::io::Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| {
-        std::io::Error::other(format!("Cannot read the OS random source: {error}."))
-    })?;
-    let out = base32(u128::from_be_bytes(bytes), 26);
-    Ok(out[26 - digits..].into())
-}
-
 /// A fresh 40-bit epoch from the OS random source: 8 Crockford base32 characters.
 fn new_epoch() -> std::io::Result<String> {
     random_chars(8)
-}
-
-/// Whether `id` has the bare task ID shape `<8-char base32 epoch>-<base32 counter>`.
-pub fn is_valid_task_id(id: &str) -> bool {
-    let Some((epoch, counter)) = id.split_once('-') else {
-        return false;
-    };
-    epoch.len() == 8
-        && !counter.is_empty()
-        && counter.len() <= 13
-        && epoch.bytes().all(|byte| ALPHABET.contains(&byte))
-        && counter.bytes().all(|byte| ALPHABET.contains(&byte))
 }
 
 /// The error a transcript read returns for a task whose files the total log limit evicted.
@@ -1863,7 +1825,11 @@ fn remove_stale_dirs(temp: &Path) {
             .and_then(|name| name.strip_prefix(prefix.as_str()))
             .and_then(|tail| {
                 let (pid, nonce) = tail.split_once('-')?;
-                if nonce.len() != 12 || !nonce.bytes().all(|byte| ALPHABET.contains(&byte)) {
+                if nonce.len() != 12
+                    || !nonce
+                        .bytes()
+                        .all(|byte| crate::id::ALPHABET.contains(&byte))
+                {
                     return None;
                 }
                 pid.parse().ok()

@@ -8,11 +8,10 @@ use super::{
 use crate::codemode;
 use crate::lease::{BytePool, Lease};
 use crate::media::MediaKind;
-use crate::platform::process::{self, Member, Tree};
+use crate::platform::process::{self, Member, Tree, normalize_members};
 use crate::session::ReadState;
 use crate::term::output::{
-    MATCH_SCAN_BYTES, Matcher, Truncate, Window, WindowBuilder, WindowSpec,
-    incomplete_legacy_suffix_reader,
+    MATCH_SCAN_BYTES, Matcher, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix_reader,
 };
 use crate::term::terminal::Live;
 use encoding_rs::Encoding;
@@ -375,11 +374,6 @@ pub(super) fn copy_snapshot_text(
     Ok(value.clone())
 }
 
-pub(crate) fn normalize_members(list: &mut Vec<Member>) {
-    list.sort_by_key(|m| m.pid);
-    list.dedup_by_key(|m| m.pid);
-}
-
 pub(crate) fn set_held(snapshot: &mut Snapshot, members: Option<Vec<Member>>) {
     match members {
         Some(mut list) => {
@@ -400,27 +394,6 @@ pub(crate) fn mark_tree_ended(snapshot: &mut Snapshot) {
     snapshot.kill_error = None;
     snapshot.held.clear();
     snapshot.held_known = true;
-}
-
-pub(crate) fn clean_member_name(name: &str) -> Option<String> {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    let mut parts = cleaned.split_whitespace();
-    let first = parts.next()?;
-    let mut out = String::from(first);
-    for part in parts {
-        out.push(' ');
-        out.push_str(part);
-    }
-    Some(out)
 }
 
 impl Spool {
@@ -1101,6 +1074,9 @@ impl Task {
                 cut = true;
             }
             if !spool.write(pending.as_bytes(), false, self, shared) {
+                if lock(&self.out).evicted {
+                    return Err(EVICTED_TRANSCRIPT.into());
+                }
                 pending.clear();
             }
         }
@@ -1258,58 +1234,21 @@ impl Task {
         let _ = self.kill();
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn read_window_with_markers(
         &self,
         state: &mut ReadState,
-        truncate: Truncate,
-        budget: usize,
-        raw: bool,
-        clean: bool,
-        keep_nul: bool,
-        include_markers: bool,
-        encoding: &'static Encoding,
+        spec: WindowSpec,
         until: Option<u64>,
     ) -> std::io::Result<Window> {
         if lock(&self.out).evicted {
-            return Ok(self.read_evicted(
-                state,
-                truncate,
-                budget,
-                raw,
-                clean,
-                keep_nul,
-                include_markers,
-                encoding,
-                until,
-            ));
+            return Ok(self.read_evicted(state, spec, until));
         }
-        match self.read_stored(
-            state,
-            truncate,
-            budget,
-            raw,
-            clean,
-            keep_nul,
-            include_markers,
-            encoding,
-            until,
-        ) {
+        match self.read_stored(state, spec, until) {
             Ok(window) => Ok(window),
             Err(_) if lock(&self.out).evicted => {
                 // Eviction deleted the log between the flags above and the read. The window is
                 // empty either way, so the half-read state is simply not committed.
-                Ok(self.read_evicted(
-                    state,
-                    truncate,
-                    budget,
-                    raw,
-                    clean,
-                    keep_nul,
-                    include_markers,
-                    encoding,
-                    until,
-                ))
+                Ok(self.read_evicted(state, spec, until))
             }
             Err(error) => Err(error),
         }
@@ -1318,48 +1257,19 @@ impl Task {
     /// The window of an evicted task: an empty one. The cursor moves past the bytes that are
     /// gone, so the next read starts where this one would have ended; the eviction itself is
     /// reported by the snapshot, not by inventing an omitted line range.
-    #[allow(clippy::too_many_arguments)]
-    fn read_evicted(
-        &self,
-        state: &mut ReadState,
-        truncate: Truncate,
-        budget: usize,
-        raw: bool,
-        clean: bool,
-        keep_nul: bool,
-        include_markers: bool,
-        encoding: &'static Encoding,
-        until: Option<u64>,
-    ) -> Window {
+    fn read_evicted(&self, state: &mut ReadState, spec: WindowSpec, until: Option<u64>) -> Window {
         let end = lock(&self.out).readable;
         let start = state.cursor;
         let end = until.map_or(end, |until| end.min(until));
-        let spec = WindowSpec {
-            truncate,
-            budget,
-            raw,
-            clean,
-            keep_nul,
-            include_markers,
-            encoding,
-            source: "log",
-        };
         let window = WindowBuilder::new(spec, &mut state.cleaner, state.lines_before + 1).finish();
         state.cursor = end.max(start);
         window
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn read_stored(
         &self,
         state: &mut ReadState,
-        truncate: Truncate,
-        budget: usize,
-        raw: bool,
-        clean: bool,
-        keep_nul: bool,
-        include_markers: bool,
-        encoding: &'static Encoding,
+        spec: WindowSpec,
         until: Option<u64>,
     ) -> std::io::Result<Window> {
         let (readable, written, closed) = {
@@ -1369,23 +1279,13 @@ impl Task {
         let start = state.cursor;
         // `readable` holds back an unfinished UTF-8 sequence; other encodings hold back their
         // own unfinished character here, until the rest arrives or output ends.
-        let end = if encoding == encoding_rs::UTF_8 || closed {
+        let end = if spec.encoding == encoding_rs::UTF_8 || closed {
             readable
         } else {
-            written - self.legacy_holdback(start, written, encoding)?
+            written - self.legacy_holdback(start, written, spec.encoding)?
         };
         let end = until.map_or(end, |until| end.min(until));
         let first_line = state.lines_before + 1;
-        let spec = WindowSpec {
-            truncate,
-            budget,
-            raw,
-            clean,
-            keep_nul,
-            include_markers,
-            encoding,
-            source: "log",
-        };
         // A read that fails part way leaves the cleaning state as it was: the fallback starts
         // from the same bytes, so nothing is half-consumed.
         let mut cleaner = state.cleaner.clone();

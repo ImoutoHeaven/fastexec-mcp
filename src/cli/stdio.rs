@@ -7,7 +7,6 @@ use crate::config::{
 use crate::endpoint;
 use crate::http;
 use crate::ingress;
-use crate::ipc;
 use crate::lease;
 use crate::mcp::{Backend, RequestLeases, Server};
 use crate::service::Service;
@@ -168,7 +167,7 @@ impl<R, W: tokio::io::AsyncWrite + Unpin> StdioTransport<R, W> {
         id: Option<rmcp::model::RequestId>,
     ) -> bool {
         let reply = rmcp::service::TxJsonRpcMessage::<RoleServer>::error(error, id);
-        let Ok(size) = ipc::json_len(&reply).map(|n| n.saturating_add(1)) else {
+        let Ok(size) = lease::json_len(&reply).map(|n| n.saturating_add(1)) else {
             return true;
         };
         let Some(mut lease) = lease::control_pool()
@@ -209,10 +208,10 @@ pub(super) fn encode_stdio_frame<T: serde::Serialize>(
     item: &T,
     outbound: Option<&mut lease::Lease>,
 ) -> std::io::Result<Vec<u8>> {
-    let length = ipc::json_len(item)?.checked_add(1).ok_or_else(|| {
+    let length = lease::json_len(item)?.checked_add(1).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "stdio frame is too large")
     })?;
-    if length > ipc::RESPONSE_LIMIT {
+    if length > lease::FRAME_LIMIT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "stdio frame exceeds 512 MiB",
@@ -247,7 +246,7 @@ struct StdioFrame {
 impl StdioSendPayload {
     fn encode(mut self) -> std::io::Result<StdioFrame> {
         if self.outbound.is_none() {
-            let size = ipc::json_len(&self.item)?.saturating_add(1);
+            let size = lease::json_len(&self.item)?.saturating_add(1);
             self.outbound = lease::process_pool().try_acquire(size).or_else(|| {
                 (size <= 64 * 1024)
                     .then(|| lease::control_pool().try_acquire(size))
@@ -477,7 +476,7 @@ pub(crate) async fn serve() {
         }
     };
     let transfer_cfg = if tools.transfer {
-        let root = match http::public_root() {
+        let root = match crate::config::public_root() {
             Ok(root) => root,
             Err(message) => {
                 eprintln!("fastexec: {message}");

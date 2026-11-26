@@ -471,7 +471,7 @@ fn sid_text(sid: windows_sys::Win32::Security::PSID) -> io::Result<String> {
 /// and SYSTEM are trusted OS principals (they can already take ownership); no ordinary other
 /// user may own or access the directory. Creator/owner ACEs are safe to inherit to its children.
 #[cfg(windows)]
-fn create_private_windows_check(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_windows_check(dir: &Path) -> io::Result<()> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
@@ -1294,7 +1294,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "fastexec-private-existing-acl-{}-{}",
             std::process::id(),
-            crate::tasks::random_chars(12).unwrap()
+            crate::id::random_chars(12).unwrap()
         ));
         create_private_new(&root).unwrap();
         inheritable_directory_acl(&root);
@@ -1324,7 +1324,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "fastexec-private-inherited-acl-{}-{}",
             std::process::id(),
-            crate::tasks::random_chars(12).unwrap()
+            crate::id::random_chars(12).unwrap()
         ));
         create_private_new(&root).unwrap();
         inheritable_directory_acl(&root);
@@ -1352,7 +1352,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "fastexec-private-create-{}-{}",
             std::process::id(),
-            crate::tasks::random_chars(12).unwrap()
+            crate::id::random_chars(12).unwrap()
         ));
         create_private_new(&root).unwrap();
         let directory = root.join("directory");
@@ -1406,7 +1406,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "fastexec-private-dacl-{}-{}",
             std::process::id(),
-            crate::tasks::random_chars(12).unwrap()
+            crate::id::random_chars(12).unwrap()
         ));
         create_private_new(&root).unwrap();
         assert!(
@@ -1496,7 +1496,7 @@ mod tests {
                 let path = std::env::temp_dir().join(format!(
                     "fastexec-{label}-{}-{}",
                     std::process::id(),
-                    crate::tasks::random_chars(12).unwrap()
+                    crate::id::random_chars(12).unwrap()
                 ));
                 create_private_new(&path).unwrap();
                 Self(path)

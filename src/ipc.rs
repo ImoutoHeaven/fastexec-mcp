@@ -1,8 +1,10 @@
 //! The wire between an endpoint and the daemon: length-prefixed JSON frames and the messages they
 //! carry.
 
-use crate::lease::Owner;
-use crate::lease::{BytePool, Lease};
+#[cfg(test)]
+use crate::lease::FRAME_LIMIT;
+use crate::lease::{BytePool, Lease, Owned, Owner, SHORT_INPUT};
+use crate::session::Unit;
 #[cfg(test)]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,51 +23,12 @@ pub const REQUEST_LIMIT: usize = 4 << 20;
 /// as a tool error, before it writes anything.
 pub const CALL_LIMIT: usize = 3 << 20;
 
-/// The largest frame the endpoint accepts. Results are sized to fit, so a larger one is a bug and
-/// the endpoint closes the connection.
-pub const RESPONSE_LIMIT: usize = 512 << 20;
-
 const WRITE_CHUNK: usize = 64 * 1024;
-
-/// The payload is destroyed before its last process-local byte owner.
-#[derive(Debug)]
-pub(crate) struct Owned<T> {
-    pub value: T,
-    pub owner: Owner,
-}
-
-impl<T> Owned<T> {
-    pub fn new(value: T, owner: Owner) -> Self {
-        Self { value, owner }
-    }
-
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Owned<U> {
-        let Self { value, owner } = self;
-        Owned::new(f(value), owner)
-    }
-
-    /// A derived value may reserve additional buffers while keeping its input owner.
-    pub fn flat_map<U>(self, f: impl FnOnce(T) -> Owned<U>) -> Owned<U> {
-        let Self { value, owner } = self;
-        let result = f(value);
-        Owned::new(result.value, Owner::new((owner, result.owner)))
-    }
-
-    /// Capturing this whole wrapper also covers a blocking job that has not started.
-    pub fn run<U>(self, f: impl FnOnce(T) -> U) -> U {
-        let Self { value, owner } = self;
-        let result = f(value);
-        drop(owner);
-        result
-    }
-}
 
 pub(crate) struct EncodedFrame {
     pub bytes: Vec<u8>,
     _lease: Lease,
 }
-
-pub(crate) const SHORT_INPUT: usize = 64 * 1024;
 
 pub(crate) fn input_budget_error() -> std::io::Error {
     std::io::Error::new(
@@ -157,26 +120,40 @@ pub(crate) enum DaemonFrame {
     Eof,
 }
 
-fn sniff_daemon_overload(head: &[u8]) -> DaemonFrame {
-    let text = std::str::from_utf8(head)
-        .unwrap_or_else(|error| std::str::from_utf8(&head[..error.valid_up_to()]).unwrap_or(""));
-    let parse_id = || {
-        let digits = text.split_once("\"id\":")?.1.trim_start();
-        let end = digits
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(digits.len());
-        digits[..end].parse().ok()
+fn sniff_tagged_head(head: &[u8]) -> Option<(&str, &str)> {
+    // `head` may cut through a multibyte UTF-8 sequence at byte 256; keep the valid prefix so
+    // the leading ASCII `"type"` and `"id"` fields still parse.
+    let text = match std::str::from_utf8(head) {
+        Ok(valid) => valid,
+        Err(err) => std::str::from_utf8(&head[..err.valid_up_to()]).unwrap_or(""),
     };
-    if text.contains("\"type\":\"call\"") {
-        return DaemonFrame::Overload { id: parse_id() };
+    text.strip_prefix("{\"type\":\"")?.split_once('"')
+}
+
+fn sniff_leading_id(rest: &str) -> Option<u64> {
+    let after = rest.strip_prefix(",\"id\":")?;
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    if end == 0 || !matches!(after.as_bytes().get(end), Some(b',' | b'}')) {
+        return None;
     }
-    if text.contains("\"type\":\"events_list\"")
-        || text.contains("\"type\":\"events_poll\"")
-        || text.contains("\"type\":\"events_stream\"")
-    {
-        return DaemonFrame::OverloadEvent { id: parse_id() };
+    after[..end].parse().ok()
+}
+
+fn sniff_daemon_overload(head: &[u8]) -> DaemonFrame {
+    let Some((kind, rest)) = sniff_tagged_head(head) else {
+        return DaemonFrame::Overload { id: None };
+    };
+    match kind {
+        "call" => DaemonFrame::Overload {
+            id: sniff_leading_id(rest),
+        },
+        "events_list" | "events_poll" | "events_stream" => DaemonFrame::OverloadEvent {
+            id: sniff_leading_id(rest),
+        },
+        _ => DaemonFrame::Overload { id: None },
     }
-    DaemonFrame::Overload { id: None }
 }
 
 /// Charges raw bytes, parsing, and the owned arguments through actual dispatch.
@@ -341,30 +318,6 @@ where
     Ok(bytes)
 }
 
-/// Counts the serialized JSON bytes of `message` without allocating a buffer.
-pub fn json_len<T>(message: &T) -> std::io::Result<usize>
-where
-    T: Serialize + ?Sized,
-{
-    struct Count(usize);
-
-    impl std::io::Write for Count {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            self.0 += buffer.len();
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, message)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    Ok(count.0)
-}
-
 /// The bytes a frame of `message` occupies, counted without holding them: the length prefix and
 /// the JSON. A caller that must reserve room for a frame before it exists measures it here, so
 /// no encoded buffer is ever held without the room for it.
@@ -372,7 +325,7 @@ pub fn frame_len<T>(message: &T) -> std::io::Result<usize>
 where
     T: Serialize + ?Sized,
 {
-    Ok(4 + json_len(message)?)
+    Ok(4 + crate::lease::json_len(message)?)
 }
 
 /// Writes bytes that are already a frame, then flushes them: a frame a reader waits on is never
@@ -700,32 +653,19 @@ where
 }
 
 fn sniff_endpoint_overload(head: &[u8]) -> LeasedEndpointFrame {
-    // `head` may cut through a multibyte UTF-8 sequence at byte 256; keep the valid prefix so
-    // ASCII JSON header fields (`"type"` and `"id"`) at the front of the frame still parse.
-    let text = match std::str::from_utf8(head) {
-        Ok(valid) => valid,
-        Err(err) => std::str::from_utf8(&head[..err.valid_up_to()]).unwrap_or(""),
-    };
-    if text.contains("\"type\":\"progress\"") {
-        return LeasedEndpointFrame::OverloadProgress;
-    }
-    let parse_id = || {
-        text.split_once("\"id\":").and_then(|(_, rest)| {
-            let digits: String = rest
-                .trim_start()
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            digits.parse().ok()
-        })
-    };
-    if text.contains("\"type\":\"event_frame\"") {
-        return LeasedEndpointFrame::OverloadEvent { id: parse_id() };
-    }
-    if !text.contains("\"type\":\"result\"") {
+    let Some((kind, rest)) = sniff_tagged_head(head) else {
         return LeasedEndpointFrame::OverloadResult { id: None };
+    };
+    match kind {
+        "progress" => LeasedEndpointFrame::OverloadProgress,
+        "event_frame" => LeasedEndpointFrame::OverloadEvent {
+            id: sniff_leading_id(rest),
+        },
+        "result" => LeasedEndpointFrame::OverloadResult {
+            id: sniff_leading_id(rest),
+        },
+        _ => LeasedEndpointFrame::OverloadResult { id: None },
     }
-    LeasedEndpointFrame::OverloadResult { id: parse_id() }
 }
 
 /// An OS string as the wire carries it: a JSON string when it is valid Unicode, and its native
@@ -737,13 +677,6 @@ pub enum OsText {
     Text(String),
     Units { units: Vec<Unit> },
 }
-
-/// The native unit of an OS string: UTF-16 on Windows, a byte on Unix.
-#[cfg(windows)]
-pub type Unit = u16;
-/// The native unit of an OS string: UTF-16 on Windows, a byte on Unix.
-#[cfg(unix)]
-pub type Unit = u8;
 
 #[cfg(windows)]
 fn units_of(value: &OsStr) -> Vec<Unit> {
@@ -987,63 +920,66 @@ pub enum ToEndpoint {
     },
 }
 
-impl crate::session::LaunchContext {
-    /// Payload capacity of the temporary wire copy, excluding the persistent environment.
-    pub(crate) fn wire_capacity(&self) -> usize {
-        fn copied(value: &OsStr) -> usize {
-            if let Some(text) = value.to_str() {
-                return text.len();
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStrExt;
-                value.as_bytes().len()
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::ffi::OsStrExt;
-                value.encode_wide().count() * std::mem::size_of::<Unit>()
-            }
+/// Payload capacity of the temporary wire copy, excluding the persistent environment.
+pub(crate) fn launch_wire_capacity(launch: &crate::session::LaunchContext) -> usize {
+    fn copied(value: &OsStr) -> usize {
+        if let Some(text) = value.to_str() {
+            return text.len();
         }
-        self.env
-            .iter()
-            .fold(copied(self.cwd.as_os_str()), |sum, (name, value)| {
-                sum.saturating_add(copied(name))
-                    .saturating_add(copied(value))
-            })
-    }
-    /// The context a Hello describes, or the field that could not be read.
-    pub fn from_wire(cwd: &OsText, env: &[(OsText, OsText)]) -> Result<Self, String> {
-        let cwd = cwd
-            .to_os_string()
-            .map_err(|problem| format!("cwd: {problem}"))?;
-        let mut entries = Vec::with_capacity(env.len());
-        for (index, (name, value)) in env.iter().enumerate() {
-            let name = name
-                .to_os_string()
-                .map_err(|problem| format!("env[{index}] name: {problem}"))?;
-            let value = value
-                .to_os_string()
-                .map_err(|problem| format!("env[{index}] value: {problem}"))?;
-            entries.push((name, value));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            value.as_bytes().len()
         }
-        Ok(Self::new(cwd.into(), entries))
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            value.encode_wide().count() * std::mem::size_of::<Unit>()
+        }
     }
+    launch
+        .env
+        .iter()
+        .fold(copied(launch.cwd.as_os_str()), |sum, (name, value)| {
+            sum.saturating_add(copied(name))
+                .saturating_add(copied(value))
+        })
+}
 
-    /// This context as a Hello carries it.
-    pub fn to_wire(&self) -> (OsText, Vec<(OsText, OsText)>) {
-        let env = self
-            .env
-            .iter()
-            .map(|(name, value)| {
-                (
-                    OsText::from(name.as_os_str()),
-                    OsText::from(value.as_os_str()),
-                )
-            })
-            .collect();
-        (OsText::from(self.cwd.as_os_str()), env)
+/// The context a Hello describes, or the field that could not be read.
+pub fn launch_from_wire(
+    cwd: &OsText,
+    env: &[(OsText, OsText)],
+) -> Result<crate::session::LaunchContext, String> {
+    let cwd = cwd
+        .to_os_string()
+        .map_err(|problem| format!("cwd: {problem}"))?;
+    let mut entries = Vec::with_capacity(env.len());
+    for (index, (name, value)) in env.iter().enumerate() {
+        let name = name
+            .to_os_string()
+            .map_err(|problem| format!("env[{index}] name: {problem}"))?;
+        let value = value
+            .to_os_string()
+            .map_err(|problem| format!("env[{index}] value: {problem}"))?;
+        entries.push((name, value));
     }
+    Ok(crate::session::LaunchContext::new(cwd.into(), entries))
+}
+
+/// This context as a Hello carries it.
+pub fn launch_to_wire(launch: &crate::session::LaunchContext) -> (OsText, Vec<(OsText, OsText)>) {
+    let env = launch
+        .env
+        .iter()
+        .map(|(name, value)| {
+            (
+                OsText::from(name.as_os_str()),
+                OsText::from(value.as_os_str()),
+            )
+        })
+        .collect();
+    (OsText::from(launch.cwd.as_os_str()), env)
 }
 
 #[cfg(test)]
@@ -1206,7 +1142,7 @@ mod tests {
         let ToDaemon::Hello { cwd, env, .. } = &owned.value else {
             panic!("Hello");
         };
-        let installed = crate::session::LaunchContext::from_wire(cwd, env).unwrap();
+        let installed = launch_from_wire(cwd, env).unwrap();
         assert_eq!(installed.cwd, std::path::PathBuf::from("/w"));
         assert_eq!(
             installed.env,
@@ -1332,7 +1268,7 @@ mod tests {
             },
         ];
         for message in &received {
-            assert_eq!(&round_trip(message, RESPONSE_LIMIT).await, message);
+            assert_eq!(&round_trip(message, FRAME_LIMIT).await, message);
         }
     }
 
@@ -1571,8 +1507,8 @@ mod tests {
                 (OsString::from("LANG"), OsString::from("C.UTF-8")),
             ],
         );
-        let (cwd, env) = context.to_wire();
-        let back = crate::session::LaunchContext::from_wire(&cwd, &env).unwrap();
+        let (cwd, env) = launch_to_wire(&context);
+        let back = launch_from_wire(&cwd, &env).unwrap();
         assert_eq!(back.cwd, context.cwd);
         assert_eq!(back.env, context.env);
 
@@ -1581,14 +1517,14 @@ mod tests {
             OsText::Text("TERM".to_owned()),
             OsText::Units { units: Vec::new() },
         )];
-        let back = crate::session::LaunchContext::from_wire(&cwd, &empty).unwrap();
+        let back = launch_from_wire(&cwd, &empty).unwrap();
         assert_eq!(back.env, [(OsString::from("TERM"), OsString::new())]);
     }
 
     #[tokio::test]
     async fn idle_writes_reset_on_forward_progress_and_fail_on_stall() {
         assert_eq!(PROTOCOL, 6);
-        assert_eq!(RESPONSE_LIMIT, 512 << 20);
+        assert_eq!(FRAME_LIMIT, 512 << 20);
 
         let payload = vec![b'x'; 256];
         let idle = std::time::Duration::from_millis(80);
@@ -1715,7 +1651,7 @@ mod tests {
         let occupied = pool.try_acquire(1).unwrap();
         let mut input = std::io::Cursor::new(wire.clone());
         assert!(matches!(
-            read_endpoint_frame_leased(&mut input, RESPONSE_LIMIT, &pool, &control, |_| false)
+            read_endpoint_frame_leased(&mut input, FRAME_LIMIT, &pool, &control, |_| false)
                 .await
                 .unwrap(),
             LeasedEndpointFrame::OverloadResult { id: Some(7) }
@@ -1729,7 +1665,7 @@ mod tests {
         drop(occupied);
         let mut input = std::io::Cursor::new(wire);
         let LeasedEndpointFrame::Frame(decoded, lease) =
-            read_endpoint_frame_leased(&mut input, RESPONSE_LIMIT, &pool, &control, |_| false)
+            read_endpoint_frame_leased(&mut input, FRAME_LIMIT, &pool, &control, |_| false)
                 .await
                 .unwrap()
         else {
@@ -1783,7 +1719,7 @@ mod tests {
 
         match read_endpoint_frame_leased(
             &mut cursor,
-            RESPONSE_LIMIT,
+            FRAME_LIMIT,
             &main_pool,
             &control_pool,
             |id| id == 78,
@@ -1798,7 +1734,7 @@ mod tests {
 
         match read_endpoint_frame_leased(
             &mut cursor,
-            RESPONSE_LIMIT,
+            FRAME_LIMIT,
             &main_pool,
             &control_pool,
             |id| id == 78,
@@ -1818,7 +1754,7 @@ mod tests {
 
         match read_endpoint_frame_leased(
             &mut cursor,
-            RESPONSE_LIMIT,
+            FRAME_LIMIT,
             &main_pool,
             &control_pool,
             |_| false,
@@ -1868,7 +1804,7 @@ mod tests {
         assert!(matches!(
             read_endpoint_frame_leased(
                 &mut drain_cursor,
-                RESPONSE_LIMIT,
+                FRAME_LIMIT,
                 &main_pool,
                 &control_pool,
                 |_| false,
@@ -1879,7 +1815,7 @@ mod tests {
         ));
         match read_endpoint_frame_leased(
             &mut drain_cursor,
-            RESPONSE_LIMIT,
+            FRAME_LIMIT,
             &main_pool,
             &control_pool,
             |_| false,
@@ -1893,7 +1829,7 @@ mod tests {
         drop(rem_main);
         match read_endpoint_frame_leased(
             &mut drain_cursor,
-            RESPONSE_LIMIT,
+            FRAME_LIMIT,
             &main_pool,
             &control_pool,
             |_| false,
@@ -1916,7 +1852,7 @@ mod tests {
         let mut over_64k_cursor = std::io::Cursor::new(over_64k_wire);
         match read_endpoint_frame_leased(
             &mut over_64k_cursor,
-            RESPONSE_LIMIT,
+            FRAME_LIMIT,
             &main_pool,
             &roomy_control,
             |_| false,
@@ -2007,7 +1943,7 @@ mod tests {
         let mut big_cursor = std::io::Cursor::new(big_wire);
         match read_endpoint_frame_leased(
             &mut big_cursor,
-            RESPONSE_LIMIT,
+            FRAME_LIMIT,
             &main_pool,
             &control_pool,
             |_| false,
@@ -2058,7 +1994,7 @@ mod tests {
             let mut cursor = std::io::Cursor::new(wire);
             match read_endpoint_frame_leased(
                 &mut cursor,
-                RESPONSE_LIMIT,
+                FRAME_LIMIT,
                 &main_pool,
                 &control_pool,
                 |_| false,
@@ -2107,7 +2043,7 @@ mod tests {
             let mut cursor = std::io::Cursor::new(wire);
             match read_endpoint_frame_leased(
                 &mut cursor,
-                RESPONSE_LIMIT,
+                FRAME_LIMIT,
                 &main_pool,
                 &control_pool,
                 |_| false,
@@ -2124,6 +2060,122 @@ mod tests {
                 other => panic!("expected control EventFrame({expected_id}), got {other:?}"),
             }
             assert_eq!(control_pool.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn overload_sniffers_anchor_top_level_type_and_id_against_nested_decoys() {
+        let empty_main = BytePool::new(0);
+        let empty_control = BytePool::new(0);
+        let roomy_control = BytePool::new(crate::lease::CONTROL_LIMIT);
+
+        // 1. Endpoint `EventFrame` carrying nested `{"type":"progress","id":999}` in `data`
+        //    must still sniff as `OverloadEvent { id: Some(42) }`, both when `control_pool` is
+        //    empty and when (> 64 KiB) skipping a roomy `control_pool`.
+        let small_event = ToEndpoint::EventFrame {
+            id: 42,
+            frame: EventWireFrame::Event(crate::events::StreamEvent {
+                event_id: "ep000001:1".to_owned(),
+                name: "external.event".to_owned(),
+                timestamp: "2026-11-26T00:00:00.000Z".to_owned(),
+                data: json!({
+                    "type": "progress",
+                    "id": 999,
+                    "nested": "{\"type\":\"result\",\"id\":888}"
+                }),
+                cursor: "ep000001:1".to_owned(),
+            }),
+        };
+        let mut cursor = std::io::Cursor::new(encode_frame(&small_event).unwrap());
+        match read_endpoint_frame_leased(
+            &mut cursor,
+            FRAME_LIMIT,
+            &empty_main,
+            &empty_control,
+            |_| false,
+        )
+        .await
+        .unwrap()
+        {
+            LeasedEndpointFrame::OverloadEvent { id } => assert_eq!(id, Some(42)),
+            other => panic!("expected OverloadEvent(42), got {other:?}"),
+        }
+
+        let big_event = ToEndpoint::EventFrame {
+            id: 43,
+            frame: EventWireFrame::Event(crate::events::StreamEvent {
+                event_id: "ep000001:2".to_owned(),
+                name: "external.event".to_owned(),
+                timestamp: "2026-11-26T00:00:00.000Z".to_owned(),
+                data: json!({
+                    "type": "progress",
+                    "id": 999,
+                    "pad": "p".repeat(70 * 1024),
+                }),
+                cursor: "ep000001:2".to_owned(),
+            }),
+        };
+        let mut big_cursor = std::io::Cursor::new(encode_frame(&big_event).unwrap());
+        match read_endpoint_frame_leased(
+            &mut big_cursor,
+            FRAME_LIMIT,
+            &empty_main,
+            &roomy_control,
+            |_| false,
+        )
+        .await
+        .unwrap()
+        {
+            LeasedEndpointFrame::OverloadEvent { id } => assert_eq!(id, Some(43)),
+            other => panic!("expected OverloadEvent(43), got {other:?}"),
+        }
+        assert_eq!(roomy_control.used(), 0);
+
+        // 2. Daemon `EventsPoll` and `EmitEvent` carrying nested `"type":"call"` and `"id":999`
+        //    must keep their top-level classification and top-level `id`.
+        let poll_with_decoy = ToDaemon::EventsPoll {
+            id: 73,
+            request: crate::events::PollRequest {
+                name: "external.event".to_owned(),
+                arguments: Some(json!({
+                    "source": "{\"type\":\"call\",\"id\":999}",
+                    "pad": "q".repeat(70 * 1024),
+                })),
+                cursor: None,
+                max_age_ms: None,
+                max_events: None,
+            },
+        };
+        for control in [&empty_control, &roomy_control] {
+            let mut poll_cursor = std::io::Cursor::new(encode_frame(&poll_with_decoy).unwrap());
+            match read_daemon_frame_owned(&mut poll_cursor, REQUEST_LIMIT, &empty_main, control)
+                .await
+                .unwrap()
+            {
+                DaemonFrame::OverloadEvent { id } => assert_eq!(id, Some(73)),
+                _ => panic!("expected OverloadEvent(73)"),
+            }
+            assert_eq!(control.used(), 0);
+        }
+
+        let emit_with_decoy = ToDaemon::EmitEvent {
+            event: crate::events::ExternalEventInput {
+                event_type: None,
+                source: "ci".to_owned(),
+                topic: None,
+                name: "done".to_owned(),
+                event_id: "ev-1".to_owned(),
+                timestamp: None,
+                data: json!({"type": "call", "id": 999}),
+            },
+        };
+        let mut emit_cursor = std::io::Cursor::new(encode_frame(&emit_with_decoy).unwrap());
+        match read_daemon_frame_owned(&mut emit_cursor, REQUEST_LIMIT, &empty_main, &empty_control)
+            .await
+            .unwrap()
+        {
+            DaemonFrame::Overload { id } => assert_eq!(id, None),
+            _ => panic!("expected Overload {{ id: None }} for EmitEvent"),
         }
     }
 }

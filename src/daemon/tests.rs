@@ -29,7 +29,7 @@ fn event_ipc_encoding_reserves_overlap_and_keeps_queued_bytes_charged() {
         let pool = BytePool::new(source_bytes + encoded_bytes - usize::from(!fits));
         let reserved = Arc::new(Semaphore::new(65_536));
         let owner = crate::lease::Owner::new(pool.try_acquire(source_bytes).unwrap());
-        let input = ipc::Owned::new(frame(), owner);
+        let input = lease::Owned::new(frame(), owner);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let closing = CancellationToken::new();
         let queued = events::queue_event_frame(&tx, &pool, 1, input);
@@ -110,7 +110,7 @@ fn fixture_with_write_stall(write_stall: Duration) -> Fixture {
 }
 
 fn hello(session: &str, connection: u64) -> ToDaemon {
-    let (cwd, env) = LaunchContext::current().unwrap().to_wire();
+    let (cwd, env) = ipc::launch_to_wire(&LaunchContext::current().unwrap());
     ToDaemon::Hello {
         protocol: ipc::PROTOCOL,
         namespace: "fastexec".to_owned(),
@@ -203,7 +203,7 @@ impl Client {
     async fn next(&mut self) -> Option<ToEndpoint> {
         timeout(
             Duration::from_secs(60),
-            ipc::read_frame(&mut self.reader, ipc::RESPONSE_LIMIT),
+            ipc::read_frame(&mut self.reader, lease::FRAME_LIMIT),
         )
         .await
         .expect("a frame arrived")
@@ -906,7 +906,7 @@ async fn kill_narrows_over_reserved_dual_frame_and_overload_preserves_cursor_and
     // Admit this normal input first; the remaining response allowance is
     // still far below the 128 KiB text workspace, so this checks post-start
     // overload and cursor preservation rather than pre-dispatch rejection.
-    let input_peak = ipc::json_len(&request).unwrap() * 6;
+    let input_peak = lease::json_len(&request).unwrap() * 6;
     let held_most = pool
         .try_acquire(pool.limit() - pool.used() - input_peak - 64)
         .unwrap();
@@ -1117,7 +1117,7 @@ async fn cancelling_waiting_file_work_does_not_dispatch_it() {
     let path = std::env::temp_dir().join(format!(
         "fastexec-cancel-render-write-{}-{}.txt",
         std::process::id(),
-        crate::tasks::random_chars(12).unwrap(),
+        crate::id::random_chars(12).unwrap(),
     ));
     assert!(!path.exists());
     client
@@ -1255,7 +1255,7 @@ async fn slow_forward_progress_outlives_write_stall_and_protocol_mismatch_is_rej
     // 2. Slow reader draining 16 bytes every 25ms across > 250ms (> 3 * stall) still completes.
     let dir = std::env::temp_dir().join(format!(
         "fastexec-slow-stall-{}",
-        crate::tasks::random_chars(8).unwrap()
+        crate::id::random_chars(8).unwrap()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("notes.txt"), "line1234567890\n".repeat(40)).unwrap();
@@ -1301,7 +1301,7 @@ async fn slow_forward_progress_outlives_write_stall_and_protocol_mismatch_is_rej
         stall
     );
     let decoded: Option<ToEndpoint> =
-        ipc::read_frame(&mut std::io::Cursor::new(raw), ipc::RESPONSE_LIMIT)
+        ipc::read_frame(&mut std::io::Cursor::new(raw), lease::FRAME_LIMIT)
             .await
             .unwrap();
     assert!(matches!(decoded, Some(ToEndpoint::Result { id: 1, .. })));
@@ -1547,7 +1547,7 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
     let disabled_frame = queued.recv().await.unwrap();
     let mut cursor = std::io::Cursor::new(disabled_frame.bytes);
     let Some(ToEndpoint::Result { result, .. }) =
-        ipc::read_frame::<_, ToEndpoint>(&mut cursor, ipc::RESPONSE_LIMIT)
+        ipc::read_frame::<_, ToEndpoint>(&mut cursor, lease::FRAME_LIMIT)
             .await
             .unwrap()
     else {
@@ -1589,7 +1589,7 @@ async fn transfer_checks_disabled_ipc_target_before_bind_ip_conflicts_and_unspec
     let bad_args_frame = queued.recv().await.unwrap();
     let mut cursor = std::io::Cursor::new(bad_args_frame.bytes);
     let Some(ToEndpoint::Result { result, .. }) =
-        ipc::read_frame::<_, ToEndpoint>(&mut cursor, ipc::RESPONSE_LIMIT)
+        ipc::read_frame::<_, ToEndpoint>(&mut cursor, lease::FRAME_LIMIT)
             .await
             .unwrap()
     else {

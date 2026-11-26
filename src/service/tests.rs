@@ -2,6 +2,7 @@ use super::core::*;
 use super::render::*;
 use super::schema::*;
 use super::*;
+use crate::id::parse_handle;
 use crate::session::TaskEntry;
 use crate::tasks::state::Snapshot;
 use crate::term::output::{Window, WindowBuilder, WindowSpec};
@@ -1046,7 +1047,7 @@ async fn rpc_id_budget_refusal_precedes_reader_commit_on_local_and_daemon_paths(
         let slot = RenderSlot::new(&render_pool);
         let mut ctx = script_ctx(&session);
         let mut delivery = AgentDelivery {
-            rpc_id_bytes: crate::ipc::json_len(&"r".repeat(2048)).unwrap(),
+            rpc_id_bytes: crate::lease::json_len(&"r".repeat(2048)).unwrap(),
             ..Default::default()
         };
         if daemon {
@@ -1079,7 +1080,7 @@ async fn rpc_id_budget_refusal_precedes_reader_commit_on_local_and_daemon_paths(
         assert_eq!(pool.used(), 0);
         let mut ctx = script_ctx(&session);
         let mut delivery = AgentDelivery {
-            rpc_id_bytes: crate::ipc::json_len(&"small").unwrap(),
+            rpc_id_bytes: crate::lease::json_len(&"small").unwrap(),
             ..Default::default()
         };
         if daemon {
@@ -1101,7 +1102,7 @@ async fn rpc_id_budget_refusal_precedes_reader_commit_on_local_and_daemon_paths(
             assert_eq!(state.attachments_seen, 1);
         }
         if daemon {
-            let local = crate::ipc::json_len(&delivered.result).unwrap();
+            let local = crate::lease::json_len(&delivered.result).unwrap();
             assert!(delivered.lease.as_ref().unwrap().bytes() >= local);
         }
         drop(delivered);
@@ -1234,7 +1235,7 @@ async fn agent_text_result_keeps_its_payload_owner_after_rendering() {
     let retained = result_payload_capacity(&result.result);
     assert!(retained > 0);
     let wire = result.lease.as_ref().unwrap().bytes();
-    assert!(wire >= crate::ipc::json_len(&result.result).unwrap());
+    assert!(wire >= crate::lease::json_len(&result.result).unwrap());
     assert_eq!(pool.used(), retained + wire);
     drop(result.lease.take());
     assert_eq!(pool.used(), retained);

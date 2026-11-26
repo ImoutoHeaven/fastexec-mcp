@@ -16,12 +16,10 @@ use self::schema::{
     Action, DEFAULT_KEY_DELAY_MS, ExecPolicy, ListScope, ListState, MAX_INPUT_BYTES, Request, View,
     flag, normalize_request, validate, validate_cwd,
 };
+use crate::id;
 use crate::lease::Lease;
 use crate::platform::{conpty, process};
-use crate::session::{
-    LaunchContext, ProbeWarning, ReadState, Reader, Session, TaskEntry, parse_handle,
-    parse_handle_for,
-};
+use crate::session::{LaunchContext, ProbeWarning, ReadState, Reader, Session, TaskEntry};
 use crate::tasks::state::{AttachmentLease, Task};
 use crate::tasks::{
     self, EVICTED_TRANSCRIPT, ListQuery, ListedResult, ListedTask, ScriptArgs, StartArgs, Tasks,
@@ -454,7 +452,7 @@ impl Service {
         let tasks = Arc::clone(&self.tasks);
         let session = Arc::clone(ctx.session);
         let key =
-            tasks::random_chars(4).map_err(|error| format!("Cannot name the reader: {error}"))?;
+            id::random_chars(4).map_err(|error| format!("Cannot name the reader: {error}"))?;
         let started = tokio::task::spawn_blocking(move || tasks.start_script(args, &session, key))
             .await
             .map_err(|error| format!("Internal failure while starting: {error}."))??;
@@ -594,7 +592,7 @@ impl Service {
                 };
                 let tasks = Arc::clone(&self.tasks);
                 let starting = Arc::clone(&session);
-                let key = tasks::random_chars(4)
+                let key = id::random_chars(4)
                     .map_err(|error| format!("Cannot name the reader: {error}"))?;
                 if consumer == Consumer::Program && ctx.cancel.is_cancelled() {
                     return Err(ServiceError::Cancelled(
@@ -939,28 +937,22 @@ impl Service {
             })?;
         let encoding = view.encoding.unwrap_or(task.encoding);
         let initial_metadata = PreparedSnapshot::new(&task, launch, action)?;
-        let clean = !task.is_script();
-        let keep_nul = view.keep_nul;
-        let include_markers = view.inline_markers;
-        let budget = view.max_bytes;
+        let spec = WindowSpec {
+            truncate: view.truncate,
+            budget: view.max_bytes,
+            raw: view.raw,
+            clean: !task.is_script(),
+            keep_nul: view.keep_nul,
+            include_markers: view.inline_markers,
+            encoding,
+            source: "log",
+        };
         let initial_seen = state.attachments_seen;
-        let truncate = view.truncate;
-        let raw = view.raw;
         let staged = (workspace, permit, StagedRead::new(state));
         let pending = tokio::task::spawn_blocking(move || {
             let mut held = staged;
             let start = held.2.state.cursor;
-            let window = reader.read_window_with_markers(
-                &mut held.2.state,
-                truncate,
-                budget,
-                raw,
-                clean,
-                keep_nul,
-                include_markers,
-                encoding,
-                None,
-            );
+            let window = reader.read_window_with_markers(&mut held.2.state, spec, None);
             let had_new_text = held.2.state.cursor > start;
             let unseen = if window.is_ok() {
                 reader.unseen_attachments(initial_seen)
@@ -1025,17 +1017,17 @@ impl Service {
         let staged = (screen, permit, StagedRead::new(state));
         let pending = tokio::task::spawn_blocking(move || {
             let mut held = staged;
-            let window = reader.read_window_with_markers(
-                &mut held.2.state,
-                Truncate::Tail,
-                MIN_BODY_BUDGET,
-                false,
-                true,
-                false,
-                true,
-                reader.encoding,
-                Some(until),
-            );
+            let spec = WindowSpec {
+                truncate: Truncate::Tail,
+                budget: MIN_BODY_BUDGET,
+                raw: false,
+                clean: true,
+                keep_nul: false,
+                include_markers: true,
+                encoding: reader.encoding,
+                source: "log",
+            };
+            let window = reader.read_window_with_markers(&mut held.2.state, spec, Some(until));
             (window, held)
         })
         .await
@@ -1230,7 +1222,7 @@ impl Service {
         }
         let parent_id = match parent_task_id {
             Some(raw) => Some(
-                parse_handle_for(raw, "parentTaskId")
+                id::parse_handle_for(raw, "parentTaskId")
                     .map_err(ServiceError::Validation)?
                     .0,
             ),
@@ -1286,7 +1278,7 @@ impl Service {
     }
 
     fn unknown_task_error(&self, field: &str, id: &str) -> String {
-        let epoch_differs = tasks::is_valid_task_id(id)
+        let epoch_differs = id::is_valid_task_id(id)
             && id
                 .split_once('-')
                 .is_some_and(|(epoch, _)| epoch != self.tasks.epoch());
@@ -1316,7 +1308,7 @@ impl Service {
         handle: Option<&'a str>,
     ) -> Result<(Arc<Task>, Option<&'a str>), ServiceError> {
         let (id, key) =
-            parse_handle(handle.unwrap_or_default()).map_err(ServiceError::Validation)?;
+            id::parse_handle(handle.unwrap_or_default()).map_err(ServiceError::Validation)?;
         if let Some(task) = self.tasks.find(id) {
             return Ok((task, key));
         }

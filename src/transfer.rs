@@ -4,7 +4,7 @@
 //! download or a stalled upload never loses its URL. The table is in memory only: a server or
 //! daemon restart starts with none.
 
-use crate::tasks::ALPHABET;
+use crate::id::{ALPHABET, random_chars};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -103,7 +103,7 @@ impl Transfers {
 
     /// `create` with the moment named, so a test can move time without sleeping.
     fn create_at(&self, path: PathBuf, now: Instant) -> Result<String, String> {
-        let id = crate::tasks::random_chars(ID_LENGTH)
+        let id = random_chars(ID_LENGTH)
             .map_err(|error| format!("Cannot make a transfer id: {error}"))?;
         let entry = Entry {
             path: Arc::new(path),
@@ -481,9 +481,9 @@ pub(crate) fn inspect_transfer_request(
     request: Request,
     launch: Arc<crate::session::LaunchContext>,
     input_owner: crate::lease::Owner,
-) -> impl std::future::Future<Output = crate::ipc::Owned<TransferInspection>> {
+) -> impl std::future::Future<Output = crate::lease::Owned<TransferInspection>> {
     // Build the owner before creating the future, including its never-polled case.
-    let input = crate::ipc::Owned::new(request, input_owner);
+    let input = crate::lease::Owned::new(request, input_owner);
     async move {
         match tokio::task::spawn_blocking(move || {
             input.flat_map(|request| {
@@ -493,13 +493,15 @@ pub(crate) fn inspect_transfer_request(
                     let bytes = inspect_transfer_target(&path, &shown, launch.memory(), lease)?;
                     Ok::<_, String>((path, shown, bytes))
                 })
-                .unwrap_or_else(|message| crate::ipc::Owned::new(Err(message), Default::default()))
+                .unwrap_or_else(|message| {
+                    crate::lease::Owned::new(Err(message), Default::default())
+                })
             })
         })
         .await
         {
             Ok(result) => result,
-            Err(error) => crate::ipc::Owned::new(
+            Err(error) => crate::lease::Owned::new(
                 Err(format!("the file operation did not finish: {error}")),
                 Default::default(),
             ),

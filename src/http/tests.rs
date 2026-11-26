@@ -6,7 +6,7 @@ async fn download_fixture(
 ) -> (PathBuf, Arc<Transfers>, FileBody) {
     let directory = std::env::temp_dir().join(format!(
         "fastexec-download-budget-{}",
-        crate::tasks::random_chars(12).unwrap()
+        crate::id::random_chars(12).unwrap()
     ));
     std::fs::create_dir(&directory).unwrap();
     let path = directory.join("ordinary.txt");
@@ -68,7 +68,7 @@ async fn download_frame_slices_keep_their_lease_after_body_drop() {
 async fn native_file_worker_admits_before_io_and_releases_success_and_error() {
     let directory = std::env::temp_dir().join(format!(
         "fastexec-native-transfer-{}",
-        crate::tasks::random_chars(12).unwrap()
+        crate::id::random_chars(12).unwrap()
     ));
     std::fs::create_dir(&directory).unwrap();
     let path = Arc::new(directory.join("ordinary.txt"));
@@ -149,7 +149,7 @@ fn metadata_worker_keeps_the_shared_path_after_its_waiter_is_dropped() {
         let id = table
             .create(PathBuf::from(format!(
                 "future-transfer-{}",
-                crate::tasks::random_chars(12).unwrap()
+                crate::id::random_chars(12).unwrap()
             )))
             .unwrap();
         let admitted = table.admit(&id).unwrap();
@@ -193,7 +193,7 @@ fn metadata_worker_keeps_the_shared_path_after_its_waiter_is_dropped() {
 async fn downloads_size_the_same_open_handle_it_streams() {
     let directory = std::env::temp_dir().join(format!(
         "fastexec-transfer-replace-{}",
-        crate::tasks::random_chars(12).unwrap()
+        crate::id::random_chars(12).unwrap()
     ));
     std::fs::create_dir(&directory).unwrap();
     let path = directory.join("file.txt");
@@ -246,7 +246,7 @@ async fn idle_upload_flushes_accepted_prefix_and_releases_turn() {
 
     let directory = std::env::temp_dir().join(format!(
         "fastexec-transfer-idle-{}",
-        crate::tasks::random_chars(12).unwrap()
+        crate::id::random_chars(12).unwrap()
     ));
     let path = directory.join("file.txt");
     let table = Arc::new(Transfers::new());
@@ -330,131 +330,6 @@ fn the_origins_are_this_listener_and_what_the_configuration_adds() {
     assert!(allowed_hosts(bound, false).contains(&"127.0.0.2".to_owned()));
     // A daemon reachable through a proxy trusts the proxy for both.
     assert!(allowed_hosts(bound, true).is_empty());
-}
-
-/// Every value that names an address clients reach, normalized to what a URL is minted from.
-#[test]
-fn a_public_root_keeps_what_it_states_and_gains_one_trailing_slash() {
-    let valid = [
-        ("http://h", "http://h/"),
-        ("http://h/", "http://h/"),
-        ("https://h.example/mac", "https://h.example/mac/"),
-        ("https://h.example/mac/", "https://h.example/mac/"),
-        ("HTTP://Host.Example/Mac", "http://Host.Example/Mac/"),
-        (
-            "https://HtTpS.example:8443/mac/",
-            "https://HtTpS.example:8443/mac/",
-        ),
-        ("http://127.0.0.1:8765/mac/", "http://127.0.0.1:8765/mac/"),
-        ("https://h:65535/", "https://h:65535/"),
-        // A bracketed IPv6 host is an authority like any other, with or without a port.
-        ("http://[::1]", "http://[::1]/"),
-        ("http://[::1]:80/", "http://[::1]:80/"),
-        ("http://[::1]:8080/mac", "http://[::1]:8080/mac/"),
-        (
-            "https://[2001:db8:0:0:0:0:0:1]:443/files",
-            "https://[2001:db8:0:0:0:0:0:1]:443/files/",
-        ),
-        ("http://[::ffff:127.0.0.1]/", "http://[::ffff:127.0.0.1]/"),
-        // Encoded bytes are what a proxy rewrites to, so they are kept as stated.
-        ("https://h/a%20b/", "https://h/a%20b/"),
-        ("https://h/%2E%2E/%2e/", "https://h/%2E%2E/%2e/"),
-    ];
-    for (value, expected) in valid {
-        assert_eq!(valid_root(value).as_deref(), Ok(expected), "{value:?}");
-    }
-}
-
-/// Each way a value cannot name an address, with the reason it is refused for.
-#[test]
-fn a_public_root_that_cannot_be_used_is_refused_with_its_reason() {
-    let refused = [
-        ("", "must start with http:// or https://"),
-        (
-            "http://h/ mac/",
-            "contains whitespace or a control character",
-        ),
-        (
-            "http://h/a\u{7}",
-            "contains whitespace or a control character",
-        ),
-        ("https://h/a?b=c", "carries a query or a fragment"),
-        ("https://h/a#b", "carries a query or a fragment"),
-        ("ftp://h/mac/", "must start with http:// or https://"),
-        ("h/mac/", "must start with http:// or https://"),
-        ("http:///mac/", "names no host"),
-        ("http://user@h/mac/", "carries userinfo"),
-        ("http://user:secret@h/mac/", "carries userinfo"),
-        ("http://h:/", "has an empty port"),
-        ("http://h:/mac/", "has an empty port"),
-        ("http://h:0/", "has a port outside 1-65535"),
-        ("http://h:65536/", "has a port outside 1-65535"),
-        ("http://h:abc/", "has a port that is not a decimal number"),
-        ("http://h:8a80/", "has a port that is not a decimal number"),
-        ("http://h:-1/", "has a port that is not a decimal number"),
-        ("http://[::1]:/", "has an empty port"),
-        ("http://[::1]:70000/", "has a port outside 1-65535"),
-        // `http::Uri` reads a bracketed authority loosely, so these are judged on the raw text.
-        ("http://[]/", "names no host"),
-        ("http://[]:80/mac/", "names no host"),
-        (
-            "http://[localhost]/",
-            "has a bracketed host that is not an IPv6 address",
-        ),
-        (
-            "http://[127.0.0.1]:80/mac/",
-            "has a bracketed host that is not an IPv6 address",
-        ),
-        (
-            "http://[:::1]/",
-            "has a bracketed host that is not an IPv6 address",
-        ),
-        (
-            "http://[::1::]/",
-            "has a bracketed host that is not an IPv6 address",
-        ),
-        ("http://[::1]junk/mac/", "has text after a bracketed host"),
-        (
-            "http://[::1]junk:abc/mac/",
-            "has text after a bracketed host",
-        ),
-        ("http://[::1:8080/mac/", "has an unclosed bracketed host"),
-        ("http://h/./mac/", "has a dot path segment"),
-        ("http://h/../mac/", "has a dot path segment"),
-        ("http://h/mac/.", "has a dot path segment"),
-        ("http://h//mac/", "has an empty path segment"),
-        ("http://h/mac//deep/", "has an empty path segment"),
-    ];
-    for (value, reason) in refused {
-        let message = valid_root(value).expect_err(value);
-        // The reason and the variable, and never the value: a mistyped value can carry userinfo
-        // and this message reaches a terminal and a daemon log.
-        assert_eq!(
-            message,
-            format!("FASTEXEC_PUBLIC_URL {reason}"),
-            "{value:?}"
-        );
-    }
-}
-
-/// The variable is unset or it is a value; a value that is not UTF-8 cannot be a URL.
-#[test]
-fn an_unset_public_root_is_no_root_and_an_unreadable_one_is_refused() {
-    assert_eq!(root_of(None), Ok(None));
-    assert_eq!(
-        root_of(Some(std::ffi::OsStr::new("https://h/mac"))),
-        Ok(Some("https://h/mac/".to_owned()))
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let message = root_of(Some(std::ffi::OsStr::from_bytes(b"https://h/\xff")))
-            .expect_err("a value that is not UTF-8");
-        assert!(
-            message.starts_with("FASTEXEC_PUBLIC_URL ") && message.contains("UTF-8"),
-            "{message}"
-        );
-    }
 }
 
 #[derive(Clone)]
@@ -1295,7 +1170,7 @@ async fn three_client_suites_modern_events_modern_plain_and_legacy_2025() {
 async fn transfer_subquota_returns_503_while_preserving_mcp_control_plane() {
     let dir = std::env::temp_dir().join(format!(
         "fastexec-transfer-subquota-{}",
-        crate::tasks::random_chars(12).unwrap()
+        crate::id::random_chars(12).unwrap()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1423,7 +1298,7 @@ impl TestHttpSender {
 async fn transfer_connection_quota_survives_completed_requests_on_http1_and_http2() {
     let dir = std::env::temp_dir().join(format!(
         "fastexec-transfer-connections-{}",
-        crate::tasks::random_chars(12).unwrap()
+        crate::id::random_chars(12).unwrap()
     ));
     std::fs::create_dir(&dir).unwrap();
     let sample = dir.join("ordinary.txt");

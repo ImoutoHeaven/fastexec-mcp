@@ -87,7 +87,7 @@ pub(super) fn run(
         captured,
         input_owner,
     } = work;
-    let code = crate::ipc::Owned::new(code, input_owner);
+    let code = crate::lease::Owned::new(code, input_owner);
     let output = Rc::new(RefCell::new(Output { writer, written: 0 }));
     let Some(diagnostic_lease) = launch.control_memory().try_acquire(DIAGNOSTIC_WORKSPACE) else {
         output.borrow_mut().diagnostic(&[

@@ -184,7 +184,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "fastexec-bash-native-{}-{}",
             std::process::id(),
-            crate::tasks::random_chars(10).unwrap(),
+            crate::id::random_chars(10).unwrap(),
         ));
         let missing = root.join(OsString::from_vec(b"bin-\xff".to_vec()));
         let working = root.join("bin-\u{fffd}");

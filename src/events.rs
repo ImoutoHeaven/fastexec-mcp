@@ -1,8 +1,7 @@
 //! Bounded in-memory event bus for MCP Events (`task.exited` and `external.event`).
 
-use crate::ipc::{self, Owned};
-use crate::lease::{self, BytePool, Lease, Owner};
-use crate::tasks;
+use crate::id;
+use crate::lease::{self, BytePool, Lease, Owned, Owner};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -408,14 +407,14 @@ struct EventRecord {
     timestamp: String,
     emitted_ms: u64,
     data: Value,
+    data_bytes: usize,
     meta: EventMeta,
     lease: Lease,
 }
 
 impl EventRecord {
     fn projection_bytes(&self, cursor_bytes: usize) -> usize {
-        ipc::json_len(&self.data)
-            .unwrap_or(usize::MAX)
+        self.data_bytes
             .saturating_add(self.event_id.len())
             .saturating_add(self.name.len())
             .saturating_add(self.timestamp.len())
@@ -567,6 +566,13 @@ impl BusState {
         self.ring.front().map(|entry| entry.seq)
     }
 
+    fn reclaimable_bytes(&self) -> usize {
+        self.ring
+            .iter()
+            .filter(|r| Arc::strong_count(r) == 1)
+            .fold(0usize, |sum, r| sum.saturating_add(r.lease.bytes()))
+    }
+
     fn evict_oldest(&mut self) -> bool {
         let Some(evicted) = self.ring.pop_front() else {
             return false;
@@ -612,7 +618,7 @@ impl Drop for StreamGuard {
 
 impl EventBus {
     pub fn new() -> std::io::Result<Self> {
-        let boot_epoch = tasks::random_chars(8)?;
+        let boot_epoch = id::random_chars(8)?;
         Ok(Self::with_config(
             boot_epoch,
             DEFAULT_MAX_EVENTS,
@@ -793,15 +799,13 @@ impl EventBus {
             obj.insert("logPath".to_owned(), Value::String(log_path));
         }
         let data = Value::Object(obj);
-        let data_bytes = serde_json::to_vec(&data)
-            .map_err(|e| EventError::InvalidParams(format!("cannot serialize event: {e}")))?
-            .len();
+        let data_bytes = lease::json_len(&data)
+            .map_err(|e| EventError::InvalidParams(format!("cannot serialize event: {e}")))?;
         let meta = EventMeta::TaskExited {
             task_id: input.task_id,
             session_id: input.session_id,
         };
-        let entry_bytes = estimate_entry_bytes(EVENT_TASK_EXITED, data_bytes, &meta);
-        self.enqueue(EVENT_TASK_EXITED, data, meta, entry_bytes, now_ms, None)
+        self.enqueue(EVENT_TASK_EXITED, data, data_bytes, meta, now_ms, None)
     }
 
     pub fn publish_external(&self, input: ExternalEventInput) -> Result<PublishResult, EventError> {
@@ -855,9 +859,8 @@ impl EventBus {
         }
         obj.insert("data".to_owned(), input.data);
         let payload = Value::Object(obj);
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| EventError::InvalidParams(format!("cannot serialize event: {e}")))?
-            .len();
+        let payload_bytes = lease::json_len(&payload)
+            .map_err(|e| EventError::InvalidParams(format!("cannot serialize event: {e}")))?;
         if payload_bytes > MAX_EXTERNAL_EVENT_BYTES {
             return Err(EventError::InvalidParams(format!(
                 "external.event payload ({payload_bytes} bytes) exceeds {MAX_EXTERNAL_EVENT_BYTES} byte limit"
@@ -871,12 +874,11 @@ impl EventBus {
             upstream_name: input.name,
             event_id: input.event_id,
         };
-        let entry_bytes = estimate_entry_bytes(EVENT_EXTERNAL, payload_bytes, &meta);
         self.enqueue(
             EVENT_EXTERNAL,
             payload,
+            payload_bytes,
             meta,
-            entry_bytes,
             now_ms,
             Some(dedup_key),
         )
@@ -886,8 +888,8 @@ impl EventBus {
         &self,
         name: &'static str,
         data: Value,
+        data_bytes: usize,
         meta: EventMeta,
-        entry_bytes: usize,
         now_ms: u64,
         dedup_key: Option<(String, String)>,
     ) -> Result<PublishResult, EventError> {
@@ -902,6 +904,7 @@ impl EventBus {
             });
         }
 
+        let entry_bytes = estimate_entry_bytes(name, data_bytes, &meta);
         if entry_bytes > self.max_bytes {
             return Err(EventError::ResourceExhausted {
                 limit: "event_bus_bytes",
@@ -910,6 +913,20 @@ impl EventBus {
                     "event size ({entry_bytes} bytes) exceeds event bus budget ({} bytes)",
                     self.max_bytes
                 ),
+            });
+        }
+
+        if self.pool.available() < entry_bytes
+            && self
+                .pool
+                .available()
+                .saturating_add(state.reclaimable_bytes())
+                < entry_bytes
+        {
+            return Err(EventError::ResourceExhausted {
+                limit: "process_memory",
+                max: self.pool.limit(),
+                message: "process byte budget is full; event was not enqueued".to_owned(),
             });
         }
 
@@ -922,17 +939,26 @@ impl EventBus {
             }
         }
 
-        let lease = loop {
-            if let Some(lease) = self.pool.try_acquire(entry_bytes) {
-                break lease;
-            }
-            if !state.evict_oldest() {
-                return Err(EventError::ResourceExhausted {
-                    limit: "process_memory",
-                    max: self.pool.limit(),
-                    message: "process byte budget is full; event was not enqueued".to_owned(),
-                });
-            }
+        let lease = match self.pool.try_acquire(entry_bytes) {
+            Some(lease) => lease,
+            None => loop {
+                if self
+                    .pool
+                    .available()
+                    .saturating_add(state.reclaimable_bytes())
+                    < entry_bytes
+                    || !state.evict_oldest()
+                {
+                    return Err(EventError::ResourceExhausted {
+                        limit: "process_memory",
+                        max: self.pool.limit(),
+                        message: "process byte budget is full; event was not enqueued".to_owned(),
+                    });
+                }
+                if let Some(lease) = self.pool.try_acquire(entry_bytes) {
+                    break lease;
+                }
+            },
         };
 
         let seq = state.next_seq;
@@ -946,6 +972,7 @@ impl EventBus {
             timestamp: format_rfc3339_ms(now_ms),
             emitted_ms: now_ms,
             data,
+            data_bytes,
             meta,
             lease,
         });
@@ -1611,7 +1638,8 @@ mod tests {
         let expected_catalog = serde_json::to_value(&catalog.value).unwrap();
         let expected_active = serde_json::to_value(&active.value).unwrap();
         assert!(
-            ipc::json_len(&catalog.value).unwrap() <= catalog.owner.get::<Lease>().unwrap().bytes()
+            lease::json_len(&catalog.value).unwrap()
+                <= catalog.owner.get::<Lease>().unwrap().bytes()
         );
         let charged = pool.used();
         let catalog = catalog.map(Value::from);
@@ -2350,5 +2378,93 @@ mod tests {
         assert_eq!(payload["timestamp"], "2026-11-25T12:34:56Z");
         assert!(payload.get("upstreamEventId").is_none());
         assert!(payload.get("upstreamTruncated").is_none());
+    }
+
+    #[test]
+    fn unrecoverable_pool_exhaustion_preserves_ring_and_dedup() {
+        // 1. External lease pins pool space so evicting the ring still cannot satisfy `entry_bytes`.
+        let (bus, pool) = test_bus(16, 1 << 20, 8, 4096);
+        let start = bus.current_cursor();
+        let first = bus
+            .publish_external_at(ext_input("gh", "keep-1", "push", json!({"n": 1})), 1000)
+            .unwrap();
+        bus.publish_external_at(ext_input("gh", "keep-2", "push", json!({"n": 2})), 1001)
+            .unwrap();
+        let ring_charged = pool.used();
+        assert_eq!(bus.ring_len(), 2);
+        assert_eq!(bus.dedup_len(), 2);
+
+        let pinned = pool.try_acquire(pool.available()).unwrap();
+        let err = bus
+            .publish_external_at(
+                ext_input(
+                    "gh",
+                    "too-large",
+                    "push",
+                    json!({"pad": "x".repeat(ring_charged + 256)}),
+                ),
+                1002,
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), -32025);
+        assert_eq!(
+            err.data(),
+            Some(json!({"limit": "process_memory", "max": pool.limit()}))
+        );
+        assert_eq!(bus.ring_len(), 2);
+        assert_eq!(bus.dedup_len(), 2);
+
+        let dup = bus
+            .publish_external_at(ext_input("gh", "keep-1", "push", json!({"n": 99})), 1003)
+            .unwrap();
+        assert!(dup.deduplicated);
+        assert_eq!(dup.cursor, first.cursor);
+
+        drop(pinned);
+        let polled = bus
+            .poll(
+                PollRequest {
+                    name: EVENT_EXTERNAL.to_owned(),
+                    cursor: Some(start),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(polled.value.events.len(), 2);
+
+        // 2. Active stream subscriber holds `Arc<EventRecord>` references (`strong_count > 1`)
+        //    on a full ring (`max_events = 2`), so ring eviction would reclaim 0 bytes and must
+        //    not kick `sub-1` out of `ring` or `dedup`.
+        let (sub_bus, sub_pool) = test_bus(2, 1 << 20, 8, 4096);
+        let _sub = sub_bus
+            .subscribe(
+                SubscribeRequest {
+                    name: EVENT_EXTERNAL.to_owned(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let sub_first = sub_bus
+            .publish_external_at(ext_input("gh", "sub-1", "push", json!({})), 2000)
+            .unwrap();
+        sub_bus
+            .publish_external_at(ext_input("gh", "sub-2", "push", json!({})), 2001)
+            .unwrap();
+        let _pinned_sub = sub_pool.try_acquire(sub_pool.available()).unwrap();
+
+        let err = sub_bus
+            .publish_external_at(ext_input("gh", "sub-3", "push", json!({})), 2002)
+            .unwrap_err();
+        assert_eq!(err.code(), -32025);
+        assert_eq!(sub_bus.ring_len(), 2);
+        assert_eq!(sub_bus.dedup_len(), 2);
+
+        let sub_dup = sub_bus
+            .publish_external_at(ext_input("gh", "sub-1", "push", json!({})), 2003)
+            .unwrap();
+        assert!(sub_dup.deduplicated);
+        assert_eq!(sub_dup.cursor, sub_first.cursor);
     }
 }

@@ -1,0 +1,2833 @@
+//! Lexical and module-path architecture gates for Phase 2 decoupling (Spec §3, §7.1, §7.2).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Target 23-module strict lower-triangular allowlist `D(u)` from Spec §3 (`rank(v) < rank(u)`).
+///
+/// Checkpoint 1 mapping notes:
+/// - `#4 session` occupies the target `#4 env` slot until Checkpoint 2 splits `src/session.rs`
+///   into `#4 src/env.rs` and `#12 src/tasks/session.rs`.
+/// - `#15 render` and `#18 http_wire` are included at their target ranks so Checkpoint 2 and
+///   Checkpoint 3 extractions activate without reordering.
+/// - `ingress` is listed separately in [`CP1_TRANSITIONAL_MODULES`] until Checkpoint 3 folds
+///   `src/ingress.rs` into `#21 src/mcp/ingress.rs`.
+const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
+    // S0 primitives (#1..#3, 3x3 diagonal block)
+    ("id", &[]),
+    ("lease", &[]),
+    ("transport", &[]),
+    // S1a launch environment (#4; named `session` in CP1 before splitting out `env`)
+    ("session", &["lease"]),
+    // S1b host capabilities (#5..#7, 3x3 diagonal block)
+    ("media", &["lease"]),
+    ("term", &["lease"]),
+    ("platform", &["id", "lease", "transport", "session"]),
+    // S1c files and configuration (#8..#10, {transfer, config} 2x2 diagonal block)
+    (
+        "files",
+        &["lease", "transport", "session", "media", "platform"],
+    ),
+    ("transfer", &["id", "lease", "session", "files"]),
+    ("config", &["session", "files"]),
+    // S2 events, tasks, and wait (#11..#13)
+    ("events", &["id", "lease"]),
+    (
+        "tasks",
+        &[
+            "id", "lease", "session", "media", "term", "platform", "files", "events",
+        ],
+    ),
+    ("wait", &["lease", "term", "files", "tasks"]),
+    // S3 domain orchestration (#14)
+    (
+        "service",
+        &[
+            "id", "lease", "session", "term", "platform", "files", "events", "tasks", "wait",
+        ],
+    ),
+    // S4 projection and wire (#15..#17, 3x3 diagonal block)
+    (
+        "render",
+        &[
+            "lease", "session", "media", "term", "platform", "files", "transfer", "events",
+            "tasks", "wait", "service",
+        ],
+    ),
+    (
+        "codemode",
+        &[
+            "id", "lease", "session", "media", "term", "platform", "files", "tasks", "wait",
+            "service",
+        ],
+    ),
+    ("ipc", &["lease", "session", "events"]),
+    // S5a HTTP wire and IPC client (#18..#19, 2x2 diagonal block)
+    ("http_wire", &["lease", "files", "transfer"]),
+    (
+        "endpoint",
+        &[
+            "id",
+            "lease",
+            "transport",
+            "session",
+            "platform",
+            "events",
+            "wait",
+            "render",
+            "ipc",
+        ],
+    ),
+    // S5b daemon and MCP handler (#20..#21, 2x2 diagonal block)
+    (
+        "daemon",
+        &[
+            "lease",
+            "transport",
+            "session",
+            "platform",
+            "transfer",
+            "config",
+            "events",
+            "tasks",
+            "service",
+            "render",
+            "codemode",
+            "ipc",
+            "http_wire",
+        ],
+    ),
+    (
+        "mcp",
+        &[
+            "id", "lease", "session", "files", "transfer", "config", "events", "tasks", "wait",
+            "service", "render", "codemode", "ipc", "endpoint",
+        ],
+    ),
+    // S5c HTTP server and CLI entrypoints (#22..#23)
+    (
+        "http",
+        &[
+            "lease",
+            "session",
+            "transfer",
+            "config",
+            "tasks",
+            "service",
+            "http_wire",
+            "mcp",
+        ],
+    ),
+    (
+        "cli",
+        &[
+            "id",
+            "lease",
+            "transport",
+            "session",
+            "platform",
+            "transfer",
+            "config",
+            "events",
+            "tasks",
+            "service",
+            "ipc",
+            "http_wire",
+            "endpoint",
+            "daemon",
+            "mcp",
+            "http",
+        ],
+    ),
+];
+
+/// Top-level modules present in CP1 that fold into another module in a later checkpoint.
+/// `src/ingress.rs` folds into `src/mcp/ingress.rs` in Checkpoint 3.
+const CP1_TRANSITIONAL_MODULES: &[&str] = &["ingress"];
+
+/// Exact set of cross-top-module directed edges `(from, to)` still present after Checkpoint 1
+/// that lie outside [`TARGET_DAG_ALLOWLIST`] and are scheduled for removal in CP2 or CP3.
+const CP1_TRANSITIONAL_EDGES: &[(&str, &str)] = &[
+    // CP2 removals: `session` split (`env` + `tasks/session`), `render` extraction, `codemode` decoupling
+    ("session", "id"),
+    ("session", "term"),
+    ("session", "files"),
+    ("session", "platform"),
+    ("session", "tasks"),
+    ("files", "service"),
+    ("tasks", "codemode"),
+    ("tasks", "service"),
+    ("wait", "session"),
+    ("service", "media"),
+    ("service", "codemode"),
+    ("service", "ipc"),
+    ("endpoint", "files"),
+    // CP3 removals: `http_wire` extraction, `daemon <-> http` inversion, `mcp/ingress` fold
+    ("ingress", "lease"),
+    ("daemon", "files"),
+    ("daemon", "http"),
+    ("mcp", "ingress"),
+    ("mcp", "http"),
+    ("http", "files"),
+    ("http", "daemon"),
+    ("cli", "ingress"),
+];
+
+/// Remaining top-level 2-cycles scheduled for removal in Checkpoints 2 and 3 (15 -> 9 -> 2 -> 0).
+/// Every pair is ordered lexicographically (`a < b`).
+const CP1_TRANSITIONAL_2CYCLES: &[(&str, &str)] = &[
+    ("codemode", "service"),
+    ("codemode", "tasks"),
+    ("daemon", "http"),
+    ("files", "service"),
+    ("files", "session"),
+    ("http", "mcp"),
+    ("platform", "session"),
+    ("service", "tasks"),
+    ("session", "tasks"),
+];
+
+/// Cross-layer one-way edges eliminated in Checkpoint 1.
+const CP1_FORBIDDEN_EDGES: &[(&str, &str)] = &[
+    ("platform", "ipc"),
+    ("files", "ipc"),
+    ("transfer", "tasks"),
+    ("transfer", "ipc"),
+    ("codemode", "ipc"),
+    ("endpoint", "tasks"),
+];
+
+/// Multi-file top-level modules whose entire submodule graph (including parent `<top>.rs` and
+/// child `<top>/<sub>.rs` files) must have zero strongly connected cycles.
+const ACYCLIC_SUBMODULE_TREES: &[&str] = &["term", "http", "cli"];
+
+/// Multi-file top-level modules whose sibling child submodules (`<top>/<sub>.rs`) must have zero
+/// strongly connected cycles among siblings (ready to include `tasks` in CP2).
+const ACYCLIC_SIBLING_SUBMODULES: &[&str] = &["term", "http", "cli", "service", "daemon"];
+
+const RQUICKJS_ALLOWED: &[&str] = &["codemode"];
+const HYPER_ALLOWED: &[&str] = &["http", "http_wire"];
+const RMCP_ALLOWED_CP1: &[&str] = &[
+    "render", "ipc", "endpoint", "daemon", "mcp", "http", "cli", // target shell/wire set
+    "files", "transfer", "service", "ingress", // CP1 transitional set
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Tok {
+    Ident(String),
+    RawIdent(String),
+    Lifetime,
+    Literal,
+    ColonColon,
+    Arrow,
+    FatArrow,
+    Le,
+    Ge,
+    Shl,
+    Shr,
+    ShlEq,
+    ShrEq,
+    Lt,
+    Gt,
+    Punct(char),
+}
+
+#[derive(Clone, Debug)]
+struct Token {
+    kind: Tok,
+    line: usize,
+}
+
+impl Token {
+    fn is_kw(&self, kw: &str) -> bool {
+        matches!(&self.kind, Tok::Ident(s) if s == kw)
+    }
+
+    fn ident_name(&self) -> Option<&str> {
+        match &self.kind {
+            Tok::Ident(s) | Tok::RawIdent(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn is_punct(&self, ch: char) -> bool {
+        self.kind == Tok::Punct(ch)
+    }
+}
+
+/// Matches a `use` import keyword while excluding Rust 2024 precise-capturing `+ use<'a, T>` bounds.
+fn is_use_kw(tokens: &[Token], idx: usize) -> bool {
+    tokens.get(idx).is_some_and(|t| t.is_kw("use"))
+        && tokens.get(idx + 1).map(|t| &t.kind) != Some(&Tok::Lt)
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic() || (!ch.is_ascii() && ch.is_alphabetic())
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric() || (!ch.is_ascii() && ch.is_alphanumeric())
+}
+
+/// Checks if `src[pos..]` starts a raw string (`r#*"`, `br#*"`, `rb#*"`, `cr#*"`, `rc#*"`),
+/// returning `(prefix_len_before_opening_quote, hash_count)`.
+fn raw_string_prefix(src: &str, pos: usize) -> Option<(usize, usize)> {
+    let bytes = src.as_bytes();
+    let r_offset = match (bytes.get(pos).copied(), bytes.get(pos + 1).copied()) {
+        (Some(b'b' | b'c'), Some(b'r')) | (Some(b'r'), Some(b'b' | b'c')) => 2,
+        (Some(b'r'), _) => 1,
+        _ => return None,
+    };
+    let mut hashes = 0;
+    while bytes.get(pos + r_offset + hashes) == Some(&b'#') {
+        hashes += 1;
+    }
+    (bytes.get(pos + r_offset + hashes) == Some(&b'"')).then_some((r_offset + hashes, hashes))
+}
+
+/// Scans Rust source with a character state machine, stripping `//` and nested `/* ... */`
+/// comments while collapsing string, raw-string, char, and numeric literals to `Tok::Literal`.
+fn lex(src: &str) -> Vec<Token> {
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0;
+    let mut line = 1usize;
+    let mut out = Vec::new();
+    let push = |out: &mut Vec<Token>, kind: Tok, line: usize| out.push(Token { kind, line });
+
+    while pos < len {
+        let b = bytes[pos];
+        if b == b'\n' {
+            line += 1;
+            pos += 1;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            pos += 1;
+            continue;
+        }
+
+        if b == b'/' && bytes.get(pos + 1) == Some(&b'/') {
+            pos += 2;
+            while pos < len && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+
+        if b == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+            pos += 2;
+            let mut depth = 1usize;
+            while pos < len && depth > 0 {
+                if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+                    depth += 1;
+                    pos += 2;
+                } else if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
+                    depth -= 1;
+                    pos += 2;
+                } else {
+                    if bytes[pos] == b'\n' {
+                        line += 1;
+                    }
+                    pos += 1;
+                }
+            }
+            continue;
+        }
+
+        if let Some((prefix_len, hashes)) = raw_string_prefix(src, pos) {
+            let tok_line = line;
+            pos += prefix_len + 1;
+            while pos < len {
+                if bytes[pos] == b'\n' {
+                    line += 1;
+                    pos += 1;
+                    continue;
+                }
+                if bytes[pos] == b'"' {
+                    let mut matched = 0;
+                    while matched < hashes && bytes.get(pos + 1 + matched) == Some(&b'#') {
+                        matched += 1;
+                    }
+                    if matched == hashes {
+                        pos += 1 + hashes;
+                        break;
+                    }
+                }
+                pos += 1;
+            }
+            push(&mut out, Tok::Literal, tok_line);
+            continue;
+        }
+
+        if b == b'"' || ((b == b'b' || b == b'c') && bytes.get(pos + 1) == Some(&b'"')) {
+            let tok_line = line;
+            pos += if b == b'"' { 1 } else { 2 };
+            while pos < len {
+                match bytes[pos] {
+                    b'\\' => {
+                        pos += 1;
+                        if pos < len {
+                            if bytes[pos] == b'\n' {
+                                line += 1;
+                            }
+                            let ch = src[pos..].chars().next().unwrap();
+                            pos += ch.len_utf8();
+                        }
+                    }
+                    b'"' => {
+                        pos += 1;
+                        break;
+                    }
+                    b'\n' => {
+                        line += 1;
+                        pos += 1;
+                    }
+                    _ => pos += 1,
+                }
+            }
+            push(&mut out, Tok::Literal, tok_line);
+            continue;
+        }
+
+        if b == b'b' && bytes.get(pos + 1) == Some(&b'\'') {
+            let tok_line = line;
+            pos += 2;
+            if bytes.get(pos) == Some(&b'\\') {
+                pos += 2.min(len - pos);
+            }
+            while pos < len {
+                if bytes[pos] == b'\n' {
+                    line += 1;
+                }
+                if bytes[pos] == b'\'' {
+                    pos += 1;
+                    break;
+                }
+                pos += 1;
+            }
+            push(&mut out, Tok::Literal, tok_line);
+            continue;
+        }
+
+        // Distinguish character literals (`'{'`, `'\''`, `'\"'`, `'\x7f'`, `'\u{...}'`) from lifetimes (`'a`, `'_`, `'static`).
+        if b == b'\'' {
+            let tok_line = line;
+            let rest = &src[pos + 1..];
+            if rest.starts_with('\\') {
+                pos += 2;
+                if let Some(escaped) = src[pos..].chars().next() {
+                    if escaped == '\n' {
+                        line += 1;
+                    }
+                    pos += escaped.len_utf8();
+                }
+                while pos < len {
+                    if bytes[pos] == b'\n' {
+                        line += 1;
+                    }
+                    if bytes[pos] == b'\'' {
+                        pos += 1;
+                        break;
+                    }
+                    pos += 1;
+                }
+                push(&mut out, Tok::Literal, tok_line);
+                continue;
+            }
+            if let Some(ch) = rest.chars().next() {
+                let after = &rest[ch.len_utf8()..];
+                if ch != '\'' && ch != '\n' && ch != '\r' && ch != '\t' && after.starts_with('\'') {
+                    pos += 1 + ch.len_utf8() + 1;
+                    push(&mut out, Tok::Literal, tok_line);
+                    continue;
+                }
+                if is_ident_start(ch) {
+                    pos += 1;
+                    if src[pos..].starts_with("r#") {
+                        pos += 2;
+                    }
+                    while let Some(c) = src[pos..].chars().next() {
+                        if is_ident_continue(c) {
+                            pos += c.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                    push(&mut out, Tok::Lifetime, tok_line);
+                    continue;
+                }
+            }
+            pos += 1;
+            if bytes.get(pos) == Some(&b'\'') {
+                pos += 1;
+            }
+            push(&mut out, Tok::Literal, tok_line);
+            continue;
+        }
+
+        if b.is_ascii_digit() {
+            let tok_line = line;
+            pos += 1;
+            while pos < len {
+                let c = bytes[pos];
+                if c.is_ascii_alphanumeric() || c == b'_' {
+                    if (c == b'e' || c == b'E')
+                        && matches!(bytes.get(pos + 1), Some(b'+' | b'-'))
+                        && bytes.get(pos + 2).is_some_and(u8::is_ascii_digit)
+                    {
+                        pos += 2;
+                    } else {
+                        pos += 1;
+                    }
+                } else if c == b'.'
+                    && bytes.get(pos + 1) != Some(&b'.')
+                    && !src[pos + 1..].chars().next().is_some_and(is_ident_start)
+                {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            push(&mut out, Tok::Literal, tok_line);
+            continue;
+        }
+
+        if b == b'r'
+            && bytes.get(pos + 1) == Some(&b'#')
+            && src[pos + 2..].chars().next().is_some_and(is_ident_start)
+        {
+            let tok_line = line;
+            pos += 2;
+            let start = pos;
+            while let Some(c) = src[pos..].chars().next() {
+                if is_ident_continue(c) {
+                    pos += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            push(
+                &mut out,
+                Tok::RawIdent(src[start..pos].to_owned()),
+                tok_line,
+            );
+            continue;
+        }
+
+        let ch = src[pos..].chars().next().unwrap();
+        if is_ident_start(ch) {
+            let tok_line = line;
+            let start = pos;
+            pos += ch.len_utf8();
+            while let Some(c) = src[pos..].chars().next() {
+                if is_ident_continue(c) {
+                    pos += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            push(&mut out, Tok::Ident(src[start..pos].to_owned()), tok_line);
+            continue;
+        }
+
+        let tok_line = line;
+        let next = bytes.get(pos + 1).copied();
+        let next2 = bytes.get(pos + 2).copied();
+        let (kind, step) = match (b, next, next2) {
+            (b':', Some(b':'), _) => (Tok::ColonColon, 2),
+            (b'-', Some(b'>'), _) => (Tok::Arrow, 2),
+            (b'=', Some(b'>'), _) => (Tok::FatArrow, 2),
+            (b'<', Some(b'='), _) => (Tok::Le, 2),
+            (b'>', Some(b'='), _) => (Tok::Ge, 2),
+            (b'<', Some(b'<'), Some(b'=')) => (Tok::ShlEq, 3),
+            (b'>', Some(b'>'), Some(b'=')) => (Tok::ShrEq, 3),
+            (b'<', Some(b'<'), _) => (Tok::Shl, 2),
+            (b'>', Some(b'>'), _) => (Tok::Shr, 2),
+            (b'<', _, _) => (Tok::Lt, 1),
+            (b'>', _, _) => (Tok::Gt, 1),
+            _ => (Tok::Punct(ch), ch.len_utf8()),
+        };
+        pos += step;
+        push(&mut out, kind, tok_line);
+    }
+
+    out
+}
+
+/// Kleene three-valued truth values for `#[cfg(...)]` satisfiability with `test = false`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Truth {
+    True,
+    False,
+    Unknown,
+}
+
+impl Truth {
+    fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    fn and(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn or(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+fn skip_balanced_delim(tokens: &[Token], open_idx: usize) -> usize {
+    let (open, close) = match tokens.get(open_idx).map(|t| &t.kind) {
+        Some(Tok::Punct('(')) => ('(', ')'),
+        Some(Tok::Punct('[')) => ('[', ']'),
+        Some(Tok::Punct('{')) => ('{', '}'),
+        _ => return open_idx + 1,
+    };
+    let mut depth = 1usize;
+    let mut i = open_idx + 1;
+    while i < tokens.len() && depth > 0 {
+        if tokens[i].is_punct(open) {
+            depth += 1;
+        } else if tokens[i].is_punct(close) {
+            depth -= 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn split_top_level_commas(tokens: &[Token]) -> Vec<&[Token]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let (mut paren, mut bracket, mut brace) = (0usize, 0usize, 0usize);
+    for (idx, tok) in tokens.iter().enumerate() {
+        match tok.kind {
+            Tok::Punct('(') => paren += 1,
+            Tok::Punct(')') => paren = paren.saturating_sub(1),
+            Tok::Punct('[') => bracket += 1,
+            Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+            Tok::Punct('{') => brace += 1,
+            Tok::Punct('}') => brace = brace.saturating_sub(1),
+            Tok::Punct(',') if paren == 0 && bracket == 0 && brace == 0 => {
+                if start < idx {
+                    parts.push(&tokens[start..idx]);
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < tokens.len() {
+        parts.push(&tokens[start..]);
+    }
+    parts
+}
+
+/// Evaluates a `cfg(...)` predicate slice under `test = False`, `true = True`, `false = False`,
+/// and all platform/feature atoms as `Unknown`.
+fn eval_cfg_expr(tokens: &[Token]) -> Truth {
+    if tokens.is_empty() {
+        return Truth::Unknown;
+    }
+    if tokens.len() >= 3
+        && let Some(op) = tokens[0].ident_name()
+        && tokens[1].is_punct('(')
+    {
+        let end = skip_balanced_delim(tokens, 1);
+        if end == tokens.len() {
+            let inner = &tokens[2..end - 1];
+            match op {
+                "all" => {
+                    return split_top_level_commas(inner)
+                        .into_iter()
+                        .fold(Truth::True, |acc, part| acc.and(eval_cfg_expr(part)));
+                }
+                "any" => {
+                    return split_top_level_commas(inner)
+                        .into_iter()
+                        .fold(Truth::False, |acc, part| acc.or(eval_cfg_expr(part)));
+                }
+                "not" => return eval_cfg_expr(inner).not(),
+                _ => return Truth::Unknown,
+            }
+        }
+    }
+    if tokens.len() == 1
+        && let Tok::Ident(atom) = &tokens[0].kind
+    {
+        return match atom.as_str() {
+            "test" | "false" => Truth::False,
+            "true" => Truth::True,
+            _ => Truth::Unknown,
+        };
+    }
+    Truth::Unknown
+}
+
+fn parse_attribute(tokens: &[Token], idx: usize) -> Option<(usize, bool, Option<Truth>)> {
+    if !tokens.get(idx)?.is_punct('#') {
+        return None;
+    }
+    let (is_inner, bracket_idx) = if tokens.get(idx + 1).is_some_and(|t| t.is_punct('!'))
+        && tokens.get(idx + 2).is_some_and(|t| t.is_punct('['))
+    {
+        (true, idx + 2)
+    } else if tokens.get(idx + 1).is_some_and(|t| t.is_punct('[')) {
+        (false, idx + 1)
+    } else {
+        return None;
+    };
+    let after_bracket = skip_balanced_delim(tokens, bracket_idx);
+    if after_bracket <= bracket_idx + 1 {
+        return Some((after_bracket, is_inner, None));
+    }
+    let attr_body = &tokens[bracket_idx + 1..after_bracket - 1];
+    if attr_body.len() >= 3 && attr_body[0].is_kw("cfg") && attr_body[1].is_punct('(') {
+        let after_paren = skip_balanced_delim(attr_body, 1);
+        if after_paren == attr_body.len() {
+            let truth = eval_cfg_expr(&attr_body[2..after_paren - 1]);
+            return Some((after_bracket, is_inner, Some(truth)));
+        }
+    }
+    Some((after_bracket, is_inner, None))
+}
+
+/// True when `prev` forces a following `{ ... }` to be an inner operand/closure/modifier block
+/// rather than the outer body of `if` / `while` / `for` / `match`.
+fn forces_operand_block(prev: &Token) -> bool {
+    matches!(
+        &prev.kind,
+        Tok::Punct('=' | '|' | '&' | '!' | '+' | '-' | '*' | '/' | '%' | '^' | ',' | ':')
+            | Tok::Arrow
+            | Tok::FatArrow
+            | Tok::Le
+            | Tok::Ge
+            | Tok::Shl
+            | Tok::ShlEq
+            | Tok::ShrEq
+    ) || prev.is_kw("unsafe")
+        || prev.is_kw("const")
+        || prev.is_kw("async")
+        || prev.is_kw("move")
+}
+
+/// Consumes a control-flow header and its body `{ ... }` at `()` and `[]` depth 0 so closures or
+/// `unsafe` blocks inside conditions do not terminate early before the real statement body.
+fn skip_control_body(tokens: &[Token], start: usize, has_header: bool) -> usize {
+    let mut i = start;
+    let (mut paren, mut bracket) = (0usize, 0usize);
+    while i < tokens.len() {
+        if paren == 0 && bracket == 0 && tokens[i].is_punct('{') {
+            let is_inner_expr_block =
+                has_header && i > start && forces_operand_block(&tokens[i - 1]);
+            if !is_inner_expr_block {
+                return skip_balanced_delim(tokens, i);
+            }
+            i = skip_balanced_delim(tokens, i);
+            continue;
+        }
+        match tokens[i].kind {
+            Tok::Punct('(') => paren += 1,
+            Tok::Punct(')') => paren = paren.saturating_sub(1),
+            Tok::Punct('[') => bracket += 1,
+            Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+            Tok::Punct('{') => {
+                i = skip_balanced_delim(tokens, i);
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Advances past an item, statement, control-flow block, or field/argument gated by a `False`
+/// `#[cfg(...)]` attribute (§7.2.3 four-category syntax-aware skipper).
+fn skip_pure_test_target(tokens: &[Token], mut i: usize) -> usize {
+    while let Some((after_attr, false, _)) = parse_attribute(tokens, i) {
+        i = after_attr;
+    }
+
+    loop {
+        if tokens.get(i).is_some_and(|t| t.is_kw("pub")) {
+            i += 1;
+            if tokens.get(i).is_some_and(|t| t.is_punct('(')) {
+                i = skip_balanced_delim(tokens, i);
+            }
+            continue;
+        }
+        if tokens
+            .get(i)
+            .is_some_and(|t| t.is_kw("default") || t.is_kw("async") || t.is_kw("unsafe"))
+        {
+            i += 1;
+            if tokens.get(i).is_some_and(|t| t.is_kw("move"))
+                && tokens.get(i + 1).is_some_and(|t| t.is_punct('{'))
+            {
+                i += 1;
+            }
+            continue;
+        }
+        if tokens.get(i).is_some_and(|t| t.is_kw("const"))
+            && tokens.get(i + 1).is_some_and(|next| {
+                next.is_kw("fn")
+                    || next.is_kw("unsafe")
+                    || next.is_kw("extern")
+                    || next.is_punct('{')
+            })
+        {
+            i += 1;
+            continue;
+        }
+        // Keep `extern crate foo;` together for Category 1 while stripping `extern "C"` ABI
+        // modifiers before `fn` or `{ ... }` extern blocks (without adding `crate` to Category 1,
+        // which would overshoot call arguments like `foo(#[cfg(test)] crate::id::x(), prod())`).
+        if tokens.get(i).is_some_and(|t| t.is_kw("extern"))
+            && !tokens.get(i + 1).is_some_and(|t| t.is_kw("crate"))
+        {
+            i += 1;
+            if matches!(tokens.get(i).map(|t| &t.kind), Some(Tok::Literal)) {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+
+    // Optional loop/block label (`'label: loop { ... }`).
+    if tokens.get(i).is_some_and(|t| t.kind == Tok::Lifetime)
+        && tokens.get(i + 1).is_some_and(|t| t.is_punct(':'))
+    {
+        i += 2;
+    }
+
+    let Some(lead) = tokens.get(i) else {
+        return i;
+    };
+
+    // Category 1: Semicolon-terminated declarations (`type`, `const`, `static`, `use`, `extern crate`)
+    // and `let` statements (`let ... else { ... };`).
+    let is_extern_crate =
+        lead.is_kw("extern") && tokens.get(i + 1).is_some_and(|t| t.is_kw("crate"));
+    if lead.is_kw("type")
+        || lead.is_kw("const")
+        || lead.is_kw("static")
+        || is_use_kw(tokens, i)
+        || lead.is_kw("let")
+        || is_extern_crate
+    {
+        let (mut paren, mut bracket, mut brace) = (0usize, 0usize, 0usize);
+        i += 1;
+        while i < tokens.len() {
+            match tokens[i].kind {
+                Tok::Punct('(') => paren += 1,
+                Tok::Punct(')') => paren = paren.saturating_sub(1),
+                Tok::Punct('[') => bracket += 1,
+                Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+                Tok::Punct('{') => brace += 1,
+                Tok::Punct('}') => brace = brace.saturating_sub(1),
+                Tok::Punct(';') if paren == 0 && bracket == 0 && brace == 0 => return i + 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        return i;
+    }
+
+    // Category 2: Items with `{ ... }` body or `;` terminator (never truncated at `,`), plus
+    // brace-delimited macro items (`ident! { ... }`).
+    let is_brace_macro = lead.ident_name().is_some()
+        && tokens.get(i + 1).is_some_and(|t| t.is_punct('!'))
+        && tokens.get(i + 2).is_some_and(|t| t.is_punct('{'));
+    if lead.is_kw("fn")
+        || lead.is_kw("struct")
+        || lead.is_kw("enum")
+        || lead.is_kw("union")
+        || lead.is_kw("trait")
+        || lead.is_kw("impl")
+        || lead.is_kw("mod")
+        || lead.is_kw("macro_rules")
+        || is_brace_macro
+    {
+        let (mut paren, mut bracket) = (0usize, 0usize);
+        i += 1;
+        while i < tokens.len() {
+            match tokens[i].kind {
+                Tok::Punct('(') => paren += 1,
+                Tok::Punct(')') => paren = paren.saturating_sub(1),
+                Tok::Punct('[') => bracket += 1,
+                Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+                Tok::Punct(';') if paren == 0 && bracket == 0 => return i + 1,
+                Tok::Punct('{') if paren == 0 && bracket == 0 => {
+                    return skip_balanced_delim(tokens, i);
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        return i;
+    }
+
+    // Category 3: Control-flow expressions/statements (`if` + `else` chain, `match`, `loop`,
+    // `while`, `for`) or direct block `{ ... }`.
+    if lead.is_punct('{') {
+        i = skip_balanced_delim(tokens, i);
+        if tokens
+            .get(i)
+            .is_some_and(|t| t.is_punct(';') || t.is_punct(','))
+        {
+            i += 1;
+        }
+        return i;
+    }
+    if lead.is_kw("if") {
+        i = skip_control_body(tokens, i + 1, true);
+        while tokens.get(i).is_some_and(|t| t.is_kw("else")) {
+            i += 1;
+            if tokens.get(i).is_some_and(|t| t.is_kw("if")) {
+                i = skip_control_body(tokens, i + 1, true);
+            } else if tokens.get(i).is_some_and(|t| t.is_punct('{')) {
+                i = skip_balanced_delim(tokens, i);
+                break;
+            } else {
+                break;
+            }
+        }
+        if tokens
+            .get(i)
+            .is_some_and(|t| t.is_punct(';') || t.is_punct(','))
+        {
+            i += 1;
+        }
+        return i;
+    }
+    if lead.is_kw("loop") {
+        i = skip_control_body(tokens, i + 1, false);
+        if tokens
+            .get(i)
+            .is_some_and(|t| t.is_punct(';') || t.is_punct(','))
+        {
+            i += 1;
+        }
+        return i;
+    }
+    if lead.is_kw("match") || lead.is_kw("while") || lead.is_kw("for") {
+        i = skip_control_body(tokens, i + 1, true);
+        if tokens
+            .get(i)
+            .is_some_and(|t| t.is_punct(';') || t.is_punct(','))
+        {
+            i += 1;
+        }
+        return i;
+    }
+
+    // Category 4: Struct/enum fields, struct literal fields, parameters, call arguments.
+    let (mut paren, mut bracket, mut brace, mut angle) = (0usize, 0usize, 0usize, 0usize);
+    while i < tokens.len() {
+        if paren == 0 && bracket == 0 && brace == 0 {
+            if tokens[i].is_punct('}') || tokens[i].is_punct(']') || tokens[i].is_punct(')') {
+                return i;
+            }
+            if angle == 0 && (tokens[i].is_punct(',') || tokens[i].is_punct(';')) {
+                return i + 1;
+            }
+            match tokens[i].kind {
+                Tok::Lt => angle += 1,
+                Tok::Gt => angle = angle.saturating_sub(1),
+                Tok::Shr => angle = angle.saturating_sub(2),
+                _ => {}
+            }
+        }
+        match tokens[i].kind {
+            Tok::Punct('(') => paren += 1,
+            Tok::Punct(')') => paren = paren.saturating_sub(1),
+            Tok::Punct('[') => bracket += 1,
+            Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+            Tok::Punct('{') => brace += 1,
+            Tok::Punct('}') => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Removes all pure-test `#![cfg(...)]` scopes and `#[cfg(...)]` targets where 3-valued evaluation
+/// under `test = False` produces `Truth::False`.
+fn strip_pure_test_code(tokens: &[Token]) -> Vec<Token> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut brace_depth = 0usize;
+    let mut i = 0;
+    while i < tokens.len() {
+        if let Some((after_attr, is_inner, Some(Truth::False))) = parse_attribute(tokens, i) {
+            if is_inner {
+                if brace_depth == 0 {
+                    break;
+                }
+                let target_depth = brace_depth - 1;
+                i = after_attr;
+                while i < tokens.len() {
+                    if tokens[i].is_punct('{') {
+                        brace_depth += 1;
+                    } else if tokens[i].is_punct('}') {
+                        // Stop at the enclosing block's closing `}` without decrementing here so
+                        // the outer loop processes that `}` once and keeps `brace_depth` exact.
+                        if brace_depth - 1 == target_depth {
+                            break;
+                        }
+                        brace_depth -= 1;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            i = skip_pure_test_target(tokens, after_attr);
+            continue;
+        }
+        if tokens[i].is_punct('{') {
+            brace_depth += 1;
+        } else if tokens[i].is_punct('}') {
+            brace_depth = brace_depth.saturating_sub(1);
+        }
+        out.push(tokens[i].clone());
+        i += 1;
+    }
+    out
+}
+
+#[derive(Clone, Debug)]
+struct ExpandedUse {
+    leading_coloncolon: bool,
+    segments: Vec<String>,
+    bound_name: Option<String>,
+    is_glob: bool,
+    line: usize,
+}
+
+fn expand_use_tree(
+    tokens: &[Token],
+    prefix: &[String],
+    leading_coloncolon: bool,
+    default_line: usize,
+    out: &mut Vec<ExpandedUse>,
+) {
+    for part in split_top_level_commas(tokens) {
+        if part.is_empty() {
+            continue;
+        }
+        let mut i = 0;
+        let mut leading = leading_coloncolon;
+        if prefix.is_empty() && part.first().is_some_and(|t| t.kind == Tok::ColonColon) {
+            leading = true;
+            i = 1;
+        }
+        let line = part.get(i).map_or(default_line, |t| t.line);
+        let mut segs: Vec<String> = prefix.to_vec();
+
+        loop {
+            if i >= part.len() {
+                break;
+            }
+            if part[i].is_punct('{') {
+                let end = skip_balanced_delim(part, i);
+                expand_use_tree(&part[i + 1..end - 1], &segs, leading, part[i].line, out);
+                break;
+            }
+            if part[i].is_punct('*') {
+                out.push(ExpandedUse {
+                    leading_coloncolon: leading,
+                    segments: segs,
+                    bound_name: None,
+                    is_glob: true,
+                    line: part[i].line,
+                });
+                break;
+            }
+            let Some(ident) = part[i].ident_name() else {
+                break;
+            };
+            i += 1;
+            if part.get(i).is_some_and(|t| t.kind == Tok::ColonColon) {
+                segs.push(ident.to_owned());
+                i += 1;
+                continue;
+            }
+            let alias = if part.get(i).is_some_and(|t| t.is_kw("as")) {
+                part.get(i + 1)
+                    .and_then(Token::ident_name)
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            let (final_segs, bound_name) = if ident == "self" {
+                let bound = match alias.as_deref() {
+                    Some("_") => None,
+                    Some(name) => Some(name.to_owned()),
+                    None => segs.last().cloned(),
+                };
+                (segs, bound)
+            } else {
+                segs.push(ident.to_owned());
+                let bound = match alias.as_deref() {
+                    Some("_") => None,
+                    Some(name) => Some(name.to_owned()),
+                    None => Some(ident.to_owned()),
+                };
+                (segs, bound)
+            };
+            out.push(ExpandedUse {
+                leading_coloncolon: leading,
+                segments: final_segs,
+                bound_name,
+                is_glob: false,
+                line,
+            });
+            break;
+        }
+    }
+}
+
+/// Canonicalizes a path (`crate::...`, `super::...`, `self::...`, imported binding, or bare
+/// declared submodule `<sub>::...`) into crate-relative segments (`vec![<top>, ...]`).
+fn resolve_internal_path(
+    leading_coloncolon: bool,
+    segments: &[String],
+    mod_path: &[String],
+    declared_submods: &BTreeSet<String>,
+    imports: &HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    if leading_coloncolon || segments.is_empty() {
+        return None;
+    }
+    match segments[0].as_str() {
+        "crate" => {
+            let rest = segments[1..].to_vec();
+            (!rest.is_empty()).then_some(rest)
+        }
+        "self" | "super" => {
+            let mut base = mod_path.to_vec();
+            let mut idx = 0;
+            while idx < segments.len() {
+                match segments[idx].as_str() {
+                    "self" => idx += 1,
+                    "super" => {
+                        base.pop();
+                        idx += 1;
+                    }
+                    _ => break,
+                }
+            }
+            base.extend_from_slice(&segments[idx..]);
+            (!base.is_empty()).then_some(base)
+        }
+        first => {
+            if let Some(prefix) = imports.get(first) {
+                let mut full = prefix.clone();
+                full.extend_from_slice(&segments[1..]);
+                return (!full.is_empty()).then_some(full);
+            }
+            if declared_submods.contains(first) {
+                let mut full = mod_path.to_vec();
+                full.extend_from_slice(segments);
+                return (!full.is_empty()).then_some(full);
+            }
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EdgeRef {
+    file: String,
+    line: usize,
+    from_mod: Vec<String>,
+    to_path: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InherentImplViolation {
+    file: String,
+    line: usize,
+    from_top: String,
+    target_top: String,
+    target_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrateLeak {
+    crate_name: String,
+    file: String,
+    line: usize,
+    from_top: String,
+}
+
+#[derive(Default, Debug)]
+struct ScanReport {
+    top_modules: BTreeSet<String>,
+    file_submodules: BTreeMap<String, BTreeSet<String>>,
+    edges: Vec<EdgeRef>,
+    inherent_impls: Vec<InherentImplViolation>,
+    crate_leaks: Vec<CrateLeak>,
+}
+
+fn skip_generic_params(tokens: &[Token], open_lt_idx: usize) -> usize {
+    if tokens.get(open_lt_idx).map(|t| &t.kind) != Some(&Tok::Lt) {
+        return open_lt_idx;
+    }
+    let (mut paren, mut bracket, mut brace, mut angle) = (0usize, 0usize, 0usize, 1usize);
+    let mut i = open_lt_idx + 1;
+    while i < tokens.len() && angle > 0 {
+        if paren == 0 && bracket == 0 && brace == 0 {
+            match tokens[i].kind {
+                Tok::Lt => angle += 1,
+                Tok::Gt => angle = angle.saturating_sub(1),
+                Tok::Shr => angle = angle.saturating_sub(2),
+                _ => {}
+            }
+        }
+        match tokens[i].kind {
+            Tok::Punct('(') => paren += 1,
+            Tok::Punct(')') => paren = paren.saturating_sub(1),
+            Tok::Punct('[') => bracket += 1,
+            Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+            Tok::Punct('{') => brace += 1,
+            Tok::Punct('}') => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Peels outer parentheses, reference prefixes (`&`, optional `'a`, optional `mut`), and raw
+/// pointer prefixes (`*const`, `*mut`) before extracting the leading type path.
+fn extract_leading_path(mut slice: &[Token]) -> Option<(bool, Vec<String>)> {
+    loop {
+        if slice.first().is_some_and(|t| t.is_punct('('))
+            && skip_balanced_delim(slice, 0) == slice.len()
+        {
+            slice = &slice[1..slice.len() - 1];
+            continue;
+        }
+        if slice.first().is_some_and(|t| t.is_punct('&')) {
+            slice = &slice[1..];
+            if slice.first().is_some_and(|t| t.kind == Tok::Lifetime) {
+                slice = &slice[1..];
+            }
+            if slice.first().is_some_and(|t| t.is_kw("mut")) {
+                slice = &slice[1..];
+            }
+            continue;
+        }
+        if slice.first().is_some_and(|t| t.is_punct('*'))
+            && slice
+                .get(1)
+                .is_some_and(|t| t.is_kw("const") || t.is_kw("mut"))
+        {
+            slice = &slice[2..];
+            continue;
+        }
+        break;
+    }
+    let mut p = 0;
+    let mut leading_cc = false;
+    if slice.first().is_some_and(|t| t.kind == Tok::ColonColon) {
+        leading_cc = true;
+        p = 1;
+    }
+    let mut segs = Vec::new();
+    while let Some(name) = slice.get(p).and_then(Token::ident_name) {
+        segs.push(name.to_owned());
+        p += 1;
+        if slice.get(p).is_some_and(|t| t.kind == Tok::ColonColon)
+            && slice.get(p + 1).and_then(Token::ident_name).is_some()
+        {
+            p += 1;
+        } else {
+            break;
+        }
+    }
+    (!segs.is_empty()).then_some((leading_cc, segs))
+}
+
+/// Inspects an `impl` item header starting at `impl_idx` (`tokens[impl_idx]` is `impl`).
+/// If it has no top-level trait `for`, extracts the leading path of the inherent target type.
+fn extract_inherent_impl_target(tokens: &[Token], impl_idx: usize) -> Option<(bool, Vec<String>)> {
+    let mut i = impl_idx + 1;
+    if tokens.get(i).is_some_and(|t| t.kind == Tok::Lt) {
+        i = skip_generic_params(tokens, i);
+    }
+    let header_start = i;
+    let (mut paren, mut bracket, mut angle) = (0usize, 0usize, 0usize);
+    let mut type_end = None;
+    while i < tokens.len() {
+        if paren == 0 && bracket == 0 && angle == 0 {
+            if tokens[i].is_punct('{') {
+                type_end.get_or_insert(i);
+                break;
+            }
+            if tokens[i].is_punct(';') {
+                return None;
+            }
+            if tokens[i].is_kw("where") {
+                type_end.get_or_insert(i);
+            }
+            if tokens[i].is_kw("for")
+                && !(tokens.get(i + 1).is_some_and(|t| t.kind == Tok::Lt)
+                    && tokens.get(i + 2).is_some_and(|t| t.kind == Tok::Lifetime))
+            {
+                return None;
+            }
+            match tokens[i].kind {
+                Tok::Lt => angle += 1,
+                Tok::Gt => angle = angle.saturating_sub(1),
+                Tok::Shr => angle = angle.saturating_sub(2),
+                _ => {}
+            }
+        }
+        match tokens[i].kind {
+            Tok::Punct('(') => paren += 1,
+            Tok::Punct(')') => paren = paren.saturating_sub(1),
+            Tok::Punct('[') => bracket += 1,
+            Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    extract_leading_path(&tokens[header_start..type_end?])
+}
+
+fn collect_defined_types(tokens: &[Token], out: &mut BTreeSet<String>) {
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        if (tokens[i].is_kw("struct") || tokens[i].is_kw("enum") || tokens[i].is_kw("union"))
+            && let Some(name) = tokens[i + 1].ident_name()
+        {
+            out.insert(name.to_owned());
+        }
+        i += 1;
+    }
+}
+
+fn check_crate_token(tok: &Token, current_top: &str, file_label: &str, report: &mut ScanReport) {
+    if let Some(ident) = tok.ident_name() {
+        let forbidden = match ident {
+            "rquickjs" => !RQUICKJS_ALLOWED.contains(&current_top),
+            "hyper" | "hyper_util" => !HYPER_ALLOWED.contains(&current_top),
+            "rmcp" => !RMCP_ALLOWED_CP1.contains(&current_top),
+            _ => false,
+        };
+        if forbidden {
+            report.crate_leaks.push(CrateLeak {
+                crate_name: ident.to_owned(),
+                file: file_label.to_owned(),
+                line: tok.line,
+                from_top: current_top.to_owned(),
+            });
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BlockScope {
+    imports: HashMap<String, Vec<String>>,
+    glob_tops: BTreeSet<String>,
+}
+
+fn scan_slice_paths_and_crates(
+    slice: &[Token],
+    file_label: &str,
+    mod_path: &[String],
+    declared_submods: &BTreeSet<String>,
+    imports: &HashMap<String, Vec<String>>,
+    report: &mut ScanReport,
+) {
+    let current_top = &mod_path[0];
+    let mut i = 0;
+    while i < slice.len() {
+        let leading_cc = slice[i].kind == Tok::ColonColon
+            && !slice
+                .get(i.wrapping_sub(1))
+                .is_some_and(|prev| prev.ident_name().is_some() || prev.is_punct('>'));
+        let path_start = if leading_cc { i + 1 } else { i };
+        let preceded_by_dot = !leading_cc && i > 0 && slice[i - 1].is_punct('.');
+        if !preceded_by_dot
+            && let Some(first_seg) = slice.get(path_start).and_then(Token::ident_name)
+        {
+            let mut segs = vec![first_seg.to_owned()];
+            check_crate_token(&slice[path_start], current_top, file_label, report);
+            let mut p = path_start + 1;
+            while slice.get(p).is_some_and(|t| t.kind == Tok::ColonColon)
+                && let Some(next_seg) = slice.get(p + 1).and_then(Token::ident_name)
+            {
+                check_crate_token(&slice[p + 1], current_top, file_label, report);
+                segs.push(next_seg.to_owned());
+                p += 2;
+            }
+            if segs.len() >= 2
+                && let Some(canon) =
+                    resolve_internal_path(leading_cc, &segs, mod_path, declared_submods, imports)
+            {
+                report.edges.push(EdgeRef {
+                    file: file_label.to_owned(),
+                    line: slice[path_start].line,
+                    from_mod: mod_path.to_vec(),
+                    to_path: canon,
+                });
+            }
+            i = p;
+            continue;
+        }
+        check_crate_token(&slice[i], current_top, file_label, report);
+        i += 1;
+    }
+}
+
+fn analyze_module_scope(
+    file_label: &str,
+    mod_path: &[String],
+    tokens: &[Token],
+    defined_types_by_top: &HashMap<String, BTreeSet<String>>,
+    report: &mut ScanReport,
+) {
+    let current_top = &mod_path[0];
+
+    let mut declared_submods = BTreeSet::new();
+    let mut excluded_spans: Vec<(usize, usize)> = Vec::new();
+    let mut inline_mods: Vec<(String, usize, usize)> = Vec::new();
+    {
+        let (mut paren, mut bracket, mut brace) = (0usize, 0usize, 0usize);
+        let mut i = 0;
+        while i < tokens.len() {
+            if paren == 0
+                && bracket == 0
+                && brace == 0
+                && tokens[i].is_kw("mod")
+                && let Some(sub) = tokens.get(i + 1).and_then(Token::ident_name)
+            {
+                if tokens.get(i + 2).is_some_and(|t| t.is_punct(';')) {
+                    declared_submods.insert(sub.to_owned());
+                    excluded_spans.push((i, i + 3));
+                    i += 3;
+                    continue;
+                }
+                if tokens.get(i + 2).is_some_and(|t| t.is_punct('{')) {
+                    let after_body = skip_balanced_delim(tokens, i + 2);
+                    declared_submods.insert(sub.to_owned());
+                    excluded_spans.push((i, after_body));
+                    inline_mods.push((sub.to_owned(), i + 3, after_body - 1));
+                    i = after_body;
+                    continue;
+                }
+            }
+            match tokens[i].kind {
+                Tok::Punct('(') => paren += 1,
+                Tok::Punct(')') => paren = paren.saturating_sub(1),
+                Tok::Punct('[') => bracket += 1,
+                Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+                Tok::Punct('{') => brace += 1,
+                Tok::Punct('}') => brace = brace.saturating_sub(1),
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    let in_excluded = |idx: usize| {
+        excluded_spans
+            .iter()
+            .any(|&(start, end)| idx >= start && idx < end)
+    };
+
+    // Pre-seed module-level (`brace == 0`) `use` trees and `type Alias = Path;` items so forward
+    // references resolve regardless of declaration order without leaking block-local `use` items.
+    let mut module_uses: Vec<ExpandedUse> = Vec::new();
+    let mut module_type_aliases: Vec<(String, bool, Vec<String>)> = Vec::new();
+    {
+        let (mut paren, mut bracket, mut brace) = (0usize, 0usize, 0usize);
+        let mut i = 0;
+        while i < tokens.len() {
+            if in_excluded(i) {
+                i += 1;
+                continue;
+            }
+            if paren == 0 && bracket == 0 && brace == 0 {
+                if is_use_kw(tokens, i) {
+                    let use_line = tokens[i].line;
+                    i += 1;
+                    let tree_start = i;
+                    let (mut up, mut ub, mut uc) = (0usize, 0usize, 0usize);
+                    while i < tokens.len() {
+                        match tokens[i].kind {
+                            Tok::Punct('(') => up += 1,
+                            Tok::Punct(')') => up = up.saturating_sub(1),
+                            Tok::Punct('[') => ub += 1,
+                            Tok::Punct(']') => ub = ub.saturating_sub(1),
+                            Tok::Punct('{') => uc += 1,
+                            Tok::Punct('}') => uc = uc.saturating_sub(1),
+                            Tok::Punct(';') if up == 0 && ub == 0 && uc == 0 => break,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    expand_use_tree(
+                        &tokens[tree_start..i],
+                        &[],
+                        false,
+                        use_line,
+                        &mut module_uses,
+                    );
+                    i = (i + 1).min(tokens.len());
+                    continue;
+                }
+                if tokens[i].is_kw("type")
+                    && let Some(alias) = tokens.get(i + 1).and_then(Token::ident_name)
+                {
+                    let mut k = i + 2;
+                    if tokens.get(k).is_some_and(|t| t.kind == Tok::Lt) {
+                        k = skip_generic_params(tokens, k);
+                    }
+                    if tokens.get(k).is_some_and(|t| t.is_punct('=')) {
+                        let rhs_start = k + 1;
+                        let mut end = rhs_start;
+                        let (mut tp, mut tb, mut tc) = (0usize, 0usize, 0usize);
+                        while end < tokens.len() {
+                            match tokens[end].kind {
+                                Tok::Punct('(') => tp += 1,
+                                Tok::Punct(')') => tp = tp.saturating_sub(1),
+                                Tok::Punct('[') => tb += 1,
+                                Tok::Punct(']') => tb = tb.saturating_sub(1),
+                                Tok::Punct('{') => tc += 1,
+                                Tok::Punct('}') => tc = tc.saturating_sub(1),
+                                Tok::Punct(';') if tp == 0 && tb == 0 && tc == 0 => break,
+                                _ => {}
+                            }
+                            end += 1;
+                        }
+                        if let Some((lcc, segs)) = extract_leading_path(&tokens[rhs_start..end]) {
+                            module_type_aliases.push((alias.to_owned(), lcc, segs));
+                        }
+                    }
+                }
+            }
+            match tokens[i].kind {
+                Tok::Punct('(') => paren += 1,
+                Tok::Punct(')') => paren = paren.saturating_sub(1),
+                Tok::Punct('[') => bracket += 1,
+                Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+                Tok::Punct('{') => brace += 1,
+                Tok::Punct('}') => brace = brace.saturating_sub(1),
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    let mut root_scope = BlockScope {
+        imports: HashMap::new(),
+        glob_tops: BTreeSet::new(),
+    };
+    for _ in 0..3 {
+        let mut changed = false;
+        for item in &module_uses {
+            if let Some(canon) = resolve_internal_path(
+                item.leading_coloncolon,
+                &item.segments,
+                mod_path,
+                &declared_submods,
+                &root_scope.imports,
+            ) {
+                if item.is_glob && &canon[0] != current_top {
+                    root_scope.glob_tops.insert(canon[0].clone());
+                }
+                if let Some(bound) = &item.bound_name
+                    && root_scope.imports.get(bound) != Some(&canon)
+                {
+                    root_scope.imports.insert(bound.clone(), canon);
+                    changed = true;
+                }
+            }
+        }
+        for (alias, lcc, segs) in &module_type_aliases {
+            if let Some(canon) =
+                resolve_internal_path(*lcc, segs, mod_path, &declared_submods, &root_scope.imports)
+                && root_scope.imports.get(alias) != Some(&canon)
+            {
+                root_scope.imports.insert(alias.clone(), canon);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Walk all tokens with a `{ ... }` lexical scope stack. No `paren == 0 && bracket == 0` guard
+    // is applied to `is_use_kw`, so `tokio::spawn(async move { use crate::...; })` inside call
+    // parentheses enters the enclosing block's scope while `+ use<'a>` bounds are ignored.
+    let mut scope_stack = vec![root_scope];
+    let mut at_item_boundary = true;
+    let mut i = 0;
+    while i < tokens.len() {
+        if in_excluded(i) {
+            at_item_boundary = true;
+            i += 1;
+            continue;
+        }
+
+        if is_use_kw(tokens, i) {
+            let use_line = tokens[i].line;
+            check_crate_token(&tokens[i], current_top, file_label, report);
+            i += 1;
+            let tree_start = i;
+            let (mut up, mut ub, mut uc) = (0usize, 0usize, 0usize);
+            while i < tokens.len() {
+                check_crate_token(&tokens[i], current_top, file_label, report);
+                match tokens[i].kind {
+                    Tok::Punct('(') => up += 1,
+                    Tok::Punct(')') => up = up.saturating_sub(1),
+                    Tok::Punct('[') => ub += 1,
+                    Tok::Punct(']') => ub = ub.saturating_sub(1),
+                    Tok::Punct('{') => uc += 1,
+                    Tok::Punct('}') => uc = uc.saturating_sub(1),
+                    Tok::Punct(';') if up == 0 && ub == 0 && uc == 0 => break,
+                    _ => {}
+                }
+                i += 1;
+            }
+            let mut expanded = Vec::new();
+            expand_use_tree(&tokens[tree_start..i], &[], false, use_line, &mut expanded);
+            let active = scope_stack.last_mut().unwrap();
+            for item in expanded {
+                if let Some(canon) = resolve_internal_path(
+                    item.leading_coloncolon,
+                    &item.segments,
+                    mod_path,
+                    &declared_submods,
+                    &active.imports,
+                ) {
+                    if item.is_glob && &canon[0] != current_top {
+                        active.glob_tops.insert(canon[0].clone());
+                    }
+                    if let Some(bound) = item.bound_name {
+                        active.imports.insert(bound, canon.clone());
+                    }
+                    report.edges.push(EdgeRef {
+                        file: file_label.to_owned(),
+                        line: item.line,
+                        from_mod: mod_path.to_vec(),
+                        to_path: canon,
+                    });
+                }
+            }
+            at_item_boundary = true;
+            i = (i + 1).min(tokens.len());
+            continue;
+        }
+
+        if let Some((after_attr, _, _)) = parse_attribute(tokens, i) {
+            let active = scope_stack.last().unwrap();
+            scan_slice_paths_and_crates(
+                &tokens[i + 1..after_attr],
+                file_label,
+                mod_path,
+                &declared_submods,
+                &active.imports,
+                report,
+            );
+            i = after_attr;
+            continue;
+        }
+
+        if at_item_boundary
+            && tokens[i].is_kw("impl")
+            && let Some((leading_cc, target_segs)) = extract_inherent_impl_target(tokens, i)
+        {
+            let active = scope_stack.last().unwrap();
+            let resolved = resolve_internal_path(
+                leading_cc,
+                &target_segs,
+                mod_path,
+                &declared_submods,
+                &active.imports,
+            )
+            .or_else(|| {
+                if !leading_cc && target_segs.len() == 1 {
+                    let ty = &target_segs[0];
+                    let local_has = defined_types_by_top
+                        .get(current_top)
+                        .is_some_and(|s| s.contains(ty));
+                    if !local_has {
+                        for gtop in &active.glob_tops {
+                            if defined_types_by_top
+                                .get(gtop)
+                                .is_some_and(|s| s.contains(ty))
+                            {
+                                return Some(vec![gtop.clone(), ty.clone()]);
+                            }
+                        }
+                    }
+                }
+                None
+            });
+            if let Some(canon) = resolved
+                && &canon[0] != current_top
+            {
+                report.inherent_impls.push(InherentImplViolation {
+                    file: file_label.to_owned(),
+                    line: tokens[i].line,
+                    from_top: current_top.clone(),
+                    target_top: canon[0].clone(),
+                    target_path: canon.join("::"),
+                });
+            }
+        }
+
+        let leading_cc = tokens[i].kind == Tok::ColonColon
+            && !tokens
+                .get(i.wrapping_sub(1))
+                .is_some_and(|prev| prev.ident_name().is_some() || prev.is_punct('>'));
+        let path_start = if leading_cc { i + 1 } else { i };
+        let preceded_by_dot = !leading_cc && i > 0 && tokens[i - 1].is_punct('.');
+        if !preceded_by_dot
+            && let Some(first_seg) = tokens.get(path_start).and_then(Token::ident_name)
+        {
+            let mut segs = vec![first_seg.to_owned()];
+            check_crate_token(&tokens[path_start], current_top, file_label, report);
+            let mut p = path_start + 1;
+            while tokens.get(p).is_some_and(|t| t.kind == Tok::ColonColon)
+                && let Some(next_seg) = tokens.get(p + 1).and_then(Token::ident_name)
+            {
+                check_crate_token(&tokens[p + 1], current_top, file_label, report);
+                segs.push(next_seg.to_owned());
+                p += 2;
+            }
+            let active = scope_stack.last().unwrap();
+            if segs.len() >= 2
+                && let Some(canon) = resolve_internal_path(
+                    leading_cc,
+                    &segs,
+                    mod_path,
+                    &declared_submods,
+                    &active.imports,
+                )
+            {
+                report.edges.push(EdgeRef {
+                    file: file_label.to_owned(),
+                    line: tokens[path_start].line,
+                    from_mod: mod_path.to_vec(),
+                    to_path: canon,
+                });
+            }
+            at_item_boundary = at_item_boundary
+                && segs.len() == 1
+                && matches!(first_seg, "default" | "unsafe" | "const");
+            i = p;
+            continue;
+        }
+
+        match tokens[i].kind {
+            Tok::Punct('{') => {
+                let close = skip_balanced_delim(tokens, i);
+                let mut child_scope = scope_stack.last().unwrap().clone();
+                let body = &tokens[i + 1..close.saturating_sub(1)];
+                let mut inner_brace = 0usize;
+                let mut k = 0;
+                while k < body.len() {
+                    if !in_excluded(i + 1 + k) && inner_brace == 0 && is_use_kw(body, k) {
+                        let use_line = body[k].line;
+                        k += 1;
+                        let tree_start = k;
+                        let (mut up, mut ub, mut uc) = (0usize, 0usize, 0usize);
+                        while k < body.len() {
+                            match body[k].kind {
+                                Tok::Punct('(') => up += 1,
+                                Tok::Punct(')') => up = up.saturating_sub(1),
+                                Tok::Punct('[') => ub += 1,
+                                Tok::Punct(']') => ub = ub.saturating_sub(1),
+                                Tok::Punct('{') => uc += 1,
+                                Tok::Punct('}') => uc = uc.saturating_sub(1),
+                                Tok::Punct(';') if up == 0 && ub == 0 && uc == 0 => break,
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                        let mut expanded = Vec::new();
+                        expand_use_tree(&body[tree_start..k], &[], false, use_line, &mut expanded);
+                        for item in expanded {
+                            if let Some(canon) = resolve_internal_path(
+                                item.leading_coloncolon,
+                                &item.segments,
+                                mod_path,
+                                &declared_submods,
+                                &child_scope.imports,
+                            ) {
+                                if item.is_glob && &canon[0] != current_top {
+                                    child_scope.glob_tops.insert(canon[0].clone());
+                                }
+                                if let Some(bound) = item.bound_name {
+                                    child_scope.imports.insert(bound, canon);
+                                }
+                            }
+                        }
+                        k = (k + 1).min(body.len());
+                        continue;
+                    }
+                    match body[k].kind {
+                        Tok::Punct('{') => inner_brace += 1,
+                        Tok::Punct('}') => inner_brace = inner_brace.saturating_sub(1),
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                scope_stack.push(child_scope);
+            }
+            Tok::Punct('}') => {
+                if scope_stack.len() > 1 {
+                    scope_stack.pop();
+                }
+            }
+            _ => {}
+        }
+
+        check_crate_token(&tokens[i], current_top, file_label, report);
+        at_item_boundary = matches!(tokens[i].kind, Tok::Punct(';' | '{' | '}'));
+        i += 1;
+    }
+
+    for (sub_name, body_start, body_end) in inline_mods {
+        let mut child_path = mod_path.to_vec();
+        child_path.push(sub_name);
+        analyze_module_scope(
+            file_label,
+            &child_path,
+            &tokens[body_start..body_end],
+            defined_types_by_top,
+            report,
+        );
+    }
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn mod_path_from_rel(rel: &Path) -> Option<Vec<String>> {
+    if rel == Path::new("main.rs") || rel.file_name().and_then(|s| s.to_str()) == Some("tests.rs") {
+        return None;
+    }
+    let without_ext = rel.with_extension("");
+    let mut comps: Vec<String> = without_ext
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if comps.len() > 1 && comps.last().map(String::as_str) == Some("mod") {
+        comps.pop();
+    }
+    (!comps.is_empty()).then_some(comps)
+}
+
+fn analyze_virtual_files(files: &[(&str, Vec<String>, &str)]) -> ScanReport {
+    let prepared: Vec<(&str, Vec<String>, Vec<Token>)> = files
+        .iter()
+        .map(|(label, mod_path, src)| {
+            let filtered = strip_pure_test_code(&lex(src));
+            (*label, mod_path.clone(), filtered)
+        })
+        .collect();
+
+    let mut defined_types_by_top: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut report = ScanReport::default();
+    for (_, mod_path, tokens) in &prepared {
+        report.top_modules.insert(mod_path[0].clone());
+        if mod_path.len() >= 2 {
+            report
+                .file_submodules
+                .entry(mod_path[0].clone())
+                .or_default()
+                .insert(mod_path[1].clone());
+        }
+        collect_defined_types(
+            tokens,
+            defined_types_by_top.entry(mod_path[0].clone()).or_default(),
+        );
+    }
+
+    for (label, mod_path, tokens) in &prepared {
+        analyze_module_scope(label, mod_path, tokens, &defined_types_by_top, &mut report);
+    }
+    report
+}
+
+fn scan_repo_src() -> ScanReport {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = root.join("src");
+    let mut paths = Vec::new();
+    collect_rs_files(&src_dir, &mut paths);
+
+    let mut raw_files: Vec<(String, Vec<String>, String)> = Vec::new();
+    for path in paths {
+        let rel = path.strip_prefix(&src_dir).expect("under src/");
+        let Some(mod_path) = mod_path_from_rel(rel) else {
+            continue;
+        };
+        let label = format!(
+            "src/{}",
+            rel.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        );
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        raw_files.push((label, mod_path, content));
+    }
+
+    let refs: Vec<(&str, Vec<String>, &str)> = raw_files
+        .iter()
+        .map(|(label, mod_path, content)| (label.as_str(), mod_path.clone(), content.as_str()))
+        .collect();
+    analyze_virtual_files(&refs)
+}
+
+fn top_level_directed_edges(report: &ScanReport) -> BTreeMap<(String, String), Vec<String>> {
+    let mut map: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for edge in &report.edges {
+        let from_top = &edge.from_mod[0];
+        let to_top = &edge.to_path[0];
+        if from_top != to_top {
+            let witness = format!(
+                "{}:{} (`crate::{}`)",
+                edge.file,
+                edge.line,
+                edge.to_path.join("::")
+            );
+            let list = map.entry((from_top.clone(), to_top.clone())).or_default();
+            if !list.contains(&witness) {
+                list.push(witness);
+            }
+        }
+    }
+    map
+}
+
+fn compute_two_cycles(
+    directed: &BTreeMap<(String, String), Vec<String>>,
+) -> BTreeSet<(String, String)> {
+    let mut cycles = BTreeSet::new();
+    for (u, v) in directed.keys() {
+        if u < v && directed.contains_key(&(v.clone(), u.clone())) {
+            cycles.insert((u.clone(), v.clone()));
+        }
+    }
+    cycles
+}
+
+/// Tarjan's strongly connected components algorithm. Returns all non-trivial SCCs (`len >= 2`)
+/// sorted deterministically.
+fn tarjan_cyclic_sccs(
+    nodes: &BTreeSet<String>,
+    adj: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<Vec<String>> {
+    struct State<'a> {
+        adj: &'a BTreeMap<String, BTreeSet<String>>,
+        next_index: usize,
+        indices: HashMap<String, usize>,
+        lowlink: HashMap<String, usize>,
+        stack: Vec<String>,
+        on_stack: BTreeSet<String>,
+        cycles: Vec<Vec<String>>,
+    }
+
+    fn strongconnect(v: &str, state: &mut State<'_>) {
+        let idx = state.next_index;
+        state.next_index += 1;
+        state.indices.insert(v.to_owned(), idx);
+        state.lowlink.insert(v.to_owned(), idx);
+        state.stack.push(v.to_owned());
+        state.on_stack.insert(v.to_owned());
+
+        if let Some(neighbors) = state.adj.get(v) {
+            for w in neighbors {
+                if w == v {
+                    continue;
+                }
+                if !state.indices.contains_key(w) {
+                    strongconnect(w, state);
+                    let low_w = state.lowlink[w];
+                    let low_v = state.lowlink.get_mut(v).unwrap();
+                    *low_v = (*low_v).min(low_w);
+                } else if state.on_stack.contains(w) {
+                    let idx_w = state.indices[w];
+                    let low_v = state.lowlink.get_mut(v).unwrap();
+                    *low_v = (*low_v).min(idx_w);
+                }
+            }
+        }
+
+        if state.lowlink[v] == state.indices[v] {
+            let mut comp = Vec::new();
+            while let Some(w) = state.stack.pop() {
+                state.on_stack.remove(&w);
+                let done = w == v;
+                comp.push(w);
+                if done {
+                    break;
+                }
+            }
+            if comp.len() >= 2 {
+                comp.sort();
+                state.cycles.push(comp);
+            }
+        }
+    }
+
+    let mut state = State {
+        adj,
+        next_index: 0,
+        indices: HashMap::new(),
+        lowlink: HashMap::new(),
+        stack: Vec::new(),
+        on_stack: BTreeSet::new(),
+        cycles: Vec::new(),
+    };
+    for node in nodes {
+        if !state.indices.contains_key(node) {
+            strongconnect(node, &mut state);
+        }
+    }
+    state.cycles.sort();
+    state.cycles
+}
+
+struct SubmoduleGraph {
+    nodes: BTreeSet<String>,
+    adj: BTreeMap<String, BTreeSet<String>>,
+    witnesses: BTreeMap<(String, String), Vec<String>>,
+}
+
+/// Builds the file-level submodule graph inside a single top-level module `top`.
+/// When `include_root` is `true`, `src/<top>.rs` participates as node `"<top>"` alongside
+/// `"<top>::<sub>"`; when `false`, only sibling child files `"<top>::<sub>"` participate.
+fn submodule_directed_edges(report: &ScanReport, top: &str, include_root: bool) -> SubmoduleGraph {
+    let empty = BTreeSet::new();
+    let known_subs = report.file_submodules.get(top).unwrap_or(&empty);
+    let mut nodes = BTreeSet::new();
+    if include_root {
+        nodes.insert(top.to_owned());
+    }
+    for sub in known_subs {
+        nodes.insert(format!("{top}::{sub}"));
+    }
+
+    let node_of = |path: &[String], is_target: bool| -> Option<String> {
+        if path.first().map(String::as_str) != Some(top) {
+            return None;
+        }
+        if let Some(candidate) = path.get(1)
+            && known_subs.contains(candidate)
+        {
+            return Some(format!("{top}::{candidate}"));
+        }
+        if include_root && (is_target || path.len() == 1) {
+            return Some(top.to_owned());
+        }
+        None
+    };
+
+    let mut adj: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut witnesses: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for edge in &report.edges {
+        let (Some(u), Some(v)) = (node_of(&edge.from_mod, false), node_of(&edge.to_path, true))
+        else {
+            continue;
+        };
+        if u == v {
+            continue;
+        }
+        adj.entry(u.clone()).or_default().insert(v.clone());
+        let w = format!(
+            "{}:{} (`crate::{}`)",
+            edge.file,
+            edge.line,
+            edge.to_path.join("::")
+        );
+        let list = witnesses.entry((u, v)).or_default();
+        if !list.contains(&w) {
+            list.push(w);
+        }
+    }
+    SubmoduleGraph {
+        nodes,
+        adj,
+        witnesses,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Architecture Gate Tests (Checkpoint 1: full D(u) allowlist + SCC gates)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn target_dag_allowlist_is_strictly_lower_triangular() {
+    let mut ranks: HashMap<&str, usize> = HashMap::new();
+    for (idx, &(module, _)) in TARGET_DAG_ALLOWLIST.iter().enumerate() {
+        assert!(
+            ranks.insert(module, idx).is_none(),
+            "duplicate module `{module}` in TARGET_DAG_ALLOWLIST"
+        );
+    }
+    for &(u, deps) in TARGET_DAG_ALLOWLIST {
+        let rank_u = ranks[u];
+        for &v in deps {
+            let Some(&rank_v) = ranks.get(v) else {
+                panic!("`{u}` lists unknown target `{v}` in TARGET_DAG_ALLOWLIST");
+            };
+            assert!(
+                rank_v < rank_u,
+                "TARGET_DAG_ALLOWLIST violates strict lower-triangular order: `{u}` (#{}) -> `{v}` (#{})",
+                rank_u + 1,
+                rank_v + 1
+            );
+        }
+    }
+}
+
+fn unauthorized_cross_module_edges(report: &ScanReport) -> Vec<String> {
+    let mut allowed_modules: BTreeSet<&str> =
+        TARGET_DAG_ALLOWLIST.iter().map(|&(m, _)| m).collect();
+    for &m in CP1_TRANSITIONAL_MODULES {
+        allowed_modules.insert(m);
+    }
+    let mut violations = Vec::new();
+    for discovered in &report.top_modules {
+        if !allowed_modules.contains(discovered.as_str()) {
+            violations.push(format!(
+                "  - unregistered top-level module `src/{discovered}` (not in TARGET_DAG_ALLOWLIST)"
+            ));
+        }
+    }
+
+    let mut allowed_edges: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for &(u, deps) in TARGET_DAG_ALLOWLIST {
+        for &v in deps {
+            allowed_edges.insert((u, v));
+        }
+    }
+    for &edge in CP1_TRANSITIONAL_EDGES {
+        assert!(
+            !allowed_edges.contains(&edge),
+            "CP1_TRANSITIONAL_EDGES redundantly lists `{}` -> `{}` which is already in TARGET_DAG_ALLOWLIST",
+            edge.0,
+            edge.1
+        );
+        allowed_edges.insert(edge);
+    }
+
+    let directed = top_level_directed_edges(report);
+    for ((u, v), sites) in &directed {
+        if !allowed_edges.contains(&(u.as_str(), v.as_str())) {
+            violations.push(format!(
+                "  - {u} -> {v} ({} site(s)): {}",
+                sites.len(),
+                sites.join(", ")
+            ));
+        }
+    }
+    violations
+}
+
+#[test]
+fn cp1_every_cross_module_edge_belongs_to_target_dag_or_transitional_budget() {
+    let report = scan_repo_src();
+    let unauthorized = unauthorized_cross_module_edges(&report);
+    assert!(
+        unauthorized.is_empty(),
+        "found {} unauthorized cross-top-module edge(s) outside D(u) ∪ CP1_TRANSITIONAL_EDGES:\n{}",
+        unauthorized.len(),
+        unauthorized.join("\n")
+    );
+}
+
+#[test]
+fn cp1_top_level_two_cycles_stay_within_transitional_budget() {
+    let report = scan_repo_src();
+    let directed = top_level_directed_edges(&report);
+    let actual_cycles = compute_two_cycles(&directed);
+    let allowed: BTreeSet<(String, String)> = CP1_TRANSITIONAL_2CYCLES
+        .iter()
+        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+        .collect();
+
+    let forbidden: Vec<(String, String)> = actual_cycles.difference(&allowed).cloned().collect();
+    if !forbidden.is_empty() {
+        let mut msg = format!(
+            "found {} top-level 2-cycle(s) outside CP1_TRANSITIONAL_2CYCLES:\n",
+            forbidden.len()
+        );
+        for (a, b) in &forbidden {
+            let ab = &directed[&(a.clone(), b.clone())];
+            let ba = &directed[&(b.clone(), a.clone())];
+            msg.push_str(&format!(
+                "  - {a} <-> {b}:\n      {a} -> {b}: {}\n      {b} -> {a}: {}\n",
+                ab.join(", "),
+                ba.join(", ")
+            ));
+        }
+        panic!("{msg}");
+    }
+}
+
+#[test]
+fn cp1_forbidden_cross_layer_edges_are_zero() {
+    let report = scan_repo_src();
+    let directed = top_level_directed_edges(&report);
+    let mut violations = Vec::new();
+    for &(from, to) in CP1_FORBIDDEN_EDGES {
+        if let Some(witnesses) = directed.get(&(from.to_owned(), to.to_owned())) {
+            violations.push(format!(
+                "  - {from} -> {to} ({} site(s)): {}",
+                witnesses.len(),
+                witnesses.join(", ")
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "found {} forbidden cross-layer edge kind(s):\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn submodule_graphs_have_zero_strongly_connected_cycles() {
+    let report = scan_repo_src();
+    let mut failures = Vec::new();
+
+    for &top in ACYCLIC_SUBMODULE_TREES {
+        let graph = submodule_directed_edges(&report, top, true);
+        for scc in tarjan_cyclic_sccs(&graph.nodes, &graph.adj) {
+            let mut details = Vec::new();
+            for u in &scc {
+                for v in &scc {
+                    if let Some(sites) = graph.witnesses.get(&(u.clone(), v.clone())) {
+                        details.push(format!("      {u} -> {v}: {}", sites.join(", ")));
+                    }
+                }
+            }
+            failures.push(format!(
+                "  - `{top}` submodule-tree SCC {{{}}}:\n{}",
+                scc.join(", "),
+                details.join("\n")
+            ));
+        }
+    }
+
+    for &top in ACYCLIC_SIBLING_SUBMODULES {
+        let graph = submodule_directed_edges(&report, top, false);
+        for scc in tarjan_cyclic_sccs(&graph.nodes, &graph.adj) {
+            let mut details = Vec::new();
+            for u in &scc {
+                for v in &scc {
+                    if let Some(sites) = graph.witnesses.get(&(u.clone(), v.clone())) {
+                        details.push(format!("      {u} -> {v}: {}", sites.join(", ")));
+                    }
+                }
+            }
+            failures.push(format!(
+                "  - `{top}` sibling-submodule SCC {{{}}}:\n{}",
+                scc.join(", "),
+                details.join("\n")
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "found {} submodule strongly connected cycle(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn cross_top_module_inherent_impls_are_zero() {
+    let report = scan_repo_src();
+    if !report.inherent_impls.is_empty() {
+        let lines: Vec<String> = report
+            .inherent_impls
+            .iter()
+            .map(|v| {
+                format!(
+                    "  - {}:{} (`{}` defines inherent `impl crate::{}` belonging to `{}`)",
+                    v.file, v.line, v.from_top, v.target_path, v.target_top
+                )
+            })
+            .collect();
+        panic!(
+            "found {} cross-top-module inherent impl block(s):\n{}",
+            lines.len(),
+            lines.join("\n")
+        );
+    }
+}
+
+#[test]
+fn third_party_protocol_and_engine_crates_stay_isolated() {
+    let report = scan_repo_src();
+    if !report.crate_leaks.is_empty() {
+        let lines: Vec<String> = report
+            .crate_leaks
+            .iter()
+            .map(|leak| {
+                format!(
+                    "  - {}:{} (top module `{}` references `{}`)",
+                    leak.file, leak.line, leak.from_top, leak.crate_name
+                )
+            })
+            .collect();
+        panic!(
+            "found {} third-party crate isolation violation(s):\n{}",
+            lines.len(),
+            lines.join("\n")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parser, Skipper, Path & SCC Self-Tests (§7.2.1 - §7.2.5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lexer_strips_urls_strings_nested_comments_and_distinguishes_chars_from_lifetimes() {
+    let src = r####"
+        //! Module doc mentioning rmcp and crate::ipc::Fake
+        /// Item doc mentioning hyper_util and "unclosed quote
+        const URL: &str = "http://127.0.0.1:8080/mcp // not a comment /* crate::tasks::Fake";
+        const BYTES: &[u8] = b"crate::daemon::Fake \"escaped\"";
+        const CSTR: &core::ffi::CStr = c"crate::http::Fake \n";
+        const RAW: &str = r##"raw "http://..." with "#" and crate::mcp::Fake"##;
+        const BRAW: &[u8] = br#"crate::events::Fake"#;
+        const CRAW: &core::ffi::CStr = cr#"crate::service::Fake"#;
+        /* Outer block comment crate::ipc::Fake
+           /* Nested block comment */ still inside outer comment: rmcp::Fake
+        */
+        fn chars_and_lifetimes<'a, 'static_lt>(x: &'a mut Holder<'_, 'static>) -> [char; 5] {
+            let _ = crate::lease::BytePool::new(1);
+            ['{', '\'', '\"', '\x7f', '\u{1F980}']
+        }
+    "####;
+
+    let report = analyze_virtual_files(&[("src/media.rs", vec!["media".into()], src)]);
+    assert!(
+        report.crate_leaks.is_empty(),
+        "unexpected crate leaks: {:?}",
+        report.crate_leaks
+    );
+    let targets: Vec<Vec<String>> = report.edges.into_iter().map(|e| e.to_path).collect();
+    assert_eq!(
+        targets,
+        vec![vec![
+            "lease".to_owned(),
+            "BytePool".to_owned(),
+            "new".to_owned()
+        ]]
+    );
+}
+
+#[test]
+fn cfg_three_valued_logic_skips_only_unsatisfiable_test_predicates() {
+    let src = r#"
+        #[cfg(test)]
+        use crate::ipc::PureTestUse;
+
+        #[cfg(all(test, unix, not(target_os = "macos")))]
+        fn pure_test_unix() {
+            let _ = crate::tasks::random_chars(8);
+        }
+
+        #[cfg(any(test, all(unix, test)))]
+        mod pure_test_mod {
+            use crate::daemon::Daemon;
+        }
+
+        #[cfg(not(test))]
+        type ProdWriter = crate::transport::Client;
+
+        #[cfg(any(windows, test))]
+        fn cross_platform_helper() {
+            let _ = crate::lease::process_pool();
+        }
+
+        #[cfg(any(target_os = "macos", test))]
+        fn macos_or_test_helper() {
+            let _ = crate::events::EventBus::new();
+        }
+    "#;
+
+    let report = analyze_virtual_files(&[(
+        "src/files/path.rs",
+        vec!["files".into(), "path".into()],
+        src,
+    )]);
+    let tops: BTreeSet<String> = report.edges.iter().map(|e| e.to_path[0].clone()).collect();
+    assert_eq!(
+        tops,
+        BTreeSet::from([
+            "events".to_owned(),
+            "lease".to_owned(),
+            "transport".to_owned(),
+        ])
+    );
+}
+
+#[test]
+fn cfg_skipper_handles_generic_commas_let_statements_closure_if_crate_args_and_inner_cfg() {
+    let src = r#"
+        #[cfg(test)]
+        extern crate alloc;
+
+        #[cfg(test)]
+        #[allow(clippy::type_complexity)]
+        pub(super) async fn generic_comma_fn<W, T>(
+            writer: &mut W,
+            msg: &T,
+        ) -> Result<(String, Vec<usize>, crate::ipc::Owned<u8>), String>
+        where
+            W: Unpin,
+            T: Sized,
+        {
+            let _ = crate::tasks::random_chars(8);
+            Err(String::new())
+        }
+
+        struct Container {
+            kept: crate::lease::Lease,
+            #[cfg(test)]
+            hook_mid: Option<fn(usize, usize) -> Result<(), crate::daemon::Error>>,
+            #[cfg(test)]
+            hook_last: std::collections::HashMap<String, Option<Vec<crate::ipc::Owned<u8>>>>
+        }
+
+        pub mod outer_mod {
+            mod first_inner_test_mod {
+                #![cfg(test)]
+                pub fn dropped_first() {
+                    let _ = crate::http::dropped_one();
+                }
+            }
+
+            mod second_inner_test_mod {
+                #![cfg(test)]
+                pub fn dropped_second() {
+                    let _ = crate::mcp::dropped_two();
+                }
+            }
+
+            pub fn kept_inside_outer() {
+                let _ = crate::id::random_chars(4);
+            }
+        }
+
+        pub fn prod_workflow() {
+            #[cfg(test)]
+            let _test_binding = crate::http::PUBLIC_URL;
+
+            #[cfg(test)]
+            let Some(_guard) = crate::mcp::check() else {
+                let _ = crate::service::abort();
+                return;
+            };
+
+            #[cfg(test)]
+            if let Ok(exe) = std::env::current_exe().map(|d| {
+                let _ = crate::ipc::in_condition_closure(&d);
+                d
+            }) {
+                let _ = crate::tasks::in_if_body(exe);
+            } else if unsafe { crate::codemode::in_unsafe_cond() } {
+                let _ = crate::codemode::in_else_if();
+            } else {
+                let _ = crate::daemon::in_else();
+            }
+
+            #[cfg(test)]
+            'probe: loop {
+                let _ = crate::http::in_labeled_loop();
+                break 'probe;
+            }
+
+            let _ = call_fn(
+                #[cfg(test)]
+                crate::ipc::pure_test_first_arg(4),
+                crate::events::prod_second_arg(),
+                #[cfg(test)]
+                (1usize << 4)
+            );
+            let _ = crate::transport::after_all_skips();
+        }
+    "#;
+
+    let report = analyze_virtual_files(&[("src/wait.rs", vec!["wait".into()], src)]);
+    let tops: BTreeSet<String> = report.edges.iter().map(|e| e.to_path[0].clone()).collect();
+    assert_eq!(
+        tops,
+        BTreeSet::from([
+            "events".to_owned(),
+            "id".to_owned(),
+            "lease".to_owned(),
+            "transport".to_owned(),
+        ]),
+        "pure-test items leaked or swallowed production code: {:?}",
+        report.edges
+    );
+}
+
+#[test]
+fn paren_nested_local_use_is_captured_and_rust2024_precise_capturing_use_lt_is_ignored() {
+    let src = r#"
+        pub fn precise_capture<'a>(
+            input: &'a str,
+        ) -> impl core::future::Future<Output = usize> + use<'a> {
+            let _ = crate::lease::BytePool::new(input.len());
+            async move { input.len() }
+        }
+
+        pub fn spawn_background() {
+            tokio::spawn(async move {
+                let _ = daemon::run();
+                let _ = Owned::new(1u8);
+                use crate::{daemon, ipc::Owned};
+            });
+        }
+    "#;
+
+    let report = analyze_virtual_files(&[("src/endpoint.rs", vec!["endpoint".into()], src)]);
+    let tops: BTreeSet<String> = report.edges.iter().map(|e| e.to_path[0].clone()).collect();
+    assert_eq!(
+        tops,
+        BTreeSet::from(["daemon".to_owned(), "ipc".to_owned(), "lease".to_owned()]),
+        "got edges: {:?}",
+        report.edges
+    );
+    assert!(
+        report
+            .edges
+            .iter()
+            .any(|e| e.to_path == vec!["daemon", "run"]),
+        "forward call before block-local `use` inside `tokio::spawn(...)` did not resolve: {:?}",
+        report.edges
+    );
+}
+
+#[test]
+fn allowlist_gate_rejects_upward_diagonal_and_three_cycle_violations() {
+    let report = analyze_virtual_files(&[
+        // Upward violation (#1 id -> #22 http)
+        (
+            "src/id.rs",
+            vec!["id".into()],
+            "pub fn bad() { let _ = crate::http::serve(); }",
+        ),
+        // Upward violation (#2 lease -> #12 tasks)
+        (
+            "src/lease.rs",
+            vec!["lease".into()],
+            "pub fn bad() { let _ = crate::tasks::Limits; }",
+        ),
+        // Diagonal S1b breach (#5 media -> #6 term)
+        (
+            "src/media.rs",
+            vec!["media".into()],
+            "pub fn bad() { let _ = crate::term::keys::Modes; }",
+        ),
+        // Diagonal S1c breach (#10 config -> #9 transfer)
+        (
+            "src/config.rs",
+            vec!["config".into()],
+            "pub fn bad() { let _ = crate::transfer::Transfers; }",
+        ),
+        // Three-cycle (`events -> wait -> tasks -> events`, where `events -> wait` is illegal)
+        (
+            "src/events.rs",
+            vec!["events".into()],
+            "pub fn c1() { let _ = crate::wait::WaitEnd; }",
+        ),
+        (
+            "src/wait.rs",
+            vec!["wait".into()],
+            "pub fn c2() { let _ = crate::tasks::Tasks; }",
+        ),
+        (
+            "src/tasks.rs",
+            vec!["tasks".into()],
+            "pub fn c3() { let _ = crate::events::EventBus; }",
+        ),
+    ]);
+
+    let violations = unauthorized_cross_module_edges(&report);
+    assert_eq!(violations.len(), 5, "got: {violations:?}");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("id -> http") && v.contains("src/id.rs:1"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("lease -> tasks") && v.contains("src/lease.rs:1"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("media -> term") && v.contains("src/media.rs:1"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("config -> transfer") && v.contains("src/config.rs:1"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("events -> wait") && v.contains("src/events.rs:1"))
+    );
+}
+
+#[test]
+fn path_canonicalizer_resolves_nested_use_trees_super_self_inline_mods_and_bare_submodules() {
+    let parent_src = r#"
+        pub(crate) mod child;
+        #[cfg(test)]
+        mod tests;
+
+        use self::child::Helper;
+        use crate::{
+            lease::{self as mem, BytePool},
+            events::{EventBus as Bus, *},
+        };
+
+        pub fn run() {
+            let _ = child::invoke();
+            let _ = Helper::new();
+            let _ = mem::json_len(&1u8);
+            let _ = BytePool::new(8);
+            let _ = Bus::new();
+        }
+    "#;
+
+    let child_src = r#"
+        use super::Helper;
+
+        pub mod nested {
+            use super::super::child;
+            pub fn call_up() {
+                let _ = super::super::super::transport::connect();
+                let _ = child::invoke();
+            }
+        }
+
+        pub fn invoke() {
+            let _ = Helper::new();
+            let _ = nested::call_up();
+            let _ = super::super::config::load();
+        }
+    "#;
+
+    let report = analyze_virtual_files(&[
+        ("src/alpha.rs", vec!["alpha".into()], parent_src),
+        (
+            "src/alpha/child.rs",
+            vec!["alpha".into(), "child".into()],
+            child_src,
+        ),
+    ]);
+
+    let directed = top_level_directed_edges(&report);
+    let edge_pairs: BTreeSet<(&str, &str)> = directed
+        .keys()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    assert_eq!(
+        edge_pairs,
+        BTreeSet::from([
+            ("alpha", "config"),
+            ("alpha", "events"),
+            ("alpha", "lease"),
+            ("alpha", "transport"),
+        ])
+    );
+
+    assert!(
+        report
+            .edges
+            .iter()
+            .any(|e| e.to_path == vec!["alpha", "child", "invoke"])
+    );
+}
+
+#[test]
+fn tarjan_scc_detects_three_node_submodule_cycles_and_passes_dags() {
+    let root_src = r#"
+        pub mod a;
+        pub mod b;
+        pub mod c;
+        pub mod leaf;
+    "#;
+    let a_src = "pub fn a() { let _ = super::b::b(); let _ = super::leaf::ok(); }";
+    let b_src = "pub fn b() { let _ = super::c::c(); }";
+    let c_src = "pub fn c() { let _ = super::a::a(); }";
+    let leaf_src = "pub fn ok() {}";
+
+    let report = analyze_virtual_files(&[
+        ("src/pkg.rs", vec!["pkg".into()], root_src),
+        ("src/pkg/a.rs", vec!["pkg".into(), "a".into()], a_src),
+        ("src/pkg/b.rs", vec!["pkg".into(), "b".into()], b_src),
+        ("src/pkg/c.rs", vec!["pkg".into(), "c".into()], c_src),
+        (
+            "src/pkg/leaf.rs",
+            vec!["pkg".into(), "leaf".into()],
+            leaf_src,
+        ),
+    ]);
+
+    let graph = submodule_directed_edges(&report, "pkg", true);
+    let cycles = tarjan_cyclic_sccs(&graph.nodes, &graph.adj);
+    assert_eq!(
+        cycles,
+        vec![vec![
+            "pkg::a".to_owned(),
+            "pkg::b".to_owned(),
+            "pkg::c".to_owned()
+        ]]
+    );
+}
+
+#[test]
+fn inherent_impl_detector_flags_direct_imported_and_ref_foreign_types_without_false_positives() {
+    let session_src = r#"
+        pub struct LaunchContext;
+        pub struct GlobImportedType;
+        pub struct LocalCollision;
+    "#;
+
+    let service_root_src = r#"
+        pub mod render;
+        pub struct Service;
+    "#;
+
+    let service_render_src = r#"
+        use super::Service;
+        impl Service {
+            pub fn same_top_module_is_allowed(&self) {}
+        }
+    "#;
+
+    let ipc_src = r#"
+        use crate::session::LaunchContext as ImportedCtx;
+        use crate::session::*;
+        type TypeAliasedCtx = crate::session::LaunchContext;
+
+        pub struct LocalWire;
+        pub struct LocalCollision;
+
+        fn block_local_import_does_not_taint_outer_impl() {
+            use crate::session::LocalCollision;
+            let _ = LocalCollision;
+        }
+
+        impl LocalCollision {
+            pub fn local_is_allowed(&self) {}
+        }
+
+        impl LocalWire {
+            pub fn ok() -> impl core::future::Future<Output = crate::session::LaunchContext> {
+                async { crate::session::LaunchContext }
+            }
+        }
+
+        impl From<ImportedCtx> for LocalWire {
+            fn from(_: ImportedCtx) -> Self {
+                Self
+            }
+        }
+
+        impl crate::session::LaunchContext {
+            pub fn direct_foreign() {}
+        }
+
+        impl<'a> ImportedCtx {
+            pub fn aliased_foreign() {}
+        }
+
+        impl TypeAliasedCtx {
+            pub fn type_aliased_foreign() {}
+        }
+
+        impl GlobImportedType {
+            pub fn glob_foreign() {}
+        }
+
+        impl &crate::session::LaunchContext {
+            pub fn shared_ref_foreign() {}
+        }
+
+        impl<'a> &'a mut ImportedCtx {
+            pub fn mut_ref_foreign() {}
+        }
+    "#;
+
+    let report = analyze_virtual_files(&[
+        ("src/session.rs", vec!["session".into()], session_src),
+        ("src/service.rs", vec!["service".into()], service_root_src),
+        (
+            "src/service/render.rs",
+            vec!["service".into(), "render".into()],
+            service_render_src,
+        ),
+        ("src/ipc.rs", vec!["ipc".into()], ipc_src),
+    ]);
+
+    assert_eq!(
+        report.inherent_impls.len(),
+        6,
+        "got: {:?}",
+        report.inherent_impls
+    );
+    for idx in [0, 1, 2, 4, 5] {
+        assert_eq!(
+            report.inherent_impls[idx].target_path,
+            "session::LaunchContext"
+        );
+    }
+    assert_eq!(
+        report.inherent_impls[3].target_path,
+        "session::GlobImportedType"
+    );
+}

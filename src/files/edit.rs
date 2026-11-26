@@ -90,15 +90,15 @@ pub async fn edit_core(
     launch: Arc<LaunchContext>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     input_owner: crate::lease::Owner,
-) -> crate::ipc::Owned<Result<FileEditData, EditError>> {
-    let input = crate::ipc::Owned::new((request, permit), input_owner);
+) -> crate::lease::Owned<Result<FileEditData, EditError>> {
+    let input = crate::lease::Owned::new((request, permit), input_owner);
     match tokio::task::spawn_blocking(move || {
         input.flat_map(|(request, _permit)| edit_blocking(&request, &launch))
     })
     .await
     {
         Ok(outcome) => outcome,
-        Err(error) => crate::ipc::Owned::new(
+        Err(error) => crate::lease::Owned::new(
             Err(FileError::Io(format!("the file operation did not finish: {error}")).into()),
             Default::default(),
         ),
@@ -450,7 +450,7 @@ pub(super) fn read_edit_content(
 
 pub(super) struct EditSource {
     path: PathBuf,
-    pub(super) target: crate::ipc::Owned<PathBuf>,
+    pub(super) target: crate::lease::Owned<PathBuf>,
     file: File,
     pub(super) content: String,
     _content_lease: Lease,
@@ -567,7 +567,7 @@ fn edit_retained_bytes(result: &Result<FileEditData, EditError>) -> Option<usize
 pub(crate) fn edit_blocking(
     request: &EditRequest,
     launch: &LaunchContext,
-) -> crate::ipc::Owned<Result<FileEditData, EditError>> {
+) -> crate::lease::Owned<Result<FileEditData, EditError>> {
     with_path_workspace(&request.path, launch, 0, |lease| {
         let path_bytes = lease.bytes();
         let result = edit_outcome_reserved(request, launch, lease);
@@ -578,7 +578,7 @@ pub(crate) fn edit_blocking(
         result
     })
     .unwrap_or_else(|message| {
-        crate::ipc::Owned::new(Err(FileError::Overload(message).into()), Default::default())
+        crate::lease::Owned::new(Err(FileError::Overload(message).into()), Default::default())
     })
 }
 

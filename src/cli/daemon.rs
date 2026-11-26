@@ -7,12 +7,11 @@ use crate::config::{
 use crate::daemon;
 use crate::endpoint;
 use crate::events;
-use crate::http;
+use crate::id;
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::lease;
 use crate::platform::runtime;
 use crate::session::LaunchContext;
-use crate::tasks;
 use crate::transport;
 
 /// The hidden `daemon` subcommand: the daemon process itself, and the CLI that starts, inspects,
@@ -313,7 +312,7 @@ async fn connect_emit_daemon(
             .map_err(|e| format!("cannot send HelloEmit: {e}"))?;
         let frame = ipc::read_endpoint_frame_leased(
             &mut client,
-            ipc::RESPONSE_LIMIT,
+            lease::FRAME_LIMIT,
             lease::process_pool(),
             lease::control_pool(),
             |_| true,
@@ -343,7 +342,7 @@ async fn send_emit_event(
         .map_err(|e| format!("cannot send EmitEvent: {e}"))?;
     match ipc::read_endpoint_frame_leased(
         client,
-        ipc::RESPONSE_LIMIT,
+        lease::FRAME_LIMIT,
         lease::process_pool(),
         lease::control_pool(),
         |_| true,
@@ -606,7 +605,7 @@ async fn cli_start(
         Err(message) => return fail(&message),
     };
     let public_root = if flags.http.is_some() || tools.transfer {
-        match http::public_root() {
+        match crate::config::public_root() {
             Ok(root) => root,
             Err(message) => return fail(&message),
         }
@@ -813,9 +812,9 @@ async fn connect_existing(paths: &runtime::Paths) -> Result<Option<transport::Cl
 fn hello(
     identity: &runtime::Identity,
     launch: &LaunchContext,
-) -> Result<ipc::Owned<ToDaemon>, String> {
+) -> Result<lease::Owned<ToDaemon>, String> {
     let session =
-        tasks::random_chars(26).map_err(|error| format!("cannot name the session: {error}"))?;
+        id::random_chars(26).map_err(|error| format!("cannot name the session: {error}"))?;
     endpoint::hello_owned(launch, identity, &session, 1, "cli").map_err(|error| error.to_string())
 }
 
@@ -837,7 +836,7 @@ async fn read_to_end(client: &mut transport::Client) -> Result<(), String> {
     loop {
         match ipc::read_endpoint_frame_leased(
             client,
-            ipc::RESPONSE_LIMIT,
+            lease::FRAME_LIMIT,
             lease::process_pool(),
             lease::control_pool(),
             |_| false,
@@ -875,7 +874,7 @@ async fn request_status(client: &mut transport::Client) -> Result<DaemonStatus, 
     .map_err(|error| format!("cannot send Status: {error}"))?;
     match ipc::read_endpoint_frame_leased(
         client,
-        ipc::RESPONSE_LIMIT,
+        lease::FRAME_LIMIT,
         lease::process_pool(),
         lease::control_pool(),
         |_| false,

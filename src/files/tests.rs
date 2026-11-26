@@ -177,7 +177,7 @@ fn read_text(
 fn edit_owned_outcome(
     request: &EditRequest,
     launch: &LaunchContext,
-) -> crate::ipc::Owned<EditView> {
+) -> crate::lease::Owned<EditView> {
     let owned = edit_blocking(request, launch);
     let owner = owned.owner.clone();
     let value = owned.run(|res| match res {
@@ -211,7 +211,7 @@ fn edit_owned_outcome(
             Err((err.error.into_message(), structured))
         }
     });
-    crate::ipc::Owned::new(value, owner)
+    crate::lease::Owned::new(value, owner)
 }
 
 fn edit_outcome(request: &EditRequest, launch: &LaunchContext) -> EditView {
@@ -1027,7 +1027,7 @@ fn windows_root_relative_symlink_write_matches_native_resolution() {
     // A root-relative target uses the current drive, which may differ from the temp drive.
     let scratch = Scratch(std::env::current_dir().unwrap().join(format!(
         "fastexec-rooted-link-{}",
-        crate::tasks::random_chars(8).unwrap()
+        crate::id::random_chars(8).unwrap()
     )));
     std::fs::create_dir(&scratch.0).unwrap();
     let launch = context(&scratch.0, &scratch.0);

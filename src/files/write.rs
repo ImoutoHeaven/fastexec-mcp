@@ -25,15 +25,15 @@ pub async fn write_core(
     launch: Arc<LaunchContext>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     input_owner: crate::lease::Owner,
-) -> crate::ipc::Owned<Result<FileWriteData, FileError>> {
-    let input = crate::ipc::Owned::new((request, permit), input_owner);
+) -> crate::lease::Owned<Result<FileWriteData, FileError>> {
+    let input = crate::lease::Owned::new((request, permit), input_owner);
     match tokio::task::spawn_blocking(move || {
         input.flat_map(|(request, _permit)| write_blocking(&request, &launch))
     })
     .await
     {
         Ok(outcome) => outcome,
-        Err(error) => crate::ipc::Owned::new(
+        Err(error) => crate::lease::Owned::new(
             Err(FileError::Io(format!(
                 "the file operation did not finish: {error}"
             ))),
@@ -45,12 +45,12 @@ pub async fn write_core(
 pub(crate) fn write_blocking(
     request: &WriteRequest,
     launch: &LaunchContext,
-) -> crate::ipc::Owned<Result<FileWriteData, FileError>> {
+) -> crate::lease::Owned<Result<FileWriteData, FileError>> {
     with_path_workspace(&request.path, launch, 0, |lease| {
         write_text_reserved(request, launch, lease)
     })
     .unwrap_or_else(|message| {
-        crate::ipc::Owned::new(Err(FileError::Overload(message)), Default::default())
+        crate::lease::Owned::new(Err(FileError::Overload(message)), Default::default())
     })
 }
 
@@ -100,14 +100,14 @@ pub(super) fn write_text_reserved(
 
 /// Creates the final target's parent directories for an initial upload. Its real
 /// blocking worker owns the resolved target even when the HTTP waiter is dropped.
-pub(crate) fn create_target_parents(path: &Path) -> io::Result<crate::ipc::Owned<PathBuf>> {
+pub(crate) fn create_target_parents(path: &Path) -> io::Result<crate::lease::Owned<PathBuf>> {
     create_target_parents_in(path, crate::lease::process_pool())
 }
 
 pub(super) fn create_target_parents_in(
     path: &Path,
     pool: &Arc<BytePool>,
-) -> io::Result<crate::ipc::Owned<PathBuf>> {
+) -> io::Result<crate::lease::Owned<PathBuf>> {
     let target = write_target(path, pool)?;
     create_target_directories(&target.value, pool)?;
     Ok(target)
@@ -132,7 +132,7 @@ fn create_target_directories(path: &Path, pool: &Arc<BytePool>) -> io::Result<()
 pub(crate) fn write_target(
     path: &Path,
     pool: &Arc<BytePool>,
-) -> io::Result<crate::ipc::Owned<PathBuf>> {
+) -> io::Result<crate::lease::Owned<PathBuf>> {
     let initial = native_path_bytes(path).ok_or_else(|| target_memory_error(pool))?;
     let mut lease = pool
         .try_acquire(initial)
@@ -184,14 +184,14 @@ pub(crate) fn write_target(
             }
             Ok(_) => {
                 lease.shrink_to(target.capacity());
-                return Ok(crate::ipc::Owned::new(
+                return Ok(crate::lease::Owned::new(
                     target,
                     crate::lease::Owner::new(lease),
                 ));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 lease.shrink_to(target.capacity());
-                return Ok(crate::ipc::Owned::new(
+                return Ok(crate::lease::Owned::new(
                     target,
                     crate::lease::Owner::new(lease),
                 ));

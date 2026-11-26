@@ -290,6 +290,7 @@ struct Candidate {
     dropped: usize,
 }
 
+#[derive(Clone, Copy)]
 pub struct WindowSpec {
     pub truncate: Truncate,
     /// Byte budget for the window body.

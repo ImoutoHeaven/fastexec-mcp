@@ -1,6 +1,7 @@
 use super::state::*;
 use super::workers::*;
 use super::*;
+use crate::id::{ALPHABET, is_valid_task_id};
 use crate::lease::BytePool;
 use crate::session::ReadState;
 use std::io::Read;
@@ -273,30 +274,6 @@ mod ids {
     }
 
     #[test]
-    fn base32_is_minimal_and_most_significant_first() {
-        assert_eq!(base32(1, 1), "1");
-        assert_eq!(base32(31, 1), "z");
-        assert_eq!(base32(32, 1), "10");
-        assert_eq!(base32(0, 1), "0");
-        // A zero source still fills the whole epoch width.
-        assert_eq!(base32(0, 26), "0".repeat(26));
-    }
-
-    #[test]
-    fn short_random_keys_use_the_full_alphabet_at_every_position() {
-        let mut high = [false; 4];
-        for _ in 0..128 {
-            let key = random_chars(4).unwrap();
-            assert_eq!(key.len(), 4);
-            for (i, byte) in key.bytes().enumerate() {
-                assert!(ALPHABET.contains(&byte));
-                high[i] |= ALPHABET[8..].contains(&byte);
-            }
-        }
-        assert!(high.into_iter().all(|seen| seen));
-    }
-
-    #[test]
     fn task_ids_carry_the_epoch_and_never_repeat() {
         let epoch = new_epoch().unwrap();
         let first = task_id(&epoch, 1);
@@ -315,7 +292,7 @@ mod tests {
     use super::*;
     use crate::service::schema::Request;
     use crate::service::{AgentDelivery, ExecContext, Service};
-    use crate::term::output::{Cleaner, Matcher, Truncate};
+    use crate::term::output::{Cleaner, Matcher, Truncate, WindowSpec};
 
     /// A `Tasks` for a test: it needs a runtime for its `killAfterMs` timer, which these tests
     /// do not arm.
@@ -644,18 +621,18 @@ mod tests {
         tasks.evict_log(&task);
         let mut state = ReadState::default();
         // Every read path that opens the deleted file reports the eviction instead of an error.
+        let head_spec = WindowSpec {
+            truncate: Truncate::Head,
+            budget: 4096,
+            raw: false,
+            clean: true,
+            keep_nul: false,
+            include_markers: true,
+            encoding: encoding_rs::UTF_8,
+            source: "log",
+        };
         let window = task
-            .read_window_with_markers(
-                &mut state,
-                Truncate::Head,
-                4096,
-                false,
-                true,
-                false,
-                true,
-                encoding_rs::UTF_8,
-                None,
-            )
+            .read_window_with_markers(&mut state, head_spec, None)
             .expect("an evicted log is not an I/O error");
         // Empty, with no invented line range: the snapshot reports the eviction.
         assert_eq!(window.text, "");
@@ -663,17 +640,7 @@ mod tests {
         assert_eq!(state.cursor, written, "the cursor moved past the output");
         // A second read has nothing more to move past and stays empty.
         let again = task
-            .read_window_with_markers(
-                &mut state,
-                Truncate::Head,
-                4096,
-                false,
-                true,
-                false,
-                true,
-                encoding_rs::UTF_8,
-                None,
-            )
+            .read_window_with_markers(&mut state, head_spec, None)
             .unwrap();
         assert_eq!(again.text, "");
         assert_eq!(state.cursor, written);
@@ -681,13 +648,16 @@ mod tests {
         assert!(
             task.read_window_with_markers(
                 &mut ReadState::default(),
-                Truncate::Tail,
-                1024,
-                false,
-                true,
-                false,
-                true,
-                encoding_rs::BIG5,
+                WindowSpec {
+                    truncate: Truncate::Tail,
+                    budget: 1024,
+                    raw: false,
+                    clean: true,
+                    keep_nul: false,
+                    include_markers: true,
+                    encoding: encoding_rs::BIG5,
+                    source: "log",
+                },
                 None,
             )
             .is_ok()
@@ -1046,13 +1016,16 @@ mod tests {
             let window = task
                 .read_window_with_markers(
                     &mut state,
-                    Truncate::Tail,
-                    1024,
-                    false,
-                    true,
-                    false,
-                    true,
-                    encoding_rs::UTF_8,
+                    WindowSpec {
+                        truncate: Truncate::Tail,
+                        budget: 1024,
+                        raw: false,
+                        clean: true,
+                        keep_nul: false,
+                        include_markers: true,
+                        encoding: encoding_rs::UTF_8,
+                        source: "log",
+                    },
                     None,
                 )
                 .unwrap();
@@ -1279,7 +1252,8 @@ mod script_tests {
                 assert_eq!(line, &format!("(Background: {} exited 0.)", task.id));
                 assert_eq!(shown.len(), 1);
                 assert!(shown[0].1.leftovers.is_empty());
-                let owned = crate::ipc::Owned::new((value, claim), crate::lease::Owner::new(lease));
+                let owned =
+                    crate::lease::Owned::new((value, claim), crate::lease::Owner::new(lease));
                 assert_eq!(memory.used(), required);
                 drop(owned);
             }
@@ -1351,7 +1325,7 @@ mod script_tests {
                 assert_eq!(snapshot.leftovers[0].name, "worker");
                 assert_eq!(snapshot.log_error.as_deref(), Some("write note"));
                 assert_eq!(snapshot.input_warning.as_deref(), Some("input note"));
-                let owned = crate::ipc::Owned::new(snapshot, crate::lease::Owner::new(lease));
+                let owned = crate::lease::Owned::new(snapshot, crate::lease::Owner::new(lease));
                 assert_eq!(pool.used(), required);
                 drop(owned);
             }
@@ -1427,7 +1401,7 @@ mod script_tests {
                 assert_eq!(snapshot.leftovers[0].name.as_ptr(), member_ptr);
                 assert_eq!(snapshot.kill_error.as_ref().unwrap().as_ptr(), kill_ptr);
                 // Keep the new diagnostic copies owned until the snapshot is destroyed below.
-                let owned = crate::ipc::Owned::new(snapshot, crate::lease::Owner::new(lease));
+                let owned = crate::lease::Owned::new(snapshot, crate::lease::Owner::new(lease));
                 assert_eq!(pool.used(), required);
                 drop(owned);
                 assert_eq!(pool.used(), 0);
@@ -2271,6 +2245,78 @@ mod script_tests {
         fail_deletes.store(false, Ordering::SeqCst);
         tasks.retry_pending_deletes();
         assert!(!task2.transcript_path().exists());
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        tasks.set_remove_hook(None);
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn transcript_rechecks_eviction_when_spool_write_races_deferred_delete() {
+        // 1. Self-eviction inside `Spool::write -> reserve` while unlink is deferred.
+        let (_runtime, mut tasks, _session) = fixture(Limits::OFF);
+        Arc::get_mut(&mut tasks).unwrap().set_log_limit(64);
+        let task = finished_pty_task(&tasks, 80, 24);
+        {
+            let mut pty = lock(task.terminal.as_ref().unwrap());
+            assert!(pty.spool.write(b"first-line\n", true, &task, &tasks));
+            pty.live.process(
+                b"pending-tail-that-crosses-64-byte-total-log-limit-here",
+                Instant::now(),
+                None,
+            );
+        }
+        let delayed = delay_log_delete(&tasks);
+        let memory = BytePool::new(16 << 20);
+        let err = task
+            .transcript(&tasks, &ReadState::default(), &memory)
+            .err()
+            .expect("eviction during spool.write must fail instead of dropping pending lines");
+        assert!(
+            matches!(err, TaskError::Io(ref msg) if msg == EVICTED_TRANSCRIPT),
+            "{err:?}"
+        );
+        assert!(task.transcript_path().exists());
+        delayed.store(false, Ordering::SeqCst);
+        tasks.retry_pending_deletes();
+        assert!(!task.transcript_path().exists());
+        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        tasks.set_remove_hook(None);
+        tasks.shutdown();
+
+        // 2. Concurrent `evict_log` mid-write before `shared.hold` while unlink is deferred.
+        let (_runtime, tasks, _session) = fixture(Limits::OFF);
+        let task = finished_pty_task(&tasks, 80, 24);
+        {
+            let mut pty = lock(task.terminal.as_ref().unwrap());
+            assert!(pty.spool.write(b"saved-line\n", true, &task, &tasks));
+            pty.live.process(b"live-screen-tail", Instant::now(), None);
+        }
+        let delayed = delay_log_delete(&tasks);
+        let evicting = Arc::clone(&tasks);
+        let target = Arc::clone(&task);
+        *lock(&tasks.log_write_hook) = Some(Arc::new(move |file, bytes| {
+            file.write_all(bytes)?;
+            let prior = {
+                let mut out = lock(&target.out);
+                out.evicted = true;
+                out.transcript
+            };
+            evicting.reclaim_file(target.transcript_path(), prior);
+            Ok(())
+        }));
+        let err = task
+            .transcript(&tasks, &ReadState::default(), &memory)
+            .err()
+            .expect("concurrent evict_log during spool.write must report EVICTED_TRANSCRIPT");
+        assert!(
+            matches!(err, TaskError::Io(ref msg) if msg == EVICTED_TRANSCRIPT),
+            "{err:?}"
+        );
+        assert!(task.transcript_path().exists());
+        *lock(&tasks.log_write_hook) = None;
+        delayed.store(false, Ordering::SeqCst);
+        tasks.retry_pending_deletes();
+        assert!(!task.transcript_path().exists());
         assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
         tasks.set_remove_hook(None);
         tasks.shutdown();

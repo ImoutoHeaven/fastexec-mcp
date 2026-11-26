@@ -135,6 +135,66 @@ pub struct Member {
     pub name: String,
 }
 
+pub(crate) fn normalize_members(list: &mut Vec<Member>) {
+    list.sort_by_key(|m| m.pid);
+    list.dedup_by_key(|m| m.pid);
+}
+
+pub(crate) fn clean_member_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut parts = cleaned.split_whitespace();
+    let first = parts.next()?;
+    let mut out = String::from(first);
+    for part in parts {
+        out.push(' ');
+        out.push_str(part);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod member_tests {
+    use super::{Member, clean_member_name, normalize_members};
+
+    #[test]
+    fn member_normalization_sorts_deduplicates_and_cleans_names() {
+        let mut list = vec![
+            Member {
+                pid: 9,
+                name: "b".into(),
+            },
+            Member {
+                pid: 3,
+                name: "first".into(),
+            },
+            Member {
+                pid: 3,
+                name: "duplicate".into(),
+            },
+        ];
+        normalize_members(&mut list);
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].pid, list[0].name.as_str()), (3, "first"));
+        assert_eq!((list[1].pid, list[1].name.as_str()), (9, "b"));
+
+        assert_eq!(clean_member_name(""), None);
+        assert_eq!(clean_member_name("\0\n\r\u{2028}\u{2029}"), None);
+        assert_eq!(
+            clean_member_name("  adb\nserver\u{2028}--daemon  "),
+            Some("adb server --daemon".into())
+        );
+    }
+}
+
 /// Per-query names and conversion workspace. The callback receives a live-byte
 /// high-water requirement, not an accumulated count of repeated native scans.
 pub(crate) struct MemberBudget<'a> {
@@ -413,7 +473,7 @@ fn write_env_dump(
             out.write_all(&bytes)?;
         }
     }
-    out.write_all(&[0; size_of::<crate::ipc::Unit>()])?;
+    out.write_all(&[0; size_of::<crate::session::Unit>()])?;
     out.flush()
 }
 
@@ -546,7 +606,7 @@ mod env_tests {
         let mut bytes = b"profile output\n".to_vec();
         write_env_dump(&mut bytes, vars.clone()).unwrap();
         assert_eq!(parse_env_dump(&bytes).unwrap(), vars);
-        for cut in 1..=2 * size_of::<crate::ipc::Unit>() {
+        for cut in 1..=2 * size_of::<crate::session::Unit>() {
             assert!(parse_env_dump(&bytes[..bytes.len() - cut]).is_err());
         }
         let mut empty = Vec::new();
@@ -1430,7 +1490,7 @@ impl Tree {
             }
         };
         if let Some(list) = result.as_mut() {
-            crate::tasks::state::normalize_members(list);
+            normalize_members(list);
         }
         result
     }

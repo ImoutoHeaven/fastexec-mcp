@@ -8,11 +8,12 @@ use super::control::{
 use super::encode::encode_service_error;
 use super::vm::{STALLED, describe, pending_text};
 use super::*;
+use crate::id;
 use crate::lease::BytePool;
 use crate::service::Service;
 use crate::session::{LaunchContext, Session};
 use crate::tasks::state::Task;
-use crate::tasks::{self, Limits, ScriptArgs, TASK_LOG_LIMIT, Tasks};
+use crate::tasks::{Limits, ScriptArgs, TASK_LOG_LIMIT, Tasks};
 use base64::Engine;
 use rquickjs::{Context, Function, Runtime, Value};
 use serde_json::json;
@@ -35,7 +36,7 @@ impl Fixture {
     fn with_limits(limits: Limits) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "fastexec-script-test-{}",
-            tasks::random_chars(12).unwrap()
+            id::random_chars(12).unwrap()
         ));
         let tasks = Tasks::new_in(limits, dir.clone()).unwrap();
         let service = Arc::new(Service::new(Arc::clone(&tasks), false));
@@ -68,7 +69,7 @@ impl Fixture {
                     input_owner: Default::default(),
                 },
                 &self.session,
-                tasks::random_chars(4).unwrap(),
+                id::random_chars(4).unwrap(),
             )
             .unwrap()
             .0
@@ -132,7 +133,7 @@ fn sync_error_message(err: &SyncCallError) -> &str {
     }
 }
 
-fn unwrap_sync_ok(res: Result<u64, crate::ipc::Owned<SyncCallError>>) -> u64 {
+fn unwrap_sync_ok(res: Result<u64, crate::lease::Owned<SyncCallError>>) -> u64 {
     match res {
         Ok(id) => id,
         Err(err) => panic!(
@@ -143,8 +144,8 @@ fn unwrap_sync_ok(res: Result<u64, crate::ipc::Owned<SyncCallError>>) -> u64 {
 }
 
 fn unwrap_sync_err(
-    res: Result<u64, crate::ipc::Owned<SyncCallError>>,
-) -> crate::ipc::Owned<SyncCallError> {
+    res: Result<u64, crate::lease::Owned<SyncCallError>>,
+) -> crate::lease::Owned<SyncCallError> {
     match res {
         Ok(id) => panic!("expected Err, got Ok({id})"),
         Err(err) => err,
@@ -1396,7 +1397,7 @@ async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() 
     // Tight disk quota rejects oversized attachment before writing any orphan file.
     let quota_dir = std::env::temp_dir().join(format!(
         "fastexec-script-quota-{}",
-        tasks::random_chars(12).unwrap()
+        id::random_chars(12).unwrap()
     ));
     let mut tight_tasks = Tasks::new_in(Limits::OFF, quota_dir.clone()).unwrap();
     Arc::get_mut(&mut tight_tasks).unwrap().set_log_limit(256);
