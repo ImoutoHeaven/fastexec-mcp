@@ -1,9 +1,9 @@
+use super::session::*;
 use super::state::*;
 use super::workers::*;
 use super::*;
 use crate::id::{ALPHABET, is_valid_task_id};
 use crate::lease::BytePool;
-use crate::session::ReadState;
 use std::io::Read;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -290,8 +290,9 @@ mod ids {
 #[allow(clippy::module_inception)]
 mod tests {
     use super::*;
+    use crate::render::types::AgentDelivery;
     use crate::service::schema::Request;
-    use crate::service::{AgentDelivery, ExecContext, Service};
+    use crate::service::{ExecContext, Service};
     use crate::term::output::{Cleaner, Matcher, Truncate, WindowSpec};
 
     /// A `Tasks` for a test: it needs a runtime for its `killAfterMs` timer, which these tests
@@ -422,7 +423,12 @@ mod tests {
             on_started: None,
             input_owner: Default::default(),
         };
-        let list_res = runtime.block_on(service.exec_agent(request, ctx, AgentDelivery::default()));
+        let list_res = runtime.block_on(crate::render::exec_agent(
+            &service,
+            request,
+            ctx,
+            AgentDelivery::default(),
+        ));
         assert!(list_res.result.structured_content.is_none());
         assert!(
             session.existing(retired).is_none(),
@@ -734,7 +740,8 @@ mod tests {
         // A pipe task and a PTY task see the same environment and the same default directory.
         for pty in [false, true] {
             let result = runtime
-                .block_on(service.exec_agent_json(
+                .block_on(crate::render::exec_agent_json(
+                    &service,
                     serde_json::json!({
                         "action": "start",
                         "command": command,
@@ -1093,8 +1100,8 @@ mod script_tests {
         tasks.shutdown();
     }
 
-    fn script_args(tasks: &Arc<Tasks>) -> ScriptArgs {
-        ScriptArgs {
+    fn script_args(tasks: &Arc<Tasks>) -> crate::codemode::ScriptSpawnArgs {
+        crate::codemode::ScriptSpawnArgs {
             code: "return undefined".into(),
             launch: Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new())),
             kill_after_ms: None,
@@ -1112,7 +1119,8 @@ mod script_tests {
         let mut args = script_args(&tasks);
         args.code = "await sleep(60000);".into();
         args.input_owner = crate::lease::Owner::new(pool.try_acquire(64).unwrap());
-        let (task, _, _) = tasks.start_script(args, &session, "ownr".into()).unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, args, &session, "ownr".into()).unwrap();
         assert_eq!(
             pool.used(),
             64,
@@ -1136,9 +1144,9 @@ mod script_tests {
     fn ipc_ingress_stdin_queue_keeps_owner_after_wait_is_dropped() {
         use std::future::Future;
         let (runtime, tasks, session) = fixture(Limits::OFF);
-        let (task, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "ownr".into())
-            .unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "ownr".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -1172,17 +1180,16 @@ mod script_tests {
         let (runtime, tasks, session) = fixture(Limits::OFF);
         std::fs::remove_dir_all(&tasks.dir).unwrap();
         assert!(
-            tasks
-                .start_script(script_args(&tasks), &session, "1234".into())
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "1234".into())
                 .is_err()
         );
         assert_eq!(tasks.pending(), 0);
         assert_eq!(lock(&tasks.registry).pending_scripts, 0);
         assert!(tasks.all().is_empty());
         std::fs::create_dir(&tasks.dir).unwrap();
-        let (task, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "1234".into())
-            .unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "1234".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -1196,9 +1203,9 @@ mod script_tests {
     #[test]
     fn background_metadata_admits_only_notice_fields_and_leaves_claims_due_on_refusal() {
         let (runtime, tasks, session) = fixture(Limits::OFF);
-        let (task, entry, _) = tasks
-            .start_script(script_args(&tasks), &session, "meta".into())
-            .unwrap();
+        let ((task, entry, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "meta".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -1272,9 +1279,9 @@ mod script_tests {
     #[test]
     fn response_snapshot_admits_source_capacity_before_cloning() {
         let (runtime, tasks, session) = fixture(Limits::OFF);
-        let (task, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "meta".into())
-            .unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "meta".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -1337,9 +1344,9 @@ mod script_tests {
     #[test]
     fn response_snapshot_refresh_admits_diagnostics_without_recloning_final_state() {
         let (runtime, tasks, session) = fixture(Limits::OFF);
-        let (task, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "meta".into())
-            .unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "meta".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -1416,16 +1423,16 @@ mod script_tests {
     #[test]
     fn snapshots_hide_cleanup_errors_only_after_confirmed_tree_end() {
         let (runtime, tasks, session) = fixture(Limits::OFF);
-        let (task, _, _) = tasks
-            .start_script(
-                ScriptArgs {
-                    code: "while (true) {}".into(),
-                    ..script_args(&tasks)
-                },
-                &session,
-                "1234".into(),
-            )
-            .unwrap();
+        let ((task, _, _), _) = crate::codemode::spawn_script(
+            &tasks,
+            crate::codemode::ScriptSpawnArgs {
+                code: "while (true) {}".into(),
+                ..script_args(&tasks)
+            },
+            &session,
+            "1234".into(),
+        )
+        .unwrap();
         for error in [
             "descendants remain after SIGKILL; the task host stays alive",
             "task host disconnected; tree cleanup is unconfirmed",
@@ -1558,9 +1565,9 @@ mod script_tests {
             max_running: 1,
             ..Limits::OFF
         });
-        let (task, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "1234".into())
-            .unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "1234".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -1618,17 +1625,17 @@ mod script_tests {
                     .unwrap();
             });
         };
-        let (pending, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "1234".into())
-            .unwrap();
+        let ((pending, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "1234".into())
+                .unwrap();
         wait(&pending);
         pending.tree_done.send_replace(false);
         assert!(!pending.is_running() && !pending.keeps_processes());
         assert!(!pending.is_finished());
 
-        let (finished, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "5678".into())
-            .unwrap();
+        let ((finished, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "5678".into())
+                .unwrap();
         wait(&finished);
         assert!(
             tasks.find(&pending.id).is_some(),
@@ -1666,9 +1673,9 @@ mod script_tests {
     #[test]
     fn stored_attachments_track_seen_watermarks_and_release_quota_on_eviction() {
         let (runtime, tasks, session) = fixture(Limits::OFF);
-        let (task, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "1234".into())
-            .unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "1234".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -1714,9 +1721,9 @@ mod script_tests {
             finished_ttl: Some(Duration::from_millis(1)),
         });
         Arc::get_mut(&mut tasks).unwrap().set_log_limit(1024);
-        let (task1, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "0001".into())
-            .unwrap();
+        let ((task1, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "0001".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task1.done().wait_for(|done| *done))
                 .await
@@ -1781,9 +1788,9 @@ mod script_tests {
     #[test]
     fn per_task_attachment_cap_stops_at_1024_before_creating_extra_files() {
         let (runtime, tasks, session) = fixture(Limits::OFF);
-        let (task, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "cap1".into())
-            .unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "cap1".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -1816,7 +1823,7 @@ mod script_tests {
         let tfile = private_file(&transcript_path).unwrap();
         let ended_at = OnceLock::new();
         let _ = ended_at.set(Instant::now());
-        let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
+        let script = Arc::new(super::script::ScriptControl::new(std::thread::current()));
         let task = Arc::new(Task {
             id,
             command: "pty-sim".into(),
@@ -2327,7 +2334,8 @@ mod script_tests {
         let (runtime, tasks, session) = fixture(Limits::OFF);
         let mut args = script_args(&tasks);
         args.kill_after_ms = Some(u64::MAX);
-        let (task, _, _) = tasks.start_script(args, &session, "r001".into()).unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, args, &session, "r001".into()).unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -2401,7 +2409,8 @@ mod script_tests {
         let (runtime, tasks, session) = fixture(Limits::OFF);
         let mut args = script_args(&tasks);
         args.code = "text('abc')".into();
-        let (task, _, _) = tasks.start_script(args, &session, "ev01".into()).unwrap();
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, args, &session, "ev01".into()).unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
                 .await
@@ -2506,7 +2515,7 @@ mod script_tests {
             let id = tasks.next_id();
             let log_path = tasks.dir.join(format!("{id}.log"));
             let _log = private_file(&log_path).unwrap();
-            let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
+            let script = Arc::new(super::script::ScriptControl::new(std::thread::current()));
             Arc::new(Task {
                 id,
                 command: "sleep 30".into(),
@@ -2598,7 +2607,7 @@ mod script_tests {
         end: Option<Final>,
         tree_done: bool,
     ) -> (Arc<Task>, Arc<TaskEntry>) {
-        let (script, _worker) = codemode::prepare(tasks.handle.clone()).unwrap();
+        let script = Arc::new(super::script::ScriptControl::new(std::thread::current()));
         make_synthetic_task_with_root(
             tasks,
             session,
@@ -2738,14 +2747,14 @@ mod script_tests {
             .retain(|task| task.id != parent.id);
 
         runtime.block_on(async {
-            let default_list = service
-                .exec_agent_json(
-                    serde_json::json!({ "action": "list" }),
-                    test_exec_context(&session),
-                    crate::service::AgentDelivery::default(),
-                )
-                .await
-                .result;
+            let default_list = crate::render::exec_agent_json(
+                &service,
+                serde_json::json!({ "action": "list" }),
+                test_exec_context(&session),
+                crate::render::types::AgentDelivery::default(),
+            )
+            .await
+            .result;
             assert_ne!(default_list.is_error, Some(true), "{default_list:?}");
             assert!(default_list.structured_content.is_none());
             let text = default_list.content[0].as_text().unwrap().text.as_str();
@@ -2755,14 +2764,14 @@ mod script_tests {
             );
             assert_eq!(text.lines().count(), 1, "expected 1 listed task:\n{text}");
 
-            let drill = service
-                .exec_agent_json(
-                    serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
-                    test_exec_context(&session),
-                    crate::service::AgentDelivery::default(),
-                )
-                .await
-                .result;
+            let drill = crate::render::exec_agent_json(
+                &service,
+                serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
+                test_exec_context(&session),
+                crate::render::types::AgentDelivery::default(),
+            )
+            .await
+            .result;
             assert_ne!(drill.is_error, Some(true), "{drill:?}");
             assert!(drill.structured_content.is_none());
             let drill_text = drill.content[0].as_text().unwrap().text.as_str();
@@ -2771,14 +2780,14 @@ mod script_tests {
                 "expected drilled child in text: {drill_text}"
             );
 
-            let missing = service
-                .exec_agent_json(
-                    serde_json::json!({ "action": "list", "parentTaskId": "zzzzzzzz-99" }),
-                    test_exec_context(&session),
-                    crate::service::AgentDelivery::default(),
-                )
-                .await
-                .result;
+            let missing = crate::render::exec_agent_json(
+                &service,
+                serde_json::json!({ "action": "list", "parentTaskId": "zzzzzzzz-99" }),
+                test_exec_context(&session),
+                crate::render::types::AgentDelivery::default(),
+            )
+            .await
+            .result;
             assert_eq!(missing.is_error, Some(true), "{missing:?}");
             assert!(missing.structured_content.is_none());
             let missing_text = missing.content[0].as_text().unwrap().text.as_str();
@@ -2842,13 +2851,13 @@ mod script_tests {
             let small_frame = Arc::new(session.launch.for_session().with_outbound_limit(512));
             let mut refused_ctx = test_exec_context(&session);
             refused_ctx.launch = Some(&small_frame);
-            let refused = service
-                .exec_agent_json(
-                    serde_json::json!({ "action": "list" }),
-                    refused_ctx,
-                    crate::service::AgentDelivery::default(),
-                )
-                .await;
+            let refused = crate::render::exec_agent_json(
+                &service,
+                serde_json::json!({ "action": "list" }),
+                refused_ctx,
+                crate::render::types::AgentDelivery::default(),
+            )
+            .await;
             assert!(refused.overload, "{:?}", refused.result);
             assert!(refused.result.structured_content.is_none());
             assert!(
@@ -2867,14 +2876,14 @@ mod script_tests {
             drop(refused);
 
             // Budget sized so parent + active_top fit while active_bottom is trimmed from the bottom.
-            let trimmed = service
-                .exec_agent_json(
-                    serde_json::json!({ "action": "list", "maxBytes": 230 }),
-                    test_exec_context(&session),
-                    crate::service::AgentDelivery::default(),
-                )
-                .await
-                .result;
+            let trimmed = crate::render::exec_agent_json(
+                &service,
+                serde_json::json!({ "action": "list", "maxBytes": 230 }),
+                test_exec_context(&session),
+                crate::render::types::AgentDelivery::default(),
+            )
+            .await
+            .result;
             assert_ne!(trimmed.is_error, Some(true), "{trimmed:?}");
             assert!(trimmed.structured_content.is_none());
             let text = trimmed.content[0].as_text().unwrap().text.as_str();
@@ -2943,14 +2952,14 @@ mod script_tests {
         runtime.block_on(async {
             // Default scope with parentTaskId is "all": Session B sees Session A's child without
             // creating session entries in Session B for cross-session tasks.
-            let all_view = service
-                .exec_agent_json(
-                    serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
-                    test_exec_context(&session_b),
-                    crate::service::AgentDelivery::default(),
-                )
-                .await
-                .result;
+            let all_view = crate::render::exec_agent_json(
+                &service,
+                serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
+                test_exec_context(&session_b),
+                crate::render::types::AgentDelivery::default(),
+            )
+            .await
+            .result;
             assert_ne!(all_view.is_error, Some(true), "{all_view:?}");
             assert!(all_view.structured_content.is_none());
             let all_text = all_view.content[0].as_text().unwrap().text.as_str();
@@ -2963,18 +2972,18 @@ mod script_tests {
             assert!(child_b_entry.is_reported());
 
             // Explicit scope: "session" restricts to Session B's own children.
-            let session_view = service
-                .exec_agent_json(
-                    serde_json::json!({
-                        "action": "list",
-                        "parentTaskId": parent.id,
-                        "scope": "session"
-                    }),
-                    test_exec_context(&session_b),
-                    crate::service::AgentDelivery::default(),
-                )
-                .await
-                .result;
+            let session_view = crate::render::exec_agent_json(
+                &service,
+                serde_json::json!({
+                    "action": "list",
+                    "parentTaskId": parent.id,
+                    "scope": "session"
+                }),
+                test_exec_context(&session_b),
+                crate::render::types::AgentDelivery::default(),
+            )
+            .await
+            .result;
             assert_ne!(session_view.is_error, Some(true), "{session_view:?}");
             assert!(session_view.structured_content.is_none());
             let session_text = session_view.content[0].as_text().unwrap().text.as_str();
@@ -3019,7 +3028,8 @@ mod script_tests {
             false,
         );
         let snap_a = make_held_snapshot(&task_a, Some(members_ordered.clone()));
-        let text_a = service.render_list_items_for_test(
+        let text_a = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&task_a),
                 snapshot: snap_a,
@@ -3044,7 +3054,8 @@ mod script_tests {
 
         // Out-of-order input yields the exact same text when normalized via set_held.
         let snap_shuffled = make_held_snapshot(&task_a, Some(members_shuffled));
-        let text_shuffled = service.render_list_items_for_test(
+        let text_shuffled = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&task_a),
                 snapshot: snap_shuffled,
@@ -3067,7 +3078,8 @@ mod script_tests {
             false,
         );
         let snap_short = make_held_snapshot(&task_short_cmd, Some(members_ordered.clone()));
-        let full_short = service.render_list_items_for_test(
+        let full_short = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&task_short_cmd),
                 snapshot: snap_short.clone(),
@@ -3081,7 +3093,8 @@ mod script_tests {
         // that `candidate_full(tree_brief).len() + 10 <= budget`.
         let budget_tier4_short = 90;
         assert!(budget_tier4_short < full_short.len(), "{full_short}");
-        let text_boundary_a = service.render_list_items_for_test(
+        let text_boundary_a = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&task_short_cmd),
                 snapshot: snap_short,
@@ -3108,7 +3121,8 @@ mod script_tests {
         // Boundary B: core.len() == budget - 10 exact boundary keeps all of core intact.
         let exact_core = format!("{} [exited 0] · keeps worker-101 +11", task_a.id);
         let exact_budget = exact_core.len() + " … [cut]".len();
-        let text_boundary_b = service.render_list_items_for_test(
+        let text_boundary_b = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&task_a),
                 snapshot: make_held_snapshot(&task_a, Some(members_ordered)),
@@ -3138,7 +3152,8 @@ mod script_tests {
             Some(finished_final(true)),
             false,
         );
-        let text_mb = service.render_list_items_for_test(
+        let text_mb = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&task_mb),
                 snapshot: make_held_snapshot(&task_mb, Some(mb_members)),
@@ -3170,7 +3185,8 @@ mod script_tests {
             Some(finished_final(true)),
             false,
         );
-        let text_unconf = service.render_list_items_for_test(
+        let text_unconf = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&task_unconf),
                 snapshot: make_held_snapshot(&task_unconf, None),
@@ -3201,7 +3217,8 @@ mod script_tests {
             Some(finished_final(true)),
             false,
         );
-        let text_empty = service.render_list_items_for_test(
+        let text_empty = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&task_empty),
                 snapshot: make_held_snapshot(&task_empty, Some(Vec::new())),
@@ -3257,7 +3274,8 @@ mod script_tests {
             ],
         };
         // head + elapsed (~30 bytes) + 10 <= budget (48) < head + elapsed + summary (~95 bytes) + 10.
-        let text_cm = service.render_list_items_for_test(
+        let text_cm = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&cm_parent),
                 snapshot: parent_snap,
@@ -3303,7 +3321,8 @@ mod script_tests {
                 name: " \r\n ".into(),
             },
         ];
-        let text_ctrl = service.render_list_items_for_test(
+        let text_ctrl = crate::render::render_list_items_for_test(
+            &service,
             vec![ListedTask {
                 task: Arc::clone(&task_ctrl),
                 snapshot: make_held_snapshot(&task_ctrl, Some(ctrl_members)),
@@ -3360,28 +3379,28 @@ mod script_tests {
         );
 
         runtime.block_on(async {
-            let list = service
-                .exec_agent_json(
-                    serde_json::json!({ "action": "list" }),
-                    test_exec_context(&session),
-                    crate::service::AgentDelivery::default(),
-                )
-                .await
-                .result;
+            let list = crate::render::exec_agent_json(
+                &service,
+                serde_json::json!({ "action": "list" }),
+                test_exec_context(&session),
+                crate::render::types::AgentDelivery::default(),
+            )
+            .await
+            .result;
             let text = list.content[0].as_text().unwrap().text.as_str();
             assert!(
                 text.contains("2 tasks (2 done, 1 kept ended)"),
                 "expected folded kept ended summary: {text}"
             );
 
-            let drill = service
-                .exec_agent_json(
-                    serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
-                    test_exec_context(&session),
-                    crate::service::AgentDelivery::default(),
-                )
-                .await
-                .result;
+            let drill = crate::render::exec_agent_json(
+                &service,
+                serde_json::json!({ "action": "list", "parentTaskId": parent.id }),
+                test_exec_context(&session),
+                crate::render::types::AgentDelivery::default(),
+            )
+            .await
+            .result;
             let drill_text = drill.content[0].as_text().unwrap().text.as_str();
             assert!(
                 drill_text.contains(&format!(
@@ -3398,8 +3417,7 @@ mod script_tests {
     #[test]
     fn footer_races_overflow_counts_and_ordered_exited_events() {
         let (_runtime, tasks, session) = fixture(Limits::OFF);
-        let bus = Arc::new(crate::events::EventBus::new().unwrap());
-        tasks.attach_event_bus(Arc::clone(&bus));
+        let bus = Arc::clone(tasks.event_bus());
 
         // 1. Batch root exit with kept processes counts overflow under `keeping processes`.
         let mut batch_tasks = Vec::new();
@@ -3660,14 +3678,350 @@ mod script_tests {
     }
 
     #[test]
+    fn outside_claim_rolls_back_when_first_render_exhausts_byte_pool() {
+        let (runtime, tasks, session_a) = fixture(Limits::OFF);
+        let service = Arc::new(crate::service::Service::new(Arc::clone(&tasks), false));
+        let (_outside_running, _) =
+            make_synthetic_process_task(&tasks, &session_a, "sleep 30", None, None, false);
+
+        let session_b = Session::new(
+            "outside-budget".into(),
+            "outside-budget".into(),
+            Arc::clone(&session_a.launch),
+        );
+        let (own_task, own_entry) = make_synthetic_process_task(
+            &tasks,
+            &session_b,
+            "printf ok",
+            None,
+            Some(finished_final(false)),
+            true,
+        );
+        let reader = own_entry.start_reader("0001".into());
+        let handle = reader.handle(&own_task.id);
+
+        // Direct background reservation failure drops OutsideClaim without consuming it.
+        let tiny_pool = BytePool::new(64);
+        let mut tiny_lease = crate::lease::Lease::empty(&tiny_pool);
+        let direct_err = tasks.background(
+            &session_b,
+            &own_task.id,
+            512,
+            &mut |bytes| {
+                if tiny_lease.try_grow(tiny_lease.bytes().saturating_add(bytes)) {
+                    Ok(())
+                } else {
+                    Err("budget full".into())
+                }
+            },
+            &mut |_| Ok(Some(Vec::new())),
+        );
+        assert!(direct_err.is_err());
+        drop(tiny_lease);
+        assert_eq!(tiny_pool.used(), 0);
+        assert!(session_b.claim_outside().is_claimed());
+
+        runtime.block_on(async {
+            // Exercise BytePool exhaustion across early workspace and final frame retention caps.
+            for cap in [128usize, 1024, 2048, 3072] {
+                let tight_pool = BytePool::new(cap);
+                let tight_launch = Arc::new(
+                    session_b
+                        .launch
+                        .for_session()
+                        .with_memory(Arc::clone(&tight_pool)),
+                );
+                let mut ctx = test_exec_context(&session_b);
+                ctx.launch = Some(&tight_launch);
+                let refused = crate::render::exec_agent_json(
+                    &service,
+                        serde_json::json!({ "action": "poll", "taskId": handle, "waitMs": 0 }),
+                        ctx,
+                        crate::render::types::AgentDelivery::default(),
+                    )
+                    .await;
+                assert!(
+                    refused.overload,
+                    "cap {cap} should fail with overload: {:?}",
+                    refused.result
+                );
+                drop(refused);
+                assert_eq!(tight_pool.used(), 0);
+                assert!(
+                    session_b.claim_outside().is_claimed(),
+                    "OutsideClaim must stay unconsumed after BytePool failure at cap {cap}"
+                );
+            }
+
+            let delivered = crate::render::exec_agent_json(
+                    &service,
+                    serde_json::json!({ "action": "poll", "taskId": handle, "waitMs": 0 }),
+                    test_exec_context(&session_b),
+                    crate::render::types::AgentDelivery::default(),
+                )
+                .await
+                .result;
+            assert_ne!(delivered.is_error, Some(true), "{delivered:?}");
+            let first_text = delivered.content[0].as_text().unwrap().text.as_str();
+            assert!(
+                first_text.contains(
+                    r#"(Background: 1 task running outside this session; use list with scope "all".)"#
+                ),
+                "first successful render must still deliver outside notice: {first_text}"
+            );
+
+            let second = crate::render::exec_agent_json(
+                    &service,
+                    serde_json::json!({ "action": "poll", "taskId": handle, "waitMs": 0 }),
+                    test_exec_context(&session_b),
+                    crate::render::types::AgentDelivery::default(),
+                )
+                .await
+                .result;
+            let second_text = second.content[0].as_text().unwrap().text.as_str();
+            assert!(
+                !second_text.contains("outside this session"),
+                "{second_text}"
+            );
+        });
+
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn concurrent_list_snapshots_keep_parent_child_folding_consistent() {
+        let (_runtime, tasks, session) = fixture(Limits::OFF);
+        let (parent, _) = make_synthetic_task(
+            &tasks,
+            &session,
+            "[codemode] concurrent()",
+            None,
+            None,
+            false,
+        );
+        let done_mutating = AtomicBool::new(false);
+
+        let verify_default = |res: &ListedResult| {
+            for item in &res.items {
+                assert_ne!(
+                    item.parent_task_id.as_deref(),
+                    Some(parent.id.as_str()),
+                    "child promoted as orphan while parent is present"
+                );
+            }
+            let parent_item = res
+                .items
+                .iter()
+                .find(|item| item.task.id == parent.id)
+                .expect("parent must appear in unfiltered view");
+            if let Some(children) = &parent_item.children {
+                let finished = children.done + children.failed;
+                assert_eq!(children.total, children.active + finished);
+                assert_eq!(children.folded_finished.len(), finished);
+                assert_eq!(
+                    children.active_tasks.len(),
+                    children.active.min(MAX_INLINE_ACTIVE)
+                );
+                assert!(children.warned <= finished);
+                assert!(children.tree_ended <= finished);
+                let finished_ids: HashSet<&str> = children
+                    .folded_finished
+                    .iter()
+                    .map(|(t, _)| t.id.as_str())
+                    .collect();
+                for (child, snap) in &children.active_tasks {
+                    assert!(
+                        snap.state == "running" || snap.kept,
+                        "inactive child in active_tasks: {}",
+                        snap.state
+                    );
+                    assert!(!finished_ids.contains(child.id.as_str()));
+                }
+            }
+        };
+
+        std::thread::scope(|scope| {
+            let writer_tasks = &tasks;
+            let writer_session = &session;
+            let parent_ref = &parent;
+            let done_flag = &done_mutating;
+            scope.spawn(move || {
+                let mut spawned: Vec<Arc<Task>> = Vec::new();
+                for idx in 0..32usize {
+                    let (child, _) = make_synthetic_process_task(
+                        writer_tasks,
+                        writer_session,
+                        &format!("step-{idx}"),
+                        Some(parent_ref.id.clone()),
+                        None,
+                        false,
+                    );
+                    spawned.push(child);
+                    if idx >= 2 {
+                        let prev = &spawned[idx - 2];
+                        let kept = idx % 3 == 0;
+                        let exit_code = if idx % 5 == 0 { Some(1) } else { Some(0) };
+                        {
+                            let _reg = lock(&writer_tasks.registry);
+                            *lock(&prev.end) = Some(Final {
+                                exit_code,
+                                killed: false,
+                                expired: false,
+                                forced_end: false,
+                                elapsed: Duration::from_millis(5),
+                                output_open: false,
+                                leftovers: Vec::new(),
+                                kept,
+                            });
+                            if !kept {
+                                prev.tree_done.send_replace(true);
+                            }
+                        }
+                    }
+                    if idx >= 5 && (idx - 5) % 3 == 0 {
+                        let kept_child = &spawned[idx - 5];
+                        let _reg = lock(&writer_tasks.registry);
+                        let _ = kept_child.tree_ended_at.set(Instant::now());
+                        kept_child.tree_done.send_replace(true);
+                    }
+                    std::thread::yield_now();
+                }
+                {
+                    let _reg = lock(&writer_tasks.registry);
+                    *lock(&parent_ref.end) = Some(finished_final(false));
+                    parent_ref.tree_done.send_replace(true);
+                }
+                done_flag.store(true, Ordering::Release);
+            });
+
+            for reader_idx in 0..3usize {
+                let reader_tasks = &tasks;
+                let reader_session = &session;
+                let parent_id = parent.id.as_str();
+                let done_flag = &done_mutating;
+                scope.spawn(move || {
+                    let mut checks = 0usize;
+                    loop {
+                        let finished = done_flag.load(Ordering::Acquire);
+                        let all_scope = reader_idx % 2 == 0;
+                        let listed = reader_tasks
+                            .listed(
+                                reader_session,
+                                ListQuery {
+                                    all_scope,
+                                    active_filter: None,
+                                    parent_task_id: None,
+                                    limit: 50,
+                                },
+                                &mut |_| Ok(()),
+                                &mut |_| Ok(Some(Vec::new())),
+                            )
+                            .unwrap()
+                            .unwrap();
+                        verify_default(&listed);
+
+                        let drill = reader_tasks
+                            .listed(
+                                reader_session,
+                                ListQuery {
+                                    all_scope: true,
+                                    active_filter: None,
+                                    parent_task_id: Some(parent_id),
+                                    limit: 50,
+                                },
+                                &mut |_| Ok(()),
+                                &mut |_| Ok(Some(Vec::new())),
+                            )
+                            .unwrap()
+                            .unwrap();
+                        assert!(drill.total_count <= 32);
+                        checks += 1;
+                        if finished && checks >= 4 {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                });
+            }
+        });
+
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn codemode_custom_cwd_anchors_relative_home_to_session_cwd() {
+        let _serial = crate::tasks::ONE_TASKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "fastexec-rel-home-cm-{}-{}",
+            std::process::id(),
+            random_chars(10).unwrap()
+        ));
+        std::fs::create_dir_all(root.join("rel-home")).unwrap();
+        std::fs::create_dir_all(root.join("nested-cwd/rel-home")).unwrap();
+
+        let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+            .filter(|(k, _)| {
+                !k.eq_ignore_ascii_case("HOME")
+                    && !k.eq_ignore_ascii_case("USERPROFILE")
+                    && !k.eq_ignore_ascii_case("HOMEDRIVE")
+                    && !k.eq_ignore_ascii_case("HOMEPATH")
+            })
+            .collect();
+        env.push(("HOME".into(), "rel-home".into()));
+        if cfg!(windows) {
+            env.push(("USERPROFILE".into(), "rel-home".into()));
+        }
+
+        let tasks = runtime.block_on(async { Tasks::new(Limits::OFF).unwrap() });
+        let service = Arc::new(crate::service::Service::new(Arc::clone(&tasks), false));
+        let launch = Arc::new(LaunchContext::new(root.clone(), env));
+        let session = Session::new("cm-rel-home".into(), "cm-rel-home".into(), launch);
+
+        runtime.block_on(async {
+            let req: crate::codemode::control::Request = serde_json::from_value(serde_json::json!({
+                "code": "await tools.write({ path: '~/memo.txt', content: 'from-session-cwd\\n' }); await tools.edit({ path: '~/memo.txt', edits: [{ oldText: 'from-session-cwd', newText: 'anchored-ok' }] }); const r = await tools.read({ path: '~/memo.txt' }); return r.text;",
+                "cwd": "nested-cwd",
+                "waitMs": 10000,
+                "killAfterMs": 10000
+            }))
+            .unwrap();
+            let mut ctx = test_exec_context(&session);
+            let delivery = crate::render::types::AgentDelivery::default();
+            let outcome = crate::codemode::prepare_script(&service, req, &mut ctx, None, false).await;
+            let out = crate::render::finish_exec_agent(&service, outcome, &ctx, &delivery)
+                .await
+                .result;
+            assert_ne!(out.is_error, Some(true), "{out:?}");
+            let text = out.content[0].as_text().unwrap().text.as_str();
+            assert!(text.contains("anchored-ok"), "{text}");
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("rel-home/memo.txt")).unwrap(),
+            "anchored-ok\n"
+        );
+        assert!(!root.join("nested-cwd/rel-home/memo.txt").exists());
+
+        tasks.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn retire_finished_evicts_logs_outside_registry_lock() {
         let (runtime, tasks, session) = fixture(Limits {
             max_finished: 1,
             ..Limits::OFF
         });
-        let (task1, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "retire1".into())
-            .unwrap();
+        let ((task1, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "retire1".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task1.done().wait_for(|done| *done))
                 .await
@@ -3691,9 +4045,9 @@ mod script_tests {
         })));
 
         std::thread::sleep(Duration::from_millis(5));
-        let (task2, _, _) = tasks
-            .start_script(script_args(&tasks), &session, "retire2".into())
-            .unwrap();
+        let ((task2, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "retire2".into())
+                .unwrap();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), task2.done().wait_for(|done| *done))
                 .await
@@ -3705,6 +4059,204 @@ mod script_tests {
         assert!(!task1.log_path.exists());
         assert!(task2.log_path.exists());
         tasks.set_remove_hook(None);
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn g1_reserve_script_slot_rolls_back_pending_counts_without_spawning_threads() {
+        let (_runtime, tasks, session) = fixture(Limits {
+            max_running: 2,
+            max_scripts: 1,
+            ..Limits::OFF
+        });
+
+        #[cfg(target_os = "linux")]
+        let count_threads = || std::fs::read_dir("/proc/self/task").unwrap().count();
+        #[cfg(target_os = "linux")]
+        let baseline_threads = count_threads();
+
+        let slot = tasks.reserve_script_slot().expect("first script slot");
+        assert_eq!(tasks.pending(), 1);
+        assert_eq!(lock(&tasks.registry).pending_scripts, 1);
+
+        // Second script reservation fails with TOO_MANY_SCRIPTS before spawning any worker thread.
+        let err = match tasks.reserve_script_slot() {
+            Ok(_) => panic!("second script slot must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err, TaskError::Overload(msg) if msg.contains("TOO_MANY_SCRIPTS")),
+            "{err:?}"
+        );
+        let spawn_err = match crate::codemode::spawn_script(
+            &tasks,
+            script_args(&tasks),
+            &session,
+            "s002".into(),
+        ) {
+            Ok(_) => panic!("spawn_script must fail under held script slot"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&spawn_err, TaskError::Overload(msg) if msg.contains("TOO_MANY_SCRIPTS")),
+            "{spawn_err:?}"
+        );
+        assert_eq!(tasks.pending(), 1);
+        assert_eq!(lock(&tasks.registry).pending_scripts, 1);
+        #[cfg(target_os = "linux")]
+        assert_eq!(count_threads(), baseline_threads);
+
+        // Dropping the uncommitted reservation rolls back both pending counters to zero.
+        drop(slot);
+        assert_eq!(tasks.pending(), 0);
+        assert_eq!(lock(&tasks.registry).pending_scripts, 0);
+
+        // Also verify TOO_MANY_TASKS rollback symmetry.
+        let (_rt2, tight_tasks, _sess2) = fixture(Limits {
+            max_running: 1,
+            max_scripts: 4,
+            ..Limits::OFF
+        });
+        let slot_a = tight_tasks.reserve_script_slot().unwrap();
+        let err_b = match tight_tasks.reserve_script_slot() {
+            Ok(_) => panic!("second task slot must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err_b, TaskError::Overload(msg) if msg.contains("TOO_MANY_TASKS")),
+            "{err_b:?}"
+        );
+        assert_eq!(tight_tasks.pending(), 1);
+        assert_eq!(lock(&tight_tasks.registry).pending_scripts, 1);
+        drop(slot_a);
+        assert_eq!(tight_tasks.pending(), 0);
+        assert_eq!(lock(&tight_tasks.registry).pending_scripts, 0);
+
+        tight_tasks.shutdown();
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn g2_publish_script_closed_job_channel_closes_pipe_and_finishes_synchronously() {
+        let (_runtime, tasks, session) = fixture(Limits::OFF);
+        let pool = BytePool::new(128);
+        let payload_owner = crate::lease::Owner::new(pool.try_acquire(128).unwrap());
+        assert_eq!(pool.used(), 128);
+
+        let reserved = tasks.reserve_script_slot().unwrap();
+        let script = Arc::new(super::script::ScriptControl::new(std::thread::current()));
+        let (job_tx, job_rx) = mpsc::sync_channel::<(ScriptIo, crate::lease::Owner)>(1);
+        // Simulate worker failure before handoff by dropping the receiver end of the job channel.
+        drop(job_rx);
+
+        let (task, _entry, _reader) = tasks
+            .publish_script(
+                reserved,
+                ScriptPublishArgs {
+                    command: "[codemode] broken-worker".into(),
+                    kill_after_ms: None,
+                    call_id: Some(42),
+                    script,
+                    key: "g2rk".into(),
+                },
+                &session,
+                job_tx,
+                payload_owner,
+            )
+            .expect("publish_script recovers synchronously when job channel is closed");
+
+        assert_eq!(pool.used(), 0, "dropped job payload must release its Owner");
+        assert_eq!(tasks.pending(), 0);
+        assert_eq!(lock(&tasks.registry).pending_scripts, 0);
+        assert!(task.output_closed(), "PipeWriter must close immediately");
+        assert!(task.is_finished(), "finish_script must run synchronously");
+        assert!(*task.done().borrow());
+        assert!(*task.tree_done().borrow());
+        let snap = task.snapshot();
+        assert_eq!(snap.state, "exited");
+        assert_eq!(snap.exit_code, Some(1));
+        assert!(!snap.output_open);
+
+        let active = tasks
+            .listed(
+                &session,
+                ListQuery {
+                    all_scope: true,
+                    active_filter: Some(true),
+                    parent_task_id: None,
+                    limit: 20,
+                },
+                &mut |_| Ok(()),
+                &mut |_| Ok(Some(Vec::new())),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.total_count, 0, "task must not linger in active list");
+
+        let finished = tasks
+            .listed(
+                &session,
+                ListQuery {
+                    all_scope: true,
+                    active_filter: Some(false),
+                    parent_task_id: None,
+                    limit: 20,
+                },
+                &mut |_| Ok(()),
+                &mut |_| Ok(Some(Vec::new())),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.total_count, 1);
+        assert_eq!(finished.items[0].task.id, task.id);
+
+        tasks.shutdown();
+    }
+
+    #[test]
+    fn pty_auto_answer_broken_pipe_leaves_input_error_none() {
+        let (runtime, tasks, session) = fixture(Limits::OFF);
+        let ((task, _, _), _) =
+            crate::codemode::spawn_script(&tasks, script_args(&tasks), &session, "pty0".into())
+                .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+
+        let workers = Workers::new(true).unwrap();
+        let (pipe_reader, pipe_writer) = std::io::pipe().unwrap();
+        drop(pipe_reader);
+        let (input_tx, input_rx) = mpsc::channel();
+        *lock(&task.input) = Some(input_tx.clone());
+        answer_program(&task, &input_tx, b"\x1b[1;1R".to_vec());
+        assert_eq!(task.queued.load(Ordering::SeqCst), 6);
+        drop(input_tx);
+
+        let done_sig = WriterDone::new(false);
+        workers
+            .input
+            .unwrap()
+            .send(InputWork {
+                task: Arc::clone(&task),
+                input: Box::new(pipe_writer),
+                received: input_rx,
+                done_signal: Arc::clone(&done_sig),
+            })
+            .unwrap();
+        done_sig.wait_until(Instant::now() + Duration::from_secs(2));
+
+        assert_eq!(task.queued.load(Ordering::SeqCst), 0);
+        assert!(lock(&task.input).is_none());
+        assert!(lock(&task.input_error).is_none());
+        assert!(lock(&task.input_warning).is_none());
+        let snap = task.snapshot();
+        assert!(snap.input_error.is_none(), "{:?}", snap.input_error);
+        assert!(snap.input_warning.is_none(), "{:?}", snap.input_warning);
+        assert!(crate::service::core::task_io_ok(&snap));
+
         tasks.shutdown();
     }
 }

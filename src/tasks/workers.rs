@@ -1,14 +1,17 @@
 //! Background output, input, wait, and process-tree cleanup workers.
 
-use super::state::{Final, Input, Task};
-use super::{DRAIN_CAP, TASK_LOG_LIMIT, Tasks, lock};
+use super::Tasks;
+use super::state::{
+    DRAIN_CAP, Final, Input, TASK_LOG_LIMIT, Task, WriterDone, WriterDoneGuard, answer_program,
+    lock,
+};
 use crate::platform::process::{self, Member};
 use crate::term::output::incomplete_utf8_suffix;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// Output that pauses this long has finished a frame: the chunks of one redraw arrive within
@@ -25,45 +28,6 @@ const KEPT_PAUSE: Duration = Duration::from_millis(100);
 pub(super) struct OutputWorkers {
     pub(super) reader: mpsc::Sender<ReadWork>,
     pub(super) capture: mpsc::Sender<CaptureWork>,
-}
-
-pub(super) struct WriterDone(Mutex<bool>, Condvar);
-
-impl WriterDone {
-    pub(super) fn new(done: bool) -> Arc<Self> {
-        Arc::new(Self(Mutex::new(done), Condvar::new()))
-    }
-
-    fn finish(&self) {
-        *lock(&self.0) = true;
-        self.1.notify_all();
-    }
-
-    pub(super) fn wait_until(&self, deadline: Instant) {
-        let mut done = lock(&self.0);
-        while !*done {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            let (guard, timeout) = self
-                .1
-                .wait_timeout(done, left)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            done = guard;
-            if timeout.timed_out() {
-                break;
-            }
-        }
-    }
-}
-
-struct WriterDoneGuard(Arc<WriterDone>);
-
-impl Drop for WriterDoneGuard {
-    fn drop(&mut self) {
-        self.0.finish();
-    }
 }
 
 pub(super) struct Workers {
@@ -206,6 +170,11 @@ impl Workers {
                         Err(error) if message.initial && is_broken_pipe(&error) => {
                             *lock(&job.task.input_warning) =
                                 Some(format!("stdin closed after {written} of {total} bytes"));
+                            *lock(&job.task.input) = None;
+                            drop(input.take());
+                            Ok(())
+                        }
+                        Err(_) if !message.initial && message.done.is_none() => {
                             *lock(&job.task.input) = None;
                             drop(input.take());
                             Ok(())
@@ -442,23 +411,6 @@ pub(super) fn read_chunks(
                 }
             }
         }
-    }
-}
-
-/// Sends the terminal emulator's replies to the program. Replies share the input limit; past
-/// it they are dropped, never queued unbounded.
-pub(super) fn answer_program(task: &Task, answer: &mpsc::Sender<Input>, reply: Vec<u8>) {
-    if !reply.is_empty()
-        && task.admit(reply.len())
-        && let Err(error) = answer.send(Input {
-            bytes: reply,
-            eof: false,
-            initial: false,
-            done: None,
-            _input_owner: Default::default(),
-        })
-    {
-        task.queued.fetch_sub(error.0.bytes.len(), Ordering::SeqCst);
     }
 }
 

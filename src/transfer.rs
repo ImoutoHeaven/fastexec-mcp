@@ -471,15 +471,11 @@ pub(crate) enum TransferEndpoint {
     },
 }
 
-pub(crate) fn transfer_error(message: String) -> rmcp::model::CallToolResult {
-    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message)])
-}
-
 pub(crate) type TransferInspection = Result<(std::path::PathBuf, String, Option<u64>), String>;
 
 pub(crate) fn inspect_transfer_request(
     request: Request,
-    launch: Arc<crate::session::LaunchContext>,
+    launch: Arc<crate::env::LaunchContext>,
     input_owner: crate::lease::Owner,
 ) -> impl std::future::Future<Output = crate::lease::Owned<TransferInspection>> {
     // Build the owner before creating the future, including its never-polled case.
@@ -506,44 +502,6 @@ pub(crate) fn inspect_transfer_request(
                 Default::default(),
             ),
         }
-    }
-}
-
-pub(crate) fn mint_transfer(
-    path: std::path::PathBuf,
-    shown_path: String,
-    bytes: Option<u64>,
-    table: &Arc<Transfers>,
-    base: &str,
-) -> rmcp::model::CallToolResult {
-    let id = match table.create(path) {
-        Ok(id) => id,
-        Err(message) => return transfer_error(message),
-    };
-    let url = format!("{base}t/{id}");
-    let text = match bytes {
-        Some(size) => format!("{url}\n{shown_path} · {size} bytes"),
-        None => format!("{url}\n{shown_path} · does not exist yet; a PUT creates it"),
-    };
-    rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)])
-}
-
-pub(crate) fn publish_transfer<'a>(
-    request: Request,
-    launch: Arc<crate::session::LaunchContext>,
-    table: &'a Arc<Transfers>,
-    base: &'a str,
-    input_owner: crate::lease::Owner,
-) -> impl std::future::Future<Output = crate::files::TrackedResult> + 'a {
-    let inspection = inspect_transfer_request(request, launch, input_owner);
-    async move {
-        let inspected = inspection.await;
-        let owner = inspected.owner.clone();
-        let result = inspected.run(|inspected| match inspected {
-            Ok((path, shown_path, bytes)) => mint_transfer(path, shown_path, bytes, table, base),
-            Err(message) => transfer_error(message),
-        });
-        crate::files::TrackedResult::owned(result, owner)
     }
 }
 
@@ -611,8 +569,8 @@ mod transfer_owner_tests {
     use std::future::Future;
     use std::time::Duration;
 
-    fn launch() -> Arc<crate::session::LaunchContext> {
-        Arc::new(crate::session::LaunchContext::new(
+    fn launch() -> Arc<crate::env::LaunchContext> {
+        Arc::new(crate::env::LaunchContext::new(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
             Vec::new(),
         ))
@@ -645,21 +603,6 @@ mod transfer_owner_tests {
             drop(inspected);
             assert_eq!(pool.used(), 0);
         }
-
-        let table = Arc::new(Transfers::new());
-        let result = publish_transfer(
-            request(),
-            launch(),
-            &table,
-            "http://localhost/",
-            crate::lease::Owner::new(pool.try_acquire(64).unwrap()),
-        )
-        .await;
-        assert_eq!(result.result.is_error, Some(false));
-        assert!(result.result.structured_content.is_none());
-        assert_eq!(pool.used(), 64);
-        drop(result);
-        assert_eq!(pool.used(), 0);
     }
 
     #[tokio::test]
@@ -667,7 +610,7 @@ mod transfer_owner_tests {
         for path in ["Cargo.toml", "missing-transfer-file", "."] {
             let pool = crate::lease::BytePool::new(64 * 1024);
             let context = Arc::new(
-                crate::session::LaunchContext::new(
+                crate::env::LaunchContext::new(
                     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
                     Vec::new(),
                 )
@@ -689,7 +632,7 @@ mod transfer_owner_tests {
         }
         let pool = crate::lease::BytePool::new(0);
         let context = Arc::new(
-            crate::session::LaunchContext::new(
+            crate::env::LaunchContext::new(
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
                 Vec::new(),
             )

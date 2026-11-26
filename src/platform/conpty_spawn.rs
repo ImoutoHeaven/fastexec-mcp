@@ -655,7 +655,7 @@ fn nul_terminated(value: &OsStr) -> std::io::Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::LaunchContext;
+    use crate::env::LaunchContext;
 
     #[test]
     fn module_lookup_never_loads_an_unregistered_dll() {
@@ -926,7 +926,7 @@ mod tests {
     #[test]
     fn a_pty_root_is_in_its_job_before_it_runs() {
         let context = LaunchContext::current().expect("this process's context");
-        let bash = context.bash().expect("bash for this context").to_path_buf();
+        let bash = crate::platform::bash::resolve(&context).expect("bash for this context");
         let cwd = std::env::current_dir().expect("a working directory");
         let launch = Launch {
             bash: &bash,

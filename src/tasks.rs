@@ -1,30 +1,33 @@
 //! Task registry: spawn, log capture, unseen-output cursors, input queues, and shutdown.
 
+pub(crate) mod script;
+pub(crate) mod session;
 pub mod state;
 #[cfg(test)]
 mod tests;
 mod workers;
 
+use self::script::{QueuedStartGuard, ScriptControl};
+use self::session::{OutsideClaim, Reader, Session, TaskEntry};
+pub(crate) use self::state::TASK_LOG_LIMIT;
 use self::state::{
     AttachmentMeta, AttachmentSlot, AttachmentSlotState, Final, Input, Pty, Root, Snapshot, Spool,
-    Task, copy_snapshot_text, mark_tree_ended, set_held,
+    Task, WriterDone, copy_snapshot_text, lock, mark_tree_ended, pids, set_held,
 };
-use self::workers::{
-    CaptureWork, InputWork, OutputWorkers, ReadWork, WaitWork, Workers, WriterDone, drain,
-};
-use crate::codemode;
+pub use self::state::{DRAIN_CAP, EVICTED_TRANSCRIPT, TaskError};
+use self::workers::{CaptureWork, InputWork, OutputWorkers, ReadWork, WaitWork, Workers, drain};
+use crate::env::{LaunchContext, ProbeWarning};
 use crate::id::{base32, random_chars};
 use crate::media::MediaKind;
 use crate::platform::process::{self, Launch, Member, Tree, clean_member_name};
-use crate::session::{LaunchContext, ProbeWarning, Reader, Session, TaskEntry};
 use crate::term::terminal::Live;
 use encoding_rs::Encoding;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Write;
+use std::io::{PipeWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -59,58 +62,14 @@ impl Limits {
     };
 }
 
-#[derive(Debug)]
-pub enum TaskError {
-    Overload(String),
-    Cancelled(String),
-    Io(String),
-}
-
-impl TaskError {
-    pub fn message(&self) -> &str {
-        match self {
-            Self::Overload(message) | Self::Cancelled(message) | Self::Io(message) => message,
-        }
-    }
-}
-
-impl std::fmt::Display for TaskError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.message())
-    }
-}
-
-impl From<String> for TaskError {
-    fn from(message: String) -> Self {
-        Self::Io(message)
-    }
-}
-
-impl From<&str> for TaskError {
-    fn from(message: &str) -> Self {
-        Self::Io(message.into())
-    }
-}
-
-pub(crate) const TASK_LOG_LIMIT: u64 = 64 << 20;
 pub(crate) const MAX_TASK_ATTACHMENTS: usize = 1024;
 const TOTAL_LOG_LIMIT: u64 = 4 << 30;
-const INPUT_QUEUE_LIMIT: usize = 1 << 20;
-const INPUT_WRITE_LIMIT: Duration = Duration::from_secs(5);
-/// How long output may stay open after the root exits and its tree is killed.
-pub const DRAIN_CAP: Duration = Duration::from_secs(2);
 
 /// Runs before a Windows ConPTY root's command, on its first line, so the script's exit status is
 /// on disk as the script ends. The root can deadlock inside its own exit; this file is what lets
 /// its task end anyway. A user's own EXIT cleanup is never overwritten, and a command that
 /// replaces the trap or execs keeps the plain wait.
 const EXIT_TRAP: &str = r#"[ -n "${FASTEXEC_EXIT_STATUS-}" ] && [ "${BASH_SUBSHELL-0}" -eq 0 ] && builtin export -n FASTEXEC_EXIT_STATUS && [ -z "$(builtin trap -p EXIT)" ] && builtin trap 'builtin printf "%s\n" "$?" 2>/dev/null > "$FASTEXEC_EXIT_STATUS" || :' EXIT || :; "#;
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 struct PendingDelete {
     path: PathBuf,
@@ -142,7 +101,7 @@ pub struct Tasks {
     /// Files whose unlink failed keep their byte charge here until a later unlink succeeds.
     pending_deletes: Mutex<Vec<PendingDelete>>,
     delete_retry_gate: Mutex<()>,
-    event_bus: OnceLock<Arc<crate::events::EventBus>>,
+    event_bus: Arc<crate::events::EventBus>,
     #[cfg(test)]
     remove_hook: Mutex<Option<RemoveHook>>,
     #[cfg(test)]
@@ -201,10 +160,6 @@ fn task_id(epoch: &str, number: u64) -> String {
 fn new_epoch() -> std::io::Result<String> {
     random_chars(8)
 }
-
-/// The error a transcript read returns for a task whose files the total log limit evicted.
-pub const EVICTED_TRANSCRIPT: &str =
-    "The files of this task were evicted under the 4 GiB total limit; its transcript is gone.";
 
 /// Maximum indented active children shown inline beneath a single `codemode` parent.
 pub const MAX_INLINE_ACTIVE: usize = 8;
@@ -276,20 +231,53 @@ pub struct StartArgs {
     /// Parent codemode task ID when started via nested `exec start`.
     pub parent_task_id: Option<String>,
     /// Releases the parent script's `queued_starts` counter once the task enters `registry.tasks`.
-    pub queued_guard: Option<codemode::control::QueuedStartGuard>,
+    pub queued_guard: Option<QueuedStartGuard>,
     /// What the task inherits: its environment, and the bash found in it.
     pub launch: Arc<LaunchContext>,
     pub input_owner: crate::lease::Owner,
 }
 
-pub(crate) struct ScriptArgs {
-    pub code: String,
-    pub launch: Arc<LaunchContext>,
+/// Holds an admitted task and script slot until [`Tasks::publish_script`] inserts the task.
+pub(crate) struct ReservedScript {
+    tasks: Arc<Tasks>,
+    id: String,
+    committed: bool,
+}
+
+impl ReservedScript {
+    fn commit(&mut self, registry: &mut Registry) {
+        if !self.committed {
+            registry.pending -= 1;
+            registry.pending_scripts -= 1;
+            self.committed = true;
+        }
+    }
+}
+
+impl Drop for ReservedScript {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.committed = true;
+            let mut registry = lock(&self.tasks.registry);
+            registry.pending -= 1;
+            registry.pending_scripts -= 1;
+        }
+    }
+}
+
+pub(crate) struct ScriptPublishArgs {
+    pub command: String,
     pub kill_after_ms: Option<u64>,
-    pub transfer: bool,
     pub call_id: Option<u64>,
-    pub service: Arc<crate::service::Service>,
-    pub input_owner: crate::lease::Owner,
+    pub script: Arc<ScriptControl>,
+    pub key: String,
+}
+
+pub(crate) struct ScriptIo {
+    pub task: Arc<Task>,
+    pub tasks: Arc<Tasks>,
+    pub writer: PipeWriter,
+    pub captured: mpsc::Receiver<()>,
 }
 
 /// Reserves metadata workspace and captures a task snapshot under the registry lock.
@@ -374,6 +362,7 @@ impl Tasks {
                 "Tasks needs a tokio runtime for the killAfterMs timer: {error}."
             ))
         })?;
+        let event_bus = Arc::new(crate::events::EventBus::new()?);
         crate::platform::runtime::create_private(&dir)?;
         Ok(Arc::new(Self {
             dir,
@@ -390,7 +379,7 @@ impl Tasks {
                 .unwrap_or(TOTAL_LOG_LIMIT),
             pending_deletes: Mutex::default(),
             delete_retry_gate: Mutex::new(()),
-            event_bus: OnceLock::new(),
+            event_bus,
             #[cfg(test)]
             remove_hook: Mutex::new(None),
             #[cfg(test)]
@@ -426,15 +415,11 @@ impl Tasks {
         file.set_len(bytes)
     }
 
-    /// Attaches the shared event bus once so task exits emit `task.exited`.
-    pub fn attach_event_bus(&self, bus: Arc<crate::events::EventBus>) {
-        let _ = self.event_bus.set(bus);
+    pub fn event_bus(&self) -> &Arc<crate::events::EventBus> {
+        &self.event_bus
     }
 
     fn emit_task_exited(&self, task: &Task) {
-        let Some(bus) = self.event_bus.get() else {
-            return;
-        };
         let input = {
             let end = lock(&task.end);
             let Some(end) = end.as_ref() else { return };
@@ -454,7 +439,7 @@ impl Tasks {
                 log_path: Some(crate::files::path::display_path(&task.log_path)),
             }
         };
-        let _ = bus.publish_task_exited(input);
+        let _ = self.event_bus.publish_task_exited(input);
     }
 
     pub fn find(&self, id: &str) -> Option<Arc<Task>> {
@@ -830,8 +815,9 @@ impl Tasks {
         };
         let need_input_worker = args.pty || keep_stdin_open || initial_input.is_some();
         let (id, mut pending) = self.admit(false)?;
-        let bash = args.launch.bash()?;
-        let (base_env, _used_snapshot, probe_warning) = args.launch.task_env(&bash, args.login);
+        let bash = crate::platform::bash::resolve(&args.launch)?;
+        let (base_env, _used_snapshot, probe_warning) =
+            process::task_env(&args.launch, &bash, args.login);
         let workers = Workers::new(need_input_worker)
             .map_err(|error| format!("Cannot prepare the task workers: {error}."))?;
         let log_path = self.dir.join(format!("{id}.log"));
@@ -1023,24 +1009,40 @@ impl Tasks {
         Ok(((task, entry, reader), probe_warning))
     }
 
-    pub(crate) fn start_script(
-        self: &Arc<Self>,
-        args: ScriptArgs,
-        session: &Arc<Session>,
-        key: String,
-    ) -> Result<Started, TaskError> {
+    pub(crate) fn runtime_handle(&self) -> &Handle {
+        &self.handle
+    }
+
+    pub(crate) fn reserve_script_slot(self: &Arc<Self>) -> Result<ReservedScript, TaskError> {
         let (id, mut pending) = self.admit(true)?;
-        let (script, worker) = codemode::prepare(self.handle.clone())?;
+        pending.counted = false;
+        Ok(ReservedScript {
+            tasks: Arc::clone(self),
+            id,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn publish_script<P>(
+        self: &Arc<Self>,
+        mut reserved: ReservedScript,
+        args: ScriptPublishArgs,
+        session: &Session,
+        job_tx: mpsc::SyncSender<(ScriptIo, P)>,
+        payload: P,
+    ) -> Result<Started, TaskError> {
+        debug_assert!(Arc::ptr_eq(self, &reserved.tasks));
         let output = OutputWorkers::new()
             .map_err(|error| format!("Cannot prepare the script workers: {error}."))?;
         let (pipe, writer) =
             std::io::pipe().map_err(|error| format!("Cannot create the script pipe: {error}."))?;
+        let id = reserved.id.clone();
         let log_path = self.dir.join(format!("{id}.log"));
         let log = private_file(&log_path)
             .map_err(|error| format!("Cannot create the script log: {error}."))?;
         let task = Arc::new(Task {
             id,
-            command: format!("[codemode] {}", args.code),
+            command: args.command,
             pty: false,
             log_path,
             encoding: encoding_rs::UTF_8,
@@ -1050,7 +1052,7 @@ impl Tasks {
             started_by: args.call_id.map(|id| (session.id.clone(), id)),
             parent_task_id: None,
             started: Instant::now(),
-            root: Root::Script(script),
+            root: Root::Script(args.script),
             tree_done: watch::Sender::new(false),
             tree_ended_at: OnceLock::new(),
             kill_error: Mutex::new(None),
@@ -1074,9 +1076,9 @@ impl Tasks {
         });
         let mut registry = lock(&self.registry);
         let entry = session.entry(&task);
-        let reader = entry.start_reader(key);
+        let reader = entry.start_reader(args.key);
         registry.tasks.push(Arc::clone(&task));
-        pending.release(&mut registry);
+        reserved.commit(&mut registry);
         let stopping = registry.stopping;
         drop(registry);
         if stopping {
@@ -1104,19 +1106,20 @@ impl Tasks {
                 eof,
             })
             .unwrap_or_else(|_| unreachable!("prepared capture worker stopped"));
-        worker.start(codemode::Work {
-            service: args.service,
-            session: Arc::clone(session),
-            launch: args.launch,
-            transfer: args.transfer,
-            call_id: args.call_id,
-            code: args.code,
-            writer,
+        let io = ScriptIo {
             task: Arc::clone(&task),
             tasks: Arc::clone(self),
+            writer,
             captured,
-            input_owner: args.input_owner,
-        });
+        };
+        if let Err(mpsc::SendError((io, payload))) = job_tx.send((io, payload)) {
+            let ScriptIo {
+                writer, captured, ..
+            } = io;
+            drop(payload);
+            drop(writer);
+            self.finish_script(&task, Some(1), captured);
+        }
         Ok((task, entry, reader))
     }
 
@@ -1713,18 +1716,7 @@ impl Tasks {
 
 /// A task and the snapshot a result showed of it.
 pub type Shown = (Arc<Task>, Snapshot);
-pub type BackgroundNotice<'a> = (
-    Option<(String, Vec<Shown>)>,
-    crate::session::OutsideClaim<'a>,
-);
-
-/// The sorted, deduplicated PIDs of `held`.
-pub(crate) fn pids(held: &[Member]) -> Vec<u32> {
-    let mut pids: Vec<u32> = held.iter().map(|member| member.pid).collect();
-    pids.sort_unstable();
-    pids.dedup();
-    pids
-}
+pub type BackgroundNotice<'a> = (Option<(String, Vec<Shown>)>, OutsideClaim<'a>);
 
 /// The first held process and how many more: `adb.exe +2`.
 fn brief(held: &[Member]) -> String {

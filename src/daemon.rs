@@ -3,14 +3,17 @@
 
 mod events;
 
+use crate::env::LaunchContext;
 use crate::http::{self, Http};
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::lease::{self, BytePool, Lease};
 use crate::platform::runtime;
+use crate::render;
+use crate::render::files::{self as render_files, mint_transfer, transfer_error};
+use crate::render::types::{AgentDelivery, DaemonDelivery, TrackedResult};
 use crate::service::core::{RenderSlot, overload_task_message};
-use crate::service::render as service_render;
-use crate::service::{AgentDelivery, ExecContext, Service};
-use crate::session::{LaunchContext, Session};
+use crate::service::{ExecContext, Service};
+use crate::tasks::session::Session;
 use crate::tasks::{Limits, Tasks};
 use crate::transfer::Transfers;
 use crate::transport::Listener;
@@ -373,32 +376,26 @@ impl Daemon {
         request: crate::transfer::Request,
         launch: &Arc<LaunchContext>,
         input_owner: crate::lease::Owner,
-    ) -> crate::files::TrackedResult {
+    ) -> TrackedResult {
         let session_root = match crate::config::root_of(launch.var(crate::config::PUBLIC_URL)) {
             Ok(root) => root,
             Err(message) => {
-                return crate::files::TrackedResult::plain(crate::transfer::transfer_error(
-                    message,
-                ));
+                return TrackedResult::plain(transfer_error(message));
             }
         };
         let public_root = session_root.or_else(|| self.public_root.as_deref().map(str::to_owned));
         if let Some(http_addr) = &self.http {
             if launch.var(crate::config::TRANSFER_ADDR).is_some() {
-                return crate::files::TrackedResult::plain(crate::transfer::transfer_error(
-                    format!(
-                        "cannot set {} with --http; --http already serves /t/",
-                        crate::config::TRANSFER_ADDR
-                    ),
-                ));
+                return TrackedResult::plain(transfer_error(format!(
+                    "cannot set {} with --http; --http already serves /t/",
+                    crate::config::TRANSFER_ADDR
+                )));
             }
             if public_root.is_none()
                 && let Ok(addr) = http_addr.parse::<std::net::SocketAddr>()
                 && let Err(message) = crate::config::check_routable_addr("--http", addr, false)
             {
-                return crate::files::TrackedResult::plain(crate::transfer::transfer_error(
-                    message,
-                ));
+                return TrackedResult::plain(transfer_error(message));
             }
         }
         let inspected = match crate::transfer::inspect_transfer_request(
@@ -416,10 +413,7 @@ impl Daemon {
                 value: Err(message),
                 owner,
             } => {
-                return crate::files::TrackedResult::owned(
-                    crate::transfer::transfer_error(message),
-                    owner,
-                );
+                return TrackedResult::owned(transfer_error(message), owner);
             }
         };
         let base = match (public_root, &self.http) {
@@ -432,9 +426,7 @@ impl Daemon {
                 {
                     Ok(addr) => addr,
                     Err(message) => {
-                        return crate::files::TrackedResult::plain(
-                            crate::transfer::transfer_error(message),
-                        );
+                        return TrackedResult::plain(transfer_error(message));
                     }
                 };
                 public_root.unwrap_or_else(|| format!("http://{bound}/"))
@@ -442,9 +434,9 @@ impl Daemon {
         };
         let owner = inspected.owner.clone();
         let result = inspected.run(|(path, shown_path, bytes)| {
-            crate::transfer::mint_transfer(path, shown_path, bytes, &self.transfers, &base)
+            mint_transfer(path, shown_path, bytes, &self.transfers, &base)
         });
-        crate::files::TrackedResult::owned(result, owner)
+        TrackedResult::owned(result, owner)
     }
 
     /// Takes a place for a connection, or refuses it: the daemon is stopping, or it already
@@ -1020,19 +1012,20 @@ impl Daemon {
                     };
                     match token {
                         Some(token) => {
-                            tokio::spawn(owner.clone().hold_future(run_call(
-                                Arc::clone(self),
-                                Arc::clone(&attached.session),
-                                attached.token.clone(),
+                            let call = CallDispatch {
+                                daemon: Arc::clone(self),
+                                session: Arc::clone(&attached.session),
+                                connection: attached.token.clone(),
                                 token,
                                 id,
                                 tool,
                                 arguments,
-                                Arc::clone(in_flight),
-                                outgoing.clone(),
+                                in_flight: Arc::clone(in_flight),
+                                outgoing: outgoing.clone(),
                                 rpc_id_bytes,
-                                owner,
-                            )));
+                                input_owner: owner.clone(),
+                            };
+                            tokio::spawn(owner.hold_future(dispatch_call(call)));
                         }
                         None => {
                             let message = if lock(in_flight).contains_key(&id) {
@@ -1220,9 +1213,7 @@ impl Daemon {
     }
 }
 
-/// Runs one call: its progress frames while it waits, then its result within the budget.
-#[allow(clippy::too_many_arguments)]
-async fn run_call(
+struct CallDispatch {
     daemon: Arc<Daemon>,
     session: Arc<Session>,
     connection: CancellationToken,
@@ -1234,7 +1225,23 @@ async fn run_call(
     outgoing: mpsc::UnboundedSender<Outgoing>,
     rpc_id_bytes: usize,
     input_owner: crate::lease::Owner,
-) {
+}
+
+/// Runs one call: its progress frames while it waits, then its result within the budget.
+async fn dispatch_call(call: CallDispatch) {
+    let CallDispatch {
+        daemon,
+        session,
+        connection,
+        token,
+        id,
+        tool,
+        arguments,
+        in_flight,
+        outgoing,
+        rpc_id_bytes,
+        input_owner,
+    } = call;
     let render_pool = match (
         tool.as_str(),
         arguments.get("action").and_then(|action| action.as_str()),
@@ -1272,33 +1279,39 @@ async fn run_call(
         input_owner: input_owner.clone(),
     };
     let delivery = AgentDelivery {
-        render_slot: Some(&render_slot),
+        daemon_ipc: Some(DaemonDelivery {
+            slot: &render_slot,
+            ipc_body_overhead: ipc::result_body_overhead(id),
+        }),
         http_response: false,
         rpc_id_bytes,
     };
     let transfer = session.launch.var("FASTEXEC_TRANSFER") == Some(std::ffi::OsStr::new("true"));
     let mut tracked = if cancelled_before_dispatch {
-        crate::files::TrackedResult::plain(error(
+        TrackedResult::plain(error(
             "Cancelled before the operation started; nothing was executed.".into(),
         ))
     } else if tool == "exec" {
-        daemon
-            .service
-            .exec_agent_json(arguments, ctx, delivery)
-            .await
+        render::exec_agent_json(&daemon.service, arguments, ctx, delivery).await
     } else if tool == "codemode" {
         match serde_json::from_value::<crate::codemode::control::Request>(arguments) {
             Ok(request) => {
-                daemon
-                    .service
-                    .codemode_agent(request, ctx, delivery, transfer)
-                    .await
+                let mut ctx = ctx;
+                let outcome = crate::codemode::prepare_script(
+                    &daemon.service,
+                    request,
+                    &mut ctx,
+                    delivery.daemon_ipc.as_ref().map(|d| d.slot),
+                    transfer,
+                )
+                .await;
+                render::finish_exec_agent(&daemon.service, outcome, &ctx, &delivery).await
             }
-            Err(problem) => crate::files::TrackedResult::plain(error(problem.to_string())),
+            Err(problem) => TrackedResult::plain(error(problem.to_string())),
         }
     } else if tool == "transfer" {
         if !transfer {
-            crate::files::TrackedResult::plain(crate::transfer::transfer_error(
+            TrackedResult::plain(transfer_error(
                 "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
             ))
         } else {
@@ -1308,17 +1321,15 @@ async fn run_call(
                         .transfer(request, &session.launch, input_owner.clone())
                         .await
                 }
-                Err(problem) => {
-                    crate::files::TrackedResult::plain(crate::transfer::transfer_error(format!(
-                        "failed to deserialize parameters: {problem}"
-                    )))
-                }
+                Err(problem) => TrackedResult::plain(transfer_error(format!(
+                    "failed to deserialize parameters: {problem}"
+                ))),
             }
         }
     } else {
         // File tools run in the daemon process using the calling session's launch context.
         let launch = Arc::clone(&session.launch);
-        crate::files::call_tracked(
+        render_files::call_tracked(
             &tool,
             arguments,
             launch,
@@ -1369,7 +1380,7 @@ async fn run_call(
 
     let payload_bytes = match &message {
         ToEndpoint::Result { result, .. } => {
-            service_render::unleased_result_payload_capacity(result, &tracked.payload_owner)
+            render::unleased_result_payload_capacity(result, &tracked.payload_owner)
         }
         _ => 0,
     };
@@ -1456,7 +1467,7 @@ async fn run_call(
         return;
     };
     let fallback_payload = match &fallback {
-        ToEndpoint::Result { result, .. } => service_render::result_payload_capacity(result),
+        ToEndpoint::Result { result, .. } => render::result_payload_capacity(result),
         _ => 0,
     };
     let fallback_peak = fallback_len.saturating_add(fallback_payload);
@@ -2031,6 +2042,40 @@ async fn daemon_lock(path: &std::path::Path) -> Option<runtime::Lock> {
             _ => return None,
         }
     }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "preserves the test call signature used by daemon/tests.rs"
+)]
+async fn run_call(
+    daemon: Arc<Daemon>,
+    session: Arc<Session>,
+    connection: CancellationToken,
+    token: CancellationToken,
+    id: u64,
+    tool: String,
+    arguments: serde_json::Value,
+    in_flight: Arc<Mutex<HashMap<u64, CancellationToken>>>,
+    outgoing: mpsc::UnboundedSender<Outgoing>,
+    rpc_id_bytes: usize,
+    input_owner: crate::lease::Owner,
+) {
+    dispatch_call(CallDispatch {
+        daemon,
+        session,
+        connection,
+        token,
+        id,
+        tool,
+        arguments,
+        in_flight,
+        outgoing,
+        rpc_id_bytes,
+        input_owner,
+    })
+    .await;
 }
 
 #[cfg(test)]

@@ -6,37 +6,35 @@ use std::path::{Path, PathBuf};
 
 /// Target 23-module strict lower-triangular allowlist `D(u)` from Spec §3 (`rank(v) < rank(u)`).
 ///
-/// Checkpoint 1 mapping notes:
-/// - `#4 session` occupies the target `#4 env` slot until Checkpoint 2 splits `src/session.rs`
-///   into `#4 src/env.rs` and `#12 src/tasks/session.rs`.
-/// - `#15 render` and `#18 http_wire` are included at their target ranks so Checkpoint 2 and
-///   Checkpoint 3 extractions activate without reordering.
-/// - `ingress` is listed separately in [`CP1_TRANSITIONAL_MODULES`] until Checkpoint 3 folds
+/// Checkpoint 2 mapping notes:
+/// - `#4 env` and `#15 render` are active at their final target ranks (`src/session.rs` is split
+///   into `#4 src/env.rs` and `#12 src/tasks/session.rs`, so `session` is no longer a valid
+///   top-level module).
+/// - `#18 http_wire` stays at its target rank so Checkpoint 3 extraction activates without
+///   reordering.
+/// - `ingress` is listed separately in [`CP2_TRANSITIONAL_MODULES`] until Checkpoint 3 folds
 ///   `src/ingress.rs` into `#21 src/mcp/ingress.rs`.
 const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
     // S0 primitives (#1..#3, 3x3 diagonal block)
     ("id", &[]),
     ("lease", &[]),
     ("transport", &[]),
-    // S1a launch environment (#4; named `session` in CP1 before splitting out `env`)
-    ("session", &["lease"]),
+    // S1a launch environment (#4)
+    ("env", &["lease"]),
     // S1b host capabilities (#5..#7, 3x3 diagonal block)
     ("media", &["lease"]),
     ("term", &["lease"]),
-    ("platform", &["id", "lease", "transport", "session"]),
+    ("platform", &["id", "lease", "transport", "env"]),
     // S1c files and configuration (#8..#10, {transfer, config} 2x2 diagonal block)
-    (
-        "files",
-        &["lease", "transport", "session", "media", "platform"],
-    ),
-    ("transfer", &["id", "lease", "session", "files"]),
-    ("config", &["session", "files"]),
+    ("files", &["lease", "transport", "env", "media", "platform"]),
+    ("transfer", &["id", "lease", "env", "files"]),
+    ("config", &["env", "files"]),
     // S2 events, tasks, and wait (#11..#13)
     ("events", &["id", "lease"]),
     (
         "tasks",
         &[
-            "id", "lease", "session", "media", "term", "platform", "files", "events",
+            "id", "lease", "env", "media", "term", "platform", "files", "events",
         ],
     ),
     ("wait", &["lease", "term", "files", "tasks"]),
@@ -44,25 +42,24 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
     (
         "service",
         &[
-            "id", "lease", "session", "term", "platform", "files", "events", "tasks", "wait",
+            "id", "lease", "env", "term", "platform", "files", "events", "tasks", "wait",
         ],
     ),
     // S4 projection and wire (#15..#17, 3x3 diagonal block)
     (
         "render",
         &[
-            "lease", "session", "media", "term", "platform", "files", "transfer", "events",
-            "tasks", "wait", "service",
+            "lease", "env", "media", "term", "platform", "files", "transfer", "events", "tasks",
+            "wait", "service",
         ],
     ),
     (
         "codemode",
         &[
-            "id", "lease", "session", "media", "term", "platform", "files", "tasks", "wait",
-            "service",
+            "id", "lease", "env", "media", "term", "platform", "files", "tasks", "wait", "service",
         ],
     ),
-    ("ipc", &["lease", "session", "events"]),
+    ("ipc", &["lease", "env", "events"]),
     // S5a HTTP wire and IPC client (#18..#19, 2x2 diagonal block)
     ("http_wire", &["lease", "files", "transfer"]),
     (
@@ -71,7 +68,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
             "id",
             "lease",
             "transport",
-            "session",
+            "env",
             "platform",
             "events",
             "wait",
@@ -85,7 +82,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
         &[
             "lease",
             "transport",
-            "session",
+            "env",
             "platform",
             "transfer",
             "config",
@@ -101,7 +98,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
     (
         "mcp",
         &[
-            "id", "lease", "session", "files", "transfer", "config", "events", "tasks", "wait",
+            "id", "lease", "env", "files", "transfer", "config", "events", "tasks", "wait",
             "service", "render", "codemode", "ipc", "endpoint",
         ],
     ),
@@ -110,7 +107,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
         "http",
         &[
             "lease",
-            "session",
+            "env",
             "transfer",
             "config",
             "tasks",
@@ -125,7 +122,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
             "id",
             "lease",
             "transport",
-            "session",
+            "env",
             "platform",
             "transfer",
             "config",
@@ -142,28 +139,13 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Top-level modules present in CP1 that fold into another module in a later checkpoint.
+/// Top-level modules still present in CP2 that fold into another module in Checkpoint 3.
 /// `src/ingress.rs` folds into `src/mcp/ingress.rs` in Checkpoint 3.
-const CP1_TRANSITIONAL_MODULES: &[&str] = &["ingress"];
+const CP2_TRANSITIONAL_MODULES: &[&str] = &["ingress"];
 
-/// Exact set of cross-top-module directed edges `(from, to)` still present after Checkpoint 1
-/// that lie outside [`TARGET_DAG_ALLOWLIST`] and are scheduled for removal in CP2 or CP3.
-const CP1_TRANSITIONAL_EDGES: &[(&str, &str)] = &[
-    // CP2 removals: `session` split (`env` + `tasks/session`), `render` extraction, `codemode` decoupling
-    ("session", "id"),
-    ("session", "term"),
-    ("session", "files"),
-    ("session", "platform"),
-    ("session", "tasks"),
-    ("files", "service"),
-    ("tasks", "codemode"),
-    ("tasks", "service"),
-    ("wait", "session"),
-    ("service", "media"),
-    ("service", "codemode"),
-    ("service", "ipc"),
-    ("endpoint", "files"),
-    // CP3 removals: `http_wire` extraction, `daemon <-> http` inversion, `mcp/ingress` fold
+/// Exact set of cross-top-module directed edges `(from, to)` still present after Checkpoint 2
+/// that lie outside [`TARGET_DAG_ALLOWLIST`] and are scheduled for removal in Checkpoint 3.
+const CP2_TRANSITIONAL_EDGES: &[(&str, &str)] = &[
     ("ingress", "lease"),
     ("daemon", "files"),
     ("daemon", "http"),
@@ -174,19 +156,9 @@ const CP1_TRANSITIONAL_EDGES: &[(&str, &str)] = &[
     ("cli", "ingress"),
 ];
 
-/// Remaining top-level 2-cycles scheduled for removal in Checkpoints 2 and 3 (15 -> 9 -> 2 -> 0).
+/// Remaining top-level 2-cycles scheduled for removal in Checkpoint 3 (15 -> 9 -> 2 -> 0).
 /// Every pair is ordered lexicographically (`a < b`).
-const CP1_TRANSITIONAL_2CYCLES: &[(&str, &str)] = &[
-    ("codemode", "service"),
-    ("codemode", "tasks"),
-    ("daemon", "http"),
-    ("files", "service"),
-    ("files", "session"),
-    ("http", "mcp"),
-    ("platform", "session"),
-    ("service", "tasks"),
-    ("session", "tasks"),
-];
+const CP2_TRANSITIONAL_2CYCLES: &[(&str, &str)] = &[("daemon", "http"), ("http", "mcp")];
 
 /// Cross-layer one-way edges eliminated in Checkpoint 1.
 const CP1_FORBIDDEN_EDGES: &[(&str, &str)] = &[
@@ -200,17 +172,26 @@ const CP1_FORBIDDEN_EDGES: &[(&str, &str)] = &[
 
 /// Multi-file top-level modules whose entire submodule graph (including parent `<top>.rs` and
 /// child `<top>/<sub>.rs` files) must have zero strongly connected cycles.
-const ACYCLIC_SUBMODULE_TREES: &[&str] = &["term", "http", "cli"];
+const ACYCLIC_SUBMODULE_TREES: &[&str] = &["term", "service", "render", "http", "cli"];
 
 /// Multi-file top-level modules whose sibling child submodules (`<top>/<sub>.rs`) must have zero
-/// strongly connected cycles among siblings (ready to include `tasks` in CP2).
-const ACYCLIC_SIBLING_SUBMODULES: &[&str] = &["term", "http", "cli", "service", "daemon"];
+/// strongly connected cycles among siblings.
+const ACYCLIC_SIBLING_SUBMODULES: &[&str] = &["term", "http", "cli", "tasks", "service", "daemon"];
+
+/// Allowed sibling submodules inside `src/tasks/` and their exact permitted sibling directed edges
+/// `(from_sub, to_sub)` (Spec §4.2.2, §7.2.5).
+const TASKS_SUBMODULES: &[&str] = &["script", "state", "workers", "session"];
+const TASKS_ALLOWED_SIBLING_EDGES: &[(&str, &str)] = &[
+    ("state", "script"),
+    ("workers", "state"),
+    ("session", "state"),
+];
 
 const RQUICKJS_ALLOWED: &[&str] = &["codemode"];
 const HYPER_ALLOWED: &[&str] = &["http", "http_wire"];
-const RMCP_ALLOWED_CP1: &[&str] = &[
-    "render", "ipc", "endpoint", "daemon", "mcp", "http", "cli", // target shell/wire set
-    "files", "transfer", "service", "ingress", // CP1 transitional set
+const RMCP_ALLOWED_CP2: &[&str] = &[
+    "render", "ipc", "endpoint", "daemon", "mcp", "http", "cli",     // target shell/wire set
+    "ingress", // CP3 transitional module (`mcp/ingress`)
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -972,38 +953,58 @@ fn skip_pure_test_target(tokens: &[Token], mut i: usize) -> usize {
 /// under `test = False` produces `Truth::False`.
 fn strip_pure_test_code(tokens: &[Token]) -> Vec<Token> {
     let mut out = Vec::with_capacity(tokens.len());
+    let mut scope_out_starts: Vec<usize> = Vec::new();
     let mut brace_depth = 0usize;
     let mut i = 0;
     while i < tokens.len() {
-        if let Some((after_attr, is_inner, Some(Truth::False))) = parse_attribute(tokens, i) {
-            if is_inner {
-                if brace_depth == 0 {
-                    break;
-                }
-                let target_depth = brace_depth - 1;
-                i = after_attr;
-                while i < tokens.len() {
-                    if tokens[i].is_punct('{') {
-                        brace_depth += 1;
-                    } else if tokens[i].is_punct('}') {
-                        // Stop at the enclosing block's closing `}` without decrementing here so
-                        // the outer loop processes that `}` once and keeps `brace_depth` exact.
-                        if brace_depth - 1 == target_depth {
-                            break;
-                        }
-                        brace_depth -= 1;
+        if let Some((after_attr, true, Some(Truth::False))) = parse_attribute(tokens, i) {
+            if brace_depth == 0 {
+                out.clear();
+                break;
+            }
+            if let Some(&start) = scope_out_starts.last() {
+                out.truncate(start);
+            }
+            let target_depth = brace_depth - 1;
+            i = after_attr;
+            while i < tokens.len() {
+                if tokens[i].is_punct('{') {
+                    brace_depth += 1;
+                } else if tokens[i].is_punct('}') {
+                    // Stop at the enclosing block's closing `}` without decrementing here so
+                    // the outer loop processes that `}` once and keeps `brace_depth` exact.
+                    if brace_depth - 1 == target_depth {
+                        break;
                     }
-                    i += 1;
+                    brace_depth -= 1;
                 }
+                i += 1;
+            }
+            continue;
+        }
+        if matches!(parse_attribute(tokens, i), Some((_, false, _))) {
+            let mut cursor = i;
+            let mut any_false = false;
+            while let Some((after_attr, false, truth)) = parse_attribute(tokens, cursor) {
+                if truth == Some(Truth::False) {
+                    any_false = true;
+                }
+                cursor = after_attr;
+            }
+            if any_false {
+                i = skip_pure_test_target(tokens, cursor);
                 continue;
             }
-            i = skip_pure_test_target(tokens, after_attr);
-            continue;
         }
         if tokens[i].is_punct('{') {
             brace_depth += 1;
+            out.push(tokens[i].clone());
+            scope_out_starts.push(out.len());
+            i += 1;
+            continue;
         } else if tokens[i].is_punct('}') {
             brace_depth = brace_depth.saturating_sub(1);
+            scope_out_starts.pop();
         }
         out.push(tokens[i].clone());
         i += 1;
@@ -1177,6 +1178,14 @@ struct CrateLeak {
     from_top: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AllowSuppression {
+    file: String,
+    line: usize,
+    is_inner: bool,
+    lints: String,
+}
+
 #[derive(Default, Debug)]
 struct ScanReport {
     top_modules: BTreeSet<String>,
@@ -1184,6 +1193,119 @@ struct ScanReport {
     edges: Vec<EdgeRef>,
     inherent_impls: Vec<InherentImplViolation>,
     crate_leaks: Vec<CrateLeak>,
+    allow_suppressions: Vec<AllowSuppression>,
+}
+
+fn format_attr_tokens(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    for tok in tokens {
+        match &tok.kind {
+            Tok::Ident(s) => out.push_str(s),
+            Tok::RawIdent(s) => {
+                out.push_str("r#");
+                out.push_str(s);
+            }
+            Tok::Lifetime => out.push_str("'lt"),
+            Tok::Literal => out.push_str("\"...\""),
+            Tok::ColonColon => out.push_str("::"),
+            Tok::Punct(',') => out.push_str(", "),
+            Tok::Punct('=') => out.push_str(" = "),
+            Tok::Arrow => out.push_str("->"),
+            Tok::FatArrow => out.push_str("=>"),
+            Tok::Le => out.push_str("<="),
+            Tok::Ge => out.push_str(">="),
+            Tok::Shl => out.push_str("<<"),
+            Tok::Shr => out.push_str(">>"),
+            Tok::ShlEq => out.push_str("<<="),
+            Tok::ShrEq => out.push_str(">>="),
+            Tok::Lt => out.push('<'),
+            Tok::Gt => out.push('>'),
+            Tok::Punct(ch) => out.push(*ch),
+        }
+    }
+    out
+}
+
+fn collect_meta_allows(
+    meta: &[Token],
+    is_inner: bool,
+    file_label: &str,
+    out: &mut Vec<AllowSuppression>,
+) -> bool {
+    if meta.is_empty() {
+        return false;
+    }
+    let mut p = 0;
+    if meta.first().is_some_and(|t| t.kind == Tok::ColonColon) {
+        p = 1;
+    }
+    let Some(first) = meta.get(p).and_then(Token::ident_name) else {
+        return false;
+    };
+    let line = meta[p].line;
+    let mut segs = vec![first];
+    p += 1;
+    while meta.get(p).is_some_and(|t| t.kind == Tok::ColonColon)
+        && let Some(next) = meta.get(p + 1).and_then(Token::ident_name)
+    {
+        segs.push(next);
+        p += 2;
+    }
+    let last = *segs.last().unwrap();
+    if last == "allow" {
+        let lints = if meta.get(p).is_some_and(|t| t.is_punct('('))
+            && skip_balanced_delim(meta, p) == meta.len()
+        {
+            format_attr_tokens(&meta[p + 1..meta.len() - 1])
+        } else if p == meta.len() {
+            String::new()
+        } else {
+            return false;
+        };
+        out.push(AllowSuppression {
+            file: file_label.to_owned(),
+            line,
+            is_inner,
+            lints,
+        });
+        true
+    } else if last == "cfg_attr"
+        && meta.get(p).is_some_and(|t| t.is_punct('('))
+        && skip_balanced_delim(meta, p) == meta.len()
+    {
+        let parts = split_top_level_commas(&meta[p + 1..meta.len() - 1]);
+        if let Some((&pred, rest)) = parts.split_first()
+            && eval_cfg_expr(pred) != Truth::False
+        {
+            for &sub_meta in rest {
+                collect_meta_allows(sub_meta, is_inner, file_label, out);
+            }
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn scan_tokens_allow_suppressions(
+    file_label: &str,
+    tokens: &[Token],
+    out: &mut Vec<AllowSuppression>,
+) {
+    let mut i = 0;
+    while i < tokens.len() {
+        if let Some((after_attr, is_inner, _)) = parse_attribute(tokens, i) {
+            let bracket_idx = if is_inner { i + 2 } else { i + 1 };
+            if after_attr > bracket_idx + 1 {
+                let attr_body = &tokens[bracket_idx + 1..after_attr - 1];
+                if collect_meta_allows(attr_body, is_inner, file_label, out) {
+                    i = after_attr;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
 }
 
 fn skip_generic_params(tokens: &[Token], open_lt_idx: usize) -> usize {
@@ -1330,7 +1452,7 @@ fn check_crate_token(tok: &Token, current_top: &str, file_label: &str, report: &
         let forbidden = match ident {
             "rquickjs" => !RQUICKJS_ALLOWED.contains(&current_top),
             "hyper" | "hyper_util" => !HYPER_ALLOWED.contains(&current_top),
-            "rmcp" => !RMCP_ALLOWED_CP1.contains(&current_top),
+            "rmcp" => !RMCP_ALLOWED_CP2.contains(&current_top),
             _ => false,
         };
         if forbidden {
@@ -1881,6 +2003,7 @@ fn analyze_virtual_files(files: &[(&str, Vec<String>, &str)]) -> ScanReport {
     }
 
     for (label, mod_path, tokens) in &prepared {
+        scan_tokens_allow_suppressions(label, tokens, &mut report.allow_suppressions);
         analyze_module_scope(label, mod_path, tokens, &defined_types_by_top, &mut report);
     }
     report
@@ -1893,8 +2016,16 @@ fn scan_repo_src() -> ScanReport {
     collect_rs_files(&src_dir, &mut paths);
 
     let mut raw_files: Vec<(String, Vec<String>, String)> = Vec::new();
+    let mut main_src: Option<String> = None;
     for path in paths {
         let rel = path.strip_prefix(&src_dir).expect("under src/");
+        if rel == Path::new("main.rs") {
+            main_src = Some(
+                fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())),
+            );
+            continue;
+        }
         let Some(mod_path) = mod_path_from_rel(rel) else {
             continue;
         };
@@ -1912,7 +2043,15 @@ fn scan_repo_src() -> ScanReport {
         .iter()
         .map(|(label, mod_path, content)| (label.as_str(), mod_path.clone(), content.as_str()))
         .collect();
-    analyze_virtual_files(&refs)
+    let mut report = analyze_virtual_files(&refs);
+    if let Some(main_content) = main_src {
+        let filtered = strip_pure_test_code(&lex(&main_content));
+        scan_tokens_allow_suppressions("src/main.rs", &filtered, &mut report.allow_suppressions);
+        report
+            .allow_suppressions
+            .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    }
+    report
 }
 
 fn top_level_directed_edges(report: &ScanReport) -> BTreeMap<(String, String), Vec<String>> {
@@ -2045,7 +2184,7 @@ fn submodule_directed_edges(report: &ScanReport, top: &str, include_root: bool) 
         nodes.insert(format!("{top}::{sub}"));
     }
 
-    let node_of = |path: &[String], is_target: bool| -> Option<String> {
+    let node_of = |path: &[String]| -> Option<String> {
         if path.first().map(String::as_str) != Some(top) {
             return None;
         }
@@ -2054,7 +2193,7 @@ fn submodule_directed_edges(report: &ScanReport, top: &str, include_root: bool) 
         {
             return Some(format!("{top}::{candidate}"));
         }
-        if include_root && (is_target || path.len() == 1) {
+        if include_root {
             return Some(top.to_owned());
         }
         None
@@ -2063,8 +2202,7 @@ fn submodule_directed_edges(report: &ScanReport, top: &str, include_root: bool) 
     let mut adj: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut witnesses: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for edge in &report.edges {
-        let (Some(u), Some(v)) = (node_of(&edge.from_mod, false), node_of(&edge.to_path, true))
-        else {
+        let (Some(u), Some(v)) = (node_of(&edge.from_mod), node_of(&edge.to_path)) else {
             continue;
         };
         if u == v {
@@ -2090,7 +2228,7 @@ fn submodule_directed_edges(report: &ScanReport, top: &str, include_root: bool) 
 }
 
 // ---------------------------------------------------------------------------
-// Architecture Gate Tests (Checkpoint 1: full D(u) allowlist + SCC gates)
+// Architecture Gate Tests (Checkpoint 2: tightened D(u), submodule & rmcp gates)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -2121,7 +2259,7 @@ fn target_dag_allowlist_is_strictly_lower_triangular() {
 fn unauthorized_cross_module_edges(report: &ScanReport) -> Vec<String> {
     let mut allowed_modules: BTreeSet<&str> =
         TARGET_DAG_ALLOWLIST.iter().map(|&(m, _)| m).collect();
-    for &m in CP1_TRANSITIONAL_MODULES {
+    for &m in CP2_TRANSITIONAL_MODULES {
         allowed_modules.insert(m);
     }
     let mut violations = Vec::new();
@@ -2139,10 +2277,10 @@ fn unauthorized_cross_module_edges(report: &ScanReport) -> Vec<String> {
             allowed_edges.insert((u, v));
         }
     }
-    for &edge in CP1_TRANSITIONAL_EDGES {
+    for &edge in CP2_TRANSITIONAL_EDGES {
         assert!(
             !allowed_edges.contains(&edge),
-            "CP1_TRANSITIONAL_EDGES redundantly lists `{}` -> `{}` which is already in TARGET_DAG_ALLOWLIST",
+            "CP2_TRANSITIONAL_EDGES redundantly lists `{}` -> `{}` which is already in TARGET_DAG_ALLOWLIST",
             edge.0,
             edge.1
         );
@@ -2163,23 +2301,23 @@ fn unauthorized_cross_module_edges(report: &ScanReport) -> Vec<String> {
 }
 
 #[test]
-fn cp1_every_cross_module_edge_belongs_to_target_dag_or_transitional_budget() {
+fn cp2_every_cross_module_edge_belongs_to_target_dag_or_transitional_budget() {
     let report = scan_repo_src();
     let unauthorized = unauthorized_cross_module_edges(&report);
     assert!(
         unauthorized.is_empty(),
-        "found {} unauthorized cross-top-module edge(s) outside D(u) ∪ CP1_TRANSITIONAL_EDGES:\n{}",
+        "found {} unauthorized cross-top-module edge(s) outside D(u) ∪ CP2_TRANSITIONAL_EDGES:\n{}",
         unauthorized.len(),
         unauthorized.join("\n")
     );
 }
 
 #[test]
-fn cp1_top_level_two_cycles_stay_within_transitional_budget() {
+fn cp2_top_level_two_cycles_stay_within_transitional_budget() {
     let report = scan_repo_src();
     let directed = top_level_directed_edges(&report);
     let actual_cycles = compute_two_cycles(&directed);
-    let allowed: BTreeSet<(String, String)> = CP1_TRANSITIONAL_2CYCLES
+    let allowed: BTreeSet<(String, String)> = CP2_TRANSITIONAL_2CYCLES
         .iter()
         .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
         .collect();
@@ -2187,7 +2325,7 @@ fn cp1_top_level_two_cycles_stay_within_transitional_budget() {
     let forbidden: Vec<(String, String)> = actual_cycles.difference(&allowed).cloned().collect();
     if !forbidden.is_empty() {
         let mut msg = format!(
-            "found {} top-level 2-cycle(s) outside CP1_TRANSITIONAL_2CYCLES:\n",
+            "found {} top-level 2-cycle(s) outside CP2_TRANSITIONAL_2CYCLES:\n",
             forbidden.len()
         );
         for (a, b) in &forbidden {
@@ -2276,6 +2414,99 @@ fn submodule_graphs_have_zero_strongly_connected_cycles() {
     );
 }
 
+fn tasks_submodule_contract_violations(report: &ScanReport) -> Vec<String> {
+    let allowed_subs: BTreeSet<&str> = TASKS_SUBMODULES.iter().copied().collect();
+    let allowed_sibling_edges: BTreeSet<(&str, &str)> =
+        TASKS_ALLOWED_SIBLING_EDGES.iter().copied().collect();
+
+    let mut known_subs: BTreeSet<&str> = allowed_subs.clone();
+    let mut unregistered_subs: BTreeSet<String> = BTreeSet::new();
+    if let Some(discovered) = report.file_submodules.get("tasks") {
+        for sub in discovered {
+            known_subs.insert(sub.as_str());
+            if !allowed_subs.contains(sub.as_str()) {
+                unregistered_subs.insert(sub.clone());
+            }
+        }
+    }
+
+    let mut bad_edges: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for edge in &report.edges {
+        if edge.from_mod.first().map(String::as_str) != Some("tasks") {
+            continue;
+        }
+        let Some(from_sub) = edge.from_mod.get(1).map(String::as_str) else {
+            continue;
+        };
+        if !allowed_subs.contains(from_sub) {
+            unregistered_subs.insert(from_sub.to_owned());
+        }
+        if edge.to_path.first().map(String::as_str) != Some("tasks") {
+            continue;
+        }
+
+        let witness = format!(
+            "{}:{} (`crate::{}`)",
+            edge.file,
+            edge.line,
+            edge.to_path.join("::")
+        );
+        if let Some(to_sub) = edge
+            .to_path
+            .get(1)
+            .map(String::as_str)
+            .filter(|cand| known_subs.contains(cand))
+        {
+            if from_sub == to_sub {
+                continue;
+            }
+            if !allowed_sibling_edges.contains(&(from_sub, to_sub)) {
+                let list = bad_edges
+                    .entry((format!("tasks::{from_sub}"), format!("tasks::{to_sub}")))
+                    .or_default();
+                if !list.contains(&witness) {
+                    list.push(witness);
+                }
+            }
+        } else if matches!(from_sub, "script" | "session") {
+            let list = bad_edges
+                .entry((format!("tasks::{from_sub}"), "tasks".to_owned()))
+                .or_default();
+            if !list.contains(&witness) {
+                list.push(witness);
+            }
+        }
+    }
+
+    let mut violations = Vec::new();
+    for sub in unregistered_subs {
+        violations.push(format!(
+            "  - unregistered `tasks` submodule `tasks::{sub}` (allowed: {{{}}})",
+            TASKS_SUBMODULES.join(", ")
+        ));
+    }
+    for ((u, v), sites) in bad_edges {
+        violations.push(format!(
+            "  - {u} -> {v} ({} site(s)): {}",
+            sites.len(),
+            sites.join(", ")
+        ));
+    }
+    violations
+}
+
+#[test]
+fn tasks_internal_submodule_contract_holds() {
+    let report = scan_repo_src();
+    let violations = tasks_submodule_contract_violations(&report);
+    assert!(
+        violations.is_empty(),
+        "found {} `src/tasks/` internal submodule contract violation(s):\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn cross_top_module_inherent_impls_are_zero() {
     let report = scan_repo_src();
@@ -2318,6 +2549,36 @@ fn third_party_protocol_and_engine_crates_stay_isolated() {
             lines.join("\n")
         );
     }
+}
+
+fn format_allow_violations(report: &ScanReport) -> Vec<String> {
+    report
+        .allow_suppressions
+        .iter()
+        .map(|sup| {
+            let bang = if sup.is_inner { "!" } else { "" };
+            if sup.lints.is_empty() {
+                format!("  - {}:{} (#{bang}[allow])", sup.file, sup.line)
+            } else {
+                format!(
+                    "  - {}:{} (#{bang}[allow({})])",
+                    sup.file, sup.line, sup.lints
+                )
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn non_test_production_code_has_zero_allow_suppressions() {
+    let report = scan_repo_src();
+    let violations = format_allow_violations(&report);
+    assert!(
+        violations.is_empty(),
+        "found {} non-test `#[allow(...)]` suppression(s) in `src/`:\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2830,4 +3091,292 @@ fn inherent_impl_detector_flags_direct_imported_and_ref_foreign_types_without_fa
         report.inherent_impls[3].target_path,
         "session::GlobImportedType"
     );
+}
+
+#[test]
+fn tasks_submodule_contract_accepts_target_dag_and_rejects_script_session_and_state_violations() {
+    let tasks_root = r#"
+        pub mod script;
+        pub mod state;
+        pub mod session;
+        mod workers;
+
+        pub struct Tasks;
+        impl Tasks {
+            pub fn touch() {
+                let _ = self::script::ScriptControl;
+                let _ = self::state::Task;
+                let _ = self::workers::OutputWorkers;
+                let _ = self::session::Session;
+            }
+        }
+    "#;
+    let valid_script = r#"
+        pub struct ScriptControl;
+        pub fn id_and_lease() {
+            let _ = crate::id::random_chars(8);
+            let _ = crate::lease::BytePool::new(1);
+        }
+    "#;
+    let valid_state = r#"
+        use super::Tasks;
+        use super::script::ScriptControl;
+        pub struct Task;
+        pub struct ReadState;
+        pub fn check(_: &Tasks, _: &ScriptControl) {}
+    "#;
+    let valid_workers = r#"
+        use super::Tasks;
+        use super::state::Task;
+        pub struct OutputWorkers;
+        pub fn run(_: &Tasks, _: &Task) {}
+    "#;
+    let valid_session = r#"
+        use super::state::{ReadState, Task};
+        pub struct Session;
+        pub fn cursor(_: &ReadState, _: &Task) {}
+    "#;
+
+    let clean_report = analyze_virtual_files(&[
+        ("src/tasks.rs", vec!["tasks".into()], tasks_root),
+        (
+            "src/tasks/script.rs",
+            vec!["tasks".into(), "script".into()],
+            valid_script,
+        ),
+        (
+            "src/tasks/state.rs",
+            vec!["tasks".into(), "state".into()],
+            valid_state,
+        ),
+        (
+            "src/tasks/workers.rs",
+            vec!["tasks".into(), "workers".into()],
+            valid_workers,
+        ),
+        (
+            "src/tasks/session.rs",
+            vec!["tasks".into(), "session".into()],
+            valid_session,
+        ),
+    ]);
+    let clean_violations = tasks_submodule_contract_violations(&clean_report);
+    assert!(
+        clean_violations.is_empty(),
+        "valid tasks submodule DAG unexpectedly failed: {clean_violations:?}"
+    );
+
+    let bad_report = analyze_virtual_files(&[
+        ("src/tasks.rs", vec!["tasks".into()], tasks_root),
+        (
+            "src/tasks/script.rs",
+            vec!["tasks".into(), "script".into()],
+            "pub fn bad() { let _ = super::state::Task; let _ = super::Tasks; }",
+        ),
+        (
+            "src/tasks/state.rs",
+            vec!["tasks".into(), "state".into()],
+            "pub struct Task; pub fn bad() { let _ = super::workers::OutputWorkers; }",
+        ),
+        (
+            "src/tasks/workers.rs",
+            vec!["tasks".into(), "workers".into()],
+            "pub struct OutputWorkers; pub fn bad() { let _ = super::script::ScriptControl; }",
+        ),
+        (
+            "src/tasks/session.rs",
+            vec!["tasks".into(), "session".into()],
+            "pub fn bad() { let _ = super::Tasks; let _ = super::workers::OutputWorkers; }",
+        ),
+        (
+            "src/tasks/extra.rs",
+            vec!["tasks".into(), "extra".into()],
+            "pub fn rogue() {}",
+        ),
+    ]);
+    let violations = tasks_submodule_contract_violations(&bad_report);
+    assert_eq!(violations.len(), 7, "got: {violations:?}");
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("unregistered `tasks` submodule `tasks::extra`"))
+    );
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::script -> tasks::state")
+            && v.contains("src/tasks/script.rs:1 (`crate::tasks::state::Task`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::script -> tasks (")
+            && v.contains("src/tasks/script.rs:1 (`crate::tasks::Tasks`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::session -> tasks (")
+            && v.contains("src/tasks/session.rs:1 (`crate::tasks::Tasks`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::session -> tasks::workers")
+            && v.contains("src/tasks/session.rs:1 (`crate::tasks::workers::OutputWorkers`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::state -> tasks::workers")
+            && v.contains("src/tasks/state.rs:1 (`crate::tasks::workers::OutputWorkers`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::workers -> tasks::script")
+            && v.contains("src/tasks/workers.rs:1 (`crate::tasks::script::ScriptControl`)")
+    }));
+}
+
+#[test]
+fn cp2_rmcp_isolation_rejects_files_transfer_and_service_while_allowing_render() {
+    let report = analyze_virtual_files(&[
+        (
+            "src/files.rs",
+            vec!["files".into()],
+            "pub fn bad() -> rmcp::model::CallToolResult { todo!() }",
+        ),
+        (
+            "src/transfer.rs",
+            vec!["transfer".into()],
+            "pub fn bad() -> rmcp::model::CallToolResult { todo!() }",
+        ),
+        (
+            "src/service.rs",
+            vec!["service".into()],
+            "pub fn bad() -> rmcp::model::CallToolResult { todo!() }",
+        ),
+        (
+            "src/render.rs",
+            vec!["render".into()],
+            "pub fn ok() -> rmcp::model::CallToolResult { todo!() }",
+        ),
+    ]);
+    let leaked_tops: Vec<&str> = report
+        .crate_leaks
+        .iter()
+        .map(|l| l.from_top.as_str())
+        .collect();
+    assert_eq!(leaked_tops, vec!["files", "transfer", "service"]);
+}
+
+#[test]
+fn root_inline_submodule_edges_map_to_root_node_and_trigger_cycle_detection() {
+    let render_root = r#"
+        pub mod files;
+        pub struct Shared;
+
+        mod detail {
+            pub fn call_sibling() {
+                let _ = super::files::entry();
+            }
+        }
+    "#;
+    let render_files = r#"
+        pub fn entry() {
+            let _ = super::Shared;
+        }
+    "#;
+
+    let cyclic_report = analyze_virtual_files(&[
+        ("src/render.rs", vec!["render".into()], render_root),
+        (
+            "src/render/files.rs",
+            vec!["render".into(), "files".into()],
+            render_files,
+        ),
+    ]);
+    let full_graph = submodule_directed_edges(&cyclic_report, "render", true);
+    assert_eq!(
+        tarjan_cyclic_sccs(&full_graph.nodes, &full_graph.adj),
+        vec![vec!["render".to_owned(), "render::files".to_owned()]]
+    );
+    let sibling_only = submodule_directed_edges(&cyclic_report, "render", false);
+    assert!(tarjan_cyclic_sccs(&sibling_only.nodes, &sibling_only.adj).is_empty());
+
+    let pure_test_inline_root = r#"
+        pub mod files;
+        pub struct Shared;
+
+        #[cfg(test)]
+        mod detail {
+            pub fn call_sibling() {
+                let _ = super::files::entry();
+            }
+        }
+    "#;
+    let clean_report = analyze_virtual_files(&[
+        (
+            "src/render.rs",
+            vec!["render".into()],
+            pure_test_inline_root,
+        ),
+        (
+            "src/render/files.rs",
+            vec!["render".into(), "files".into()],
+            render_files,
+        ),
+    ]);
+    let clean_graph = submodule_directed_edges(&clean_report, "render", true);
+    assert!(tarjan_cyclic_sccs(&clean_graph.nodes, &clean_graph.adj).is_empty());
+}
+
+#[test]
+fn allow_suppression_gate_flags_production_and_cfg_platform_allows_while_ignoring_pure_tests() {
+    let clean_src = r##"
+        //! Comments with #[allow(dead_code)] and strings do not trigger.
+        const LITERAL: &str = "#[allow(clippy::too_many_arguments)]";
+
+        #[expect(dead_code, reason = "explicit expect is permitted")]
+        struct Guarded(u8);
+
+        #[cfg(test)]
+        #[allow(clippy::too_many_arguments)]
+        fn test_first_order() {}
+
+        #[allow(clippy::type_complexity)]
+        #[cfg(all(test, unix))]
+        fn allow_before_cfg_test() {}
+
+        #[cfg_attr(all(test, windows), allow(dead_code))]
+        fn pure_test_cfg_attr() {}
+
+        mod inner_tests {
+            #![allow(dead_code)]
+            #![cfg(test)]
+            fn helper() {}
+        }
+    "##;
+    let clean_report = analyze_virtual_files(&[("src/clean.rs", vec!["clean".into()], clean_src)]);
+    assert!(
+        clean_report.allow_suppressions.is_empty(),
+        "unexpected suppressions on clean source: {:?}",
+        clean_report.allow_suppressions
+    );
+
+    let bad_mod_src = r#"
+        #![allow(missing_docs)]
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn prod_fn() {}
+
+        #[cfg(windows)]
+        #[allow(dead_code)]
+        fn windows_prod_fn() {}
+
+        #[cfg_attr(target_os = "macos", allow(clippy::type_complexity))]
+        fn macos_prod_fn() {}
+
+        #[cfg(any(test, unix))]
+        #[allow(unused_variables)]
+        fn mixed_cfg_still_compiles_in_prod() {}
+    "#;
+    let bad_report =
+        analyze_virtual_files(&[("src/service.rs", vec!["service".into()], bad_mod_src)]);
+    let violations = format_allow_violations(&bad_report);
+    assert_eq!(violations.len(), 5, "got: {violations:?}");
+    assert!(violations[0].contains("src/service.rs:2 (#![allow(missing_docs)])"));
+    assert!(violations[1].contains("src/service.rs:4 (#[allow(clippy::too_many_arguments)])"));
+    assert!(violations[2].contains("src/service.rs:8 (#[allow(dead_code)])"));
+    assert!(violations[3].contains("src/service.rs:11 (#[allow(clippy::type_complexity)])"));
+    assert!(violations[4].contains("src/service.rs:15 (#[allow(unused_variables)])"));
 }

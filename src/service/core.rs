@@ -1,20 +1,77 @@
 //! Shared execution resources, snapshots, and diagnostics for Agent and Program delivery.
 
-use super::ServiceError;
 use super::schema::Action;
+use crate::env::LaunchContext;
+use crate::files;
 use crate::id::parse_handle;
 use crate::lease::Lease;
 use crate::platform::process;
-use crate::session::LaunchContext;
-use crate::tasks::Tasks;
+use crate::tasks::script::{CallInfo, ReportSnapshot};
 use crate::tasks::state::{Snapshot, Task};
+use crate::tasks::{self, Tasks};
 use crate::term::output::Window;
-use crate::{codemode, files};
 use std::sync::Arc;
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 
+#[derive(Debug)]
+pub struct TaskMeta {
+    pub bare_task_id: String,
+    pub log_path: String,
+}
+
+#[derive(Debug)]
+pub enum ServiceError {
+    Validation(String),
+    NotFound(String),
+    Cancelled(String),
+    Overload(String, Option<TaskMeta>),
+    Io(String),
+}
+
+impl ServiceError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Validation(s)
+            | Self::NotFound(s)
+            | Self::Cancelled(s)
+            | Self::Overload(s, _)
+            | Self::Io(s) => s,
+        }
+    }
+}
+
+impl From<String> for ServiceError {
+    fn from(message: String) -> Self {
+        Self::Io(message)
+    }
+}
+
+impl From<&str> for ServiceError {
+    fn from(message: &str) -> Self {
+        Self::Io(message.to_owned())
+    }
+}
+
+impl std::ops::Deref for ServiceError {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.message()
+    }
+}
+
+impl From<tasks::TaskError> for ServiceError {
+    fn from(error: tasks::TaskError) -> Self {
+        match error {
+            tasks::TaskError::Overload(message) => Self::Overload(message, None),
+            tasks::TaskError::Cancelled(message) => Self::Cancelled(message),
+            tasks::TaskError::Io(message) => Self::Io(message),
+        }
+    }
+}
+
 /// A local daemon call obtains one render slot on demand and keeps it until encoding.
-pub(crate) struct RenderSlot<'a> {
+pub struct RenderSlot<'a> {
     pool: &'a Arc<Semaphore>,
     permit: OnceCell<Arc<OwnedSemaphorePermit>>,
 }
@@ -27,7 +84,7 @@ impl<'a> RenderSlot<'a> {
         }
     }
 
-    pub(super) fn try_hold(&self) -> Option<Arc<OwnedSemaphorePermit>> {
+    pub(crate) fn try_hold(&self) -> Option<Arc<OwnedSemaphorePermit>> {
         if let Some(permit) = self.permit.get() {
             return Some(Arc::clone(permit));
         }
@@ -54,11 +111,11 @@ impl<'a> RenderSlot<'a> {
     }
 }
 
-pub(super) fn text_workspace_bytes(bytes: usize) -> usize {
+pub(crate) fn text_workspace_bytes(bytes: usize) -> usize {
     bytes.saturating_mul(16).saturating_add(128 << 10)
 }
 
-pub(crate) fn overload_task_message(limit: usize, meta: &files::TaskMeta) -> String {
+pub(crate) fn overload_task_message(limit: usize, meta: &TaskMeta) -> String {
     format!(
         "Server active memory budget ({limit} bytes) is full while encoding the response; the operation ran (taskId: {}, logPath: {}). Do not retry start or resend input; poll taskId without input once in-flight transfers complete.",
         meta.bare_task_id, meta.log_path
@@ -68,11 +125,11 @@ pub(crate) fn overload_task_message(limit: usize, meta: &files::TaskMeta) -> Str
 /// Snapshot strings can coexist with warning/status formatting, cloned fields,
 /// the joined body and its growing suffix. Thirty-two times their source capacity,
 /// including per-member/diagnostic keys, bounds those copies and geometric capacities.
-pub(super) fn metadata_workspace_bytes(bytes: usize) -> usize {
+pub(crate) fn metadata_workspace_bytes(bytes: usize) -> usize {
     bytes.saturating_mul(32)
 }
 
-pub(super) fn resize_metadata_workspace(
+pub(crate) fn resize_metadata_workspace(
     workspace: &mut Lease,
     target: usize,
     launch: &LaunchContext,
@@ -100,7 +157,7 @@ pub(super) fn resize_metadata_workspace(
     Ok(())
 }
 
-pub(super) fn metadata_members(
+pub(crate) fn metadata_members(
     tree: &process::Tree,
     workspace: &mut Lease,
     launch: &LaunchContext,
@@ -147,8 +204,8 @@ pub(crate) struct PreparedSnapshot {
 }
 
 impl PreparedSnapshot {
-    pub(super) fn overload(launch: &LaunchContext, task: &Task) -> ServiceError {
-        let meta = files::TaskMeta {
+    pub(crate) fn overload(launch: &LaunchContext, task: &Task) -> ServiceError {
+        let meta = TaskMeta {
             bare_task_id: task.id.clone(),
             log_path: files::path::display_path(&task.log_path),
         };
@@ -158,7 +215,7 @@ impl PreparedSnapshot {
         )
     }
 
-    pub(super) fn new(
+    pub(crate) fn new(
         task: &Task,
         launch: &LaunchContext,
         action: Action,
@@ -192,7 +249,7 @@ impl PreparedSnapshot {
         })
     }
 
-    pub(super) fn refresh(
+    pub(crate) fn refresh(
         &mut self,
         task: &Task,
         launch: &LaunchContext,
@@ -229,13 +286,13 @@ pub(crate) struct StartedTaskSummary {
 }
 
 pub(crate) struct ScriptReport {
-    pub(crate) cancelled_calls: Vec<codemode::control::CallInfo>,
+    pub(crate) cancelled_calls: Vec<CallInfo>,
     pub(crate) started_tasks: Vec<StartedTaskSummary>,
     pub(crate) running: Vec<String>,
     pub(crate) _lease: Lease,
 }
 
-pub(super) fn script_report(
+pub(crate) fn script_report(
     tasks: &Tasks,
     task: &Task,
     launch: &LaunchContext,
@@ -244,7 +301,7 @@ pub(super) fn script_report(
     let Some(script) = task.script() else {
         return Ok(None);
     };
-    let codemode::control::ReportSnapshot {
+    let ReportSnapshot {
         cancelled,
         started: handles,
         _lease: lease,
@@ -254,7 +311,7 @@ pub(super) fn script_report(
             (action == Action::Kill).then_some(launch.control_memory()),
         )
         .ok_or_else(|| {
-            let meta = files::TaskMeta {
+            let meta = TaskMeta {
                 bare_task_id: task.id.clone(),
                 log_path: files::path::display_path(&task.log_path),
             };

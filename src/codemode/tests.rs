@@ -3,17 +3,20 @@ use super::bridge::{
     SLEEP_CHUNK_MS, STARTS_ERROR, SyncCallError, queue_permit, sleep, split_sleep,
 };
 use super::control::{
-    CallInfo, InFlightGuard, MAX_CODE, Outcome, Report, Request, Wake, lock, validate,
+    BridgeHandle, InFlightGuard, MAX_CODE, Outcome, ProgramDelivery, Report, Request, SettledCall,
+    lock, validate,
 };
-use super::encode::encode_service_error;
+use super::encode::{encode_exec_program, encode_service_error};
 use super::vm::{STALLED, describe, pending_text};
 use super::*;
+use crate::env::LaunchContext;
 use crate::id;
 use crate::lease::BytePool;
 use crate::service::Service;
-use crate::session::{LaunchContext, Session};
+use crate::tasks::script::{CallInfo, QueuedStartGuard, ScriptControl};
+use crate::tasks::session::Session;
 use crate::tasks::state::Task;
-use crate::tasks::{Limits, ScriptArgs, TASK_LOG_LIMIT, Tasks};
+use crate::tasks::{Limits, Started, TASK_LOG_LIMIT, Tasks};
 use base64::Engine;
 use rquickjs::{Context, Function, Runtime, Value};
 use serde_json::json;
@@ -56,27 +59,26 @@ impl Fixture {
         }
     }
 
-    fn start(&self, code: &str, deadline: Option<u64>) -> Arc<Task> {
-        self.tasks
-            .start_script(
-                ScriptArgs {
-                    code: code.into(),
-                    launch: Arc::clone(&self.session.launch),
-                    kill_after_ms: deadline,
-                    transfer: false,
-                    call_id: None,
-                    service: Arc::clone(&self.service),
-                    input_owner: Default::default(),
-                },
-                &self.session,
-                id::random_chars(4).unwrap(),
-            )
-            .unwrap()
-            .0
+    fn start(&self, code: &str, deadline: Option<u64>) -> (Started, BridgeHandle) {
+        spawn_script(
+            &self.tasks,
+            ScriptSpawnArgs {
+                code: code.into(),
+                launch: Arc::clone(&self.session.launch),
+                kill_after_ms: deadline,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&self.service),
+                input_owner: Default::default(),
+            },
+            &self.session,
+            id::random_chars(4).unwrap(),
+        )
+        .unwrap()
     }
 
     async fn result(&self, code: &str) -> (crate::tasks::state::Snapshot, String) {
-        let task = self.start(code, Some(5000));
+        let ((task, _, _), _) = self.start(code, Some(5000));
         complete(&task).await;
         (
             task.snapshot(),
@@ -164,7 +166,7 @@ async fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() 
                 .with_memory(Arc::clone(&pool))
                 .with_control_memory(BytePool::new(0)),
         );
-        let (script, worker) = prepare(Handle::current()).unwrap();
+        let (_control, script, worker) = prepare_worker().unwrap();
         drop(worker);
         lock(&script.0.report)
             .admit(
@@ -189,7 +191,7 @@ async fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() 
             on_started: None,
             input_owner: Default::default(),
         };
-        let delivery = crate::service::ProgramDelivery {
+        let delivery = ProgramDelivery {
             script: &script,
             pending_id: 1,
             is_control: false,
@@ -206,10 +208,10 @@ async fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() 
             continue;
         }
         let (sender, receiver) = mpsc::channel();
-        assert!(sender.send(Wake::Settled { id: 1, outcome }).is_ok());
+        assert!(sender.send(SettledCall { id: 1, outcome }).is_ok());
         drop(sender);
         assert_eq!(pool.used(), expected.len());
-        let Wake::Settled {
+        let SettledCall {
             outcome: Outcome::Value(payload),
             ..
         } = receiver.recv().unwrap()
@@ -245,7 +247,7 @@ async fn nested_control_wire_uses_bounded_reserve_and_keeps_queue_owner() {
                     .with_memory(Arc::clone(&pool))
                     .with_control_memory(Arc::clone(&control)),
             );
-            let (script, worker) = prepare(Handle::current()).unwrap();
+            let (_control, script, worker) = prepare_worker().unwrap();
             drop(worker);
             lock(&script.0.report)
                 .admit(
@@ -270,7 +272,7 @@ async fn nested_control_wire_uses_bounded_reserve_and_keeps_queue_owner() {
                 on_started: None,
                 input_owner: Default::default(),
             };
-            let delivery = crate::service::ProgramDelivery {
+            let delivery = ProgramDelivery {
                 script: &script,
                 pending_id: 1,
                 is_control: true,
@@ -287,11 +289,11 @@ async fn nested_control_wire_uses_bounded_reserve_and_keeps_queue_owner() {
                 continue;
             }
             let (sender, receiver) = mpsc::channel();
-            sender.send(Wake::Settled { id: 1, outcome }).unwrap();
+            sender.send(SettledCall { id: 1, outcome }).unwrap();
             drop(sender);
             assert_eq!(pool.used(), 0);
             assert_eq!(control.used(), expected.len());
-            let Wake::Settled {
+            let SettledCall {
                 outcome: Outcome::Value(value),
                 ..
             } = receiver.recv().unwrap()
@@ -376,7 +378,7 @@ async fn text_buffer_bridge_control_classification_preserves_main_admission() {
             .with_memory(Arc::clone(&memory))
             .with_control_memory(Arc::clone(&control)),
     );
-    let (script, worker) = prepare(Handle::current()).unwrap();
+    let (_control, script, worker) = prepare_worker().unwrap();
     let mut host = Host {
         service: Arc::clone(&fixture.service),
         session: Arc::clone(&fixture.session),
@@ -407,7 +409,7 @@ async fn text_buffer_bridge_control_classification_preserves_main_admission() {
     assert_eq!(control.used(), 0);
     unwrap_sync_ok(host.call("exec", r#"{"action":"kill","taskId":"aaaaaaaa-1"}"#));
     assert!(control.used() > 0);
-    script.kill();
+    script.control().stop();
     tokio::time::timeout(Duration::from_secs(5), async {
         while *lock(&script.0.in_flight.0) != 0 {
             tokio::task::yield_now().await;
@@ -438,20 +440,17 @@ async fn text_buffer_bridge_control_classification_preserves_main_admission() {
 
 #[tokio::test]
 async fn report_snapshot_reserves_spare_capacity_and_retains_its_owner() {
-    let (script, _worker) = prepare(Handle::current()).unwrap();
+    let script = ScriptControl::new(std::thread::current());
     let mut tool = String::with_capacity(128);
     tool.push_str("read");
     let mut handle = String::with_capacity(256);
     handle.push_str("task-1.abcd");
-    {
-        let mut report = lock(&script.0.report);
-        report.cancelled.push(CallInfo {
-            tool,
-            action: None,
-            task_id: None,
-        });
-        report.started.push(handle);
-    }
+    script.set_cancelled_calls(vec![CallInfo {
+        tool,
+        action: None,
+        task_id: None,
+    }]);
+    script.record_started(handle);
     let memory = BytePool::new(1024);
     let control = BytePool::new(4096);
     assert!(script.report(&memory, None).is_none());
@@ -462,7 +461,14 @@ async fn report_snapshot_reserves_spare_capacity_and_retains_its_owner() {
     assert_eq!(snapshot.started, ["task-1.abcd"]);
     script.record_started("task-2.abcd".into());
     assert_eq!(snapshot.started, ["task-1.abcd"]);
-    assert_eq!(lock(&script.0.report).started.len(), 2);
+    assert_eq!(
+        script
+            .report(crate::lease::process_pool(), None)
+            .unwrap()
+            .started
+            .len(),
+        2
+    );
     let retained = control.used();
     assert!(retained > 0);
     assert!(script.report(&memory, Some(&control)).is_none());
@@ -528,7 +534,7 @@ async fn queued_starts_keep_submission_order_when_workers_poll_in_reverse() {
 async fn start_history_limit_counts_admitted_calls_without_spawning_processes() {
     let fixture = Fixture::new();
     let runtime = Handle::current();
-    let (script, worker) = prepare(runtime.clone()).unwrap();
+    let (_control, script, worker) = prepare_worker().unwrap();
     drop(worker);
     let mut host = Host {
         service: Arc::clone(&fixture.service),
@@ -558,7 +564,7 @@ async fn start_history_limit_counts_admitted_calls_without_spawning_processes() 
     assert_eq!(lock(&script.0.report).pending.len(), 2);
     unwrap_sync_ok(host.call("read", &json!({"path":"missing"}).to_string()));
     assert_eq!(host.starts, MAX_STARTS);
-    script.kill();
+    script.control().stop();
     tokio::task::yield_now().await;
     assert!(fixture.tasks.all().is_empty());
 }
@@ -723,7 +729,7 @@ async fn diagnostic_workspace_stays_with_running_vm_until_final_output() {
                 .with_control_memory(Arc::clone(&control)),
         ),
     );
-    let task = fixture.start("await sleep(60000);", Some(5000));
+    let ((task, _, _), _) = fixture.start("await sleep(60000);", Some(5000));
     tokio::time::timeout(Duration::from_secs(2), async {
         while control.used() != DIAGNOSTIC_WORKSPACE {
             tokio::task::yield_now().await;
@@ -849,17 +855,15 @@ async fn bridge_survives_replaced_builtins() {
 #[tokio::test]
 async fn returning_cancels_calls_that_were_not_awaited() {
     let fixture = Fixture::new();
-    let task = fixture.start(
-        "for (let i=0;i<20;i++) tools.read({path:'missing'}); return 'done';",
-        None,
-    );
+    let ((task, _, _), _) =
+        fixture.start("for (let i=0;i<20;i++) sleep(60000); return 'done';", None);
     complete(&task).await;
     assert_eq!(task.snapshot().exit_code, Some(0));
     let script = task.script().unwrap();
-    assert!(script.0.cancel.is_cancelled());
+    assert!(script.cancel_token().is_cancelled());
     let report = script.report(crate::lease::process_pool(), None).unwrap();
     assert_eq!(report.cancelled.len(), 20);
-    assert!(report.cancelled.iter().all(|call| call.tool == "read"));
+    assert!(report.cancelled.iter().all(|call| call.tool == "sleep"));
     assert!(report.started.is_empty());
     assert_eq!(std::fs::read_to_string(&task.log_path).unwrap(), "done\n");
 }
@@ -867,11 +871,10 @@ async fn returning_cancels_calls_that_were_not_awaited() {
 #[tokio::test]
 async fn finishing_waits_for_a_slow_inflight_start_to_be_reported() {
     let fixture = Fixture::new();
-    let task = fixture.start("while (true) {}", None);
-    let script = task.script().unwrap().clone();
+    let ((task, _, _), bridge) = fixture.start("while (true) {}", None);
     // Hold an admitted start before its task is registered, past the old five-second drain.
-    let in_flight = InFlightGuard::enter(script.clone());
-    lock(&script.0.report)
+    let in_flight = InFlightGuard::enter(bridge.clone());
+    lock(&bridge.0.report)
         .admit(
             1,
             CallInfo {
@@ -889,7 +892,7 @@ async fn finishing_waits_for_a_slow_inflight_start_to_be_reported() {
             .await
             .is_err();
     let handle = "late-start.abcd".to_owned();
-    script.record_started(handle.clone());
+    bridge.control().record_started(handle.clone());
     drop(in_flight);
     complete(&task).await;
     assert!(
@@ -897,7 +900,8 @@ async fn finishing_waits_for_a_slow_inflight_start_to_be_reported() {
         "script finished before the admitted start registered"
     );
     assert_eq!(
-        script
+        bridge
+            .control()
             .report(crate::lease::process_pool(), None)
             .unwrap()
             .started,
@@ -914,7 +918,7 @@ async fn interrupts_bytecode_regex_and_job_loops() {
         "while(true) await null",
         "new RegExp('(a+)+$').test('a'.repeat(100000)+'b')",
     ] {
-        let task = fixture.start(code, None);
+        let ((task, _, _), _) = fixture.start(code, None);
         tokio::time::sleep(Duration::from_millis(30)).await;
         let start = Instant::now();
         task.kill().unwrap();
@@ -929,7 +933,7 @@ async fn interrupts_bytecode_regex_and_job_loops() {
         assert_eq!(state.exit_code, None);
         assert!(!state.expired);
     }
-    let task = fixture.start("while(true) {}", Some(100));
+    let ((task, _, _), _) = fixture.start("while(true) {}", Some(100));
     complete(&task).await;
     let state = task.snapshot();
     assert_eq!(state.state, "killed");
@@ -1024,8 +1028,8 @@ async fn inline_whitespace_copy_is_admitted_before_allocation() {
 #[tokio::test]
 async fn nested_attachment_registry_reuses_handles_and_rolls_back_owners() {
     let fixture = Fixture::new();
-    let producer = fixture.start("return 'source';", Some(5000));
-    let other = fixture.start("return 'other source';", Some(5000));
+    let ((producer, _, _), _) = fixture.start("return 'source';", Some(5000));
+    let ((other, _, _), _) = fixture.start("return 'other source';", Some(5000));
     complete(&producer).await;
     complete(&other).await;
     let mut png = Vec::new();
@@ -1043,7 +1047,7 @@ async fn nested_attachment_registry_reuses_handles_and_rolls_back_owners() {
     assert_eq!(attachments[0].meta().index, attachments[3].meta().index);
 
     let pool = BytePool::new(64 * 1024);
-    let (script, worker) = prepare(Handle::current()).unwrap();
+    let (_control, script, worker) = prepare_worker().unwrap();
     drop(worker);
     {
         let mut batch = script.nested_attachments(&pool, None);
@@ -1161,7 +1165,7 @@ async fn nested_attachment_registry_reuses_handles_and_rolls_back_owners() {
 
     let primary = BytePool::new(attachments[0].metadata_bytes());
     let control = BytePool::new(64 * 1024);
-    let (fallback, worker) = prepare(Handle::current()).unwrap();
+    let (_control, fallback, worker) = prepare_worker().unwrap();
     drop(worker);
     for commit in [false, true] {
         {
@@ -1253,7 +1257,7 @@ async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() 
         mp4_len = mp4_bytes.len(),
         webm_len = webm_bytes.len(),
     );
-    let r4_task = fixture.start(&r4_code, Some(5000));
+    let ((r4_task, _, _), _) = fixture.start(&r4_code, Some(5000));
     complete(&r4_task).await;
     let r4_out = std::fs::read_to_string(&r4_task.log_path).unwrap();
     assert_eq!(r4_task.snapshot().exit_code, Some(0), "{r4_out}");
@@ -1275,7 +1279,7 @@ async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() 
     //    unforgeable against clones/spoofed `__hid`, and `AttachmentLease` pins source files across
     //    source-task eviction until the consumer script exits or is cancelled!
     for action in ["poll", "kill"] {
-        let producer = fixture.start(
+        let ((producer, _, _), _) = fixture.start(
             &format!("attach('data:image/png;base64,{png_b64}'); attach('clip.mp4');"),
             Some(5000),
         );
@@ -1283,7 +1287,7 @@ async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() 
         let src_att1 = producer.attachment_path(1, "image/png");
         assert!(src_att1.is_file());
 
-        let consumer = fixture.start(
+        let ((consumer, _, _), consumer_bridge) = fixture.start(
             &format!(
                 r#"
                 const r = await tools.exec({{action: {action:?}, taskId: {pid:?}}});
@@ -1346,7 +1350,7 @@ async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() 
         );
 
         assert_eq!(
-            consumer.script().unwrap().test_attachment_count(),
+            consumer_bridge.test_attachment_count(),
             2,
             "fresh readers reuse the same two source attachment slots"
         );
@@ -1415,9 +1419,9 @@ async fn attach_covers_r4_4_inline_and_paths_opaque_handles_and_lease_cleanup() 
         big_png.resize(512, 0);
         big_png
     });
-    let (tight_task, _, _) = tight_tasks
-        .start_script(
-            ScriptArgs {
+    let ((tight_task, _, _), _) = spawn_script(
+        &tight_tasks,
+        ScriptSpawnArgs {
                 code: format!(
                     r#"
                     let quotaRejected = false;
@@ -1844,7 +1848,7 @@ async fn sh_quote_image_notes_queue_cap_and_integrity_tool_errors() {
     // End-to-end JS ToolError on injected captureError and logError: non-empty message
     // built from diagnostics and full report (output, exitCode, diagnostic) in err.result,
     // plus the 1025th pending call rejecting with ToolError(LIMIT).
-    let seeded = fixture.start("text('partial-out'); throw new Error('boom');", None);
+    let ((seeded, _, _), _) = fixture.start("text('partial-out'); throw new Error('boom');", None);
     complete(&seeded).await;
     seeded.inject_io_errors(Some("pty pipe lost"), Some("disk full"));
     let seeded_id = seeded.id.clone();
@@ -2040,7 +2044,7 @@ async fn first_line_stack_columns_match_later_lines_and_keep_custom_stacks() {
 #[tokio::test]
 async fn sleep_primitive_race_kill_and_validation() {
     let fixture = Fixture::new();
-    let child_script = fixture.start("await sleep(10000);", None);
+    let ((child_script, _, _), _) = fixture.start("await sleep(10000);", None);
     let child_id = child_script.id.clone();
     let start_t = Instant::now();
     let (st, out) = fixture
@@ -2067,15 +2071,12 @@ async fn sleep_primitive_race_kill_and_validation() {
     child_script.kill().unwrap();
     complete(&child_script).await;
 
-    let sleeping = fixture.start(
+    let ((sleeping, _, _), sleeping_bridge) = fixture.start(
         "const p = sleep(Number.MAX_VALUE); text('ready'); await p;",
         None,
     );
     let wait_deadline = Instant::now() + Duration::from_secs(10);
-    while lock(&sleeping.script().unwrap().0.report)
-        .pending
-        .is_empty()
-    {
+    while lock(&sleeping_bridge.0.report).pending.is_empty() {
         assert!(
             Instant::now() < wait_deadline,
             "sleeping script did not admit sleep(Number.MAX_VALUE) in time"
@@ -2104,8 +2105,8 @@ async fn passive_waits_and_control_calls_need_no_start_or_io_permits() {
     // Start 2 background script tasks (using 2 of Limits::OFF's 4 script slots) so the
     // orchestrator script (slot 3) can hold 8 passive polls across distinct readers,
     // read files, list, and kill without starvation.
-    let bg1 = fixture.start("text('ready'); await sleep(60000);", None);
-    let bg2 = fixture.start("await sleep(60000);", None);
+    let ((bg1, _, _), _) = fixture.start("text('ready'); await sleep(60000);", None);
+    let ((bg2, _, _), _) = fixture.start("await sleep(60000);", None);
     let id1 = bg1.id.clone();
     let id2 = bg2.id.clone();
 
@@ -2351,7 +2352,7 @@ async fn sh_template_join_quote_contract_and_prototype_pollution_immunity() {
 async fn queued_start_guard_tracks_queued_disarmed_and_cancelled_starts() {
     let fixture = Fixture::new();
     let runtime = Handle::current();
-    let (script, worker) = prepare(runtime.clone()).unwrap();
+    let (_control, script, worker) = prepare_worker().unwrap();
     drop(worker);
     let mut host = Host {
         service: Arc::clone(&fixture.service),
@@ -2378,35 +2379,35 @@ async fn queued_start_guard_tracks_queued_disarmed_and_cancelled_starts() {
     unwrap_sync_ok(host.call("exec", &json!({"action":"start","command":""}).to_string()));
     unwrap_sync_ok(host.call("read", &json!({"path":"missing"}).to_string()));
     assert_eq!(host.starts, 3);
-    assert_eq!(script.list_counts(), (3, 0));
+    assert_eq!(script.control().list_counts(), (3, 0));
 
-    script.kill();
+    script.control().stop();
     tokio::task::spawn_blocking(move || {
         script.cancel_and_drain();
-        assert_eq!(script.list_counts(), (0, 3));
+        assert_eq!(script.control().list_counts(), (0, 3));
     })
     .await
     .unwrap();
     assert!(fixture.tasks.all().is_empty());
 
     // Disarming a guard before drop leaves cancelled_starts at 0 even if the script is killed later.
-    let (disarm_script, disarm_worker) = prepare(runtime.clone()).unwrap();
+    let (_control, disarm_script, disarm_worker) = prepare_worker().unwrap();
     drop(disarm_worker);
-    let mut guard = super::control::QueuedStartGuard::new(&disarm_script);
-    assert_eq!(disarm_script.list_counts(), (1, 0));
+    let mut guard = QueuedStartGuard::new(disarm_script.control_arc());
+    assert_eq!(disarm_script.control().list_counts(), (1, 0));
     guard.disarm();
-    assert_eq!(disarm_script.list_counts(), (0, 0));
-    disarm_script.kill();
+    assert_eq!(disarm_script.control().list_counts(), (0, 0));
+    disarm_script.control().stop();
     drop(guard);
-    assert_eq!(disarm_script.list_counts(), (0, 0));
+    assert_eq!(disarm_script.control().list_counts(), (0, 0));
 
     // Dropping an armed guard without cancellation (e.g. spawn error) decrements queued_starts only.
-    let (err_script, err_worker) = prepare(runtime).unwrap();
+    let (_control, err_script, err_worker) = prepare_worker().unwrap();
     drop(err_worker);
-    let err_guard = super::control::QueuedStartGuard::new(&err_script);
-    assert_eq!(err_script.list_counts(), (1, 0));
+    let err_guard = QueuedStartGuard::new(err_script.control_arc());
+    assert_eq!(err_script.control().list_counts(), (1, 0));
     drop(err_guard);
-    assert_eq!(err_script.list_counts(), (0, 0));
+    assert_eq!(err_script.control().list_counts(), (0, 0));
 }
 
 #[tokio::test]
@@ -2449,7 +2450,7 @@ async fn program_tool_error_codes_partial_results_and_edit_matches() {
 
     // Create a finished task with injected I/O errors so polling it via tools.exec triggers IO
     // while retaining output and exitCode on err.result.
-    let io_task = fixture.start(
+    let ((io_task, _, _), _) = fixture.start(
         "text('retained-output'); throw new Error('boom');",
         Some(5000),
     );
@@ -2541,7 +2542,7 @@ async fn program_tool_error_codes_partial_results_and_edit_matches() {
     assert_eq!(out, "all-codes-ok\n");
 
     // 7. OVERLOAD & CANCELLED via encode_service_error
-    let (handle, worker) = prepare(Handle::current()).unwrap();
+    let (_control, handle, worker) = prepare_worker().unwrap();
     drop(worker);
     let ctx = crate::service::ExecContext {
         session: &fixture.session,
@@ -2554,54 +2555,1663 @@ async fn program_tool_error_codes_partial_results_and_edit_matches() {
         on_started: None,
         input_owner: Default::default(),
     };
-    for (id, err, want_code, want_tid) in [
-        (
-            1u64,
-            crate::service::ServiceError::Overload(
-                "memory full".into(),
-                Some(crate::files::TaskMeta {
-                    bare_task_id: "aaaaaaaa-1".into(),
-                    log_path: "/tmp/a.log".into(),
-                }),
-            ),
-            "OVERLOAD",
-            Some("aaaaaaaa-1"),
+    lock(&handle.0.report)
+        .admit(
+            1,
+            CallInfo {
+                tool: "exec".into(),
+                action: None,
+                task_id: None,
+            },
+            0,
+            Default::default(),
+        )
+        .unwrap();
+    let overload = encode_service_error(
+        crate::service::ServiceError::Overload(
+            "memory full".into(),
+            Some(crate::service::TaskMeta {
+                bare_task_id: "aaaaaaaa-1".into(),
+                log_path: "/tmp/a.log".into(),
+            }),
         ),
-        (
-            2u64,
-            crate::service::ServiceError::Cancelled("cancelled".into()),
-            "CANCELLED",
-            None,
-        ),
-    ] {
-        lock(&handle.0.report)
-            .admit(
-                id,
-                CallInfo {
-                    tool: "exec".into(),
-                    action: None,
-                    task_id: None,
-                },
-                0,
-                Default::default(),
+        &ctx,
+        &ProgramDelivery {
+            script: &handle,
+            pending_id: 1,
+            is_control: false,
+        },
+    );
+    assert!(overload.pre_reserved);
+    let Outcome::Value(payload) = overload.outcome else {
+        panic!("expected encoded error envelope");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&payload.value).unwrap();
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["code"], "OVERLOAD");
+    assert_eq!(parsed["result"]["taskId"].as_str(), Some("aaaaaaaa-1"));
+
+    let cancelled = encode_service_error(
+        crate::service::ServiceError::Cancelled("cancelled".into()),
+        &ctx,
+        &ProgramDelivery {
+            script: &handle,
+            pending_id: 2,
+            is_control: false,
+        },
+    );
+    assert!(!cancelled.pre_reserved);
+    assert!(
+        matches!(&cancelled.outcome, Outcome::Cancelled(msg) if msg == "cancelled"),
+        "expected Outcome::Cancelled"
+    );
+    let read_cancelled = super::encode::encode_read_program(
+        Err(crate::files::FileError::Cancelled("read cancelled".into())),
+        &fixture.session.launch,
+        &ProgramDelivery {
+            script: &handle,
+            pending_id: 3,
+            is_control: false,
+        },
+        &ctx.cancel,
+    );
+    assert!(!read_cancelled.pre_reserved);
+    assert!(
+        matches!(&read_cancelled.outcome, Outcome::Cancelled(msg) if msg == "read cancelled"),
+        "expected Outcome::Cancelled for FileError::Cancelled"
+    );
+}
+
+mod exec_program_tests {
+    use super::*;
+    use crate::files;
+    use crate::render::types::{AgentDelivery, TrackedResult};
+    use crate::service::core::PreparedSnapshot;
+    use crate::service::schema::{Action, ExecPolicy, Request, View};
+    use crate::service::{Consumer, ExecContext, PreparedExec, PreparedTranscript, StagedRead};
+    use crate::tasks;
+    use crate::tasks::session::TaskEntry;
+    use crate::term::output::{Truncate, WindowBuilder, WindowSpec};
+    use rmcp::model::CallToolResult;
+    use serde_json::Value;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Wake as TaskWake, Waker};
+    use tokio_util::sync::CancellationToken;
+
+    struct ReadWake {
+        memory: Arc<BytePool>,
+        slots: Arc<Semaphore>,
+        used: AtomicUsize,
+        permits: AtomicUsize,
+        woken: AtomicBool,
+    }
+
+    impl TaskWake for ReadWake {
+        fn wake(self: Arc<Self>) {
+            self.used.store(self.memory.used(), Ordering::Relaxed);
+            self.permits
+                .store(self.slots.available_permits(), Ordering::Relaxed);
+            self.woken.store(true, Ordering::Release);
+        }
+    }
+
+    fn script_fixture() -> (Arc<Service>, Arc<Tasks>, Arc<Session>) {
+        let tasks = Tasks::new(Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let launch = Arc::new(LaunchContext::new(std::env::temp_dir(), Vec::new()));
+        let session = Session::new("script-test".into(), "script-test".into(), launch);
+        (service, tasks, session)
+    }
+
+    fn script_ctx(session: &Arc<Session>) -> ExecContext<'_> {
+        ExecContext {
+            session,
+            launch: None,
+            cancel: CancellationToken::new(),
+            progress: None,
+            call_id: None,
+            parent_task_id: None,
+            queued_guard: None,
+            on_started: None,
+            input_owner: Default::default(),
+        }
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|b| b.as_text().map(|t| t.text.clone()))
+            .collect()
+    }
+
+    fn pixel_url() -> String {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
             )
             .unwrap();
-        let outcome = encode_service_error(
-            err,
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    }
+
+    async fn eval_script_agent(
+        service: &Arc<Service>,
+        request: super::Request,
+        mut ctx: ExecContext<'_>,
+        delivery: AgentDelivery<'_>,
+    ) -> TrackedResult {
+        let slot = delivery.daemon_ipc.as_ref().map(|d| d.slot);
+        let prepared = prepare_script(service, request, &mut ctx, slot, false).await;
+        crate::render::finish_exec_agent(service, prepared, &ctx, &delivery).await
+    }
+
+    async fn list_fixture() -> (Arc<Service>, Arc<Tasks>, Arc<Session>, Arc<TaskEntry>) {
+        let (service, tasks, session) = script_fixture();
+        let ((task, entry, _), _) = spawn_script(
+            &tasks,
+            ScriptSpawnArgs {
+                code: "return undefined;".into(),
+                launch: Arc::clone(&session.launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "abcd".into(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!entry.is_reported());
+        (service, tasks, session, entry)
+    }
+
+    #[tokio::test]
+    async fn program_result_shrinks_workspace_before_waking_the_next_reader() {
+        let (service, tasks, session, entry) = list_fixture().await;
+        let task = tasks.all().pop().unwrap();
+        let reader = entry.reader(Some("next")).unwrap();
+        let memory = crate::lease::BytePool::new(2 << 20);
+        let launch = Arc::new(
+            session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&memory)),
+        );
+        let mut ctx = script_ctx(&session);
+        ctx.launch = Some(&launch);
+        let request = serde_json::from_value(json!({
+            "action": "poll", "taskId": reader.handle(&task.id), "waitMs": 0, "maxBytes": 100
+        }))
+        .unwrap();
+        let PreparedExec::Window(mut prepared) = service
+            .exec_core(
+                request,
+                ExecPolicy::PROGRAM,
+                Consumer::Program,
+                &mut ctx,
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a window");
+        };
+        let slots = Arc::new(Semaphore::new(1));
+        prepared.permit = Some(Arc::new(Arc::clone(&slots).try_acquire_owned().unwrap()));
+        let observed = Arc::new(ReadWake {
+            memory: Arc::clone(&memory),
+            slots,
+            used: AtomicUsize::new(usize::MAX),
+            permits: AtomicUsize::new(usize::MAX),
+            woken: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&observed));
+        let mut next_read = Box::pin(reader.read_gate().lock_owned());
+        assert!(
+            next_read
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let (_control, script, worker) = prepare_worker().unwrap();
+        script.test_pending_result(1, 0, 16 << 10);
+        let encoded = encode_exec_program(
+            PreparedExec::Window(prepared),
             &ctx,
-            &crate::service::ProgramDelivery {
-                script: &handle,
-                pending_id: id,
+            &ProgramDelivery {
+                script: &script,
+                pending_id: 1,
+                is_control: false,
+            },
+        );
+        let Outcome::Value(payload) = encoded.outcome else {
+            panic!("expected a Program result");
+        };
+        assert!(observed.woken.load(Ordering::Acquire));
+        assert_eq!(
+            observed.used.load(Ordering::Relaxed),
+            payload.value.capacity()
+        );
+        assert_eq!(observed.permits.load(Ordering::Relaxed), 1);
+        drop(next_read.await);
+        drop(payload);
+        assert_eq!(memory.used(), 0);
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nested_precommit_list_quota_refusal_and_cancel_leave_reported_state_due() {
+        let (service, tasks, session, entry) = list_fixture().await;
+        let task = tasks.all().pop().unwrap();
+        let (_control, script, worker) = prepare_worker().unwrap();
+        script.control().record_started(format!("{}.abcd", task.id));
+        script.test_pending_result(1, 8, 64);
+        let make_ctx = || {
+            let mut ctx = script_ctx(&session);
+            ctx.parent_task_id = Some("aaaaaaaa-0".into());
+            ctx.on_started = Some(script.control());
+            ctx
+        };
+        let make_delivery = || ProgramDelivery {
+            script: &script,
+            pending_id: 1,
+            is_control: true,
+        };
+        let list_req = || -> Request { serde_json::from_value(json!({"action":"list"})).unwrap() };
+        let refused = exec_program(&service, list_req(), make_ctx(), make_delivery()).await;
+        assert!(matches!(refused.outcome, Outcome::Limit));
+        assert!(!entry.is_reported());
+        assert_eq!(script.test_bridge_bytes(), 8);
+        drop(refused);
+        script.test_bridge_limit(16 * 1024);
+        let cancelled = make_ctx();
+        cancelled.cancel.cancel();
+        let refused = exec_program(&service, list_req(), cancelled, make_delivery()).await;
+        assert!(matches!(refused.outcome, Outcome::Cancelled(_)));
+        assert!(!entry.is_reported());
+        let delivered = exec_program(&service, list_req(), make_ctx(), make_delivery()).await;
+        let Outcome::Value(payload) = delivered.outcome else {
+            panic!("expected Value outcome");
+        };
+        assert!(entry.is_reported());
+        assert_eq!(script.test_bridge_bytes(), payload.value.len());
+        drop(payload);
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nested_precommit_reader_and_attachment_watermarks_survive_refusal_and_cancel() {
+        let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let pool = crate::lease::BytePool::new(2 << 20);
+        let launch = Arc::new(
+            crate::env::LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(Arc::clone(&pool)),
+        );
+        let session = Session::new(
+            "nested-commit".into(),
+            "nested-commit".into(),
+            Arc::clone(&launch),
+        );
+        let ((task, entry, _), _) = spawn_script(
+            &tasks,
+            ScriptSpawnArgs {
+                code: format!("text('hello'); attach({});", json!(pixel_url())),
+                launch,
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "abcd".into(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+        let reader = entry.reader(Some("9999")).unwrap();
+        let handle = format!("{}.9999", task.id);
+        let (_control, script, worker) = prepare_worker().unwrap();
+        script.control().record_started(handle.clone());
+        script.test_pending_result(1, 8, 64);
+        let make_ctx = || {
+            let mut ctx = script_ctx(&session);
+            ctx.parent_task_id = Some("aaaaaaaa-0".into());
+            ctx.on_started = Some(script.control());
+            ctx
+        };
+        let make_delivery = || ProgramDelivery {
+            script: &script,
+            pending_id: 1,
+            is_control: false,
+        };
+        let make_req = || -> Request {
+            serde_json::from_value(
+                json!({"action":"poll", "taskId":handle, "waitMs":0, "maxBytes":100}),
+            )
+            .unwrap()
+        };
+        let refused = exec_program(&service, make_req(), make_ctx(), make_delivery()).await;
+        assert!(matches!(refused.outcome, Outcome::Limit));
+        assert_eq!(script.test_bridge_bytes(), 8);
+        assert_eq!(script.test_attachment_count(), 0);
+        let report = script.control().report(&pool, None).unwrap();
+        assert!(
+            report.started.contains(&handle),
+            "started task is recoverable from the outer report"
+        );
+        drop(report);
+        {
+            let state = reader.read_gate().lock_owned().await;
+            assert_eq!((state.cursor, state.attachments_seen), (0, 0));
+            assert!(reader.is_fresh());
+        }
+        assert!(!entry.is_reported());
+        drop(refused);
+        assert_eq!(pool.used(), 0);
+        script.test_bridge_limit(16 * 1024);
+        let cancelled = make_ctx();
+        cancelled.cancel.cancel();
+        let refused = exec_program(&service, make_req(), cancelled, make_delivery()).await;
+        assert!(matches!(refused.outcome, Outcome::Cancelled(_)));
+        assert_eq!(script.test_attachment_count(), 0);
+        assert!(reader.is_fresh());
+        let delivered = exec_program(&service, make_req(), make_ctx(), make_delivery()).await;
+        let Outcome::Value(payload) = delivered.outcome else {
+            panic!("expected Value outcome");
+        };
+        assert_eq!(script.test_bridge_bytes(), payload.value.len());
+        assert_eq!(script.test_attachment_count(), 1);
+        let parsed: Value = serde_json::from_str(&payload.value).unwrap();
+        let attachment = &parsed["value"]["codemode"]["attachments"][0];
+        assert_eq!(
+            attachment["__hid"].as_u64(),
+            Some(1),
+            "a refused batch leaves its undelivered slot available"
+        );
+        {
+            let state = reader.read_gate().lock_owned().await;
+            assert!(state.cursor > 0);
+            assert_eq!(state.attachments_seen, 1);
+            assert!(!reader.is_fresh());
+        }
+        assert!(entry.is_reported());
+        drop(payload);
+        assert_eq!(pool.used(), script.test_attachment_bytes());
+        assert!(pool.used() > 0, "the script retains its attachment handle");
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nested_task_reads_consume_reader_state_without_consuming_session_notices() {
+        let (service, tasks, session) = script_fixture();
+        let ((task, entry, reader), _) = spawn_script(
+            &tasks,
+            ScriptSpawnArgs {
+                code: "return 7".into(),
+                launch: Arc::clone(&session.launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "r001".into(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = reader.handle(&task.id);
+        // An unrelated nested script polling/killing an outer session task must NOT mark the outer
+        // session's TaskEntry reported or advance EventBus external_background_cursor.
+        service
+            .event_bus()
+            .publish_external(crate::events::ExternalEventInput {
+                event_type: None,
+                source: "src".into(),
+                topic: None,
+                name: "evt".into(),
+                event_id: "nested-cursor-test".into(),
+                timestamp: None,
+                data: json!({}),
+            })
+            .unwrap();
+        let (_control, script, worker) = prepare_worker().unwrap();
+        script.test_pending_result(1, 0, 16 * 1024);
+        let mut ctx = script_ctx(&session);
+        ctx.on_started = Some(script.control());
+        let poll_req: Request =
+            serde_json::from_value(json!({"action":"poll","taskId":handle,"waitMs":0})).unwrap();
+        let poll_out = exec_program(
+            &service,
+            poll_req,
+            ctx,
+            ProgramDelivery {
+                script: &script,
+                pending_id: 1,
+                is_control: false,
+            },
+        )
+        .await;
+        assert!(matches!(poll_out.outcome, Outcome::Value(_)));
+        assert!(reader.is_reported());
+        assert!(!entry.is_reported());
+
+        script.test_pending_result(2, 0, 16 * 1024);
+        let mut ctx = script_ctx(&session);
+        ctx.on_started = Some(script.control());
+        let kill_req: Request =
+            serde_json::from_value(json!({"action":"kill","taskId":handle})).unwrap();
+        let kill_out = exec_program(
+            &service,
+            kill_req,
+            ctx,
+            ProgramDelivery {
+                script: &script,
+                pending_id: 2,
+                is_control: true,
+            },
+        )
+        .await;
+        assert!(matches!(kill_out.outcome, Outcome::Value(_)));
+        assert!(!entry.is_reported());
+        assert!(
+            tasks
+                .background(
+                    &session,
+                    "another-task",
+                    512,
+                    &mut |_| Ok(()),
+                    &mut |_| panic!("script has no native members")
+                )
+                .unwrap()
+                .0
+                .is_some()
+        );
+        // An outer Agent call still sees both the unreported task AND the external event!
+        let outer = eval_script_agent(
+            &service,
+            serde_json::from_value(json!({"code":"return 8"})).unwrap(),
+            script_ctx(&session),
+            AgentDelivery::default(),
+        )
+        .await
+        .result;
+        let outer_text = text_of(&outer);
+        assert!(outer_text.contains(&task.id), "{outer_text}");
+        assert!(
+            outer_text.contains("External events: 1 new"),
+            "{outer_text}"
+        );
+        assert!(entry.is_reported());
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nested_list_marks_only_delivered_session_tasks() {
+        let (service, tasks, session) = script_fixture();
+        let mut started = Vec::new();
+        for (idx, code) in ["return 7", "return 8", "return 9"].into_iter().enumerate() {
+            let ((task, entry, reader), _) = spawn_script(
+                &tasks,
+                ScriptSpawnArgs {
+                    code: code.into(),
+                    launch: Arc::clone(&session.launch),
+                    kill_after_ms: None,
+                    transfer: false,
+                    call_id: None,
+                    service: Arc::clone(&service),
+                    input_owner: Default::default(),
+                },
+                &session,
+                format!("r00{idx}"),
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+                .await
+                .unwrap()
+                .unwrap();
+            started.push((task, entry, reader));
+        }
+        let (_control, script, worker) = prepare_worker().unwrap();
+        // Script owns l000 (omitted by limit: 2) and l002 (delivered), but not l001 (outer task).
+        script
+            .control()
+            .record_started(started[0].2.handle(&started[0].0.id));
+        script
+            .control()
+            .record_started(started[2].2.handle(&started[2].0.id));
+        script.test_pending_result(1, 0, 16 * 1024);
+        let mut ctx = script_ctx(&session);
+        ctx.on_started = Some(script.control());
+        let req: Request = serde_json::from_value(json!({"action":"list","limit":2})).unwrap();
+        let listed = exec_program(
+            &service,
+            req,
+            ctx,
+            ProgramDelivery {
+                script: &script,
+                pending_id: 1,
+                is_control: true,
+            },
+        )
+        .await;
+        let Outcome::Value(payload) = listed.outcome else {
+            panic!("expected Value");
+        };
+        let parsed: Value = serde_json::from_str(&payload.value).unwrap();
+        assert_eq!(parsed["value"]["tasks"].as_array().unwrap().len(), 2);
+        assert!(
+            !started[0].1.is_reported(),
+            "an unselected script-owned task stays due"
+        );
+        assert!(
+            !started[1].1.is_reported(),
+            "an outer-session task stays due even when delivered in nested list"
+        );
+        assert!(
+            started[2].1.is_reported(),
+            "a delivered script-owned task is reported"
+        );
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn list_warnings_follow_the_delivered_rows_for_direct_and_nested_calls() {
+        let (service, tasks, session, warned_entry) = list_fixture().await;
+        let warned = tasks.all().pop().unwrap();
+        warned.inject_io_errors(Some("omitted-row-warning"), None);
+        let ((newest, _, _), _) = spawn_script(
+            &tasks,
+            ScriptSpawnArgs {
+                code: "return undefined;".into(),
+                launch: Arc::clone(&session.launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "next".into(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), newest.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let request = json!({"action":"list", "truncate":"head", "maxBytes":100});
+        let direct = crate::render::exec_agent_json(
+            &service,
+            request.clone(),
+            script_ctx(&session),
+            AgentDelivery::default(),
+        )
+        .await
+        .result;
+        assert!(direct.structured_content.is_none());
+        let text = direct.content[0].as_text().unwrap().text.as_str();
+        assert!(!text.contains(&warned.id), "{text}");
+        assert!(!text.contains("Warning:"), "{text}");
+        assert!(!warned_entry.is_reported());
+
+        let (_control, script, worker) = prepare_worker().unwrap();
+        script.test_pending_result(1, 0, 16 * 1024);
+        let bad_req: Request = serde_json::from_value(request).unwrap();
+        let bad_nested = exec_program(
+            &service,
+            bad_req,
+            script_ctx(&session),
+            ProgramDelivery {
+                script: &script,
+                pending_id: 1,
+                is_control: true,
+            },
+        )
+        .await;
+        let Outcome::Value(bad_payload) = bad_nested.outcome else {
+            panic!("expected validation error envelope");
+        };
+        let bad_json: Value = serde_json::from_str(&bad_payload.value).unwrap();
+        assert_eq!(bad_json["ok"], false);
+        assert_eq!(bad_json["code"], "VALIDATION");
+        assert!(!warned_entry.is_reported());
+
+        script.test_pending_result(2, 0, 16 * 1024);
+        let plain_req: Request = serde_json::from_value(json!({"action":"list"})).unwrap();
+        let nested = exec_program(
+            &service,
+            plain_req,
+            script_ctx(&session),
+            ProgramDelivery {
+                script: &script,
+                pending_id: 2,
+                is_control: true,
+            },
+        )
+        .await;
+        let Outcome::Value(payload) = nested.outcome else {
+            panic!("expected Value");
+        };
+        let data: Value = serde_json::from_str(&payload.value).unwrap();
+        assert!(data["value"].get("warnings").is_none(), "{data}");
+        assert!(
+            data["value"]["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|task| task["taskId"] == warned.id
+                    && task["warnings"].as_array().is_some_and(|w| w
+                        .iter()
+                        .any(|s| s.as_str().unwrap().contains("omitted-row-warning")))),
+            "{data}"
+        );
+        assert!(
+            !warned_entry.is_reported(),
+            "nested list must not mark an outer-session task reported"
+        );
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn program_transcript_dto_emits_raw_output_and_all_fields() {
+        let (_service, tasks, session, entry) = list_fixture().await;
+        let task = tasks.all().pop().unwrap();
+        let reader = entry.reader(Some("tr01")).unwrap();
+        let gate = reader.read_gate().lock_owned().await;
+        let mut read = StagedRead::new(gate);
+        read.state.shown = (128, 12);
+
+        let mut cleaner = crate::term::output::Cleaner::default();
+        let mut builder = WindowBuilder::new(
+            WindowSpec {
+                truncate: Truncate::Tail,
+                budget: 16,
+                raw: false,
+                clean: false,
+                keep_nul: true,
+                include_markers: false,
+                encoding: encoding_rs::UTF_8,
+                source: "transcript",
+            },
+            &mut cleaner,
+            1,
+        );
+        builder.push(b"line-1\nline-2\nline-3\n");
+        let window = builder.finish();
+        assert!(!window.text.contains("omitted"), "{}", window.text);
+
+        let metadata = PreparedSnapshot::new(&task, &session.launch, Action::Transcript).unwrap();
+        let prepared = PreparedExec::Transcript(Box::new(PreparedTranscript {
+            workspace: crate::lease::Lease::empty(session.launch.memory()),
+            permit: None,
+            metadata,
+            window,
+            transcript_path: "/tmp/test.transcript".into(),
+            transcript_lines: 12,
+            final_lines: 10,
+            first_line: 1,
+            transcript_incomplete: true,
+            transcript_error: Some("spool truncated".into()),
+            transcript_warnings: vec!["transcript incomplete".into()],
+            task: Arc::clone(&task),
+            entry: Arc::clone(&entry),
+            reader: Arc::clone(&reader),
+            view: View {
+                truncate: Truncate::Tail,
+                max_bytes: 16,
+                raw: false,
+                encoding: None,
+                screen: false,
+                conditions: false,
+                inline_markers: false,
+                keep_nul: true,
+            },
+            mark_session_entry: false,
+            read,
+        }));
+
+        let (_control, script, worker) = prepare_worker().unwrap();
+        script.test_pending_result(1, 0, 16 * 1024);
+        let outcome = encode_exec_program(
+            prepared,
+            &script_ctx(&session),
+            &ProgramDelivery {
+                script: &script,
+                pending_id: 1,
                 is_control: false,
             },
         )
         .outcome;
         let Outcome::Value(payload) = outcome else {
-            panic!("expected encoded error envelope");
+            panic!("expected encoded transcript value");
         };
-        let parsed: serde_json::Value = serde_json::from_str(&payload.value).unwrap();
-        assert_eq!(parsed["ok"], false);
-        assert_eq!(parsed["code"], want_code);
-        assert_eq!(parsed["result"]["taskId"].as_str(), want_tid);
+        let parsed: Value = serde_json::from_str(&payload.value).unwrap();
+        assert_eq!(parsed["ok"], true);
+        let v = &parsed["value"];
+        assert_eq!(v["action"], "transcript");
+        assert_eq!(v["taskId"], reader.handle(&task.id));
+        assert_eq!(v["transcriptPath"], "/tmp/test.transcript");
+        assert_eq!(v["transcriptLines"], 12);
+        assert_eq!(v["finalLines"], 10);
+        assert_eq!(v["firstLine"], 1);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["transcriptIncomplete"], true);
+        assert_eq!(v["transcriptError"], "spool truncated");
+        assert!(v["omittedLines"].as_u64().unwrap() >= 1);
+        assert!(v["omittedRange"].is_array());
+        assert!(!v["output"].as_str().unwrap().contains("omitted"));
+        drop(payload);
+        drop(worker);
+        tasks.shutdown();
     }
+
+    #[tokio::test]
+    async fn program_bridge_admission_rollback_and_control_memory_fallback() {
+        let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
+        let service = Arc::new(Service::new(Arc::clone(&tasks), false));
+        let main_pool = crate::lease::BytePool::new(2 << 20);
+        let control_pool = crate::lease::BytePool::new(2 << 20);
+        let launch = Arc::new(
+            crate::env::LaunchContext::new(std::env::temp_dir(), Vec::new())
+                .with_memory(Arc::clone(&main_pool))
+                .with_control_memory(Arc::clone(&control_pool)),
+        );
+        let session = Session::new("rb-ctrl".into(), "rb-ctrl".into(), Arc::clone(&launch));
+        let ((task, entry, _), _) = spawn_script(
+            &tasks,
+            ScriptSpawnArgs {
+                code: format!("text('rollback-body'); attach({});", json!(pixel_url())),
+                launch: Arc::clone(&launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "rb01".into(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task.done().wait_for(|done| *done))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Verify ProbeWarning rolls back on uncommitted drop (such as failed bridge admission).
+        let (_, _, probe_opt) = crate::platform::process::task_env(
+            &launch,
+            std::path::Path::new("/nonexistent-bash-for-probe"),
+            false,
+        );
+        if let Some(mut probe) = probe_opt {
+            assert!(probe.message().is_some());
+            drop(probe);
+            let (_, _, probe_again) = crate::platform::process::task_env(
+                &launch,
+                std::path::Path::new("/nonexistent-bash-for-probe"),
+                false,
+            );
+            assert!(probe_again.unwrap().message().is_some());
+        }
+
+        let reader = entry.reader(Some("rb99")).unwrap();
+        let handle = reader.handle(&task.id);
+        let (_control, script, worker) = prepare_worker().unwrap();
+        script.control().record_started(handle.clone());
+        // Tiny bridge quota forces admit_bridge_result to fail after StagedRead & NestedAttachments.
+        script.test_pending_result(1, 0, 32);
+
+        let mut ctx = script_ctx(&session);
+        ctx.on_started = Some(script.control());
+        let poll_req: Request =
+            serde_json::from_value(json!({"action": "poll", "taskId": handle, "waitMs": 0}))
+                .unwrap();
+        let refused = exec_program(
+            &service,
+            poll_req,
+            ctx,
+            ProgramDelivery {
+                script: &script,
+                pending_id: 1,
+                is_control: false,
+            },
+        )
+        .await;
+        assert!(matches!(refused.outcome, Outcome::Limit));
+        drop(refused);
+        // Zero leaked leases, read_gate immediately acquirable, StagedRead & TaskEntry & NestedAttachments rolled back.
+        assert_eq!((main_pool.used(), control_pool.used()), (0, 0));
+        assert_eq!(script.test_attachment_count(), 0);
+        assert!(!entry.is_reported());
+        {
+            let gate = reader
+                .read_gate()
+                .try_lock_owned()
+                .expect("read_gate must not be blocked after failed bridge admission");
+            assert_eq!((gate.cursor, gate.attachments_seen), (0, 0));
+            assert!(reader.is_fresh());
+        }
+
+        // Exhaust 100% of main pool and verify Program List and Kill succeed via control_memory() fallback.
+        let _held_main = main_pool
+            .try_acquire(main_pool.limit() - main_pool.used())
+            .unwrap();
+        assert_eq!(main_pool.used(), main_pool.limit());
+
+        script.test_pending_result(2, 0, 64 * 1024);
+        let list_req: Request = serde_json::from_value(json!({"action": "list"})).unwrap();
+        let list_out = exec_program(
+            &service,
+            list_req,
+            script_ctx(&session),
+            ProgramDelivery {
+                script: &script,
+                pending_id: 2,
+                is_control: true,
+            },
+        )
+        .await;
+        let Outcome::Value(list_payload) = list_out.outcome else {
+            panic!("Program list must succeed via control_memory() when main pool is full");
+        };
+        assert!(control_pool.used() > 0);
+        let list_json: Value = serde_json::from_str(&list_payload.value).unwrap();
+        assert_eq!(list_json["ok"], true);
+        assert_eq!(list_json["value"]["action"], "list");
+        drop(list_payload);
+        assert_eq!(control_pool.used(), 0);
+
+        script.test_pending_result(3, 0, 64 * 1024);
+        let mut kill_ctx = script_ctx(&session);
+        kill_ctx.on_started = Some(script.control());
+        let kill_req: Request =
+            serde_json::from_value(json!({"action": "kill", "taskId": handle})).unwrap();
+        let kill_out = exec_program(
+            &service,
+            kill_req,
+            kill_ctx,
+            ProgramDelivery {
+                script: &script,
+                pending_id: 3,
+                is_control: true,
+            },
+        )
+        .await;
+        let Outcome::Value(kill_payload) = kill_out.outcome else {
+            panic!("Program kill must succeed via control_memory() when main pool is full");
+        };
+        assert!(control_pool.used() > 0);
+        let kill_json: Value = serde_json::from_str(&kill_payload.value).unwrap();
+        assert_eq!(kill_json["ok"], true);
+        assert_eq!(kill_json["value"]["action"], "kill");
+        assert_eq!(kill_json["value"]["output"], "rollback-body");
+        drop(kill_payload);
+        assert_eq!(control_pool.used(), script.test_attachment_bytes());
+        assert!(
+            control_pool.used() > 0,
+            "the script retains its attachment handle"
+        );
+
+        drop(_held_main);
+        assert_eq!(main_pool.used(), 0);
+        drop(worker);
+        tasks.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_active_program_wait_preserves_cancelled_code() {
+        let (service, tasks, session) = script_fixture();
+        let ((task, _, reader), _) = spawn_script(
+            &tasks,
+            ScriptSpawnArgs {
+                code: "await sleep(60000);".into(),
+                launch: Arc::clone(&session.launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "r001".into(),
+        )
+        .unwrap();
+        let (_control, script, worker) = prepare_worker().unwrap();
+        script.test_pending_result(1, 0, 16 << 10);
+        let ctx = script_ctx(&session);
+        let cancel = ctx.cancel.clone();
+        let request = serde_json::from_value(json!({
+            "action": "poll", "taskId": reader.handle(&task.id)
+        }))
+        .unwrap();
+        let mut waiting = Box::pin(exec_program(
+            &service,
+            request,
+            ctx,
+            ProgramDelivery {
+                script: &script,
+                pending_id: 1,
+                is_control: false,
+            },
+        ));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        cancel.cancel();
+        let result = waiting.await;
+        let still_running = task.is_running();
+        drop(worker);
+        tasks.shutdown();
+        assert!(still_running, "cancelling a wait must not kill its task");
+        assert!(!result.pre_reserved);
+        let Outcome::Cancelled(message) = result.outcome else {
+            panic!("expected Outcome::Cancelled");
+        };
+        assert!(message.to_lowercase().contains("cancel"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn reader_capacity_is_overload_with_task_recovery_metadata() {
+        let (service, tasks, session, entry) = list_fixture().await;
+        let task = tasks.all().pop().unwrap();
+        let busy: Vec<_> = (0..16)
+            .map(|index| entry.reader(Some(&format!("{index:04}"))).unwrap())
+            .collect();
+        let (_control, script, worker) = prepare_worker().unwrap();
+        script.test_pending_result(1, 0, 16 << 10);
+        let refused = exec_program(
+            &service,
+            serde_json::from_value(json!({"action": "poll", "taskId": task.id, "waitMs": 0}))
+                .unwrap(),
+            script_ctx(&session),
+            ProgramDelivery {
+                script: &script,
+                pending_id: 1,
+                is_control: false,
+            },
+        )
+        .await;
+        drop(worker);
+        tasks.shutdown();
+        let Outcome::Value(payload) = refused.outcome else {
+            panic!("expected an OVERLOAD error envelope");
+        };
+        let parsed: Value = serde_json::from_str(&payload.value).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["code"], "OVERLOAD");
+        assert_eq!(parsed["result"]["taskId"], task.id);
+        assert_eq!(
+            parsed["result"]["logPath"],
+            files::path::display_path(&task.log_path)
+        );
+        assert!(!entry.is_reported());
+        assert!(busy.iter().all(|reader| reader.is_fresh()));
+        assert!(Arc::ptr_eq(&busy[0], &entry.reader(Some("0000")).unwrap(),));
+    }
+}
+
+#[tokio::test]
+async fn g3_immutable_vm_thread_concurrent_kill_1000x_and_dense_bridge_unpark() {
+    let fixture = Fixture::with_limits(Limits {
+        max_running: 64,
+        max_scripts: 16,
+        max_finished: 8,
+        finished_ttl: None,
+    });
+
+    // (a) 1000 concurrent kills spanning pre-job/pre-Runtime::new(), startup, and park() idle wait.
+    let mut completed = 0usize;
+    const TOTAL: usize = 1000;
+    const BATCH: usize = 10;
+    for batch_start in (0..TOTAL).step_by(BATCH) {
+        let count = (TOTAL - batch_start).min(BATCH);
+        let mut handles = Vec::with_capacity(count);
+        for offset in 0..count {
+            let idx = batch_start + offset;
+            let tasks = Arc::clone(&fixture.tasks);
+            let service = Arc::clone(&fixture.service);
+            let session = Arc::clone(&fixture.session);
+            handles.push(tokio::spawn(async move {
+                let code = match idx % 3 {
+                    0 => "await sleep(60000);",
+                    1 => "await null; await sleep(60000);",
+                    _ => "text('ready'); await sleep(60000);",
+                };
+                let ((task, _, _), _) = tokio::task::spawn_blocking({
+                    let tasks = Arc::clone(&tasks);
+                    let session = Arc::clone(&session);
+                    move || {
+                        let res = spawn_script(
+                            &tasks,
+                            ScriptSpawnArgs {
+                                code: code.into(),
+                                launch: Arc::clone(&session.launch),
+                                kill_after_ms: None,
+                                transfer: false,
+                                call_id: None,
+                                service,
+                                input_owner: Default::default(),
+                            },
+                            &session,
+                            format!("k{:03}", idx % 1000),
+                        )
+                        .unwrap();
+                        if idx % 3 == 0 {
+                            // Immediate kill on spawning thread races job delivery and pre-Runtime::new().
+                            res.0.0.kill().unwrap();
+                        }
+                        res
+                    }
+                })
+                .await
+                .unwrap();
+
+                match idx % 3 {
+                    0 => {}
+                    1 => {
+                        if idx % 2 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        task.kill().unwrap();
+                    }
+                    _ => {
+                        tokio::time::sleep(Duration::from_micros(300)).await;
+                        task.kill().unwrap();
+                    }
+                }
+                complete(&task).await;
+                assert_eq!(task.snapshot().state, "killed");
+                assert_eq!(task.snapshot().exit_code, None);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+            completed += 1;
+        }
+    }
+    assert_eq!(completed, TOTAL);
+
+    // (b) Dense concurrent `await sleep(...)` and `await tools.exec(...)` wakeup stress.
+    let ((emitter, _, _), _) = fixture.start(
+        "for (let i = 0; i < 10; i++) { text('tick-' + i); await sleep(1); } return 'done';",
+        Some(5000),
+    );
+    let emitter_id = emitter.id.clone();
+    let (state, out) = fixture
+        .result(&format!(
+            r#"
+            for (let round = 0; round < 30; round++) {{
+                const wave = await Promise.all([
+                    sleep(0),
+                    sleep(1),
+                    sleep(2),
+                    tools.exec({{ action: "list" }}),
+                    tools.exec({{ action: "poll", taskId: {emitter_id:?}, waitMs: 2 }}),
+                ]);
+                if (wave[3].action !== "list" || wave[4].action !== "poll") {{
+                    throw new Error("unexpected response at round " + round);
+                }}
+            }}
+            return "wake-ok";
+            "#
+        ))
+        .await;
+    complete(&emitter).await;
+    assert_eq!(state.exit_code, Some(0), "{out}");
+    assert_eq!(out, "wake-ok\n");
+}
+
+#[tokio::test]
+async fn g4_post_publish_vm_and_diagnostic_failures_exit_1_with_is_error_false() {
+    let fixture = Fixture::new();
+
+    // 1. Diagnostic workspace (12 KiB) exhaustion after Published via prepare_script + finish_exec_agent.
+    let small_control = BytePool::new(DIAGNOSTIC_WORKSPACE - 1);
+    let diag_launch = Arc::new(
+        fixture
+            .session
+            .launch
+            .for_session()
+            .with_control_memory(Arc::clone(&small_control)),
+    );
+    let mut ctx = crate::service::ExecContext {
+        session: &fixture.session,
+        launch: Some(&diag_launch),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        progress: None,
+        call_id: None,
+        parent_task_id: None,
+        queued_guard: None,
+        on_started: None,
+        input_owner: Default::default(),
+    };
+    let req: Request = serde_json::from_value(json!({ "code": "return 1;" })).unwrap();
+    let delivery = crate::render::types::AgentDelivery::default();
+    let prepared = prepare_script(&fixture.service, req, &mut ctx, None, false)
+        .await
+        .expect("post-publish diagnostic workspace exhaustion must not fail prepare_script");
+    let tracked =
+        crate::render::finish_exec_agent(&fixture.service, Ok(prepared), &ctx, &delivery).await;
+    assert!(!tracked.overload);
+    assert_eq!(tracked.result.is_error, Some(false), "{:?}", tracked.result);
+    let text = tracked.result.content[0].as_text().unwrap().text.as_str();
+    assert!(text.contains("[exited 1]"), "{text}");
+    assert!(
+        text.contains("Script error: diagnostic memory budget is full"),
+        "{text}"
+    );
+    drop(tracked);
+    assert_eq!(small_control.used(), 0);
+
+    // 2. Post-publish QuickJS Context::full() initialization OOM under tiny VM memory limit.
+    let ((oom_task, _, oom_reader), _) = spawn_script_inner(
+        &fixture.tasks,
+        ScriptSpawnArgs {
+            code: "return 42;".into(),
+            launch: Arc::clone(&fixture.session.launch),
+            kill_after_ms: Some(5000),
+            transfer: false,
+            call_id: None,
+            service: Arc::clone(&fixture.service),
+            input_owner: Default::default(),
+        },
+        &fixture.session,
+        "g4vm".into(),
+        Some(1024),
+    )
+    .unwrap();
+    complete(&oom_task).await;
+    let snap = oom_task.snapshot();
+    assert_eq!(snap.state, "exited");
+    assert_eq!(snap.exit_code, Some(1));
+    let poll_ctx = crate::service::ExecContext {
+        session: &fixture.session,
+        launch: None,
+        cancel: tokio_util::sync::CancellationToken::new(),
+        progress: None,
+        call_id: None,
+        parent_task_id: None,
+        queued_guard: None,
+        on_started: None,
+        input_owner: Default::default(),
+    };
+    let polled = crate::render::exec_agent_json(
+        &fixture.service,
+        json!({
+            "action": "poll",
+            "taskId": oom_reader.handle(&oom_task.id),
+            "waitMs": 0,
+        }),
+        poll_ctx,
+        crate::render::types::AgentDelivery::default(),
+    )
+    .await;
+    assert!(!polled.overload);
+    assert_eq!(polled.result.is_error, Some(false), "{:?}", polled.result);
+    let poll_text = polled.result.content[0].as_text().unwrap().text.as_str();
+    assert!(poll_text.contains("[exited 1]"), "{poll_text}");
+    assert!(poll_text.contains("Script error:"), "{poll_text}");
+}
+
+#[tokio::test]
+async fn g5_kill_with_pending_nested_calls_refunds_leases_and_records_cancelled_ledger() {
+    let mut fixture = Fixture::new();
+    let ((bg, _, _), _) = fixture.start("await sleep(60000);", None);
+    let bg_id = bg.id.clone();
+
+    let pool = BytePool::new(4 << 20);
+    fixture.session = Session::new(
+        "g5-session".into(),
+        "g5-session".into(),
+        Arc::new(
+            fixture
+                .session
+                .launch
+                .for_session()
+                .with_memory(Arc::clone(&pool)),
+        ),
+    );
+
+    let script_code = format!(
+        r#"
+        const p1 = sleep(60000);
+        const p2 = tools.exec({{ action: "poll", taskId: {bg_id:?}, waitMs: 60000 }});
+        text("PENDING_READY");
+        await Promise.all([p1, p2]);
+        "#
+    );
+    let ((victim, _, _), victim_bridge) = fixture.start(&script_code, None);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let ready = std::fs::read_to_string(&victim.log_path)
+            .unwrap_or_default()
+            .contains("PENDING_READY");
+        if ready && lock(&victim_bridge.0.report).pending.len() == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "victim did not queue both nested calls"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        pool.used() > 0,
+        "pending nested call arguments must hold active BytePool leases"
+    );
+    assert!(victim_bridge.test_bridge_bytes() > 0);
+
+    victim.kill().unwrap();
+    complete(&victim).await;
+
+    // Wait briefly for cancelled spawned futures to drop their hold_future input owners.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.used() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending call leases must be refunded after kill");
+    assert_eq!(victim_bridge.test_bridge_bytes(), 0);
+
+    let report = victim
+        .script()
+        .unwrap()
+        .report(crate::lease::process_pool(), None)
+        .unwrap();
+    assert_eq!(report.cancelled.len(), 2, "{:?}", report.cancelled);
+    assert_eq!(
+        report.cancelled[0],
+        CallInfo {
+            tool: "sleep".into(),
+            action: None,
+            task_id: None,
+        }
+    );
+    assert_eq!(
+        report.cancelled[1],
+        CallInfo {
+            tool: "exec".into(),
+            action: Some("poll".into()),
+            task_id: Some(bg_id),
+        }
+    );
+
+    bg.kill().unwrap();
+    complete(&bg).await;
+}
+
+#[tokio::test]
+async fn g13_program_exec_preserves_nul_bytes_defaults_to_head_and_rejects_head_tail() {
+    use crate::service::schema::{ExecPolicy, Request as ExecRequest, validate as validate_exec};
+    use crate::term::output::{Cleaner, Truncate, WindowBuilder, WindowSpec};
+
+    // 1. Verify ExecPolicy::PROGRAM view contract + Cleaner NUL preservation vs AGENT stripping.
+    let raw_req: ExecRequest = serde_json::from_value(json!({
+        "action": "poll",
+        "taskId": "aaaaaaaa-1",
+    }))
+    .unwrap();
+    let prog_view = validate_exec(&raw_req, ExecPolicy::PROGRAM).unwrap();
+    assert!(prog_view.keep_nul);
+    assert!(!prog_view.inline_markers);
+    assert_eq!(prog_view.truncate, Truncate::Head);
+    let mut cleaner = Cleaner::default();
+    let mut prog_builder = WindowBuilder::new(
+        WindowSpec {
+            truncate: prog_view.truncate,
+            budget: 1024,
+            raw: false,
+            clean: true,
+            keep_nul: prog_view.keep_nul,
+            include_markers: prog_view.inline_markers,
+            encoding: encoding_rs::UTF_8,
+            source: "log",
+        },
+        &mut cleaner,
+        1,
+    );
+    prog_builder.push(b"a\x1b[31m\0b\x1b[0m\nc\0d\n");
+    assert_eq!(prog_builder.finish().text, "a\0b\nc\0d");
+
+    // 2. End-to-end nested `tools.exec` preserves `\0`, defaults to `head`, and rejects `head_tail`.
+    let fixture = Fixture::new();
+    let ((nul_task, _, _), _) = fixture.start("text('a\\0b\\nc\\0d');", Some(5000));
+    let ((many_task, _, _), _) = fixture.start(
+        "for (let i = 1; i <= 80; i++) text('row-' + String(i).padStart(3, '0'));",
+        Some(5000),
+    );
+    complete(&nul_task).await;
+    complete(&many_task).await;
+    let nul_id = nul_task.id.clone();
+    let many_id = many_task.id.clone();
+
+    let (state, out) = fixture
+        .result(&format!(
+            r#"
+            const nulRes = await tools.exec({{
+                action: "poll",
+                taskId: {nul_id:?},
+                waitMs: 0,
+            }});
+            if (nulRes.output !== "a\0b\nc\0d") {{
+                throw new Error("NUL mismatch: " + JSON.stringify(nulRes.output));
+            }}
+            if (nulRes.output.charCodeAt(1) !== 0 || nulRes.output.charCodeAt(5) !== 0) {{
+                throw new Error("expected NUL code units");
+            }}
+
+            const many = await tools.exec({{
+                action: "poll",
+                taskId: {many_id:?},
+                maxBytes: 100,
+                waitMs: 0,
+            }});
+            if (!many.truncated || !many.output.startsWith("row-001\n") || many.output.includes("row-080")) {{
+                throw new Error("expected head truncation: " + JSON.stringify(many));
+            }}
+            if (many.output.includes("omitted") || !Array.isArray(many.omittedRange) || many.omittedRange[1] !== 80) {{
+                throw new Error("expected structured omittedRange without inline markers: " + JSON.stringify(many));
+            }}
+
+            for (const req of [
+                {{ action: "start", command: "printf ok", truncate: "head_tail", loginShell: false }},
+                {{ action: "poll", taskId: many.taskId, truncate: "head_tail", waitMs: 0 }},
+            ]) {{
+                let err = null;
+                try {{ await tools.exec(req); }} catch (e) {{ err = e; }}
+                if (!err || err.name !== "ToolError" || err.code !== "VALIDATION") {{
+                    throw new Error("head_tail must reject with VALIDATION: " + JSON.stringify(req));
+                }}
+            }}
+            return "g13-ok";
+            "#
+        ))
+        .await;
+    assert_eq!(state.exit_code, Some(0), "{out}");
+    assert_eq!(out, "g13-ok\n");
+}
+
+#[tokio::test]
+async fn settled_write_before_concurrent_kill_is_not_reported_cancelled() {
+    let fixture = Fixture::new();
+    let ((bg, _, _), _) = fixture.start("await sleep(60000);", None);
+    let bg_id = bg.id.clone();
+
+    let script_code = format!(
+        r#"
+        tools.write({{ path: "settled.txt", content: "persisted\n" }});
+        tools.exec({{ action: "poll", taskId: {bg_id:?}, waitMs: 60000 }});
+        while (true) {{}}
+        "#
+    );
+    let ((victim, _, _), bridge) = fixture.start(&script_code, None);
+
+    // Wait until tools.write has written to disk and settled into settled_rx, while
+    // tools.exec poll remains the sole active in-flight call and QuickJS spins in while(true).
+    let target = fixture.dir.join("settled.txt");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let written = std::fs::read_to_string(&target).ok();
+        let in_flight = *lock(&bridge.0.in_flight.0);
+        let pending_len = lock(&bridge.0.report).pending.len();
+        if written.as_deref() == Some("persisted\n") && in_flight == 1 && pending_len == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "write did not settle while poll stayed in flight (in_flight={in_flight}, pending={pending_len})"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    victim.kill().unwrap();
+    complete(&victim).await;
+
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "persisted\n");
+    let report = victim
+        .script()
+        .unwrap()
+        .report(crate::lease::process_pool(), None)
+        .unwrap();
+    assert_eq!(
+        report.cancelled,
+        vec![CallInfo {
+            tool: "exec".into(),
+            action: Some("poll".into()),
+            task_id: Some(bg_id),
+        }]
+    );
+    let log = std::fs::read_to_string(&victim.log_path).unwrap();
+    assert!(
+        log.contains("cancelled 1 pending call(s): exec poll") && !log.contains("write"),
+        "{log}"
+    );
+
+    bg.kill().unwrap();
+    complete(&bg).await;
+}
+
+#[tokio::test]
+async fn report_result_releases_input_owner_and_done_has_zero_pool_bytes() {
+    let pool = BytePool::new(1 << 20);
+    let info = CallInfo {
+        tool: "write".into(),
+        action: None,
+        task_id: None,
+    };
+    let mut report = Report {
+        limit: Some(128),
+        ..Default::default()
+    };
+    let owner = crate::lease::Owner::new(pool.try_acquire(1024).unwrap());
+    report.admit(1, info, 32, owner).unwrap();
+    assert_eq!(pool.used(), 1024);
+    assert!(!report.result(1, 256));
+    assert_eq!(pool.used(), 1024, "refused result keeps input_owner intact");
+    assert!(report.result(1, 64));
+    assert_eq!(
+        pool.used(),
+        0,
+        "accepted result releases input_owner immediately"
+    );
+    report.remove(1);
+    assert_eq!(report.bridge_bytes, 0);
+
+    let mut fixture = Fixture::new();
+    let launch = Arc::new(
+        fixture
+            .session
+            .launch
+            .for_session()
+            .with_memory(Arc::clone(&pool)),
+    );
+    fixture.session = Session::new(
+        "lease-release".into(),
+        "lease-release".into(),
+        Arc::clone(&launch),
+    );
+
+    // Normal exit: code lease and nested awaited call leases are already 0 when done fires.
+    let code_owner = crate::lease::Owner::new(pool.try_acquire(2048).unwrap());
+    let ((task, _, _), _) = spawn_script(
+        &fixture.tasks,
+        ScriptSpawnArgs {
+            code: "const w = await tools.write({ path: 'done-lease.txt', content: 'x'.repeat(8192) }); return w.bytes;".into(),
+            launch: Arc::clone(&launch),
+            kill_after_ms: Some(5000),
+            transfer: false,
+            call_id: None,
+            service: Arc::clone(&fixture.service),
+            input_owner: code_owner,
+        },
+        &fixture.session,
+        "lr01".into(),
+    )
+    .unwrap();
+    complete(&task).await;
+    assert_eq!(pool.used(), 0);
+    assert_eq!(task.snapshot().exit_code, Some(0));
+
+    // Unconsumed settled call + kill: 4x argument lease drops as soon as host settles,
+    // and code + settled_rx leases drop before done wakes.
+    let kill_code_owner = crate::lease::Owner::new(pool.try_acquire(1024).unwrap());
+    let ((killed_task, _, _), bridge) = spawn_script(
+        &fixture.tasks,
+        ScriptSpawnArgs {
+            code: "tools.write({ path: 'queued-lease.txt', content: 'y'.repeat(16384) }); while (true) {}".into(),
+            launch,
+            kill_after_ms: None,
+            transfer: false,
+            call_id: None,
+            service: Arc::clone(&fixture.service),
+            input_owner: kill_code_owner,
+        },
+        &fixture.session,
+        "lr02".into(),
+    )
+    .unwrap();
+    let queued_file = fixture.dir.join("queued-lease.txt");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if queued_file.exists() && *lock(&bridge.0.in_flight.0) == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "nested write did not settle");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        pool.used() < 16384,
+        "4x argument lease must already be released while result sits in settled_rx: used={}",
+        pool.used()
+    );
+    killed_task.kill().unwrap();
+    complete(&killed_task).await;
+    assert_eq!(pool.used(), 0);
+}
+
+#[tokio::test]
+async fn kill_near_bridge_limit_keeps_cancelled_polls_without_limit_rewrite() {
+    let fixture = Fixture::new();
+    let ((bg, _, bg_reader), _) = fixture.start("await sleep(60000);", None);
+    let bg_handle = bg_reader.handle(&bg.id);
+
+    // Two concurrent polls on the same reader handle: the first holds read_gate in wait,
+    // while the second waits on read_gate (whose cancellation message is 61 bytes, longer
+    // than each ~44-byte argument string).
+    let script_code = format!(
+        r#"
+        const p1 = tools.exec({{ action: "poll", taskId: {bg_handle:?} }});
+        const p2 = tools.exec({{ action: "poll", taskId: {bg_handle:?} }});
+        text("BOTH_QUEUED");
+        await Promise.all([p1, p2]);
+        "#
+    );
+    let ((victim, _, _), bridge) = fixture.start(&script_code, None);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let ready = std::fs::read_to_string(&victim.log_path)
+            .unwrap_or_default()
+            .contains("BOTH_QUEUED");
+        let in_flight = *lock(&bridge.0.in_flight.0);
+        let pending_len = lock(&bridge.0.report).pending.len();
+        if ready && in_flight == 2 && pending_len == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "polls did not enter flight (in_flight={in_flight}, pending={pending_len})"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Leave only 8 bytes (< 60 bytes) of headroom under BRIDGE_LIMIT so a 61-byte
+    // cancellation message would fail Report::result if it were ever admitted there.
+    let used = bridge.test_bridge_bytes();
+    bridge.test_bridge_limit(used + 8);
+
+    victim.kill().unwrap();
+    complete(&victim).await;
+
+    let log = std::fs::read_to_string(&victim.log_path).unwrap();
+    assert!(!log.contains("256 MiB"), "{log}");
+    assert!(!log.contains("LIMIT"), "{log}");
+    assert!(log.contains("cancelled 2 pending call(s):"), "{log}");
+
+    let report = victim
+        .script()
+        .unwrap()
+        .report(crate::lease::process_pool(), None)
+        .unwrap();
+    let expected = CallInfo {
+        tool: "exec".into(),
+        action: Some("poll".into()),
+        task_id: Some(bg_handle),
+    };
+    assert_eq!(report.cancelled, vec![expected.clone(), expected]);
+
+    // Defense-in-depth: if Outcome::Cancelled ever reaches settled_rx while run_vm is parked,
+    // run_vm exits without removing the pending entry from cancelledCalls.
+    let ((parked, _, _), parked_bridge) = fixture.start("await sleep(60000);", None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lock(&parked_bridge.0.report).pending.len() != 1 {
+        assert!(Instant::now() < deadline, "sleep was not admitted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    parked_bridge
+        .0
+        .settled_tx
+        .send(SettledCall {
+            id: 1,
+            outcome: Outcome::Cancelled("cancelled".into()),
+        })
+        .unwrap();
+    parked.kill().unwrap();
+    complete(&parked).await;
+    let parked_report = parked
+        .script()
+        .unwrap()
+        .report(crate::lease::process_pool(), None)
+        .unwrap();
+    assert_eq!(
+        parked_report.cancelled,
+        vec![CallInfo {
+            tool: "sleep".into(),
+            action: None,
+            task_id: None,
+        }]
+    );
+
+    bg.kill().unwrap();
+    complete(&bg).await;
 }

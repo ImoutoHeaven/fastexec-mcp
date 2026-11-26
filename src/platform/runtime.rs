@@ -2,7 +2,7 @@
 //! runtime directory and its endpoint, the locks that serialize starters, and the cached image a
 //! daemon is started from.
 
-use crate::session::LaunchContext;
+use crate::env::LaunchContext;
 use crate::transport;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;

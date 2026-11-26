@@ -3,8 +3,11 @@ use super::path::*;
 use super::read::*;
 use super::write::*;
 use super::*;
+use crate::env::LaunchContext;
 use crate::lease::{BytePool, Lease};
-use crate::session::LaunchContext;
+use crate::render::files::*;
+use crate::render::types::media_content_block;
+use rmcp::model::ContentBlock;
 use serde_json::{Value, json};
 use std::fs::File;
 #[cfg(any(target_os = "freebsd", target_os = "macos"))]
@@ -106,12 +109,7 @@ fn read_data_to_view(data: FileReadData) -> ReadView {
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded_base64)
                     .map(|b| b.len() as u64)
                     .unwrap_or(0);
-            let block = crate::service::render::media_content_block(
-                kind,
-                &mime_type,
-                encoded_base64,
-                &resolved_path,
-            );
+            let block = media_content_block(kind, &mime_type, encoded_base64, &resolved_path);
             let structured = json!({
                 "kind": kind.as_str(),
                 "mimeType": mime_type,
@@ -316,15 +314,86 @@ fn paths_resolve_against_the_launch_context() {
 fn a_relative_home_stays_anchored_to_the_session_directory() {
     let scratch = Scratch::new("relative-home");
     let launch = context(&scratch.0, Path::new("local-home"));
-    let nested = launch.with_cwd(scratch.0.join("other"));
+    let other = scratch.0.join("other");
+    std::fs::create_dir_all(other.join("local-home")).unwrap();
+    let nested = launch.with_cwd(other.clone());
     let file = scratch.file("local-home/notes", b"session home");
     let home = scratch.0.join("local-home");
-    assert_eq!(nested.home().as_deref(), Some(home.as_path()));
+    assert_eq!(resolve_home(&nested).as_deref(), Some(home.as_path()));
     assert!(
         crate::mcp::host_line(&nested).contains(&format!(" · home {} · ", display_path(&home)))
     );
     assert_eq!(resolve("~/notes", &nested).unwrap(), file);
     assert_eq!(whole("~/notes", &nested, false).unwrap(), "session home");
+    write_text(
+        &WriteRequest {
+            path: "~/written.txt".into(),
+            content: "initial\n".into(),
+        },
+        &nested,
+    )
+    .unwrap();
+    change("~/written.txt", &[("initial", "edited")], &nested).unwrap();
+    assert_eq!(whole("~/written.txt", &nested, false).unwrap(), "edited\n");
+    assert_eq!(
+        std::fs::read(home.join("written.txt")).unwrap(),
+        b"edited\n"
+    );
+    assert!(!other.join("local-home/written.txt").exists());
+}
+
+#[test]
+fn resolve_home_follows_platform_variable_order() {
+    let env_ctx = |pairs: &[(&str, &str)]| {
+        LaunchContext::new(
+            std::env::temp_dir(),
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+        )
+    };
+    if cfg!(windows) {
+        let all = env_ctx(&[
+            ("USERPROFILE", r"C:\Users\profile"),
+            ("HOMEDRIVE", "D:"),
+            ("HOMEPATH", r"\Users\pair"),
+            ("HOME", "/home/third"),
+        ]);
+        assert_eq!(
+            resolve_home(&all).unwrap(),
+            PathBuf::from(r"C:\Users\profile")
+        );
+        let pair = env_ctx(&[
+            ("USERPROFILE", ""),
+            ("HOMEDRIVE", "D:"),
+            ("HOMEPATH", r"\Users\pair"),
+            ("HOME", "/home/third"),
+        ]);
+        assert_eq!(
+            resolve_home(&pair).unwrap(),
+            PathBuf::from(r"D:\Users\pair")
+        );
+        let half = env_ctx(&[("HOMEDRIVE", "D:"), ("HOME", "/d/home/third")]);
+        assert_eq!(
+            resolve_home(&half).unwrap(),
+            PathBuf::from(r"D:\home\third")
+        );
+        assert_eq!(resolve_home(&env_ctx(&[("HOME", "/home/third")])), None);
+    } else {
+        assert_eq!(
+            resolve_home(&env_ctx(&[
+                ("HOME", "/home/me"),
+                ("USERPROFILE", "/ignored")
+            ])),
+            Some(PathBuf::from("/home/me"))
+        );
+        assert_eq!(
+            resolve_home(&env_ctx(&[("HOME", ""), ("USERPROFILE", "/ignored")])),
+            None
+        );
+    }
+    assert_eq!(resolve_home(&env_ctx(&[])), None);
 }
 
 #[test]
@@ -4391,7 +4460,7 @@ fn text_buffer_reads_admit_before_copy_and_keep_the_result_owned() {
             let tracked = render_read_agent(data, owner);
             assert!(
                 tracked.lease.as_ref().unwrap().bytes()
-                    >= crate::service::render::result_payload_capacity(&tracked.result)
+                    >= crate::render::result_payload_capacity(&tracked.result)
             );
             assert!(tracked.result.structured_content.is_none());
             assert_eq!(pool.used(), peak);
@@ -5262,7 +5331,7 @@ async fn read_core_media_descriptor_only_vs_inline() {
             scratch.0.clone(),
             vec![
                 ("HOME".into(), scratch.0.as_os_str().to_owned()),
-                (crate::session::MAX_MEDIA_BYTES.into(), "1048576".into()),
+                (crate::env::MAX_MEDIA_BYTES.into(), "1048576".into()),
             ],
         )
         .with_memory(Arc::clone(&pool)),

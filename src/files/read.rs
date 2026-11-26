@@ -1,8 +1,8 @@
 use super::path::{display_path, open_regular, resolve, with_path_workspace};
 use super::{FileError, ReadRequest};
+use crate::env::LaunchContext;
 use crate::lease::{BytePool, Lease};
 use crate::media::{self, CompressFailure, DetectedMedia, MediaKind};
-use crate::session::LaunchContext;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -404,19 +404,40 @@ fn oversized_note(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn read_media_core(
-    file: &mut File,
+struct SniffedMedia<'a> {
+    file: &'a mut File,
     initial_len: u64,
-    prefix: &[u8],
-    resolved: &Path,
+    prefix: &'a [u8],
+    resolved: &'a Path,
     shown_path: String,
     detected: DetectedMedia,
-    launch: &LaunchContext,
+}
+
+struct MediaReadCtx<'a> {
+    launch: &'a LaunchContext,
     transfer: bool,
     policy: ReadPolicy,
-    cancel: Option<&tokio_util::sync::CancellationToken>,
+    cancel: Option<&'a tokio_util::sync::CancellationToken>,
+}
+
+fn read_media_core(
+    media: SniffedMedia<'_>,
+    ctx: MediaReadCtx<'_>,
 ) -> Result<MediaPayload, FileError> {
+    let SniffedMedia {
+        file,
+        initial_len,
+        prefix,
+        resolved,
+        shown_path,
+        detected,
+    } = media;
+    let MediaReadCtx {
+        launch,
+        transfer,
+        policy,
+        cancel,
+    } = ctx;
     let max_media_bytes = launch.max_media_bytes().map_err(FileError::Validation)?;
     let compress = launch.image_compress().map_err(FileError::Validation)?;
     if policy.media_mode == MediaReadMode::DescriptorOnly {
@@ -649,14 +670,11 @@ fn read_blocking_reserved(
     if let Some(detected) = media::detect_path(&sniff[..sniffed], Some(&resolved)) {
         // Invalid media configuration may be echoed in a diagnostic. Reserve its
         // borrowed native text before the validator formats that error.
-        let config_bytes = [
-            crate::session::IMAGE_COMPRESS,
-            crate::session::MAX_MEDIA_BYTES,
-        ]
-        .iter()
-        .filter_map(|name| launch.var(name))
-        .map(|value| value.as_encoded_bytes().len())
-        .fold(0, usize::saturating_add);
+        let config_bytes = [crate::env::IMAGE_COMPRESS, crate::env::MAX_MEDIA_BYTES]
+            .iter()
+            .filter_map(|name| launch.var(name))
+            .map(|value| value.as_encoded_bytes().len())
+            .fold(0, usize::saturating_add);
         if !path_lease.try_grow(config_bytes.saturating_mul(16)) {
             return Err(FileError::Overload(
                 "Server active memory budget is full while preparing media configuration diagnostics."
@@ -664,16 +682,20 @@ fn read_blocking_reserved(
             ));
         }
         return read_media_core(
-            &mut file,
-            metadata.len(),
-            &sniff[..sniffed],
-            &resolved,
-            shown_path,
-            detected,
-            launch,
-            transfer,
-            policy,
-            cancel,
+            SniffedMedia {
+                file: &mut file,
+                initial_len: metadata.len(),
+                prefix: &sniff[..sniffed],
+                resolved: &resolved,
+                shown_path,
+                detected,
+            },
+            MediaReadCtx {
+                launch,
+                transfer,
+                policy,
+                cancel,
+            },
         )
         .map(FileReadData::Media);
     }
@@ -1261,7 +1283,7 @@ fn unfinished_tail(data: &[u8]) -> usize {
 
 /// Bytes as the reference implementation shows them: whole bytes, and one decimal of a kilobyte
 /// or a megabyte, rounded the way `toFixed(1)` rounds.
-pub(super) fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes}B");
     }

@@ -1,6 +1,6 @@
 use super::write::SaveBuffer;
+use crate::env::LaunchContext;
 use crate::lease::{BytePool, Lease};
-use crate::session::LaunchContext;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -168,6 +168,14 @@ pub(super) fn append_path(base: &Path, path: &Path) -> PathBuf {
     clean_components(Path::new(&joined))
 }
 
+/// Resolves the session's home directory against `launch.session_cwd()`, keeping relative `HOME`
+/// values anchored to the initial session directory across `with_cwd`.
+pub fn resolve_home(launch: &LaunchContext) -> Option<PathBuf> {
+    launch
+        .raw_home()
+        .and_then(|path| resolve_from(&path, launch.session_cwd()).ok())
+}
+
 /// Resolves a path parameter against `launch`: expands `~`, maps Git Bash `/c/...` drive roots on
 /// Windows, refuses driveless rooted and drive-relative Windows paths, joins relative paths onto
 /// `launch.cwd`, and removes `.` and repeated separators while leaving `..` to the filesystem.
@@ -176,8 +184,7 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
         return Err("Path must not be empty.".into());
     }
     let home = || {
-        launch
-            .home()
+        resolve_home(launch)
             .ok_or_else(|| format!("Cannot expand ~ in {path}: the home directory is unknown."))
     };
     if path == "~" {

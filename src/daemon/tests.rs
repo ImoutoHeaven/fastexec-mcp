@@ -511,7 +511,7 @@ async fn a_call_on_a_closed_connection_queues_nothing() {
     let session = Arc::new(Session::new(
         "closed01".to_owned(),
         "closed-01".to_owned(),
-        Arc::new(crate::session::LaunchContext::new(
+        Arc::new(crate::env::LaunchContext::new(
             std::env::temp_dir(),
             std::env::vars_os().collect(),
         )),

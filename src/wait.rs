@@ -3,9 +3,9 @@
 //! task ends when they do, once a result has shown the root's exit.
 
 use crate::lease::{BytePool, Lease};
-use crate::session::{ReadState, Reader};
 use crate::tasks::TaskError;
-use crate::tasks::state::Task;
+use crate::tasks::session::Reader;
+use crate::tasks::state::{ReadState, Task};
 use crate::term::output::{Cleaner, Matcher};
 use encoding_rs::Encoding;
 use schemars::JsonSchema;
@@ -415,9 +415,12 @@ pub async fn wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codemode::{ScriptSpawnArgs, spawn_script};
+    use crate::env::LaunchContext;
     use crate::service::Service;
-    use crate::session::{LaunchContext, ReadState, Session};
-    use crate::tasks::{Limits, ScriptArgs, Tasks};
+    use crate::tasks::session::Session;
+    use crate::tasks::state::ReadState;
+    use crate::tasks::{Limits, Tasks};
 
     #[tokio::test]
     async fn mark_admits_the_matcher_peak_without_advancing_the_reader() {
@@ -428,21 +431,21 @@ mod tests {
             "match-budget".into(),
             Arc::clone(&launch),
         );
-        let (task, _, reader) = tasks
-            .start_script(
-                ScriptArgs {
-                    code: "await sleep(60000);".into(),
-                    launch: Arc::clone(&launch),
-                    kill_after_ms: None,
-                    transfer: false,
-                    call_id: None,
-                    service: Arc::new(Service::new(Arc::clone(&tasks), false)),
-                    input_owner: Default::default(),
-                },
-                &session,
-                "r001".into(),
-            )
-            .unwrap();
+        let ((task, _, reader), _) = spawn_script(
+            &tasks,
+            ScriptSpawnArgs {
+                code: "await sleep(60000);".into(),
+                launch: Arc::clone(&launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::new(Service::new(Arc::clone(&tasks), false)),
+                input_owner: Default::default(),
+            },
+            &session,
+            "r001".into(),
+        )
+        .unwrap();
         let state = ReadState::default();
         let when: ReturnWhen = serde_json::from_value(serde_json::json!({
             "outputContains": ["accepted"]
@@ -530,9 +533,9 @@ mod tests {
             let tasks = Tasks::new(Limits::OFF).unwrap();
             let launch = Arc::new(LaunchContext::current().unwrap());
             let session = Session::new("s".into(), "s".into(), Arc::clone(&launch));
-            let (task, _, reader) = tasks
-                .start_script(
-                    ScriptArgs {
+            let ((task, _, reader), _) = spawn_script(
+                &tasks,
+                ScriptSpawnArgs {
                         code: "await sleep(60000);".into(),
                         launch,
                         kill_after_ms: None,
@@ -600,21 +603,21 @@ mod tests {
         let launch = Arc::new(LaunchContext::current().unwrap());
         let session = Session::new("s".into(), "s".into(), Arc::clone(&launch));
 
-        let (task, _entry, reader) = tasks
-            .start_script(
-                ScriptArgs {
-                    code: "text('done');".into(),
-                    launch: Arc::clone(&launch),
-                    kill_after_ms: None,
-                    transfer: false,
-                    call_id: None,
-                    service: Arc::clone(&service),
-                    input_owner: Default::default(),
-                },
-                &session,
-                "r001".into(),
-            )
-            .unwrap();
+        let ((task, _entry, reader), _) = spawn_script(
+            &tasks,
+            ScriptSpawnArgs {
+                code: "text('done');".into(),
+                launch: Arc::clone(&launch),
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service: Arc::clone(&service),
+                input_owner: Default::default(),
+            },
+            &session,
+            "r001".into(),
+        )
+        .unwrap();
         let m = mark(
             &task,
             &reader,
@@ -629,21 +632,21 @@ mod tests {
             .unwrap();
         assert!(matches!(end, WaitEnd::TaskEnded));
 
-        let (task2, _entry2, reader2) = tasks
-            .start_script(
-                ScriptArgs {
-                    code: "while (true) {}".into(),
-                    launch,
-                    kill_after_ms: None,
-                    transfer: false,
-                    call_id: None,
-                    service,
-                    input_owner: Default::default(),
-                },
-                &session,
-                "r002".into(),
-            )
-            .unwrap();
+        let ((task2, _entry2, reader2), _) = spawn_script(
+            &tasks,
+            ScriptSpawnArgs {
+                code: "while (true) {}".into(),
+                launch,
+                kill_after_ms: None,
+                transfer: false,
+                call_id: None,
+                service,
+                input_owner: Default::default(),
+            },
+            &session,
+            "r002".into(),
+        )
+        .unwrap();
         let m2 = mark(
             &task2,
             &reader2,

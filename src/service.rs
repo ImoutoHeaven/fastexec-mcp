@@ -1,8 +1,7 @@
-//! Core execution engine for `exec` and `codemode` tasks, split into shared preparation
-//! (`PreparedExec`) and sibling Agent (`render.rs`) and Program (`codemode/encode.rs`) frontends.
+//! Core execution engine for `exec` and `codemode` tasks, producing shared `PreparedExec`
+//! values for Agent (`crate::render`) and Program (`codemode::encode`) frontends.
 
-pub(crate) mod core;
-pub(crate) mod render;
+pub mod core;
 pub(crate) mod schema;
 #[cfg(test)]
 mod tests;
@@ -11,24 +10,25 @@ use self::core::{
     PreparedSnapshot, RenderSlot, ScriptReport, metadata_members, metadata_workspace_bytes,
     overload_task_message, resize_metadata_workspace, script_report, text_workspace_bytes,
 };
-use self::render::{error_result, schema_error};
+pub use self::core::{ServiceError, TaskMeta};
 use self::schema::{
     Action, DEFAULT_KEY_DELAY_MS, ExecPolicy, ListScope, ListState, MAX_INPUT_BYTES, Request, View,
     flag, normalize_request, validate, validate_cwd,
 };
+use crate::env::{LaunchContext, ProbeWarning};
+use crate::files;
 use crate::id;
 use crate::lease::Lease;
 use crate::platform::{conpty, process};
-use crate::session::{LaunchContext, ProbeWarning, ReadState, Reader, Session, TaskEntry};
-use crate::tasks::state::{AttachmentLease, Task};
+use crate::tasks::script::{QueuedStartGuard, ScriptControl};
+use crate::tasks::session::{Reader, Session, TaskEntry};
+use crate::tasks::state::{AttachmentLease, ReadState, Task};
 use crate::tasks::{
-    self, EVICTED_TRANSCRIPT, ListQuery, ListedResult, ListedTask, ScriptArgs, StartArgs, Tasks,
+    self, EVICTED_TRANSCRIPT, ListQuery, ListedResult, ListedTask, StartArgs, Tasks,
 };
 use crate::term::keys;
 use crate::term::output::{Cleaner, Truncate, Window, WindowBuilder, WindowSpec};
 use crate::wait::{self, WaitEnd};
-use crate::{codemode, files};
-use serde_json::Value;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -42,7 +42,7 @@ const DEFAULT_LIST_LIMIT: u64 = 20;
 const MIN_BODY_BUDGET: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Consumer {
+pub(crate) enum Consumer {
     Agent,
     Program,
 }
@@ -59,9 +59,9 @@ pub struct ExecContext<'a> {
     pub call_id: Option<u64>,
     pub parent_task_id: Option<String>,
     /// Tracks an admitted nested `exec start` until it enters `registry.tasks`.
-    pub queued_guard: Option<codemode::control::QueuedStartGuard>,
+    pub queued_guard: Option<QueuedStartGuard>,
     /// Nested script handle; records starts before cancellation and checks task ownership.
-    pub on_started: Option<&'a codemode::control::ScriptHandle>,
+    pub on_started: Option<&'a ScriptControl>,
     /// Keeps decoded arguments alive through worker-owned copies after caller cancellation.
     pub input_owner: crate::lease::Owner,
 }
@@ -72,78 +72,11 @@ impl<'a> ExecContext<'a> {
     }
 }
 
-/// Agent-only delivery parameters (MCP stdio / HTTP / Daemon IPC).
-#[derive(Default)]
-pub struct AgentDelivery<'a> {
-    pub(crate) render_slot: Option<&'a RenderSlot<'a>>,
-    pub http_response: bool,
-    /// Encoded outer JSON-RPC ID length, known before committing output cursors.
-    pub rpc_id_bytes: usize,
-}
-
-/// Program-only delivery parameters (nested `codemode` JS bridge).
-pub(crate) struct ProgramDelivery<'a> {
-    pub script: &'a codemode::control::ScriptHandle,
-    pub pending_id: u64,
-    pub is_control: bool,
-}
-
-#[derive(Debug)]
-pub(crate) enum ServiceError {
-    Validation(String),
-    NotFound(String),
-    Cancelled(String),
-    Overload(String, Option<files::TaskMeta>),
-    Io(String),
-}
-
-impl ServiceError {
-    pub(crate) fn message(&self) -> &str {
-        match self {
-            Self::Validation(s)
-            | Self::NotFound(s)
-            | Self::Cancelled(s)
-            | Self::Overload(s, _)
-            | Self::Io(s) => s,
-        }
-    }
-}
-
-impl From<String> for ServiceError {
-    fn from(message: String) -> Self {
-        Self::Io(message)
-    }
-}
-
-impl From<&str> for ServiceError {
-    fn from(message: &str) -> Self {
-        Self::Io(message.to_owned())
-    }
-}
-
-impl std::ops::Deref for ServiceError {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.message()
-    }
-}
-
-impl From<tasks::TaskError> for ServiceError {
-    fn from(error: tasks::TaskError) -> Self {
-        match error {
-            tasks::TaskError::Overload(message) => Self::Overload(message, None),
-            tasks::TaskError::Cancelled(message) => Self::Cancelled(message),
-            tasks::TaskError::Io(message) => Self::Io(message),
-        }
-    }
-}
-
 fn task_error(error: tasks::TaskError, task: &Task) -> ServiceError {
     match error {
         tasks::TaskError::Overload(message) => ServiceError::Overload(
             message,
-            Some(files::TaskMeta {
+            Some(TaskMeta {
                 bare_task_id: task.id.clone(),
                 log_path: files::path::display_path(&task.log_path),
             }),
@@ -153,14 +86,14 @@ fn task_error(error: tasks::TaskError, task: &Task) -> ServiceError {
 }
 
 /// Two-phase execution output shared between Agent Presenter and Program Encoder.
-pub(crate) enum PreparedExec {
+pub enum PreparedExec {
     Window(Box<PreparedWindow>),
     Transcript(Box<PreparedTranscript>),
     Screen(Box<PreparedScreen>),
     List(PreparedList),
 }
 
-pub(crate) struct PreparedWindow {
+pub struct PreparedWindow {
     pub(crate) metadata: PreparedSnapshot,
     pub(crate) script: Option<ScriptReport>,
     pub(crate) unseen: Vec<AttachmentLease>,
@@ -182,7 +115,7 @@ pub(crate) struct PreparedWindow {
     pub(crate) read: StagedRead,
 }
 
-pub(crate) struct PreparedTranscript {
+pub struct PreparedTranscript {
     pub(crate) metadata: PreparedSnapshot,
     pub(crate) window: Window,
     pub(crate) transcript_path: String,
@@ -203,7 +136,7 @@ pub(crate) struct PreparedTranscript {
     pub(crate) read: StagedRead,
 }
 
-pub(crate) struct PreparedScreen {
+pub struct PreparedScreen {
     pub(crate) metadata: PreparedSnapshot,
     pub(crate) screen_rows: Vec<String>,
     pub(crate) cols: u16,
@@ -224,7 +157,7 @@ pub(crate) struct PreparedScreen {
     pub(crate) read: StagedRead,
 }
 
-pub(crate) struct PreparedList {
+pub struct PreparedList {
     pub(crate) total_count: usize,
     pub(crate) items: Vec<ListedTask>,
     pub(crate) parent_filter: Option<String>,
@@ -238,11 +171,7 @@ impl PreparedList {
     /// Marks only tasks started by the calling script (top-level, active children, and folded
     /// finished children) reported in `session`, without modifying outer-session entries or
     /// `keeps_reported`.
-    pub(crate) fn commit_program(
-        self,
-        session: &Session,
-        on_started: Option<&codemode::control::ScriptHandle>,
-    ) {
+    pub(crate) fn commit_program(self, session: &Session, on_started: Option<&ScriptControl>) {
         let owns = |task: &Task| on_started.is_some_and(|script| script.owns(&task.id));
         for item in &self.items {
             if owns(&item.task)
@@ -279,18 +208,37 @@ pub struct Service {
     pub(super) daemon: bool,
 }
 
+struct StartWait<'a> {
+    started: tasks::Started,
+    startup_warning: Option<ProbeWarning>,
+    wait_duration: Option<Duration>,
+    when: Option<&'a wait::ReturnWhen>,
+}
+
+struct ReadTarget {
+    task: Arc<Task>,
+    entry: Arc<TaskEntry>,
+    reader: Arc<Reader>,
+    state: tokio::sync::OwnedMutexGuard<ReadState>,
+}
+
+struct OutputRead {
+    action: Action,
+    view: View,
+    ended: Option<WaitEnd>,
+    startup_warning: Option<ProbeWarning>,
+}
+
+struct ListFilter<'a> {
+    scope: Option<ListScope>,
+    state: Option<ListState>,
+    parent_task_id: Option<&'a str>,
+    limit: usize,
+}
+
 impl Service {
     pub fn new(tasks: Arc<Tasks>, daemon: bool) -> Self {
-        let event_bus = Arc::new(crate::events::EventBus::new().unwrap_or_else(|_| {
-            crate::events::EventBus::with_config(
-                tasks.epoch().to_owned(),
-                crate::events::DEFAULT_MAX_EVENTS,
-                crate::events::DEFAULT_MAX_BYTES,
-                1024,
-                Arc::clone(crate::lease::process_pool()),
-            )
-        }));
-        tasks.attach_event_bus(Arc::clone(&event_bus));
+        let event_bus = Arc::clone(tasks.event_bus());
         Self {
             tasks,
             event_bus,
@@ -302,165 +250,26 @@ impl Service {
         &self.event_bus
     }
 
-    /// Agent entrypoint for `exec`: returns pure-text/media `CallToolResult` with `structured_content: None`.
-    pub async fn exec_agent(
+    pub(crate) fn tasks(&self) -> &Arc<Tasks> {
+        &self.tasks
+    }
+
+    pub(crate) async fn wait_and_prepare_agent_start(
         &self,
-        request: Request,
-        mut ctx: ExecContext<'_>,
-        delivery: AgentDelivery<'_>,
-    ) -> files::TrackedResult {
-        self.tasks.prune_entries(ctx.session);
-        match self
-            .exec_core(
-                request,
-                ExecPolicy::AGENT,
-                Consumer::Agent,
-                &mut ctx,
-                delivery.render_slot,
-            )
-            .await
-        {
-            Ok(prepared) => match self.render_agent(prepared, &ctx, &delivery).await {
-                Ok((result, lease, task_meta, payload_owner)) => files::TrackedResult {
-                    result,
-                    lease,
-                    overload: false,
-                    task_meta,
-                    payload_owner,
-                },
-                Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
-                    result: error_result(&message),
-                    lease: None,
-                    overload: true,
-                    task_meta,
-                    payload_owner: Default::default(),
-                },
-                Err(err) => files::TrackedResult::plain(error_result(err.message())),
-            },
-            Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
-                result: error_result(&message),
-                lease: None,
-                overload: true,
-                task_meta,
-                payload_owner: Default::default(),
-            },
-            Err(err) => files::TrackedResult::plain(error_result(err.message())),
-        }
-    }
-
-    /// Agent entrypoint for raw JSON `exec` arguments (daemon IPC / HTTP).
-    pub async fn exec_agent_json(
-        &self,
-        arguments: Value,
-        ctx: ExecContext<'_>,
-        delivery: AgentDelivery<'_>,
-    ) -> files::TrackedResult {
-        match serde_json::from_value::<Request>(arguments) {
-            Ok(request) => self.exec_agent(request, ctx, delivery).await,
-            Err(error) => schema_error(format!("failed to deserialize parameters: {error}")),
-        }
-    }
-
-    /// Agent entrypoint for `codemode`: starts a script task and renders its Agent output.
-    pub async fn codemode_agent(
-        self: &Arc<Self>,
-        request: codemode::control::Request,
-        ctx: ExecContext<'_>,
-        delivery: AgentDelivery<'_>,
-        transfer: bool,
-    ) -> files::TrackedResult {
-        self.tasks.prune_entries(ctx.session);
-        match self
-            .prepare_script(request, &ctx, delivery.render_slot, transfer)
-            .await
-        {
-            Ok(prepared) => match self.render_agent(prepared, &ctx, &delivery).await {
-                Ok((result, lease, task_meta, payload_owner)) => files::TrackedResult {
-                    result,
-                    lease,
-                    overload: false,
-                    task_meta,
-                    payload_owner,
-                },
-                Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
-                    result: error_result(&message),
-                    lease: None,
-                    overload: true,
-                    task_meta,
-                    payload_owner: Default::default(),
-                },
-                Err(err) => files::TrackedResult::plain(error_result(err.message())),
-            },
-            Err(ServiceError::Overload(message, task_meta)) => files::TrackedResult {
-                result: error_result(&message),
-                lease: None,
-                overload: true,
-                task_meta,
-                payload_owner: Default::default(),
-            },
-            Err(err) => files::TrackedResult::plain(error_result(err.message())),
-        }
-    }
-
-    /// Program entrypoint for nested `tools.exec` inside `codemode`.
-    pub(crate) async fn exec_program(
-        &self,
-        request: Request,
-        mut ctx: ExecContext<'_>,
-        delivery: ProgramDelivery<'_>,
-    ) -> codemode::encode::ProgramOutcome {
-        self.tasks.prune_entries(ctx.session);
-        match self
-            .exec_core(
-                request,
-                ExecPolicy::PROGRAM,
-                Consumer::Program,
-                &mut ctx,
-                None,
-            )
-            .await
-        {
-            Ok(prepared) => codemode::encode::encode_exec_program(prepared, &ctx, &delivery),
-            Err(err) => codemode::encode::encode_service_error(err, &ctx, &delivery),
-        }
-    }
-
-    async fn prepare_script(
-        self: &Arc<Self>,
-        request: codemode::control::Request,
+        started: tasks::Started,
+        wait_duration: Option<Duration>,
+        when: Option<&wait::ReturnWhen>,
+        view: View,
         ctx: &ExecContext<'_>,
         render_slot: Option<&RenderSlot<'_>>,
-        transfer: bool,
     ) -> Result<PreparedExec, ServiceError> {
-        let base_launch = ctx.launch();
-        let (start, resolved_cwd) =
-            codemode::control::validate(&request, base_launch).map_err(ServiceError::Validation)?;
-        let view = validate(&start, ExecPolicy::AGENT).map_err(ServiceError::Validation)?;
-        let launch = match resolved_cwd {
-            None => Arc::clone(base_launch),
-            Some(dir) => Arc::new(base_launch.with_cwd(dir)),
-        };
-        let args = ScriptArgs {
-            code: request.code,
-            launch,
-            kill_after_ms: start.kill_after_ms,
-            transfer,
-            call_id: ctx.call_id,
-            service: Arc::clone(self),
-            input_owner: ctx.input_owner.clone(),
-        };
-        let tasks = Arc::clone(&self.tasks);
-        let session = Arc::clone(ctx.session);
-        let key =
-            id::random_chars(4).map_err(|error| format!("Cannot name the reader: {error}"))?;
-        let started = tokio::task::spawn_blocking(move || tasks.start_script(args, &session, key))
-            .await
-            .map_err(|error| format!("Internal failure while starting: {error}."))??;
         self.wait_and_prepare_started(
-            started,
-            None,
-            Some(Duration::from_millis(start.wait_ms.unwrap_or(30_000))),
-            start.return_when.as_ref(),
+            StartWait {
+                started,
+                startup_warning: None,
+                wait_duration,
+                when,
+            },
             view,
             ctx,
             render_slot,
@@ -469,19 +278,20 @@ impl Service {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn wait_and_prepare_started(
         &self,
-        started: tasks::Started,
-        startup_warning: Option<ProbeWarning>,
-        wait_duration: Option<Duration>,
-        when: Option<&wait::ReturnWhen>,
+        start: StartWait<'_>,
         view: View,
         ctx: &ExecContext<'_>,
         render_slot: Option<&RenderSlot<'_>>,
         consumer: Consumer,
     ) -> Result<PreparedExec, ServiceError> {
-        let (task, entry, reader) = started;
+        let StartWait {
+            started: (task, entry, reader),
+            startup_warning,
+            wait_duration,
+            when,
+        } = start;
         let state = read_gate(&reader, &ctx.cancel).await?;
         let mark = wait::mark(&task, &reader, &state, when, ctx.launch().memory())
             .map_err(|error| task_error(error, &task))?;
@@ -502,21 +312,25 @@ impl Service {
             self.prepare_window_or_screen(
                 ctx,
                 render_slot,
-                Action::Start,
-                task,
-                entry,
-                reader,
-                state,
-                view,
-                Some(ended),
-                startup_warning,
+                ReadTarget {
+                    task,
+                    entry,
+                    reader,
+                    state,
+                },
+                OutputRead {
+                    action: Action::Start,
+                    view,
+                    ended: Some(ended),
+                    startup_warning,
+                },
                 consumer,
             ),
         )
         .await
     }
 
-    async fn exec_core(
+    pub(crate) async fn exec_core(
         &self,
         mut request: Request,
         policy: ExecPolicy,
@@ -556,10 +370,12 @@ impl Service {
                 self.prepare_list(
                     ctx,
                     view,
-                    request.scope,
-                    request.state,
-                    request.parent_task_id.as_deref(),
-                    request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
+                    ListFilter {
+                        scope: request.scope,
+                        state: request.state,
+                        parent_task_id: request.parent_task_id.as_deref(),
+                        limit: request.limit.unwrap_or(DEFAULT_LIST_LIMIT) as usize,
+                    },
                     permit,
                 )
             }
@@ -610,10 +426,12 @@ impl Service {
                     .resolve_wait_ms(request.wait_ms, request.return_when.is_some(), false)
                     .map(Duration::from_millis);
                 self.wait_and_prepare_started(
-                    (task, entry, task_reader),
-                    startup_warning,
-                    wait,
-                    request.return_when.as_ref(),
+                    StartWait {
+                        started: (task, entry, task_reader),
+                        startup_warning,
+                        wait_duration: wait,
+                        when: request.return_when.as_ref(),
+                    },
                     view,
                     ctx,
                     render_slot,
@@ -771,14 +589,18 @@ impl Service {
                     self.prepare_window_or_screen(
                         ctx,
                         render_slot,
-                        Action::Poll,
-                        task,
-                        entry,
-                        task_reader,
-                        state,
-                        view,
-                        Some(ended),
-                        None,
+                        ReadTarget {
+                            task,
+                            entry,
+                            reader: task_reader,
+                            state,
+                        },
+                        OutputRead {
+                            action: Action::Poll,
+                            view,
+                            ended: Some(ended),
+                            startup_warning: None,
+                        },
                         consumer,
                     ),
                 )
@@ -820,14 +642,18 @@ impl Service {
                     self.prepare_window_or_screen(
                         ctx,
                         render_slot,
-                        Action::Kill,
-                        task,
-                        entry,
-                        task_reader,
-                        state,
-                        view,
-                        None,
-                        None,
+                        ReadTarget {
+                            task,
+                            entry,
+                            reader: task_reader,
+                            state,
+                        },
+                        OutputRead {
+                            action: Action::Kill,
+                            view,
+                            ended: None,
+                            startup_warning: None,
+                        },
                         consumer,
                     ),
                 )
@@ -863,10 +689,12 @@ impl Service {
                     self.prepare_transcript(
                         ctx,
                         render_slot,
-                        task,
-                        entry,
-                        task_reader,
-                        state,
+                        ReadTarget {
+                            task,
+                            entry,
+                            reader: task_reader,
+                            state,
+                        },
                         view,
                         consumer,
                     ),
@@ -876,42 +704,43 @@ impl Service {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn prepare_window_or_screen(
         &self,
         ctx: &ExecContext<'_>,
         render_slot: Option<&RenderSlot<'_>>,
-        action: Action,
-        task: Arc<Task>,
-        entry: Arc<TaskEntry>,
-        task_reader: Arc<Reader>,
-        state: tokio::sync::OwnedMutexGuard<ReadState>,
-        view: View,
-        ended: Option<WaitEnd>,
-        startup_warning: Option<ProbeWarning>,
+        target: ReadTarget,
+        output_read: OutputRead,
         consumer: Consumer,
     ) -> Result<PreparedExec, ServiceError> {
         let mark_session_entry = consumer == Consumer::Agent
-            || ctx.on_started.is_some_and(|script| script.owns(&task.id));
-        let permit =
-            task_render_permit(render_slot, &ctx.cancel, action, &task, &task_reader).await?;
-        if view.screen {
+            || ctx
+                .on_started
+                .is_some_and(|script| script.owns(&target.task.id));
+        let permit = task_render_permit(
+            render_slot,
+            &ctx.cancel,
+            output_read.action,
+            &target.task,
+            &target.reader,
+        )
+        .await?;
+        if output_read.view.screen {
             return self
-                .prepare_screen(
-                    ctx,
-                    action,
-                    task,
-                    entry,
-                    task_reader,
-                    state,
-                    view,
-                    ended.expect("screen applies to start and poll"),
-                    startup_warning,
-                    permit,
-                    mark_session_entry,
-                )
+                .prepare_screen(ctx, target, output_read, permit, mark_session_entry)
                 .await;
         }
+        let ReadTarget {
+            task,
+            entry,
+            reader: task_reader,
+            state,
+        } = target;
+        let OutputRead {
+            action,
+            view,
+            ended,
+            startup_warning,
+        } = output_read;
         let reader = Arc::clone(&task);
         let launch = ctx.launch();
         let pool = Arc::clone(launch.memory());
@@ -929,7 +758,7 @@ impl Service {
                     .try_acquire(text_workspace_bytes(view.max_bytes))
             })
             .ok_or_else(|| {
-                let meta = files::TaskMeta {
+                let meta = TaskMeta {
                     bare_task_id: task.id.clone(),
                     log_path: files::path::display_path(&task.log_path),
                 };
@@ -993,21 +822,27 @@ impl Service {
         })))
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn prepare_screen(
         &self,
         ctx: &ExecContext<'_>,
-        action: Action,
-        task: Arc<Task>,
-        entry: Arc<TaskEntry>,
-        task_reader: Arc<Reader>,
-        state: tokio::sync::OwnedMutexGuard<ReadState>,
-        view: View,
-        ended: WaitEnd,
-        startup_warning: Option<ProbeWarning>,
+        target: ReadTarget,
+        output_read: OutputRead,
         permit: Option<Arc<OwnedSemaphorePermit>>,
         mark_session_entry: bool,
     ) -> Result<PreparedExec, ServiceError> {
+        let ReadTarget {
+            task,
+            entry,
+            reader: task_reader,
+            state,
+        } = target;
+        let OutputRead {
+            action,
+            view,
+            ended,
+            startup_warning,
+        } = output_read;
+        let ended = ended.expect("screen applies to start and poll");
         let launch = ctx.launch();
         let initial_metadata = PreparedSnapshot::new(&task, launch, action)?;
         let screen = task
@@ -1058,18 +893,20 @@ impl Service {
         })))
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn prepare_transcript(
         &self,
         ctx: &ExecContext<'_>,
         render_slot: Option<&RenderSlot<'_>>,
-        task: Arc<Task>,
-        entry: Arc<TaskEntry>,
-        task_reader: Arc<Reader>,
-        state: tokio::sync::OwnedMutexGuard<ReadState>,
+        target: ReadTarget,
         view: View,
         consumer: Consumer,
     ) -> Result<PreparedExec, ServiceError> {
+        let ReadTarget {
+            task,
+            entry,
+            reader: task_reader,
+            state,
+        } = target;
         let mark_session_entry = consumer == Consumer::Agent
             || ctx.on_started.is_some_and(|script| script.owns(&task.id));
         let launch = ctx.launch();
@@ -1087,7 +924,7 @@ impl Service {
         let workspace = memory
             .try_acquire(text_workspace_bytes(view.max_bytes))
             .ok_or_else(|| {
-                let meta = files::TaskMeta {
+                let meta = TaskMeta {
                     bare_task_id: task.id.clone(),
                     log_path: files::path::display_path(&task.log_path),
                 };
@@ -1204,17 +1041,19 @@ impl Service {
         })))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn prepare_list(
         &self,
         ctx: &ExecContext<'_>,
         view: View,
-        scope: Option<ListScope>,
-        state: Option<ListState>,
-        parent_task_id: Option<&str>,
-        limit: usize,
+        filter: ListFilter<'_>,
         permit: Option<Arc<OwnedSemaphorePermit>>,
     ) -> Result<PreparedExec, ServiceError> {
+        let ListFilter {
+            scope,
+            state,
+            parent_task_id,
+            limit,
+        } = filter;
         if ctx.cancel.is_cancelled() {
             return Err(ServiceError::Cancelled(
                 "Cancelled while listing tasks; retry list.".into(),
@@ -1234,7 +1073,7 @@ impl Service {
             None => parent_id.is_some(),
         };
         let launch = ctx.launch();
-        let workspace = std::cell::RefCell::new(Lease::empty(launch.control_memory()));
+        let workspace = std::cell::RefCell::new(Lease::empty(launch.memory()));
         resize_metadata_workspace(&mut workspace.borrow_mut(), 8192, launch, Action::List)
             .map_err(|message| ServiceError::Overload(message, None))?;
         let active_filter = state.map(|state| state == ListState::Active);

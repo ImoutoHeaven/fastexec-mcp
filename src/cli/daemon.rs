@@ -6,12 +6,12 @@ use crate::config::{
 };
 use crate::daemon;
 use crate::endpoint;
+use crate::env::LaunchContext;
 use crate::events;
 use crate::id;
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::lease;
 use crate::platform::runtime;
-use crate::session::LaunchContext;
 use crate::transport;
 
 /// The hidden `daemon` subcommand: the daemon process itself, and the CLI that starts, inspects,

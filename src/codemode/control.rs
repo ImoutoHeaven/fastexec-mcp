@@ -1,19 +1,19 @@
-//! Script request validation, lifecycle handles, and pending-call accounting.
+//! Script request validation, bridge handles, and pending-call accounting.
 
 use super::bridge::{BRIDGE_ERROR, BRIDGE_LIMIT};
-use crate::id::parse_handle;
+use crate::env::LaunchContext;
 use crate::lease::{BytePool, Lease};
 use crate::service::schema as service_schema;
-use crate::session::LaunchContext;
+use crate::tasks::script::{CallInfo, ScriptControl};
 use crate::tasks::state::AttachmentLease;
 use crate::term::output::Truncate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
-use tokio_util::sync::CancellationToken;
 
 pub(super) const MAX_CODE: usize = 256 * 1024;
 const PENDING_CALLS: usize = 1024;
@@ -94,22 +94,6 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CallInfo {
-    pub tool: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-}
-
-pub(crate) struct ReportSnapshot {
-    pub cancelled: Vec<CallInfo>,
-    pub started: Vec<String>,
-    pub _lease: Lease,
-}
-
 pub(super) struct PendingCall {
     pub(super) info: CallInfo,
     pub(super) bytes: usize,
@@ -122,9 +106,6 @@ pub(super) struct Report {
     pub(super) limit: Option<usize>,
     pub(super) pending: BTreeMap<u64, PendingCall>,
     pub(super) bridge_bytes: usize,
-    pub(super) cancelled: Vec<CallInfo>,
-    pub(super) started: Vec<String>,
-    pub(super) started_ids: HashSet<String>,
 }
 
 impl Report {
@@ -134,25 +115,6 @@ impl Report {
             return limit;
         }
         BRIDGE_LIMIT
-    }
-
-    fn snapshot_bytes(&self) -> usize {
-        let cancelled = self.cancelled.iter().fold(0usize, |bytes, call| {
-            bytes
-                .saturating_add(call.tool.capacity())
-                .saturating_add(call.action.as_ref().map_or(0, String::capacity))
-                .saturating_add(call.task_id.as_ref().map_or(0, String::capacity))
-        });
-        let strings = self.started.iter().fold(cancelled, |bytes, handle| {
-            bytes.saturating_add(handle.capacity())
-        });
-        // Per-item field names and state strings, plus the outer report keys.
-        let fields = self.cancelled.len().saturating_add(self.started.len());
-        // Raw snapshots, JSON values, a candidate copy, and String growth coexist.
-        strings
-            .saturating_add(fields.saturating_mul(32))
-            .saturating_add(64)
-            .saturating_mul(6)
     }
 
     pub(super) fn admit(
@@ -192,6 +154,7 @@ impl Report {
         // Admission failure preserves the old reservation and total together.
         self.bridge_bytes = other_bytes + bytes;
         pending.bytes = bytes;
+        pending.input_owner = Default::default();
         true
     }
 
@@ -204,15 +167,15 @@ impl Report {
 
 pub(crate) enum Outcome {
     Value(crate::lease::Owned<String>),
-    Error(&'static str),
-    Cancelled(&'static str),
+    Error(Cow<'static, str>),
+    Cancelled(Cow<'static, str>),
     Limit,
     Memory(Option<(String, String)>),
 }
 
-pub(super) enum Wake {
-    Settled { id: u64, outcome: Outcome },
-    Stop,
+pub(super) struct SettledCall {
+    pub(super) id: u64,
+    pub(super) outcome: Outcome,
 }
 
 struct HeldAttachment {
@@ -294,63 +257,29 @@ impl Drop for NestedAttachments<'_> {
     }
 }
 
-pub(super) struct Control {
-    pub(super) stopped: AtomicBool,
+pub(super) struct BridgeState {
+    pub(super) control: Arc<ScriptControl>,
     pub(super) exited: AtomicBool,
-    pub(super) cancel: CancellationToken,
-    pub(super) wake: mpsc::Sender<Wake>,
+    pub(super) settled_tx: mpsc::Sender<SettledCall>,
     pub(super) report: Mutex<Report>,
     pub(super) in_flight: (Mutex<usize>, Condvar),
     pub(super) held_attachments: Mutex<AttachmentRegistry>,
-    pub(super) queued_starts: AtomicUsize,
-    pub(super) cancelled_starts: AtomicUsize,
 }
 
 #[derive(Clone)]
-pub struct ScriptHandle(pub(super) Arc<Control>);
+pub(crate) struct BridgeHandle(pub(super) Arc<BridgeState>);
 
-/// Counts an admitted `exec start` from validation until it enters `registry.tasks`,
-/// moving unspawned cancelled starts into `cancelled_starts` on drop.
-pub struct QueuedStartGuard {
-    control: Arc<Control>,
-    armed: bool,
+/// Program-only delivery parameters for the nested `codemode` JS bridge.
+pub(crate) struct ProgramDelivery<'a> {
+    pub(crate) script: &'a BridgeHandle,
+    pub(crate) pending_id: u64,
+    pub(crate) is_control: bool,
 }
 
-impl QueuedStartGuard {
-    pub(super) fn new(script: &ScriptHandle) -> Self {
-        script.0.queued_starts.fetch_add(1, Ordering::Relaxed);
-        Self {
-            control: Arc::clone(&script.0),
-            armed: true,
-        }
-    }
-
-    pub fn disarm(&mut self) {
-        if self.armed {
-            self.armed = false;
-            self.control.queued_starts.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-}
-
-impl Drop for QueuedStartGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.armed = false;
-            self.control.queued_starts.fetch_sub(1, Ordering::Relaxed);
-            if self.control.cancel.is_cancelled() {
-                self.control
-                    .cancelled_starts
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-pub(super) struct InFlightGuard(ScriptHandle);
+pub(super) struct InFlightGuard(BridgeHandle);
 
 impl InFlightGuard {
-    pub(super) fn enter(script: ScriptHandle) -> Self {
+    pub(super) fn enter(script: BridgeHandle) -> Self {
         *lock(&script.0.in_flight.0) += 1;
         Self(script)
     }
@@ -367,12 +296,24 @@ impl Drop for InFlightGuard {
     }
 }
 
-impl ScriptHandle {
-    pub fn list_counts(&self) -> (usize, usize) {
-        (
-            self.0.queued_starts.load(Ordering::Relaxed),
-            self.0.cancelled_starts.load(Ordering::Relaxed),
-        )
+impl BridgeHandle {
+    pub(super) fn new(control: Arc<ScriptControl>, settled_tx: mpsc::Sender<SettledCall>) -> Self {
+        Self(Arc::new(BridgeState {
+            control,
+            exited: AtomicBool::new(false),
+            settled_tx,
+            report: Mutex::new(Report::default()),
+            in_flight: (Mutex::new(0), Condvar::new()),
+            held_attachments: Mutex::default(),
+        }))
+    }
+
+    pub(crate) fn control(&self) -> &ScriptControl {
+        &self.0.control
+    }
+
+    pub(super) fn control_arc(&self) -> &Arc<ScriptControl> {
+        &self.0.control
     }
 
     pub(crate) fn reserve_result(&self, id: u64, bytes: usize) -> bool {
@@ -407,45 +348,9 @@ impl ScriptHandle {
         lock(&self.0.report).limit = Some(limit);
     }
 
-    pub fn kill(&self) {
-        self.0.stopped.store(true, Ordering::Release);
-        self.0.cancel.cancel();
-        let _ = self.0.wake.send(Wake::Stop);
-    }
-
+    #[inline]
     pub(super) fn interrupted(&self) -> bool {
-        self.0.stopped.load(Ordering::Acquire) || self.0.exited.load(Ordering::Acquire)
-    }
-
-    pub fn report(
-        &self,
-        memory: &Arc<BytePool>,
-        control: Option<&Arc<BytePool>>,
-    ) -> Option<ReportSnapshot> {
-        let report = lock(&self.0.report);
-        let bytes = report.snapshot_bytes();
-        let lease = memory
-            .try_acquire(bytes)
-            .or_else(|| control.and_then(|pool| pool.try_acquire(bytes)))?;
-        Some(ReportSnapshot {
-            cancelled: report.cancelled.clone(),
-            started: report.started.clone(),
-            _lease: lease,
-        })
-    }
-
-    pub fn record_started(&self, handle: String) {
-        let mut report = lock(&self.0.report);
-        if let Ok((id, _)) = parse_handle(&handle) {
-            report.started_ids.insert(id.to_owned());
-        }
-        if !report.started.contains(&handle) {
-            report.started.push(handle);
-        }
-    }
-
-    pub fn owns(&self, task_id: &str) -> bool {
-        lock(&self.0.report).started_ids.contains(task_id)
+        self.0.control.is_stopped() || self.0.exited.load(Ordering::Acquire)
     }
 
     pub(crate) fn nested_attachments<'a>(
@@ -488,7 +393,7 @@ impl ScriptHandle {
     }
 
     pub(super) fn cancel_and_drain(&self) {
-        self.0.cancel.cancel();
+        self.0.control.cancel_token().cancel();
         let (count, idle) = &self.0.in_flight;
         let active = lock(count);
         // A start can still be registering its task; only the caller's wait has a deadline.
@@ -498,20 +403,24 @@ impl ScriptHandle {
     pub(super) fn finish(&self) -> crate::lease::Owned<Vec<CallInfo>> {
         let dropped = std::mem::take(&mut *lock(&self.0.held_attachments));
         drop(dropped);
-        let mut report = lock(&self.0.report);
-        report.cancelled = report
-            .pending
-            .values()
-            .map(|pending| pending.info.clone())
-            .collect();
-        let owners: Vec<_> = report
-            .pending
-            .values()
-            .map(|call| call.input_owner.clone())
-            .collect();
-        report.pending.clear();
-        report.bridge_bytes = 0;
-        self.0.cancel.cancel();
-        crate::lease::Owned::new(report.cancelled.clone(), crate::lease::Owner::new(owners))
+        let (cancelled, owners) = {
+            let mut report = lock(&self.0.report);
+            let cancelled: Vec<CallInfo> = report
+                .pending
+                .values()
+                .map(|pending| pending.info.clone())
+                .collect();
+            let owners: Vec<_> = report
+                .pending
+                .values()
+                .map(|call| call.input_owner.clone())
+                .collect();
+            report.pending.clear();
+            report.bridge_bytes = 0;
+            (cancelled, owners)
+        };
+        self.0.control.set_cancelled_calls(cancelled.clone());
+        self.0.control.cancel_token().cancel();
+        crate::lease::Owned::new(cancelled, crate::lease::Owner::new(owners))
     }
 }

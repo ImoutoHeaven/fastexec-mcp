@@ -2,13 +2,18 @@
 //!
 //! Derived from FastCtx `src/shell/bash.rs` (Apache-2.0, Copyright 2026 yc-duan), modified for fastexec.
 
-use crate::session::LaunchContext;
+use crate::env::LaunchContext;
 use std::collections::HashSet;
 #[cfg(windows)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 const OVERRIDE: &str = "FASTEXEC_BASH";
+
+/// The GNU bash for `launch`, found once per session cache and retried after failure.
+pub fn resolve(launch: &LaunchContext) -> Result<PathBuf, String> {
+    launch.cached_bash(find)
+}
 
 /// GNU bash for `ctx`: its override, then its PATH and the usual install roots. Everything comes
 /// from the context, so two sessions can find different bashes.
@@ -166,6 +171,21 @@ fn excluded(path: &Path, ctx: &LaunchContext) -> bool {
 #[cfg(not(windows))]
 fn excluded(_path: &Path, _ctx: &LaunchContext) -> bool {
     false
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn bash_is_found_while_the_starting_directory_is_gone() {
+        let gone = std::env::temp_dir().join(format!("fastexec-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gone);
+        let ctx = LaunchContext::new(gone, std::env::vars_os().collect());
+        let found = resolve(&ctx).expect("bash is found without the session's starting directory");
+        assert!(found.is_file(), "{}", found.display());
+        assert_eq!(resolve(&ctx).unwrap(), found);
+    }
 }
 
 #[cfg(all(test, unix))]

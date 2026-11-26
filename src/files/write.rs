@@ -4,8 +4,8 @@ use super::path::{
     reserve_target_workspace, resolve, target_memory_error, with_path_workspace,
 };
 use super::{FileError, WriteRequest, lock};
+use crate::env::LaunchContext;
 use crate::lease::{BytePool, Lease};
-use crate::session::LaunchContext;
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
 use std::fs::Metadata;
 use std::fs::{File, OpenOptions};

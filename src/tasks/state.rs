@@ -1,17 +1,13 @@
 //! Task runtime state, terminal snapshots, transcript spool, and attachment leases.
 
-use super::workers::{WriterDone, answer_program};
-use super::{
-    EVICTED_TRANSCRIPT, INPUT_QUEUE_LIMIT, INPUT_WRITE_LIMIT, TASK_LOG_LIMIT, TaskError, Tasks,
-    lock,
-};
-use crate::codemode;
+use super::Tasks;
+use super::script::ScriptControl;
 use crate::lease::{BytePool, Lease};
 use crate::media::MediaKind;
 use crate::platform::process::{self, Member, Tree, normalize_members};
-use crate::session::ReadState;
 use crate::term::output::{
-    MATCH_SCAN_BYTES, Matcher, Window, WindowBuilder, WindowSpec, incomplete_legacy_suffix_reader,
+    Cleaner, MATCH_SCAN_BYTES, Matcher, Window, WindowBuilder, WindowSpec,
+    incomplete_legacy_suffix_reader,
 };
 use crate::term::terminal::Live;
 use encoding_rs::Encoding;
@@ -19,14 +15,139 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug)]
+pub enum TaskError {
+    Overload(String),
+    Cancelled(String),
+    Io(String),
+}
+
+impl TaskError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Overload(message) | Self::Cancelled(message) | Self::Io(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<String> for TaskError {
+    fn from(message: String) -> Self {
+        Self::Io(message)
+    }
+}
+
+impl From<&str> for TaskError {
+    fn from(message: &str) -> Self {
+        Self::Io(message.into())
+    }
+}
+
+pub(crate) const TASK_LOG_LIMIT: u64 = 64 << 20;
+/// The error a transcript read returns for a task whose files the total log limit evicted.
+pub const EVICTED_TRANSCRIPT: &str =
+    "The files of this task were evicted under the 4 GiB total limit; its transcript is gone.";
+pub(super) const INPUT_QUEUE_LIMIT: usize = 1 << 20;
+pub(super) const INPUT_WRITE_LIMIT: Duration = Duration::from_secs(5);
+/// How long output may stay open after the root exits and its tree is killed.
+pub const DRAIN_CAP: Duration = Duration::from_secs(2);
+
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The sorted, deduplicated PIDs of `held`.
+pub(crate) fn pids(held: &[Member]) -> Vec<u32> {
+    let mut pids: Vec<u32> = held.iter().map(|member| member.pid).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Where this reader's next read of a task starts, and how much of a PTY task's transcript it
+/// has shown.
+#[derive(Clone, Default)]
+pub struct ReadState {
+    pub cursor: u64,
+    /// Attachments delivered or reported with a degradation receipt.
+    pub attachments_seen: usize,
+    pub lines_before: u64,
+    pub cleaner: Cleaner,
+    /// Bytes and lines of the final transcript lines a result has shown.
+    pub shown: (u64, u64),
+}
+
+pub(super) struct WriterDone(Mutex<bool>, Condvar);
+
+impl WriterDone {
+    pub(super) fn new(done: bool) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(done), Condvar::new()))
+    }
+
+    fn finish(&self) {
+        *lock(&self.0) = true;
+        self.1.notify_all();
+    }
+
+    pub(super) fn wait_until(&self, deadline: Instant) {
+        let mut done = lock(&self.0);
+        while !*done {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let (guard, timeout) = self
+                .1
+                .wait_timeout(done, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            done = guard;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+    }
+}
+
+pub(super) struct WriterDoneGuard(pub(super) Arc<WriterDone>);
+
+impl Drop for WriterDoneGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+/// Sends the terminal emulator's replies to the program. Replies share the input limit; past
+/// it they are dropped, never queued unbounded.
+pub(super) fn answer_program(task: &Task, answer: &mpsc::Sender<Input>, reply: Vec<u8>) {
+    if !reply.is_empty()
+        && task.admit(reply.len())
+        && let Err(error) = answer.send(Input {
+            bytes: reply,
+            eof: false,
+            initial: false,
+            done: None,
+            _input_owner: Default::default(),
+        })
+    {
+        task.queued.fetch_sub(error.0.bytes.len(), Ordering::SeqCst);
+    }
+}
+
 pub(super) enum Root {
     Process(Tree),
-    Script(codemode::control::ScriptHandle),
+    Script(Arc<ScriptControl>),
 }
 
 impl Root {
@@ -34,7 +155,7 @@ impl Root {
         match self {
             Self::Process(tree) => tree.kill(),
             Self::Script(script) => {
-                script.kill();
+                script.stop();
                 Ok(())
             }
         }
@@ -534,7 +655,7 @@ impl Task {
         matches!(self.root, Root::Script(_))
     }
 
-    pub(crate) fn script(&self) -> Option<&codemode::control::ScriptHandle> {
+    pub(crate) fn script(&self) -> Option<&ScriptControl> {
         match &self.root {
             Root::Script(script) => Some(script),
             Root::Process(_) => None,

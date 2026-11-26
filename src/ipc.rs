@@ -1,16 +1,19 @@
 //! The wire between an endpoint and the daemon: length-prefixed JSON frames and the messages they
 //! carry.
 
+use crate::env::Unit;
 #[cfg(test)]
 use crate::lease::FRAME_LIMIT;
 use crate::lease::{BytePool, Lease, Owned, Owner, SHORT_INPUT};
-use crate::session::Unit;
 #[cfg(test)]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// Byte length of the little-endian u32 length prefix on each IPC wire frame.
+pub const FRAME_HEADER_LEN: usize = 4;
 
 /// What a Hello and a Welcome must agree on.
 pub const PROTOCOL: u32 = 6;
@@ -325,7 +328,18 @@ pub fn frame_len<T>(message: &T) -> std::io::Result<usize>
 where
     T: Serialize + ?Sized,
 {
-    Ok(4 + crate::lease::json_len(message)?)
+    Ok(FRAME_HEADER_LEN + crate::lease::json_len(message)?)
+}
+
+/// Exact JSON byte overhead added around a `CallToolResult` body by `ToEndpoint::Result`.
+pub fn result_body_overhead(call_id: u64) -> usize {
+    let empty = rmcp::model::CallToolResult::success(Vec::new());
+    let wrapped = ToEndpoint::Result {
+        id: call_id,
+        result: empty.clone(),
+    };
+    crate::lease::json_len(&wrapped).expect("infallible")
+        - crate::lease::json_len(&empty).expect("infallible")
 }
 
 /// Writes bytes that are already a frame, then flushes them: a frame a reader waits on is never
@@ -921,7 +935,7 @@ pub enum ToEndpoint {
 }
 
 /// Payload capacity of the temporary wire copy, excluding the persistent environment.
-pub(crate) fn launch_wire_capacity(launch: &crate::session::LaunchContext) -> usize {
+pub(crate) fn launch_wire_capacity(launch: &crate::env::LaunchContext) -> usize {
     fn copied(value: &OsStr) -> usize {
         if let Some(text) = value.to_str() {
             return text.len();
@@ -950,7 +964,7 @@ pub(crate) fn launch_wire_capacity(launch: &crate::session::LaunchContext) -> us
 pub fn launch_from_wire(
     cwd: &OsText,
     env: &[(OsText, OsText)],
-) -> Result<crate::session::LaunchContext, String> {
+) -> Result<crate::env::LaunchContext, String> {
     let cwd = cwd
         .to_os_string()
         .map_err(|problem| format!("cwd: {problem}"))?;
@@ -964,11 +978,11 @@ pub fn launch_from_wire(
             .map_err(|problem| format!("env[{index}] value: {problem}"))?;
         entries.push((name, value));
     }
-    Ok(crate::session::LaunchContext::new(cwd.into(), entries))
+    Ok(crate::env::LaunchContext::new(cwd.into(), entries))
 }
 
 /// This context as a Hello carries it.
-pub fn launch_to_wire(launch: &crate::session::LaunchContext) -> (OsText, Vec<(OsText, OsText)>) {
+pub fn launch_to_wire(launch: &crate::env::LaunchContext) -> (OsText, Vec<(OsText, OsText)>) {
     let env = launch
         .env
         .iter()
@@ -1500,7 +1514,7 @@ mod tests {
 
     #[test]
     fn a_launch_context_survives_the_wire() {
-        let context = crate::session::LaunchContext::new(
+        let context = crate::env::LaunchContext::new(
             PathBuf::from("/work"),
             vec![
                 (OsString::from("PATH"), OsString::from("/usr/bin")),
@@ -2176,6 +2190,44 @@ mod tests {
         {
             DaemonFrame::Overload { id } => assert_eq!(id, None),
             _ => panic!("expected Overload {{ id: None }} for EmitEvent"),
+        }
+    }
+
+    #[test]
+    fn result_body_overhead_matches_serialized_result_envelope_across_call_ids() {
+        let mut rich = rmcp::model::CallToolResult::success(vec![
+            rmcp::model::ContentBlock::text("hello 世界\nline 2"),
+            rmcp::model::ContentBlock::image("YWJjZA==".to_owned(), "image/png".to_owned()),
+        ]);
+        rich.meta = Some(rmcp::model::MetaObject(
+            serde_json::json!({"trace": "t-1"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        let err = rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+            "boom: \"quoted\" \\ backslash",
+        )]);
+        for sample in [rich, err] {
+            let body_len = crate::lease::json_len(&sample).unwrap();
+            for call_id in [0, 7, u64::MAX] {
+                let wrapped = ToEndpoint::Result {
+                    id: call_id,
+                    result: sample.clone(),
+                };
+                let wrapped_json = serde_json::to_vec(&wrapped).unwrap();
+                let sample_json = serde_json::to_vec(&sample).unwrap();
+                let overhead = result_body_overhead(call_id);
+                assert_eq!(wrapped_json.len() - sample_json.len(), overhead);
+                assert_eq!(
+                    crate::lease::json_len(&wrapped).unwrap(),
+                    body_len + overhead
+                );
+                assert_eq!(
+                    frame_len(&wrapped).unwrap(),
+                    FRAME_HEADER_LEN + body_len + overhead
+                );
+            }
         }
     }
 }

@@ -117,7 +117,7 @@ pub struct Request {
     pub(super) login_shell: Option<bool>,
     /// start: kill the entire tree, including kept processes, this many ms after launch. Zero or omitted disables it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) kill_after_ms: Option<u64>,
+    pub(crate) kill_after_ms: Option<u64>,
     /// start: keep descendants after bash exits until kill, killAfterMs or owner shutdown (session or daemon). By default they end with bash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) keep_tree: Option<bool>,
@@ -140,10 +140,10 @@ pub struct Request {
     /// start, poll: wait up to 240000 ms per call. Poll again for longer. Ignored by kill and transcript.
     #[schemars(range(min = 0, max = 240000))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) wait_ms: Option<u64>,
+    pub(crate) wait_ms: Option<u64>,
     /// start, poll: any match returns; the task continues. Text conditions take 1-16 case-sensitive literals, 1-4096 bytes each, without line breaks. waitMs defaults to 30000.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) return_when: Option<wait::ReturnWhen>,
+    pub(crate) return_when: Option<wait::ReturnWhen>,
     /// Window placement for all actions. Default head_tail, tail for transcript, head for nested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) truncate: Option<Truncate>,
@@ -185,15 +185,15 @@ pub struct Request {
 
 /// Output options shared by start and poll.
 pub(crate) struct View {
-    pub(super) inline_markers: bool,
-    pub(super) keep_nul: bool,
-    pub(super) truncate: Truncate,
+    pub(crate) inline_markers: bool,
+    pub(crate) keep_nul: bool,
+    pub(crate) truncate: Truncate,
     pub(crate) max_bytes: usize,
-    pub(super) raw: bool,
-    pub(super) encoding: Option<&'static encoding_rs::Encoding>,
-    pub(super) screen: bool,
+    pub(crate) raw: bool,
+    pub(crate) encoding: Option<&'static encoding_rs::Encoding>,
+    pub(crate) screen: bool,
     /// The call set `returnWhen`.
-    pub(super) conditions: bool,
+    pub(crate) conditions: bool,
 }
 
 /// Effective presence of an optional boolean flag in applicability and conflict checks:
@@ -504,7 +504,7 @@ pub(super) fn action_name(action: Action) -> &'static str {
 
 pub(crate) fn validate_cwd(
     dir: &str,
-    launch: &crate::session::LaunchContext,
+    launch: &crate::env::LaunchContext,
 ) -> Result<PathBuf, String> {
     let resolved = files::path::resolve(dir, launch)?;
     if !resolved.is_dir() {

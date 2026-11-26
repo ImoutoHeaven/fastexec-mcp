@@ -1,14 +1,14 @@
 //! Asynchronous host bridge, 256 MiB pending-call budget, permits, and script output writer.
 
-use super::control::{
-    CallInfo, InFlightGuard, Outcome, QueuedStartGuard, ScriptHandle, Wake, lock,
-};
+use super::control::{BridgeHandle, InFlightGuard, Outcome, ProgramDelivery, SettledCall, lock};
 use super::encode::{self, ProgramOutcome};
+use crate::env::LaunchContext;
 use crate::files;
 use crate::service::schema::{self as service_schema, Action};
-use crate::service::{ExecContext, ProgramDelivery, Service};
-use crate::session::{LaunchContext, Session};
+use crate::service::{ExecContext, Service};
 use crate::tasks::TASK_LOG_LIMIT;
+use crate::tasks::script::{CallInfo, QueuedStartGuard};
+use crate::tasks::session::Session;
 use std::io::{PipeWriter, Write};
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -109,7 +109,7 @@ pub(super) struct Host {
     pub(super) call_id: Option<u64>,
     pub(super) parent_task_id: String,
     pub(super) runtime: Handle,
-    pub(super) script: ScriptHandle,
+    pub(super) script: BridgeHandle,
     pub(super) start_permits: Arc<Semaphore>,
     pub(super) io_permits: Arc<Semaphore>,
     pub(super) next: u64,
@@ -210,7 +210,7 @@ impl Host {
         tool: &str,
         arguments: &str,
     ) -> Result<u64, crate::lease::Owned<SyncCallError>> {
-        if self.script.interrupted() || self.script.0.cancel.is_cancelled() {
+        if self.script.interrupted() || self.script.control().cancel_token().is_cancelled() {
             return Err(crate::lease::Owned::new(
                 SyncCallError::Type("The script is ending; no new tool calls can start.".into()),
                 Default::default(),
@@ -327,7 +327,7 @@ impl Host {
                 ));
             }
             self.starts += 1;
-            Some(QueuedStartGuard::new(&self.script))
+            Some(QueuedStartGuard::new(self.script.control_arc()))
         } else {
             None
         };
@@ -351,7 +351,7 @@ impl Host {
         let transfer = self.transfer;
         let call_id = self.call_id;
         let parent_task_id = self.parent_task_id.clone();
-        let cancel = script.0.cancel.child_token();
+        let cancel = script.control().cancel_token().child_token();
         self.runtime
             .spawn(input_owner.clone().hold_future(async move {
                 let _in_flight = in_flight;
@@ -380,34 +380,41 @@ impl Host {
                             () = sleep(ms) => {}
                         }
                         let _ = lock(&script.0.report).result(id, 0);
-                        let _ = script.0.wake.send(Wake::Settled {
-                            id,
-                            outcome: Outcome::Value(crate::lease::Owned::new(
-                                String::new(),
-                                Default::default(),
-                            )),
-                        });
+                        if script
+                            .0
+                            .settled_tx
+                            .send(SettledCall {
+                                id,
+                                outcome: Outcome::Value(crate::lease::Owned::new(
+                                    String::new(),
+                                    Default::default(),
+                                )),
+                            })
+                            .is_ok()
+                        {
+                            script.control().unpark();
+                        }
                         return;
                     }
                     ToolCall::Exec(request) => {
                         let _permit = permit;
-                        service
-                            .exec_program(
-                                *request,
-                                ExecContext {
-                                    session: &session,
-                                    launch: Some(&launch),
-                                    cancel: cancel.clone(),
-                                    progress: None,
-                                    call_id,
-                                    parent_task_id: Some(parent_task_id),
-                                    queued_guard,
-                                    on_started: Some(&script),
-                                    input_owner: input_owner.clone(),
-                                },
-                                delivery,
-                            )
-                            .await
+                        super::exec_program(
+                            &service,
+                            *request,
+                            ExecContext {
+                                session: &session,
+                                launch: Some(&launch),
+                                cancel: cancel.clone(),
+                                progress: None,
+                                call_id,
+                                parent_task_id: Some(parent_task_id),
+                                queued_guard,
+                                on_started: Some(script.control()),
+                                input_owner: input_owner.clone(),
+                            },
+                            delivery,
+                        )
+                        .await
                     }
                     ToolCall::Read(request) => {
                         let permit = permit.expect("read acquires an I/O permit");
@@ -462,6 +469,9 @@ impl Host {
                         })
                     }
                 };
+                if matches!(outcome, Outcome::Cancelled(_)) {
+                    return;
+                }
                 // `admit_bridge_result` already called `script.reserve_result(id, wire_len)` once.
                 // Only unreserved error outcomes update the pending bridge byte count here.
                 if !pre_reserved {
@@ -474,7 +484,14 @@ impl Host {
                         outcome = Outcome::Limit;
                     }
                 }
-                let _ = script.0.wake.send(Wake::Settled { id, outcome });
+                if script
+                    .0
+                    .settled_tx
+                    .send(SettledCall { id, outcome })
+                    .is_ok()
+                {
+                    script.control().unpark();
+                }
             }));
         Ok(id)
     }

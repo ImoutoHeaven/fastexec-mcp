@@ -7,8 +7,8 @@ use super::write::save_target;
 #[cfg(windows)]
 use super::write::windows_file_identity;
 use super::{EditRequest, FileError, lock};
+use crate::env::LaunchContext;
 use crate::lease::{BytePool, Lease};
-use crate::session::LaunchContext;
 use serde::Serialize;
 use std::fmt;
 use std::fs::File;
@@ -636,8 +636,11 @@ pub(super) fn edit_outcome_reserved(
     let source = EditSource::read(resolved, launch.memory()).map_err(map_io)?;
     reserve_target_workspace(&source.target.value, lease, launch.memory()).map_err(map_io)?;
     let mut workspace = EditWorkspace::new(lease, launch.memory().limit());
-    let (mut written, starts, fuzzy_flags) =
-        apply_edits_budgeted(&source.content, request, &shown_path, &mut workspace)?;
+    let AppliedEdits {
+        mut written,
+        starts,
+        fuzzy_flags,
+    } = apply_edits_budgeted(&source.content, request, &shown_path, &mut workspace)?;
     if source.content.starts_with('\u{feff}') && !written.starts_with('\u{feff}') {
         written.insert(0, '\u{feff}');
     }
@@ -671,15 +674,21 @@ fn edit_no_change(path: &str) -> EditError {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct AppliedEdits {
+    pub(super) written: String,
+    pub(super) starts: Vec<usize>,
+    pub(super) fuzzy_flags: Vec<bool>,
+}
+
 /// Matches in LF-normalized text, collects every entry failure (ambiguous, not_found, overlap),
 /// and replaces the corresponding original byte ranges when every entry succeeds.
-#[allow(clippy::type_complexity)]
 pub(super) fn apply_edits_budgeted(
     content: &str,
     request: &EditRequest,
     path: &str,
     workspace: &mut EditWorkspace<'_>,
-) -> Result<(String, Vec<usize>, Vec<bool>), EditError> {
+) -> Result<AppliedEdits, EditError> {
     let size = prepare_edit_workspace(content, request, workspace)?;
     let total = request.edits.len();
     let normalized = LfText::new(content);
@@ -1092,24 +1101,28 @@ pub(super) fn apply_edits_budgeted(
     for edit in &matched {
         fuzzy_flags[edit.index] = edit.fuzzy;
     }
-    Ok((replaced, starts, fuzzy_flags))
+    Ok(AppliedEdits {
+        written: replaced,
+        starts,
+        fuzzy_flags,
+    })
 }
 
 #[cfg(test)]
-#[allow(clippy::type_complexity)]
 pub(super) fn apply_edits(
     content: &str,
     request: &EditRequest,
     path: &str,
-) -> Result<(String, Vec<usize>, Vec<bool>), EditError> {
+) -> Result<(String, Vec<usize>), EditError> {
     let pool = crate::lease::process_pool();
     let mut lease = Lease::empty(pool);
-    apply_edits_budgeted(
+    let applied = apply_edits_budgeted(
         content,
         request,
         path,
         &mut EditWorkspace::new(&mut lease, pool.limit()),
-    )
+    )?;
+    Ok((applied.written, applied.starts))
 }
 
 fn fuzzy_boundary_context(text: &str, at: usize, len: usize) -> Option<(usize, &str)> {

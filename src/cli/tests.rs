@@ -6,13 +6,13 @@ use super::daemon::{
 };
 use super::stdio::{StdioTransport, encode_stdio_frame};
 use crate::config::{InstructionsToolMode, Tools};
+use crate::env::LaunchContext;
 use crate::events;
-use crate::files;
 use crate::lease;
 use crate::mcp::{Backend, RequestLeases, Server, decode_mcp_header_value};
+use crate::render;
+use crate::render::types::TrackedResult;
 use crate::service::Service;
-use crate::service::render as service_render;
-use crate::session::LaunchContext;
 use crate::tasks::{Limits, Tasks};
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::service::RequestContext;
@@ -357,7 +357,7 @@ mod stdio_transport_tests {
         for send in [false, true] {
             let result = CallToolResult::success(vec![ContentBlock::text("already admitted")]);
             let id = rmcp::model::RequestId::Number(7);
-            let payload_bytes = service_render::result_payload_capacity(&result);
+            let payload_bytes = render::result_payload_capacity(&result);
             let wire_bytes =
                 lease::json_len(&result).unwrap() + lease::json_len(&id).unwrap() + 256;
             let pool = lease::BytePool::new(payload_bytes + wire_bytes);
@@ -389,7 +389,7 @@ mod stdio_transport_tests {
                 None,
             );
             let context = RequestContext::new(id.clone(), peer.peer().clone());
-            let tracked = files::TrackedResult {
+            let tracked = TrackedResult {
                 result,
                 overload: false,
                 task_meta: None,

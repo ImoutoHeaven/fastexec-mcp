@@ -3,6 +3,7 @@
 use crate::codemode;
 use crate::config::{InstructionsToolMode, Tools, compose_instructions};
 use crate::endpoint;
+use crate::env::LaunchContext;
 use crate::events;
 use crate::files;
 use crate::http;
@@ -10,12 +11,14 @@ use crate::id;
 use crate::ingress;
 use crate::ipc;
 use crate::lease;
+use crate::render;
+use crate::render::files::{self as render_files, publish_transfer, transfer_error};
+use crate::render::types::{AgentDelivery, TrackedResult};
 use crate::service::core::overload_task_message;
-use crate::service::render as service_render;
 use crate::service::schema::{Action, Request};
-use crate::service::{AgentDelivery, ExecContext, Service};
-use crate::session::{LaunchContext, Session};
-use crate::transfer::{self, TransferEndpoint, publish_transfer, transfer_error};
+use crate::service::{ExecContext, Service};
+use crate::tasks::session::Session;
+use crate::transfer::{self, TransferEndpoint};
 use crate::wait;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -285,7 +288,7 @@ pub(crate) fn host_line(launch: &LaunchContext) -> String {
     let user = value("USER")
         .or_else(|| value("USERNAME"))
         .unwrap_or_else(|| "unknown".to_owned());
-    let home = launch.home().map_or_else(
+    let home = files::path::resolve_home(launch).map_or_else(
         || "unknown".to_owned(),
         |home| files::path::display_path(&home),
     );
@@ -785,7 +788,15 @@ impl Server {
                         frame = stream.next() => {
                             let Some((frame, held)) = frame else {
                                 if !terminated_sent {
-                                    let error = if stream.link_closed() {
+                                    let error = if stream.overflowed() {
+                                        ipc::IpcEventError {
+                                            code: -32025,
+                                            message:
+                                                "endpoint event stream queue full due to slow consumer"
+                                                    .to_owned(),
+                                            data: None,
+                                        }
+                                    } else if stream.link_closed() {
                                         ipc::IpcEventError {
                                             code: -32000,
                                             message: "daemon connection closed".to_owned(),
@@ -969,16 +980,16 @@ impl Server {
                         input_owner: request_input_owner(&context),
                     };
                     let delivery = AgentDelivery {
-                        render_slot: None,
+                        daemon_ipc: None,
                         http_response: http_context(&context),
                         rpc_id_bytes: lease::json_len(&context.id).unwrap_or(usize::MAX),
                     };
-                    let tracked = service.exec_agent(request, ctx, delivery).await;
+                    let tracked = render::exec_agent(service, request, ctx, delivery).await;
                     self.deliver_local(&context, tracked, launch, is_control)
                 }
                 Err(message) => {
                     let err = CallToolResult::error(vec![ContentBlock::text(message)]);
-                    self.deliver_local(&context, files::TrackedResult::plain(err), launch, true)
+                    self.deliver_local(&context, TrackedResult::plain(err), launch, true)
                 }
             },
         }
@@ -1024,7 +1035,7 @@ impl Server {
                     }
                 };
                 let (progress, _forwarder) = progress(&context);
-                let ctx = ExecContext {
+                let mut ctx = ExecContext {
                     session: &session,
                     launch: None,
                     cancel: context.ct.clone(),
@@ -1036,13 +1047,19 @@ impl Server {
                     input_owner: request_input_owner(&context),
                 };
                 let delivery = AgentDelivery {
-                    render_slot: None,
+                    daemon_ipc: None,
                     http_response: http_context(&context),
                     rpc_id_bytes: lease::json_len(&context.id).unwrap_or(usize::MAX),
                 };
-                let tracked = service
-                    .codemode_agent(request, ctx, delivery, self.tools.transfer)
-                    .await;
+                let outcome = crate::codemode::prepare_script(
+                    service,
+                    request,
+                    &mut ctx,
+                    None,
+                    self.tools.transfer,
+                )
+                .await;
+                let tracked = render::finish_exec_agent(service, outcome, &ctx, &delivery).await;
                 self.deliver_local(&context, tracked, launch, false)
             }
         }
@@ -1061,7 +1078,7 @@ impl Server {
         }
         match &self.backend {
             Backend::Local { launch, .. } => {
-                let tracked = files::read_tracked(
+                let tracked = render_files::read_tracked(
                     request,
                     Arc::clone(launch),
                     self.tools.transfer,
@@ -1094,7 +1111,7 @@ impl Server {
         }
         match &self.backend {
             Backend::Local { launch, .. } => {
-                let res = files::write_tracked(
+                let res = render_files::write_tracked(
                     request,
                     Arc::clone(launch),
                     request_input_owner(&context),
@@ -1125,9 +1142,12 @@ impl Server {
         }
         match &self.backend {
             Backend::Local { launch, .. } => {
-                let res =
-                    files::edit_tracked(request, Arc::clone(launch), request_input_owner(&context))
-                        .await;
+                let res = render_files::edit_tracked(
+                    request,
+                    Arc::clone(launch),
+                    request_input_owner(&context),
+                )
+                .await;
                 self.deliver_local(&context, res, launch, false)
             }
             Backend::Daemon(endpoint) => {
@@ -1162,7 +1182,7 @@ impl Server {
             }
             Backend::Local { launch, .. } => {
                 let res = match &self.transfer {
-                    None => files::TrackedResult::plain(transfer_error(
+                    None => TrackedResult::plain(transfer_error(
                         "transfer is disabled; set FASTEXEC_TRANSFER=true.".to_owned(),
                     )),
                     Some(TransferEndpoint::Fixed { table, base }) => {
@@ -1197,7 +1217,7 @@ impl Server {
                                 )
                                 .await
                             }
-                            Err(message) => files::TrackedResult::plain(transfer_error(message)),
+                            Err(message) => TrackedResult::plain(transfer_error(message)),
                         }
                     }
                 };
@@ -1247,7 +1267,7 @@ impl Server {
     pub(crate) fn deliver_local(
         &self,
         context: &RequestContext<RoleServer>,
-        mut tracked: files::TrackedResult,
+        mut tracked: TrackedResult,
         launch: &LaunchContext,
         is_control: bool,
     ) -> CallToolResult {
@@ -1257,10 +1277,8 @@ impl Server {
             return tracked.result;
         }
         let use_control = is_control || tracked.result.is_error == Some(true);
-        let b64_bytes = service_render::unleased_result_payload_capacity(
-            &tracked.result,
-            &tracked.payload_owner,
-        );
+        let b64_bytes =
+            render::unleased_result_payload_capacity(&tracked.result, &tracked.payload_owner);
         let exact_json = lease::json_len(&tracked.result).unwrap_or(usize::MAX);
         let id_bytes = lease::json_len(&context.id).unwrap_or(usize::MAX);
         let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
@@ -1289,8 +1307,7 @@ impl Server {
                 .unwrap_or(usize::MAX)
                 .saturating_add(id_bytes)
                 .saturating_add(256);
-            let err_peak =
-                service_render::result_payload_capacity(&err).saturating_add(err_outbound);
+            let err_peak = render::result_payload_capacity(&err).saturating_add(err_outbound);
             if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
                 .then(|| launch.control_memory().try_acquire(err_peak))
                 .flatten()
@@ -1325,7 +1342,7 @@ impl Server {
     fn deliver_daemon(
         &self,
         context: &RequestContext<RoleServer>,
-        mut tracked: files::TrackedResult,
+        mut tracked: TrackedResult,
         endpoint: &endpoint::Endpoint,
         is_control: bool,
     ) -> CallToolResult {
@@ -1336,10 +1353,8 @@ impl Server {
         let pool = endpoint.memory();
         let control_pool = endpoint.control_memory();
         let use_control = is_control || tracked.result.is_error == Some(true);
-        let b64_bytes = service_render::unleased_result_payload_capacity(
-            &tracked.result,
-            &tracked.payload_owner,
-        );
+        let b64_bytes =
+            render::unleased_result_payload_capacity(&tracked.result, &tracked.payload_owner);
         let exact_json = lease::json_len(&tracked.result).unwrap_or(usize::MAX);
         let id_bytes = lease::json_len(&context.id).unwrap_or(usize::MAX);
         let outbound_bytes = exact_json.saturating_add(id_bytes).saturating_add(256);
@@ -1356,8 +1371,7 @@ impl Server {
                 .unwrap_or(usize::MAX)
                 .saturating_add(id_bytes)
                 .saturating_add(256);
-            let err_peak =
-                service_render::result_payload_capacity(&err).saturating_add(err_outbound);
+            let err_peak = render::result_payload_capacity(&err).saturating_add(err_outbound);
             if let Some(mut err_lease) = (err_peak <= lease::CONTROL_LIMIT)
                 .then(|| control_pool.try_acquire(err_peak))
                 .flatten()

@@ -3,8 +3,9 @@
 
 use crate::config::{InstructionsToolMode, Tools};
 use crate::daemon::Daemon;
+use crate::env::LaunchContext;
 use crate::mcp::{Backend, Server};
-use crate::session::{LaunchContext, Session};
+use crate::tasks::session::Session;
 use crate::transfer::{self, Admitted, TransferEndpoint, Transfers};
 use bytes::Bytes;
 use http::header::HeaderName;

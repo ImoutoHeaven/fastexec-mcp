@@ -1,7 +1,7 @@
 //! Process configuration: environment parsing, listen-address checks, and server instructions.
 
+use crate::env::{self, LaunchContext};
 use crate::files;
-use crate::session::{self, LaunchContext};
 use std::sync::Arc;
 
 /// Optional fixed `host:port` listener address for standalone `/t/` transfers.
@@ -36,8 +36,8 @@ pub struct Tools {
 
 impl Tools {
     pub fn from_env() -> Result<Self, String> {
-        session::parse_image_compress(std::env::var_os(session::IMAGE_COMPRESS).as_deref())?;
-        session::parse_max_media_bytes(std::env::var_os(session::MAX_MEDIA_BYTES).as_deref())?;
+        env::parse_image_compress(std::env::var_os(env::IMAGE_COMPRESS).as_deref())?;
+        env::parse_max_media_bytes(std::env::var_os(env::MAX_MEDIA_BYTES).as_deref())?;
         Ok(Self {
             codemode: codemode()?,
             transfer: transfer()?,

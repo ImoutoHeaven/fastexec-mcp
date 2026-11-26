@@ -2,7 +2,8 @@
 //! handle registration with rollback, and single-peak bridge memory admission.
 
 use super::bridge::BRIDGE_LIMIT;
-use super::control::{CallInfo, Outcome};
+use super::control::{Outcome, ProgramDelivery};
+use crate::env::{LaunchContext, ProbeWarning};
 use crate::files::{
     self, EditError, EditFailure, EditMatch, FileEditData, FileError, FileReadData, FileWriteData,
     MediaPayload,
@@ -15,13 +16,14 @@ use crate::service::core::{
 use crate::service::schema::Action;
 use crate::service::{
     ExecContext, PreparedExec, PreparedList, PreparedScreen, PreparedTranscript, PreparedWindow,
-    ProgramDelivery, ServiceError,
+    ServiceError,
 };
-use crate::session::{LaunchContext, ProbeWarning};
+use crate::tasks::script::CallInfo;
 use crate::tasks::state::{Snapshot, Task};
 use crate::term::output;
 use crate::wait::WaitEnd;
 use serde::Serialize;
+use std::borrow::Cow;
 use tokio_util::sync::CancellationToken;
 
 /// Outcome of encoding a Program tool call, tracking whether `script.reserve_result` was
@@ -55,14 +57,14 @@ impl ProgramOutcome {
 
     pub(crate) fn error(message: &'static str, pre_reserved: bool) -> Self {
         Self {
-            outcome: Outcome::Error(message),
+            outcome: Outcome::Error(Cow::Borrowed(message)),
             pre_reserved,
         }
     }
 
-    pub(crate) fn cancelled(message: &'static str) -> Self {
+    pub(crate) fn cancelled(message: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            outcome: Outcome::Cancelled(message),
+            outcome: Outcome::Cancelled(message.into()),
             pre_reserved: false,
         }
     }
@@ -1160,7 +1162,7 @@ pub(crate) fn encode_service_error(
     let (code, message, task_meta) = match err {
         ServiceError::Validation(msg) => ("VALIDATION", msg, None),
         ServiceError::NotFound(msg) => ("NOT_FOUND", msg, None),
-        ServiceError::Cancelled(msg) => ("CANCELLED", msg, None),
+        ServiceError::Cancelled(msg) => return ProgramOutcome::cancelled(msg),
         ServiceError::Overload(msg, meta) => ("OVERLOAD", msg, meta),
         ServiceError::Io(msg) => ("IO", msg, None),
     };
@@ -1288,6 +1290,7 @@ pub(crate) fn encode_read_program(
         Ok(FileReadData::Media(MediaPayload::Inline { .. })) => {
             unreachable!("ReadPolicy::PROGRAM uses MediaReadMode::DescriptorOnly")
         }
+        Err(FileError::Cancelled(msg)) => ProgramOutcome::cancelled(msg),
         Err(err) => {
             let code = file_error_code(&err);
             let msg = err.into_message();
@@ -1445,8 +1448,7 @@ mod tests {
                 .with_memory(std::sync::Arc::clone(&memory));
             let mut lease = memory.try_acquire(4096).unwrap();
             let body = String::from("retained output");
-            let (script, worker) =
-                crate::codemode::prepare(tokio::runtime::Handle::current()).unwrap();
+            let (_control, script, worker) = crate::codemode::prepare_worker().unwrap();
             script.test_pending_result(1, 0, if cancelled { 4096 } else { 1 });
             let cancel = CancellationToken::new();
             if cancelled {

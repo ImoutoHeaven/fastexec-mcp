@@ -4,11 +4,11 @@
 //! Object are derived from FastCtx `src/shell/process.rs` and `src/process_policy.rs`
 //! (Apache-2.0, Copyright 2026 yc-duan), modified for fastexec.
 
+#[cfg(windows)]
+use crate::env::var_in;
+use crate::env::{LaunchContext, ProbeWarning, Unit};
 #[cfg(unix)]
 use crate::platform::unix_pty::open as open_pty;
-use crate::session::LaunchContext;
-#[cfg(windows)]
-use crate::session::var_in;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -473,7 +473,7 @@ fn write_env_dump(
             out.write_all(&bytes)?;
         }
     }
-    out.write_all(&[0; size_of::<crate::session::Unit>()])?;
+    out.write_all(&[0; size_of::<Unit>()])?;
     out.flush()
 }
 
@@ -606,7 +606,7 @@ mod env_tests {
         let mut bytes = b"profile output\n".to_vec();
         write_env_dump(&mut bytes, vars.clone()).unwrap();
         assert_eq!(parse_env_dump(&bytes).unwrap(), vars);
-        for cut in 1..=2 * size_of::<crate::session::Unit>() {
+        for cut in 1..=2 * size_of::<Unit>() {
             assert!(parse_env_dump(&bytes[..bytes.len() - cut]).is_err());
         }
         let mut empty = Vec::new();
@@ -762,8 +762,17 @@ pub(crate) fn bash_version(
     )
 }
 
+/// Returns `(base_env, used_snapshot, one_time_warning)` for a task launch.
+pub fn task_env<'a>(
+    launch: &'a LaunchContext,
+    bash: &Path,
+    login: bool,
+) -> (&'a [(OsString, OsString)], bool, Option<ProbeWarning>) {
+    launch.cached_task_env(login, |ctx| probe_login_env(bash, ctx))
+}
+
 /// Probes `bash -l` once per session to capture the login environment snapshot.
-pub(crate) fn probe_login_env(
+fn probe_login_env(
     bash: &Path,
     context: &LaunchContext,
 ) -> Result<Vec<(OsString, OsString)>, String> {

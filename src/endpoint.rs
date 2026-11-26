@@ -6,15 +6,16 @@
 //! connection: each call carries an ID that stays its name across a reconnect, so a caller's
 //! `Cancel` still names the right call after the link was replaced.
 
+use crate::env::LaunchContext;
 use crate::ipc::{self, ToDaemon, ToEndpoint};
 use crate::platform::runtime;
-use crate::session::LaunchContext;
+use crate::render::types::TrackedResult;
 use crate::transport;
 use crate::wait;
 use rmcp::model::{CallToolResult, ContentBlock};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, OnceCell, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -83,27 +84,34 @@ struct Link {
     epoch: String,
     writer: Mutex<Option<Writer>>,
     pending: std::sync::Mutex<HashMap<u64, Pending>>,
-    event_pending:
-        std::sync::Mutex<HashMap<u64, mpsc::Sender<(ipc::EventWireFrame, crate::lease::Lease)>>>,
+    event_pending: std::sync::Mutex<HashMap<u64, PendingEvent>>,
     /// Cancelled when the link ends: every call on it is lost, and the reader stops.
     closed: CancellationToken,
     memory: Arc<crate::lease::BytePool>,
     control_memory: Arc<crate::lease::BytePool>,
 }
 
+#[derive(Clone)]
+struct PendingEvent {
+    tx: mpsc::Sender<(ipc::EventWireFrame, crate::lease::Lease)>,
+    overflowed: Option<Arc<AtomicBool>>,
+}
+
 /// Removes the event routing entry (and optionally cancels a stream) if dropped before `disarm`.
 struct EventRegistration {
     link: Arc<Link>,
     id: u64,
+    overflowed: Option<Arc<AtomicBool>>,
     active: bool,
     cancel_on_drop: bool,
 }
 
 impl EventRegistration {
-    fn new(link: Arc<Link>, id: u64) -> Self {
+    fn new(link: Arc<Link>, id: u64, overflowed: Option<Arc<AtomicBool>>) -> Self {
         Self {
             link,
             id,
+            overflowed,
             active: true,
             cancel_on_drop: false,
         }
@@ -124,7 +132,11 @@ impl Drop for EventRegistration {
             return;
         }
         lock(&self.link.event_pending).remove(&self.id);
-        if self.cancel_on_drop && !self.link.closed.is_cancelled() {
+        let already_overflowed = self
+            .overflowed
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
+        if self.cancel_on_drop && !already_overflowed && !self.link.closed.is_cancelled() {
             tokio::spawn(Arc::clone(&self.link).cancel_event(self.id));
         }
     }
@@ -135,6 +147,7 @@ pub struct EndpointEventStream {
     link: Arc<Link>,
     id: u64,
     rx: mpsc::Receiver<(ipc::EventWireFrame, crate::lease::Lease)>,
+    overflowed: Arc<AtomicBool>,
     cancelled: bool,
 }
 
@@ -147,20 +160,26 @@ impl EndpointEventStream {
         self.link.closed.is_cancelled()
     }
 
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+    }
+
     pub async fn cancel(&mut self) {
         if self.cancelled {
             return;
         }
         self.cancelled = true;
         lock(&self.link.event_pending).remove(&self.id);
-        Arc::clone(&self.link).cancel_event(self.id).await;
+        if !self.overflowed() {
+            Arc::clone(&self.link).cancel_event(self.id).await;
+        }
     }
 }
 
 impl Drop for EndpointEventStream {
     fn drop(&mut self) {
         lock(&self.link.event_pending).remove(&self.id);
-        if !self.cancelled && !self.link.closed.is_cancelled() {
+        if !self.cancelled && !self.overflowed() && !self.link.closed.is_cancelled() {
             tokio::spawn(Arc::clone(&self.link).cancel_event(self.id));
         }
     }
@@ -322,8 +341,8 @@ impl Endpoint {
         client_name: &str,
         cancel: CancellationToken,
         progress: Option<watch::Sender<Option<wait::Progress>>>,
-    ) -> crate::files::TrackedResult {
-        let plain_err = |msg: String| crate::files::TrackedResult::plain(error(msg));
+    ) -> TrackedResult {
+        let plain_err = |msg: String| TrackedResult::plain(error(msg));
         let action = arguments
             .get("action")
             .and_then(|action| action.as_str())
@@ -372,17 +391,15 @@ impl Endpoint {
             request_id: request_id.clone(),
             arguments,
         };
-        let lost =
-            || crate::files::TrackedResult::plain(self.lost(&link, tool, &action, id, &request_id));
-        let to_tracked = |(result, lease): (CallToolResult, Option<crate::lease::Lease>)| {
-            crate::files::TrackedResult {
+        let lost = || TrackedResult::plain(self.lost(&link, tool, &action, id, &request_id));
+        let to_tracked =
+            |(result, lease): (CallToolResult, Option<crate::lease::Lease>)| TrackedResult {
                 result,
-                lease,
                 overload: false,
                 task_meta: None,
+                lease,
                 payload_owner: Default::default(),
-            }
-        };
+            };
         let mut attempted = false;
         let sent = tokio::select! {
             biased;
@@ -472,7 +489,13 @@ impl Endpoint {
         )?;
         let epoch = match tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            handshake(&mut client, hello, identity),
+            handshake_in(
+                &mut client,
+                hello,
+                identity,
+                self.memory(),
+                self.control_memory(),
+            ),
         )
         .await
         {
@@ -586,8 +609,14 @@ impl Endpoint {
         };
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel(EVENT_RPC_CHANNEL_CAPACITY);
-        lock(&link.event_pending).insert(id, tx);
-        let _reg = EventRegistration::new(Arc::clone(&link), id);
+        lock(&link.event_pending).insert(
+            id,
+            PendingEvent {
+                tx,
+                overflowed: None,
+            },
+        );
+        let _reg = EventRegistration::new(Arc::clone(&link), id, None);
         let mut attempted = false;
         let frame = ToDaemon::EventsList { id };
         let sent = tokio::select! {
@@ -658,8 +687,14 @@ impl Endpoint {
         };
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel(EVENT_RPC_CHANNEL_CAPACITY);
-        lock(&link.event_pending).insert(id, tx);
-        let _reg = EventRegistration::new(Arc::clone(&link), id);
+        lock(&link.event_pending).insert(
+            id,
+            PendingEvent {
+                tx,
+                overflowed: None,
+            },
+        );
+        let _reg = EventRegistration::new(Arc::clone(&link), id, None);
         let mut attempted = false;
         let frame = ToDaemon::EventsPoll { id, request };
         let sent = tokio::select! {
@@ -734,8 +769,15 @@ impl Endpoint {
         };
         let id = self.next_call.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel(EVENT_STREAM_CHANNEL_CAPACITY);
-        lock(&link.event_pending).insert(id, tx);
-        let mut reg = EventRegistration::new(Arc::clone(&link), id);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        lock(&link.event_pending).insert(
+            id,
+            PendingEvent {
+                tx,
+                overflowed: Some(Arc::clone(&overflowed)),
+            },
+        );
+        let mut reg = EventRegistration::new(Arc::clone(&link), id, Some(Arc::clone(&overflowed)));
         let mut attempted = false;
         let frame = ToDaemon::EventsStream { id, request };
         let sent = tokio::select! {
@@ -779,6 +821,7 @@ impl Endpoint {
                         link,
                         id,
                         rx,
+                        overflowed,
                         cancelled: false,
                     },
                 ))
@@ -918,15 +961,24 @@ async fn read_loop(
                 }
             }
             Some(ipc::LeasedEndpointFrame::Frame(ToEndpoint::EventFrame { id, frame }, lease)) => {
-                let sender = lock(&link.event_pending).get(&id).cloned();
-                if let Some(tx) = sender {
-                    if let Err(err) = tx.try_send((frame, lease)) {
+                let pending = lock(&link.event_pending).get(&id).cloned();
+                if let Some(entry) = pending {
+                    if let Err(err) = entry.tx.try_send((frame, lease)) {
                         // Drop this stream's sender when its bounded buffer fills so the shared IPC link keeps moving.
-                        lock(&link.event_pending).remove(&id);
+                        let removed = lock(&link.event_pending).remove(&id).is_some();
                         let (frame, lease) = match err {
-                            mpsc::error::TrySendError::Full(item)
-                            | mpsc::error::TrySendError::Closed(item) => item,
+                            mpsc::error::TrySendError::Full(item) => {
+                                if let Some(overflowed) = &entry.overflowed {
+                                    overflowed.store(true, Ordering::Release);
+                                }
+                                if removed {
+                                    tokio::spawn(Arc::clone(&link).cancel_event(id));
+                                }
+                                item
+                            }
+                            mpsc::error::TrySendError::Closed(item) => item,
                         };
+                        drop(entry);
                         drop(frame);
                         drop(lease);
                     }
@@ -949,18 +1001,16 @@ async fn read_loop(
                 }
             }
             Some(ipc::LeasedEndpointFrame::OverloadEvent { id: Some(id) }) => {
-                if let Some(tx) = lock(&link.event_pending).remove(&id) {
+                if let Some(entry) = lock(&link.event_pending).remove(&id) {
                     let frame = ipc::EventWireFrame::Terminated(ipc::IpcEventError {
                         code: -32025,
                         message: "endpoint active memory budget full during event stream".into(),
                         data: None,
                     });
                     if let Ok(bytes) = crate::lease::json_len(&frame)
-                        && let Some(lease) = control_pool
-                            .try_acquire(bytes)
-                            .or_else(|| crate::lease::control_pool().try_acquire(bytes))
+                        && let Some(lease) = control_pool.try_acquire(bytes)
                     {
-                        let _ = tx.try_send((frame, lease));
+                        let _ = entry.tx.try_send((frame, lease));
                     }
                 }
             }
@@ -1031,11 +1081,28 @@ pub(crate) async fn handshake(
     hello: crate::lease::Owned<ToDaemon>,
     identity: &runtime::Identity,
 ) -> Result<String, SetupError> {
+    handshake_in(
+        client,
+        hello,
+        identity,
+        crate::lease::process_pool(),
+        crate::lease::control_pool(),
+    )
+    .await
+}
+
+async fn handshake_in(
+    client: &mut transport::Client,
+    hello: crate::lease::Owned<ToDaemon>,
+    identity: &runtime::Identity,
+    main: &Arc<crate::lease::BytePool>,
+    control: &Arc<crate::lease::BytePool>,
+) -> Result<String, SetupError> {
     {
         let frame = ipc::encode_frame_leased(
             &hello.value,
-            crate::lease::process_pool(),
-            crate::lease::control_pool(),
+            main,
+            control,
             ipc::daemon_control(&hello.value),
         )
         .map_err(|error| {
@@ -1049,13 +1116,9 @@ pub(crate) async fn handshake(
             .await
             .map_err(|error| SetupError::Other(format!("cannot send the Hello: {error}")))?;
     }
-    match ipc::read_endpoint_frame_leased(
-        client,
-        crate::lease::FRAME_LIMIT,
-        crate::lease::process_pool(),
-        crate::lease::control_pool(),
-        |_| false,
-    )
+    match ipc::read_endpoint_frame_leased(client, crate::lease::FRAME_LIMIT, main, control, |_| {
+        false
+    })
     .await
     {
         Ok(ipc::LeasedEndpointFrame::Frame(
@@ -1656,7 +1719,8 @@ mod tests {
                 "drop_registration" => {
                     let mut stream = stream.take().unwrap();
                     stream.cancelled = true;
-                    let mut registration = EventRegistration::new(Arc::clone(&link), stream.id);
+                    let mut registration =
+                        EventRegistration::new(Arc::clone(&link), stream.id, None);
                     registration.arm_cancel();
                     drop(registration);
                     drop(stream);
@@ -3217,5 +3281,498 @@ mod tests {
         drop(link);
         drop(endpoint);
         finish(peer).await;
+    }
+
+    #[tokio::test]
+    async fn link_handshake_and_overload_event_stay_isolated_to_endpoint_pools() {
+        // 1. `Endpoint::link` handshake must charge `self.memory()` / `self.control_memory()`,
+        //    never falling back to global `process_pool()` / `control_pool()`.
+        let (identity, paths, mut listener, _target) = test_daemon("isolated-handshake");
+        let response = welcome(&identity);
+        let (ready_for_oversized_tx, ready_for_oversized_rx) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut ready_for_oversized_rx = Some(ready_for_oversized_rx);
+            // Attempt 1: `hello_owned` succeeds, but encoding `Hello` runs out of isolated pools.
+            let mut first = listener.accept().await.unwrap();
+            assert!(
+                ipc::read_frame::<_, ToDaemon>(&mut first, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "Hello encoding must fail against the endpoint pools before writing bytes"
+            );
+            drop(first);
+
+            // Attempt 2: `Hello` encodes and arrives, but reading `Welcome` exceeds isolated pools.
+            let mut second = listener.accept().await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut second, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Hello { .. })
+            ));
+            let mut large_welcome = response.clone();
+            if let ToEndpoint::Welcome { epoch, .. } = &mut large_welcome {
+                *epoch = "e".repeat(2048);
+            }
+            ipc::write_frame(&mut second, &large_welcome).await.unwrap();
+            drop(second);
+
+            // Attempt 3: `Link` connects cleanly; then an oversized `EventFrame` triggers
+            // `OverloadEvent`. When the isolated `control` pool is full, it must NOT pierce into
+            // `lease::control_pool()` to synthesize a `Terminated` frame; when `control` has room,
+            // the `Terminated` lease comes strictly from `control`.
+            let mut third = listener.accept().await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut third, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Hello { .. })
+            ));
+            ipc::write_frame(&mut third, &response).await.unwrap();
+            for expected_streams in 0..2 {
+                let Some(ToDaemon::EventsStream { id, .. }) =
+                    ipc::read_frame::<_, ToDaemon>(&mut third, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap()
+                else {
+                    panic!("expected subscription {expected_streams}");
+                };
+                ipc::write_frame(
+                    &mut third,
+                    &ToEndpoint::EventFrame {
+                        id,
+                        frame: ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                            cursor: "ep000001:0".into(),
+                            truncated: false,
+                            heartbeat_ms: 30_000,
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+                if let Some(rx) = ready_for_oversized_rx.take() {
+                    rx.await.unwrap();
+                }
+                ipc::write_frame(
+                    &mut third,
+                    &ToEndpoint::EventFrame {
+                        id,
+                        frame: ipc::EventWireFrame::Event(crate::events::StreamEvent {
+                            event_id: format!("ev-{expected_streams}"),
+                            name: crate::events::EVENT_EXTERNAL.into(),
+                            timestamp: "2026-11-26T00:00:00.000Z".into(),
+                            data: serde_json::json!({"pad": "x".repeat(72 * 1024)}),
+                            cursor: "ep000001:1".into(),
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut third, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == id
+                ));
+            }
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut third, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Bye)
+            ));
+        });
+
+        let base_launch = LaunchContext::new(std::env::temp_dir(), Vec::new());
+        let session = "s".repeat(26);
+        let copied = ipc::launch_wire_capacity(&base_launch)
+            + identity.namespace.len()
+            + identity.build.len()
+            + session.len()
+            + "test".len();
+
+        // Attempt 1: exact `copied` bytes fit `hello_owned`, leaving 0 bytes for `encode_frame_leased`.
+        let mut endpoint = Endpoint::for_test(identity.clone(), paths.clone());
+        let tight_encode_pool = crate::lease::BytePool::new(copied);
+        endpoint.launch = Arc::new(
+            base_launch
+                .for_session()
+                .with_memory(Arc::clone(&tight_encode_pool))
+                .with_control_memory(crate::lease::BytePool::new(0)),
+        );
+        let err = endpoint
+            .link("test", std::time::Instant::now() + runtime::START_WAIT)
+            .await
+            .err()
+            .expect("Hello encode must fail when isolated pools have no room");
+        assert!(matches!(err, SetupError::MemoryBudget), "{err:?}");
+        assert_eq!(tight_encode_pool.used(), 0);
+
+        // Attempt 2: enough bytes to construct and encode `Hello`, not enough to decode the 2 KiB `Welcome`.
+        let sample_hello = hello_owned(&base_launch, &identity, &session, 1, "test").unwrap();
+        let hello_wire = ipc::frame_len(&sample_hello.value).unwrap();
+        drop(sample_hello);
+        let tight_welcome_pool = crate::lease::BytePool::new(copied + hello_wire);
+        endpoint.launch = Arc::new(
+            base_launch
+                .for_session()
+                .with_memory(Arc::clone(&tight_welcome_pool))
+                .with_control_memory(crate::lease::BytePool::new(0)),
+        );
+        let err = endpoint
+            .link("test", std::time::Instant::now() + runtime::START_WAIT)
+            .await
+            .err()
+            .expect("Welcome decode must fail when isolated pools cannot fit parse peak");
+        assert!(matches!(err, SetupError::MemoryBudget), "{err:?}");
+        assert_eq!(tight_welcome_pool.used(), 0);
+
+        // Attempt 3: 32 KiB main pool + 4 KiB control pool.
+        let main_pool = crate::lease::BytePool::new(32 * 1024);
+        let control_pool = crate::lease::BytePool::new(4 * 1024);
+        endpoint.launch = Arc::new(
+            base_launch
+                .with_memory(Arc::clone(&main_pool))
+                .with_control_memory(Arc::clone(&control_pool)),
+        );
+
+        // 3a. Exhaust `control_pool` before the oversized (> 64 KiB) event frame arrives:
+        //     `OverloadEvent` must drop `tx` cleanly (`stream.next() == None`) rather than
+        //     acquiring from the global `lease::control_pool()`.
+        let (active, mut stream1) = endpoint
+            .events_stream(
+                "test",
+                crate::events::SubscribeRequest {
+                    name: crate::events::EVENT_EXTERNAL.into(),
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        drop(active);
+        let saturate_ctrl = control_pool
+            .try_acquire(control_pool.limit() - control_pool.used())
+            .unwrap();
+        ready_for_oversized_tx.send(()).unwrap();
+        let next1 = timeout(Duration::from_secs(5), stream1.next())
+            .await
+            .unwrap();
+        assert!(
+            next1.is_none(),
+            "OverloadEvent must not fall back to global control_pool when endpoint control_pool is full: {next1:?}"
+        );
+        assert!(!stream1.overflowed());
+        assert!(!stream1.link_closed());
+        drop(saturate_ctrl);
+        stream1.cancel().await;
+
+        // 3b. With `control_pool` available, `OverloadEvent`'s `Terminated` lease comes from `control_pool`.
+        assert_eq!(control_pool.used(), 0);
+        let (active2, mut stream2) = endpoint
+            .events_stream(
+                "test",
+                crate::events::SubscribeRequest {
+                    name: crate::events::EVENT_EXTERNAL.into(),
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        drop(active2);
+        let (term_frame, term_lease) = timeout(Duration::from_secs(5), stream2.next())
+            .await
+            .unwrap()
+            .expect("Terminated frame fits in isolated control_pool");
+        assert!(matches!(term_frame, ipc::EventWireFrame::Terminated(_)));
+        assert_eq!(control_pool.used(), term_lease.bytes());
+        drop(term_frame);
+        drop(term_lease);
+        assert_eq!(control_pool.used(), 0);
+        assert!(
+            timeout(Duration::from_secs(5), stream2.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        stream2.cancel().await;
+
+        endpoint.bye().await;
+        finish(peer).await;
+    }
+
+    #[tokio::test]
+    async fn event_stream_channel_overflow_immediately_cancels_and_reports_slow_consumer() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        // Part 1: Direct `Endpoint::events_stream` 128-slot saturation immediately sends `EventsCancel`
+        //         and sets `stream.overflowed()` before the slow consumer drains `rx`.
+        let (identity, paths, mut listener, _target) = test_daemon("evt-chan-overflow");
+        let response = welcome(&identity);
+        let (filled_128_tx, filled_128_rx) = oneshot::channel();
+        let (proceed_129_tx, proceed_129_rx) = oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Hello { .. })
+            ));
+            ipc::write_frame(&mut conn, &response).await.unwrap();
+            let Some(ToDaemon::EventsStream { id, .. }) =
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected first subscription");
+            };
+            ipc::write_frame(
+                &mut conn,
+                &ToEndpoint::EventFrame {
+                    id,
+                    frame: ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                        cursor: "ep000001:0".into(),
+                        truncated: false,
+                        heartbeat_ms: 30_000,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            for seq in 0..EVENT_STREAM_CHANNEL_CAPACITY {
+                ipc::write_frame(
+                    &mut conn,
+                    &ToEndpoint::EventFrame {
+                        id,
+                        frame: ipc::EventWireFrame::Event(crate::events::StreamEvent {
+                            event_id: format!("ev-{seq}"),
+                            name: crate::events::EVENT_EXTERNAL.into(),
+                            timestamp: "2026-11-26T00:00:00.000Z".into(),
+                            data: serde_json::json!({"seq": seq}),
+                            cursor: format!("ep000001:{}", seq + 1),
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            filled_128_tx.send(()).unwrap();
+            proceed_129_rx.await.unwrap();
+            // The 129th frame overflows `EVENT_STREAM_CHANNEL_CAPACITY` and must immediately trigger `EventsCancel`.
+            ipc::write_frame(
+                &mut conn,
+                &ToEndpoint::EventFrame {
+                    id,
+                    frame: ipc::EventWireFrame::Event(crate::events::StreamEvent {
+                        event_id: "ev-overflow".into(),
+                        name: crate::events::EVENT_EXTERNAL.into(),
+                        timestamp: "2026-11-26T00:00:00.000Z".into(),
+                        data: serde_json::json!({"seq": EVENT_STREAM_CHANNEL_CAPACITY}),
+                        cursor: "ep000001:129".into(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == id
+            ));
+            cancelled_tx.send(()).unwrap();
+
+            // Part 2 on the same connection: MCP `events/stream` slow consumer receives distinct
+            // slow-consumer queue-full message (not memory budget full).
+            let Some(ToDaemon::EventsStream { id: mcp_id, .. }) =
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected MCP subscription on preserved IPC connection");
+            };
+            ipc::write_frame(
+                &mut conn,
+                &ToEndpoint::EventFrame {
+                    id: mcp_id,
+                    frame: ipc::EventWireFrame::Active(crate::events::ActiveNotice {
+                        cursor: "ep000001:0".into(),
+                        truncated: false,
+                        heartbeat_ms: 30_000,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            for seq in 0..(EVENT_STREAM_CHANNEL_CAPACITY + 4) {
+                ipc::write_frame(
+                    &mut conn,
+                    &ToEndpoint::EventFrame {
+                        id: mcp_id,
+                        frame: ipc::EventWireFrame::Event(crate::events::StreamEvent {
+                            event_id: format!("mcp-ev-{seq}"),
+                            name: crate::events::EVENT_EXTERNAL.into(),
+                            timestamp: "2026-11-26T00:00:00.000Z".into(),
+                            data: serde_json::json!({"seq": seq}),
+                            cursor: format!("ep000001:{}", seq + 1),
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == mcp_id
+            ));
+            assert!(matches!(
+                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                    .await
+                    .unwrap(),
+                Some(ToDaemon::Bye)
+            ));
+        });
+
+        let endpoint = Arc::new(Endpoint::for_test(identity, paths));
+        let (active, mut stream) = endpoint
+            .events_stream(
+                "test",
+                crate::events::SubscribeRequest {
+                    name: crate::events::EVENT_EXTERNAL.into(),
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active.value.cursor, "ep000001:0");
+        drop(active);
+
+        timeout(Duration::from_secs(5), filled_128_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // Wait briefly for `read_loop` to buffer all 128 frames without overflowing.
+        timeout(Duration::from_secs(5), async {
+            while stream.rx.len() < EVENT_STREAM_CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!stream.overflowed());
+        proceed_129_tx.send(()).unwrap();
+
+        // Daemon receives `EventsCancel` immediately while all 128 frames are still unread in `stream.rx`.
+        timeout(Duration::from_secs(5), cancelled_rx)
+            .await
+            .expect("128-slot overflow must send EventsCancel before consumer reads")
+            .unwrap();
+        assert!(stream.overflowed());
+        assert!(!stream.link_closed());
+
+        for expected in 0..EVENT_STREAM_CHANNEL_CAPACITY {
+            let Some((ipc::EventWireFrame::Event(ev), _lease)) =
+                timeout(Duration::from_secs(5), stream.next())
+                    .await
+                    .unwrap()
+            else {
+                panic!("missing buffered event {expected}");
+            };
+            assert_eq!(ev.event_id, format!("ev-{expected}"));
+        }
+        assert!(
+            timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(stream.overflowed());
+        stream.cancel().await;
+
+        // Verify MCP `handle_events_stream` emits the slow-consumer queue-full message.
+        let leases = Arc::new(crate::mcp::RequestLeases::default());
+        let server = crate::mcp::Server::new(
+            crate::mcp::Backend::Daemon(Arc::clone(&endpoint)),
+            &endpoint.launch,
+            None,
+            crate::config::Tools::default(),
+            None,
+            crate::config::InstructionsToolMode::Off,
+        )
+        .with_stdio_leases(Arc::clone(&leases));
+        // Tiny 64-byte duplex pipe stalls stdout writes as soon as the client stops reading.
+        let (client, serving) = tokio::io::duplex(64);
+        let (read, write) = tokio::io::split(serving);
+        let transport = crate::cli::stdio::StdioTransport::new(read, write, leases);
+        let serving = tokio::spawn(async move {
+            let service = server.serve(transport).await.unwrap();
+            let _ = service.waiting().await;
+        });
+        let (read, mut input) = tokio::io::split(client);
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        let meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "slow-stream",
+            "method": "events/stream",
+            "params": {
+                "name": "external.event",
+                "_meta": meta,
+            }
+        });
+        input
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+        let active_line = timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&active_line).unwrap()["method"],
+            "notifications/events/active"
+        );
+
+        let mut term_msg = None;
+        loop {
+            let line = timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if msg["id"] == "slow-stream" {
+                assert_eq!(msg["result"]["resultType"], "complete");
+                break;
+            }
+            if msg["method"] == "notifications/events/terminated" {
+                term_msg = Some(msg);
+            }
+        }
+        let term_msg = term_msg.expect("expected terminated notification on slow consumer");
+        assert_eq!(term_msg["params"]["error"]["code"], -32025);
+        assert_eq!(
+            term_msg["params"]["error"]["message"],
+            "endpoint event stream queue full due to slow consumer"
+        );
+
+        endpoint.bye().await;
+        drop(input);
+        drop(lines);
+        finish(peer).await;
+        finish(serving).await;
     }
 }

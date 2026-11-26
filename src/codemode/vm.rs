@@ -5,11 +5,12 @@ use super::bridge::{
     BRIDGE_MEMORY_RESULT_ERROR, BRIDGE_RESULT_ERROR, DIAGNOSTIC_RESERVE, DIAGNOSTIC_WORKSPACE,
     Host, IO_PERMITS, Output, START_PERMITS, SyncCallError,
 };
-use super::control::{CallInfo, Outcome, ScriptHandle, Wake, lock};
+use super::control::{BridgeHandle, Outcome, SettledCall, lock};
 use crate::files;
 use crate::media::{self, CompressFailure, MediaKind};
-use crate::tasks::Tasks;
+use crate::tasks::script::CallInfo;
 use crate::tasks::state::Task;
+use crate::tasks::{ScriptIo, Tasks};
 use base64::Engine;
 use rquickjs::context::EvalOptions;
 use rquickjs::{Context, Ctx, Exception, Function, Object, Persistent, Runtime, Value};
@@ -19,7 +20,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
-use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 
 // QuickJS mixes column origins on its first physical line; user code starts on the next one.
@@ -69,11 +69,17 @@ pub(super) fn pending_text(calls: &[CallInfo]) -> String {
 }
 
 pub(super) fn run(
+    io: ScriptIo,
     work: Work,
-    script: ScriptHandle,
-    receiver: mpsc::Receiver<Wake>,
-    runtime: Handle,
+    script: BridgeHandle,
+    settled_rx: mpsc::Receiver<SettledCall>,
 ) {
+    let ScriptIo {
+        task,
+        tasks,
+        writer,
+        captured,
+    } = io;
     let Work {
         service,
         session,
@@ -81,11 +87,10 @@ pub(super) fn run(
         transfer,
         call_id,
         code,
-        writer,
-        task,
-        tasks,
-        captured,
+        runtime,
         input_owner,
+        #[cfg(test)]
+        vm_memory_limit,
     } = work;
     let code = crate::lease::Owned::new(code, input_owner);
     let output = Rc::new(RefCell::new(Output { writer, written: 0 }));
@@ -93,6 +98,8 @@ pub(super) fn run(
         output.borrow_mut().diagnostic(&[
             "Script error: diagnostic memory budget is full; the script was not started.",
         ]);
+        drop(code);
+        drop(settled_rx);
         drop(output);
         tasks.finish_script(&task, Some(1), captured);
         return;
@@ -115,18 +122,25 @@ pub(super) fn run(
         run_vm(
             &code.value,
             &script,
-            receiver,
+            &settled_rx,
             Rc::clone(&host),
             Rc::clone(&output),
-            &task,
-            &tasks,
+            (&task, &tasks),
+            #[cfg(test)]
+            vm_memory_limit,
         )
     }))
     .unwrap_or_else(|_| Err("The JavaScript worker panicked.".into()));
+    drop(code);
     drop(host);
     script.cancel_and_drain();
+    for settled in settled_rx.try_iter() {
+        if !matches!(settled.outcome, Outcome::Cancelled(_)) {
+            lock(&script.0.report).remove(settled.id);
+        }
+    }
     let pending = script.finish();
-    let exit_code = if script.0.stopped.load(Ordering::Acquire) {
+    let exit_code = if script.control().is_stopped() {
         let count = pending.value.len().to_string();
         let pending = pending_text(&pending.value);
         output.borrow_mut().diagnostic(&[
@@ -152,6 +166,8 @@ pub(super) fn run(
     } else {
         Some(0)
     };
+    drop(settled_rx);
+    drop(pending);
     drop(result);
     drop(output);
     drop(diagnostic_lease);
@@ -264,15 +280,22 @@ fn js_error(ctx: &Ctx<'_>, error: rquickjs::Error) -> String {
 
 fn run_vm(
     code: &str,
-    script: &ScriptHandle,
-    receiver: mpsc::Receiver<Wake>,
+    script: &BridgeHandle,
+    settled_rx: &mpsc::Receiver<SettledCall>,
     host: Rc<RefCell<Host>>,
     output: Rc<RefCell<Output>>,
-    task: &Arc<Task>,
-    tasks: &Arc<Tasks>,
+    (task, tasks): (&Arc<Task>, &Arc<Tasks>),
+    #[cfg(test)] vm_memory_limit: Option<usize>,
 ) -> Result<(), String> {
+    if script.interrupted() {
+        return Ok(());
+    }
     let runtime = Runtime::new().map_err(|error| error.to_string())?;
-    runtime.set_memory_limit(MEMORY_LIMIT);
+    #[cfg(test)]
+    let memory_limit = vm_memory_limit.unwrap_or(MEMORY_LIMIT);
+    #[cfg(not(test))]
+    let memory_limit = MEMORY_LIMIT;
+    runtime.set_memory_limit(memory_limit);
     runtime.set_max_stack_size(512 * 1024);
     let interrupt = script.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || interrupt.interrupted())));
@@ -405,7 +428,7 @@ fn run_vm(
                                 max_bytes,
                                 launch_ctx.memory(),
                                 None,
-                                Some(&control.0.cancel),
+                                Some(control.control().cancel_token()),
                             ) {
                                 Ok(files::read::MediaBytes::Loaded { bytes, lease }) => (bytes, lease),
                                 Ok(files::read::MediaBytes::Oversized { .. }) => {
@@ -491,7 +514,7 @@ fn run_vm(
                                 max_bytes,
                                 launch_ctx.memory(),
                                 None,
-                                Some(&control.0.cancel),
+                                Some(control.control().cancel_token()),
                             ) {
                                 Ok(files::read::MediaBytes::Loaded { bytes, lease }) => {
                                     (bytes, lease, det.kind, det.mime.to_owned())
@@ -698,8 +721,11 @@ fn run_vm(
             if finished {
                 return Ok(());
             }
-            match receiver.recv() {
-                Ok(Wake::Settled { id, outcome }) => {
+            match settled_rx.try_recv() {
+                Ok(SettledCall { id, outcome }) => {
+                    if matches!(outcome, Outcome::Cancelled(_)) {
+                        return Ok(());
+                    }
                     let settled = context.with(|ctx| -> Result<(), String> {
                         let api = api
                             .clone()
@@ -709,8 +735,10 @@ fn run_vm(
                             api.get("settle").map_err(|error| js_error(&ctx, error))?;
                         let (ok, err_code, payload, task_id, log_path) = match &outcome {
                             Outcome::Value(value) => (true, "", value.value.as_str(), "", ""),
-                            Outcome::Error(error) => (false, "IO", *error, "", ""),
-                            Outcome::Cancelled(error) => (false, "CANCELLED", *error, "", ""),
+                            Outcome::Error(error) => (false, "IO", error.as_ref(), "", ""),
+                            Outcome::Cancelled(error) => {
+                                (false, "CANCELLED", error.as_ref(), "", "")
+                            }
                             Outcome::Limit => (false, "LIMIT", BRIDGE_RESULT_ERROR, "", ""),
                             Outcome::Memory(Some((tid, lpath))) => (
                                 false,
@@ -730,7 +758,12 @@ fn run_vm(
                     lock(&script.0.report).remove(id);
                     settled?;
                 }
-                Ok(Wake::Stop) | Err(_) => return Ok(()),
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                Err(mpsc::TryRecvError::Empty) => {
+                    if !script.interrupted() {
+                        std::thread::park();
+                    }
+                }
             }
         }
     })();
