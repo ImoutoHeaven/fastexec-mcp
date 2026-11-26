@@ -19,7 +19,8 @@ use self::workers::{CaptureWork, InputWork, OutputWorkers, ReadWork, WaitWork, W
 use crate::env::{LaunchContext, ProbeWarning};
 use crate::id::{base32, random_chars};
 use crate::media::MediaKind;
-use crate::platform::process::{self, Launch, Member, Tree, clean_member_name};
+use crate::platform::members::Member;
+use crate::platform::process::{self, Launch, Tree, clean_member_name};
 use crate::term::terminal::Live;
 use encoding_rs::Encoding;
 use std::collections::{HashMap, HashSet};
@@ -1826,8 +1827,9 @@ fn remove_stale_dirs(temp: &Path) {
                 }
                 pid.parse().ok()
             });
-        if pid.is_some_and(|pid| pid != std::process::id() && !process::is_alive(pid))
-            && crate::platform::runtime::create_private_unix_check(&entry.path()).is_ok()
+        if pid.is_some_and(|pid| {
+            pid != std::process::id() && !crate::platform::runtime::is_alive(pid)
+        }) && crate::platform::runtime::create_private_unix_check(&entry.path()).is_ok()
         {
             let _ = std::fs::remove_dir_all(entry.path());
         }

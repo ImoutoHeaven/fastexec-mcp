@@ -5,7 +5,8 @@ use super::state::{
     DRAIN_CAP, Final, Input, TASK_LOG_LIMIT, Task, WriterDone, WriterDoneGuard, answer_program,
     lock,
 };
-use crate::platform::process::{self, Member};
+use crate::platform::members::Member;
+use crate::platform::process;
 use crate::term::output::incomplete_utf8_suffix;
 use std::fs::File;
 use std::io::{Read, Write};

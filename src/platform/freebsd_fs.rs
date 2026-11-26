@@ -141,6 +141,13 @@ fn open_directory(dir: &Path) -> io::Result<File> {
         .open(dir)
 }
 
+/// Checks the opened leaf's owner, mode, and ACL.
+pub(super) fn check_private_directory(dir: &Path) -> io::Result<()> {
+    let file = open_directory(dir)?;
+    crate::platform::private_unix::check_metadata(dir, &file.metadata()?)?;
+    check_private_acl(&file)
+}
+
 /// The directory stays empty until its ACL is private; an old directory handle cannot read
 /// the subsequently created 0600 file. Never sanitize an existing directory or remove its contents.
 pub fn create_private_directory(dir: &Path) -> io::Result<()> {
@@ -189,7 +196,7 @@ pub fn create_private_directory(dir: &Path) -> io::Result<()> {
         if held.dev() != named.dev() || held.ino() != named.ino() || !named.is_dir() {
             return Err(io::Error::other("the new private directory was replaced"));
         }
-        crate::platform::runtime::create_private_unix_check(dir)?;
+        check_private_directory(dir)?;
         if fs::read_dir(dir)?.next().transpose()?.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -208,7 +215,7 @@ pub fn create_private_directory(dir: &Path) -> io::Result<()> {
 /// ordinary path components, while the requested leaf must always pass the private-directory check.
 pub fn create_private_all(dir: &Path) -> io::Result<()> {
     match fs::symlink_metadata(dir) {
-        Ok(_) => return crate::platform::runtime::create_private_unix_check(dir),
+        Ok(_) => return check_private_directory(dir),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -253,13 +260,13 @@ fn publish_private_directory(dir: &Path) -> io::Result<()> {
         };
         if renamed == 0 {
             // The temporary name no longer exists. Never clean up the published directory.
-            return crate::platform::runtime::create_private_unix_check(dir);
+            return check_private_directory(dir);
         }
         let error = io::Error::last_os_error();
         // Only our random, empty sibling is removed, never the winner or its contents.
         fs::remove_dir(&temporary)?;
         return if error.kind() == io::ErrorKind::AlreadyExists {
-            crate::platform::runtime::create_private_unix_check(dir)
+            check_private_directory(dir)
         } else {
             Err(error)
         };
@@ -617,7 +624,7 @@ mod tests {
                 break;
             }
             assert_eq!(fs::read_dir(&directory).unwrap().count(), 8);
-            crate::platform::runtime::create_private_unix_check(&directory).unwrap();
+            check_private_directory(&directory).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
         assert!(

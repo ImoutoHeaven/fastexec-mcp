@@ -10,6 +10,37 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Reports whether a process with this PID exists.
+#[cfg(any(target_os = "linux", windows))]
+pub fn is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only checks for existence and permission.
+        let exists = unsafe { libc::kill(pid as i32, 0) } == 0;
+        exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+        // SAFETY: the handle is checked, waited without blocking, and closed.
+        unsafe {
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                // Only an absent PID proves its old owner's directory is unused.
+                return GetLastError() != ERROR_INVALID_PARAMETER;
+            }
+            let alive = WaitForSingleObject(handle, 0) != WAIT_OBJECT_0;
+            CloseHandle(handle);
+            alive
+        }
+    }
+}
+
 /// How long a start waits for a daemon to answer, from the first connect to the last.
 pub const START_WAIT: Duration = Duration::from_secs(10);
 /// How often a waiting start looks again.
@@ -198,8 +229,7 @@ pub(crate) fn create_private_new(dir: &Path) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        private_macos::create_leaf(dir)?;
-        create_private_unix_check(dir)
+        private_macos::create_leaf(dir)
     }
     #[cfg(target_os = "freebsd")]
     {
@@ -218,11 +248,13 @@ pub(crate) fn create_private_new(dir: &Path) -> io::Result<()> {
 /// removing an inherited ACL is too late: another user could already have opened the directory.
 #[cfg(target_os = "macos")]
 mod private_macos {
-    use super::*;
     use std::ffi::{CString, c_void};
     use std::fs::File;
+    use std::io;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
 
     // Public Darwin <sys/acl.h>/<sys/fcntl.h> APIs not currently exposed by Rust libc.
     const FILESEC_MODE: libc::c_int = 4;
@@ -307,7 +339,7 @@ mod private_macos {
         if unsafe { mkdirx_np(path.as_ptr(), security.0) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(())
+        check(dir)
     }
 
     // Existing ancestors keep normal path semantics, including a caller-selected parent
@@ -327,7 +359,7 @@ mod private_macos {
         if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             parents(parent)?;
         }
-        match super::create_private_new(dir) {
+        match create_leaf(dir) {
             Ok(()) => Ok(()),
             Err(error)
                 if error.kind() == io::ErrorKind::AlreadyExists
@@ -343,16 +375,23 @@ mod private_macos {
         if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             parents(parent)?;
         }
-        match super::create_private_new(dir) {
+        match create_leaf(dir) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                super::create_private_unix_check(dir)
-            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => check(dir),
             Err(error) => Err(error),
         }
     }
 
-    pub(super) fn check_acl(file: &File, dir: &Path) -> io::Result<()> {
+    pub(super) fn check(dir: &Path) -> io::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)?;
+        crate::platform::private_unix::check_metadata(dir, &file.metadata()?)?;
+        check_acl(&file, dir)
+    }
+
+    fn check_acl(file: &File, dir: &Path) -> io::Result<()> {
         let fd = file.as_raw_fd();
         let refuse = |reason: &str| {
             io::Error::new(
@@ -561,43 +600,18 @@ pub(crate) fn create_private_windows_check(dir: &Path) -> io::Result<()> {
 /// Checks that what is at `dir` is a real directory this user owns with mode 0700.
 #[cfg(unix)]
 pub(crate) fn create_private_unix_check(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(dir)?
-    };
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    let meta = file.metadata()?;
-    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
-    let meta = std::fs::symlink_metadata(dir)?;
-    if !meta.is_dir() {
-        return Err(io::Error::other(format!(
-            "{} is not a directory this user owns with mode 0700",
-            dir.display()
-        )));
-    }
-    if meta.uid() != user_id() {
-        return Err(io::Error::other(format!(
-            "{} is not owned by this user",
-            dir.display()
-        )));
-    }
-    if meta.permissions().mode() & 0o777 != 0o700 {
-        return Err(io::Error::other(format!(
-            "{} is not mode 0700",
-            dir.display()
-        )));
-    }
     #[cfg(target_os = "macos")]
-    private_macos::check_acl(&file, dir)?;
+    {
+        private_macos::check(dir)
+    }
     #[cfg(target_os = "freebsd")]
-    crate::platform::freebsd_fs::check_private_acl(&file)?;
-    Ok(())
+    {
+        crate::platform::freebsd_fs::check_private_directory(dir)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+    {
+        crate::platform::private_unix::check_metadata(dir, &std::fs::symlink_metadata(dir)?)
+    }
 }
 
 /// A namespace is exactly 16 lowercase hex characters, which is what an identity produces and
@@ -1051,7 +1065,7 @@ fn spawn_daemon(
     ];
     args.extend(extra.iter().cloned());
     let mut command_line =
-        crate::platform::conpty_spawn::command_line_of(exe.as_os_str(), &args)
+        crate::platform::windows_command::command_line_of(exe.as_os_str(), &args)
             .map_err(|error| format!("cannot build the daemon command line: {error}"))?;
     let application: Vec<u16> = exe
         .as_os_str()

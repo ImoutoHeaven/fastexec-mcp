@@ -7,15 +7,33 @@
 #[cfg(windows)]
 use crate::env::var_in;
 use crate::env::{LaunchContext, ProbeWarning, Unit};
+#[cfg(windows)]
+use crate::platform::conpty_native::{Attributes, ConPty, Terminal};
+use crate::platform::members::{Member, MemberBudget};
 #[cfg(unix)]
 use crate::platform::unix_pty::open as open_pty;
+#[cfg(windows)]
+use crate::platform::windows_command;
 use std::ffi::OsString;
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Hidden CLI flag used by the per-session login environment probe.
 pub const ENV_FLAG: &str = "--fastexec-dump-env";
+
+/// The first argument that makes the fastexec binary run as a task host.
+#[cfg(unix)]
+pub const HOST_FLAG: &str = "--fastexec-task-host";
+
+/// The host's first word on the status pipe: 0 after its bash spawn attempt, else a
+/// Unix errno saying why it cannot own the task's tree. The root bash's exit code follows as a
+/// second word.
+#[cfg(unix)]
+pub const HOST_STARTUP_READY: u32 = 0;
+
 const ENV_MARKER: &[u8] = b"\0__FASTEXEC_ENV_START__\0";
 const LOGIN_ENV_LIMIT: u64 = 1 << 20;
 
@@ -61,7 +79,7 @@ pub struct Spawned {
 /// the tree ended finds it taken.
 pub struct PtyControl {
     #[cfg(windows)]
-    terminal: std::sync::Arc<crate::platform::conpty_spawn::Terminal>,
+    terminal: std::sync::Arc<crate::platform::conpty_native::Terminal>,
     #[cfg(unix)]
     master: std::os::fd::OwnedFd,
 }
@@ -69,7 +87,7 @@ pub struct PtyControl {
 impl PtyControl {
     #[cfg(windows)]
     pub(crate) fn new(
-        terminal: std::sync::Arc<crate::platform::conpty_spawn::Terminal>,
+        terminal: std::sync::Arc<crate::platform::conpty_native::Terminal>,
     ) -> PtyControl {
         PtyControl { terminal }
     }
@@ -126,13 +144,6 @@ impl PtyControl {
             Ok(())
         }
     }
-}
-
-/// A process of a task's tree other than its root bash.
-#[derive(Clone, Debug)]
-pub struct Member {
-    pub pid: u32,
-    pub name: String,
 }
 
 pub(crate) fn normalize_members(list: &mut Vec<Member>) {
@@ -195,61 +206,6 @@ mod member_tests {
     }
 }
 
-/// Per-query names and conversion workspace. The callback receives a live-byte
-/// high-water requirement, not an accumulated count of repeated native scans.
-pub(crate) struct MemberBudget<'a> {
-    reserve: Option<&'a mut dyn FnMut(usize) -> bool>,
-    retained: usize,
-    refused: bool,
-}
-
-impl<'a> MemberBudget<'a> {
-    pub(crate) fn new(reserve: &'a mut dyn FnMut(usize) -> bool) -> Self {
-        Self {
-            reserve: Some(reserve),
-            retained: 0,
-            refused: false,
-        }
-    }
-
-    pub(crate) fn unlimited() -> Self {
-        Self {
-            reserve: None,
-            retained: 0,
-            refused: false,
-        }
-    }
-
-    pub(crate) fn temporary(&mut self, bytes: usize) -> bool {
-        if self.refused {
-            return false;
-        }
-        let wanted = self.retained.saturating_add(bytes);
-        if self
-            .reserve
-            .as_mut()
-            .is_some_and(|reserve| !reserve(wanted))
-        {
-            self.refused = true;
-            return false;
-        }
-        true
-    }
-
-    pub(crate) fn retain(&mut self, bytes: usize) {
-        self.retained = self.retained.saturating_add(bytes);
-    }
-
-    #[cfg(target_os = "freebsd")]
-    pub(crate) fn reset(&mut self) {
-        self.retained = 0;
-    }
-
-    pub(crate) fn refused(&self) -> bool {
-        self.refused
-    }
-}
-
 /// The root of a task: bash itself on Windows, the task host (src/platform/host.rs) on Unix.
 #[cfg(windows)]
 pub enum Child {
@@ -262,7 +218,7 @@ pub enum Child {
             dead_code,
             reason = "held for the console's lifetime until the tree ends"
         )]
-        terminal: std::sync::Arc<crate::platform::conpty_spawn::Terminal>,
+        terminal: std::sync::Arc<crate::platform::conpty_native::Terminal>,
         /// Where the script records its exit status, so a root that never terminates can still
         /// end its task.
         exit_status: Option<std::path::PathBuf>,
@@ -284,7 +240,7 @@ impl Child {
                 process,
                 exit_status,
                 ..
-            } => crate::platform::conpty_spawn::wait(process, exit_status.as_deref()),
+            } => crate::platform::conpty_native::wait(process, exit_status.as_deref()),
         };
         (msys_signal_exit(code), forced)
     }
@@ -1041,9 +997,158 @@ pub const PTY_COLS_MAX: u16 = 500;
 pub const PTY_ROWS_MIN: u16 = 5;
 pub const PTY_ROWS_MAX: u16 = 200;
 
+/// A root bash created suspended inside its console and already in the task's Job.
+#[cfg(windows)]
+struct Suspended {
+    process: OwnedHandle,
+    thread: OwnedHandle,
+    tree: Tree,
+    terminal: Terminal,
+    output: Box<dyn Read + Send>,
+    input: Box<dyn Write + Send>,
+}
+
 #[cfg(windows)]
 fn spawn_pty(launch: &Launch<'_>) -> std::io::Result<Spawned> {
-    crate::platform::conpty_spawn::spawn_pty(launch)
+    let suspended = create_in_job(launch)?;
+    if let Err(error) = resume(&suspended.thread) {
+        let _ = suspended.tree.kill();
+        end(&suspended.process);
+        return Err(error);
+    }
+    let terminal = std::sync::Arc::new(suspended.terminal);
+    Ok(Spawned {
+        child: Child::Pty {
+            process: suspended.process,
+            terminal: std::sync::Arc::clone(&terminal),
+            exit_status: launch.exit_status.map(std::path::Path::to_path_buf),
+        },
+        output: suspended.output,
+        input: Some(suspended.input),
+        tree: suspended.tree,
+        pty: Some(PtyControl::new(terminal)),
+    })
+}
+
+/// Creates bash suspended inside its console and puts it in the task's Job. The root runs no
+/// instruction until [`resume`] is called on it.
+#[cfg(windows)]
+fn create_in_job(launch: &Launch<'_>) -> std::io::Result<Suspended> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
+        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    };
+    let api = ConPty::load()?;
+    let (input_reader, input_writer) = std::io::pipe()?;
+    let (output_reader, output_writer) = std::io::pipe()?;
+    let terminal = api.create(
+        input_reader.as_raw_handle(),
+        output_writer.as_raw_handle(),
+        launch.cols,
+        launch.rows,
+    )?;
+    // The console keeps its own copies of the two ends it was handed.
+    drop((input_reader, output_writer));
+    let app = windows_command::nul_terminated(launch.bash.as_os_str())?;
+    let mut command =
+        windows_command::command_line_of(launch.bash.as_os_str(), &bash_args(launch))?;
+    let block = environment_block(launch)?;
+    let cwd = windows_command::nul_terminated(launch.cwd.as_os_str())?;
+    let mut attributes = Attributes::new(1)?;
+    attributes.set_console(&terminal)?;
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    // The console is the child's stdio. Handles inherited in their place would leak through as
+    // if they were, which portable-pty guarded against the same way.
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+    startup.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+    startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+    startup.lpAttributeList = attributes.as_mut();
+    let mut info = PROCESS_INFORMATION::default();
+    // SAFETY: every pointer refers to storage that outlives the call: the NUL-terminated app and
+    // cwd, the mutable command line, the environment block, and the attribute list, which keeps
+    // the console live as well.
+    let created = unsafe {
+        CreateProcessW(
+            app.as_ptr(),
+            command.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+            block.as_ptr().cast(),
+            cwd.as_ptr(),
+            &startup.StartupInfo,
+            &mut info,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful CreateProcessW returns two handles, owned here from now on.
+    let (process, thread) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(info.hProcess),
+            OwnedHandle::from_raw_handle(info.hThread),
+        )
+    };
+    let tree = match Tree::adopt(process.as_raw_handle()) {
+        Ok(tree) => tree,
+        Err(error) => {
+            end(&process);
+            return Err(error);
+        }
+    };
+    Ok(Suspended {
+        process,
+        thread,
+        tree,
+        terminal,
+        output: Box::new(output_reader),
+        input: Box::new(input_writer),
+    })
+}
+
+/// Ends a root that never became a task and waits for it, so a failed start leaves no process
+/// terminating behind it after its handles are released.
+#[cfg(windows)]
+fn end(process: &OwnedHandle) {
+    use windows_sys::Win32::System::Threading::{INFINITE, TerminateProcess, WaitForSingleObject};
+    // SAFETY: the handle is a live process of this call.
+    unsafe {
+        TerminateProcess(process.as_raw_handle(), 1);
+        WaitForSingleObject(process.as_raw_handle(), INFINITE);
+    }
+}
+
+#[cfg(windows)]
+fn resume(thread: &OwnedHandle) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Threading::ResumeThread;
+    // SAFETY: the thread handle is the suspended root's own and alive.
+    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The session's environment, then this launch's values over it, as `CreateProcessW` wants them:
+/// names sorted in ordinal ignore-case order, each `name=value` NUL-terminated, and the block
+/// NUL-terminated.
+#[cfg(windows)]
+fn environment_block(launch: &Launch<'_>) -> std::io::Result<Vec<u16>> {
+    let overrides = environment(launch);
+    let pairs = launch
+        .base_env
+        .iter()
+        .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+        .chain(
+            overrides
+                .iter()
+                .map(|(name, value)| (std::ffi::OsStr::new(*name), value.as_os_str())),
+        );
+    windows_command::block(pairs)
 }
 
 /// Starts the task host (`src/platform/host.rs`) as the leader of a new session, with bash's command
@@ -1091,7 +1196,7 @@ fn spawn_host_args(
     };
     let mut command = Command::new(host);
     command
-        .arg(crate::platform::host::FLAG)
+        .arg(HOST_FLAG)
         .args(passed.iter().map(|fd| fd.to_string()))
         .arg(launch.bash)
         .args(args)
@@ -1195,7 +1300,7 @@ fn finish_host_startup(
         )),
         Ok(()) => {
             let startup = u32::from_le_bytes(startup);
-            if startup == crate::platform::host::STARTUP_READY {
+            if startup == HOST_STARTUP_READY {
                 return Ok(());
             }
             let problem = std::io::Error::from_raw_os_error(startup as i32);
@@ -1583,37 +1688,6 @@ fn unix_members(_host: i32) -> Vec<Member> {
     Vec::new()
 }
 
-/// Reports whether a process with this PID exists.
-#[cfg(any(target_os = "linux", windows))]
-pub fn is_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: signal 0 only checks for existence and permission.
-        let exists = unsafe { libc::kill(pid as i32, 0) } == 0;
-        exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{
-            CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0,
-        };
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-        };
-        // SAFETY: the handle is checked, waited without blocking, and closed.
-        unsafe {
-            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-            if handle.is_null() {
-                // Only an absent PID proves its old owner's directory is unused.
-                return GetLastError() != ERROR_INVALID_PARAMETER;
-            }
-            let alive = WaitForSingleObject(handle, 0) != WAIT_OBJECT_0;
-            CloseHandle(handle);
-            alive
-        }
-    }
-}
-
 /// UTF-8 locale for commands: glibc 2.35+, musl, and msys provide `C.UTF-8`; macOS lacks it.
 // ponytail: fixed locale; probe `locale -a` if an older distribution without C.UTF-8 matters.
 pub const LOCALE: &str = if cfg!(target_os = "macos") {
@@ -1624,7 +1698,7 @@ pub const LOCALE: &str = if cfg!(target_os = "macos") {
 
 #[cfg(windows)]
 mod windows {
-    use super::{Member, MemberBudget};
+    use crate::platform::members::{Member, MemberBudget};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, GetLastError, INVALID_HANDLE_VALUE,
@@ -2037,7 +2111,7 @@ mod windows {
                 ));
                 assert!(job_members(job, root).unwrap().is_empty());
                 assert!(job_members(job, None).unwrap().is_empty());
-                assert!(!crate::platform::process::is_alive(child.id()));
+                assert!(!crate::platform::runtime::is_alive(child.id()));
             }
         }
 
@@ -2183,5 +2257,57 @@ mod windows {
             );
             assert_eq!(calls, 1);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod pty_tests {
+    use super::*;
+    use crate::env::LaunchContext;
+    use windows_sys::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    fn pid_of(process: &OwnedHandle) -> u32 {
+        // SAFETY: the handle is a live process handle owned by the caller.
+        unsafe { windows_sys::Win32::System::Threading::GetProcessId(process.as_raw_handle()) }
+    }
+
+    /// The Job owns the root from before its first instruction: the root is a member while its
+    /// only thread is still suspended, which a resumed or unsuspended creation cannot show.
+    #[test]
+    fn a_pty_root_is_in_its_job_before_it_runs() {
+        let context = LaunchContext::current().expect("this process's context");
+        let bash = crate::platform::bash::resolve(&context).expect("bash for this context");
+        let cwd = std::env::current_dir().expect("a working directory");
+        let launch = Launch {
+            bash: &bash,
+            command: "sleep 5",
+            script: None,
+            cwd: &cwd,
+            base_env: &context.env,
+            used_snapshot: false,
+            login: false,
+            pty: true,
+            pipe_stdin: false,
+            cols: PTY_COLS,
+            rows: PTY_ROWS,
+            exit_status: None,
+        };
+        let suspended = create_in_job(&launch).expect("a suspended PTY root");
+        let pid = pid_of(&suspended.process);
+        assert!(
+            suspended
+                .tree
+                .members()
+                .unwrap_or_default()
+                .iter()
+                .any(|member| member.pid == pid),
+            "the root is in the job before it runs"
+        );
+        // SAFETY: the handle is the suspended root's own thread, and the calls balance.
+        let previous = unsafe { SuspendThread(suspended.thread.as_raw_handle()) };
+        assert_eq!(previous, 1, "the root is still suspended");
+        // SAFETY: undoes the count above, leaving the root suspended as it was.
+        unsafe { ResumeThread(suspended.thread.as_raw_handle()) };
+        let _ = suspended.tree.kill();
     }
 }

@@ -7,22 +7,22 @@
 //! The launcher uses the exact module loaded from the verified extracted image. A failed
 //! extraction falls back to the system API without searching the working directory or PATH.
 
-#[cfg(all(windows, target_arch = "x86_64"))]
-macro_rules! arch {
-    () => {
-        "x64"
-    };
-}
-
-#[cfg(all(windows, target_arch = "aarch64"))]
-macro_rules! arch {
-    () => {
-        "arm64"
-    };
-}
-
 #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod bundled {
+    #[cfg(target_arch = "x86_64")]
+    macro_rules! arch {
+        () => {
+            "x64"
+        };
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    macro_rules! arch {
+        () => {
+            "arm64"
+        };
+    }
+
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::windows::fs::OpenOptionsExt;
@@ -138,7 +138,7 @@ mod bundled {
                     })
                     .and_then(|(pid, _)| pid.parse::<u32>().ok());
                 if old_pid.is_some_and(|pid| {
-                    pid != std::process::id() && !crate::platform::process::is_alive(pid)
+                    pid != std::process::id() && !crate::platform::runtime::is_alive(pid)
                 }) && crate::platform::runtime::create_private_windows_check(&entry.path())
                     .is_ok()
                 {

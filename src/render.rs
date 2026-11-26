@@ -11,7 +11,8 @@ pub use self::types::{AgentDelivery, DaemonDelivery, TrackedResult, error_result
 use crate::env::{LaunchContext, ProbeWarning};
 use crate::lease::Lease;
 use crate::media;
-use crate::platform::process::{self, clean_member_name};
+use crate::platform::members::Member;
+use crate::platform::process::clean_member_name;
 use crate::service::core::{
     PreparedSnapshot, ScriptReport, encoding_warning, kill_pending_note, metadata_members,
     metadata_workspace_bytes, output_incomplete, overload_task_message, resize_metadata_workspace,
@@ -1967,7 +1968,7 @@ fn held_members_text(snapshot: &Snapshot) -> String {
 }
 
 /// Names processes as `adb.exe (4120), sleep (77) and 3 more`.
-fn members(members: &[process::Member]) -> String {
+fn members(members: &[Member]) -> String {
     if members.is_empty() {
         return "processes".into();
     }

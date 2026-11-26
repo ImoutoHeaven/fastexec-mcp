@@ -3001,7 +3001,7 @@ mod script_tests {
     fn list_single_block_narrow_budget_tiers_and_ack_conservation() {
         let (_runtime, tasks, session) = fixture(Limits::OFF);
         let service = Arc::new(crate::service::Service::new(Arc::clone(&tasks), false));
-        let make_held_snapshot = |task: &Task, members: Option<Vec<process::Member>>| {
+        let make_held_snapshot = |task: &Task, members: Option<Vec<Member>>| {
             let mut snap = task.notice_snapshot();
             crate::tasks::state::set_held(&mut snap, members);
             snap
@@ -3009,8 +3009,8 @@ mod script_tests {
 
         // 1. 12 processes + maxBytes: 100 -> Tier 4 (`keeps <min-pid-name> +11` + ` … [cut]`),
         // records keeps_reported, and out-of-order members render identically.
-        let members_ordered: Vec<process::Member> = (101..=112)
-            .map(|pid| process::Member {
+        let members_ordered: Vec<Member> = (101..=112)
+            .map(|pid| Member {
                 pid,
                 name: format!("worker-{pid}"),
             })
@@ -3136,8 +3136,8 @@ mod script_tests {
 
         // 2. Long multibyte process name triggers Tier 5 (`keeps 12 processes` + ` … [cut]`)
         // without consuming keeps_reported.
-        let mut mb_members: Vec<process::Member> = (201..=212)
-            .map(|pid| process::Member {
+        let mut mb_members: Vec<Member> = (201..=212)
+            .map(|pid| Member {
                 pid,
                 name: format!("p{pid}"),
             })
@@ -3308,15 +3308,15 @@ mod script_tests {
             false,
         );
         let ctrl_members = vec![
-            process::Member {
+            Member {
                 pid: 301,
                 name: "bad\n\t\x07name".into(),
             },
-            process::Member {
+            Member {
                 pid: 302,
                 name: String::new(),
             },
-            process::Member {
+            Member {
                 pid: 303,
                 name: " \r\n ".into(),
             },
@@ -3433,7 +3433,7 @@ mod script_tests {
         }
         let (notice, claim) = tasks
             .background(&session, "", 512, &mut |_| Ok(()), &mut |_| {
-                Ok(Some(vec![process::Member {
+                Ok(Some(vec![Member {
                     pid: 555,
                     name: "sleep".into(),
                 }]))
@@ -3639,7 +3639,7 @@ mod script_tests {
                 forced_end: false,
                 elapsed: Duration::from_millis(20),
                 output_open: false,
-                leftovers: vec![process::Member {
+                leftovers: vec![Member {
                     pid: 900,
                     name: "sleep".into(),
                 }],

@@ -53,7 +53,10 @@ With no arguments, fastexec serves MCP over stdio.";
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     #[cfg(unix)]
     {
-        if args.first().is_some_and(|arg| arg == platform::host::FLAG) {
+        if args
+            .first()
+            .is_some_and(|arg| arg == platform::process::HOST_FLAG)
+        {
             platform::host::main(&args[1..]);
         }
     }

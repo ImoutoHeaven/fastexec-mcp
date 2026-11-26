@@ -5,7 +5,8 @@ use crate::env::LaunchContext;
 use crate::files;
 use crate::id::parse_handle;
 use crate::lease::Lease;
-use crate::platform::process;
+use crate::platform::members::{Member, MemberBudget};
+use crate::platform::process::Tree;
 use crate::tasks::script::{CallInfo, ReportSnapshot};
 use crate::tasks::state::{Snapshot, Task};
 use crate::tasks::{self, Tasks};
@@ -158,18 +159,18 @@ pub(crate) fn resize_metadata_workspace(
 }
 
 pub(crate) fn metadata_members(
-    tree: &process::Tree,
+    tree: &Tree,
     workspace: &mut Lease,
     launch: &LaunchContext,
     action: Action,
-) -> Result<Option<Vec<process::Member>>, String> {
+) -> Result<Option<Vec<Member>>, String> {
     let retained = workspace.bytes();
     let (members, refused) = {
         let mut reserve = |bytes| {
             resize_metadata_workspace(workspace, retained.saturating_add(bytes), launch, action)
                 .is_ok()
         };
-        let mut budget = process::MemberBudget::new(&mut reserve);
+        let mut budget = MemberBudget::new(&mut reserve);
         let members = tree.members_with_budget(&mut budget);
         (members, budget.refused())
     };

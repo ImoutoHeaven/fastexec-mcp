@@ -1,6 +1,6 @@
 //! The Unix task host: the root of each task's process tree, between the server and bash.
 //!
-//! The server starts the fastexec binary again with [`FLAG`] as the leader of a new session. The
+//! The server starts the fastexec binary again with [`HOST_FLAG`] as the leader of a new session. The
 //! host then:
 //! - on Linux and FreeBSD, becomes the child reaper of its descendants, so processes that daemonize
 //!   (`setsid`, a double fork) are adopted by it instead of init and stay in the tree;
@@ -14,18 +14,11 @@
 //! - ends the tree when its lifeline reaches EOF: the server dropped the tree or died, even by
 //!   SIGKILL.
 
+use crate::platform::process::{HOST_FLAG, HOST_STARTUP_READY};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
-
-/// The first argument that makes the fastexec binary run as a task host.
-pub const FLAG: &str = "--fastexec-task-host";
-
-/// The host's first word on the status pipe: 0 after its bash spawn attempt, else a
-/// Unix errno saying why it cannot own the task's tree. The root bash's exit code follows as a
-/// second word.
-pub const STARTUP_READY: u32 = 0;
 
 extern "C" fn ignore(_: libc::c_int) {}
 
@@ -38,14 +31,14 @@ pub fn main(args: &[OsString]) -> ! {
         (descriptor(0), descriptor(1), descriptor(2), args.get(3))
     else {
         eprintln!(
-            "fastexec: {FLAG} takes <status fd> <lifeline fd> <control fd> <bash> [arguments]"
+            "fastexec: {HOST_FLAG} takes <status fd> <lifeline fd> <control fd> <bash> [arguments]"
         );
         std::process::exit(2);
     };
     #[cfg(not(target_os = "macos"))]
     let (Some(status), Some(lifeline), Some(bash)) = (descriptor(0), descriptor(1), args.get(2))
     else {
-        eprintln!("fastexec: {FLAG} takes <status fd> <lifeline fd> <bash> [arguments]");
+        eprintln!("fastexec: {HOST_FLAG} takes <status fd> <lifeline fd> <bash> [arguments]");
         std::process::exit(2);
     };
     // SAFETY: the server opened these descriptors for this process alone; bash must not
@@ -200,7 +193,7 @@ pub fn main(args: &[OsString]) -> ! {
         Ok(bash) => bash.id() as libc::pid_t,
         Err(error) => {
             eprintln!("fastexec: cannot start {}: {error}", bash.to_string_lossy());
-            let _ = status.write_all(&STARTUP_READY.to_le_bytes());
+            let _ = status.write_all(&HOST_STARTUP_READY.to_le_bytes());
             let _ = status.write_all(&127_i32.to_le_bytes());
             #[cfg(target_os = "freebsd")]
             drain_terminal(terminal.as_ref());
@@ -219,7 +212,7 @@ pub fn main(args: &[OsString]) -> ! {
     // A caller may kill immediately after readiness, so it must never observe a host that has
     // yet to create its command. A closed status pipe does not relinquish an existing tree:
     // the lifeline watcher owns cleanup if the server disappeared during startup.
-    let _ = status.write_all(&STARTUP_READY.to_le_bytes());
+    let _ = status.write_all(&HOST_STARTUP_READY.to_le_bytes());
     release_stdio();
     #[cfg(target_os = "macos")]
     wait_macos(bash, bash_start, &mut status, &tracker, &control);

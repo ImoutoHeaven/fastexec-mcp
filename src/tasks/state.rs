@@ -4,7 +4,8 @@ use super::Tasks;
 use super::script::ScriptControl;
 use crate::lease::{BytePool, Lease};
 use crate::media::MediaKind;
-use crate::platform::process::{self, Member, Tree, normalize_members};
+use crate::platform::members::Member;
+use crate::platform::process::{self, Tree, normalize_members};
 use crate::term::output::{
     Cleaner, MATCH_SCAN_BYTES, Matcher, Window, WindowBuilder, WindowSpec,
     incomplete_legacy_suffix_reader,

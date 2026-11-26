@@ -8,7 +8,7 @@ use crate::files::read::{FileReadData, MediaPayload};
 use crate::files::write::FileWriteData;
 use crate::files::{self, FileError};
 use crate::lease::{Lease, Owner};
-use crate::platform::process;
+use crate::platform::members::Member;
 use crate::service::core::{
     encoding_warning, kill_pending_note, output_incomplete, task_io_ok, task_warnings,
 };
@@ -97,7 +97,7 @@ struct MemberDto<'a> {
     name: &'a str,
 }
 
-fn members_dto(members: &[process::Member]) -> Vec<MemberDto<'_>> {
+fn members_dto(members: &[Member]) -> Vec<MemberDto<'_>> {
     members
         .iter()
         .map(|m| MemberDto {
