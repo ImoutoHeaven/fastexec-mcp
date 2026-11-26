@@ -3515,6 +3515,8 @@ mod tests {
         let (filled_128_tx, filled_128_rx) = oneshot::channel();
         let (proceed_129_tx, proceed_129_rx) = oneshot::channel();
         let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let (mcp_active_read_tx, mcp_active_read_rx) = oneshot::channel();
+        let (mcp_cancelled_tx, mcp_cancelled_rx) = oneshot::channel();
         let peer = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
             assert!(matches!(
@@ -3589,15 +3591,16 @@ mod tests {
 
             // Part 2 on the same connection: MCP `events/stream` slow consumer receives distinct
             // slow-consumer queue-full message (not memory budget full).
+            let (mut peer_read, mut peer_write) = tokio::io::split(conn);
             let Some(ToDaemon::EventsStream { id: mcp_id, .. }) =
-                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                ipc::read_frame::<_, ToDaemon>(&mut peer_read, ipc::REQUEST_LIMIT)
                     .await
                     .unwrap()
             else {
                 panic!("expected MCP subscription on preserved IPC connection");
             };
             ipc::write_frame(
-                &mut conn,
+                &mut peer_write,
                 &ToEndpoint::EventFrame {
                     id: mcp_id,
                     frame: ipc::EventWireFrame::Active(crate::events::ActiveNotice {
@@ -3609,31 +3612,44 @@ mod tests {
             )
             .await
             .unwrap();
-            for seq in 0..(EVENT_STREAM_CHANNEL_CAPACITY + 4) {
-                ipc::write_frame(
-                    &mut conn,
-                    &ToEndpoint::EventFrame {
-                        id: mcp_id,
-                        frame: ipc::EventWireFrame::Event(crate::events::StreamEvent {
-                            event_id: format!("mcp-ev-{seq}"),
-                            name: crate::events::EVENT_EXTERNAL.into(),
-                            timestamp: "2026-11-26T00:00:00.000Z".into(),
-                            data: serde_json::json!({"seq": seq}),
-                            cursor: format!("ep000001:{}", seq + 1),
-                        }),
-                    },
-                )
-                .await
-                .unwrap();
-            }
-            assert!(matches!(
-                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+            mcp_active_read_rx.await.unwrap();
+            let stop_sending = AtomicBool::new(false);
+            let writer = async {
+                for seq in 0..(EVENT_STREAM_CHANNEL_CAPACITY * 3) {
+                    if stop_sending.load(Ordering::Acquire) {
+                        break;
+                    }
+                    ipc::write_frame(
+                        &mut peer_write,
+                        &ToEndpoint::EventFrame {
+                            id: mcp_id,
+                            frame: ipc::EventWireFrame::Event(crate::events::StreamEvent {
+                                event_id: format!("mcp-ev-{seq}"),
+                                name: crate::events::EVENT_EXTERNAL.into(),
+                                timestamp: "2026-11-26T00:00:00.000Z".into(),
+                                data: serde_json::json!({"seq": seq}),
+                                cursor: format!("ep000001:{}", seq + 1),
+                            }),
+                        },
+                    )
                     .await
-                    .unwrap(),
-                Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == mcp_id
-            ));
+                    .unwrap();
+                    tokio::task::yield_now().await;
+                }
+            };
+            let reader = async {
+                assert!(matches!(
+                    ipc::read_frame::<_, ToDaemon>(&mut peer_read, ipc::REQUEST_LIMIT)
+                        .await
+                        .unwrap(),
+                    Some(ToDaemon::EventsCancel { id: cancelled }) if cancelled == mcp_id
+                ));
+                stop_sending.store(true, Ordering::Release);
+            };
+            tokio::join!(writer, reader);
+            mcp_cancelled_tx.send(()).unwrap();
             assert!(matches!(
-                ipc::read_frame::<_, ToDaemon>(&mut conn, ipc::REQUEST_LIMIT)
+                ipc::read_frame::<_, ToDaemon>(&mut peer_read, ipc::REQUEST_LIMIT)
                     .await
                     .unwrap(),
                 Some(ToDaemon::Bye)
@@ -3745,6 +3761,11 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&active_line).unwrap()["method"],
             "notifications/events/active"
         );
+        mcp_active_read_tx.send(()).unwrap();
+        timeout(Duration::from_secs(10), mcp_cancelled_rx)
+            .await
+            .expect("paused MCP client must stall stdout and trigger EventsCancel")
+            .unwrap();
 
         let mut term_msg = None;
         loop {
