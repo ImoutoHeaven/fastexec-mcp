@@ -2,8 +2,7 @@ use super::*;
 use crate::env::LaunchContext;
 use crate::id::parse_handle;
 use crate::service::core::{
-    PreparedSnapshot, RenderSlot, output_incomplete, script_report, task_io_ok, task_warnings,
-    text_workspace_bytes,
+    RenderSlot, output_incomplete, script_report, task_io_ok, task_warnings, text_workspace_bytes,
 };
 use crate::service::{ExecContext, Service, ServiceError};
 use crate::tasks::session::{Session, TaskEntry};
@@ -1202,6 +1201,7 @@ async fn agent_text_result_keeps_its_payload_owner_after_rendering() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancellation_keeps_attachment_worker_memory_and_reader_pinned() {
+    use crate::service::core::PreparedSnapshot;
     use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
     let tasks = Tasks::new(tasks::Limits::OFF).unwrap();
     let service = Arc::new(Service::new(Arc::clone(&tasks), false));
