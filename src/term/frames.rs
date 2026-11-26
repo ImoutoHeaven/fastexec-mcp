@@ -260,14 +260,13 @@ impl History {
     /// and dropped lines are passed over.
     fn beside(&self, id: usize, up: bool) -> Option<usize> {
         let at = self.pos[id];
-        let positions: Box<dyn Iterator<Item = usize>> = if up {
-            Box::new(at + 1..self.order.len())
+        let eligible =
+            |&other: &usize| !self.lines[other].dropped && !self.lines[other].placeholder;
+        let id = if up {
+            self.order[at + 1..].iter().copied().find(eligible)
         } else {
-            Box::new((0..at).rev())
-        };
-        let id = positions
-            .map(|pos| self.order[pos])
-            .find(|&other| !self.lines[other].dropped && !self.lines[other].placeholder)?;
+            self.order[..at].iter().rev().copied().find(eligible)
+        }?;
         (!self.screen.contains(&id)).then_some(id)
     }
 
@@ -673,17 +672,31 @@ impl History {
                     && core(line).chars().count() >= 3
                     && continues(&rows[j].text, line)
             };
-            let near = |range: Box<dyn Iterator<Item = usize>>| {
-                range
-                    .map(|pos| self.order[pos])
-                    .filter(|&id| self.usable(id, shown))
-                    .take(CONTINUE_REACH)
-                    .find(grows)
-            };
-            let after = above.then(|| near(Box::new(lo..hi))).flatten();
-            if let Some(id) =
-                after.or_else(|| below.then(|| near(Box::new((lo..hi).rev()))).flatten())
-            {
+            let window = &self.order[lo..hi];
+            let usable = |&id: &usize| self.usable(id, shown);
+            let after = above
+                .then(|| {
+                    window
+                        .iter()
+                        .copied()
+                        .filter(usable)
+                        .take(CONTINUE_REACH)
+                        .find(grows)
+                })
+                .flatten();
+            if let Some(id) = after.or_else(|| {
+                below
+                    .then(|| {
+                        window
+                            .iter()
+                            .rev()
+                            .copied()
+                            .filter(usable)
+                            .take(CONTINUE_REACH)
+                            .find(grows)
+                    })
+                    .flatten()
+            }) {
                 shown[j] = Some(id);
             }
         }
@@ -736,26 +749,28 @@ impl History {
         row: usize,
         after: bool,
     ) -> Option<usize> {
-        let range: Box<dyn Iterator<Item = usize>> = match after {
-            true => Box::new(row + 1..rows.len()),
-            false => Box::new((0..row).rev()),
-        };
-        range
-            .filter(|&k| !blank(&rows[k].text))
-            .find_map(|k| shown[k])
+        let has_text = |&k: &usize| !blank(&rows[k].text);
+        if after {
+            (row + 1..rows.len())
+                .filter(has_text)
+                .find_map(|k| shown[k])
+        } else {
+            (0..row).rev().filter(has_text).find_map(|k| shown[k])
+        }
     }
 
     /// The nearest line before or after line `id` that holds text.
     fn text_beside(&self, id: usize, after: bool) -> Option<usize> {
         let at = self.pos[id];
-        let range: Box<dyn Iterator<Item = usize>> = match after {
-            true => Box::new(at + 1..self.order.len()),
-            false => Box::new((0..at).rev()),
-        };
-        range.map(|pos| self.order[pos]).find(|&other| {
+        let has_text = |&other: &usize| {
             let line = &self.lines[other];
             !line.dropped && !line.placeholder && !blank(&line.text)
-        })
+        };
+        if after {
+            self.order[at + 1..].iter().copied().find(has_text)
+        } else {
+            self.order[..at].iter().rev().copied().find(has_text)
+        }
     }
 
     /// A replaced line whose words reappear together in the rows around its replacement was
