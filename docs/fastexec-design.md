@@ -1741,12 +1741,15 @@ until the listener stops.
 
 The HTTP listener admits at most `128` concurrent connections and enforces a
 `10` second header-read deadline without imposing a total timeout on uploads,
-SSE streams, or long tool calls. Within those `128` connections, `/t/` transfer
-requests are bounded by a dedicated sub-quota (returning `503 Service
-Unavailable` when transfer slots are full) so concurrent file transfers cannot
-starve `/mcp` control traffic. Extra connections past `128` close without
-queueing; local daemon socket management keeps its own capacity. Streamed
-responses include `X-Accel-Buffering: no`.
+SSE streams, or long tool calls. On the shared MCP listener, `/t/` uses at most
+`96` connections, retaining each slot across keep-alive requests until the TCP
+connection closes. A separate `96`-request limit covers active transfers,
+including multiplexed HTTP/2 streams. When the connection sub-quota is full,
+new transfer connections receive `503 Service Unavailable` and close gracefully
+(HTTP/1 close or HTTP/2 GOAWAY), preserving `32` connection slots for `/mcp`.
+The standalone transfer listener has no MCP reservation. Extra connections past
+`128` close without queueing; local daemon socket management keeps its own
+capacity. Streamed responses include `X-Accel-Buffering: no`.
 
 ### Transfer route (`src/transfer.rs`)
 

@@ -323,7 +323,13 @@ pub async fn serve(http: Http, daemon: Arc<Daemon>, stopped: CancellationToken) 
         stopped: stopped.clone(),
         inner,
     };
-    serve_connections(listener, layer, stopped).await;
+    serve_connections(
+        listener,
+        layer,
+        stopped,
+        Some(Arc::new(Semaphore::new(MAX_TRANSFER_CONNECTIONS))),
+    )
+    .await;
 }
 
 /// Serves `/t/` capabilities on `listener` until `stopped` is cancelled.
@@ -336,11 +342,15 @@ pub async fn serve_transfers(
         table,
         stopped: stopped.clone(),
     };
-    serve_connections(listener, layer, stopped).await;
+    serve_connections(listener, layer, stopped, None).await;
 }
 
-async fn serve_connections<S>(listener: TcpListener, service: S, stopped: CancellationToken)
-where
+async fn serve_connections<S>(
+    listener: TcpListener,
+    service: S,
+    stopped: CancellationToken,
+    transfer_connections: Option<Arc<Semaphore>>,
+) where
     S: tower_service::Service<Request<Incoming>, Response = Reply, Error = Infallible>
         + Clone
         + Send
@@ -387,8 +397,43 @@ where
                 };
                 let service = service.clone();
                 let stopped = stopped.clone();
+                let transfer_connections = transfer_connections.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let close_requested = CancellationToken::new();
+                    let request_close = close_requested.clone();
+                    let transfer_permit = Arc::new(std::sync::Mutex::new(None));
+                    let request_transfer_permit = Arc::clone(&transfer_permit);
+                    let service = TowerToHyperService::new(service);
+                    let service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                        let version = request.version();
+                        let allowed = if request.uri().path().starts_with("/t/")
+                            && let Some(slots) = &transfer_connections
+                        {
+                            // Retain one slot across requests until this connection closes.
+                            let mut held = request_transfer_permit
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            if held.is_none() {
+                                *held = Arc::clone(slots).try_acquire_owned().ok();
+                            }
+                            held.is_some()
+                        } else {
+                            true
+                        };
+                        let response = if allowed {
+                            Some(hyper::service::Service::call(&service, request))
+                        } else {
+                            request_close.cancel();
+                            None
+                        };
+                        async move {
+                            match response {
+                                Some(response) => response.await,
+                                None => Ok(refusal(version, StatusCode::SERVICE_UNAVAILABLE, "")),
+                            }
+                        }
+                    });
                     let mut builder = auto::Builder::new(TokioExecutor::new());
                     builder
                         .http1()
@@ -399,11 +444,18 @@ where
                         .timer(TokioTimer::new())
                         .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
                         .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL);
+                    let connection = builder.serve_connection(TokioIo::new(stream), service);
+                    tokio::pin!(connection);
                     let served = tokio::select! {
                         _ = stopped.cancelled() => return,
-                        served = builder.serve_connection(
-                            TokioIo::new(stream), TowerToHyperService::new(service)
-                        ) => served,
+                        served = &mut connection => served,
+                        _ = close_requested.cancelled() => {
+                            connection.as_mut().graceful_shutdown();
+                            tokio::select! {
+                                _ = stopped.cancelled() => return,
+                                served = &mut connection => served,
+                            }
+                        }
                     };
                     // Malformed or abandoned unauthenticated requests are ordinary client
                     // faults. Logging each one would let a peer fill the daemon's error log.

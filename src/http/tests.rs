@@ -716,7 +716,7 @@ async fn http2_h2c_concurrent_requests_and_refusal_omit_connection_close() {
         stopped: stopped.clone(),
         inner: poc_service(gate, bound),
     };
-    let server_task = tokio::spawn(serve_connections(listener, layer, stopped.clone()));
+    let server_task = tokio::spawn(serve_connections(listener, layer, stopped.clone(), None));
 
     let stream = tokio::net::TcpStream::connect(bound).await.unwrap();
     let (mut sender, conn) =
@@ -1319,7 +1319,7 @@ async fn transfer_subquota_returns_503_while_preserving_mcp_control_plane() {
         stopped: stopped.clone(),
         inner,
     };
-    let server_task = tokio::spawn(serve_connections(listener, layer, stopped.clone()));
+    let server_task = tokio::spawn(serve_connections(listener, layer, stopped.clone(), None));
 
     let open_transfer = || async {
         let mut s = tokio::net::TcpStream::connect(bound).await.unwrap();
@@ -1375,4 +1375,163 @@ async fn transfer_subquota_returns_503_while_preserving_mcp_control_plane() {
     stopped.cancel();
     let _ = server_task.await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+enum TestHttpSender {
+    Http1(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
+    Http2(hyper::client::conn::http2::SendRequest<Full<Bytes>>),
+}
+
+impl TestHttpSender {
+    async fn connect(bound: SocketAddr, http2: bool) -> (Self, tokio::task::JoinHandle<()>) {
+        let stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+        if http2 {
+            let (sender, connection) =
+                hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                    .await
+                    .unwrap();
+            let task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            (Self::Http2(sender), task)
+        } else {
+            let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            (Self::Http1(sender), task)
+        }
+    }
+
+    async fn send(&mut self, request: Request<Full<Bytes>>) -> Response<Incoming> {
+        match self {
+            Self::Http1(sender) => {
+                sender.ready().await.unwrap();
+                sender.send_request(request).await.unwrap()
+            }
+            Self::Http2(sender) => {
+                sender.ready().await.unwrap();
+                sender.send_request(request).await.unwrap()
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn transfer_connection_quota_survives_completed_requests_on_http1_and_http2() {
+    let dir = std::env::temp_dir().join(format!(
+        "fastexec-transfer-connections-{}",
+        crate::tasks::random_chars(12).unwrap()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let sample = dir.join("ordinary.txt");
+    std::fs::write(&sample, b"ordinary").unwrap();
+
+    for http2 in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let stopped = CancellationToken::new();
+        let token = "transfer-connections-test-token";
+        let table = Arc::new(Transfers::new());
+        let id = table.create(sample.clone()).unwrap();
+        let connections = Arc::new(Semaphore::new(2));
+        let layer = Bearer {
+            digests: Arc::from([digest(token)]),
+            table,
+            transfer_slots: Arc::new(Semaphore::new(2)),
+            stopped: stopped.clone(),
+            inner: poc_service(Arc::new(tokio::sync::Notify::new()), bound),
+        };
+        let server_task = tokio::spawn(serve_connections(
+            listener,
+            layer,
+            stopped.clone(),
+            Some(Arc::clone(&connections)),
+        ));
+        let version = if http2 {
+            Version::HTTP_2
+        } else {
+            Version::HTTP_11
+        };
+        let transfer_request = || {
+            Request::get(format!("http://{bound}/t/{id}"))
+                .version(version)
+                .header(header::HOST, bound.to_string())
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        };
+        let (mut first, first_task) = TestHttpSender::connect(bound, http2).await;
+        for _ in 0..2 {
+            let response = first.send(transfer_request()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"ordinary");
+            assert_eq!(connections.available_permits(), 1);
+        }
+        let (mut second, second_task) = TestHttpSender::connect(bound, http2).await;
+        let response = second.send(transfer_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(connections.available_permits(), 0);
+
+        let (mut refused, refused_task) = TestHttpSender::connect(bound, http2).await;
+        let response = refused.send(transfer_request()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().contains_key(header::CONNECTION), !http2);
+        response.into_body().collect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), refused_task)
+            .await
+            .expect("a refused transfer connection must close after its response")
+            .unwrap();
+        drop(refused);
+
+        let (mut control, control_task) = TestHttpSender::connect(bound, http2).await;
+        let request = Request::post(format!("http://{bound}/mcp"))
+            .version(version)
+            .header(header::HOST, "localhost")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "events/list")
+            .body(Full::new(modern_post_body(
+                1,
+                "events/list",
+                serde_json::json!({}),
+            )))
+            .unwrap();
+        let response = control.send(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), first_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let released = tokio::time::timeout(Duration::from_secs(5), connections.acquire())
+            .await
+            .expect("closing the connection must release its transfer slot")
+            .unwrap();
+        drop(released);
+        let (mut replacement, replacement_task) = TestHttpSender::connect(bound, http2).await;
+        let response = replacement.send(transfer_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(connections.available_permits(), 0);
+
+        drop((second, control, replacement));
+        stopped.cancel();
+        server_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            second_task.await.unwrap();
+            control_task.await.unwrap();
+            replacement_task.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
