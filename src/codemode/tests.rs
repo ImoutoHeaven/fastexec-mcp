@@ -198,7 +198,7 @@ async fn text_buffer_bridge_reserves_exact_encoding_and_keeps_queue_ownership() 
             is_control: false,
         };
         let outcome = encode_service_error(
-            crate::service::ServiceError::Io("hello λ\n".into()),
+            crate::service::core::ServiceError::Io("hello λ\n".into()),
             &ctx,
             &delivery,
         )
@@ -279,7 +279,7 @@ async fn nested_control_wire_uses_bounded_reserve_and_keeps_queue_owner() {
                 is_control: true,
             };
             let outcome = encode_service_error(
-                crate::service::ServiceError::NotFound("Unknown taskId.".into()),
+                crate::service::core::ServiceError::NotFound("Unknown taskId.".into()),
                 &ctx,
                 &delivery,
             )
@@ -2569,9 +2569,9 @@ async fn program_tool_error_codes_partial_results_and_edit_matches() {
         )
         .unwrap();
     let overload = encode_service_error(
-        crate::service::ServiceError::Overload(
+        crate::service::core::ServiceError::Overload(
             "memory full".into(),
-            Some(crate::service::TaskMeta {
+            Some(crate::service::core::TaskMeta {
                 bare_task_id: "aaaaaaaa-1".into(),
                 log_path: "/tmp/a.log".into(),
             }),
@@ -2593,7 +2593,7 @@ async fn program_tool_error_codes_partial_results_and_edit_matches() {
     assert_eq!(parsed["result"]["taskId"].as_str(), Some("aaaaaaaa-1"));
 
     let cancelled = encode_service_error(
-        crate::service::ServiceError::Cancelled("cancelled".into()),
+        crate::service::core::ServiceError::Cancelled("cancelled".into()),
         &ctx,
         &ProgramDelivery {
             script: &handle,

@@ -1589,7 +1589,7 @@ fn deliver_tracked(
     context: &RequestContext<RoleServer>,
     mut tracked: TrackedResult,
     is_control: bool,
-    overload_message: impl FnOnce(Option<&crate::service::TaskMeta>) -> String,
+    overload_message: impl FnOnce(Option<&crate::service::core::TaskMeta>) -> String,
 ) -> CallToolResult {
     let use_control = is_control || tracked.result.is_error == Some(true);
     let b64_bytes =

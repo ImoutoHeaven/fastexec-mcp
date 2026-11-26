@@ -10,7 +10,7 @@ use self::core::{
     PreparedSnapshot, RenderSlot, ScriptReport, metadata_members, metadata_workspace_bytes,
     overload_task_message, resize_metadata_workspace, script_report, text_workspace_bytes,
 };
-pub use self::core::{ServiceError, TaskMeta};
+use self::core::{ServiceError, TaskMeta};
 use self::schema::{
     Action, DEFAULT_KEY_DELAY_MS, ExecPolicy, ListScope, ListState, MAX_INPUT_BYTES, Request, View,
     flag, normalize_request, validate, validate_cwd,

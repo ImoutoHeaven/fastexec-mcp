@@ -2,8 +2,7 @@
 
 use crate::lease::Lease;
 use crate::media;
-use crate::service::TaskMeta;
-use crate::service::core::RenderSlot;
+use crate::service::core::{RenderSlot, TaskMeta};
 use rmcp::model::{CallToolResult, ContentBlock, ResourceContents};
 use std::path::Path;
 

@@ -2,9 +2,10 @@ use super::*;
 use crate::env::LaunchContext;
 use crate::id::parse_handle;
 use crate::service::core::{
-    RenderSlot, output_incomplete, script_report, task_io_ok, task_warnings, text_workspace_bytes,
+    RenderSlot, ServiceError, output_incomplete, script_report, task_io_ok, task_warnings,
+    text_workspace_bytes,
 };
-use crate::service::{ExecContext, Service, ServiceError};
+use crate::service::{ExecContext, Service};
 use crate::tasks::session::{Session, TaskEntry};
 use crate::tasks::state::Snapshot;
 use crate::tasks::{self, Tasks};

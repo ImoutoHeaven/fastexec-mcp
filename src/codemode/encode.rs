@@ -10,12 +10,11 @@ use crate::files::{self, FileError};
 use crate::lease::{Lease, Owner};
 use crate::platform::members::Member;
 use crate::service::core::{
-    encoding_warning, kill_pending_note, output_incomplete, task_io_ok, task_warnings,
+    ServiceError, encoding_warning, kill_pending_note, output_incomplete, task_io_ok, task_warnings,
 };
 use crate::service::schema::Action;
 use crate::service::{
     ExecContext, PreparedExec, PreparedList, PreparedScreen, PreparedTranscript, PreparedWindow,
-    ServiceError,
 };
 use crate::tasks::script::CallInfo;
 use crate::tasks::state::{Snapshot, Task};

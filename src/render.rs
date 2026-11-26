@@ -7,21 +7,21 @@ mod tests;
 pub mod types;
 
 use self::types::media_content_block;
-pub use self::types::{AgentDelivery, DaemonDelivery, TrackedResult, error_result, schema_error};
+use self::types::{AgentDelivery, DaemonDelivery, TrackedResult, error_result, schema_error};
 use crate::env::{LaunchContext, ProbeWarning};
 use crate::lease::Lease;
 use crate::media;
 use crate::platform::members::Member;
 use crate::platform::process::clean_member_name;
 use crate::service::core::{
-    PreparedSnapshot, ScriptReport, encoding_warning, kill_pending_note, metadata_members,
-    metadata_workspace_bytes, output_incomplete, overload_task_message, resize_metadata_workspace,
-    task_io_ok, task_warnings,
+    PreparedSnapshot, ScriptReport, ServiceError, TaskMeta, encoding_warning, kill_pending_note,
+    metadata_members, metadata_workspace_bytes, output_incomplete, overload_task_message,
+    resize_metadata_workspace, task_io_ok, task_warnings,
 };
 use crate::service::schema::{Action, ExecPolicy, ListState, Request};
 use crate::service::{
     Consumer, ExecContext, PreparedExec, PreparedList, PreparedScreen, PreparedTranscript,
-    PreparedWindow, Service, ServiceError, StagedRead, TaskMeta,
+    PreparedWindow, Service, StagedRead,
 };
 use crate::tasks::session::{OutsideClaim, Reader, Session, TaskEntry};
 use crate::tasks::state::{Snapshot, Task};
