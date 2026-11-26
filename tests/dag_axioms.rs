@@ -1918,10 +1918,8 @@ fn analyze_module_scope(
                 }
                 scope_stack.push(child_scope);
             }
-            Tok::Punct('}') => {
-                if scope_stack.len() > 1 {
-                    scope_stack.pop();
-                }
+            Tok::Punct('}') if scope_stack.len() > 1 => {
+                scope_stack.pop();
             }
             _ => {}
         }
