@@ -422,11 +422,11 @@ impl Host {
                         let result = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => return,
-                            result = files::read_core(
+                            result = files::read::read_core(
                                 request,
                                 Arc::clone(&launch),
                                 transfer,
-                                files::ReadPolicy::PROGRAM,
+                                files::read::ReadPolicy::PROGRAM,
                                 Some(permit),
                                 Some(read_cancel),
                                 input_owner.clone(),
@@ -441,7 +441,7 @@ impl Host {
                         let result = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => return,
-                            result = files::write_core(
+                            result = files::write::write_core(
                                 request,
                                 Arc::clone(&launch),
                                 Some(permit),
@@ -457,7 +457,7 @@ impl Host {
                         let result = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => return,
-                            result = files::edit_core(
+                            result = files::edit::edit_core(
                                 request,
                                 Arc::clone(&launch),
                                 Some(permit),

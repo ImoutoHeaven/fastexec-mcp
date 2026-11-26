@@ -2,11 +2,12 @@
 
 use super::types::{TrackedResult, media_content_block};
 use crate::env::LaunchContext;
-use crate::files::read::format_size;
-use crate::files::{
-    EditError, EditRequest, FileError, FileReadData, FileWriteData, MediaPayload, ReadPolicy,
-    ReadRequest, TextSlice, WriteRequest, edit_core, read_core, write_core,
+use crate::files::edit::{EditError, edit_core};
+use crate::files::read::{
+    FileReadData, MediaPayload, ReadPolicy, TextSlice, format_size, read_core,
 };
+use crate::files::write::{FileWriteData, write_core};
+use crate::files::{EditRequest, FileError, ReadRequest, WriteRequest};
 use crate::transfer::{self, Transfers, inspect_transfer_request};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;

@@ -12,9 +12,6 @@ pub(crate) mod write;
 #[cfg(test)]
 mod tests;
 
-pub use self::edit::{EditError, EditFailure, EditMatch, FileEditData, edit_core};
-pub use self::read::{FileReadData, MediaPayload, ReadPolicy, TextSlice, read_core};
-pub use self::write::{FileWriteData, write_core};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;

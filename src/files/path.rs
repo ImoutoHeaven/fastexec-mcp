@@ -1,4 +1,3 @@
-use super::write::SaveBuffer;
 use crate::env::LaunchContext;
 use crate::lease::{BytePool, Lease};
 use std::fs::{File, OpenOptions};
@@ -377,6 +376,48 @@ pub(crate) fn native_path_bytes(path: &Path) -> Option<usize> {
         .checked_add(1024)
 }
 
+#[cfg(any(unix, windows, test))]
+pub(super) fn save_memory_error(pool: &BytePool) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "Server active memory budget ({} bytes) is full while preserving file metadata; the original file was not replaced.",
+            pool.limit()
+        ),
+    )
+}
+
+#[cfg(any(unix, windows, test))]
+pub(super) struct SaveBuffer<T> {
+    pub(super) data: Vec<T>,
+    pub(super) _lease: Lease,
+}
+
+#[cfg(any(unix, windows, test))]
+impl<T: Default + Clone> SaveBuffer<T> {
+    pub(super) fn new(count: usize, pool: &Arc<BytePool>) -> io::Result<Self> {
+        let memory = || save_memory_error(pool);
+        let bytes = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(memory)?;
+        let mut lease = pool.try_acquire(bytes).ok_or_else(memory)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(count).map_err(|_| memory())?;
+        let actual = data
+            .capacity()
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(memory)?;
+        if !lease.try_resize(actual) {
+            return Err(memory());
+        }
+        data.resize(count, T::default());
+        Ok(Self {
+            data,
+            _lease: lease,
+        })
+    }
+}
+
 pub(super) fn target_memory_error(pool: &BytePool) -> io::Error {
     io::Error::new(
         io::ErrorKind::OutOfMemory,
@@ -518,7 +559,8 @@ pub(super) fn canonical_target(
         // Include String growth while the complete UTF-16 buffer remains owned.
         let bytes = (count as usize)
             .checked_mul(3)
-            .and_then(|n| super::edit::edit_growth(n, 1))
+            .and_then(|n| n.checked_add(8))
+            .and_then(|n| n.checked_mul(4))
             .ok_or_else(|| target_memory_error(pool))?;
         let mut lease = pool
             .try_acquire(bytes)

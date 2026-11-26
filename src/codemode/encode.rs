@@ -4,10 +4,10 @@
 use super::bridge::BRIDGE_LIMIT;
 use super::control::{Outcome, ProgramDelivery};
 use crate::env::{LaunchContext, ProbeWarning};
-use crate::files::{
-    self, EditError, EditFailure, EditMatch, FileEditData, FileError, FileReadData, FileWriteData,
-    MediaPayload,
-};
+use crate::files::edit::{EditError, EditFailure, EditMatch, FileEditData};
+use crate::files::read::{FileReadData, MediaPayload};
+use crate::files::write::FileWriteData;
+use crate::files::{self, FileError};
 use crate::lease::{Lease, Owner};
 use crate::platform::process;
 use crate::service::core::{

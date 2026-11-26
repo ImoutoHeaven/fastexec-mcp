@@ -1,15 +1,20 @@
-use super::edit::EditSource;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use super::path::SaveBuffer;
+#[cfg(windows)]
+use super::path::save_memory_error;
 use super::path::{
-    append_path, display_path, ends_in_directory, native_path_bytes, read_target_link,
-    reserve_target_workspace, resolve, target_memory_error, with_path_workspace,
+    append_path, canonical_target, display_path, ends_in_directory, native_path_bytes,
+    open_regular, read_target_link, reserve_target_workspace, resolve, target_memory_error,
+    with_path_workspace,
 };
+use super::read::TEXT_BLOCK;
 use super::{FileError, WriteRequest, lock};
 use crate::env::LaunchContext;
 use crate::lease::{BytePool, Lease};
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
 use std::fs::Metadata;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -201,6 +206,160 @@ pub(crate) fn write_target(
     ))
 }
 
+fn read_uninterrupted(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+pub(super) fn verify_edit_content(current: &mut impl Read, content: &str) -> io::Result<()> {
+    let mut offset = 0;
+    let mut buffer = [0; TEXT_BLOCK];
+    loop {
+        let read = read_uninterrupted(current, &mut buffer)?;
+        if read == 0 {
+            return if offset == content.len() {
+                Ok(())
+            } else {
+                Err(EditSource::changed())
+            };
+        }
+        if content.as_bytes().get(offset..offset + read) != Some(&buffer[..read]) {
+            return Err(EditSource::changed());
+        }
+        offset += read;
+    }
+}
+
+pub(super) fn read_edit_content(
+    file: &mut impl Read,
+    pool: &Arc<BytePool>,
+) -> io::Result<(String, Lease)> {
+    let memory = || {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "Server active memory budget ({} bytes) is full while editing the file; nothing was changed.",
+                pool.limit()
+            ),
+        )
+    };
+    let mut lease = pool.try_acquire(TEXT_BLOCK).ok_or_else(memory)?;
+    let mut bytes = Vec::new();
+    let mut block = [0u8; TEXT_BLOCK];
+    loop {
+        let count = read_uninterrupted(file, &mut block)?;
+        if count == 0 {
+            break;
+        }
+        let needed = bytes.len().checked_add(count).ok_or_else(memory)?;
+        if needed > bytes.capacity() {
+            let preferred = bytes
+                .capacity()
+                .checked_mul(2)
+                .ok_or_else(memory)?
+                .max(needed);
+            let mut capacity = preferred;
+            let peak = |capacity| {
+                TEXT_BLOCK
+                    .checked_add(bytes.capacity())?
+                    .checked_add(capacity)
+            };
+            if !peak(capacity).is_some_and(|peak| lease.try_resize(peak)) {
+                capacity = needed;
+                if !peak(capacity).is_some_and(|peak| lease.try_resize(peak)) {
+                    return Err(memory());
+                }
+            }
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(capacity)
+                .map_err(|_| memory())?;
+            if !peak(replacement.capacity()).is_some_and(|peak| lease.try_resize(peak)) {
+                return Err(memory());
+            }
+            replacement.extend_from_slice(&bytes);
+            bytes = replacement;
+            lease.shrink_to(
+                TEXT_BLOCK
+                    .checked_add(bytes.capacity())
+                    .ok_or_else(memory)?,
+            );
+        }
+        bytes.extend_from_slice(&block[..count]);
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|_| io::Error::other("the file is not valid UTF-8; edit it with exec"))?;
+    Ok((content, lease))
+}
+
+pub(super) struct EditSource {
+    path: PathBuf,
+    pub(super) target: crate::lease::Owned<PathBuf>,
+    file: File,
+    pub(super) content: String,
+    _content_lease: Lease,
+}
+
+impl EditSource {
+    pub(super) fn read(path: PathBuf, pool: &Arc<BytePool>) -> io::Result<Self> {
+        // A canonicalizer can discard directory requirements that the native open enforces.
+        let (mut file, _) = open_regular(&path)?;
+        let target = canonical_target(&path, pool)?;
+        let (content, mut lease) = read_edit_content(&mut file, pool)?;
+        // The reader's fixed block is gone; retain the actual String allocation.
+        lease.shrink_to(content.capacity());
+        Ok(Self {
+            path,
+            target,
+            file,
+            content,
+            _content_lease: lease,
+        })
+    }
+
+    pub(super) fn changed() -> io::Error {
+        io::Error::other("the file changed after it was read; read it again and retry the edit")
+    }
+
+    pub(super) fn verify_target(
+        &self,
+        current: Option<&File>,
+        pool: &Arc<BytePool>,
+    ) -> io::Result<()> {
+        let current = current.ok_or_else(Self::changed)?;
+        let (named, _) = open_regular(&self.path)?;
+        if canonical_target(&self.path, pool)?.value != self.target.value {
+            return Err(Self::changed());
+        }
+        #[cfg(unix)]
+        let identity = |file: &File| {
+            use std::os::unix::fs::MetadataExt;
+            file.metadata()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+        };
+        #[cfg(windows)]
+        let identity = windows_file_identity;
+        let original = identity(&self.file)?;
+        if original != identity(current)? || original != identity(&named)? {
+            return Err(Self::changed());
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_content(&self, current: &mut File) -> io::Result<()> {
+        current.rewind()?;
+        verify_edit_content(current, &self.content)
+    }
+
+    pub(super) fn save(&self, bytes: &[u8], pool: &Arc<BytePool>) -> io::Result<()> {
+        save_target(&self.target.value, bytes, Some(self), pool)
+    }
+}
+
 /// A fully staged replacement, removed on every failure. Closing before removal also makes
 /// cleanup work on Windows.
 pub(super) struct Staged {
@@ -296,11 +455,13 @@ pub(super) fn create_staging_file(path: &Path, private: bool) -> io::Result<File
 /// ACL APIs, and XNU honors ACL_FLAG_NO_INHERIT on an initial openx_np security descriptor.
 #[cfg(target_os = "macos")]
 pub(super) mod macos_access {
-    use super::*;
     use std::ffi::{CString, c_char, c_int, c_void};
+    use std::fs::File;
+    use std::io;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
 
     const ACL_TYPE_EXTENDED: c_int = 0x100;
     const ACL_FLAG_NO_INHERIT: c_int = 1 << 17;
@@ -607,48 +768,6 @@ fn preserve_owner(file: &File, original: &Metadata) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(any(unix, windows, test))]
-fn save_memory_error(pool: &BytePool) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::OutOfMemory,
-        format!(
-            "Server active memory budget ({} bytes) is full while preserving file metadata; the original file was not replaced.",
-            pool.limit()
-        ),
-    )
-}
-
-#[cfg(any(unix, windows, test))]
-pub(super) struct SaveBuffer<T> {
-    pub(super) data: Vec<T>,
-    pub(super) _lease: Lease,
-}
-
-#[cfg(any(unix, windows, test))]
-impl<T: Default + Clone> SaveBuffer<T> {
-    pub(super) fn new(count: usize, pool: &Arc<BytePool>) -> io::Result<Self> {
-        let memory = || save_memory_error(pool);
-        let bytes = count
-            .checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(memory)?;
-        let mut lease = pool.try_acquire(bytes).ok_or_else(memory)?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(count).map_err(|_| memory())?;
-        let actual = data
-            .capacity()
-            .checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(memory)?;
-        if !lease.try_resize(actual) {
-            return Err(memory());
-        }
-        data.resize(count, T::default());
-        Ok(Self {
-            data,
-            _lease: lease,
-        })
-    }
 }
 
 /// Keeps ACLs and extended attributes on the Unix platforms supported by the server. Linux
