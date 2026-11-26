@@ -142,32 +142,6 @@ const CP1_FORBIDDEN_EDGES: &[(&str, &str)] = &[
     ("endpoint", "tasks"),
 ];
 
-/// Multi-file top-level modules whose entire submodule graph (including parent `<top>.rs` and
-/// child `<top>/<sub>.rs` files) must have zero strongly connected cycles.
-const ACYCLIC_SUBMODULE_TREES: &[&str] = &[
-    "term",
-    "service",
-    "render",
-    "http_wire",
-    "mcp",
-    "http",
-    "cli",
-];
-
-/// Multi-file top-level modules whose sibling child submodules (`<top>/<sub>.rs`) must have zero
-/// strongly connected cycles among siblings.
-const ACYCLIC_SIBLING_SUBMODULES: &[&str] = &[
-    "term",
-    "tasks",
-    "service",
-    "render",
-    "http_wire",
-    "daemon",
-    "mcp",
-    "http",
-    "cli",
-];
-
 /// Allowed sibling submodules inside `src/tasks/` and their exact permitted sibling directed edges
 /// `(from_sub, to_sub)` (Spec §4.2.2, §7.2.5).
 const TASKS_SUBMODULES: &[&str] = &["script", "state", "workers", "session"];
@@ -1186,6 +1160,7 @@ struct ScanReport {
     main_declared_mods: Vec<DeclaredMod>,
     top_modules: BTreeSet<String>,
     file_submodules: BTreeMap<String, BTreeSet<String>>,
+    modules: BTreeSet<Vec<String>>,
     edges: Vec<EdgeRef>,
     inherent_impls: Vec<InherentImplViolation>,
     crate_leaks: Vec<CrateLeak>,
@@ -1392,10 +1367,10 @@ fn extract_inherent_impl_target(tokens: &[Token], impl_idx: usize) -> Option<(bo
         i = skip_generic_params(tokens, i);
     }
     let header_start = i;
-    let (mut paren, mut bracket, mut angle) = (0usize, 0usize, 0usize);
+    let (mut paren, mut bracket, mut brace, mut angle) = (0usize, 0usize, 0usize, 0usize);
     let mut type_end = None;
     while i < tokens.len() {
-        if paren == 0 && bracket == 0 && angle == 0 {
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 {
             if tokens[i].is_punct('{') {
                 type_end.get_or_insert(i);
                 break;
@@ -1412,6 +1387,8 @@ fn extract_inherent_impl_target(tokens: &[Token], impl_idx: usize) -> Option<(bo
             {
                 return None;
             }
+        }
+        if paren == 0 && bracket == 0 && brace == 0 {
             match tokens[i].kind {
                 Tok::Lt => angle += 1,
                 Tok::Gt => angle = angle.saturating_sub(1),
@@ -1424,6 +1401,8 @@ fn extract_inherent_impl_target(tokens: &[Token], impl_idx: usize) -> Option<(bo
             Tok::Punct(')') => paren = paren.saturating_sub(1),
             Tok::Punct('[') => bracket += 1,
             Tok::Punct(']') => bracket = bracket.saturating_sub(1),
+            Tok::Punct('{') => brace += 1,
+            Tok::Punct('}') => brace = brace.saturating_sub(1),
             _ => {}
         }
         i += 1;
@@ -1527,6 +1506,9 @@ fn analyze_module_scope(
     report: &mut ScanReport,
 ) {
     let current_top = &mod_path[0];
+    for len in 1..=mod_path.len() {
+        report.modules.insert(mod_path[..len].to_vec());
+    }
 
     let mut declared_submods = BTreeSet::new();
     let mut excluded_spans: Vec<(usize, usize)> = Vec::new();
@@ -1567,6 +1549,12 @@ fn analyze_module_scope(
             }
             i += 1;
         }
+    }
+
+    for sub in &declared_submods {
+        let mut child = mod_path.to_vec();
+        child.push(sub.clone());
+        report.modules.insert(child);
     }
 
     let in_excluded = |idx: usize| {
@@ -2210,33 +2198,26 @@ struct SubmoduleGraph {
     witnesses: BTreeMap<(String, String), Vec<String>>,
 }
 
-/// Builds the file-level submodule graph inside a single top-level module `top`.
-/// When `include_root` is `true`, `src/<top>.rs` participates as node `"<top>"` alongside
-/// `"<top>::<sub>"`; when `false`, only sibling child files `"<top>::<sub>"` participate.
+/// Resolves each path to its longest declared module prefix, including inline and nested modules.
+/// Only the Spec's tasks aggregate root may be omitted; descendants remain distinct nodes.
 fn submodule_directed_edges(report: &ScanReport, top: &str, include_root: bool) -> SubmoduleGraph {
-    let empty = BTreeSet::new();
-    let known_subs = report.file_submodules.get(top).unwrap_or(&empty);
-    let mut nodes = BTreeSet::new();
-    if include_root {
-        nodes.insert(top.to_owned());
-    }
-    for sub in known_subs {
-        nodes.insert(format!("{top}::{sub}"));
-    }
+    let modules: Vec<&Vec<String>> = report
+        .modules
+        .iter()
+        .filter(|path| path.first().map(String::as_str) == Some(top))
+        .collect();
+    let nodes = modules
+        .iter()
+        .filter(|path| include_root || path.len() > 1)
+        .map(|path| path.join("::"))
+        .collect();
 
     let node_of = |path: &[String]| -> Option<String> {
-        if path.first().map(String::as_str) != Some(top) {
-            return None;
-        }
-        if let Some(candidate) = path.get(1)
-            && known_subs.contains(candidate)
-        {
-            return Some(format!("{top}::{candidate}"));
-        }
-        if include_root {
-            return Some(top.to_owned());
-        }
-        None
+        let module = modules
+            .iter()
+            .filter(|module| path.starts_with(module.as_slice()))
+            .max_by_key(|module| module.len())?;
+        (include_root || module.len() > 1).then(|| module.join("::"))
     };
 
     let mut adj: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -2554,21 +2535,7 @@ fn cp1_forbidden_cross_layer_edges_are_zero() {
 
 #[test]
 fn submodule_graphs_have_zero_strongly_connected_cycles() {
-    const COHESIVE_INTERNAL_HELPERS: &[&str] = &["files", "platform", "codemode"];
-    const AGGREGATE_ROOT_CORES: &[&str] = &["tasks", "daemon"];
-
     let report = scan_repo_src();
-    let mut tree_targets: BTreeSet<&str> = ACYCLIC_SUBMODULE_TREES.iter().copied().collect();
-    let mut sibling_targets: BTreeSet<&str> = ACYCLIC_SIBLING_SUBMODULES.iter().copied().collect();
-    for discovered in report.file_submodules.keys().map(String::as_str) {
-        if !COHESIVE_INTERNAL_HELPERS.contains(&discovered) {
-            sibling_targets.insert(discovered);
-            if !AGGREGATE_ROOT_CORES.contains(&discovered) {
-                tree_targets.insert(discovered);
-            }
-        }
-    }
-
     let mut failures = Vec::new();
     let mut check = |top: &str, include_root: bool, kind: &str| {
         let graph = submodule_directed_edges(&report, top, include_root);
@@ -2589,11 +2556,8 @@ fn submodule_graphs_have_zero_strongly_connected_cycles() {
         }
     };
 
-    for top in tree_targets {
-        check(top, true, "submodule-tree");
-    }
-    for top in sibling_targets {
-        check(top, false, "sibling-submodule");
+    for top in &report.top_modules {
+        check(top, top != "tasks", "module-tree");
     }
 
     assert!(
@@ -3644,10 +3608,11 @@ fn top_level_tarjan_scc_and_mcp_ingress_submodule_tree_detect_cycles() {
 }
 
 #[test]
-fn root_inline_submodule_edges_map_to_root_node_and_trigger_cycle_detection() {
+fn inline_and_nested_modules_remain_distinct_in_cycle_detection() {
     let render_root = r#"
         pub mod files;
         pub struct Shared;
+        pub fn run() { detail::call_sibling(); }
 
         mod detail {
             pub fn call_sibling() {
@@ -3672,7 +3637,11 @@ fn root_inline_submodule_edges_map_to_root_node_and_trigger_cycle_detection() {
     let full_graph = submodule_directed_edges(&cyclic_report, "render", true);
     assert_eq!(
         tarjan_cyclic_sccs(&full_graph.nodes, &full_graph.adj),
-        vec![vec!["render".to_owned(), "render::files".to_owned()]]
+        vec![vec![
+            "render".to_owned(),
+            "render::detail".to_owned(),
+            "render::files".to_owned(),
+        ]]
     );
     let sibling_only = submodule_directed_edges(&cyclic_report, "render", false);
     assert!(tarjan_cyclic_sccs(&sibling_only.nodes, &sibling_only.adj).is_empty());
@@ -3702,6 +3671,81 @@ fn root_inline_submodule_edges_map_to_root_node_and_trigger_cycle_detection() {
     ]);
     let clean_graph = submodule_directed_edges(&clean_report, "render", true);
     assert!(tarjan_cyclic_sccs(&clean_graph.nodes, &clean_graph.adj).is_empty());
+}
+
+#[test]
+fn nested_file_and_inline_module_cycles_are_checked_without_group_exclusions() {
+    for top in ["files", "platform", "codemode", "daemon"] {
+        let root = "mod outer;";
+        let outer = r#"
+            mod nested;
+            pub struct Shared;
+            pub fn run() { nested::back(); }
+            mod left { pub fn run() { super::right::run(); } }
+            mod right { pub fn run() { super::left::run(); } }
+        "#;
+        let nested = "pub fn back() { let _ = super::Shared; }";
+        let report = analyze_virtual_files(&[
+            ("src/root.rs", vec![top.into()], root),
+            ("src/root/outer.rs", vec![top.into(), "outer".into()], outer),
+            (
+                "src/root/outer/nested.rs",
+                vec![top.into(), "outer".into(), "nested".into()],
+                nested,
+            ),
+        ]);
+        let graph = submodule_directed_edges(&report, top, true);
+        assert_eq!(
+            tarjan_cyclic_sccs(&graph.nodes, &graph.adj),
+            vec![
+                vec![format!("{top}::outer"), format!("{top}::outer::nested")],
+                vec![
+                    format!("{top}::outer::left"),
+                    format!("{top}::outer::right")
+                ],
+            ]
+        );
+    }
+}
+
+#[test]
+fn inherent_impl_detector_tracks_generic_targets_and_distinguishes_trait_impls() {
+    let report = analyze_virtual_files(&[
+        (
+            "src/lease.rs",
+            vec!["lease".into()],
+            "pub struct Owned<T>(T); pub struct Flag<const B: bool>;",
+        ),
+        (
+            "src/files.rs",
+            vec!["files".into()],
+            r#"
+            use crate::lease::Owned as Imported;
+            struct Local;
+            trait Trait<T> {}
+            impl<T> crate::lease::Owned<T> {}
+            impl<T> Imported<T> {}
+            impl crate::lease::Owned<Vec<u8>> {}
+            impl crate::lease::Flag<{ 2 > 1 }> {}
+            impl<T> Trait<T> for Local {}
+            impl<T> Trait<Vec<T>> for crate::lease::Owned<T> {}
+        "#,
+        ),
+    ]);
+    let targets: Vec<&str> = report
+        .inherent_impls
+        .iter()
+        .map(|violation| violation.target_path.as_str())
+        .collect();
+    assert_eq!(
+        targets,
+        [
+            "lease::Owned",
+            "lease::Owned",
+            "lease::Owned",
+            "lease::Flag"
+        ]
+    );
 }
 
 #[test]
