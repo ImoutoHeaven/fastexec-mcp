@@ -600,7 +600,8 @@ pub struct EventBus {
     max_session_cursors: usize,
     max_streams: usize,
     active_streams: AtomicUsize,
-    pool: Arc<BytePool>,
+    record_pool: Arc<BytePool>,
+    output_pool: Arc<BytePool>,
     state: Mutex<BusState>,
     tx: broadcast::Sender<Arc<EventRecord>>,
 }
@@ -624,6 +625,7 @@ impl EventBus {
             DEFAULT_MAX_EVENTS,
             DEFAULT_MAX_BYTES,
             DEFAULT_BROADCAST_CAPACITY,
+            BytePool::new(DEFAULT_MAX_BYTES),
             Arc::clone(lease::process_pool()),
         ))
     }
@@ -633,7 +635,8 @@ impl EventBus {
         max_events: usize,
         max_bytes: usize,
         broadcast_capacity: usize,
-        pool: Arc<BytePool>,
+        record_pool: Arc<BytePool>,
+        output_pool: Arc<BytePool>,
     ) -> Self {
         let (tx, _) = broadcast::channel(broadcast_capacity.max(1));
         Self {
@@ -643,7 +646,8 @@ impl EventBus {
             max_session_cursors: MAX_SESSION_CURSORS,
             max_streams: MAX_EVENT_STREAMS,
             active_streams: AtomicUsize::new(0),
-            pool,
+            record_pool,
+            output_pool,
             state: Mutex::new(BusState::new()),
             tx,
         }
@@ -690,11 +694,11 @@ impl EventBus {
     }
 
     fn output_lease(&self, bytes: usize) -> Result<Lease, EventError> {
-        self.pool
+        self.output_pool
             .try_acquire(bytes)
             .ok_or_else(|| EventError::ResourceExhausted {
                 limit: "process_memory",
-                max: self.pool.limit(),
+                max: self.output_pool.limit(),
                 message: "process byte budget is full while preparing event output".to_owned(),
             })
     }
@@ -916,16 +920,16 @@ impl EventBus {
             });
         }
 
-        if self.pool.available() < entry_bytes
+        if self.record_pool.available() < entry_bytes
             && self
-                .pool
+                .record_pool
                 .available()
                 .saturating_add(state.reclaimable_bytes())
                 < entry_bytes
         {
             return Err(EventError::ResourceExhausted {
                 limit: "process_memory",
-                max: self.pool.limit(),
+                max: self.record_pool.limit(),
                 message: "process byte budget is full; event was not enqueued".to_owned(),
             });
         }
@@ -939,11 +943,11 @@ impl EventBus {
             }
         }
 
-        let lease = match self.pool.try_acquire(entry_bytes) {
+        let lease = match self.record_pool.try_acquire(entry_bytes) {
             Some(lease) => lease,
             None => loop {
                 if self
-                    .pool
+                    .record_pool
                     .available()
                     .saturating_add(state.reclaimable_bytes())
                     < entry_bytes
@@ -951,11 +955,11 @@ impl EventBus {
                 {
                     return Err(EventError::ResourceExhausted {
                         limit: "process_memory",
-                        max: self.pool.limit(),
+                        max: self.record_pool.limit(),
                         message: "process byte budget is full; event was not enqueued".to_owned(),
                     });
                 }
-                if let Some(lease) = self.pool.try_acquire(entry_bytes) {
+                if let Some(lease) = self.record_pool.try_acquire(entry_bytes) {
                     break lease;
                 }
             },
@@ -1082,7 +1086,7 @@ impl EventBus {
                 if !held.try_grow(rec.projection_bytes(0)) {
                     return Err(EventError::ResourceExhausted {
                         limit: "process_memory",
-                        max: self.pool.limit(),
+                        max: self.output_pool.limit(),
                         message: "process byte budget is full while preparing event output"
                             .to_owned(),
                     });
@@ -1509,6 +1513,7 @@ mod tests {
             max_bytes,
             broadcast_cap,
             Arc::clone(&pool),
+            Arc::clone(&pool),
         ));
         (bus, pool)
     }
@@ -1523,6 +1528,72 @@ mod tests {
             timestamp: None,
             data,
         }
+    }
+
+    #[tokio::test]
+    async fn event_record_budget_is_independent_of_output_and_full_ring_remains_readable() {
+        let default = EventBus::new().unwrap();
+        assert_eq!(default.record_pool.limit(), DEFAULT_MAX_BYTES);
+        assert!(!Arc::ptr_eq(&default.record_pool, lease::process_pool()));
+        assert!(Arc::ptr_eq(&default.output_pool, lease::process_pool()));
+
+        let records = BytePool::new(4096);
+        let output = BytePool::new(32 << 10);
+        let bus = Arc::new(EventBus::with_config(
+            "ep000001".into(),
+            16,
+            records.limit(),
+            8,
+            Arc::clone(&records),
+            Arc::clone(&output),
+        ));
+        let cursor = bus.current_cursor();
+        let full_output = output.try_acquire(output.limit()).unwrap();
+        bus.publish_external(ext_input(
+            "src",
+            "first",
+            "ready",
+            json!({"value": "x".repeat(1024)}),
+        ))
+        .unwrap();
+        assert!(records.used() > 0);
+        assert_eq!(bus.list_event_types().unwrap_err().code(), -32025);
+        drop(full_output);
+
+        // No record capacity remains; projections must still use the output pool.
+        let full_records = records.try_acquire(records.available()).unwrap();
+        let poll = bus
+            .poll(
+                PollRequest {
+                    name: EVENT_EXTERNAL.into(),
+                    cursor: Some(cursor.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(poll.value.events.len(), 1);
+        assert!(bus.list_event_types().is_ok());
+        let mut sub = bus
+            .subscribe(
+                SubscribeRequest {
+                    name: EVENT_EXTERNAL.into(),
+                    cursor: Some(cursor),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert!(sub.initial_active().is_ok());
+        assert!(sub.current_cursor().is_ok());
+        let streamed = sub.next().await.unwrap().unwrap();
+        assert!(matches!(&streamed.value, StreamItem::Event(_)));
+        assert_eq!(records.used(), records.limit());
+        drop((poll, streamed, sub));
+        assert_eq!(output.used(), 0);
+        drop(full_records);
+        drop(bus);
+        assert_eq!(records.used(), 0);
     }
 
     #[test]
@@ -2243,7 +2314,14 @@ mod tests {
     #[test]
     fn remove_session_clears_cursor_and_evicts_oldest_when_capped() {
         let pool = BytePool::new(1 << 20);
-        let mut bus = EventBus::with_config("ep000002".to_owned(), 32, 1 << 20, 16, pool);
+        let mut bus = EventBus::with_config(
+            "ep000002".to_owned(),
+            32,
+            1 << 20,
+            16,
+            Arc::clone(&pool),
+            pool,
+        );
         bus.max_session_cursors = 3;
         bus.publish_external(ext_input("gh", "e1", "push", json!({})))
             .unwrap();
@@ -2265,7 +2343,14 @@ mod tests {
     #[test]
     fn stream_guard_enforces_active_stream_limit_and_releases_on_drop() {
         let pool = BytePool::new(1 << 20);
-        let mut raw_bus = EventBus::with_config("ep000003".to_owned(), 16, 1 << 20, 8, pool);
+        let mut raw_bus = EventBus::with_config(
+            "ep000003".to_owned(),
+            16,
+            1 << 20,
+            8,
+            Arc::clone(&pool),
+            pool,
+        );
         raw_bus.max_streams = 2;
         let bus = Arc::new(raw_bus);
 
