@@ -19,6 +19,10 @@ lifecycles:
 
 On protocol `2026-07-28`, `fastexec` also exposes MCP Events (`events/list`,
 `events/poll`, and `events/stream`) for `task.exited` and `external.event`.
+When `FASTEXEC_SKILLS_DIR` is set, protocol `2026-07-28` also exposes Skills
+over MCP (`SEP-2640`: `skills/list`, `skills/get`, `resources/read`, and
+`resources/directory/read`) while keeping `<= 2025-11-25` clients isolated with
+zero capability or method fingerprint.
 
 ## Quick start
 
@@ -88,6 +92,7 @@ oversized Codemode result, inspect task state before retrying.
 | `FASTEXEC_YOLO` | `false` | Set `true` to mark exposed tools read-only in MCP annotations without changing runtime permissions. |
 | `FASTEXEC_IMAGE_COMPRESS` | `false` | Set `true` to downscale and re-encode compressible images for size-constrained hosts. |
 | `FASTEXEC_MAX_MEDIA_BYTES` | `104857600` | Set the maximum raw size per media file or attachment (`1 MiB` to `360 MiB`). |
+| `FASTEXEC_SKILLS_DIR` | unset | Set a read-only single-skill directory or multi-skill parent directory for stdio MCP and `--http` daemons. Non-`--http` daemons ignore it. |
 
 Direct MCP tool calls return text and media content blocks without
 `structuredContent`. For stdio, set environment variables on the client server
@@ -106,6 +111,25 @@ startup. Choose `FASTEXEC_INSTRUCTIONS_TOOL` based on what your client displays:
 
 With no extra file text, `move` sends the built-in guidance on both surfaces.
 Do not place secrets in the instructions file.
+
+### Skills
+
+Set `FASTEXEC_SKILLS_DIR` to mount either a single skill directory (containing
+`SKILL.md`) or a parent directory whose subdirectories hold skills. When unset,
+capabilities, tool definitions, and startup behavior remain unchanged.
+
+Stdio MCP processes (with `FASTEXEC_DAEMON=off` or `on`) and `--http` daemons
+load the catalog at startup; non-`--http` local IPC daemons ignore
+`FASTEXEC_SKILLS_DIR`. On MCP `>= 2026-07-28`, clients can call `skills/list`,
+`skills/get`, `resources/read`, and `resources/directory/read`. Legacy
+`<= 2025-11-25` clients never see the skills extension or resource capabilities
+and receive `-32601` on all skills and resource methods.
+
+Startup scans and runtime reads open paths relative to an anchored directory
+handle without following symlinks or Windows reparse points, verify each file's
+byte length and `sha256:` digest on every read, and charge all metadata and
+response buffers to the `1 GiB` main memory pool without touching the `8 MiB`
+control reserve. See [Skills over MCP](docs/fastexec-design.md#8-skills-over-mcp-sep-2640).
 
 ### JavaScript tasks
 

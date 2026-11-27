@@ -13,7 +13,9 @@ Broad compatibility with MCP clients is a core product contract. `fastexec`
 supports multiple protocol revisions over stdio and Streamable HTTP across both
 the `initialize` / `notifications/initialized` session lifecycle and the
 stateless `server/discover` / inline-metadata lifecycle, plus `2026-07-28` MCP
-Events (`events/list`, `events/poll`, `events/stream`; section 7). Their
+Events (`events/list`, `events/poll`, `events/stream`; section 7) and optional
+Skills over MCP (`skills/list`, `skills/get`, `resources/read`,
+`resources/directory/read`; section 8). Their
 protocol paths, client fixtures, and release smoke coverage are part of the
 supported external interface.
 
@@ -1302,6 +1304,28 @@ daemon commands ignore the caller's flag. Changes take effect when the serving
 process restarts. Do not include secrets: clients allowed to discover tools
 can receive the description as part of discovery.
 
+### `FASTEXEC_SKILLS_DIR`
+
+When unset, no filesystem scan runs and advertised capabilities stay unchanged.
+When set, `config::skills_dir` resolves the path against the launch working
+directory (supporting `~` expansion) and rejects empty or non-UTF-8 values with
+exit status `1`.
+
+- Stdio MCP (`FASTEXEC_DAEMON=off` or `on`): loads the catalog once at startup
+  into `launch.memory()`.
+- Cold `--http` daemon (`daemon run --http` and `daemon start --http` when no
+  daemon is running): runs zero-pool `skills::preflight_check` before
+  `TcpListener::bind`, `set_current_dir`, or removing `endpoint` and `logs/`,
+  exiting `1` without filesystem side effects on invalid paths. After
+  `Daemon::with_config` creates the isolated `daemon.memory` pool,
+  `skills::load` charges catalog metadata to `daemon.memory` (leaving the global
+  `process_pool()` untouched).
+- Healthy `--http` daemon reuse (`daemon start --http` hitting an existing
+  daemon): returns `0` immediately without rereading `FASTEXEC_SKILLS_DIR`.
+- Non-`--http` local IPC daemons (`daemon start`, `status`, `stop`, `run`, and
+  auto-spawned `FASTEXEC_DAEMON=on` background daemons): ignore
+  `FASTEXEC_SKILLS_DIR` completely; `ipc::PROTOCOL = 6` is unchanged.
+
 A nonzero command `exitCode` is a normal result (`isError: false` on direct
 calls; resolves normally in `codemode`). Operational failures set
 `isError: true` on direct MCP calls (with no `structuredContent`) and reject
@@ -1914,3 +1938,75 @@ Event `data` is never included in the footer. `commit_external_background_cursor
 advances the session cursor only after the direct tool response is committed for
 delivery; cancelled calls and nested `codemode` calls leave the cursor
 untouched.
+
+## 8. Skills over MCP (`SEP-2640`)
+
+### Module topology and dependency gates (`tests/dag_axioms.rs`)
+
+`src/skills.rs` sits at rank `#15` (`S3b`, between `#14 service` and `#16
+render`) in the 24-module strictly lower-triangular DAG. Its allowed outbound
+edges are `D(skills) = {lease, media, platform, files}`, with no dependencies
+on `env`, `config`, `rmcp`, `hyper`, or `rquickjs`. Upper layers (`daemon`,
+`mcp`, `http`, `cli`) resolve `FASTEXEC_SKILLS_DIR` via `config::skills_dir`
+and pass a plain `&Path` into `skills::preflight_check` and `skills::load`.
+`tests/dag_axioms.rs` enforces the 24-module order, keeps all 6 existing
+diagonal blocks unchanged, and locks `SERDE_SAPHYR_ALLOWED = &["skills"]` so
+`serde-saphyr` stays confined to `src/skills.rs`.
+
+### Anchored `DirFd` and catalog validation (`src/platform/dirfd.rs`, `src/skills.rs`)
+
+Catalog scanning and runtime `resources/read` file reads use two-phase `DirFd`
+confinement:
+
+- Phase 1 (root anchoring): checks `symlink_metadata(root)` and rejects a final
+  component that is a symlink, Windows reparse point, or non-directory, while
+  allowing symlinks in ancestor directories (such as `/var -> /private/var`).
+  Unix opens the root with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`;
+  Windows opens it with `CreateFileW` (`FILE_FLAG_BACKUP_SEMANTICS |
+  FILE_FLAG_OPEN_REPARSE_POINT`), verifies `FILE_ATTRIBUTE_REPARSE_POINT` is
+  clear, and records the canonical root path via `GetFinalPathNameByHandleW`.
+- Phase 2 (relative traversal): opens every directory and file segment relative
+  to the anchored handle without following links (Unix `openat` with
+  `O_NOFOLLOW`; Windows `NtCreateFile` with `OBJ_DONT_REPARSE`,
+  `FILE_OPEN_REPARSE_POINT`, `GetFileType == FILE_TYPE_DISK`, and a
+  `GetFinalPathNameByHandleW` prefix check against the phase-1 root).
+
+Path segments must use ASCII `[A-Za-z0-9._-]`, must not end with `.` or space,
+must not collide under ASCII case-folding within the same directory, and must
+pass `files::path::is_windows_reserved_device_name` on all platforms. `SKILL.md`
+frontmatter is parsed with `serde-saphyr` configured with zero anchors, zero
+aliases, `MergeKeyPolicy::Error`, and strict UTF-8 without BOM or NUL. Binary
+MIME detection reuses `media::detect_path` with minimal `.zip` and `.wasm`
+magic checks. Runtime `resources/read` lookups match only indexed URIs, acquire
+a permit from `read_permits` (`MAX_SKILL_READ_WORKERS = 8`), and run the
+`DirFd` read and raw-byte `sha256:` check in `spawn_blocking`, returning
+`-32603` on size or digest mismatch.
+
+### Protocol isolation and response lease backpressure (`src/mcp.rs`, `src/http.rs`, `src/cli/stdio.rs`)
+
+`mcp::validate_skill_catalog` projects the catalog into `rmcp::model::Skill`
+entries and asserts `rmcp::model::validate_skills` once at startup in
+`http::serve` and `cli/stdio.rs`.
+
+- Legacy isolation: `Server` tracks a session-level `legacy_session` flag.
+  `Server::initialize` sets it to `true`, strips
+  `io.modelcontextprotocol/skills` and `resources` from negotiated capabilities,
+  and stores the negotiated `<= 2025-11-25` version on peer info. `get_info()`
+  advertises `resources` and `skills` (`directoryRead: true`) only when
+  `skills.is_some()` and `!legacy_session`. Stdio wraps `Server` in `McpService`
+  to return `-32601` for legacy or disabled sessions before URI validation while
+  still allowing `2026-07-28` inline requests missing `_meta` to reach `rmcp`
+  and return `-32602`. HTTP `Bearer::call` keeps zero-buffer request streaming
+  and scopes `tokio::task_local` `HTTP_REQ_LEGACY` to `true` when
+  `Mcp-Session-Id` is absent and `MCP-Protocol-Version` is missing or
+  `< "2026-07-28"`, preserving all native HTTP status codes (`403`, `405`,
+  `406`, `404`, `400`, `-32020`).
+- Main-pool response leases: `Server::deliver_skill_response` measures the
+  outbound frame and grows the staging lease exclusively from the `1 GiB` main
+  `BytePool` (returning `-32603` when full without touching the `8 MiB` control
+  reserve). Stdio registers `(staging, outbound)` in `RequestLeases` by request
+  ID. HTTP bridges `HttpResponseLease` across `rmcp`'s `tokio::spawn` via
+  `Parts.extensions` into `LeaseBody`, which slices large single-frame bodies
+  into `16 KiB` chunks so Hyper holds `daemon.memory` while a slow client
+  stalls and releases it immediately in `LeaseBody::drop` (or via
+  `LeaseSlotGuard` if cancelled before body creation).
