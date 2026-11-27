@@ -881,34 +881,112 @@ fn read_verified_file(
     })
 }
 
+fn hash_map_storage_bytes<K, V>(map: &HashMap<K, V>) -> usize {
+    if map.capacity() == 0 {
+        return 0;
+    }
+    // Twice the usable capacity covers spare buckets, with control bytes and alignment slack.
+    map.capacity()
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<(K, V)>().saturating_add(1))
+        .saturating_add(16)
+}
+
+fn file_metadata_bytes(entry: &SkillFileEntry) -> usize {
+    entry.segments.iter().fold(
+        entry
+            .uri
+            .capacity()
+            .saturating_add(entry.rel_path.capacity())
+            .saturating_add(entry.name.capacity())
+            .saturating_add(entry.digest.capacity())
+            .saturating_add(
+                entry
+                    .segments
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            ),
+        |total, segment| total.saturating_add(segment.capacity()),
+    )
+}
+
+fn json_metadata_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.capacity(),
+        Value::Array(values) => values.iter().fold(
+            values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Value>()),
+            |total, value| total.saturating_add(json_metadata_bytes(value)),
+        ),
+        Value::Object(map) => object_metadata_bytes(map),
+        _ => 0,
+    }
+}
+
+fn object_metadata_bytes(map: &Map<String, Value>) -> usize {
+    // Budget a whole B-tree node per entry, including an empty root retained after removals.
+    const NODE_BYTES: usize =
+        16 * (std::mem::size_of::<(String, Value)>() + std::mem::size_of::<usize>());
+    map.iter().fold(
+        map.len().max(1).saturating_mul(NODE_BYTES),
+        |total, (key, value)| {
+            total
+                .saturating_add(key.capacity())
+                .saturating_add(json_metadata_bytes(value))
+        },
+    )
+}
+
 fn estimate_metadata_bytes(scanned: &ScannedCatalog) -> usize {
-    let mut total = 0usize;
+    let mut total = std::mem::size_of::<SkillCatalog>()
+        .saturating_add(std::mem::size_of::<DirFd>())
+        .saturating_add(std::mem::size_of::<Semaphore>())
+        .saturating_add(4 * std::mem::size_of::<usize>())
+        .saturating_add(
+            scanned
+                .skills
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SkillEntry>()),
+        )
+        .saturating_add(hash_map_storage_bytes(&scanned.skill_by_uri))
+        .saturating_add(hash_map_storage_bytes(&scanned.files_by_uri))
+        .saturating_add(hash_map_storage_bytes(&scanned.dirs_by_uri));
     for skill in &scanned.skills {
         total = total
-            .saturating_add(skill.uri.len())
-            .saturating_add(skill.root_uri.len())
-            .saturating_add(skill.name.len())
-            .saturating_add(skill.description.len())
-            .saturating_add(crate::lease::json_len(&skill.frontmatter_extra).unwrap_or(0))
-            .saturating_add(128);
-        for res in &skill.resources {
-            let seg_bytes: usize = res.segments.iter().map(String::len).sum();
-            total = total
-                .saturating_add(res.uri.len())
-                .saturating_add(res.rel_path.len())
-                .saturating_add(res.name.len())
-                .saturating_add(res.digest.len())
-                .saturating_add(seg_bytes)
-                .saturating_add(128);
+            .saturating_add(skill.uri.capacity())
+            .saturating_add(skill.root_uri.capacity())
+            .saturating_add(skill.name.capacity())
+            .saturating_add(skill.description.capacity())
+            .saturating_add(object_metadata_bytes(&skill.frontmatter_extra))
+            .saturating_add(
+                skill
+                    .resources
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SkillFileEntry>()),
+            );
+        for entry in &skill.resources {
+            total = total.saturating_add(file_metadata_bytes(entry));
         }
     }
+    for uri in scanned.skill_by_uri.keys() {
+        total = total.saturating_add(uri.capacity());
+    }
+    for (uri, entry) in &scanned.files_by_uri {
+        total = total
+            .saturating_add(uri.capacity())
+            .saturating_add(file_metadata_bytes(entry));
+    }
     for (dir_uri, children) in &scanned.dirs_by_uri {
-        total = total.saturating_add(dir_uri.len()).saturating_add(64);
+        total = total.saturating_add(dir_uri.capacity()).saturating_add(
+            children
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SkillDirChild>()),
+        );
         for child in children {
             total = total
-                .saturating_add(child.uri.len())
-                .saturating_add(child.name.len())
-                .saturating_add(64);
+                .saturating_add(child.uri.capacity())
+                .saturating_add(child.name.capacity());
         }
     }
     total
@@ -954,6 +1032,66 @@ mod tests {
     }
 
     #[test]
+    fn catalog_metadata_budget_covers_owned_resource_copies() {
+        let base = TempDir::new("metadata-budget");
+        let skill = base.0.join("catalog");
+        write_file(
+            &skill.join("SKILL.md"),
+            b"---\nname: catalog\ndescription: Documentation catalog\nmetadata:\n  owner: docs\n  labels: [daily, weekly]\n---\n# Catalog\n",
+        );
+        let mut relative = PathBuf::from("references");
+        for index in 0..4 {
+            relative.push(format!("section-{index}-{}", "a".repeat(36)));
+        }
+        for index in 0..24 {
+            write_file(
+                &skill
+                    .join(&relative)
+                    .join(format!("guide-{index:02}-{}.md", "b".repeat(48))),
+                b"# Guide\n",
+            );
+        }
+
+        let scanned = scan_root(&skill).unwrap();
+        let strings = |entry: &SkillFileEntry| {
+            entry.uri.len()
+                + entry.rel_path.len()
+                + entry.name.len()
+                + entry.digest.len()
+                + entry.segments.iter().map(String::len).sum::<usize>()
+        };
+        let minimum = scanned
+            .skills
+            .iter()
+            .flat_map(|skill| &skill.resources)
+            .map(strings)
+            .sum::<usize>()
+            + scanned
+                .files_by_uri
+                .iter()
+                .map(|(uri, entry)| uri.len() + strings(entry))
+                .sum::<usize>();
+        drop(scanned);
+
+        let limited = BytePool::new(minimum - 1);
+        preflight_check(&skill).unwrap();
+        assert_eq!(limited.used(), 0);
+        let Err(error) = load(&skill, &limited) else {
+            panic!("catalog must charge every owned resource copy");
+        };
+        assert!(error.contains("skills metadata"), "{error}");
+        assert_eq!(limited.used(), 0);
+
+        let memory = BytePool::new(1 << 20);
+        let catalog = load(&skill, &memory).unwrap();
+        assert_eq!(catalog.skills()[0].resources.len(), 25);
+        assert!(catalog.metadata_lease_bytes() >= minimum);
+        assert_eq!(memory.used(), catalog.metadata_lease_bytes());
+        drop(catalog);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
     fn mounts_single_skill_and_multi_skill_parent_and_empty_dir() {
         let pool = BytePool::new(1 << 20);
 
@@ -962,8 +1100,9 @@ mod tests {
         preflight_check(&empty.0).unwrap();
         let cat = load(&empty.0, &pool).unwrap();
         assert!(cat.skills().is_empty());
-        assert_eq!(pool.used(), 0);
+        assert_eq!(pool.used(), cat.metadata_lease_bytes());
         drop(cat);
+        assert_eq!(pool.used(), 0);
 
         // Single-skill root.
         let single_parent = TempDir::new("single");
