@@ -941,6 +941,7 @@ fn object_metadata_bytes(map: &Map<String, Value>) -> usize {
 fn estimate_metadata_bytes(scanned: &ScannedCatalog) -> usize {
     let mut total = std::mem::size_of::<SkillCatalog>()
         .saturating_add(std::mem::size_of::<DirFd>())
+        .saturating_add(scanned.root.heap_bytes())
         .saturating_add(std::mem::size_of::<Semaphore>())
         .saturating_add(4 * std::mem::size_of::<usize>())
         .saturating_add(

@@ -37,6 +37,10 @@ pub(crate) struct DirFd {
 
 #[cfg(unix)]
 impl DirFd {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        0
+    }
+
     pub(crate) fn open_root(root: &Path) -> io::Result<Self> {
         use std::ffi::CString;
         use std::os::fd::FromRawFd;
@@ -279,6 +283,10 @@ pub(crate) struct DirFd {
 
 #[cfg(windows)]
 impl DirFd {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.canonical_root.capacity()
+    }
+
     pub(crate) fn open_root(root: &Path) -> io::Result<Self> {
         use std::os::windows::fs::MetadataExt;
         use std::os::windows::io::FromRawHandle;
