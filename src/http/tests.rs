@@ -1510,6 +1510,14 @@ async fn verify_g12_transfer_pool_isolation() {
         let _ = h1_conn.await;
         let _ = h2_conn.await;
 
+        // The listener and client joins do not join the spawned server connections.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pool.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server connections must release their download chunk leases");
         assert_eq!(pool.used(), 0);
         assert_eq!(crate::lease::process_pool().used(), 0);
         std::fs::remove_dir_all(dir).unwrap();
