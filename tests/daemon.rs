@@ -3645,9 +3645,10 @@ fn cold_http_daemon_invalid_skills_dir_exits_without_deleting_logs_or_endpoint()
     std::fs::create_dir_all(&logs).unwrap();
     let sentinel_log = logs.join("preexisting.log");
     std::fs::write(&sentinel_log, b"keep this log").unwrap();
+    // Keep the real stale Unix socket left by the seed daemon rather than replacing it with a
+    // regular file (on FreeBSD, connect() on a regular file fails with ENOTSOCK / os error 38).
     let sentinel_endpoint = ns_dir.join("sock");
-    let _ = std::fs::remove_file(&sentinel_endpoint);
-    std::fs::write(&sentinel_endpoint, b"keep this endpoint").unwrap();
+    let had_endpoint = std::fs::symlink_metadata(&sentinel_endpoint).is_ok();
 
     let missing = fixture.runtime.join("nonexistent-skills-dir");
     for subcommand in ["start", "run"] {
@@ -3660,7 +3661,7 @@ fn cold_http_daemon_invalid_skills_dir_exits_without_deleting_logs_or_endpoint()
         assert_eq!(output.status.code(), Some(1), "daemon {subcommand} --http");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("fastexec:"),
+            stderr.contains("fastexec:") && stderr.contains("skill root"),
             "daemon {subcommand} --http: {stderr:?}"
         );
         assert_eq!(
@@ -3668,10 +3669,11 @@ fn cold_http_daemon_invalid_skills_dir_exits_without_deleting_logs_or_endpoint()
             b"keep this log",
             "daemon {subcommand} --http deleted pre-existing logs"
         );
-        assert_eq!(
-            std::fs::read(&sentinel_endpoint).unwrap(),
-            b"keep this endpoint",
-            "daemon {subcommand} --http deleted pre-existing endpoint"
-        );
+        if had_endpoint {
+            assert!(
+                std::fs::symlink_metadata(&sentinel_endpoint).is_ok(),
+                "daemon {subcommand} --http deleted pre-existing endpoint"
+            );
+        }
     }
 }

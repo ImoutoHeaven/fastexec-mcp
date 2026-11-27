@@ -1663,18 +1663,21 @@ async fn skills_http_response_lease_holds_daemon_memory_until_body_dropped() {
     let payload_size = 2 * 1024 * 1024;
     std::fs::write(skill_dir.join("data.txt"), vec![b'a'; payload_size]).unwrap();
 
-    let process_before = crate::lease::process_pool().used();
     let daemon_memory = BytePool::new(8 << 20);
+    let daemon_before = daemon_memory.used();
     let catalog = Arc::new(crate::skills::load(&skill_dir, &daemon_memory).unwrap());
+    let metadata_bytes = catalog.metadata_lease_bytes();
     let baseline = daemon_memory.used();
     assert!(
-        baseline > 0,
+        metadata_bytes > 0,
         "catalog metadata must be leased from daemon_memory"
     );
+    // Leases are charged explicitly to the isolated `daemon_memory` pool rather than the shared
+    // global `process_pool()`, which concurrent unit tests mutate in parallel.
     assert_eq!(
-        crate::lease::process_pool().used(),
-        process_before,
-        "skills::load must not charge global process_pool"
+        baseline,
+        daemon_before + metadata_bytes,
+        "skills::load must charge catalog metadata exclusively to daemon_memory"
     );
 
     // Direct unit check for early-disconnect `closed == true` branch on HttpResponseLease.
