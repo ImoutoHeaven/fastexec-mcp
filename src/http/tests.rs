@@ -1648,6 +1648,38 @@ async fn http2_authority_mints_transfer_url_without_host_header_and_blocks_useri
 }
 
 #[tokio::test]
+async fn leased_body_size_hint_tracks_each_response_chunk() {
+    use hyper::body::Body;
+
+    let length = LEASE_BODY_CHUNK_BYTES * 2 + 7;
+    let memory = BytePool::new(length);
+    let slot = HttpResponseLease::default();
+    assert!(slot.attach(memory.try_acquire(length).unwrap()));
+    let mut body = LeaseBody {
+        inner: Full::new(Bytes::from(vec![b'a'; length])),
+        pending: None,
+        slot,
+    };
+    let mut remaining = length;
+    let mut chunks = 0;
+    assert_eq!(body.size_hint().exact(), Some(remaining as u64));
+    while let Some(frame) = body.frame().await {
+        let data = frame.unwrap().into_data().unwrap();
+        assert!(data.len() <= LEASE_BODY_CHUNK_BYTES);
+        assert!(data.iter().all(|byte| *byte == b'a'));
+        remaining -= data.len();
+        chunks += 1;
+        assert_eq!(body.size_hint().exact(), Some(remaining as u64));
+        assert_eq!(body.is_end_stream(), remaining == 0);
+        assert_eq!(memory.used(), length);
+    }
+    assert_eq!(chunks, 3);
+    assert_eq!(remaining, 0);
+    drop(body);
+    assert_eq!(memory.used(), 0);
+}
+
+#[tokio::test]
 async fn skills_http_response_lease_holds_daemon_memory_until_body_dropped() {
     let dir = std::env::temp_dir().join(format!(
         "fastexec-http-skills-lease-{}",

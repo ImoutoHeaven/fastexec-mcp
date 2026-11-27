@@ -433,10 +433,10 @@ where
         let mut hint = self.inner.size_hint();
         if let Some(pending) = &self.pending {
             let extra = pending.len() as u64;
-            hint.set_lower(hint.lower().saturating_add(extra));
             if let Some(upper) = hint.upper() {
                 hint.set_upper(upper.saturating_add(extra));
             }
+            hint.set_lower(hint.lower().saturating_add(extra));
         }
         hint
     }
