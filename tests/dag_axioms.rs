@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Final 23-module strict lower-triangular allowlist `D(u)` from Spec §3 (`rank(v) < rank(u)`).
+/// Final 24-module strict lower-triangular allowlist `D(u)` from Spec §2.1 (`rank(v) < rank(u)`).
 /// Every cross-top-module dependency in non-test `src/` code must appear in this table, and the
-/// set of top-level modules declared in `src/main.rs` must match these 23 entries one-to-one.
+/// set of top-level modules declared in `src/main.rs` must match these 24 entries one-to-one.
 const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
     // S0 primitives (#1..#3, 3x3 diagonal block)
     ("id", &[]),
@@ -38,7 +38,9 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
             "id", "lease", "env", "term", "platform", "files", "events", "tasks", "wait",
         ],
     ),
-    // S4 projection and wire (#15..#17, 3x3 diagonal block)
+    // S3b read-only skills catalog (#15)
+    ("skills", &["lease", "media", "platform", "files"]),
+    // S4 projection and wire (#16..#18, 3x3 diagonal block)
     (
         "render",
         &[
@@ -53,7 +55,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
         ],
     ),
     ("ipc", &["lease", "env", "events"]),
-    // S5a HTTP wire and IPC client (#18..#19, 2x2 diagonal block)
+    // S5a HTTP wire and IPC client (#19..#20, 2x2 diagonal block)
     ("http_wire", &["lease", "files", "transfer"]),
     (
         "endpoint",
@@ -69,7 +71,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
             "ipc",
         ],
     ),
-    // S5b daemon and MCP handler (#20..#21, 2x2 diagonal block)
+    // S5b daemon and MCP handler (#21..#22, 2x2 diagonal block)
     (
         "daemon",
         &[
@@ -82,6 +84,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
             "events",
             "tasks",
             "service",
+            "skills",
             "render",
             "codemode",
             "ipc",
@@ -92,10 +95,10 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
         "mcp",
         &[
             "id", "lease", "env", "files", "transfer", "config", "events", "tasks", "wait",
-            "service", "render", "codemode", "ipc", "endpoint",
+            "service", "skills", "render", "codemode", "ipc", "endpoint",
         ],
     ),
-    // S5c HTTP server and CLI entrypoints (#22..#23)
+    // S5c HTTP server and CLI entrypoints (#23..#24)
     (
         "http",
         &[
@@ -105,6 +108,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
             "config",
             "tasks",
             "service",
+            "skills",
             "http_wire",
             "mcp",
         ],
@@ -122,6 +126,7 @@ const TARGET_DAG_ALLOWLIST: &[(&str, &[&str])] = &[
             "events",
             "tasks",
             "service",
+            "skills",
             "ipc",
             "http_wire",
             "endpoint",
@@ -155,6 +160,7 @@ const RQUICKJS_ALLOWED: &[&str] = &["codemode"];
 const ALACRITTY_ALLOWED: &[&str] = &["term"];
 const HYPER_ALLOWED: &[&str] = &["http_wire", "http"];
 const RMCP_ALLOWED: &[&str] = &["render", "ipc", "endpoint", "daemon", "mcp", "http", "cli"];
+const SERDE_SAPHYR_ALLOWED: &[&str] = &["skills"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok {
@@ -1430,6 +1436,7 @@ fn check_crate_token(tok: &Token, current_top: &str, file_label: &str, report: &
             "hyper" | "hyper_util" | "http_body_util" | "tower_service" | "axum" | "rustls"
             | "tokio_rustls" => !HYPER_ALLOWED.contains(&current_top),
             "rmcp" => !RMCP_ALLOWED.contains(&current_top),
+            "serde_saphyr" => !SERDE_SAPHYR_ALLOWED.contains(&current_top),
             _ => false,
         };
         if forbidden {
@@ -2269,6 +2276,7 @@ fn target_dag_allowlist_is_strictly_lower_triangular() {
         "tasks",
         "wait",
         "service",
+        "skills",
         "render",
         "codemode",
         "ipc",
@@ -2291,7 +2299,7 @@ fn target_dag_allowlist_is_strictly_lower_triangular() {
     let actual_order: Vec<&str> = TARGET_DAG_ALLOWLIST.iter().map(|&(m, _)| m).collect();
     assert_eq!(
         actual_order, EXPECTED_RANK_ORDER,
-        "TARGET_DAG_ALLOWLIST must match the 23 Spec §3 modules in exact #1..#23 rank order"
+        "TARGET_DAG_ALLOWLIST must match the 24 Spec §2.1 modules in exact #1..#24 rank order"
     );
 
     let mut ranks: HashMap<&str, usize> = HashMap::new();
@@ -2396,7 +2404,7 @@ fn main_rs_declares_exact_target_top_level_modules() {
         top_level_module_bijection_violations(&report.main_declared_mods, &report.top_modules);
     assert!(
         violations.is_empty(),
-        "top-level module declarations do not match the 23 target modules in TARGET_DAG_ALLOWLIST:\n{}",
+        "top-level module declarations do not match the 24 target modules in TARGET_DAG_ALLOWLIST:\n{}",
         violations.join("\n")
     );
 }
@@ -3440,6 +3448,16 @@ fn third_party_crate_isolation_enforces_final_rmcp_hyper_and_rquickjs_boundaries
             "pub fn bad(_: alacritty_terminal::grid::Scroll) {}",
         ),
         (
+            "src/config.rs",
+            vec!["config".into()],
+            "pub fn bad() -> Result<(), serde_saphyr::Error> { Ok(()) }",
+        ),
+        (
+            "src/skills.rs",
+            vec!["skills".into()],
+            "pub fn ok() -> serde_saphyr::Options { todo!() }",
+        ),
+        (
             "src/mcp/ingress.rs",
             vec!["mcp".into(), "ingress".into()],
             "pub fn ok() -> rmcp::model::RequestId { todo!() }",
@@ -3475,6 +3493,7 @@ fn third_party_crate_isolation_enforces_final_rmcp_hyper_and_rquickjs_boundaries
             ("cli", "tower_service"),
             ("tasks", "alacritty_terminal"),
             ("wait", "alacritty_terminal"),
+            ("config", "serde_saphyr"),
         ]
     );
 }
@@ -3491,7 +3510,7 @@ fn top_level_module_bijection_gate_rejects_missing_extra_duplicate_and_inline_mo
     let clean_decls = extract_top_level_mods(&strip_pure_test_code(&lex(&full_main)));
     assert!(
         top_level_module_bijection_violations(&clean_decls, &full_tops).is_empty(),
-        "exact 23-module bijection unexpectedly failed"
+        "exact 24-module bijection unexpectedly failed"
     );
 
     let mut bad_main = full_main

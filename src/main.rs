@@ -18,6 +18,7 @@ mod media;
 mod platform;
 mod render;
 mod service;
+mod skills;
 mod tasks;
 mod term;
 mod transfer;

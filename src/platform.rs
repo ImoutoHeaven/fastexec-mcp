@@ -4,6 +4,7 @@ pub(crate) mod bash;
 pub(crate) mod conpty;
 #[cfg(windows)]
 pub(crate) mod conpty_native;
+pub(crate) mod dirfd;
 #[cfg(target_os = "freebsd")]
 pub(crate) mod freebsd_fs;
 #[cfg(unix)]

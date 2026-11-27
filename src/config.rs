@@ -14,6 +14,8 @@ pub const HTTP_ALLOW_REMOTE: &str = "FASTEXEC_HTTP_ALLOW_REMOTE";
 pub const INSTRUCTIONS_FILE: &str = "FASTEXEC_INSTRUCTIONS_FILE";
 /// Controls whether server instructions are also exposed as an MCP tool (`off`, `move`, `copy`).
 pub const INSTRUCTIONS_TOOL: &str = "FASTEXEC_INSTRUCTIONS_TOOL";
+/// Optional path to a read-only skill root or parent directory exposed over MCP Skills.
+pub const SKILLS_DIR: &str = "FASTEXEC_SKILLS_DIR";
 /// Maximum raw byte size accepted for `FASTEXEC_INSTRUCTIONS_FILE`.
 const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 pub(crate) const MOVE_INSTRUCTIONS_POINTER: &str =
@@ -144,6 +146,22 @@ pub(crate) fn instructions_file(launch: &LaunchContext) -> Result<Option<String>
         return Ok(None);
     }
     Ok(Some(content.to_owned()))
+}
+
+/// Resolves `FASTEXEC_SKILLS_DIR` without touching the filesystem.
+pub fn skills_dir(launch: &LaunchContext) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(value) = launch.var(SKILLS_DIR) else {
+        return Ok(None);
+    };
+    let Some(raw) = value.to_str() else {
+        return Err(format!("{SKILLS_DIR} is not UTF-8"));
+    };
+    if raw.is_empty() {
+        return Err(format!("{SKILLS_DIR} must not be empty"));
+    }
+    files::path::resolve(raw, launch)
+        .map(Some)
+        .map_err(|error| format!("{SKILLS_DIR}: {}", error.trim_end_matches('.')))
 }
 
 /// What `FASTEXEC_YOLO` asks for, or the message saying what it held instead.
@@ -622,6 +640,36 @@ mod instructions_file_tests {
             let bad = OsString::from_vec(vec![b'a', 0xff]);
             let err = instructions_file(&launch_with(&dir.0, Some(bad))).unwrap_err();
             assert_eq!(err, "FASTEXEC_INSTRUCTIONS_FILE is not UTF-8");
+        }
+    }
+
+    #[test]
+    fn skills_dir_unset_empty_non_utf8_and_relative_resolution() {
+        let dir = TempDir::new("skills-dir");
+        let launch_skills = |value: Option<OsString>| {
+            let mut env = Vec::new();
+            if let Some(value) = value {
+                env.push((OsString::from(SKILLS_DIR), value));
+            }
+            LaunchContext::new(dir.0.clone(), env)
+        };
+
+        assert_eq!(skills_dir(&launch_skills(None)), Ok(None));
+        assert_eq!(
+            skills_dir(&launch_skills(Some(OsString::from("")))).unwrap_err(),
+            "FASTEXEC_SKILLS_DIR must not be empty"
+        );
+        assert_eq!(
+            skills_dir(&launch_skills(Some(OsString::from("sub/skills")))),
+            Ok(Some(dir.0.join("sub").join("skills")))
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = OsString::from_vec(vec![b'a', 0xff]);
+            let err = skills_dir(&launch_skills(Some(bad))).unwrap_err();
+            assert_eq!(err, "FASTEXEC_SKILLS_DIR is not UTF-8");
         }
     }
 

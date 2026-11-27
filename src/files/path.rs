@@ -207,8 +207,7 @@ pub fn resolve(path: &str, launch: &LaunchContext) -> Result<PathBuf, String> {
     resolve_from(Path::new(path), &launch.cwd)
 }
 
-#[cfg(any(windows, test))]
-pub(super) fn is_windows_reserved_device_name(component: &str) -> bool {
+pub(crate) fn is_windows_reserved_device_name(component: &str) -> bool {
     let stem = component
         .split(['.', ':'])
         .next()

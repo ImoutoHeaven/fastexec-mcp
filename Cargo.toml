@@ -23,6 +23,7 @@ rmcp = { version = "=3.9.0", features = ["server", "macros", "transport-streamab
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde-saphyr = { version = "=2.1.1", default-features = false, features = ["deserialize"] }
 sha2 = "0.11.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-std", "io-util", "fs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -41,7 +42,7 @@ libc = "0.2"
 rquickjs = { version = "=0.14.0", features = ["bindgen"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_SystemServices", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_SystemServices", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell"] }
 
 # Every CLI command hashes this image, and a debug-built SHA-256 is slow enough to show: the
 # dependency is optimized so the hash costs milliseconds rather than seconds.
