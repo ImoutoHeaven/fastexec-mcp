@@ -1125,15 +1125,18 @@ mod tests {
         }
 
         // Reserved device name inside skill directory fails preflight_check.
-        let res = TempDir::new("reserved");
-        let rskill = res.0.join("res-skill");
-        write_file(
-            &rskill.join("SKILL.md"),
-            valid_skill_md("res-skill", "Reserved test").as_bytes(),
-        );
-        write_file(&rskill.join("aux.py"), b"print(1)\n");
-        let err = preflight_check(&rskill).unwrap_err();
-        assert!(err.contains("reserved device name"), "{err}");
+        #[cfg(not(windows))]
+        {
+            let res = TempDir::new("reserved");
+            let rskill = res.0.join("res-skill");
+            write_file(
+                &rskill.join("SKILL.md"),
+                valid_skill_md("res-skill", "Reserved test").as_bytes(),
+            );
+            write_file(&rskill.join("aux.py"), b"print(1)\n");
+            let err = preflight_check(&rskill).unwrap_err();
+            assert!(err.contains("reserved device name"), "{err}");
+        }
     }
 
     #[test]

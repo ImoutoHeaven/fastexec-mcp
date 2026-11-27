@@ -556,14 +556,12 @@ fn open_relative_nt(parent: &File, segment: &str, directory: bool) -> io::Result
     }
     // SAFETY: handle is a valid newly opened kernel handle.
     let file = unsafe { File::from_raw_handle(handle) };
-    if !directory {
-        // SAFETY: file owns this live handle.
-        if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "skill resource is not a regular file",
-            ));
-        }
+    // SAFETY: file owns this live handle.
+    if !directory && unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "skill resource is not a regular file",
+        ));
     }
     let meta = file.metadata()?;
     if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0

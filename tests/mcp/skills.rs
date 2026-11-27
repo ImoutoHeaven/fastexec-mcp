@@ -1,4 +1,4 @@
-use super::common::{Scratch, Server};
+use super::common::Scratch;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -400,7 +400,4 @@ fn skills_stdio_main_pool_exhausted_returns_32603_and_exec_list_succeeds() {
     );
     assert!(list["result"].is_object(), "{list}");
     assert_ne!(list["result"]["isError"], json!(true), "{list}");
-
-    // Ensure standard Server helper remains exercised without warnings.
-    let _ = std::any::type_name::<Server>();
 }
