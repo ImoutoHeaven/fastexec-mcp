@@ -16,3 +16,5 @@ mod files;
 mod protocol;
 #[path = "mcp/pty.rs"]
 mod pty;
+#[path = "mcp/skills.rs"]
+mod skills;

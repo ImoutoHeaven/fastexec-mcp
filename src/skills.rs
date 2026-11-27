@@ -112,6 +112,7 @@ impl SkillCatalog {
         self.skills.get(index)
     }
 
+    #[cfg(test)]
     pub fn get_file(&self, uri: &str) -> Option<&SkillFileEntry> {
         self.files_by_uri.get(uri)
     }
@@ -120,10 +121,12 @@ impl SkillCatalog {
         self.dirs_by_uri.get(uri).map(Vec::as_slice)
     }
 
+    #[cfg(test)]
     pub fn read_permits(&self) -> &Arc<Semaphore> {
         &self.read_permits
     }
 
+    #[cfg(test)]
     pub fn metadata_lease_bytes(&self) -> usize {
         self._metadata_lease.bytes()
     }

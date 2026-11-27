@@ -35,6 +35,7 @@ struct Fixture {
     transfer: Option<String>,
     instructions_file: Option<String>,
     instructions_tool: Option<String>,
+    skills_dir: Option<String>,
     memory_limit: Option<String>,
     /// An explicitly chosen launch directory for path-alias regression tests.
     cwd: Option<PathBuf>,
@@ -89,6 +90,11 @@ impl Fixture {
         self
     }
 
+    fn with_skills_dir(mut self, value: impl Into<String>) -> Fixture {
+        self.skills_dir = Some(value.into());
+        self
+    }
+
     /// A fixture with its runtime directory, and no daemon yet: the shape of a start that is
     /// expected to be refused.
     fn bare(tag: &str) -> Fixture {
@@ -121,6 +127,7 @@ impl Fixture {
             transfer: None,
             instructions_file: None,
             instructions_tool: None,
+            skills_dir: None,
             memory_limit: None,
             cwd: None,
             starting,
@@ -168,6 +175,9 @@ impl Fixture {
         }
         if let Some(value) = &self.instructions_tool {
             command.env("FASTEXEC_INSTRUCTIONS_TOOL", value);
+        }
+        if let Some(value) = &self.skills_dir {
+            command.env("FASTEXEC_SKILLS_DIR", value);
         }
         if let Some(value) = &self.memory_limit {
             command.env("FASTEXEC_TEST_MEMORY_LIMIT", value);
@@ -3749,4 +3759,369 @@ fn http_control_reserve_survives_output_admission_failure() {
         status_line(killed["content"][0]["text"].as_str().unwrap()).starts_with("[killed"),
         "{killed}"
     );
+}
+
+#[test]
+fn http_skills_pipeline_preserves_status_codes_and_legacy_isolation() {
+    let mut fixture = Fixture::bare("skills-http");
+    let skills_root = fixture.runtime.join("skills");
+    std::fs::create_dir_all(skills_root.join("alpha/refs")).unwrap();
+    std::fs::write(
+        skills_root.join("alpha/SKILL.md"),
+        b"---\nname: alpha\ndescription: Alpha HTTP skill\n---\n# Alpha\n",
+    )
+    .unwrap();
+    std::fs::write(skills_root.join("alpha/refs/note.md"), b"hello over http\n").unwrap();
+    fixture = fixture.with_skills_dir(skills_root.to_string_lossy().into_owned());
+    fixture.start();
+
+    let token = fixture.tokens[0].clone();
+    let mut client = Client::new(fixture.addr, token.clone());
+
+    // 2026-07-28 full pipeline succeeds.
+    let discover = client.modern("server/discover", json!({}));
+    assert!(
+        discover["capabilities"]["resources"].is_object(),
+        "{discover}"
+    );
+    assert_eq!(
+        discover["capabilities"]["extensions"]["io.modelcontextprotocol/skills"],
+        json!({"directoryRead": true}),
+        "{discover}"
+    );
+    let listed = client.modern("skills/list", json!({}));
+    assert_eq!(listed["skills"].as_array().unwrap().len(), 1, "{listed}");
+    let got = client.modern("skills/get", json!({"uri": "skill://alpha/SKILL.md"}));
+    assert_eq!(got["skill"]["uri"], "skill://alpha/SKILL.md", "{got}");
+    let read_body = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "resources/read",
+        "params": {
+            "uri": "skill://alpha/refs/note.md",
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "http-skills-test", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }
+        }
+    })
+    .to_string();
+    let read_resp = client.post_with(
+        &read_body,
+        "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: resources/read\r\nMcp-Name: skill://alpha/refs/note.md\r\n",
+    );
+    assert_eq!(read_resp.status, 200, "{:?}", read_resp.body);
+    let read = read_resp.answer(4)["result"].clone();
+    assert_eq!(
+        read["contents"][0]["text"],
+        json!("hello over http\n"),
+        "{read}"
+    );
+    let dir = client.modern("resources/directory/read", json!({"uri": "skill://alpha"}));
+    assert_eq!(dir["resources"].as_array().unwrap().len(), 2, "{dir}");
+
+    // HTTP security and protocol status codes remain intact: 403, 405, 406, 404, 400, -32020.
+    let bad_host = exchange(
+        fixture.addr,
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: evil.example\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: 2\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n{{}}"
+        )
+        .as_bytes(),
+    );
+    assert_eq!(bad_host.status, 403, "{:?}", bad_host.body);
+
+    let bad_origin = exchange(
+        fixture.addr,
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nOrigin: https://evil.example\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: 2\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n{{}}",
+            fixture.addr
+        )
+        .as_bytes(),
+    );
+    assert_eq!(bad_origin.status, 403, "{:?}", bad_origin.body);
+
+    let method_not_allowed = exchange(
+        fixture.addr,
+        format!(
+            "PUT /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            fixture.addr
+        )
+        .as_bytes(),
+    );
+    assert_eq!(
+        method_not_allowed.status, 405,
+        "{:?}",
+        method_not_allowed.body
+    );
+
+    let not_acceptable = exchange(
+        fixture.addr,
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: text/plain\r\nContent-Type: application/json\r\nContent-Length: 2\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n{{}}",
+            fixture.addr
+        )
+        .as_bytes(),
+    );
+    assert_eq!(not_acceptable.status, 406, "{:?}", not_acceptable.body);
+
+    let unknown_session_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    let unknown_session = exchange(
+        fixture.addr,
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nMcp-Session-Id: does-not-exist\r\nContent-Length: {}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n{unknown_session_body}",
+            fixture.addr,
+            unknown_session_body.len()
+        )
+        .as_bytes(),
+    );
+    assert_eq!(unknown_session.status, 404, "{:?}", unknown_session.body);
+
+    let missing_session = exchange(
+        fixture.addr,
+        format!(
+            "GET /mcp HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n",
+            fixture.addr
+        )
+        .as_bytes(),
+    );
+    assert_eq!(missing_session.status, 400, "{:?}", missing_session.body);
+
+    let mismatch_body = json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "skills/list",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }
+        }
+    })
+    .to_string();
+    let header_mismatch = client.post_with(
+        &mismatch_body,
+        "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list\r\n",
+    );
+    assert_eq!(header_mismatch.status, 400, "{:?}", header_mismatch.body);
+    assert_eq!(
+        header_mismatch.answer(99)["error"]["code"],
+        json!(-32020),
+        "{:?}",
+        header_mismatch.body
+    );
+
+    // Legacy initialized session gets zero skills/resources fingerprint and -32601 on all methods.
+    let mut legacy = Client::new(fixture.addr, token.clone());
+    let init = legacy.initialize_version("2025-11-25");
+    assert!(init["capabilities"].get("resources").is_none(), "{init}");
+    assert!(
+        init["capabilities"]
+            .get("extensions")
+            .and_then(|e| e.get("io.modelcontextprotocol/skills"))
+            .is_none(),
+        "{init}"
+    );
+    for (method, params) in [
+        ("skills/list", json!({})),
+        ("skills/get", json!({"uri": "bad"})),
+        ("skills/get", json!({"uri": "skill://alpha/SKILL.md"})),
+        ("resources/read", json!({"uri": "skill://alpha/SKILL.md"})),
+        ("resources/directory/read", json!({"uri": "skill://alpha"})),
+        ("resources/list", json!({})),
+        ("resources/templates/list", json!({})),
+    ] {
+        legacy.next_id += 1;
+        let id = legacy.next_id;
+        let resp = legacy.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }));
+        assert_eq!(resp.status, 200, "{method}: {:?}", resp.body);
+        assert_eq!(
+            resp.answer(id)["error"]["code"],
+            json!(-32601),
+            "legacy session {method}: {:?}",
+            resp.body
+        );
+    }
+
+    // Stateless inline < 2026-07-28 HTTP requests (no Mcp-Session-Id, inline _meta) return -32601.
+    let mut stateless = Client::new(fixture.addr, token);
+    for (method, mut params, extra_header) in [
+        ("skills/get", json!({"uri": "bad"}), ""),
+        (
+            "resources/read",
+            json!({"uri": "skill://alpha/SKILL.md"}),
+            "Mcp-Name: skill://alpha/SKILL.md\r\n",
+        ),
+        (
+            "resources/directory/read",
+            json!({"uri": "skill://alpha"}),
+            "",
+        ),
+    ] {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+            "io.modelcontextprotocol/clientInfo": {"name": "legacy-inline", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": method,
+            "params": params,
+        })
+        .to_string();
+        let resp = stateless.post_with(
+            &body,
+            &format!("MCP-Protocol-Version: 2025-11-25\r\nMcp-Method: {method}\r\n{extra_header}"),
+        );
+        assert!(
+            resp.status == 200 || resp.status == 404,
+            "stateless {method}: status {} {:?}",
+            resp.status,
+            resp.body
+        );
+        assert_eq!(
+            resp.answer(77)["error"]["code"],
+            json!(-32601),
+            "stateless {method}: {:?}",
+            resp.body
+        );
+    }
+}
+
+#[test]
+fn http_skills_idempotent_start_reuses_running_daemon() {
+    let mut fixture = Fixture::bare("skills-idempotent");
+    let skills_root = fixture.runtime.join("skills");
+    std::fs::create_dir_all(skills_root.join("alpha")).unwrap();
+    std::fs::write(
+        skills_root.join("alpha/SKILL.md"),
+        b"---\nname: alpha\ndescription: Alpha\n---\n# Alpha\n",
+    )
+    .unwrap();
+    fixture = fixture.with_skills_dir(skills_root.to_string_lossy().into_owned());
+    fixture.start();
+
+    let original_pid = fixture.pid.get().expect("daemon pid");
+    let original_addr = fixture.addr;
+
+    // Removing the skills dir or pointing FASTEXEC_SKILLS_DIR to a missing path still reuses the
+    // running HTTP daemon idempotently with exit 0.
+    let output = fixture
+        .command(&["daemon", "start", "--http", "127.0.0.1:0"])
+        .env("FASTEXEC_SKILLS_DIR", fixture.runtime.join("nonexistent"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "idempotent start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(pid_of(&out), Some(original_pid), "{out}");
+    assert!(out.contains(&format!("http {original_addr}")), "{out}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn http_skills_response_lease_backpressure_and_disconnect_release() {
+    let mut fixture = Fixture::bare("skills-http-lease");
+    let skills_root = fixture.runtime.join("skills");
+    std::fs::create_dir_all(skills_root.join("big")).unwrap();
+    std::fs::write(
+        skills_root.join("big/SKILL.md"),
+        b"---\nname: big\ndescription: Big HTTP skill\n---\n# Big\n",
+    )
+    .unwrap();
+    // 10 MiB payload exceeds kernel loopback socket buffers so an unread TCP client keeps
+    // `LeaseBody` alive on the server while holding `daemon.memory`.
+    let payload_size = 10 * 1024 * 1024;
+    std::fs::write(skills_root.join("big/blob.txt"), vec![b'z'; payload_size]).unwrap();
+
+    // Limit allows one in-flight 10 MiB response (~20 MiB peak with staging+outbound) but not two.
+    fixture = fixture.with_skills_dir(skills_root.to_string_lossy().into_owned());
+    fixture.memory_limit = Some((24 * 1024 * 1024).to_string());
+    fixture.start();
+
+    let token = fixture.tokens[0].clone();
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "resources/read",
+        "params": {
+            "uri": "skill://big/blob.txt",
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "slow-client", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }
+        }
+    })
+    .to_string();
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Authorization: Bearer {token}\r\n\
+         MCP-Protocol-Version: 2026-07-28\r\n\
+         Mcp-Method: resources/read\r\n\
+         Mcp-Name: skill://big/blob.txt\r\n\r\n{body}",
+        fixture.addr,
+        body.len()
+    );
+
+    // Client 1 sends the request and reads only the first 64 bytes (headers), then stalls.
+    let mut slow = TcpStream::connect(fixture.addr).unwrap();
+    slow.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    slow.write_all(req.as_bytes()).unwrap();
+    let mut head_peek = [0u8; 64];
+    slow.read_exact(&mut head_peek).unwrap();
+    assert!(
+        head_peek.starts_with(b"HTTP/1.1 200"),
+        "{:?}",
+        String::from_utf8_lossy(&head_peek)
+    );
+
+    // While Client 1's LeaseBody pins ~10 MiB of daemon.memory, Client 2 cannot fit a second 10 MiB
+    // response (~20 MiB peak) inside the 24 MiB budget and gets -32603.
+    let resp2 = exchange(fixture.addr, req.as_bytes());
+    assert_eq!(resp2.status, 200, "{:?}", resp2.body);
+    assert_eq!(
+        resp2.answer(1)["error"]["code"],
+        json!(-32603),
+        "expected memory budget rejection while slow client holds LeaseBody: {:?}",
+        resp2.body
+    );
+
+    // Drop Client 1 early (disconnect) -> LeaseBody::drop frees daemon.memory -> Client 3 succeeds.
+    drop(slow);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let resp3 = exchange(fixture.addr, req.as_bytes());
+        assert_eq!(resp3.status, 200, "{:?}", resp3.body);
+        let ans = resp3.answer(1);
+        if ans["result"].is_object() {
+            assert_eq!(
+                ans["result"]["contents"][0]["text"].as_str().unwrap().len(),
+                payload_size
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lease was not released after slow client disconnected: {ans}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

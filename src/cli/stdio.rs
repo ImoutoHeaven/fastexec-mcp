@@ -2,14 +2,15 @@
 
 use crate::config::{
     TRANSFER_ADDR, Tools, check_routable_addr, instructions_file, instructions_tool_mode,
-    transfer_addr,
+    skills_dir, transfer_addr,
 };
 use crate::endpoint;
 use crate::env::LaunchContext;
 use crate::http_wire;
 use crate::lease;
-use crate::mcp::{Backend, RequestLeases, Server, ingress};
+use crate::mcp::{Backend, McpService, RequestLeases, Server, ingress, validate_skill_catalog};
 use crate::service::Service;
+use crate::skills;
 use crate::tasks::{Limits, Tasks};
 use crate::transfer::{self, TransferEndpoint};
 use rmcp::{RoleServer, ServiceExt};
@@ -552,6 +553,20 @@ pub(crate) async fn serve() {
             std::process::exit(1);
         }
     };
+    let skills = match skills_dir(&launch) {
+        Ok(Some(root)) => match skills::load(&root, launch.memory()) {
+            Ok(catalog) => Some(Arc::new(catalog)),
+            Err(message) => {
+                eprintln!("fastexec: {message}");
+                std::process::exit(1);
+            }
+        },
+        Ok(None) => None,
+        Err(message) => {
+            eprintln!("fastexec: {message}");
+            std::process::exit(1);
+        }
+    };
     let (backend, tasks, transfer_endpoint, transfer_stop) = if daemon {
         let endpoint = match endpoint::Endpoint::new(Arc::clone(&launch)) {
             Ok(endpoint) => endpoint,
@@ -616,6 +631,9 @@ pub(crate) async fn serve() {
         };
         (backend, Some(tasks), transfer_endpoint, transfer_stop)
     };
+    if let Some(catalog) = &skills {
+        validate_skill_catalog(catalog);
+    }
     let stdio_leases = Arc::new(RequestLeases::default());
     let server = Server::new(
         backend,
@@ -625,7 +643,8 @@ pub(crate) async fn serve() {
         extra_instructions.as_deref(),
         instructions_tool,
     )
-    .with_stdio_leases(Arc::clone(&stdio_leases));
+    .with_stdio_leases(Arc::clone(&stdio_leases))
+    .with_skills(skills);
     let eof = Arc::new(tokio::sync::Notify::new());
     let stdin = EofSignal {
         inner: tokio::io::stdin(),
@@ -644,7 +663,7 @@ pub(crate) async fn serve() {
     // The backend outlives the serve call, which consumes the handler.
     let backend = server.backend.clone();
     let served = tokio::select! {
-        served = server.serve(transport) => Some(served),
+        served = McpService(server).serve(transport) => Some(served),
         _ = &mut signal => None,
     };
     let mut exit_code = 0;

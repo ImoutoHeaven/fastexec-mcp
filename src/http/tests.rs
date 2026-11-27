@@ -1546,6 +1546,7 @@ async fn http2_authority_mints_transfer_url_without_host_header_and_blocks_useri
         public_root: None,
         extra_instructions: None,
         instructions_tool: InstructionsToolMode::Off,
+        skills: None,
         service,
         transfers: Arc::clone(&table),
         memory: BytePool::new(1 << 20),
@@ -1640,6 +1641,122 @@ async fn http2_authority_mints_transfer_url_without_host_header_and_blocks_useri
     }
 
     drop(h2_client);
+    stopped.cancel();
+    server_task.await.unwrap();
+    let _ = h2_conn.await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn skills_http_response_lease_holds_daemon_memory_until_body_dropped() {
+    let dir = std::env::temp_dir().join(format!(
+        "fastexec-http-skills-lease-{}",
+        crate::id::random_chars(8).unwrap()
+    ));
+    let skill_dir = dir.join("big");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        b"---\nname: big\ndescription: Big skill\n---\n# Big\n",
+    )
+    .unwrap();
+    let payload_size = 2 * 1024 * 1024;
+    std::fs::write(skill_dir.join("data.txt"), vec![b'a'; payload_size]).unwrap();
+
+    let process_before = crate::lease::process_pool().used();
+    let daemon_memory = BytePool::new(8 << 20);
+    let catalog = Arc::new(crate::skills::load(&skill_dir, &daemon_memory).unwrap());
+    let baseline = daemon_memory.used();
+    assert!(
+        baseline > 0,
+        "catalog metadata must be leased from daemon_memory"
+    );
+    assert_eq!(
+        crate::lease::process_pool().used(),
+        process_before,
+        "skills::load must not charge global process_pool"
+    );
+
+    // Direct unit check for early-disconnect `closed == true` branch on HttpResponseLease.
+    let closed_slot = HttpResponseLease::default();
+    closed_slot.close();
+    let probe = daemon_memory.try_acquire(4096).unwrap();
+    assert_eq!(daemon_memory.used(), baseline + 4096);
+    assert!(!closed_slot.attach(probe));
+    assert_eq!(
+        daemon_memory.used(),
+        baseline,
+        "attaching to a closed HttpResponseLease must immediately release outbound lease"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let stopped = CancellationToken::new();
+    let token = "0123456789abcdef";
+    let tasks = crate::tasks::Tasks::new(crate::tasks::Limits::OFF).unwrap();
+    let service = Arc::new(crate::service::Service::new(tasks, true));
+    let launch = Arc::new(LaunchContext::new(dir.clone(), Vec::new()));
+    let table = Arc::new(Transfers::new());
+    let server_task = tokio::spawn(serve(HttpServeArgs {
+        listener,
+        digests: vec![digest(token)],
+        tools: Tools::default(),
+        launch,
+        public_root: None,
+        extra_instructions: None,
+        instructions_tool: InstructionsToolMode::Off,
+        skills: Some(catalog),
+        service,
+        transfers: table,
+        memory: Arc::clone(&daemon_memory),
+        control_memory: BytePool::new(256 * 1024),
+        stopped: stopped.clone(),
+    }));
+
+    // HTTP/2 has a 64 KiB initial stream window, so a 256 KiB response stays suspended in
+    // LeaseBody until the client reads or disconnects.
+    let (mut h2_client, h2_conn) = TestHttpSender::connect(bound, true).await;
+    let body = modern_post_body(
+        1,
+        "resources/read",
+        serde_json::json!({"uri": "skill://big/data.txt"}),
+    );
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://{bound}/mcp"))
+        .version(Version::HTTP_2)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "resources/read")
+        .header("mcp-name", "skill://big/data.txt")
+        .body(Full::new(body))
+        .unwrap();
+    let res = h2_client.send(req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // While the response body is unread (flow-control blocked), daemon_memory holds the lease.
+    let held = daemon_memory.used();
+    assert!(
+        held >= baseline + payload_size,
+        "expected LeaseBody to hold >= {} bytes, got {held} (baseline {baseline})",
+        baseline + payload_size
+    );
+
+    // Drop the response and client early (simulating client disconnect) -> lease returns to baseline.
+    drop(res);
+    drop(h2_client);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while daemon_memory.used() != baseline && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        daemon_memory.used(),
+        baseline,
+        "LeaseBody::drop must release outbound lease back to daemon_memory"
+    );
+
     stopped.cancel();
     server_task.await.unwrap();
     let _ = h2_conn.await;

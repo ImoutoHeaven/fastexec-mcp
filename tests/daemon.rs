@@ -3570,3 +3570,108 @@ fn older_protocol_hello_is_rejected_by_current_daemon() {
         assert_eq!(reply["message"], json!("protocol 5 is not 6"), "{reply}");
     }
 }
+
+#[test]
+fn non_http_daemon_and_daemon_on_ignore_invalid_skills_dir() {
+    let fixture = Fixture::new("skills-non-http");
+    let missing = fixture.runtime.join("nonexistent-skills-dir");
+
+    for subcommand in ["start", "status", "stop"] {
+        let output = fixture
+            .command(&["daemon", subcommand])
+            .env("FASTEXEC_SKILLS_DIR", &missing)
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        if let Some(pid) = pid_of(&out) {
+            fixture.pid.set(Some(pid));
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "daemon {subcommand} failed: {out}{err}"
+        );
+    }
+
+    // Foreground `daemon run` without `--http` also ignores invalid FASTEXEC_SKILLS_DIR.
+    let mut fg = fixture
+        .command(&["daemon", "run"])
+        .env("FASTEXEC_SKILLS_DIR", &missing)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(fg.stderr.take().unwrap());
+    let mut ready = String::new();
+    stderr.read_line(&mut ready).unwrap();
+    assert!(
+        ready.contains("fastexec daemon"),
+        "unexpected ready line: {ready:?}"
+    );
+    let (code, _, err) = fixture.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "stop foreground daemon failed: {err}");
+    let status = fg.wait().unwrap();
+    assert!(status.success(), "foreground daemon exit: {status}");
+
+    // `FASTEXEC_DAEMON=on` auto-started background daemon ignores invalid FASTEXEC_SKILLS_DIR.
+    let (code, out, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let mut ep = Endpoint::start_with(&fixture, |cmd| {
+        cmd.env("FASTEXEC_DAEMON", "on");
+    });
+    let (text, is_error) =
+        ep.call(json!({"action": "start", "command": "echo ok", "waitMs": 5000}));
+    assert!(!is_error, "{text}");
+    assert!(text.contains("ok"), "{text}");
+    ep.close();
+}
+
+#[test]
+fn cold_http_daemon_invalid_skills_dir_exits_without_deleting_logs_or_endpoint() {
+    let fixture = Fixture::new("skills-cold-http");
+    let (code, _, err) = fixture.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "seed start failed: {err}");
+    let (code, _, err) = fixture.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "seed stop failed: {err}");
+
+    let ns_dir = std::fs::read_dir(fixture.runtime.join("ns"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("namespace directory");
+    let logs = ns_dir.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let sentinel_log = logs.join("preexisting.log");
+    std::fs::write(&sentinel_log, b"keep this log").unwrap();
+    let sentinel_endpoint = ns_dir.join("sock");
+    let _ = std::fs::remove_file(&sentinel_endpoint);
+    std::fs::write(&sentinel_endpoint, b"keep this endpoint").unwrap();
+
+    let missing = fixture.runtime.join("nonexistent-skills-dir");
+    for subcommand in ["start", "run"] {
+        let output = fixture
+            .command(&["daemon", subcommand, "--http", "127.0.0.1:0"])
+            .env("FASTEXEC_HTTP_TOKEN", "0123456789abcdef")
+            .env("FASTEXEC_SKILLS_DIR", &missing)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "daemon {subcommand} --http");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("fastexec:"),
+            "daemon {subcommand} --http: {stderr:?}"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel_log).unwrap(),
+            b"keep this log",
+            "daemon {subcommand} --http deleted pre-existing logs"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel_endpoint).unwrap(),
+            b"keep this endpoint",
+            "daemon {subcommand} --http deleted pre-existing endpoint"
+        );
+    }
+}

@@ -1037,6 +1037,7 @@ mod g15_http_daemon_wiring_tests {
                 public_root: None,
                 extra_instructions: None,
                 instructions_tool: InstructionsToolMode::Off,
+                skills: None,
             },
             crate::cli::daemon::spawn_http,
         );

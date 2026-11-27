@@ -2,7 +2,7 @@
 
 use crate::config::{
     TRANSFER_ADDR, Tools, check_listen_addr, check_routable_addr, http_addr, http_token,
-    instructions_file, instructions_tool_mode, transfer_addr,
+    instructions_file, instructions_tool_mode, skills_dir, transfer_addr,
 };
 use crate::daemon;
 use crate::endpoint;
@@ -186,6 +186,7 @@ pub(super) fn spawn_http(
         public_root: launch.public_root,
         extra_instructions: launch.extra_instructions,
         instructions_tool: launch.instructions_tool,
+        skills: launch.skills,
         service: launch.service,
         transfers: launch.transfers,
         memory: launch.memory,
@@ -705,6 +706,16 @@ async fn cli_start(
                 if let Err(message) = {
                     let launch = launch.for_session();
                     blocking_within(deadline, move || instructions_file(&launch)).await
+                } {
+                    return fail(&message);
+                }
+                if let Err(message) = {
+                    let launch = launch.for_session();
+                    blocking_within(deadline, move || match skills_dir(&launch)? {
+                        Some(root) => crate::skills::preflight_check(&root),
+                        None => Ok(()),
+                    })
+                    .await
                 } {
                     return fail(&message);
                 }

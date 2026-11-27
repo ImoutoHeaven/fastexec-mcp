@@ -5,8 +5,9 @@ use crate::config::{InstructionsToolMode, Tools};
 use crate::env::LaunchContext;
 use crate::http_wire::{self, Reply};
 use crate::lease::BytePool;
-use crate::mcp::{Backend, Principal, Server};
+use crate::mcp::{Backend, HttpResponseLease, Principal, Server, validate_skill_catalog};
 use crate::service::Service;
+use crate::skills::SkillCatalog;
 use crate::tasks::session::Session;
 use crate::transfer::{TransferEndpoint, Transfers};
 use http::header::HeaderName;
@@ -37,6 +38,10 @@ const MAX_TRANSFER_CONNECTIONS: usize = 96;
 /// Legacy HTTP sessions survive individual connections and have a separate count cap.
 const MAX_HTTP_SESSIONS: usize = 256;
 
+tokio::task_local! {
+    static HTTP_REQ_LEGACY: bool;
+}
+
 /// Arguments for the Streamable HTTP front door: listener, auth digests, and shared state.
 pub struct HttpServeArgs {
     pub listener: TcpListener,
@@ -54,6 +59,8 @@ pub struct HttpServeArgs {
     pub extra_instructions: Option<String>,
     /// Whether HTTP sessions also expose server instructions as an MCP tool.
     pub instructions_tool: InstructionsToolMode,
+    /// Optional read-only skills catalog loaded into `daemon.memory`.
+    pub skills: Option<Arc<SkillCatalog>>,
     pub service: Arc<Service>,
     pub transfers: Arc<Transfers>,
     pub memory: Arc<BytePool>,
@@ -71,6 +78,7 @@ pub async fn serve(args: HttpServeArgs) {
         public_root,
         extra_instructions,
         instructions_tool,
+        skills,
         service,
         transfers: table,
         memory,
@@ -104,6 +112,9 @@ pub async fn serve(args: HttpServeArgs) {
         tools,
         tool_instructions.as_deref(),
     ));
+    if let Some(catalog) = &skills {
+        validate_skill_catalog(catalog);
+    }
     let memory = Arc::clone(launch.memory());
     let factory = {
         let table = Arc::clone(&table);
@@ -119,6 +130,7 @@ pub async fn serve(args: HttpServeArgs) {
                 table: Arc::clone(&table),
                 public_root: public_root.clone(),
             });
+            let is_legacy = HTTP_REQ_LEGACY.try_with(|v| *v).unwrap_or(false);
             let mut server = Server::with_shared(
                 backend,
                 Arc::clone(&router),
@@ -126,7 +138,9 @@ pub async fn serve(args: HttpServeArgs) {
                 tool_instructions.clone(),
                 transfer,
                 tools,
-            );
+            )
+            .with_skills(skills.clone())
+            .with_legacy_session(is_legacy);
             server.principals = Some(Arc::clone(&principals));
             Ok(server)
         }
@@ -296,23 +310,135 @@ where
                 ));
             }
             let (mut parts, body) = request.into_parts();
+            let is_legacy = is_legacy_http_request(&parts.headers);
+            let lease_slot = HttpResponseLease::default();
             parts.extensions.insert(Principal(principal));
+            parts.extensions.insert(lease_slot.clone());
+            let mut lease_guard = LeaseSlotGuard(Some(lease_slot));
             let request = Request::from_parts(parts, Limited::new(body, LIMIT));
-            let answer = inner
-                .call(request)
-                .await
-                .unwrap_or_else(|never| match never {});
+            let answer = HTTP_REQ_LEGACY
+                .scope(is_legacy, async move {
+                    inner
+                        .call(request)
+                        .await
+                        .unwrap_or_else(|never| match never {})
+                })
+                .await;
             let (mut parts, body) = answer.into_parts();
             // A proxy that buffers would hold every event of a stream until the call ended.
             parts.headers.insert(
                 HeaderName::from_static("x-accel-buffering"),
                 "no".parse().expect("a header value"),
             );
+            let leased = LeaseBody {
+                inner: body,
+                pending: None,
+                slot: lease_guard.0.take().expect("lease slot"),
+            };
             Ok(Response::from_parts(
                 parts,
-                body.map_err(|never: Infallible| match never {}).boxed(),
+                leased.map_err(|never: Infallible| match never {}).boxed(),
             ))
         })
+    }
+}
+
+fn is_legacy_http_request(headers: &HeaderMap) -> bool {
+    if headers.contains_key("mcp-session-id") {
+        return false;
+    }
+    match headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
+        Some(version) => version < "2026-07-28",
+        None => true,
+    }
+}
+
+struct LeaseSlotGuard(Option<HttpResponseLease>);
+
+impl Drop for LeaseSlotGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0.take() {
+            slot.close();
+        }
+    }
+}
+
+// Slice large single-frame JSON responses into small chunks so Hyper cannot drain and drop
+// `LeaseBody` before the client's transport window accepts the bytes.
+const LEASE_BODY_CHUNK_BYTES: usize = 16 * 1024;
+
+struct LeaseBody<B> {
+    inner: B,
+    pending: Option<bytes::Bytes>,
+    slot: HttpResponseLease,
+}
+
+impl<B> LeaseBody<B> {
+    fn take_pending_chunk(&mut self) -> Option<bytes::Bytes> {
+        let pending = self.pending.as_mut()?;
+        if pending.len() > LEASE_BODY_CHUNK_BYTES {
+            Some(pending.split_to(LEASE_BODY_CHUNK_BYTES))
+        } else {
+            self.pending.take()
+        }
+    }
+}
+
+impl<B> Drop for LeaseBody<B> {
+    fn drop(&mut self) {
+        self.slot.close();
+    }
+}
+
+impl<B> hyper::body::Body for LeaseBody<B>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
+{
+    type Data = bytes::Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(chunk) = self.take_pending_chunk() {
+            return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))));
+        }
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(mut data) => {
+                    if data.len() > LEASE_BODY_CHUNK_BYTES {
+                        let first = data.split_to(LEASE_BODY_CHUNK_BYTES);
+                        self.pending = Some(data);
+                        Poll::Ready(Some(Ok(hyper::body::Frame::data(first))))
+                    } else {
+                        Poll::Ready(Some(Ok(hyper::body::Frame::data(data))))
+                    }
+                }
+                Err(other) => Poll::Ready(Some(Ok(other))),
+            },
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.pending.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let mut hint = self.inner.size_hint();
+        if let Some(pending) = &self.pending {
+            let extra = pending.len() as u64;
+            hint.set_lower(hint.lower().saturating_add(extra));
+            if let Some(upper) = hint.upper() {
+                hint.set_upper(upper.saturating_add(extra));
+            }
+        }
+        hint
     }
 }
 

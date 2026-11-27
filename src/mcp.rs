@@ -17,17 +17,26 @@ use crate::render::types::{AgentDelivery, TrackedResult};
 use crate::service::core::overload_task_message;
 use crate::service::schema::{Action, Request};
 use crate::service::{ExecContext, Service};
+use crate::skills::{SkillCatalog, SkillContent, SkillEntry, SkillReadError};
 use crate::tasks::session::Session;
 use crate::transfer::{self, TransferEndpoint};
 use crate::wait;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, InitializeRequestParams, InitializeResult,
-    ServerCapabilities, ServerConfig, ToolAnnotations,
+    CacheScope, CallToolResult, ContentBlock, GetSkillRequestMethod, GetSkillRequestParams,
+    GetSkillResult, Implementation, InitializeRequestParams, InitializeResult,
+    ListResourceTemplatesRequestMethod, ListResourceTemplatesResult, ListResourcesRequestMethod,
+    ListResourcesResult, ListSkillsRequestMethod, ListSkillsResult, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceDirectoryRequestMethod, ReadResourceDirectoryRequestParams,
+    ReadResourceDirectoryResult, ReadResourceRequestMethod, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResultType,
+    SKILLS_EXTENSION_ID, ServerCapabilities, ServerConfig, Skill, SkillFrontmatter, SkillResource,
+    SkillResources, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +60,49 @@ impl schemars::JsonSchema for CodemodeArguments {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Principal(pub usize);
 
+#[derive(Default)]
+struct HttpResponseLeaseState {
+    closed: bool,
+    lease: Option<lease::Lease>,
+}
+
+/// Shared outbound response lease slot bridged from `Server` to HTTP `LeaseBody` across
+/// `tokio::spawn` boundaries via `http::request::Parts::extensions`.
+#[derive(Clone, Default)]
+pub(crate) struct HttpResponseLease(Arc<std::sync::Mutex<HttpResponseLeaseState>>);
+
+impl HttpResponseLease {
+    pub(crate) fn attach(&self, outbound: lease::Lease) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            drop(state);
+            drop(outbound);
+            return false;
+        }
+        let replaced = state.lease.replace(outbound);
+        drop(state);
+        drop(replaced);
+        true
+    }
+
+    pub(crate) fn close(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
+        let dropped = state.lease.take();
+        drop(state);
+        drop(dropped);
+    }
+}
+
+const SKILLS_PAGE_SIZE: usize = 64;
+const DIR_PAGE_SIZE: usize = 256;
+
 #[derive(Clone)]
 pub(crate) struct Server {
     pub(crate) backend: Backend,
@@ -64,6 +116,10 @@ pub(crate) struct Server {
     pub(crate) principals: Option<Arc<[Arc<Session>]>>,
     /// Outbound active-byte leases indexed by JSON-RPC request ID for stdio responses.
     pub(crate) stdio_leases: Option<Arc<RequestLeases>>,
+    /// Optional read-only skills catalog exposed on MCP `2026-07-28+`.
+    skills: Option<Arc<SkillCatalog>>,
+    /// True once this session negotiated via legacy `initialize` or a `< 2026-07-28` HTTP request.
+    legacy_session: Arc<AtomicBool>,
 }
 
 pub(crate) struct RegisteredSession {
@@ -152,11 +208,23 @@ impl Server {
             tools,
             principals: None,
             stdio_leases: None,
+            skills: None,
+            legacy_session: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub(crate) fn with_stdio_leases(mut self, stdio_leases: Arc<RequestLeases>) -> Self {
         self.stdio_leases = Some(stdio_leases);
+        self
+    }
+
+    pub(crate) fn with_skills(mut self, skills: Option<Arc<SkillCatalog>>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    pub(crate) fn with_legacy_session(self, legacy: bool) -> Self {
+        self.legacy_session.store(legacy, Ordering::Release);
         self
     }
 
@@ -349,12 +417,22 @@ impl ServerHandler for Server {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, rmcp::ErrorData> {
+        self.legacy_session.store(true, Ordering::Release);
         let _response_workspace =
             reserve_response_content(self.pools().0, self.instructions.len().saturating_add(512))?;
-        let result = self
+        let mut result = self
             .negotiate_initialize(&request)?
             .with_instructions(self.instructions.as_ref());
-        context.peer.set_peer_info(request);
+        if let Some(extensions) = result.capabilities.extensions.as_mut() {
+            extensions.remove(SKILLS_EXTENSION_ID);
+            if extensions.is_empty() {
+                result.capabilities.extensions = None;
+            }
+        }
+        result.capabilities.resources = None;
+        let mut peer = request;
+        peer.protocol_version = result.protocol_version.clone();
+        context.peer.set_peer_info(peer);
         if let Backend::Local {
             service,
             session,
@@ -450,10 +528,404 @@ impl ServerHandler for Server {
         })
     }
 
+    async fn list_skills(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListSkillsResult, rmcp::ErrorData> {
+        let catalog = self.require_skills::<ListSkillsRequestMethod>(&context)?;
+        let entries = catalog.skills();
+        let cursor = request.and_then(|p| p.cursor);
+        let start = parse_pagination_cursor(cursor.as_deref(), entries.len())?;
+        let end = start.saturating_add(SKILLS_PAGE_SIZE).min(entries.len());
+        let skills: Vec<Skill> = entries[start..end].iter().map(project_skill).collect();
+        let next_cursor = (end < entries.len()).then(|| end.to_string());
+        let staging = self.pools().0.try_acquire(0).expect("zero-byte lease");
+        let result = ListSkillsResult {
+            result_type: Some(ResultType::COMPLETE),
+            ttl_ms: Some(0),
+            cache_scope: Some(CacheScope::Public),
+            skills,
+            next_cursor,
+            meta: None,
+        };
+        self.deliver_skill_response(&context, result, staging)
+    }
+
+    async fn get_skill(
+        &self,
+        request: GetSkillRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetSkillResult, rmcp::ErrorData> {
+        let catalog = self.require_skills::<GetSkillRequestMethod>(&context)?;
+        let entry = catalog.get_skill(&request.uri).ok_or_else(|| {
+            rmcp::ErrorData::invalid_params(format!("skill not found: {}", request.uri), None)
+        })?;
+        let staging = self.pools().0.try_acquire(0).expect("zero-byte lease");
+        let result = GetSkillResult::new(project_skill(entry))
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Public);
+        self.deliver_skill_response(&context, result, staging)
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
+        use base64::Engine as _;
+
+        let catalog = self.require_skills::<ReadResourceRequestMethod>(&context)?;
+        let read = catalog
+            .read_resource(&request.uri, self.pools().0, &context.ct)
+            .await
+            .map_err(skill_read_error_to_rmcp)?;
+        let mut staging = read.lease;
+        let contents = match read.content {
+            SkillContent::Text(text) => ResourceContents::TextResourceContents {
+                uri: read.uri,
+                mime_type: Some(read.mime_type.to_owned()),
+                text,
+                meta: None,
+            },
+            SkillContent::Blob(bytes) => {
+                let encoded_len = bytes.len().div_ceil(3).saturating_mul(4);
+                let Some(peak) = staging.bytes().checked_add(encoded_len) else {
+                    drop(staging);
+                    drop(bytes);
+                    return Err(rmcp::ErrorData::internal_error(
+                        "Server active memory budget is full while preparing the response",
+                        None,
+                    ));
+                };
+                if !staging.try_resize(peak) {
+                    drop(staging);
+                    drop(bytes);
+                    return Err(rmcp::ErrorData::internal_error(
+                        "Server active memory budget is full while preparing the response",
+                        None,
+                    ));
+                }
+                let blob = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                drop(bytes);
+                let _ = staging.try_resize(blob.len());
+                ResourceContents::BlobResourceContents {
+                    uri: read.uri,
+                    mime_type: Some(read.mime_type.to_owned()),
+                    blob,
+                    meta: None,
+                }
+            }
+        };
+        let result = ReadResourceResult::new(vec![contents])
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Public);
+        self.deliver_skill_response(&context, result, staging)
+            .map(ReadResourceResponse::Complete)
+    }
+
+    async fn read_resource_directory(
+        &self,
+        request: ReadResourceDirectoryRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceDirectoryResult, rmcp::ErrorData> {
+        let catalog = self.require_skills::<ReadResourceDirectoryRequestMethod>(&context)?;
+        let children = catalog.read_directory(&request.uri).ok_or_else(|| {
+            rmcp::ErrorData::invalid_params(
+                format!("skill directory not found: {}", request.uri),
+                None,
+            )
+        })?;
+        let start = parse_pagination_cursor(request.cursor.as_deref(), children.len())?;
+        let end = start.saturating_add(DIR_PAGE_SIZE).min(children.len());
+        let resources: Vec<Resource> = children[start..end]
+            .iter()
+            .map(|child| {
+                let mut res = Resource::new(child.uri.clone(), child.name.clone())
+                    .with_mime_type(child.mime_type);
+                if let Some(size) = child.size {
+                    res = res.with_size(size);
+                }
+                res
+            })
+            .collect();
+        let next_cursor = (end < children.len()).then(|| end.to_string());
+        let staging = self.pools().0.try_acquire(0).expect("zero-byte lease");
+        let result = ListResourcesResult {
+            result_type: Some(ResultType::COMPLETE),
+            ttl_ms: Some(0),
+            cache_scope: Some(CacheScope::Public),
+            resources,
+            next_cursor,
+            meta: None,
+        };
+        self.deliver_skill_response(&context, result, staging)
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, rmcp::ErrorData> {
+        let _ = self.require_skills::<ListResourcesRequestMethod>(&context)?;
+        let cursor = request.and_then(|p| p.cursor);
+        let _ = parse_pagination_cursor(cursor.as_deref(), 0)?;
+        let staging = self.pools().0.try_acquire(0).expect("zero-byte lease");
+        let result = ListResourcesResult {
+            result_type: Some(ResultType::COMPLETE),
+            ttl_ms: Some(0),
+            cache_scope: Some(CacheScope::Public),
+            resources: Vec::new(),
+            next_cursor: None,
+            meta: None,
+        };
+        self.deliver_skill_response(&context, result, staging)
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, rmcp::ErrorData> {
+        let _ = self.require_skills::<ListResourceTemplatesRequestMethod>(&context)?;
+        let cursor = request.and_then(|p| p.cursor);
+        let _ = parse_pagination_cursor(cursor.as_deref(), 0)?;
+        let staging = self.pools().0.try_acquire(0).expect("zero-byte lease");
+        let result = ListResourceTemplatesResult {
+            result_type: Some(ResultType::COMPLETE),
+            ttl_ms: Some(0),
+            cache_scope: Some(CacheScope::Public),
+            resource_templates: Vec::new(),
+            next_cursor: None,
+            meta: None,
+        };
+        self.deliver_skill_response(&context, result, staging)
+    }
+
     fn get_info(&self) -> ServerConfig {
+        let capabilities = if self.skills.is_some() && !self.legacy_session.load(Ordering::Acquire)
+        {
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_skills_with_directory_read()
+                .build()
+        } else {
+            ServerCapabilities::builder().enable_tools().build()
+        };
         // Internal capability checks need no per-request instructions copy.
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new("fastexec", env!("CARGO_PKG_VERSION")))
+    }
+}
+
+/// Stdio service wrapper that intercepts skills/resources requests for legacy or disabled sessions
+/// before `rmcp`'s default `ServerHandler` dispatch runs URI validation.
+pub(crate) struct McpService(pub(crate) Server);
+
+impl rmcp::service::Service<RoleServer> for McpService {
+    async fn handle_request(
+        &self,
+        request: <RoleServer as rmcp::service::ServiceRole>::PeerReq,
+        context: RequestContext<RoleServer>,
+    ) -> Result<<RoleServer as rmcp::service::ServiceRole>::Resp, rmcp::ErrorData> {
+        let reject_as_legacy_or_disabled = self.0.skills.is_none()
+            || self.0.legacy_session.load(Ordering::Acquire)
+            || context
+                .protocol_version()
+                .is_some_and(|v| v < ProtocolVersion::V_2026_07_28);
+        if reject_as_legacy_or_disabled {
+            match &request {
+                rmcp::model::ClientRequest::ListSkillsRequest(_) => {
+                    return Err(rmcp::ErrorData::method_not_found::<ListSkillsRequestMethod>());
+                }
+                rmcp::model::ClientRequest::GetSkillRequest(_) => {
+                    return Err(rmcp::ErrorData::method_not_found::<GetSkillRequestMethod>());
+                }
+                rmcp::model::ClientRequest::ReadResourceRequest(_) => {
+                    return Err(rmcp::ErrorData::method_not_found::<ReadResourceRequestMethod>());
+                }
+                rmcp::model::ClientRequest::ReadResourceDirectoryRequest(_) => {
+                    return Err(rmcp::ErrorData::method_not_found::<
+                        ReadResourceDirectoryRequestMethod,
+                    >());
+                }
+                rmcp::model::ClientRequest::ListResourcesRequest(_) => {
+                    return Err(rmcp::ErrorData::method_not_found::<
+                        ListResourcesRequestMethod,
+                    >());
+                }
+                rmcp::model::ClientRequest::ListResourceTemplatesRequest(_) => {
+                    return Err(rmcp::ErrorData::method_not_found::<
+                        ListResourceTemplatesRequestMethod,
+                    >());
+                }
+                _ => {}
+            }
+        }
+        rmcp::service::Service::handle_request(&self.0, request, context).await
+    }
+
+    async fn handle_notification(
+        &self,
+        notification: <RoleServer as rmcp::service::ServiceRole>::PeerNot,
+        context: rmcp::service::NotificationContext<RoleServer>,
+    ) -> Result<(), rmcp::ErrorData> {
+        rmcp::service::Service::handle_notification(&self.0, notification, context).await
+    }
+
+    fn get_info(&self) -> <RoleServer as rmcp::service::ServiceRole>::Info {
+        rmcp::service::Service::get_info(&self.0)
+    }
+
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        rmcp::service::Service::supported_protocol_versions(&self.0)
+    }
+}
+
+pub(crate) fn validate_skill_catalog(catalog: &SkillCatalog) {
+    let projected: Vec<Skill> = catalog.skills().iter().map(project_skill).collect();
+    if let Err(err) = rmcp::model::validate_skills(&projected) {
+        panic!("invalid skill catalog projection: {err}");
+    }
+}
+
+fn project_skill(entry: &SkillEntry) -> Skill {
+    let mut frontmatter = SkillFrontmatter::new(entry.name.clone(), entry.description.clone());
+    frontmatter.extra = entry.frontmatter_extra.clone();
+    let resources = SkillResources::Files(
+        entry
+            .resources
+            .iter()
+            .map(|file| SkillResource::new(file.uri.clone(), file.digest.clone(), file.size))
+            .collect(),
+    );
+    Skill::new(entry.uri.clone(), frontmatter, resources)
+}
+
+fn parse_pagination_cursor(
+    cursor: Option<&str>,
+    total_len: usize,
+) -> Result<usize, rmcp::ErrorData> {
+    let Some(raw) = cursor else {
+        return Ok(0);
+    };
+    if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(rmcp::ErrorData::invalid_params(
+            "invalid pagination cursor",
+            None,
+        ));
+    }
+    let offset = raw
+        .parse::<usize>()
+        .map_err(|_| rmcp::ErrorData::invalid_params("invalid pagination cursor", None))?;
+    if offset == 0 || offset >= total_len {
+        return Err(rmcp::ErrorData::invalid_params(
+            "invalid pagination cursor",
+            None,
+        ));
+    }
+    Ok(offset)
+}
+
+fn skill_read_error_to_rmcp(err: SkillReadError) -> rmcp::ErrorData {
+    match err {
+        SkillReadError::NotFound(msg) => rmcp::ErrorData::invalid_params(msg, None),
+        SkillReadError::MemoryFull(_) => rmcp::ErrorData::internal_error(
+            "Server active memory budget is full while preparing the response",
+            None,
+        ),
+        SkillReadError::Integrity(msg) | SkillReadError::Io(msg) => {
+            rmcp::ErrorData::internal_error(msg, None)
+        }
+        SkillReadError::Cancelled => {
+            rmcp::ErrorData::internal_error("Cancelled before the response was queued.", None)
+        }
+    }
+}
+
+impl Server {
+    fn require_skills<M: rmcp::model::ConstString>(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<&Arc<SkillCatalog>, rmcp::ErrorData> {
+        let Some(catalog) = &self.skills else {
+            return Err(rmcp::ErrorData::method_not_found::<M>());
+        };
+        if self.legacy_session.load(Ordering::Acquire)
+            || context
+                .protocol_version()
+                .is_some_and(|v| v < ProtocolVersion::V_2026_07_28)
+        {
+            return Err(rmcp::ErrorData::method_not_found::<M>());
+        }
+        Ok(catalog)
+    }
+
+    fn deliver_skill_response<T: serde::Serialize>(
+        &self,
+        context: &RequestContext<RoleServer>,
+        result: T,
+        mut staging: lease::Lease,
+    ) -> Result<T, rmcp::ErrorData> {
+        let outbound_bytes = lease::json_len(&result)
+            .unwrap_or(usize::MAX)
+            .saturating_add(lease::json_len(&context.id).unwrap_or(usize::MAX))
+            .saturating_add(256);
+        let Some(target) = staging.bytes().checked_add(outbound_bytes) else {
+            drop(staging);
+            drop(result);
+            return Err(rmcp::ErrorData::internal_error(
+                "Server active memory budget is full while preparing the response",
+                None,
+            ));
+        };
+        if !staging.try_resize(target) {
+            drop(staging);
+            drop(result);
+            return Err(rmcp::ErrorData::internal_error(
+                "Server active memory budget is full while preparing the response",
+                None,
+            ));
+        }
+        let outbound = staging.split_off(outbound_bytes);
+
+        if let Some(slot) = context
+            .extensions
+            .get::<::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<HttpResponseLease>())
+        {
+            drop(staging);
+            if !slot.attach(outbound) {
+                drop(result);
+                return Err(rmcp::ErrorData::internal_error(
+                    "Cancelled before the response was queued.",
+                    None,
+                ));
+            }
+            return Ok(result);
+        }
+
+        if let Some(stdio) = self.stdio_leases.as_deref() {
+            if !stdio.register_response(
+                context.id.clone(),
+                &context.ct,
+                staging,
+                outbound,
+                Default::default(),
+            ) {
+                drop(result);
+                return Err(rmcp::ErrorData::internal_error(
+                    "Cancelled before the response was queued.",
+                    None,
+                ));
+            }
+            return Ok(result);
+        }
+
+        drop(staging);
+        drop(outbound);
+        Ok(result)
     }
 }
 
@@ -1887,6 +2359,29 @@ impl RequestLeases {
         true
     }
 
+    pub(crate) fn register_response(
+        &self,
+        id: rmcp::model::RequestId,
+        cancel: &CancellationToken,
+        staging: lease::Lease,
+        outbound: lease::Lease,
+        payload_owner: lease::Owner,
+    ) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed
+            || cancel.is_cancelled()
+            || state.cancelled.iter().any(|(entry, _)| entry == &id)
+        {
+            drop(state);
+            drop((staging, outbound, payload_owner));
+            return false;
+        }
+        let replaced = state.entries.insert(id, (staging, outbound, payload_owner));
+        drop(state);
+        drop(replaced);
+        true
+    }
+
     pub(crate) fn deliver(
         &self,
         id: rmcp::model::RequestId,
@@ -1896,21 +2391,12 @@ impl RequestLeases {
         outbound: lease::Lease,
         payload_owner: lease::Owner,
     ) -> CallToolResult {
-        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if state.closed
-            || cancel.is_cancelled()
-            || state.cancelled.iter().any(|(entry, _)| entry == &id)
-        {
-            drop(state);
+        if !self.register_response(id, cancel, staging, outbound, payload_owner) {
             drop(result);
-            drop((staging, outbound, payload_owner));
             return CallToolResult::error(vec![ContentBlock::text(
                 "Cancelled before the response was queued.",
             )]);
         }
-        let replaced = state.entries.insert(id, (staging, outbound, payload_owner));
-        drop(state);
-        drop(replaced);
         result
     }
 

@@ -2347,6 +2347,7 @@ async fn g15_http_launch_handoff_bidirectional_stop_and_panic_propagation() {
                 public_root: None,
                 extra_instructions: None,
                 instructions_tool: crate::config::InstructionsToolMode::Off,
+                skills: None,
             },
             recording_spawner,
         );
@@ -2411,6 +2412,7 @@ async fn g15_http_launch_handoff_bidirectional_stop_and_panic_propagation() {
                 public_root: None,
                 extra_instructions: None,
                 instructions_tool: crate::config::InstructionsToolMode::Off,
+                skills: None,
             },
             panicking_spawner,
         );

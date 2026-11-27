@@ -71,6 +71,7 @@ pub struct HttpLaunch {
     pub public_root: Option<Arc<str>>,
     pub extra_instructions: Option<String>,
     pub instructions_tool: crate::config::InstructionsToolMode,
+    pub skills: Option<Arc<crate::skills::SkillCatalog>>,
     pub service: Arc<Service>,
     pub transfers: Arc<Transfers>,
     pub memory: Arc<BytePool>,
@@ -87,6 +88,7 @@ pub(crate) struct PendingHttp {
     pub public_root: Option<Arc<str>>,
     pub extra_instructions: Option<String>,
     pub instructions_tool: crate::config::InstructionsToolMode,
+    pub skills: Option<Arc<crate::skills::SkillCatalog>>,
 }
 
 struct StopOnDrop(Arc<Daemon>);
@@ -421,6 +423,7 @@ impl Daemon {
             public_root: http.public_root,
             extra_instructions: http.extra_instructions,
             instructions_tool: http.instructions_tool,
+            skills: http.skills,
             service: self.service(),
             transfers: self.transfers(),
             memory: Arc::clone(self.memory()),
@@ -1900,7 +1903,7 @@ async fn serve_daemon(
     };
     // The launch context is captured before the daemon leaves its starting directory, so HTTP
     // sessions keep that directory as the one a task starts in.
-    let (http_addr, http, startup_transfer, config) = match http {
+    let (http_addr, http, startup_transfer, config, http_skills_dir) = match http {
         Some(value) => {
             if std::env::var_os(crate::config::TRANSFER_ADDR).is_some() {
                 eprintln!(
@@ -1947,6 +1950,19 @@ async fn serve_daemon(
                     return 1;
                 }
             };
+            let skills_dir = match crate::config::skills_dir(&launch) {
+                Ok(dir) => dir,
+                Err(message) => {
+                    eprintln!("fastexec: {message}");
+                    return 1;
+                }
+            };
+            if let Some(root) = &skills_dir
+                && let Err(message) = crate::skills::preflight_check(root)
+            {
+                eprintln!("fastexec: {message}");
+                return 1;
+            }
             let listener = match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => listener,
                 Err(error) => {
@@ -1967,12 +1983,14 @@ async fn serve_daemon(
                     public_root: public_root.clone(),
                     extra_instructions,
                     instructions_tool,
+                    skills: None,
                 }),
                 None,
                 Config {
                     idle_exit: false,
                     ..Config::default()
                 },
+                skills_dir,
             )
         }
         None => {
@@ -2016,6 +2034,7 @@ async fn serve_daemon(
                     idle_exit: idle_exit && !foreground,
                     ..Config::default()
                 },
+                None,
             )
         }
     };
@@ -2076,7 +2095,20 @@ async fn serve_daemon(
     if let Some((transfer_tcp, bound)) = startup_transfer {
         daemon.attach_transfer_listener(transfer_tcp, bound);
     }
-    let http_task = http.map(|pending| daemon.attach_http(pending, spawn_http));
+    let http_task = if let Some(mut pending) = http {
+        if let Some(root) = http_skills_dir {
+            match crate::skills::load(&root, daemon.memory()) {
+                Ok(catalog) => pending.skills = Some(Arc::new(catalog)),
+                Err(message) => {
+                    eprintln!("fastexec: {message}");
+                    return 1;
+                }
+            }
+        }
+        Some(daemon.attach_http(pending, spawn_http))
+    } else {
+        None
+    };
     let mut run = std::pin::pin!(Arc::clone(&daemon).run(listener));
     let mut shutdown = std::pin::pin!(shutdown);
     if foreground {
