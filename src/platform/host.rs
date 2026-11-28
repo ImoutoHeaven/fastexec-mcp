@@ -209,11 +209,12 @@ pub fn main(args: &[OsString]) -> ! {
     #[cfg(target_os = "macos")]
     let bash_start = crate::platform::tree_macos::start_time(bash).unwrap_or(0);
     drop(spawn_guard);
+    // Readiness includes stdio handoff: a task that closes stdin must have no host reader left.
+    release_stdio();
     // A caller may kill immediately after readiness, so it must never observe a host that has
     // yet to create its command. A closed status pipe does not relinquish an existing tree:
     // the lifeline watcher owns cleanup if the server disappeared during startup.
     let _ = status.write_all(&HOST_STARTUP_READY.to_le_bytes());
-    release_stdio();
     #[cfg(target_os = "macos")]
     wait_macos(bash, bash_start, &mut status, &tracker, &control);
     #[cfg(target_os = "freebsd")]
