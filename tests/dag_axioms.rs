@@ -189,6 +189,7 @@ const ALACRITTY_ALLOWED: &[&str] = &["term"];
 const HYPER_ALLOWED: &[&str] = &["http_wire", "http"];
 const RMCP_ALLOWED: &[&str] = &["render", "ipc", "endpoint", "daemon", "mcp", "http", "cli"];
 const SERDE_SAPHYR_ALLOWED: &[&str] = &["skills"];
+const MAX_PROD_LINES: usize = 1500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok {
@@ -946,21 +947,25 @@ fn skip_pure_test_target(tokens: &[Token], mut i: usize) -> usize {
 }
 
 /// Removes all pure-test `#![cfg(...)]` scopes and `#[cfg(...)]` targets where 3-valued evaluation
-/// under `test = False` produces `Truth::False`.
-fn strip_pure_test_code(tokens: &[Token]) -> Vec<Token> {
+/// under `test = False` produces `Truth::False`, returning `(kept_tokens, whole_file_test, excluded_line_spans)`.
+fn strip_pure_test_code_with_spans(tokens: &[Token]) -> (Vec<Token>, bool, Vec<(usize, usize)>) {
     let mut out = Vec::with_capacity(tokens.len());
-    let mut scope_out_starts: Vec<usize> = Vec::new();
+    let mut scope_out_starts: Vec<(usize, Option<usize>)> = Vec::new();
+    let mut excluded_spans: Vec<(usize, usize)> = Vec::new();
     let mut brace_depth = 0usize;
     let mut i = 0;
     while i < tokens.len() {
         if let Some((after_attr, true, Some(Truth::False))) = parse_attribute(tokens, i) {
             if brace_depth == 0 {
                 out.clear();
-                break;
+                return (out, true, excluded_spans);
             }
-            if let Some(&start) = scope_out_starts.last() {
+            let scope_start_line = if let Some(&(start, first_line)) = scope_out_starts.last() {
                 out.truncate(start);
-            }
+                first_line.unwrap_or(tokens[i].line)
+            } else {
+                tokens[i].line
+            };
             let target_depth = brace_depth - 1;
             i = after_attr;
             while i < tokens.len() {
@@ -976,9 +981,16 @@ fn strip_pure_test_code(tokens: &[Token]) -> Vec<Token> {
                 }
                 i += 1;
             }
+            if i > 0 {
+                let end_line = tokens[i - 1].line;
+                if scope_start_line <= end_line {
+                    excluded_spans.push((scope_start_line, end_line));
+                }
+            }
             continue;
         }
         if matches!(parse_attribute(tokens, i), Some((_, false, _))) {
+            let start_line = tokens[i].line;
             let mut cursor = i;
             let mut any_false = false;
             while let Some((after_attr, false, truth)) = parse_attribute(tokens, cursor) {
@@ -988,24 +1000,101 @@ fn strip_pure_test_code(tokens: &[Token]) -> Vec<Token> {
                 cursor = after_attr;
             }
             if any_false {
-                i = skip_pure_test_target(tokens, cursor);
+                let end_idx = skip_pure_test_target(tokens, cursor);
+                if end_idx > i {
+                    excluded_spans.push((start_line, tokens[end_idx - 1].line));
+                }
+                i = end_idx;
                 continue;
             }
         }
         if tokens[i].is_punct('{') {
+            if let Some((_, first_line)) = scope_out_starts.last_mut()
+                && first_line.is_none()
+            {
+                *first_line = Some(tokens[i].line);
+            }
             brace_depth += 1;
             out.push(tokens[i].clone());
-            scope_out_starts.push(out.len());
+            scope_out_starts.push((out.len(), None));
             i += 1;
             continue;
         } else if tokens[i].is_punct('}') {
             brace_depth = brace_depth.saturating_sub(1);
             scope_out_starts.pop();
+        } else if let Some((_, first_line)) = scope_out_starts.last_mut()
+            && first_line.is_none()
+        {
+            *first_line = Some(tokens[i].line);
         }
         out.push(tokens[i].clone());
         i += 1;
     }
-    out
+    (out, false, excluded_spans)
+}
+
+fn strip_pure_test_code(tokens: &[Token]) -> Vec<Token> {
+    strip_pure_test_code_with_spans(tokens).0
+}
+
+fn is_test_only_src_path(rel: &Path) -> bool {
+    if rel.file_name().and_then(|s| s.to_str()) == Some("tests.rs") {
+        return true;
+    }
+    rel.parent().is_some_and(|parent| {
+        parent
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(name) if name == "tests"))
+    })
+}
+
+fn count_production_lines(src: &str) -> usize {
+    let total_lines = src.lines().count();
+    if total_lines == 0 {
+        return 0;
+    }
+    let (_, whole_file_test, mut spans) = strip_pure_test_code_with_spans(&lex(src));
+    if whole_file_test {
+        return 0;
+    }
+    if spans.is_empty() {
+        return total_lines;
+    }
+    spans.sort_unstable();
+    let mut excluded = 0usize;
+    let mut cur_start = spans[0].0.clamp(1, total_lines);
+    let mut cur_end = spans[0].1.clamp(cur_start, total_lines);
+    for (start, end) in spans.into_iter().skip(1) {
+        let start = start.clamp(1, total_lines);
+        let end = end.clamp(start, total_lines);
+        if start <= cur_end + 1 {
+            cur_end = cur_end.max(end);
+        } else {
+            excluded += cur_end - cur_start + 1;
+            cur_start = start;
+            cur_end = end;
+        }
+    }
+    excluded += cur_end - cur_start + 1;
+    total_lines.saturating_sub(excluded)
+}
+
+fn production_line_budget_violations(files: &[(&str, &str)], max_lines: usize) -> Vec<String> {
+    let mut violations = Vec::new();
+    for &(label, src) in files {
+        let rel = Path::new(label)
+            .strip_prefix("src")
+            .unwrap_or(Path::new(label));
+        if is_test_only_src_path(rel) {
+            continue;
+        }
+        let prod_lines = count_production_lines(src);
+        if prod_lines > max_lines {
+            violations.push(format!("{label}: {prod_lines} > {max_lines}"));
+        }
+    }
+    violations.sort();
+    violations
 }
 
 #[derive(Clone, Debug)]
@@ -3923,4 +4012,110 @@ fn allow_suppression_gate_flags_production_and_cfg_platform_allows_while_ignorin
     assert!(violations[2].contains("src/service.rs:8 (#[allow(dead_code)])"));
     assert!(violations[3].contains("src/service.rs:11 (#[allow(clippy::type_complexity)])"));
     assert!(violations[4].contains("src/service.rs:15 (#[allow(unused_variables)])"));
+}
+
+#[test]
+fn production_files_respect_line_budget() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = manifest_dir.join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&src_dir, &mut files);
+
+    let mut owned: Vec<(String, String)> = Vec::new();
+    for path in files {
+        let rel = path.strip_prefix(&src_dir).expect("under src/");
+        if is_test_only_src_path(rel) {
+            continue;
+        }
+        let label = format!("src/{}", rel.to_string_lossy().replace('\\', "/"));
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        owned.push((label, content));
+    }
+    let refs: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(label, content)| (label.as_str(), content.as_str()))
+        .collect();
+    let violations = production_line_budget_violations(&refs, MAX_PROD_LINES);
+    assert!(
+        violations.is_empty(),
+        "found {} production file(s) exceeding MAX_PROD_LINES ({MAX_PROD_LINES}):\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn production_line_budget_gate_handles_cfg_test_spans_raw_strings_and_test_files() {
+    // (a) 1,501-line production file fails.
+    let over_budget = (0..1501)
+        .map(|i| format!("pub const C_{i}: usize = {i};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let over_violations =
+        production_line_budget_violations(&[("src/over.rs", &over_budget)], MAX_PROD_LINES);
+    assert_eq!(over_violations, vec!["src/over.rs: 1501 > 1500"]);
+
+    // (b) 1,000-line production file + 2,000-line #[cfg(test)] mod tests passes.
+    let mut prod_plus_tests = (0..1000)
+        .map(|i| format!("pub const P_{i}: usize = {i};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    prod_plus_tests.push_str("\n#[cfg(test)]\nmod tests {\n");
+    for i in 0..1997 {
+        prod_plus_tests.push_str(&format!("    const T_{i}: usize = {i};\n"));
+    }
+    prod_plus_tests.push_str("}\n");
+    assert_eq!(count_production_lines(&prod_plus_tests), 1000);
+    assert!(
+        production_line_budget_violations(&[("src/mixed.rs", &prod_plus_tests)], MAX_PROD_LINES)
+            .is_empty()
+    );
+
+    // (c) Multi-line raw string literal in production code counts all of its lines.
+    let raw_str_src = "pub const BODY: &str = r#\"\nline 2\nline 3\nline 4\n\"#;\n";
+    assert_eq!(count_production_lines(raw_str_src), 5);
+    let mut big_raw_str = String::from("pub const BIG: &str = r#\"\n");
+    for i in 0..1500 {
+        big_raw_str.push_str(&format!("payload line {i}\n"));
+    }
+    big_raw_str.push_str("\"#;\n");
+    let raw_violations =
+        production_line_budget_violations(&[("src/raw.rs", &big_raw_str)], MAX_PROD_LINES);
+    assert_eq!(raw_violations, vec!["src/raw.rs: 1502 > 1500"]);
+
+    // (d) #[cfg(test)] struct fields (with trailing comma and final field without comma before `}`)
+    // exclude only the field lines, never the closing `}` or surrounding struct lines.
+    let struct_src = concat!(
+        "pub struct S {\n",
+        "    pub a: usize,\n",
+        "    #[cfg(test)]\n",
+        "    pub test_mid: usize,\n",
+        "    pub b: usize,\n",
+        "    #[allow(dead_code)]\n",
+        "    #[cfg(test)]\n",
+        "    pub test_last: usize\n",
+        "}\n",
+    );
+    // Total 9 lines minus 2 (test_mid) minus 3 (stacked attr + test_last) = 4 production lines.
+    assert_eq!(count_production_lines(struct_src), 4);
+
+    // (e) tests.rs and files under tests/ > 1,500 lines pass; top-level #![cfg(test)] counts as 0.
+    let huge_test = (0..1600)
+        .map(|i| format!("fn t_{i}() {{}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let whole_file_test = format!("#![cfg(test)]\n{huge_test}");
+    assert_eq!(count_production_lines(&whole_file_test), 0);
+    assert!(
+        production_line_budget_violations(
+            &[
+                ("src/foo/tests.rs", &huge_test),
+                ("src/foo/tests/helpers.rs", &huge_test),
+                ("src/only_tests.rs", &whole_file_test),
+            ],
+            MAX_PROD_LINES,
+        )
+        .is_empty()
+    );
 }

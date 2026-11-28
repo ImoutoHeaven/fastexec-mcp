@@ -674,7 +674,9 @@ Fastexec-injected prose.
 
 `src/service.rs` prepares domain results for both frontends. Shared snapshots,
 resource leases, task reports, and diagnostics live in `src/service/core.rs`;
-Agent text and MCP media packing live in `src/service/render.rs`. The Program
+Agent text and MCP media packing live in `src/render.rs`
+(`src/render/types.rs`, `src/render/files.rs`, `src/render/budget.rs`,
+`src/render/list.rs`, `src/render/exec.rs`). The Program
 encoder imports the shared core directly. An explicit `Consumer` selects startup
 cancellation and session-reporting rules independently of `ExecPolicy`; `View`
 contains output options. Task failures retain their overload, cancellation, or
@@ -1155,7 +1157,7 @@ before reading: raw bytes, decoded strings, escape scratch and the extra owned
 resource-content copy. After parsing, raw and scratch storage is dropped before
 the decoded payload owner is handed to its application consumer.
 
-The custom stdio input accumulator (`src/ingress.rs`, `src/cli/stdio.rs`)
+The custom stdio input accumulator (`src/mcp/ingress.rs`, `src/cli/stdio.rs`)
 reserves old and replacement capacity together. Raw bytes, decoded JSON strings,
 and escape scratch are admitted before parsing; four times the input length
 remains for model strings, metadata, and application parameter conversion.
@@ -1472,7 +1474,8 @@ File names use the bare task ID, without the reader
 
 Each UTF-8 PTY task
   feeds output bytes into an `alacritty_terminal` (`0.26.0`) instance at the
-  task's size (`src/term/terminal.rs`, `src/term/frames.rs`) that answers terminal queries
+  task's size (`src/term/terminal.rs`, `src/term/terminal/osc.rs`,
+  `src/term/terminal/recorder.rs`, `src/term/frames.rs`) that answers terminal queries
   (`ESC[6n`, `ESC[c`), tracks keyboard modes, serves `screen: true`, and
   continuously spools `<taskId>.transcript.txt` (up to `64` MiB, counted under
   the `4` GiB total limit). A resize settles the transcript at the old size,
@@ -1540,7 +1543,7 @@ Windows x64 and arm64 builds embed Microsoft
 
 ## 5. Bash launch and process-tree ownership
 
-### Launch (`src/platform/bash.rs`, `src/platform/process.rs`, `src/session.rs`)
+### Launch (`src/platform/bash.rs`, `src/platform/process.rs`, `src/env.rs`)
 
 Runs
   `bash --noprofile --norc -c` (`loginShell: false`, default) on top of a
@@ -1949,9 +1952,44 @@ edges are `D(skills) = {lease, media, platform, files}`, with no dependencies
 on `env`, `config`, `rmcp`, `hyper`, or `rquickjs`. Upper layers (`daemon`,
 `mcp`, `http`, `cli`) resolve `FASTEXEC_SKILLS_DIR` via `config::skills_dir`
 and pass a plain `&Path` into `skills::preflight_check` and `skills::load`.
-`tests/dag_axioms.rs` enforces the 24-module order, keeps all 6 existing
-diagonal blocks unchanged, and locks `SERDE_SAPHYR_ALLOWED = &["skills"]` so
-`serde-saphyr` stays confined to `src/skills.rs`.
+
+`tests/dag_axioms.rs` enforces the 24-module top-level DAG order, keeps all 6
+diagonal blocks unchanged, forbids cross-top-module inherent `impl` blocks and
+non-test `#[allow(...)]` suppressions, and isolates third-party protocol and
+engine crates (`RQUICKJS_ALLOWED`, `ALACRITTY_ALLOWED`, `HYPER_ALLOWED`,
+`RMCP_ALLOWED`, and `SERDE_SAPHYR_ALLOWED = &["skills"]`). It also enforces
+two structural gates across the repository:
+
+- Root-inclusive submodule acyclicity (`include_root = true` Tarjan SCC) across
+  all 24 top-level module trees with zero exemptions. In `src/tasks/`, every
+  submodule is forbidden from referencing root `tasks`.
+- Non-test production line budget (`MAX_PROD_LINES = 1500`) across every `.rs`
+  file under `src/` (skipping `tests.rs` and `tests/` directories), computed by
+  subtracting the union of stripped `#[cfg(test)]` source-line spans from total
+  file lines.
+
+The decomposed multi-file module trees follow a thin-facade layout with downward
+sibling dependencies:
+
+- `src/codemode.rs`: `src/codemode/vm.rs` loads `src/codemode/prelude.js` via
+  `include_str!`.
+- `src/media.rs`: `src/media/detect.rs`, `src/media/uri.rs`,
+  `src/media/compress.rs`.
+- `src/platform/process.rs`: `src/platform/process/types.rs`,
+  `src/platform/process/unix.rs`, `src/platform/process/windows.rs`,
+  `src/platform/process/probe.rs`.
+- `src/term/terminal.rs`: `src/term/terminal/osc.rs`,
+  `src/term/terminal/recorder.rs`.
+- `src/render.rs`: `src/render/types.rs`, `src/render/files.rs`,
+  `src/render/budget.rs`, `src/render/list.rs`, `src/render/exec.rs`.
+- `src/tasks.rs`: `src/tasks/script.rs`, `src/tasks/quota.rs`,
+  `src/tasks/state.rs`, `src/tasks/store.rs`, `src/tasks/workers.rs`,
+  `src/tasks/session.rs`, `src/tasks/lifecycle.rs`, `src/tasks/query.rs`.
+- `src/daemon.rs`: `src/daemon/wire.rs`, `src/daemon/events.rs`,
+  `src/daemon/state.rs`, `src/daemon/dispatch.rs`, `src/daemon/serve.rs`.
+- `src/mcp.rs`: `src/mcp/ingress.rs`, `src/mcp/leases.rs`, `src/mcp/schema.rs`,
+  `src/mcp/server.rs`, `src/mcp/skills.rs`, `src/mcp/events.rs`,
+  `src/mcp/handler.rs`.
 
 ### Anchored `DirFd` and catalog validation (`src/platform/dirfd.rs`, `src/skills.rs`)
 
