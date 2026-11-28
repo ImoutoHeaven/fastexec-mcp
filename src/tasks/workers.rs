@@ -1,10 +1,10 @@
 //! Background output, input, wait, and process-tree cleanup workers.
 
-use super::Tasks;
+use super::quota::lock;
 use super::state::{
     DRAIN_CAP, Final, Input, TASK_LOG_LIMIT, Task, WriterDone, WriterDoneGuard, answer_program,
-    lock,
 };
+use super::store::Tasks;
 use crate::platform::members::Member;
 use crate::platform::process;
 use crate::term::output::incomplete_utf8_suffix;
@@ -445,7 +445,7 @@ pub(super) fn capture(
                             let mut pty = lock(terminal);
                             answer_program(task, answer, pty.live.end_sync());
                             let written = pty.live.take_written();
-                            pty.spool.append(&written, task, shared);
+                            pty.spool.append(&written, task, &shared.quota, shared);
                             // The held frame shows now, so quiet counts from now; the time is
                             // set under the terminal lock that `last_output` also takes.
                             lock(&task.out).last_output = Some(Instant::now());
@@ -479,7 +479,7 @@ pub(super) fn capture(
             let pause = (gap >= FRAME_PAUSE).then_some(gap >= LONG_PAUSE);
             answer_program(task, answer, pty.live.process(chunk, arrived, pause));
             let written = pty.live.take_written();
-            pty.spool.append(&written, task, shared);
+            pty.spool.append(&written, task, &shared.quota, shared);
         }
         // Storing stops at the first byte that does not fit, so the log stays a prefix of the
         // output: a later chunk that would fit is not stored after the gap.
@@ -499,13 +499,13 @@ pub(super) fn capture(
         let mut write_error = None;
         if size > 0
             && let Some(file) = log.as_mut()
-            && shared.reserve(size)
+            && shared.quota.reserve(size, shared)
         {
-            match shared.write_log(file, keep) {
+            match shared.quota.write_log(file, keep) {
                 Ok(()) => stored = true,
                 Err(error) => {
-                    if shared.truncate_log(file, prefix).is_ok() {
-                        shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                    if shared.quota.truncate_log(file, prefix).is_ok() {
+                        shared.quota.log_bytes.fetch_sub(size, Ordering::SeqCst);
                     } else {
                         retained_tail = true;
                     }
@@ -540,7 +540,7 @@ pub(super) fn capture(
         drop(out);
         drop(terminal);
         if reclaim_evicted {
-            shared.reclaim_file(task.log_path.clone(), size);
+            shared.quota.reclaim_file(task.log_path.clone(), size);
         }
         task.activity.send_replace(());
     }
@@ -555,7 +555,7 @@ pub(super) fn capture(
         pty.live.end_sync();
         pty.live.finish();
         let written = pty.live.take_written();
-        pty.spool.append(&written, task, shared);
+        pty.spool.append(&written, task, &shared.quota, shared);
     }
     let mut out = lock(&task.out);
     out.readable = out.written;

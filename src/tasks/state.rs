@@ -1,6 +1,7 @@
 //! Task runtime state, terminal snapshots, transcript spool, and attachment leases.
 
-use super::Tasks;
+pub(super) use super::quota::lock;
+use super::quota::{LogEvictor, LogQuota};
 use super::script::ScriptControl;
 use crate::lease::{BytePool, Lease};
 use crate::media::MediaKind;
@@ -16,7 +17,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -62,12 +63,6 @@ pub(super) const INPUT_QUEUE_LIMIT: usize = 1 << 20;
 pub(super) const INPUT_WRITE_LIMIT: Duration = Duration::from_secs(5);
 /// How long output may stay open after the root exits and its tree is killed.
 pub const DRAIN_CAP: Duration = Duration::from_secs(2);
-
-pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 /// The sorted, deduplicated PIDs of `held`.
 pub(crate) fn pids(held: &[Member]) -> Vec<u32> {
@@ -194,7 +189,7 @@ pub(super) struct AttachmentSlotState {
 }
 
 pub(crate) struct AttachmentSlot {
-    pub(super) tasks: Weak<Tasks>,
+    pub(super) quota: Weak<LogQuota>,
     pub meta: AttachmentMeta,
     pub(super) state: Mutex<AttachmentSlotState>,
 }
@@ -221,8 +216,8 @@ impl AttachmentSlot {
                 false
             }
         };
-        if reclaim && let Some(tasks) = self.tasks.upgrade() {
-            tasks.reclaim_file(self.meta.path.clone(), self.meta.size);
+        if reclaim && let Some(quota) = self.quota.upgrade() {
+            quota.reclaim_file(self.meta.path.clone(), self.meta.size);
         }
     }
 }
@@ -268,8 +263,8 @@ impl Drop for AttachmentLease {
                 false
             }
         };
-        if reclaim && let Some(tasks) = self.0.tasks.upgrade() {
-            tasks.reclaim_file(self.0.meta.path.clone(), self.0.meta.size);
+        if reclaim && let Some(quota) = self.0.quota.upgrade() {
+            quota.reclaim_file(self.0.meta.path.clone(), self.0.meta.size);
         }
     }
 }
@@ -521,7 +516,13 @@ pub(crate) fn mark_tree_ended(snapshot: &mut Snapshot) {
 impl Spool {
     /// Appends final lines, each ending in a newline, in place of the pending lines. Past the
     /// per-task limit, the file keeps the lines that fit and takes no more.
-    pub(super) fn append(&mut self, text: &str, task: &Task, shared: &Tasks) {
+    pub(super) fn append(
+        &mut self,
+        text: &str,
+        task: &Task,
+        quota: &LogQuota,
+        evictor: &dyn LogEvictor,
+    ) {
         if text.is_empty() || self.stopped.is_some() {
             return;
         }
@@ -532,7 +533,7 @@ impl Spool {
             text = &text[..fit.map_or(0, |end| end + 1)];
             self.stopped = Some(format!("it reached its {} MiB limit", TASK_LOG_LIMIT >> 20));
         }
-        self.write(text, true, task, shared);
+        self.write(text, true, task, quota, evictor);
     }
 
     /// Writes `text` after the final lines in place of the pending lines, as final lines or as
@@ -542,7 +543,8 @@ impl Spool {
         text: &[u8],
         as_final: bool,
         task: &Task,
-        shared: &Tasks,
+        quota: &LogQuota,
+        evictor: &dyn LogEvictor,
     ) -> bool {
         if lock(&task.out).evicted {
             *lock(&task.transcript_file) = None;
@@ -558,20 +560,20 @@ impl Spool {
                     self.pending = 0;
                     return false;
                 };
-                shared.truncate_log(file, self.bytes)
+                quota.truncate_log(file, self.bytes)
             };
             if let Err(error) = truncated {
                 self.stopped = Some(format!("writing it failed: {error}"));
                 return false;
             }
-            shared.release(task, self.pending);
+            task.release_transcript(quota, self.pending);
             self.pending = 0;
         }
         let size = text.len() as u64;
         if text.is_empty() {
             return true;
         }
-        if !shared.reserve(size) {
+        if !quota.reserve(size, evictor) {
             self.stopped = Some("the 4 GiB total log limit is reached".into());
             return false;
         }
@@ -581,24 +583,24 @@ impl Spool {
                 Some(file) => {
                     let result = file
                         .seek(SeekFrom::Start(self.bytes))
-                        .and_then(|_| shared.write_log(file, text));
+                        .and_then(|_| quota.write_log(file, text));
                     let rolled_back =
-                        result.is_err() && shared.truncate_log(file, self.bytes).is_ok();
+                        result.is_err() && quota.truncate_log(file, self.bytes).is_ok();
                     Some((result, rolled_back))
                 }
                 None => None,
             }
         };
         let Some((write_result, rolled_back)) = write_result else {
-            shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
+            quota.log_bytes.fetch_sub(size, Ordering::SeqCst);
             return false;
         };
         match write_result {
             Ok(()) => {
-                if !shared.hold(task, size) {
+                if !task.hold_transcript(size) {
                     let closed = lock(&task.transcript_file).take();
                     drop(closed);
-                    shared.reclaim_file(task.transcript_path(), size);
+                    quota.reclaim_file(task.transcript_path(), size);
                     return false;
                 }
                 if as_final {
@@ -611,11 +613,11 @@ impl Spool {
             }
             Err(error) => {
                 if rolled_back {
-                    shared.log_bytes.fetch_sub(size, Ordering::SeqCst);
-                } else if !shared.hold(task, size) {
+                    quota.log_bytes.fetch_sub(size, Ordering::SeqCst);
+                } else if !task.hold_transcript(size) {
                     let closed = lock(&task.transcript_file).take();
                     drop(closed);
-                    shared.reclaim_file(task.transcript_path(), size);
+                    quota.reclaim_file(task.transcript_path(), size);
                 }
                 // Unconfirmed bytes stay charged, but never become final or pending lines.
                 // Stopping also prevents later transcript refreshes from overwriting this tail.
@@ -627,6 +629,26 @@ impl Spool {
 }
 
 impl Task {
+    /// Counts `bytes` written to a task's transcript file; returns `false` without refunding when
+    /// the task was concurrently evicted so the caller closes the handle and runs `reclaim_file`.
+    pub(super) fn hold_transcript(&self, bytes: u64) -> bool {
+        let mut out = lock(&self.out);
+        if out.evicted {
+            false
+        } else {
+            out.transcript += bytes;
+            true
+        }
+    }
+
+    /// Gives back `bytes` a task's transcript file no longer holds.
+    pub(super) fn release_transcript(&self, quota: &LogQuota, bytes: u64) {
+        let mut out = lock(&self.out);
+        if !out.evicted {
+            out.transcript -= bytes;
+            quota.log_bytes.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
     /// The ender may discover host loss before or after the root's result is published.
     pub(super) fn publish_end(&self, mut final_state: Final) {
         let mut end = lock(&self.end);
@@ -1040,7 +1062,13 @@ impl Task {
     /// old size and reflows at the new one, the output's own replies go to the program, and then
     /// the program is told through the terminal's own handle, outside the lock capture needs. On
     /// failure the terminal's state is reported unusable while capture continues.
-    pub fn resize(&self, shared: &Tasks, cols: u16, rows: u16) -> Result<(), String> {
+    pub(super) fn resize_with_quota(
+        &self,
+        quota: &LogQuota,
+        evictor: &dyn LogEvictor,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), String> {
         self.check_size()?;
         let terminal = self.terminal.as_ref().ok_or(
             "A pipe task has no terminal size; its output is a byte stream with no screen.",
@@ -1073,7 +1101,7 @@ impl Task {
             }
             let replies = pty.live.resize(cols, rows);
             let written = pty.live.take_written();
-            pty.spool.append(&written, self, shared);
+            pty.spool.append(&written, self, quota, evictor);
             if ended_frame {
                 lock(&self.out).last_output = Some(Instant::now());
             }
@@ -1153,9 +1181,10 @@ impl Task {
     /// Writes the pending lines into the transcript file after its final lines, and returns
     /// what this read covers: the final lines no earlier read of this session has shown, then
     /// the pending lines. The caller commits the next position only after reading them.
-    pub fn transcript(
+    pub(super) fn transcript_with_quota(
         &self,
-        shared: &Tasks,
+        quota: &LogQuota,
+        evictor: &dyn LogEvictor,
         state: &ReadState,
         memory: &Arc<BytePool>,
     ) -> Result<Transcript, TaskError> {
@@ -1195,7 +1224,7 @@ impl Task {
                 pending.truncate(fit.map_or(0, |end| end + 1));
                 cut = true;
             }
-            if !spool.write(pending.as_bytes(), false, self, shared) {
+            if !spool.write(pending.as_bytes(), false, self, quota, evictor) {
                 if lock(&self.out).evicted {
                     return Err(EVICTED_TRANSCRIPT.into());
                 }

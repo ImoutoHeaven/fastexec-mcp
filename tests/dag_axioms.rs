@@ -148,12 +148,40 @@ const CP1_FORBIDDEN_EDGES: &[(&str, &str)] = &[
 ];
 
 /// Allowed sibling submodules inside `src/tasks/` and their exact permitted sibling directed edges
-/// `(from_sub, to_sub)` (Spec §4.2.2, §7.2.5).
-const TASKS_SUBMODULES: &[&str] = &["script", "state", "workers", "session"];
+/// `(from_sub, to_sub)` (Anti-Monolith Campaign Spec §4.5, §6.2).
+const TASKS_SUBMODULES: &[&str] = &[
+    "script",
+    "quota",
+    "state",
+    "store",
+    "workers",
+    "session",
+    "lifecycle",
+    "query",
+];
 const TASKS_ALLOWED_SIBLING_EDGES: &[(&str, &str)] = &[
     ("state", "script"),
+    ("state", "quota"),
+    ("store", "script"),
+    ("store", "quota"),
+    ("store", "state"),
+    ("workers", "quota"),
     ("workers", "state"),
+    ("workers", "store"),
     ("session", "state"),
+    ("lifecycle", "script"),
+    ("lifecycle", "quota"),
+    ("lifecycle", "state"),
+    ("lifecycle", "store"),
+    ("lifecycle", "workers"),
+    ("lifecycle", "session"),
+    ("query", "script"),
+    ("query", "quota"),
+    ("query", "state"),
+    ("query", "store"),
+    ("query", "workers"),
+    ("query", "session"),
+    ("query", "lifecycle"),
 ];
 
 const RQUICKJS_ALLOWED: &[&str] = &["codemode"];
@@ -2565,7 +2593,7 @@ fn submodule_graphs_have_zero_strongly_connected_cycles() {
     };
 
     for top in &report.top_modules {
-        check(top, top != "tasks", "module-tree");
+        check(top, true, "module-tree");
     }
 
     assert!(
@@ -2630,7 +2658,7 @@ fn tasks_submodule_contract_violations(report: &ScanReport) -> Vec<String> {
                     list.push(witness);
                 }
             }
-        } else if matches!(from_sub, "script" | "session") {
+        } else {
             let list = bad_edges
                 .entry((format!("tasks::{from_sub}"), "tasks".to_owned()))
                 .or_default();
@@ -3258,20 +3286,20 @@ fn inherent_impl_detector_flags_direct_imported_and_ref_foreign_types_without_fa
 #[test]
 fn tasks_submodule_contract_accepts_target_dag_and_rejects_script_session_and_state_violations() {
     let tasks_root = r#"
+        mod lifecycle;
+        mod query;
+        mod quota;
         pub mod script;
-        pub mod state;
         pub mod session;
+        pub mod state;
+        mod store;
         mod workers;
 
-        pub struct Tasks;
-        impl Tasks {
-            pub fn touch() {
-                let _ = self::script::ScriptControl;
-                let _ = self::state::Task;
-                let _ = self::workers::OutputWorkers;
-                let _ = self::session::Session;
-            }
-        }
+        pub use self::lifecycle::StartArgs;
+        pub use self::query::ListQuery;
+        pub use self::quota::Limits;
+        pub use self::state::TaskError;
+        pub use self::store::Tasks;
     "#;
     let valid_script = r#"
         pub struct ScriptControl;
@@ -3280,23 +3308,51 @@ fn tasks_submodule_contract_accepts_target_dag_and_rejects_script_session_and_st
             let _ = crate::lease::BytePool::new(1);
         }
     "#;
+    let valid_quota = r#"
+        pub struct Limits;
+        pub struct LogQuota;
+    "#;
     let valid_state = r#"
-        use super::Tasks;
+        use super::quota::LogQuota;
         use super::script::ScriptControl;
         pub struct Task;
+        pub struct TaskError;
         pub struct ReadState;
-        pub fn check(_: &Tasks, _: &ScriptControl) {}
+        pub fn check(_: &LogQuota, _: &ScriptControl) {}
+    "#;
+    let valid_store = r#"
+        use super::quota::LogQuota;
+        use super::state::Task;
+        pub struct Tasks;
+        pub fn store(_: &LogQuota, _: &Task) {}
     "#;
     let valid_workers = r#"
-        use super::Tasks;
+        use super::quota::LogQuota;
         use super::state::Task;
+        use super::store::Tasks;
         pub struct OutputWorkers;
-        pub fn run(_: &Tasks, _: &Task) {}
+        pub fn run(_: &LogQuota, _: &Tasks, _: &Task) {}
     "#;
     let valid_session = r#"
         use super::state::{ReadState, Task};
         pub struct Session;
         pub fn cursor(_: &ReadState, _: &Task) {}
+    "#;
+    let valid_lifecycle = r#"
+        use super::script::ScriptControl;
+        use super::session::Session;
+        use super::state::Task;
+        use super::store::Tasks;
+        use super::workers::OutputWorkers;
+        pub struct StartArgs;
+        pub fn start(_: &Tasks, _: &Session, _: &ScriptControl, _: &Task, _: &OutputWorkers) {}
+    "#;
+    let valid_query = r#"
+        use super::session::Session;
+        use super::state::Task;
+        use super::store::Tasks;
+        pub struct ListQuery;
+        pub fn list(_: &Tasks, _: &Session, _: &Task) {}
     "#;
 
     let clean_report = analyze_virtual_files(&[
@@ -3307,9 +3363,19 @@ fn tasks_submodule_contract_accepts_target_dag_and_rejects_script_session_and_st
             valid_script,
         ),
         (
+            "src/tasks/quota.rs",
+            vec!["tasks".into(), "quota".into()],
+            valid_quota,
+        ),
+        (
             "src/tasks/state.rs",
             vec!["tasks".into(), "state".into()],
             valid_state,
+        ),
+        (
+            "src/tasks/store.rs",
+            vec!["tasks".into(), "store".into()],
+            valid_store,
         ),
         (
             "src/tasks/workers.rs",
@@ -3320,6 +3386,16 @@ fn tasks_submodule_contract_accepts_target_dag_and_rejects_script_session_and_st
             "src/tasks/session.rs",
             vec!["tasks".into(), "session".into()],
             valid_session,
+        ),
+        (
+            "src/tasks/lifecycle.rs",
+            vec!["tasks".into(), "lifecycle".into()],
+            valid_lifecycle,
+        ),
+        (
+            "src/tasks/query.rs",
+            vec!["tasks".into(), "query".into()],
+            valid_query,
         ),
     ]);
     let clean_violations = tasks_submodule_contract_violations(&clean_report);
@@ -3336,14 +3412,19 @@ fn tasks_submodule_contract_accepts_target_dag_and_rejects_script_session_and_st
             "pub fn bad() { let _ = super::state::Task; let _ = super::Tasks; }",
         ),
         (
+            "src/tasks/quota.rs",
+            vec!["tasks".into(), "quota".into()],
+            "pub fn bad() { let _ = super::state::Task; let _ = super::Tasks; }",
+        ),
+        (
             "src/tasks/state.rs",
             vec!["tasks".into(), "state".into()],
-            "pub struct Task; pub fn bad() { let _ = super::workers::OutputWorkers; }",
+            "pub struct Task; pub fn bad() { let _ = super::store::Tasks; let _ = super::Tasks; }",
         ),
         (
             "src/tasks/workers.rs",
             vec!["tasks".into(), "workers".into()],
-            "pub struct OutputWorkers; pub fn bad() { let _ = super::script::ScriptControl; }",
+            "pub struct OutputWorkers; pub fn bad() { let _ = super::script::ScriptControl; let _ = super::Tasks; }",
         ),
         (
             "src/tasks/session.rs",
@@ -3357,7 +3438,7 @@ fn tasks_submodule_contract_accepts_target_dag_and_rejects_script_session_and_st
         ),
     ]);
     let violations = tasks_submodule_contract_violations(&bad_report);
-    assert_eq!(violations.len(), 7, "got: {violations:?}");
+    assert_eq!(violations.len(), 11, "got: {violations:?}");
     assert!(
         violations
             .iter()
@@ -3372,20 +3453,36 @@ fn tasks_submodule_contract_accepts_target_dag_and_rejects_script_session_and_st
             && v.contains("src/tasks/script.rs:1 (`crate::tasks::Tasks`)")
     }));
     assert!(violations.iter().any(|v| {
+        v.contains("tasks::quota -> tasks::state")
+            && v.contains("src/tasks/quota.rs:1 (`crate::tasks::state::Task`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::quota -> tasks (")
+            && v.contains("src/tasks/quota.rs:1 (`crate::tasks::Tasks`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::state -> tasks::store")
+            && v.contains("src/tasks/state.rs:1 (`crate::tasks::store::Tasks`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::state -> tasks (")
+            && v.contains("src/tasks/state.rs:1 (`crate::tasks::Tasks`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::workers -> tasks::script")
+            && v.contains("src/tasks/workers.rs:1 (`crate::tasks::script::ScriptControl`)")
+    }));
+    assert!(violations.iter().any(|v| {
+        v.contains("tasks::workers -> tasks (")
+            && v.contains("src/tasks/workers.rs:1 (`crate::tasks::Tasks`)")
+    }));
+    assert!(violations.iter().any(|v| {
         v.contains("tasks::session -> tasks (")
             && v.contains("src/tasks/session.rs:1 (`crate::tasks::Tasks`)")
     }));
     assert!(violations.iter().any(|v| {
         v.contains("tasks::session -> tasks::workers")
             && v.contains("src/tasks/session.rs:1 (`crate::tasks::workers::OutputWorkers`)")
-    }));
-    assert!(violations.iter().any(|v| {
-        v.contains("tasks::state -> tasks::workers")
-            && v.contains("src/tasks/state.rs:1 (`crate::tasks::workers::OutputWorkers`)")
-    }));
-    assert!(violations.iter().any(|v| {
-        v.contains("tasks::workers -> tasks::script")
-            && v.contains("src/tasks/workers.rs:1 (`crate::tasks::script::ScriptControl`)")
     }));
 }
 

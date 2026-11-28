@@ -1,11 +1,26 @@
+use super::lifecycle::*;
+use super::query::*;
+use super::quota::lock;
+use super::quota::*;
 use super::session::*;
 use super::state::*;
+use super::store::*;
 use super::workers::*;
 use super::*;
-use crate::id::{ALPHABET, is_valid_task_id};
+use crate::env::LaunchContext;
+use crate::id::{ALPHABET, is_valid_task_id, random_chars};
 use crate::lease::BytePool;
-use std::io::Read;
-use tokio::sync::oneshot;
+use crate::media::MediaKind;
+use crate::platform::members::Member;
+use crate::platform::process;
+use crate::term::terminal::Live;
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
@@ -365,8 +380,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         // Reserving the 99-byte chunk crosses the limit and evicts the finished task's 3 bytes.
-        let before = tasks.log_limit - 97;
-        tasks.log_bytes.store(before, Ordering::SeqCst);
+        let before = tasks.quota.log_limit - 97;
+        tasks.quota.log_bytes.store(before, Ordering::SeqCst);
         let log = File::create(tasks.dir.join("extra.log")).unwrap();
         let (chunks, received) = mpsc::sync_channel(1);
         chunks.send(Ok((Instant::now(), vec![b'x'; 99]))).unwrap();
@@ -375,7 +390,7 @@ mod tests {
         let out = lock(&task.out);
         assert!(out.evicted);
         assert_eq!((out.written, out.dropped), (3, 99));
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), before - 3);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), before - 3);
         drop(out);
         tasks.shutdown();
     }
@@ -601,7 +616,10 @@ mod tests {
             "the fixture did not end in the wrong order"
         );
         // One byte over the limit: exactly one eviction is needed, and it must be the earliest end.
-        tasks.log_bytes.store(tasks.log_limit - 1, Ordering::SeqCst);
+        tasks
+            .quota
+            .log_bytes
+            .store(tasks.quota.log_limit - 1, Ordering::SeqCst);
         assert!(tasks.reserve(2), "the reservation failed");
         assert!(
             lock(&quick.out).evicted,
@@ -1655,7 +1673,7 @@ mod script_tests {
             tasks.find(&pending.id).is_some(),
             "pending trees do not expire"
         );
-        assert!(!tasks.reserve(tasks.log_limit + 1));
+        assert!(!tasks.reserve(tasks.quota.log_limit + 1));
         assert!(
             !pending.evicted(),
             "log pressure must preserve a pending tree"
@@ -1682,7 +1700,7 @@ mod script_tests {
                 .unwrap()
                 .unwrap();
         });
-        let before = tasks.log_bytes.load(Ordering::SeqCst);
+        let before = tasks.quota.log_bytes.load(Ordering::SeqCst);
         let first = tasks
             .store_attachment(&task, MediaKind::Image, "image/png", b"one")
             .unwrap();
@@ -1692,7 +1710,7 @@ mod script_tests {
             .store_attachment(&task, MediaKind::Document, "application/pdf", b"two")
             .unwrap();
         assert_eq!(second.index, 2);
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), before + 6);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), before + 6);
         assert_eq!(task.unseen_attachment_count(0), 2);
         assert_eq!(task.unseen_attachments(0)[0].meta().index, 1);
         assert_eq!(task.unseen_attachments(1)[0].meta().index, 2);
@@ -1705,10 +1723,10 @@ mod script_tests {
             second.path.exists(),
             "pinned attachment must survive eviction until lease drops"
         );
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 3);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 3);
         drop(pinned);
         assert!(!second.path.exists());
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
         tasks.shutdown();
     }
 
@@ -1730,7 +1748,7 @@ mod script_tests {
                 .unwrap()
                 .unwrap();
         });
-        let baseline = tasks.log_bytes.load(Ordering::SeqCst);
+        let baseline = tasks.quota.log_bytes.load(Ordering::SeqCst);
         assert!(baseline < 900, "unexpected baseline={baseline}");
         let att_len = (1024 - baseline - 30) as usize;
         let att1 = tasks
@@ -1741,7 +1759,7 @@ mod script_tests {
                 &vec![b'x'; att_len],
             )
             .unwrap();
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 994);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 994);
 
         let pin = task1.unseen_attachments(0).pop().expect("leased");
         let fail_deletes = Arc::new(AtomicBool::new(true));
@@ -1764,23 +1782,23 @@ mod script_tests {
             "task1 removed from registry"
         );
         assert!(att1.path.exists(), "read lease kept attachment on disk");
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 994);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 994);
 
         drop(pin);
         assert!(att1.path.exists());
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 994);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 994);
 
         assert!(!tasks.reserve(40), "must not admit past 1024-byte limit");
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 994);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 994);
 
         fail_deletes.store(false, Ordering::SeqCst);
         assert!(tasks.reserve(40), "freed pending delete makes room");
         assert!(!att1.path.exists());
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 40);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 40);
 
         tasks.retry_pending_deletes();
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 40);
-        tasks.log_bytes.fetch_sub(40, Ordering::SeqCst);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 40);
+        tasks.quota.log_bytes.fetch_sub(40, Ordering::SeqCst);
         tasks.set_remove_hook(None);
         tasks.shutdown();
     }
@@ -1880,11 +1898,11 @@ mod script_tests {
     }
 
     fn partial_log_write(tasks: &Tasks, rollback_fails: bool) {
-        *lock(&tasks.log_write_hook) = Some(Arc::new(|file, bytes| {
+        *lock(&tasks.quota.log_write_hook) = Some(Arc::new(|file, bytes| {
             file.write_all(&bytes[..bytes.len().min(2)])?;
             Err(std::io::Error::other("injected partial write"))
         }));
-        *lock(&tasks.log_truncate_hook) = rollback_fails.then(|| {
+        *lock(&tasks.quota.log_truncate_hook) = rollback_fails.then(|| {
             Arc::new(|_: &File, _: u64| Err(std::io::Error::other("injected truncate failure")))
                 as LogTruncateHook
         });
@@ -1942,7 +1960,7 @@ mod script_tests {
                 assert_eq!(out.log_tail, charge - 3);
                 assert!(out.log_error.is_some());
             }
-            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+            assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), charge);
             assert_eq!(
                 std::fs::read(&task.log_path).unwrap(),
                 if rollback_fails {
@@ -1953,12 +1971,12 @@ mod script_tests {
             );
             let delayed = delay_log_delete(&tasks);
             tasks.evict_log(&task);
-            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+            assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), charge);
             delayed.store(false, Ordering::SeqCst);
             tasks.retry_pending_deletes();
-            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+            assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
             tasks.retry_pending_deletes();
-            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+            assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
             assert!(!task.log_path.exists());
             tasks.shutdown();
         }
@@ -1971,13 +1989,16 @@ mod script_tests {
             let task = finished_pty_task(&tasks, 4, 2);
             {
                 let mut pty = lock(task.terminal.as_ref().unwrap());
-                assert!(pty.spool.write(b"ok\n", true, &task, &tasks));
+                assert!(pty.spool.write(b"ok\n", true, &task, &tasks.quota, &*tasks));
             }
             partial_log_write(&tasks, rollback_fails);
             {
                 let mut pty = lock(task.terminal.as_ref().unwrap());
-                assert!(!pty.spool.write(b"tail\n", false, &task, &tasks));
-                pty.spool.append("later\n", &task, &tasks);
+                assert!(
+                    !pty.spool
+                        .write(b"tail\n", false, &task, &tasks.quota, &*tasks)
+                );
+                pty.spool.append("later\n", &task, &tasks.quota, &*tasks);
                 assert_eq!(
                     (pty.spool.bytes, pty.spool.lines, pty.spool.pending),
                     (3, 1, 0)
@@ -1995,7 +2016,7 @@ mod script_tests {
                 assert!(transcript.stopped.is_some());
             }
             assert_eq!(lock(&task.out).transcript, charge);
-            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+            assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), charge);
             assert_eq!(
                 std::fs::read(task.transcript_path()).unwrap(),
                 if rollback_fails {
@@ -2006,12 +2027,12 @@ mod script_tests {
             );
             let delayed = delay_log_delete(&tasks);
             tasks.evict_log(&task);
-            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+            assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), charge);
             delayed.store(false, Ordering::SeqCst);
             tasks.retry_pending_deletes();
-            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+            assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
             tasks.retry_pending_deletes();
-            assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+            assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
             assert!(!task.transcript_path().exists());
             tasks.shutdown();
         }
@@ -2025,7 +2046,7 @@ mod script_tests {
                 let task = finished_pty_task(&tasks, 4, 2);
                 let log = if transcript {
                     let mut pty = lock(task.terminal.as_ref().unwrap());
-                    assert!(pty.spool.write(b"ok\n", true, &task, &tasks));
+                    assert!(pty.spool.write(b"ok\n", true, &task, &tasks.quota, &*tasks));
                     None
                 } else {
                     Some(seed_capture_prefix(&tasks, &task))
@@ -2034,7 +2055,7 @@ mod script_tests {
                 let delayed = delay_log_delete(&tasks);
                 let (writing, started) = mpsc::channel();
                 let observed = Arc::clone(&task);
-                *lock(&tasks.log_write_hook) = Some(Arc::new(move |file, bytes| {
+                *lock(&tasks.quota.log_write_hook) = Some(Arc::new(move |file, bytes| {
                     file.write_all(&bytes[..2])?;
                     writing.send(()).unwrap();
                     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2052,7 +2073,10 @@ mod script_tests {
                 });
                 if transcript {
                     let mut pty = lock(task.terminal.as_ref().unwrap());
-                    assert!(!pty.spool.write(b"tail\n", true, &task, &tasks));
+                    assert!(
+                        !pty.spool
+                            .write(b"tail\n", true, &task, &tasks.quota, &*tasks)
+                    );
                     assert_eq!(
                         (pty.spool.bytes, pty.spool.lines, pty.spool.pending),
                         (3, 1, 0)
@@ -2065,9 +2089,9 @@ mod script_tests {
                 }
                 eviction.join().unwrap();
                 let charge = if rollback_fails { 8 } else { 3 };
-                assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), charge);
+                assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), charge);
                 assert_eq!(
-                    lock(&tasks.pending_deletes)
+                    lock(&tasks.quota.pending_deletes)
                         .iter()
                         .map(|entry| entry.bytes)
                         .sum::<u64>(),
@@ -2075,9 +2099,9 @@ mod script_tests {
                 );
                 delayed.store(false, Ordering::SeqCst);
                 tasks.retry_pending_deletes();
-                assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+                assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
                 tasks.retry_pending_deletes();
-                assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+                assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
                 tasks.shutdown();
             }
         }
@@ -2161,7 +2185,7 @@ mod script_tests {
         };
         let path = task.transcript_path();
         let file_before = std::fs::read(&path).unwrap();
-        let quota_before = tasks.log_bytes.load(Ordering::SeqCst);
+        let quota_before = tasks.quota.log_bytes.load(Ordering::SeqCst);
         assert!(
             matches!(task.transcript(&tasks, &state, &memory), Err(TaskError::Overload(message)) if message.contains("memory budget"))
         );
@@ -2175,7 +2199,7 @@ mod script_tests {
             );
         }
         assert_eq!(std::fs::read(&path).unwrap(), file_before);
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), quota_before);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), quota_before);
 
         drop(occupied);
         let transcript = task.transcript(&tasks, &state, &memory).unwrap();
@@ -2203,19 +2227,25 @@ mod script_tests {
         // Seed initial transcript bytes while under the 64-byte limit.
         {
             let mut pty = lock(task.terminal.as_ref().unwrap());
-            assert!(pty.spool.write(b"first-line\n", true, &task, &tasks));
+            assert!(
+                pty.spool
+                    .write(b"first-line\n", true, &task, &tasks.quota, &*tasks)
+            );
         }
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 11);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 11);
 
         // Hold `task.terminal` (exact state of `capture` with open output or `resize`) and write
         // 60 more bytes (11 + 60 > 64), forcing `reserve` -> `evict_log(&task)` on this thread!
         {
             let mut pty = lock(task.terminal.as_ref().unwrap());
-            assert!(!pty.spool.write(&[b'z'; 60], true, &task, &tasks));
+            assert!(
+                !pty.spool
+                    .write(&[b'z'; 60], true, &task, &tasks.quota, &*tasks)
+            );
         }
         assert!(task.evicted());
         assert!(lock(&task.transcript_file).is_none());
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
 
         // Verify concurrent eviction during `Spool::write` closes `transcript_file` and records
         // `pending_deletes` when unlinking fails (R4-7).
@@ -2245,14 +2275,14 @@ mod script_tests {
         drop(closed);
         tasks.reclaim_file(task2.transcript_path(), 20);
         assert_eq!(
-            tasks.log_bytes.load(Ordering::SeqCst),
+            tasks.quota.log_bytes.load(Ordering::SeqCst),
             20,
             "failed unlink must keep transcript bytes charged"
         );
         fail_deletes.store(false, Ordering::SeqCst);
         tasks.retry_pending_deletes();
         assert!(!task2.transcript_path().exists());
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
         tasks.set_remove_hook(None);
         tasks.shutdown();
     }
@@ -2265,7 +2295,10 @@ mod script_tests {
         let task = finished_pty_task(&tasks, 80, 24);
         {
             let mut pty = lock(task.terminal.as_ref().unwrap());
-            assert!(pty.spool.write(b"first-line\n", true, &task, &tasks));
+            assert!(
+                pty.spool
+                    .write(b"first-line\n", true, &task, &tasks.quota, &*tasks)
+            );
             pty.live.process(
                 b"pending-tail-that-crosses-64-byte-total-log-limit-here",
                 Instant::now(),
@@ -2286,7 +2319,7 @@ mod script_tests {
         delayed.store(false, Ordering::SeqCst);
         tasks.retry_pending_deletes();
         assert!(!task.transcript_path().exists());
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
         tasks.set_remove_hook(None);
         tasks.shutdown();
 
@@ -2295,13 +2328,16 @@ mod script_tests {
         let task = finished_pty_task(&tasks, 80, 24);
         {
             let mut pty = lock(task.terminal.as_ref().unwrap());
-            assert!(pty.spool.write(b"saved-line\n", true, &task, &tasks));
+            assert!(
+                pty.spool
+                    .write(b"saved-line\n", true, &task, &tasks.quota, &*tasks)
+            );
             pty.live.process(b"live-screen-tail", Instant::now(), None);
         }
         let delayed = delay_log_delete(&tasks);
         let evicting = Arc::clone(&tasks);
         let target = Arc::clone(&task);
-        *lock(&tasks.log_write_hook) = Some(Arc::new(move |file, bytes| {
+        *lock(&tasks.quota.log_write_hook) = Some(Arc::new(move |file, bytes| {
             file.write_all(bytes)?;
             let prior = {
                 let mut out = lock(&target.out);
@@ -2320,11 +2356,11 @@ mod script_tests {
             "{err:?}"
         );
         assert!(task.transcript_path().exists());
-        *lock(&tasks.log_write_hook) = None;
+        *lock(&tasks.quota.log_write_hook) = None;
         delayed.store(false, Ordering::SeqCst);
         tasks.retry_pending_deletes();
         assert!(!task.transcript_path().exists());
-        assert_eq!(tasks.log_bytes.load(Ordering::SeqCst), 0);
+        assert_eq!(tasks.quota.log_bytes.load(Ordering::SeqCst), 0);
         tasks.set_remove_hook(None);
         tasks.shutdown();
     }
@@ -2425,8 +2461,8 @@ mod script_tests {
         let written_before = lock(&task.out).written;
         assert!(written_before >= 3);
 
-        let before = tasks.log_limit - 97;
-        tasks.log_bytes.store(before, Ordering::SeqCst);
+        let before = tasks.quota.log_limit - 97;
+        tasks.quota.log_bytes.store(before, Ordering::SeqCst);
         let log = File::create(tasks.dir.join("extra.log")).unwrap();
         let (chunks, received) = mpsc::sync_channel(1);
         let arrived = Instant::now() + Duration::from_secs(1);
@@ -2438,7 +2474,7 @@ mod script_tests {
         assert_eq!((out.written, out.dropped), (written_before, 99));
         assert_eq!(out.last_output, Some(arrived));
         assert_eq!(
-            tasks.log_bytes.load(Ordering::SeqCst),
+            tasks.quota.log_bytes.load(Ordering::SeqCst),
             before - written_before
         );
         drop(out);
